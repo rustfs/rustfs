@@ -30,7 +30,7 @@ documentation = "https://docs.rs/rustfs-scanner/latest/rustfs_scanner/"
 workspace = true
 
 [dependencies]
-rustfs-config = { workspace = true }
+rustfs-config = { workspace = true, features = ["server-config-model"] }
 rustfs-common = { workspace = true }
 rustfs-utils = { workspace = true }
 tokio = { workspace = true, features = ["fs","sync","rt","time","io-uring","macros"] }
