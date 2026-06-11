@@ -40,6 +40,16 @@ const CREDENTIAL_VENDING_UNSUPPORTED: &str = "unsupported";
 const TABLE_CATALOG_NAMESPACE_RESOURCE_ROOT: &str = "namespaces";
 const TABLE_CATALOG_TABLE_RESOURCE_ROOT: &str = "tables";
 const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
+    "GET /v1/{prefix}/namespaces",
+    "POST /v1/{prefix}/namespaces",
+    "GET /v1/{prefix}/namespaces/{namespace}",
+    "DELETE /v1/{prefix}/namespaces/{namespace}",
+    "GET /v1/{prefix}/namespaces/{namespace}/tables",
+    "POST /v1/{prefix}/namespaces/{namespace}/tables",
+    "POST /v1/{prefix}/namespaces/{namespace}/register",
+    "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+    "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+    "DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}",
     "PUT /buckets/{warehouse}",
     "GET /buckets/{warehouse}",
     "GET /{warehouse}/namespaces",
@@ -133,6 +143,8 @@ struct CreateTableRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RestCommitTableRequest {
+    #[serde(default, rename = "identifier")]
+    _identifier: Option<serde_json::Value>,
     #[serde(default, rename = "commit-id")]
     commit_id: Option<String>,
     #[serde(default, rename = "idempotency-key")]
@@ -2434,6 +2446,12 @@ mod tests {
             Some(&TABLE_CATALOG_COMPAT_PREFIX)
         );
         assert!(response.overrides.is_empty());
+        assert!(response.endpoints.contains(&"GET /v1/{prefix}/namespaces"));
+        assert!(
+            response
+                .endpoints
+                .contains(&"GET /v1/{prefix}/namespaces/{namespace}/tables/{table}")
+        );
         assert!(response.endpoints.contains(&"GET /{warehouse}/namespaces"));
         assert!(response.endpoints.contains(&"POST /{warehouse}/namespaces"));
         assert!(
@@ -4020,6 +4038,7 @@ mod tests {
                 new_metadata_location: Some(next_metadata_location.to_string()),
                 requirements: Vec::new(),
                 updates: Vec::new(),
+                _identifier: None,
                 writer: Some("pyiceberg".to_string()),
             },
         )
@@ -4756,6 +4775,7 @@ mod tests {
                     new_metadata_location: Some(mismatched_location.to_string()),
                     requirements: Vec::new(),
                     updates: Vec::new(),
+                    _identifier: None,
                     writer: Some("pyiceberg".to_string()),
                 },
             )
