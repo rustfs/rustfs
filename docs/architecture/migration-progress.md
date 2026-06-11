@@ -5,17 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-config-consumers`
-- Baseline: `origin/main` at `22059911807158aae9617415a916cf1156558b7b`
+- Branch: `overtrue/arch-config-scanner-consumer`
+- Baseline: `origin/main` at `704c95a22d9106b75cde26bf6fcc3988a175a19b`
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: migrate admin/runtime/audit/notify/targets/iam and
-  ECStore service/default model consumers from the temporary
-  `rustfs_ecstore::config` model path to `rustfs_config::server_config`, and
-  enable the `server-config-model` feature in affected crates.
+- Rust code changes: migrate the scanner runtime-config model consumer from
+  the temporary `rustfs_ecstore::config` model path to
+  `rustfs_config::server_config`, and enable the `server-config-model` feature
+  in `rustfs-scanner`.
 - CI/script changes: none.
-- Docs changes: record CFG-005/CFG-006 consumer-migration context, verification
-  evidence, and the preserved ECStore runtime-state boundary.
+- Docs changes: record CFG-007 consumer-migration context, verification
+  evidence, and the preserved ECStore global server-config boundary.
 
 ## Phase 0 Tasks
 
@@ -104,6 +104,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     model import path except the deliberate compatibility smoke test; the old
     public re-export remains available for downstream callers until CFG-004 is
     cleaned up.
+- [x] `CFG-007` Migrate scanner runtime-config model consumer.
+  - Current branch: migrate scanner runtime-config parsing and validation from
+    the temporary `rustfs_ecstore::config::{Config, KVS}` model path to
+    `rustfs_config::server_config`.
+  - Acceptance: scanner uses the model crate for pure server-config types while
+    still using ECStore for the global server-config accessor; scanner defaults,
+    env overrides, persisted-config validation, cycle scheduling, bitrot-cycle
+    compatibility, cache timeout, and alert threshold semantics remain
+    unchanged.
 
 ## Phase 1 Security Governance Tasks
 
@@ -329,7 +338,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Next PRs
 
 1. `api-extraction`: remove the temporary `rustfs_ecstore::config` model
-   re-export after downstream compatibility policy allows CFG-004 cleanup.
+   re-export after code scans prove only the deliberate CFG-004 compatibility
+   marker and smoke test still use the old model path.
 2. `security-change`: make Local KMS unsafe defaults explicit development
    opt-ins or production failures in KMSD-002.
 3. `security-change`: make Vault unsafe defaults explicit development opt-ins
@@ -339,34 +349,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed this is only a model-consumer migration and feature-gate update; ECStore persistence helpers, global state, startup wiring, config persistence, and storage hot paths stay unchanged. |
-| Migration preservation | pass | Confirmed the old `rustfs_ecstore::config` model path remains available through `RUSTFS_COMPAT_TODO(CFG-004)`, with no tuple-shape, serde, default, or persisted JSON changes. |
-| Testing/verification | pass | Confirmed focused config/admin/audit/notify/targets/iam tests, compile checks, migration guards, boundary scans, and added-line risk scan are sufficient; full pre-commit is skipped under the current larger-granularity instruction. |
+| Quality/architecture | pass | Confirmed the diff only moves scanner pure model imports to `rustfs_config::server_config`, enables the required feature, and keeps ECStore global-state access through ECStore. |
+| Migration preservation | pass | Confirmed scanner defaults, env/config precedence, validation, cycle scheduling, bitrot compatibility, cache timeout, alert thresholds, and active global-config access are unchanged. |
+| Testing/verification | pass | Confirmed focused scanner runtime-config tests, scanner/ECStore/server compile check, migration guards, old-path scan, and added-line risk scan are sufficient; full pre-commit is skipped under the current larger-granularity instruction. |
 
 ## Verification Notes
 
 Passed:
 - `cargo fmt --all --check`.
-- `cargo check -p rustfs-config -p rustfs-audit -p rustfs-notify -p rustfs-targets -p rustfs-iam -p rustfs-ecstore -p rustfs --lib`.
-- `cargo test -p rustfs-config --features server-config-model --lib`; 29 passed.
-- `cargo test -p rustfs-ecstore config --lib`; 60 passed.
-- `cargo test -p rustfs-targets config --lib`; 65 passed.
-- `cargo test -p rustfs-notify config_manager --lib`; 12 passed.
-- `cargo test -p rustfs-audit --lib`; 5 passed.
-- `cargo test -p rustfs-iam oidc --lib`; 53 passed.
-- `cargo test -p rustfs admin::handlers::config_admin --lib`; 29 passed.
-- `cargo test -p rustfs admin::service::config --lib`; 6 passed.
+- `cargo test -p rustfs-scanner runtime_config --lib`; 16 passed.
+- `cargo check -p rustfs-scanner -p rustfs-ecstore -p rustfs --lib`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - `./scripts/check_metrics_migration_refs.sh`.
 - `./scripts/check_unsafe_code_allowances.sh`.
 - `git diff --check`.
-- External old-model path scan:
-  `rustfs_ecstore::config::{Config, KV, KVS}` is absent from `rustfs/src`,
-  `crates/audit`, `crates/notify`, `crates/targets`, and `crates/iam`.
-- ECStore runtime helper scan: no `rustfs_config::server_config::{init,
-  get_global_server_config, set_global_server_config,
-  set_global_storage_class, com, storageclass}` usage exists.
+- Old model code-path scan:
+  `rustfs_ecstore::config::{Config, KV, KVS, DEFAULT_KVS,
+  register_default_kvs}` is absent from `crates/**/*.rs` and `rustfs/src`.
 - Added-line risk scan found no production `unwrap`/`expect`, lossy numeric
   casts, stringly public errors, boxed dynamic errors, stdout/stderr printing,
   or relaxed atomic ordering.
@@ -374,19 +374,20 @@ Passed:
 Notes:
 - Full pre-commit may be skipped if focused tests, compile checks, and guards
   pass, per the current instruction to increase PR granularity.
-- This slice migrates model consumers only. ECStore retains persistence helpers,
-  ConfigSys, global server-config state, storage-class global state, startup
-  wiring, and all storage/config persistence logic.
+- This slice migrates the scanner model consumer only. ECStore retains
+  persistence helpers, ConfigSys, global server-config state, storage-class
+  global state, startup wiring, and all storage/config persistence logic.
 - The old rustfs_ecstore::config model path intentionally remains as a
   temporary compatibility re-export with `RUSTFS_COMPAT_TODO(CFG-004)` and a
   matching cleanup-register entry.
-- The remaining ECStore old-path references are limited to the deliberate
-  compatibility smoke test in `crates/ecstore/src/config/mod.rs`.
+- The remaining old-path references are limited to architecture documentation;
+  the deliberate CFG-004 compatibility re-export remains available but is no
+  longer imported by Rust code in `crates` or `rustfs/src`.
 
 ## Handoff Notes
 
-- Keep this CFG-005/CFG-006 slice as a `consumer-migration` PR that only
-  updates model type imports and affected crate feature gates.
+- Keep this CFG-007 slice as a `consumer-migration` PR that only updates the
+  scanner model type import and affected crate feature gate.
 - Do not move `ConfigSys`, `GLOBAL_SERVER_CONFIG`, storage-class global state,
   `read_config_without_migrate`, `save_server_config`, config-object helpers,
   startup wiring, storage-class helpers, ECStore persistence helpers, or storage

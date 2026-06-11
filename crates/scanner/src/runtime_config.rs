@@ -30,8 +30,8 @@ use rustfs_config::{
     SCANNER_CYCLE_MAX_OBJECTS, SCANNER_DELAY, SCANNER_IDLE_MODE, SCANNER_MAX_CONCURRENT_DISK_SCANS,
     SCANNER_MAX_CONCURRENT_SET_SCANS, SCANNER_MAX_WAIT, SCANNER_SPEED, SCANNER_START_DELAY, SCANNER_SUB_SYS,
     SCANNER_YIELD_EVERY_N_OBJECTS, ScannerSpeed,
+    server_config::{Config as ServerConfig, KVS},
 };
-use rustfs_ecstore::config::{Config as ServerConfig, KVS};
 use serde::Serialize;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -798,6 +798,7 @@ pub(crate) fn scanner_alert_excess_folders() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{ScannerRuntimeConfigSource, lookup_scanner_runtime_config, validate_scanner_runtime_config};
+    use rustfs_config::server_config::{Config as ServerConfig, KVS};
     use rustfs_config::{
         DEFAULT_DELIMITER, ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, ENV_SCANNER_CYCLE,
         ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_DELAY, ENV_SCANNER_MAX_WAIT_SECS, ENV_SCANNER_SPEED, HEAL_BITROT_CYCLE,
@@ -805,7 +806,6 @@ mod tests {
         SCANNER_CYCLE_MAX_DURATION, SCANNER_CYCLE_MAX_OBJECTS, SCANNER_DELAY, SCANNER_IDLE_MODE, SCANNER_SPEED, SCANNER_SUB_SYS,
         ScannerSpeed,
     };
-    use rustfs_ecstore::config::{Config as ServerConfig, KVS};
     use serial_test::serial;
     use std::collections::HashMap;
     use std::time::Duration;
