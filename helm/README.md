@@ -237,8 +237,15 @@ Notes:
   a few crash/restart cycles before the cluster converges. This is harmless.
 * After the cluster converges, run `rc admin rebalance start <alias>` to
   spread existing objects across the new pool.
-* Pod anti-affinity is scoped per pool, so two pools can share the same
-  nodes while each pool's own pods still spread across distinct nodes.
+* Pod anti-affinity in pool mode is scoped per pool and **preferred**
+  (soft), not required: two pools can share nodes, and each pool's own pods
+  spread across distinct nodes when capacity allows. Soft affinity is
+  load-bearing for in-place expansion — with required rules, the
+  not-yet-rolled pods of the existing pool block the new pool's pods from
+  their nodes while the rolled pods crash on the unresolvable (Pending)
+  peers, deadlocking the rollout on any cluster with fewer nodes than the
+  total pod count. Single-pool deployments (`pools.enabled=false`) keep the
+  chart's existing required anti-affinity unchanged.
 * The PodDisruptionBudget spans all pools: with the default
   `pdb.maxUnavailable: 1`, at most one pod of the whole cluster may be
   evicted at a time. This is deliberately conservative — quorum safety

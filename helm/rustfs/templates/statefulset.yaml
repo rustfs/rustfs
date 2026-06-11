@@ -60,6 +60,29 @@ spec:
         {{- end }}
         {{- if $.Values.affinity.podAntiAffinity.enabled }}
         podAntiAffinity:
+          {{- if $poolsEnabled }}
+          {{- /* Pool-scoped and PREFERRED, not required: during in-place
+                 expansion the not-yet-rolled pods' required rules block new
+                 pods from their nodes, while the new pods' DNS must resolve
+                 before the roll can proceed - required rules deadlock
+                 expansion whenever the cluster has fewer nodes than total
+                 pods. Soft anti-affinity converges (the scheduler still
+                 spreads when capacity allows). */}}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app.kubernetes.io/name
+                      operator: In
+                      values:
+                        - {{ include "rustfs.name" $ }}
+                    - key: rustfs.com/pool
+                      operator: In
+                      values:
+                        - {{ $pool.index | quote }}
+                topologyKey: {{ $.Values.affinity.podAntiAffinity.topologyKey }}
+          {{- else }}
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
                 matchExpressions:
@@ -67,15 +90,8 @@ spec:
                     operator: In
                     values:
                       - {{ include "rustfs.name" $ }}
-                  {{- if $poolsEnabled }}
-                  {{- /* Scope anti-affinity to the pool: pods of different
-                         pools may share a node, pods of one pool may not. */}}
-                  - key: rustfs.com/pool
-                    operator: In
-                    values:
-                      - {{ $pool.index | quote }}
-                  {{- end }}
               topologyKey: {{ $.Values.affinity.podAntiAffinity.topologyKey }}
+          {{- end }}
         {{- end }}
       {{- end }}
       {{- if $.Values.tolerations }}
