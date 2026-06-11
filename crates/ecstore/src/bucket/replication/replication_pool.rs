@@ -27,7 +27,7 @@ use crate::bucket::replication::replication_state::ReplicationStats;
 use crate::config::com::read_config;
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::Error as EcstoreError;
-use crate::store_api::ObjectInfo;
+use crate::store_api::{ObjectIO, ObjectInfo};
 use lazy_static::lazy_static;
 use rustfs_filemeta::MrfReplicateEntry;
 use rustfs_filemeta::ReplicateDecision;
@@ -976,7 +976,7 @@ impl<S: StorageAPI> ReplicationPool<S> {
 }
 
 /// Load bucket resync metadata from disk
-async fn load_bucket_resync_metadata<S: StorageAPI>(
+async fn load_bucket_resync_metadata<S: ObjectIO>(
     bucket: &str,
     obj_api: Arc<S>,
 ) -> Result<BucketReplicationResyncStatus, EcstoreError> {
