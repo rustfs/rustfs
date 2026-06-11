@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-api-bucket-dtos`
-- Baseline: `upstream/main` at `5fef10548477d9d25b0d391874f8280bf259d10e`
-- PR type for this branch: `api-extraction`
+- Branch: `overtrue/arch-admin-readiness-storage-admin`
+- Baseline: `origin/main` at `b48d7b1fa514e5da274d652a0cb7f282521f46c0`
+- PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: move the pure bucket/options DTO subset from
-  `rustfs-ecstore` into `rustfs-storage-api`, while preserving old
-  `ecstore::store_api` import paths through a temporary compatibility
-  re-export.
-- CI/script changes: none
-- Docs changes: record API-003 bucket DTO compatibility cleanup.
+- Rust code changes: migrate grouped admin/readiness read-side consumers from
+  old `StorageAPI::{backend_info, storage_info}` trait imports to the
+  inventory-facing `StorageAdminApi` contract.
+- CI/script changes: none.
+- Docs changes: record API-007 grouped consumer-migration context,
+  verification evidence, and expert review outcomes.
 
 ## Phase 0 Tasks
 
@@ -167,8 +167,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     quorum classification, and reserved code gaps `0x2B/0x2C`.
   - Risk defense: no storage hot-path enum move in this PR; only numeric code
     mapping uses the new contract.
-- [~] `API-003` Move DTOs.
-  - Current branch: move the pure bucket/options DTO subset:
+- [x] `API-003` Move DTOs.
+  - Current PR: `rustfs/rustfs#3314` merged.
+  - Completed slice: move the pure bucket/options DTO subset:
     `MakeBucketOptions`, `SRBucketDeleteOp`, `DeleteBucketOptions`,
     `BucketOptions`, and `BucketInfo`.
   - Acceptance: `rustfs-storage-api` exports these DTOs, ECStore re-exports
@@ -177,6 +178,41 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Must preserve: no `ObjectOptions`, `ObjectInfo`, reader, compression,
     encryption, filemeta conversion, multipart conversion, route, storage, or
     runtime behavior changes in this PR.
+- [x] `API-006` Add disk inventory/admin trait.
+  - Current PR: `rustfs/rustfs#3330` merged.
+  - Completed slice: add `StorageAdminApi` and `DiskSetSelector` to
+    `rustfs-storage-api`.
+  - Acceptance: `StorageAdminApi` exposes backend info, global storage info,
+    local storage info, disk-set inventory, and drive-count surfaces without
+    depending on ECStore implementation types.
+  - Must preserve: no `StorageAPI::get_disks` removal, no ECStore implementation
+    change, no admin/readiness/capacity behavior change.
+  - Risk defense: use associated types for backend/storage/disk DTOs so this
+    contract slice does not pull `rustfs-madmin` or `rustfs-ecstore` into
+    `rustfs-storage-api`.
+  - Verification: focused storage-api tests, dependency tree, migration guards,
+    formatting, and diff hygiene.
+- [~] `API-007` Dual-route `get_disks` consumers.
+  - Completed first slice: `rustfs/rustfs#3331` bound `ECStore` to
+    `StorageAdminApi` while keeping all consumers unchanged.
+  - Completed second slice: `rustfs/rustfs#3332` migrated the admin
+    storage-class config drive-count consumer to
+    `StorageAdminApi::set_drive_counts`.
+  - Completed third slice: `rustfs/rustfs#3333` migrated
+    `DefaultAdminUsecase` storage-info reads to
+    `StorageAdminApi::storage_info`.
+  - Current branch slice: migrate grouped read-side admin/readiness consumers:
+    account-info `backend_info`, rebalance status `storage_info`, and runtime
+    readiness `storage_info`.
+  - Acceptance: account-info, rebalance status, and readiness no longer import
+    old `StorageAPI` only to read admin storage information.
+  - Must preserve: old `StorageAPI` trait shape, `StorageAPI::get_disks`
+    behavior, account-info response shape, rebalance used-space aggregation,
+    readiness degraded-state semantics, RPC `local_storage_info`, heal/scanner
+    consumers, and storage hot paths.
+  - Risk defense: group only read-side callers that delegate to the existing
+    ECStore admin info implementation; do not migrate RPC `local_storage_info`,
+    heal, scanner, observability, or storage hot-path consumers in this PR.
 
 ## Phase 8 Background Controller Tasks
 
@@ -201,79 +237,60 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `api-extraction`: continue API-003 with the next pure DTO subset only after
-   the bucket/options compatibility re-export is reviewed.
-2. `contract`: wait for API-002/#3313 before adding error-aware storage API
-   traits.
-3. `test-only`: add focused preservation tests before moving scanner, heal,
-   replication, lifecycle, or disk health workers.
-4. `api-extraction`: move only the pure server-config model into
+1. `consumer-migration`: migrate the remaining readiness/admin/capacity
+   consumers to the inventory-facing admin contract one group at a time.
+2. `dependency-migration`: remove duplicate old-path admin surfaces only after
+   consumer migration proves equivalent behavior.
+3. `api-extraction`: move only the pure server-config model into
    rustfs-config as CFG-003.
-5. `api-extraction`: keep the old rustfs_ecstore::config::* path with
+4. `api-extraction`: keep the old rustfs_ecstore::config::* path with
    RUSTFS_COMPAT_TODO(CFG-004) and cleanup-register coverage.
-6. `consumer-migration`: migrate external consumers one group at a time only
+5. `consumer-migration`: migrate external consumers one group at a time only
    after the model path and compatibility shim are stable.
-7. `security-change`: make Local KMS unsafe defaults explicit development
+6. `security-change`: make Local KMS unsafe defaults explicit development
    opt-ins or production failures in KMSD-002.
-8. `security-change`: make Vault unsafe defaults explicit development opt-ins
+7. `security-change`: make Vault unsafe defaults explicit development opt-ins
    or production failures in KMSD-003.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Only pure bucket/options DTOs moved into `rustfs-storage-api`; object, reader, compression, encryption, filemeta, multipart, storage, and runtime logic stayed in ECStore. |
-| Migration preservation | pass | Old `ecstore::store_api` import paths remain through `RUSTFS_COMPAT_TODO(API-003)` compatibility re-export, with cleanup registered. |
-| Testing/verification | pass | Focused DTO tests, ECStore compatibility test, migration guards, formatting, rio-v2 clippy, dependency review, diff checks, and pre-commit passed. |
-| Quality/architecture | pass | Single `docs-only` PR; ADR chooses existing rustfs-config, records module path and dependency boundaries, and avoids a speculative new crate. |
-| Migration preservation | pass | No code movement; ADR explicitly keeps persistence helpers, global server-config state, startup order, and old-path compatibility requirements out of CFG-002. |
-| Testing/verification | pass | Docs-only verification uses migration guard scripts, metrics reference guard, layer dependency guard, and whitespace checks. |
-| Quality/architecture | pass | Single `docs-only` PR; the inventory is isolated under `docs/architecture`, uses existing KMS source files as evidence, and introduces no new abstraction or dependency edge. |
-| Migration preservation | pass | No runtime code, config persistence, admin authorization, startup order, storage path, global state, or crate boundary changes are made. |
-| Testing/verification | pass | Docs-only verification is bounded to diff review, architecture migration rules, metrics reference guard, layer dependency guard, and whitespace checks. |
+| Quality/architecture | pass | Confirmed the diff stays limited to three read-side consumers and migration notes, with no manifest, ECStore, storage-api, RPC, heal, scanner, observability, or hot-path scope creep. |
+| Migration preservation | pass | Confirmed the new and old ECStore trait paths still delegate to the same backend/storage-info handlers, while account-info response construction, rebalance aggregation, and readiness cache/degraded-state logic remain unchanged. |
+| Testing/verification | pass | Confirmed touched-consumer focused tests, compile checks, migration guards, diff hygiene, and full pre-commit evidence are sufficient; no missing success-path integration test is a blocker for this call-path migration. |
 
 ## Verification Notes
 
 Passed:
-
-- `cargo test -p rustfs-storage-api`
-- `cargo test -p rustfs-ecstore --test storage_api_compat_test`
-- `cargo check -p rustfs-storage-api -p rustfs-ecstore`
-- `cargo check -p rustfs-ecstore --features rio-v2`
-- `cargo clippy -p rustfs-ecstore --features rio-v2 --all-targets -- -D warnings`
-- `cargo fmt --all`
-- `cargo fmt --all --check`
-- `cargo test -p rustfs-ecstore error -- --nocapture`
-- `./scripts/check_architecture_migration_rules.sh`
-- `./scripts/check_layer_dependencies.sh`
-- `./scripts/check_metrics_migration_refs.sh`
-- `./scripts/check_unsafe_code_allowances.sh`
-- `git diff --check`
-- `cargo tree -p rustfs-storage-api --edges normal`
-- `make NUM_CORES=1 pre-commit`
+- `cargo fmt --all --check`.
+- `cargo check -p rustfs --lib`.
+- `cargo test -p rustfs admin::handlers::account_info --lib`; 3 passed.
+- `cargo test -p rustfs admin::handlers::rebalance --lib`; 19 passed.
+- `cargo test -p rustfs server::readiness --lib`; 13 passed.
+- `cargo check -p rustfs-storage-api -p rustfs-ecstore -p rustfs --lib`.
+- `./scripts/check_architecture_migration_rules.sh`.
+- `./scripts/check_layer_dependencies.sh`.
+- `./scripts/check_metrics_migration_refs.sh`.
+- `./scripts/check_unsafe_code_allowances.sh`.
+- `git diff --check`.
+- `make NUM_CORES=1 pre-commit`.
 
 Notes:
-- Plain `make pre-commit` runs `fmt` and `unsafe-code-check` concurrently via
-  global Makefile parallelism; `unsafe-code-check` passes standalone, and the
-  full pre-commit target passed when run serially with `NUM_CORES=1`.
-- Full nextest in pre-commit: 5704 passed, 111 skipped.
-- Workspace doctests passed.
+- This branch relies on the existing direct `rustfs` dependency on
+  `rustfs-storage-api` from earlier API-007 slices.
+- No ECStore handler, old `StorageAPI` trait, RPC consumer, heal/scanner
+  consumer, observability consumer, or storage hot path is changed.
+- Full pre-commit passed with nextest `5757 passed, 111 skipped`; workspace
+  doctests passed.
+- No temporary compatibility shim was added.
 
 ## Handoff Notes
 
-- Keep this API-003 branch as a focused `api-extraction` PR for bucket/options
-  DTOs only.
-- Do not move `ObjectOptions`, `ObjectInfo`, `CompletePart`, reader types,
-  compression/encryption helpers, filemeta conversions, S3 DTO conversions, or
-  storage traits in this PR.
-- Keep the old `ecstore::store_api` compatibility re-export until all consumers
-  import bucket DTOs from `rustfs_storage_api`.
-- Do not add temporary compatibility code without a matching
-  `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.
-- KMS production default hardening remains a separate task group; do not bundle
-  it with this inventory PR.
-- The CFG-003 extraction PR must preserve the tuple-struct shape, serde fields,
-  `hiddenIfEmpty` alias, `Config::new` default behavior, marshal/unmarshal
-  behavior, and old `rustfs_ecstore::config::*` path.
-- Do not create a new config-model crate unless a later implementation attempt
-  proves `rustfs-config` cannot hold the pure model boundary.
+- Keep this API-007 slice as a grouped read-side `consumer-migration` PR.
+- Do not migrate RPC `local_storage_info`, heal, scanner, observability, or
+  storage hot-path consumers in this PR.
+- Do not remove or route around `StorageAPI::get_disks` in this PR.
+- Do not make the old `StorageAPI` trait inherit `StorageAdminApi` in this PR.
+- Do not add temporary compatibility code unless a matching
+  `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry are added.

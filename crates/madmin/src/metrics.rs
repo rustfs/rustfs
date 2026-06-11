@@ -203,6 +203,51 @@ impl ScannerPacingPressureSnapshot {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerLifecycleTransitionSnapshot {
+    #[serde(rename = "current_queue_capacity", default)]
+    pub current_queue_capacity: u64,
+    #[serde(rename = "current_queued", default)]
+    pub current_queued: u64,
+    #[serde(rename = "current_active", default)]
+    pub current_active: u64,
+    #[serde(rename = "current_workers", default)]
+    pub current_workers: u64,
+    #[serde(rename = "queue_full", default)]
+    pub queue_full: u64,
+    #[serde(rename = "queue_send_timeout", default)]
+    pub queue_send_timeout: u64,
+    #[serde(rename = "compensation_scheduled", default)]
+    pub compensation_scheduled: u64,
+    #[serde(rename = "compensation_running", default)]
+    pub compensation_running: u64,
+    #[serde(rename = "scanner_queued", default)]
+    pub scanner_queued: u64,
+    #[serde(rename = "scanner_missed", default)]
+    pub scanner_missed: u64,
+    #[serde(rename = "completed", default)]
+    pub completed: u64,
+    #[serde(rename = "failed", default)]
+    pub failed: u64,
+}
+
+impl ScannerLifecycleTransitionSnapshot {
+    fn merge(&mut self, other: &Self) {
+        self.current_queue_capacity = self.current_queue_capacity.saturating_add(other.current_queue_capacity);
+        self.current_queued = self.current_queued.saturating_add(other.current_queued);
+        self.current_active = self.current_active.saturating_add(other.current_active);
+        self.current_workers = self.current_workers.saturating_add(other.current_workers);
+        self.queue_full = self.queue_full.saturating_add(other.queue_full);
+        self.queue_send_timeout = self.queue_send_timeout.saturating_add(other.queue_send_timeout);
+        self.compensation_scheduled = self.compensation_scheduled.saturating_add(other.compensation_scheduled);
+        self.compensation_running = self.compensation_running.saturating_add(other.compensation_running);
+        self.scanner_queued = self.scanner_queued.saturating_add(other.scanner_queued);
+        self.scanner_missed = self.scanner_missed.saturating_add(other.scanner_missed);
+        self.completed = self.completed.saturating_add(other.completed);
+        self.failed = self.failed.saturating_add(other.failed);
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScannerMetrics {
     #[serde(rename = "collected")]
@@ -223,6 +268,14 @@ pub struct ScannerMetrics {
     pub last_minute: LastMinute,
     #[serde(rename = "active")]
     pub active_paths: Vec<String>,
+    #[serde(rename = "current_cycle_lifecycle_expiry_actions", default)]
+    pub current_cycle_lifecycle_expiry_actions: u64,
+    #[serde(rename = "current_cycle_lifecycle_transition_actions", default)]
+    pub current_cycle_lifecycle_transition_actions: u64,
+    #[serde(rename = "last_cycle_lifecycle_expiry_actions", default)]
+    pub last_cycle_lifecycle_expiry_actions: u64,
+    #[serde(rename = "last_cycle_lifecycle_transition_actions", default)]
+    pub last_cycle_lifecycle_transition_actions: u64,
     #[serde(rename = "last_cycle_partial_source", default)]
     pub last_cycle_partial_source: String,
     #[serde(rename = "last_cycle_partial_source_code", default)]
@@ -231,6 +284,8 @@ pub struct ScannerMetrics {
     pub partial_cycles_by_source: Vec<ScannerSourceCycleSnapshot>,
     #[serde(rename = "pacing_pressure", default)]
     pub pacing_pressure: ScannerPacingPressureSnapshot,
+    #[serde(rename = "lifecycle_transition", default)]
+    pub lifecycle_transition: ScannerLifecycleTransitionSnapshot,
 }
 
 impl ScannerMetrics {
@@ -243,6 +298,19 @@ impl ScannerMetrics {
         }
 
         self.pacing_pressure.merge(&other.pacing_pressure);
+        self.lifecycle_transition.merge(&other.lifecycle_transition);
+        self.current_cycle_lifecycle_expiry_actions = self
+            .current_cycle_lifecycle_expiry_actions
+            .saturating_add(other.current_cycle_lifecycle_expiry_actions);
+        self.current_cycle_lifecycle_transition_actions = self
+            .current_cycle_lifecycle_transition_actions
+            .saturating_add(other.current_cycle_lifecycle_transition_actions);
+        self.last_cycle_lifecycle_expiry_actions = self
+            .last_cycle_lifecycle_expiry_actions
+            .saturating_add(other.last_cycle_lifecycle_expiry_actions);
+        self.last_cycle_lifecycle_transition_actions = self
+            .last_cycle_lifecycle_transition_actions
+            .saturating_add(other.last_cycle_lifecycle_transition_actions);
 
         if self.ongoing_buckets < other.ongoing_buckets {
             self.ongoing_buckets = other.ongoing_buckets;
@@ -892,5 +960,72 @@ mod tests {
 
         assert_eq!(pacing_pressure.primary_pressure, "none");
         assert_eq!(pacing_pressure.current_active_scans, 1);
+    }
+
+    #[test]
+    fn scanner_metrics_merge_aggregates_lifecycle_transition_status() {
+        let collected_at = Utc::now();
+        let mut scanner = ScannerMetrics {
+            collected_at,
+            current_cycle_lifecycle_expiry_actions: 2,
+            current_cycle_lifecycle_transition_actions: 3,
+            last_cycle_lifecycle_expiry_actions: 5,
+            last_cycle_lifecycle_transition_actions: 7,
+            lifecycle_transition: ScannerLifecycleTransitionSnapshot {
+                current_queue_capacity: 8,
+                current_queued: 2,
+                current_active: 1,
+                current_workers: 2,
+                queue_full: 3,
+                queue_send_timeout: 1,
+                compensation_scheduled: 1,
+                compensation_running: 1,
+                scanner_queued: 5,
+                scanner_missed: 2,
+                completed: 7,
+                failed: 1,
+            },
+            ..Default::default()
+        };
+
+        scanner.merge(&ScannerMetrics {
+            collected_at: collected_at + chrono::Duration::seconds(1),
+            current_cycle_lifecycle_expiry_actions: 11,
+            current_cycle_lifecycle_transition_actions: 13,
+            last_cycle_lifecycle_expiry_actions: 17,
+            last_cycle_lifecycle_transition_actions: 19,
+            lifecycle_transition: ScannerLifecycleTransitionSnapshot {
+                current_queue_capacity: 4,
+                current_queued: 3,
+                current_active: 2,
+                current_workers: 1,
+                queue_full: 2,
+                queue_send_timeout: 3,
+                compensation_scheduled: 4,
+                compensation_running: 0,
+                scanner_queued: 6,
+                scanner_missed: 4,
+                completed: 8,
+                failed: 2,
+            },
+            ..Default::default()
+        });
+
+        assert_eq!(scanner.lifecycle_transition.current_queue_capacity, 12);
+        assert_eq!(scanner.lifecycle_transition.current_queued, 5);
+        assert_eq!(scanner.lifecycle_transition.current_active, 3);
+        assert_eq!(scanner.lifecycle_transition.current_workers, 3);
+        assert_eq!(scanner.lifecycle_transition.queue_full, 5);
+        assert_eq!(scanner.lifecycle_transition.queue_send_timeout, 4);
+        assert_eq!(scanner.lifecycle_transition.compensation_scheduled, 5);
+        assert_eq!(scanner.lifecycle_transition.compensation_running, 1);
+        assert_eq!(scanner.lifecycle_transition.scanner_queued, 11);
+        assert_eq!(scanner.lifecycle_transition.scanner_missed, 6);
+        assert_eq!(scanner.lifecycle_transition.completed, 15);
+        assert_eq!(scanner.lifecycle_transition.failed, 3);
+        assert_eq!(scanner.current_cycle_lifecycle_expiry_actions, 13);
+        assert_eq!(scanner.current_cycle_lifecycle_transition_actions, 16);
+        assert_eq!(scanner.last_cycle_lifecycle_expiry_actions, 22);
+        assert_eq!(scanner.last_cycle_lifecycle_transition_actions, 26);
     }
 }
