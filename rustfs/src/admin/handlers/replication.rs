@@ -318,11 +318,9 @@ pub struct ListRemoteTargetHandler {}
 #[async_trait::async_trait]
 impl Operation for ListRemoteTargetHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        validate_replication_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
+
         let queries = extract_query_params(&req.uri);
-        let Some(_cred) = req.credentials else {
-            error!("credentials null");
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
-        };
 
         if let Some(bucket) = queries.get("bucket") {
             if bucket.is_empty() {
