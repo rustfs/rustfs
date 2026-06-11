@@ -163,7 +163,7 @@ services:
       - observability
 
   tempo:
-    image: grafana/tempo:latest
+    image: grafana/tempo:2.10.5
     user: "10001"
     command: [ "-config.file=/etc/tempo.yaml" ]
     volumes:
