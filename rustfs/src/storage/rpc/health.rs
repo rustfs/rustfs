@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::storage::rpc::encode_msgpack_map;
+use rustfs_storage_api::StorageAdminApi;
 
 impl NodeService {
     pub(super) async fn handle_get_proc_info(
@@ -221,7 +222,7 @@ impl NodeService {
             }));
         };
 
-        let info = store.local_storage_info().await;
+        let info = StorageAdminApi::local_storage_info(store.as_ref()).await;
         match encode_msgpack_map(&info) {
             Ok(buf) => Ok(Response::new(LocalStorageInfoResponse {
                 success: true,

@@ -37,7 +37,7 @@ use rustfs_ecstore::{
         SERVICE_SIGNAL_RELOAD_DYNAMIC,
     },
     store::{all_local_disk_path, find_local_disk_by_ref},
-    store_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions, StorageAPI},
+    store_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions},
 };
 use rustfs_filemeta::{FileInfo, MetacacheReader};
 use rustfs_iam::{get_global_iam_sys, store::UserType};
