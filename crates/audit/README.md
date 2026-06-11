@@ -33,7 +33,7 @@ rustfs-audit = "0.1"
 
 ```rust
 use rustfs_audit::{start_audit_system, AuditLogger};
-use rustfs_ecstore::config::Config;
+use rustfs_config::server_config::Config;
 
 #[tokio::main]
 async fn main() {

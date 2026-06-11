@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::{KVS, storageclass};
+use crate::config::storageclass;
 use crate::disk::error_reduce::{count_errs, reduce_write_quorum_errs};
 use crate::disk::{self, DiskAPI};
 use crate::error::{Error, Result};
@@ -26,6 +26,7 @@ use crate::{
     endpoints::Endpoints,
 };
 use futures::future::join_all;
+use rustfs_config::server_config::KVS;
 use std::collections::{HashMap, hash_map::Entry};
 use tracing::{debug, info, warn};
 use uuid::Uuid;

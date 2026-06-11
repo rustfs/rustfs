@@ -18,8 +18,9 @@
 
 use crate::config::{RustFSBufferConfig, get_global_buffer_config};
 use async_trait::async_trait;
+use rustfs_config::server_config::Config;
 use rustfs_ecstore::bucket::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
-use rustfs_ecstore::config::{Config, get_global_server_config};
+use rustfs_ecstore::config::get_global_server_config;
 use rustfs_ecstore::endpoints::EndpointServerPools;
 use rustfs_ecstore::global::{get_global_endpoints_opt, get_global_region, get_global_tier_config_mgr};
 use rustfs_ecstore::store::ECStore;

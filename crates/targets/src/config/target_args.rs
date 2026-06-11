@@ -27,6 +27,7 @@ use crate::target::{
     webhook::WebhookArgs,
 };
 use rumqttc::QoS;
+use rustfs_config::server_config::KVS;
 use rustfs_config::{
     AMQP_EXCHANGE, AMQP_MANDATORY, AMQP_PASSWORD, AMQP_PERSISTENT, AMQP_QUEUE_DIR, AMQP_QUEUE_LIMIT, AMQP_ROUTING_KEY,
     AMQP_TLS_CA, AMQP_TLS_CLIENT_CERT, AMQP_TLS_CLIENT_KEY, AMQP_URL, AMQP_USERNAME, DEFAULT_LIMIT, KAFKA_ACKS, KAFKA_BROKERS,
@@ -47,7 +48,6 @@ use rustfs_config::{
     REDIS_USERNAME, RUSTFS_WEBHOOK_SKIP_TLS_VERIFY_DEFAULT, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT,
     WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT, WEBHOOK_SKIP_TLS_VERIFY,
 };
-use rustfs_ecstore::config::KVS;
 use std::path::Path;
 use std::time::Duration;
 
@@ -602,6 +602,7 @@ mod tests {
         kafka::{KAFKA_SASL_PLAIN, KAFKA_SASL_SCRAM_SHA_512},
         postgres::PostgresFormat,
     };
+    use rustfs_config::server_config::KVS;
     use rustfs_config::{
         AMQP_EXCHANGE, AMQP_MANDATORY, AMQP_PASSWORD, AMQP_PERSISTENT, AMQP_QUEUE_DIR, AMQP_ROUTING_KEY, AMQP_TLS_CLIENT_CERT,
         AMQP_TLS_CLIENT_KEY, AMQP_URL, AMQP_USERNAME, KAFKA_ACKS, KAFKA_BROKERS, KAFKA_SASL_ENABLE, KAFKA_SASL_MECHANISM,
@@ -611,7 +612,6 @@ mod tests {
         REDIS_CHANNEL, REDIS_CONNECTION_TIMEOUT, REDIS_MAX_RETRY_DELAY, REDIS_MIN_RETRY_DELAY, REDIS_PIPELINE_BUFFER_SIZE,
         REDIS_RECONNECT_RETRY_ATTEMPTS, REDIS_RESPONSE_TIMEOUT, REDIS_TLS_ALLOW_INSECURE, REDIS_URL,
     };
-    use rustfs_ecstore::config::KVS;
 
     fn absolute_test_path(path: &str) -> String {
         std::env::temp_dir().join(path).to_string_lossy().into_owned()

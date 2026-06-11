@@ -18,7 +18,7 @@ use crate::{
     manifest::{TargetPluginManifest, builtin_target_manifest},
 };
 use hashbrown::HashMap;
-use rustfs_ecstore::config::{Config, KVS};
+use rustfs_config::server_config::{Config, KVS};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::HashSet;
@@ -349,7 +349,7 @@ mod tests {
     use crate::{StoreError, Target, TargetError};
     use async_trait::async_trait;
     use rustfs_config::ENABLE_KEY;
-    use rustfs_ecstore::config::{Config, KVS};
+    use rustfs_config::server_config::{Config, KVS};
     use serde::{Serialize, de::DeserializeOwned};
     use std::collections::HashMap;
     use std::sync::Arc;

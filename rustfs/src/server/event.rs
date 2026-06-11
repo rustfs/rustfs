@@ -24,7 +24,7 @@ use tracing::{error, info, instrument, warn};
 
 static NOTIFY_MODULE_ENABLED: AtomicBool = AtomicBool::new(rustfs_config::DEFAULT_NOTIFY_ENABLE);
 
-fn server_config_from_context() -> Option<rustfs_ecstore::config::Config> {
+fn server_config_from_context() -> Option<rustfs_config::server_config::Config> {
     resolve_server_config()
 }
 

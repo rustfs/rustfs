@@ -16,12 +16,12 @@ use futures::StreamExt;
 use futures::future::BoxFuture;
 use hashbrown::HashSet as HbHashSet;
 use http::{HeaderMap, HeaderValue, StatusCode};
+use rustfs_config::server_config::{Config, KVS};
 use rustfs_config::{
     AMQP_QUEUE_DIR, ENABLE_KEY, EnableState, KAFKA_BROKERS, KAFKA_QUEUE_DIR, KAFKA_TOPIC, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS,
     MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC,
     MQTT_USERNAME, MQTT_WS_PATH_ALLOWLIST, MYSQL_QUEUE_DIR, POSTGRES_QUEUE_DIR, REDIS_QUEUE_DIR,
 };
-use rustfs_ecstore::config::{Config, KVS};
 use rustfs_targets::SharedTarget;
 use rustfs_targets::{
     BuiltinTargetAdminDescriptor, TargetAdminMetadata, TargetDomain, TargetError, TargetRequestValidator,
@@ -904,8 +904,8 @@ async fn validate_redis_request(
     })
 }
 
-fn to_kvs(kv_map: &HashMap<String, String>) -> rustfs_ecstore::config::KVS {
-    let mut kvs = rustfs_ecstore::config::KVS::new();
+fn to_kvs(kv_map: &HashMap<String, String>) -> rustfs_config::server_config::KVS {
+    let mut kvs = rustfs_config::server_config::KVS::new();
     for (key, value) in kv_map {
         kvs.insert(key.clone(), value.clone());
     }

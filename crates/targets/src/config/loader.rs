@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use super::common::{is_target_enabled, split_env_field_and_instance};
+use rustfs_config::server_config::{Config, KVS};
 use rustfs_config::{DEFAULT_DELIMITER, ENV_PREFIX};
-use rustfs_ecstore::config::{Config, KVS};
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, warn};
 
@@ -244,10 +244,10 @@ mod tests {
         ENV_NOTIFY_REDIS_ENABLE, ENV_NOTIFY_REDIS_RECONNECT_RETRY_ATTEMPTS, ENV_NOTIFY_REDIS_TLS_ALLOW_INSECURE,
         ENV_NOTIFY_REDIS_URL, NOTIFY_REDIS_KEYS, NOTIFY_ROUTE_PREFIX,
     };
+    use rustfs_config::server_config::{Config, KVS};
     use rustfs_config::{
         ENABLE_KEY, REDIS_RECONNECT_RETRY_ATTEMPTS, REDIS_TLS_ALLOW_INSECURE, REDIS_URL, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_LIMIT,
     };
-    use rustfs_ecstore::config::{Config, KVS};
     use std::collections::{HashMap, HashSet};
 
     #[test]
