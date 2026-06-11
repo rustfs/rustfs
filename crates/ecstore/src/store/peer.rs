@@ -14,6 +14,12 @@
 
 use super::*;
 use crate::global::GLOBAL_LOCAL_DISK_ID_MAP;
+use tracing::{debug, error};
+
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_DISK_STARTUP: &str = "disk_startup";
+const EVENT_LOCAL_DISK_ID_PREWARM_SKIPPED: &str = "local_disk_id_prewarm_skipped";
+const EVENT_LOCK_CLIENT_INITIALIZATION_FAILED: &str = "lock_client_initialization_failed";
 
 async fn remember_local_disk_id(disk: &DiskStore) -> Option<Uuid> {
     let disk_id = disk.get_disk_id().await.ok().flatten()?;
@@ -94,7 +100,14 @@ pub async fn all_local_disk() -> Vec<DiskStore> {
 pub async fn prewarm_local_disk_id_map() {
     for disk in all_local_disk().await {
         if let Err(err) = disk.get_disk_id().await {
-            warn!("prewarm_local_disk_id_map: failed to load disk id for {}: {}", disk.endpoint(), err);
+            debug!(
+                event = EVENT_LOCAL_DISK_ID_PREWARM_SKIPPED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_STARTUP,
+                disk_endpoint = %disk.endpoint(),
+                error = %err,
+                "Skipped local disk id prewarm"
+            );
             continue;
         }
 
@@ -159,7 +172,14 @@ pub fn init_lock_clients(endpoint_pools: EndpointServerPools) {
             if !first_local_client_set {
                 if let Err(e) = crate::global::set_global_lock_client(local_client.clone()) {
                     // If already set, ignore the error (another thread may have set it)
-                    warn!("set_global_lock_client error: {:?}", e);
+                    debug!(
+                        event = EVENT_LOCK_CLIENT_INITIALIZATION_FAILED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_STARTUP,
+                        error = ?e,
+                        reason = "global_lock_client_already_set",
+                        "Skipped global lock client publication"
+                    );
                 } else {
                     first_local_client_set = true;
                 }
@@ -173,7 +193,13 @@ pub fn init_lock_clients(endpoint_pools: EndpointServerPools) {
 
     // Store the lock clients map globally
     if crate::global::set_global_lock_clients(clients).is_err() {
-        error!("init_lock_clients: error setting lock clients");
+        error!(
+            event = EVENT_LOCK_CLIENT_INITIALIZATION_FAILED,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_DISK_STARTUP,
+            reason = "set_global_lock_clients_failed",
+            "Failed to initialize lock clients"
+        );
     }
 }
 

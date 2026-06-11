@@ -26,6 +26,11 @@ architecture-migration-check: ## Check architecture migration guardrails
 	@echo "🏗️ Checking architecture migration guardrails..."
 	./scripts/check_architecture_migration_rules.sh
 
+.PHONY: logging-guardrails-check
+logging-guardrails-check: ## Check logging guardrails for redaction and noise regressions
+	@echo "🪵 Checking logging guardrails..."
+	./scripts/check_logging_guardrails.sh
+
 .PHONY: compilation-check
 compilation-check: core-deps ## Run compilation check
 	@echo "🔨 Running compilation check..."

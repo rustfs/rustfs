@@ -1230,10 +1230,20 @@ where
                     return;
                 }
             }
-            Err(err) => warn!("legacy tier config is incompatible, skip local migration: {}", err),
+            Err(err) => debug!(
+                bucket = RUSTFS_META_BUCKET,
+                path = %legacy_path,
+                error = %err,
+                "Skipping incompatible legacy tier config migration"
+            ),
         },
         Ok(None) => {}
-        Err(err) => warn!("read legacy local tier config failed: {}", err),
+        Err(err) => debug!(
+            bucket = RUSTFS_META_BUCKET,
+            path = %legacy_path,
+            error = %err,
+            "Skipping legacy tier config migration after read failure"
+        ),
     }
 
     match read_tier_config_from_bucket(api.clone(), MIGRATING_META_BUCKET, &target_path, &opts).await {
@@ -1243,10 +1253,20 @@ where
                     info!("Migrated compatible tier config from migrating metadata bucket");
                 }
             }
-            Err(err) => warn!("migrating tier config is incompatible, skip migration: {}", err),
+            Err(err) => debug!(
+                bucket = MIGRATING_META_BUCKET,
+                path = %target_path,
+                error = %err,
+                "Skipping incompatible migrating tier config"
+            ),
         },
         Ok(None) => {}
-        Err(err) => warn!("read migrating tier config failed: {}", err),
+        Err(err) => debug!(
+            bucket = MIGRATING_META_BUCKET,
+            path = %target_path,
+            error = %err,
+            "Skipping migrating tier config after read failure"
+        ),
     }
 }
 

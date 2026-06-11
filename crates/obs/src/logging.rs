@@ -179,4 +179,43 @@ mod tests {
             &["Protocol storage client ListBuckets request: access_key={}"],
         );
     }
+
+    #[test]
+    fn startup_runtime_logging_does_not_dump_full_config_debug_output() {
+        let path = workspace_root().join("rustfs/src/main.rs");
+        let source = fs::read_to_string(&path).unwrap_or_else(|err| panic!("failed to read {}: {}", path.display(), err));
+        assert!(
+            !source.contains("debug!(\"config: {:?}\", &config)"),
+            "found forbidden full config debug output in {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn audit_notify_runtime_logging_does_not_use_previous_sentence_first_noise_patterns() {
+        assert_no_unmasked_access_key_logging(
+            "crates/audit/src/pipeline.rs",
+            &[
+                "No audit targets configured for dispatch",
+                "No audit targets configured for batch dispatch",
+                "Successfully sent audit entry, target: {}, key: {}",
+                "Target {} not connected, retrying...",
+                "Timeout sending to target {}, retrying...",
+            ],
+        );
+        assert_no_unmasked_access_key_logging(
+            "crates/notify/src/runtime_facade.rs",
+            &[
+                "Event stream processing for target {} is started successfully",
+                "Target {} has no replay worker to start",
+            ],
+        );
+        assert_no_unmasked_access_key_logging(
+            "crates/notify/src/notifier.rs",
+            &[
+                "Sending event to targets: {:?}",
+                "Event processing initiated for {} targets for bucket: {}",
+            ],
+        );
+    }
 }
