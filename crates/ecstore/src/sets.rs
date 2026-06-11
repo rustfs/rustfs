@@ -901,28 +901,6 @@ impl StorageAPI for Sets {
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         self.disk_set[0].new_ns_lock(bucket, object).await
     }
-    #[tracing::instrument(skip(self))]
-    async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
-        unimplemented!()
-    }
-    #[tracing::instrument(skip(self))]
-    async fn storage_info(&self) -> rustfs_madmin::StorageInfo {
-        self.storage_info_snapshot().await
-    }
-    #[tracing::instrument(skip(self))]
-    async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
-        self.local_storage_info_snapshot().await
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn get_disks(&self, _pool_idx: usize, _set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
-        unimplemented!()
-    }
-
-    #[tracing::instrument(skip(self))]
-    fn set_drive_counts(&self) -> Vec<usize> {
-        unimplemented!()
-    }
 }
 
 async fn _close_storage_disks(disks: &[Option<DiskStore>]) {
