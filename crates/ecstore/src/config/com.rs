@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::{Config, KVS, audit, notify, oidc, set_global_storage_class, storageclass};
+use crate::config::{audit, notify, oidc, set_global_storage_class, storageclass};
 use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::global::is_first_cluster_node_local;
@@ -30,6 +30,7 @@ use rustfs_config::notify::{
     NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::oidc::{IDENTITY_OPENID_KEYS, IDENTITY_OPENID_SUB_SYS, OIDC_REDIRECT_URI_DYNAMIC};
+use rustfs_config::server_config::{Config, KVS};
 use rustfs_config::{COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, RUSTFS_REGION};
 use rustfs_storage_api::StorageAdminApi;
 use rustfs_utils::path::SLASH_SEPARATOR;
@@ -293,7 +294,7 @@ fn get_config_file() -> String {
     format!("{CONFIG_PREFIX}{SLASH_SEPARATOR}{CONFIG_FILE}")
 }
 
-fn storage_class_kvs_mut(cfg: &mut Config) -> &mut crate::config::KVS {
+fn storage_class_kvs_mut(cfg: &mut Config) -> &mut KVS {
     let sub_cfg = cfg.0.entry(STORAGE_CLASS_SUB_SYS.to_string()).or_insert_with(|| {
         let mut section = HashMap::new();
         section.insert(DEFAULT_DELIMITER.to_string(), storageclass::DEFAULT_KVS.clone());
@@ -1210,7 +1211,7 @@ mod tests {
         configs_semantically_equal, decode_server_config_blob, encode_server_config_blob, is_standard_object_server_config,
         read_config_with_metadata, storage_class_kvs_mut,
     };
-    use crate::config::{Config, audit, notify, oidc};
+    use crate::config::{audit, notify, oidc};
     use crate::disk::endpoint::Endpoint;
     use crate::endpoints::SetupType;
     use crate::error::{Error, Result};
@@ -1228,6 +1229,7 @@ mod tests {
         NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
     };
     use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
+    use rustfs_config::server_config::{Config, KV, KVS};
     use rustfs_config::{
         DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MYSQL_DSN_STRING, MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_TABLE,
     };
@@ -2152,18 +2154,18 @@ mod tests {
         webhook_section.insert(DEFAULT_DELIMITER.to_string(), notify::DEFAULT_NOTIFY_WEBHOOK_KVS.clone());
         webhook_section.insert(
             "primary".to_string(),
-            crate::config::KVS(vec![
-                crate::config::KV {
+            KVS(vec![
+                KV {
                     key: ENABLE_KEY.to_string(),
                     value: EnableState::On.to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::WEBHOOK_ENDPOINT.to_string(),
                     value: "https://example.com/hook".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::WEBHOOK_QUEUE_DIR.to_string(),
                     value: "/tmp/webhook-queue".to_string(),
                     hidden_if_empty: false,
@@ -2179,18 +2181,18 @@ mod tests {
         mqtt_section.insert(DEFAULT_DELIMITER.to_string(), mqtt_default);
         mqtt_section.insert(
             "analytics".to_string(),
-            crate::config::KVS(vec![
-                crate::config::KV {
+            KVS(vec![
+                KV {
                     key: ENABLE_KEY.to_string(),
                     value: EnableState::On.to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::MQTT_BROKER.to_string(),
                     value: "tcp://127.0.0.1:1883".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::MQTT_QUEUE_DIR.to_string(),
                     value: "".to_string(),
                     hidden_if_empty: false,
@@ -2206,23 +2208,23 @@ mod tests {
         kafka_section.insert(DEFAULT_DELIMITER.to_string(), kafka_default);
         kafka_section.insert(
             "streaming".to_string(),
-            crate::config::KVS(vec![
-                crate::config::KV {
+            KVS(vec![
+                KV {
                     key: ENABLE_KEY.to_string(),
                     value: EnableState::On.to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::KAFKA_BROKERS.to_string(),
                     value: "127.0.0.1:9092,127.0.0.1:9093".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::KAFKA_ACKS.to_string(),
                     value: "all".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::KAFKA_TLS_ENABLE.to_string(),
                     value: EnableState::On.to_string(),
                     hidden_if_empty: false,
@@ -2234,33 +2236,33 @@ mod tests {
         let mut amqp_section = std::collections::HashMap::new();
         amqp_section.insert(
             "primary".to_string(),
-            crate::config::KVS(vec![
-                crate::config::KV {
+            KVS(vec![
+                KV {
                     key: ENABLE_KEY.to_string(),
                     value: EnableState::On.to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::AMQP_URL.to_string(),
                     value: "amqp://127.0.0.1:5672/%2f".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::AMQP_EXCHANGE.to_string(),
                     value: "rustfs.events".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::AMQP_ROUTING_KEY.to_string(),
                     value: "objects".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::AMQP_MANDATORY.to_string(),
                     value: "false".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::AMQP_PERSISTENT.to_string(),
                     value: "false".to_string(),
                     hidden_if_empty: false,
@@ -2341,18 +2343,18 @@ mod tests {
         webhook_section.insert(DEFAULT_DELIMITER.to_string(), audit::DEFAULT_AUDIT_WEBHOOK_KVS.clone());
         webhook_section.insert(
             "primary".to_string(),
-            crate::config::KVS(vec![
-                crate::config::KV {
+            KVS(vec![
+                KV {
                     key: ENABLE_KEY.to_string(),
                     value: EnableState::On.to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::WEBHOOK_ENDPOINT.to_string(),
                     value: "https://example.com/audit-hook".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::WEBHOOK_QUEUE_DIR.to_string(),
                     value: "/tmp/audit-queue".to_string(),
                     hidden_if_empty: false,
@@ -2364,33 +2366,33 @@ mod tests {
         let mut amqp_section = std::collections::HashMap::new();
         amqp_section.insert(
             "primary".to_string(),
-            crate::config::KVS(vec![
-                crate::config::KV {
+            KVS(vec![
+                KV {
                     key: ENABLE_KEY.to_string(),
                     value: EnableState::On.to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::AMQP_URL.to_string(),
                     value: "amqp://127.0.0.1:5672/%2f".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::AMQP_EXCHANGE.to_string(),
                     value: "rustfs.audit".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::AMQP_ROUTING_KEY.to_string(),
                     value: "audit".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::AMQP_MANDATORY.to_string(),
                     value: "false".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::AMQP_PERSISTENT.to_string(),
                     value: "false".to_string(),
                     hidden_if_empty: false,
@@ -2406,13 +2408,13 @@ mod tests {
         mqtt_section.insert(DEFAULT_DELIMITER.to_string(), mqtt_default);
         mqtt_section.insert(
             "analytics".to_string(),
-            crate::config::KVS(vec![
-                crate::config::KV {
+            KVS(vec![
+                KV {
                     key: ENABLE_KEY.to_string(),
                     value: EnableState::On.to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::MQTT_BROKER.to_string(),
                     value: "tcp://127.0.0.1:1883".to_string(),
                     hidden_if_empty: false,
@@ -2428,13 +2430,13 @@ mod tests {
         kafka_section.insert(DEFAULT_DELIMITER.to_string(), kafka_default);
         kafka_section.insert(
             "auditlog".to_string(),
-            crate::config::KVS(vec![
-                crate::config::KV {
+            KVS(vec![
+                KV {
                     key: ENABLE_KEY.to_string(),
                     value: EnableState::On.to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::KAFKA_BROKERS.to_string(),
                     value: "127.0.0.1:9092".to_string(),
                     hidden_if_empty: false,

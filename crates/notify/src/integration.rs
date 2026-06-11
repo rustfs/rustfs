@@ -22,7 +22,7 @@ use crate::{
 use hashbrown::HashMap;
 use metrics::{counter, gauge};
 use rustfs_config::notify::{DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY};
-use rustfs_ecstore::config::{Config, KVS};
+use rustfs_config::server_config::{Config, KVS};
 use rustfs_s3_types::EventName;
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::{ReplayWorkerManager, RuntimeTargetHealthSnapshot, SharedTarget};

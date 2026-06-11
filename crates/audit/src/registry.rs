@@ -14,7 +14,7 @@
 
 use crate::{AuditEntry, AuditError, AuditResult, factory::builtin_target_plugins};
 use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
-use rustfs_ecstore::config::{Config, KVS};
+use rustfs_config::server_config::{Config, KVS};
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::{SharedTarget, Target, TargetError, TargetPluginRegistry, TargetRuntimeManager};
 use tracing::info;

@@ -16,7 +16,7 @@ use crate::{
     AuditEntry, AuditError, AuditRegistry, AuditResult, observability,
     pipeline::{AuditPipeline, AuditRuntimeFacade, AuditRuntimeView},
 };
-use rustfs_ecstore::config::Config;
+use rustfs_config::server_config::Config;
 use rustfs_targets::{ReplayWorkerManager, Target};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -537,7 +537,7 @@ mod tests {
         }
 
         system
-            .reload_config(rustfs_ecstore::config::Config(HashMap::new()))
+            .reload_config(rustfs_config::server_config::Config(HashMap::new()))
             .await
             .expect("reload with empty config should succeed");
 
@@ -545,6 +545,6 @@ mod tests {
         assert!(system.list_targets().await.is_empty());
         assert_eq!(system.runtime_status_snapshot().await, ReplayWorkerManager::new().snapshot(0));
         assert_eq!(close_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(*system.config.read().await, Some(rustfs_ecstore::config::Config(HashMap::new())));
+        assert_eq!(*system.config.read().await, Some(rustfs_config::server_config::Config(HashMap::new())));
     }
 }

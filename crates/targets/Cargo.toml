@@ -12,7 +12,7 @@ categories = ["web-programming", "development-tools", "filesystem"]
 documentation = "https://docs.rs/rustfs-targets/latest/rustfs_targets/"
 
 [dependencies]
-rustfs-config = { workspace = true, features = ["notify", "constants", "audit"] }
+rustfs-config = { workspace = true, features = ["notify", "constants", "audit", "server-config-model"] }
 rustfs-ecstore = { workspace = true }
 rustfs-tls-runtime = { workspace = true }
 rustfs-s3-types = { workspace = true }

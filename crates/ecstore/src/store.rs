@@ -77,6 +77,7 @@ use lazy_static::lazy_static;
 use rand::RngExt as _;
 use rustfs_common::heal_channel::{HealItemType, HealOpts};
 use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, GLOBAL_RUSTFS_HOST, GLOBAL_RUSTFS_PORT};
+use rustfs_config::server_config::Config;
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::{LocalClient, LockClient, NamespaceLockWrapper};
 use rustfs_madmin::heal_commands::HealResultItem;
@@ -214,12 +215,12 @@ impl std::fmt::Debug for ECStore {
 /// remain the single source of truth until the migration is complete.
 impl ECStore {
     /// Get server configuration (delegates to global)
-    pub fn get_server_config(&self) -> Option<crate::config::Config> {
+    pub fn get_server_config(&self) -> Option<Config> {
         crate::config::get_global_server_config()
     }
 
     /// Set server configuration (delegates to global)
-    pub fn set_server_config(&self, cfg: crate::config::Config) {
+    pub fn set_server_config(&self, cfg: Config) {
         crate::config::set_global_server_config(cfg);
     }
 
@@ -264,7 +265,7 @@ impl ECStore {
     }
 
     /// Get the server configuration
-    pub fn server_config(&self) -> Option<crate::config::Config> {
+    pub fn server_config(&self) -> Option<Config> {
         get_global_server_config()
     }
 

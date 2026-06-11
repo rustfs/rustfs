@@ -13,7 +13,7 @@
 //  limitations under the License.
 
 use rustfs_audit::*;
-use rustfs_ecstore::config::{Config, KVS};
+use rustfs_config::server_config::{Config, KVS};
 use std::collections::HashMap;
 use temp_env::with_vars;
 

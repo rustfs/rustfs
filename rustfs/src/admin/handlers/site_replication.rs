@@ -691,7 +691,7 @@ fn config_enabled(value: Option<String>) -> bool {
     matches!(value.as_deref(), Some("on" | "true" | "enabled"))
 }
 
-fn ldap_settings_from_kvs(kvs: &rustfs_ecstore::config::KVS) -> (LDAPSettings, LDAPConfigSettings) {
+fn ldap_settings_from_kvs(kvs: &rustfs_config::server_config::KVS) -> (LDAPSettings, LDAPConfigSettings) {
     let enabled = config_enabled(kvs.lookup("enable"));
     let settings = LDAPSettings {
         is_ldap_enabled: enabled,
@@ -4508,28 +4508,28 @@ mod tests {
 
     #[test]
     fn test_ldap_settings_from_kvs_reads_minio_style_keys() {
-        let kvs = rustfs_ecstore::config::KVS(vec![
-            rustfs_ecstore::config::KV {
+        let kvs = rustfs_config::server_config::KVS(vec![
+            rustfs_config::server_config::KV {
                 key: "enable".to_string(),
                 value: "on".to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: "user_dn_search_base_dn".to_string(),
                 value: "ou=people,dc=example,dc=com".to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: "user_dn_search_filter".to_string(),
                 value: "(uid=%s)".to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: "group_search_base_dn".to_string(),
                 value: "ou=groups,dc=example,dc=com".to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: "group_search_filter".to_string(),
                 value: "(&(objectclass=groupOfNames)(member=%s))".to_string(),
                 hidden_if_empty: false,

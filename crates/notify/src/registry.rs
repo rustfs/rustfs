@@ -15,7 +15,7 @@
 use crate::Event;
 use crate::factory::builtin_target_plugins;
 use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
-use rustfs_ecstore::config::{Config, KVS};
+use rustfs_config::server_config::{Config, KVS};
 use rustfs_targets::{Target, TargetError, TargetPluginRegistry};
 
 /// Registry for managing target factories
