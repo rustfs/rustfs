@@ -1,8 +1,5 @@
 use super::*;
 
-// RUSTFS_COMPAT_TODO(API-003): keep old ecstore::store_api bucket DTO import paths while storage API consumers migrate. Remove after all consumers import these DTOs from rustfs_storage_api.
-pub use rustfs_storage_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};
-
 #[derive(Debug, Default, Clone)]
 pub struct HTTPPreconditions {
     pub if_match: Option<String>,

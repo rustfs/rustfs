@@ -24,10 +24,7 @@ use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_BUCKET_METADATA_IMPORT_SIZE;
-use rustfs_ecstore::{
-    bucket::utils::{deserialize, serialize},
-    store_api::MakeBucketOptions,
-};
+use rustfs_ecstore::bucket::utils::{deserialize, serialize};
 use rustfs_ecstore::{
     bucket::{
         metadata::{
@@ -41,12 +38,13 @@ use rustfs_ecstore::{
     },
     error::StorageError,
     new_object_layer_fn,
-    store_api::{BucketOperations, BucketOptions},
+    store_api::BucketOperations,
 };
 use rustfs_policy::policy::{
     BucketPolicy,
     action::{Action, AdminAction},
 };
+use rustfs_storage_api::{BucketOptions, MakeBucketOptions};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::{
     Body, S3Request, S3Response, S3Result,
