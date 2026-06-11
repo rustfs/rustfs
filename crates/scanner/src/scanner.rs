@@ -37,7 +37,6 @@ use rustfs_config::{
     ENV_SCANNER_CYCLE_MAX_OBJECTS,
 };
 use rustfs_config::{ENV_SCANNER_CYCLE, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS};
-use rustfs_ecstore::StorageAPI as _;
 use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle as _;
 use rustfs_ecstore::bucket::metadata_sys::{get_lifecycle_config, get_replication_config};
 use rustfs_ecstore::bucket::replication::ReplicationConfigurationExt as _;
@@ -46,7 +45,7 @@ use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 use rustfs_ecstore::error::Error as EcstoreError;
 use rustfs_ecstore::global::is_erasure_sd;
 use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::BucketOperations;
+use rustfs_ecstore::store_api::{BucketOperations, NamespaceLocking as _};
 use rustfs_storage_api::BucketOptions;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;

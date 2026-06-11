@@ -24,7 +24,7 @@ use crate::global::get_global_endpoints;
 use crate::pools::ListCallback;
 use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
 use crate::store::ECStore;
-use crate::store_api::{GetObjectReader, HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions};
+use crate::store_api::{GetObjectReader, HTTPRangeSpec, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions};
 use http::HeaderMap;
 use rand::RngExt as _;
 use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
@@ -651,7 +651,7 @@ impl RebalanceMeta {
 }
 
 impl ECStore {
-    async fn save_rebalance_meta_with_merge<S: StorageAPI>(
+    async fn save_rebalance_meta_with_merge<S: StorageAPI + NamespaceLocking>(
         &self,
         pool: Arc<S>,
         local_snapshot: &RebalanceMeta,

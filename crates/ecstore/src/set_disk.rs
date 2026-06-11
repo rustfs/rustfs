@@ -54,7 +54,8 @@ use crate::{
     store_api::{
         BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
         HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectsV2Info, ListOperations, MakeBucketOptions, MultipartInfo,
-        MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOperations, PartInfo, PutObjReader, StorageAPI,
+        MultipartOperations, MultipartUploadResult, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, PartInfo,
+        PutObjReader, StorageAPI,
     },
     store_init::load_format_erasure,
 };
@@ -1586,7 +1587,10 @@ impl SetDisks {
 }
 
 #[async_trait::async_trait]
-impl StorageAPI for SetDisks {
+impl StorageAPI for SetDisks {}
+
+#[async_trait::async_trait]
+impl NamespaceLocking for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         let set_lock = if is_dist_erasure().await {

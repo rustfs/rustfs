@@ -32,7 +32,9 @@ use crate::event_notification::{EventArgs, send_event};
 use crate::global::GLOBAL_LocalNodeName;
 use crate::global::get_global_bucket_monitor;
 use crate::set_disk::get_lock_acquire_timeout;
-use crate::store_api::{DeletedObject, HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOptions, ObjectToDelete, WalkOptions};
+use crate::store_api::{
+    DeletedObject, HTTPRangeSpec, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOptions, ObjectToDelete, WalkOptions,
+};
 use crate::{StorageAPI, new_object_layer_fn};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
@@ -700,7 +702,7 @@ impl ReplicationResyncer {
     }
 
     #[instrument(skip(cancellation_token, storage))]
-    pub async fn resync_bucket<S: StorageAPI>(
+    pub async fn resync_bucket<S: StorageAPI + NamespaceLocking>(
         self: Arc<Self>,
         cancellation_token: CancellationToken,
         storage: Arc<S>,
@@ -1668,7 +1670,7 @@ pub async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOpti
     dsc
 }
 
-pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo, storage: Arc<S>) {
+pub async fn replicate_delete<S: StorageAPI + NamespaceLocking>(dobj: DeletedObjectReplicationInfo, storage: Arc<S>) {
     if dobj.delete_object.force_delete {
         replicate_force_delete_to_targets(&dobj, storage).await;
         return;
@@ -2170,7 +2172,10 @@ async fn replicate_delete_marker_purge_to_targets(bucket: &str, dobj: &DeletedOb
     }
 }
 
-async fn replicate_force_delete_to_targets<S: StorageAPI>(dobj: &DeletedObjectReplicationInfo, storage: Arc<S>) {
+async fn replicate_force_delete_to_targets<S: StorageAPI + NamespaceLocking>(
+    dobj: &DeletedObjectReplicationInfo,
+    storage: Arc<S>,
+) {
     let bucket = &dobj.bucket;
     let object_name = &dobj.delete_object.object_name;
 
