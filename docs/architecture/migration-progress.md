@@ -5,17 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-api-namespace-lock-cleanup`
-- Baseline: `origin/main` at `7146c893cbbb84a0d5332a7a8a79b70d57191bcc`
-- PR type for this branch: `api-extraction`
-- Runtime behavior changes: none intended.
-- Rust code changes: migrate remaining namespace-lock consumers to
-  `NamespaceLocking`, implement namespace locking directly on ECStore storage
-  types, and remove the temporary namespace-lock compatibility method from the
-  full storage trait.
+- Branch: `overtrue/arch-kms-dev-defaults`
+- Baseline: `origin/main` at `a85cc0354c02fc55e2dd8eb64cfc6155c37921c7`
+- PR type for this branch: `security-change`
+- Runtime behavior changes: KMS development-only defaults now fail closed unless
+  `RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS=true` or an admin configure request
+  sets `allow_insecure_dev_defaults=true`.
+- Rust code changes: harden Local KMS missing-master-key/temp-dir defaults,
+  Vault HTTP/default-token/skip-TLS defaults, KMS service-manager validation,
+  admin configure request conversion, and server CLI KMS configuration.
 - CI/script changes: none.
-- Docs changes: remove the API-012 cleanup-register entry and record the
-  completed namespace-lock compatibility cleanup in progress notes.
+- Docs changes: record KMS compatibility notes and mark `KMSD-002` through
+  `KMSD-005` complete.
 
 ## Phase 0 Tasks
 
@@ -193,6 +194,27 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     authorization, startup order, storage path, or crate boundary changes.
   - Verification: docs diff review, migration guards, metrics reference guard,
     and `git diff --check`.
+- [x] `KMSD-002` Make Local KMS unsafe defaults explicit dev opt-in.
+  - Acceptance: Local KMS now rejects missing master keys and process-temp key
+    directories unless `allow_insecure_dev_defaults` is explicitly set.
+  - Compatibility: server CLI/config now accepts `RUSTFS_KMS_LOCAL_MASTER_KEY`
+    for production local encryption and
+    `RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS=true` for development-only local
+    setups.
+- [x] `KMSD-003` Make Vault unsafe defaults explicit dev opt-in.
+  - Acceptance: Vault KV2 and Vault Transit now reject HTTP addresses,
+    `dev-token`, and `skip_tls_verify` unless explicit development opt-in is set.
+  - Compatibility: the KMS env loader and admin configure requests support the
+    same explicit development opt-in.
+- [x] `KMSD-004` Add production KMS default tests.
+  - Acceptance: focused tests cover Local and Vault production rejection plus
+    explicit development opt-in paths across config, env loading, admin request
+    conversion, and service-manager validation.
+- [x] `KMSD-005` Write KMS compatibility notes.
+  - Acceptance:
+    [`kms-development-defaults-inventory.md`](kms-development-defaults-inventory.md)
+    now records the production-safe alternatives and explicit development opt-in
+    behavior for deployments that relied on old defaults.
 
 ## Phase 2 Storage API Tasks
 
@@ -362,57 +384,52 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `security-change`: make Local KMS unsafe defaults explicit development
-   opt-ins or production failures in KMSD-002.
-2. `security-change`: make Vault unsafe defaults explicit development opt-ins
-   or production failures in KMSD-003.
+1. `security-change`: apply IAM and plugin secret redaction in `S-014`.
+2. `security-change`: classify and add strict serde ingress tests in `S-015`.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed the diff removes the temporary namespace-lock method from the full `StorageAPI` trait while keeping `NamespaceLocking` as the narrow operation-group contract. |
-| Migration preservation | pass | Confirmed ECStore, Sets, SetDisks, scanner leader locking, self-copy locking, replication resync, rebalance metadata, and config test storage retain their existing lock behavior and only narrow trait dependencies. |
-| Testing/verification | pass | Confirmed focused compile/tests, migration guards, dependency guard, old-path scan, and added-line Rust risk scan cover this cleanup; full pre-commit is skipped under the current larger-granularity instruction. |
+| Quality/architecture | pass | Confirmed KMS unsafe-development defaults are enforced in `KmsConfig::validate()` and reused by env loading, admin configure conversion, service-manager lifecycle, and direct backend construction. |
+| Migration preservation | pass | Confirmed KMS runtime key operations, cache behavior, redaction behavior, storage SSE call sites, and admin route contracts keep their existing shapes except for the explicit development opt-in field. |
+| Testing/verification | pass | Confirmed KMS crate tests, rustfs config/SSE focused tests, rustfs lib/test compile, migration guards, format check, and diff check cover this larger security-change slice; full pre-commit is skipped under the current larger-granularity instruction. |
 
 ## Verification Notes
 
-Passed on `7146c893cbbb84a0d5332a7a8a79b70d57191bcc`:
-- `cargo check -p rustfs-ecstore -p rustfs-scanner -p rustfs --all-targets`.
-- `cargo test -p rustfs-ecstore --test storage_api_compat_test`; 2 passed.
-- `cargo test -p rustfs-ecstore --lib new_ns_lock`; 2 passed.
-- `cargo test -p rustfs-scanner --tests --no-run`.
-- `cargo test -p rustfs --lib --no-run`.
+Passed on `a85cc0354c02fc55e2dd8eb64cfc6155c37921c7`:
+- `cargo check -p rustfs --lib --tests`.
+- `cargo check -p rustfs-kms --tests`.
+- `cargo test -p rustfs-kms --no-fail-fast`; 57 passed, 1 ignored, doc-test
+  passed.
+- `cargo test -p rustfs --lib config::config_test --no-fail-fast`; 20 passed.
+- `cargo test -p rustfs --lib storage::sse::tests::test_kms --no-fail-fast`;
+  1 passed.
+- `cargo test -p rustfs --lib -- --list | rg "sse.*kms|kms.*sse|config::config_test::tests::test_config_new_defaults"`.
 - `cargo fmt --all --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - `./scripts/check_metrics_migration_refs.sh`.
 - `git diff --check`.
-- API-012 old-path and marker scan found no stale API-012 compatibility marker
-  or old full-storage-trait namespace-lock method references in `crates`,
-  `rustfs/src`, or architecture docs.
-- Added-line Rust risk scan found no new production `unwrap`/`expect`, lossy
-  numeric casts, stringly public errors, boxed dynamic errors, stdout/stderr
-  printing, or relaxed atomic ordering.
 
 Notes:
 - Full pre-commit may be skipped if focused tests, compile checks, and guards
   pass, per the current instruction to increase PR granularity.
-- This slice removes only the old namespace-lock method from the full storage
-  trait. ECStore retains bucket, object, listing, multipart, heal, replication,
-  rebalance, scanner, config persistence, and namespace-lock implementation
-  behavior.
-- Consumers that need namespace locks should depend on `NamespaceLocking`
-  instead of the full storage trait.
+- `cargo test -p rustfs --lib storage::sse::tests::test_sse_kms --no-fail-fast`
+  and `cargo test -p rustfs --lib test_sse_kms_roundtrip --no-fail-fast`
+  matched 0 tests because the `rio-v2` roundtrip test is feature-gated out of
+  the default `rustfs --lib` test binary.
+- This slice includes a minimal compile unblock after PR #3365: table catalog's
+  ECStore object backend now declares `NamespaceLocking` where it calls
+  `new_ns_lock`; the lock path itself is unchanged.
+- This slice does not change KMS authorization actions, key operation behavior,
+  storage encryption metadata formats, or cache semantics.
 
 ## Handoff Notes
 
-- Keep this API-012 cleanup slice as an `api-extraction` PR that only removes
-  the temporary namespace-lock method from the full storage trait, migrates
-  namespace-lock consumers to `NamespaceLocking`, and deletes the
-  cleanup-register entry.
-- Do not move storage traits, bucket/object/list/multipart/heal operation
-  logic, lock implementation code, storage runtime wiring, route behavior, or
-  storage persistence logic in this PR.
-- Do not add temporary compatibility code unless a matching task marker and
-  cleanup-register entry are added.
+- Keep this KMS slice as a `security-change` PR covering KMSD-002 through
+  KMSD-005 plus the minimal table catalog compile unblock from PR #3365.
+- Do not change KMS key operation behavior, storage SSE metadata formats, IAM
+  policy actions, admin route wiring, or cache semantics in this PR.
+- If more time is available before the next slice, start `S-014` with IAM/plugin
+  secret redaction; otherwise start `S-015` strict serde ingress tests.

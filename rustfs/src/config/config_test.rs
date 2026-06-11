@@ -133,10 +133,12 @@ mod tests {
         assert!(!config.kms_enable);
         assert_eq!(config.kms_backend, "local");
         assert_eq!(config.kms_key_dir, None);
+        assert_eq!(config.kms_local_master_key, None);
         assert_eq!(config.kms_vault_address, None);
         assert_eq!(config.kms_vault_token, None);
         assert_eq!(config.kms_vault_mount_path, None);
         assert_eq!(config.kms_default_key_id, None);
+        assert!(!config.kms_allow_insecure_dev_defaults);
         assert!(!config.buffer_profile_disable);
         assert_eq!(config.buffer_profile, "GeneralPurpose");
     }

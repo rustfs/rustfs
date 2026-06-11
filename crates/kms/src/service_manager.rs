@@ -92,6 +92,8 @@ impl KmsServiceManager {
 
     /// Configure KMS with new configuration
     pub async fn configure(&self, new_config: KmsConfig) -> Result<()> {
+        new_config.validate()?;
+
         // Update configuration
         {
             let mut config = self.config.write().await;
@@ -200,6 +202,7 @@ impl KmsServiceManager {
         let _guard = self.lifecycle_mutex.lock().await;
 
         info!("Reconfiguring KMS service (zero-downtime)");
+        new_config.validate()?;
 
         // Configure with new config
         {
@@ -307,6 +310,8 @@ impl KmsServiceManager {
     ///
     /// This creates a new backend, manager, and service, and assigns it a new version number.
     async fn create_service_version(&self, config: &KmsConfig) -> Result<ServiceVersion> {
+        config.validate()?;
+
         // Increment version counter
         let version = self.version_counter.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -370,4 +375,23 @@ pub fn get_global_kms_service_manager() -> Option<Arc<KmsServiceManager>> {
 pub async fn get_global_encryption_service() -> Option<Arc<ObjectEncryptionService>> {
     let manager = get_global_kms_service_manager().unwrap_or_else(init_global_kms_service_manager);
     manager.get_encryption_service().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn configure_rejects_insecure_development_defaults_before_state_update() {
+        let manager = KmsServiceManager::new();
+
+        let error = manager
+            .configure(KmsConfig::default())
+            .await
+            .expect_err("unsafe local defaults should fail validation");
+
+        assert!(error.to_string().contains(crate::config::ENV_KMS_ALLOW_INSECURE_DEV_DEFAULTS));
+        assert_eq!(manager.get_status().await, KmsServiceStatus::NotConfigured);
+        assert!(manager.get_config().await.is_none());
+    }
 }
