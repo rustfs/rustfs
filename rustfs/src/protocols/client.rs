@@ -16,6 +16,7 @@ use crate::storage::ecfs::FS;
 use http::{HeaderMap, Method};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustfs_credentials;
+use rustfs_obs::MaskedAccessKey;
 use s3s::dto::*;
 use s3s::{S3, S3Request, S3Result};
 use tokio_stream::Stream;
@@ -401,7 +402,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
     }
 
     async fn list_buckets(&self, access_key: &str, secret_key: &str) -> Result<ListBucketsOutput, Self::Error> {
-        trace!("Protocol storage client ListBuckets request: access_key={}", access_key);
+        trace!(access_key = %MaskedAccessKey(access_key), "Protocol storage client ListBuckets request");
 
         let input = ListBucketsInput::builder().build().map_err(|e| {
             s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build ListBucketsInput: {}", e))

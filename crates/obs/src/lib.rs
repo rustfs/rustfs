@@ -62,6 +62,7 @@ mod cleaner;
 mod config;
 mod error;
 mod global;
+mod logging;
 pub mod metrics;
 mod telemetry;
 
@@ -69,6 +70,7 @@ pub use cleaner::*;
 pub use config::*;
 pub use error::*;
 pub use global::*;
+pub use logging::*;
 pub use metrics::schema::*;
 pub use metrics::{init_metrics_collectors, init_metrics_runtime};
 pub use telemetry::{OtelGuard, Recorder};
