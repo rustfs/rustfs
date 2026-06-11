@@ -29,6 +29,9 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 const RUSTFS_AUDIT_METRICS_NAMESPACE: &str = "rustfs.audit.";
+const LOG_COMPONENT_AUDIT: &str = "audit";
+const LOG_SUBSYSTEM_OBSERVABILITY: &str = "observability";
+const EVENT_AUDIT_OBSERVABILITY_STATE: &str = "audit_observability_state";
 
 const M_AUDIT_EVENTS_TOTAL: &str = const_str::concat!(RUSTFS_AUDIT_METRICS_NAMESPACE, "events.total");
 const M_AUDIT_EVENTS_FAILED: &str = const_str::concat!(RUSTFS_AUDIT_METRICS_NAMESPACE, "events.failed");
@@ -152,14 +155,26 @@ impl AuditMetrics {
     pub fn record_config_reload(&self) {
         self.config_reload_count.fetch_add(1, Ordering::Relaxed);
         counter!(M_AUDIT_CONFIG_RELOADS).increment(1);
-        info!("Audit configuration reloaded");
+        info!(
+            event = EVENT_AUDIT_OBSERVABILITY_STATE,
+            component = LOG_COMPONENT_AUDIT,
+            subsystem = LOG_SUBSYSTEM_OBSERVABILITY,
+            state = "config_reloaded",
+            "Audit observability state updated"
+        );
     }
 
     /// Records a system start
     pub fn record_system_start(&self) {
         self.system_start_count.fetch_add(1, Ordering::Relaxed);
         counter!(M_AUDIT_SYSTEM_STARTS).increment(1);
-        info!("Audit system started");
+        info!(
+            event = EVENT_AUDIT_OBSERVABILITY_STATE,
+            component = LOG_COMPONENT_AUDIT,
+            subsystem = LOG_SUBSYSTEM_OBSERVABILITY,
+            state = "system_started",
+            "Audit observability state updated"
+        );
     }
 
     /// Gets the current events per second (EPS)
@@ -229,7 +244,13 @@ impl AuditMetrics {
 
         // Reset EPS to zero after reset
         gauge!(M_AUDIT_EPS).set(0.0);
-        info!("Audit metrics reset");
+        info!(
+            event = EVENT_AUDIT_OBSERVABILITY_STATE,
+            component = LOG_COMPONENT_AUDIT,
+            subsystem = LOG_SUBSYSTEM_OBSERVABILITY,
+            state = "metrics_reset",
+            "Audit observability state updated"
+        );
     }
 
     /// Generates a comprehensive metrics report
