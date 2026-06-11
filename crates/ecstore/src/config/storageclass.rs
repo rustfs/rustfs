@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::KVS;
-use crate::config::KV;
 use crate::error::{Error, Result};
+use rustfs_config::server_config::{KV, KVS};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::sync::LazyLock;

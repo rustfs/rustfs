@@ -28,6 +28,7 @@ use crate::store_api::{GetObjectReader, HTTPRangeSpec, ObjectIO, ObjectInfo, Obj
 use http::HeaderMap;
 use rand::RngExt as _;
 use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
+use rustfs_storage_api::StorageAdminApi;
 use rustfs_utils::path::encode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -565,11 +566,11 @@ impl RebalanceMeta {
     pub fn new() -> Self {
         Self::default()
     }
-    pub async fn load<S: StorageAPI>(&mut self, store: Arc<S>) -> Result<()> {
+    pub async fn load<S: ObjectIO>(&mut self, store: Arc<S>) -> Result<()> {
         self.load_with_opts(store, ObjectOptions::default()).await
     }
 
-    pub async fn load_with_opts<S: StorageAPI>(&mut self, store: Arc<S>, opts: ObjectOptions) -> Result<()> {
+    pub async fn load_with_opts<S: ObjectIO>(&mut self, store: Arc<S>, opts: ObjectOptions) -> Result<()> {
         let (data, _) = read_config_with_metadata(store, REBAL_META_NAME, &opts).await?;
         if data.is_empty() {
             info!("rebalanceMeta load_with_opts: no data");
@@ -598,11 +599,11 @@ impl RebalanceMeta {
         Ok(())
     }
 
-    pub async fn save<S: StorageAPI>(&self, store: Arc<S>) -> Result<()> {
+    pub async fn save<S: ObjectIO>(&self, store: Arc<S>) -> Result<()> {
         self.save_with_opts(store, ObjectOptions::default()).await
     }
 
-    pub async fn save_with_opts<S: StorageAPI>(&self, store: Arc<S>, opts: ObjectOptions) -> Result<()> {
+    pub async fn save_with_opts<S: ObjectIO>(&self, store: Arc<S>, opts: ObjectOptions) -> Result<()> {
         if self.pool_stats.is_empty() {
             info!("rebalanceMeta save_with_opts: no pool stats");
             return Ok(());
@@ -732,7 +733,7 @@ impl ECStore {
     #[tracing::instrument(skip(self))]
     pub async fn init_rebalance_meta(&self, bucktes: Vec<String>) -> Result<String> {
         info!("init_rebalance_meta: start rebalance");
-        let si = self.storage_info().await;
+        let si = StorageAdminApi::storage_info(self).await;
 
         let mut disk_stats = vec![DiskStat::default(); self.pools.len()];
 

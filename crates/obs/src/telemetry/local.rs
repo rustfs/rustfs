@@ -50,13 +50,35 @@ use rustfs_config::observability::{
 use rustfs_config::{APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_STDOUT_ENABLED};
 use std::sync::Arc;
 use std::{fs, io::IsTerminal, time::Duration};
+use tracing::Subscriber;
 use tracing::info;
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{
     fmt::{format::FmtSpan, time::LocalTime},
     layer::SubscriberExt,
+    registry::LookupSpan,
     util::SubscriberInitExt,
 };
+
+pub(super) fn build_json_log_layer<S, W>(writer: W, enable_ansi: bool, span_events: FmtSpan) -> impl tracing_subscriber::Layer<S>
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt::layer()
+        .with_timer(LocalTime::rfc_3339())
+        .with_target(true)
+        .with_ansi(enable_ansi)
+        .with_thread_names(true)
+        .with_thread_ids(true)
+        .with_file(true)
+        .with_line_number(true)
+        .with_writer(writer)
+        .json()
+        .with_current_span(true)
+        .with_span_list(true)
+        .with_span_events(span_events)
+}
 
 /// Initialize local logging (stdout-only or file-rolling).
 ///
@@ -124,22 +146,11 @@ pub(super) fn init_local_logging(
 fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: bool) -> OtelGuard {
     let env_filter = build_env_filter(logger_level, None);
     let (nb, guard) = tracing_appender::non_blocking(std::io::stdout());
+    let span_events = if is_production { FmtSpan::CLOSE } else { FmtSpan::FULL };
 
     // Keep stdout formatting JSON-shaped even in local-only mode so operators
     // can ship the same log schema to external collectors if needed.
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_timer(LocalTime::rfc_3339())
-        .with_target(true)
-        .with_ansi(std::io::stdout().is_terminal())
-        .with_thread_names(true)
-        .with_thread_ids(true)
-        .with_file(true)
-        .with_line_number(true)
-        .with_writer(nb)
-        .json()
-        .with_current_span(true)
-        .with_span_list(true)
-        .with_span_events(if is_production { FmtSpan::CLOSE } else { FmtSpan::FULL });
+    let fmt_layer = build_json_log_layer(nb, std::io::stdout().is_terminal(), span_events);
 
     tracing_subscriber::registry()
         .with(env_filter)
@@ -149,7 +160,14 @@ fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: boo
 
     set_observability_metric_enabled(false);
     counter!("rustfs_start_total").increment(1);
-    info!("Init stdout logging (level: {})", logger_level);
+    info!(
+        backend = "local",
+        sink = "stdout",
+        output_format = "json",
+        logger_level,
+        is_production,
+        "Initialized local logging"
+    );
 
     OtelGuard {
         tracer_provider: None,
@@ -227,19 +245,7 @@ fn init_file_logging_internal(
 
     // File output stays machine-readable and free of ANSI sequences so the
     // resulting files are safe to parse or ship to log processors.
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_timer(LocalTime::rfc_3339())
-        .with_target(true)
-        .with_ansi(false)
-        .with_thread_names(true)
-        .with_thread_ids(true)
-        .with_file(true)
-        .with_line_number(true)
-        .with_writer(non_blocking)
-        .json()
-        .with_current_span(true)
-        .with_span_list(true)
-        .with_span_events(span_events.clone());
+    let file_layer = build_json_log_layer(non_blocking, false, span_events.clone());
 
     // Optional stdout mirror: enabled explicitly via `log_stdout_enabled`, or
     // unconditionally in non-production environments so developers still see
@@ -247,23 +253,7 @@ fn init_file_logging_internal(
     let (stdout_layer, stdout_guard) = if config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) || !is_production {
         let (stdout_nb, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
         let enable_color = std::io::stdout().is_terminal();
-        (
-            Some(
-                tracing_subscriber::fmt::layer()
-                    .with_timer(LocalTime::rfc_3339())
-                    .with_target(true)
-                    .with_ansi(enable_color)
-                    .with_thread_names(true)
-                    .with_thread_ids(true)
-                    .with_file(true)
-                    .with_line_number(true)
-                    .with_writer(stdout_nb) // .json()
-                    // .with_current_span(true)
-                    // .with_span_list(true)
-                    .with_span_events(span_events),
-            ),
-            Some(stdout_guard),
-        )
+        (Some(build_json_log_layer(stdout_nb, enable_color, span_events)), Some(stdout_guard))
     } else {
         (None, None)
     };
@@ -281,8 +271,16 @@ fn init_file_logging_internal(
     let cleanup_handle = spawn_cleanup_task(config, log_directory, log_filename, keep_files);
 
     info!(
-        "Init file logging at '{}', rotation: {}, keep {} files",
-        log_directory, rotation_str, keep_files
+        backend = "local",
+        sink = "file",
+        output_format = "json",
+        log_directory,
+        rotation = %rotation_str,
+        keep_files,
+        stdout_mirror_enabled = stdout_guard.is_some(),
+        is_production,
+        logger_level,
+        "Initialized local logging"
     );
 
     Ok(OtelGuard {
@@ -500,7 +498,65 @@ pub fn spawn_cleanup_task(
 mod tests {
     use super::*;
     use crate::config::OtelConfig;
+    use serde_json::Value;
+    use std::collections::BTreeSet;
+    use std::io;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+    use tracing_subscriber::{Registry, layer::SubscriberExt};
+
+    #[derive(Clone, Default)]
+    struct SharedWriter {
+        inner: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct SharedWriterGuard {
+        inner: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for SharedWriter {
+        type Writer = SharedWriterGuard;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            SharedWriterGuard {
+                inner: Arc::clone(&self.inner),
+            }
+        }
+    }
+
+    impl io::Write for SharedWriterGuard {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut inner = self.inner.lock().expect("shared writer lock should not be poisoned");
+            inner.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn render_json_log(enable_ansi: bool) -> (String, Value) {
+        let writer = SharedWriter::default();
+        let layer = build_json_log_layer(writer.clone(), enable_ansi, FmtSpan::NONE);
+        let subscriber = Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(component = "obs_contract_test", sink = "stdout", "hello world");
+        });
+
+        let raw = String::from_utf8(
+            writer
+                .inner
+                .lock()
+                .expect("shared writer lock should not be poisoned")
+                .clone(),
+        )
+        .expect("log output should be valid UTF-8");
+        let first_line = raw.lines().next().expect("expected one JSON log line");
+        let parsed: Value = serde_json::from_str(first_line).expect("log line should be valid JSON");
+        (raw, parsed)
+    }
 
     #[test]
     /// Invalid file names should be reported as errors instead of panicking.
@@ -533,5 +589,51 @@ mod tests {
         assert!(!should_fallback_to_stdout(&TelemetryError::Io(
             "No such file or directory (os error 2)".to_string()
         )));
+    }
+
+    #[test]
+    fn test_json_log_layer_produces_parseable_json_without_ansi_escape_sequences() {
+        let (raw, parsed) = render_json_log(true);
+
+        assert!(!raw.contains('\u{1b}'), "JSON log output must not contain ANSI escape sequences: {raw}");
+        assert_eq!(parsed.get("level").and_then(Value::as_str), Some("INFO"));
+        assert_eq!(parsed["fields"]["message"], Value::String("hello world".to_string()));
+        assert_eq!(parsed["fields"]["component"], Value::String("obs_contract_test".to_string()));
+        assert_eq!(parsed["fields"]["sink"], Value::String("stdout".to_string()));
+        assert!(parsed.get("target").is_some(), "expected target field in JSON log output");
+    }
+
+    #[test]
+    fn test_json_log_layer_keeps_same_shape_when_ansi_setting_changes() {
+        let (_raw_plain, plain) = render_json_log(false);
+        let (_raw_color, color) = render_json_log(true);
+
+        let plain_keys = plain
+            .as_object()
+            .expect("plain JSON log should be an object")
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let color_keys = color
+            .as_object()
+            .expect("color JSON log should be an object")
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(plain_keys, color_keys, "top-level JSON log keys must stay stable across sinks");
+
+        let plain_field_keys = plain["fields"]
+            .as_object()
+            .expect("plain JSON log fields should be an object")
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let color_field_keys = color["fields"]
+            .as_object()
+            .expect("color JSON log fields should be an object")
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(plain_field_keys, color_field_keys, "structured field keys must stay stable across sinks");
     }
 }

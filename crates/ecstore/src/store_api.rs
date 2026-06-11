@@ -15,7 +15,6 @@
 use crate::bucket::metadata_sys::get_versioning_config;
 use crate::bucket::versioning::VersioningApi as _;
 use crate::config::storageclass;
-use crate::disk::DiskStore;
 use crate::error::{Error, Result};
 use crate::rio::{HashReader, LimitReader};
 use crate::store_utils::clean_metadata;

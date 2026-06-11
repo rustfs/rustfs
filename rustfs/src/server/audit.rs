@@ -20,7 +20,7 @@ use tracing::{info, warn};
 
 static AUDIT_MODULE_ENABLED: AtomicBool = AtomicBool::new(rustfs_config::DEFAULT_AUDIT_ENABLE);
 
-fn server_config_from_context() -> Option<rustfs_ecstore::config::Config> {
+fn server_config_from_context() -> Option<rustfs_config::server_config::Config> {
     resolve_server_config()
 }
 
@@ -34,7 +34,7 @@ pub fn is_audit_module_enabled() -> bool {
     AUDIT_MODULE_ENABLED.load(Ordering::Relaxed)
 }
 
-fn has_any_audit_targets(config: &rustfs_ecstore::config::Config) -> bool {
+fn has_any_audit_targets(config: &rustfs_config::server_config::Config) -> bool {
     for &subsystem in rustfs_config::audit::AUDIT_SUB_SYSTEMS {
         let Some(targets) = config.0.get(subsystem) else {
             continue;

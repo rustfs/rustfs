@@ -172,6 +172,23 @@ pub trait HealOperations: Send + Sync + Debug {
     async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()>;
 }
 
+/// Namespace lock operations needed by consumers that only coordinate object
+/// mutations but do not require the full storage API surface.
+#[async_trait::async_trait]
+pub trait NamespaceLocking: Send + Sync + Debug + 'static {
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper>;
+}
+
+#[async_trait::async_trait]
+impl<T> NamespaceLocking for T
+where
+    T: StorageAPI + ?Sized + 'static,
+{
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
+        StorageAPI::new_ns_lock(self, bucket, object).await
+    }
+}
+
 /// Unified storage API combining all operation groups.
 ///
 /// Consumers can depend on specific sub-traits (e.g., `BucketOperations`)
@@ -181,12 +198,6 @@ pub trait HealOperations: Send + Sync + Debug {
 pub trait StorageAPI:
     ObjectIO + BucketOperations + ObjectOperations + ListOperations + MultipartOperations + HealOperations + Debug
 {
+    // RUSTFS_COMPAT_TODO(API-012): keep old StorageAPI lock callers compiling while namespace-lock-only consumers migrate. Remove after namespace-lock-only consumers depend on NamespaceLocking and StorageAPI no longer owns namespace locking.
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper>;
-
-    async fn backend_info(&self) -> rustfs_madmin::BackendInfo;
-    async fn storage_info(&self) -> rustfs_madmin::StorageInfo;
-    async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo;
-
-    async fn get_disks(&self, pool_idx: usize, set_idx: usize) -> Result<Vec<Option<DiskStore>>>;
-    fn set_drive_counts(&self) -> Vec<usize>;
 }

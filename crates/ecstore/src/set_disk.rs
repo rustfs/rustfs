@@ -1557,6 +1557,34 @@ impl SetDisks {
     }
 }
 
+impl SetDisks {
+    pub(crate) async fn storage_info_snapshot(&self) -> rustfs_madmin::StorageInfo {
+        let disks = self.get_disks_internal().await;
+
+        get_storage_info(&disks, &self.set_endpoints).await
+    }
+
+    pub(crate) async fn local_storage_info_snapshot(&self) -> rustfs_madmin::StorageInfo {
+        let disks = self.get_disks_internal().await;
+
+        let mut local_disks: Vec<Option<DiskStore>> = Vec::new();
+        let mut local_endpoints = Vec::new();
+
+        for (i, ep) in self.set_endpoints.iter().enumerate() {
+            if ep.is_local {
+                local_disks.push(disks[i].clone());
+                local_endpoints.push(ep.clone());
+            }
+        }
+
+        get_storage_info(&local_disks, &local_endpoints).await
+    }
+
+    pub(crate) async fn disk_inventory(&self) -> Vec<Option<DiskStore>> {
+        self.get_disks_internal().await
+    }
+}
+
 #[async_trait::async_trait]
 impl StorageAPI for SetDisks {
     #[tracing::instrument(skip(self))]
@@ -1584,43 +1612,6 @@ impl StorageAPI for SetDisks {
         };
 
         Ok(NamespaceLockWrapper::new(set_lock, resource, self.locker_owner.clone()))
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
-        unimplemented!()
-    }
-    #[tracing::instrument(skip(self))]
-    async fn storage_info(&self) -> rustfs_madmin::StorageInfo {
-        let disks = self.get_disks_internal().await;
-
-        get_storage_info(&disks, &self.set_endpoints).await
-    }
-    #[tracing::instrument(skip(self))]
-    async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
-        let disks = self.get_disks_internal().await;
-
-        let mut local_disks: Vec<Option<DiskStore>> = Vec::new();
-        let mut local_endpoints = Vec::new();
-
-        for (i, ep) in self.set_endpoints.iter().enumerate() {
-            if ep.is_local {
-                local_disks.push(disks[i].clone());
-                local_endpoints.push(ep.clone());
-            }
-        }
-
-        get_storage_info(&local_disks, &local_endpoints).await
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn get_disks(&self, _pool_idx: usize, _set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
-        Ok(self.get_disks_internal().await)
-    }
-
-    #[tracing::instrument(skip(self))]
-    fn set_drive_counts(&self) -> Vec<usize> {
-        unimplemented!()
     }
 }
 
@@ -1823,7 +1814,7 @@ impl ObjectOperations for SetDisks {
     }
     #[tracing::instrument(skip(self))]
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
-        let disks = self.get_disks(0, 0).await?;
+        let disks = self.disk_inventory().await;
         let write_quorum = disks.len() / 2 + 1;
 
         let mut futures = Vec::with_capacity(disks.len());
@@ -2199,9 +2190,8 @@ impl ObjectOperations for SetDisks {
                 .await
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
-            if let Ok(disks) = self.get_disks(0, 0).await {
-                record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
-            }
+            let disks = self.disk_inventory().await;
+            record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
 
             let mut oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
             oi.replication_decision = goi.replication_decision;
@@ -2229,9 +2219,8 @@ impl ObjectOperations for SetDisks {
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
-        if let Ok(disks) = self.get_disks(0, 0).await {
-            record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
-        }
+        let disks = self.disk_inventory().await;
+        record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
 
         let mut obj_info = ObjectInfo::from_file_info(&dfi, bucket, object, opts.versioned || opts.version_suspended);
         obj_info.size = goi.size;
@@ -2505,7 +2494,7 @@ impl ObjectOperations for SetDisks {
         let event_name = EventName::LifecycleTransition.as_str();
         let mut should_notify_transition = true;
 
-        let disks = self.get_disks(0, 0).await?;
+        let disks = self.disk_inventory().await;
 
         if let Err(err) = self.delete_object_version(bucket, object, &fi, false).await {
             should_notify_transition = false;

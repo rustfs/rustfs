@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::{Config, KVS, audit, notify, oidc, set_global_storage_class, storageclass};
+use crate::config::{audit, notify, oidc, set_global_storage_class, storageclass};
 use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::global::is_first_cluster_node_local;
-use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
+use crate::store_api::{ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, PutObjReader};
 use http::HeaderMap;
 use rustfs_config::audit::{
     AUDIT_AMQP_KEYS, AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS,
@@ -30,7 +30,9 @@ use rustfs_config::notify::{
     NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::oidc::{IDENTITY_OPENID_KEYS, IDENTITY_OPENID_SUB_SYS, OIDC_REDIRECT_URI_DYNAMIC};
+use rustfs_config::server_config::{Config, KVS};
 use rustfs_config::{COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, RUSTFS_REGION};
+use rustfs_storage_api::StorageAdminApi;
 use rustfs_utils::path::SLASH_SEPARATOR;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -180,12 +182,12 @@ fn audit_target_descriptors() -> [TargetConfigDescriptor; 9] {
 }
 
 #[instrument(skip(api))]
-pub async fn read_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
+pub async fn read_config<S: ObjectIO>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
     let (data, _obj) = read_config_with_metadata(api, file, &ObjectOptions::default()).await?;
     Ok(data)
 }
 
-pub async fn read_config_no_lock<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
+pub async fn read_config_no_lock<S: ObjectIO>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
     let (data, _obj) = read_config_with_metadata(
         api,
         file,
@@ -198,7 +200,7 @@ pub async fn read_config_no_lock<S: StorageAPI>(api: Arc<S>, file: &str) -> Resu
     Ok(data)
 }
 
-pub async fn read_config_with_metadata<S: StorageAPI>(
+pub async fn read_config_with_metadata<S: ObjectIO>(
     api: Arc<S>,
     file: &str,
     opts: &ObjectOptions,
@@ -226,7 +228,7 @@ pub async fn read_config_with_metadata<S: StorageAPI>(
 }
 
 #[instrument(skip(api, data))]
-pub async fn save_config<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()> {
+pub async fn save_config<S: ObjectIO>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()> {
     save_config_with_opts(
         api,
         file,
@@ -240,7 +242,7 @@ pub async fn save_config<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>) 
 }
 
 #[instrument(skip(api))]
-pub async fn delete_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<()> {
+pub async fn delete_config<S: ObjectOperations>(api: Arc<S>, file: &str) -> Result<()> {
     match api
         .delete_object(
             RUSTFS_META_BUCKET,
@@ -264,7 +266,7 @@ pub async fn delete_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<()>
     }
 }
 
-pub async fn save_config_with_opts<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<()> {
+pub async fn save_config_with_opts<S: ObjectIO>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<()> {
     let mut put_data = PutObjReader::from_vec(data);
     if let Err(err) = api.put_object(RUSTFS_META_BUCKET, file, &mut put_data, opts).await {
         error!("save_config_with_opts: err: {:?}, file: {}", err, file);
@@ -277,7 +279,10 @@ fn new_server_config() -> Config {
     Config::new()
 }
 
-async fn new_and_save_server_config<S: StorageAPI>(api: Arc<S>) -> Result<Config> {
+async fn new_and_save_server_config<S>(api: Arc<S>) -> Result<Config>
+where
+    S: ObjectIO + StorageAdminApi,
+{
     let mut cfg = new_server_config();
     lookup_configs(&mut cfg, api.clone()).await;
     save_server_config(api, &cfg).await?;
@@ -289,7 +294,7 @@ fn get_config_file() -> String {
     format!("{CONFIG_PREFIX}{SLASH_SEPARATOR}{CONFIG_FILE}")
 }
 
-fn storage_class_kvs_mut(cfg: &mut Config) -> &mut crate::config::KVS {
+fn storage_class_kvs_mut(cfg: &mut Config) -> &mut KVS {
     let sub_cfg = cfg.0.entry(STORAGE_CLASS_SUB_SYS.to_string()).or_insert_with(|| {
         let mut section = HashMap::new();
         section.insert(DEFAULT_DELIMITER.to_string(), storageclass::DEFAULT_KVS.clone());
@@ -978,7 +983,10 @@ fn is_object_not_found(err: &Error) -> bool {
     *err == Error::FileNotFound || matches!(err, Error::ObjectNotFound(_, _) | Error::BucketNotFound(_))
 }
 
-pub async fn try_migrate_server_config<S: StorageAPI>(api: Arc<S>) {
+pub async fn try_migrate_server_config<S>(api: Arc<S>)
+where
+    S: ObjectIO + ObjectOperations,
+{
     let config_file = get_config_file();
     match api
         .get_object_info(
@@ -1059,7 +1067,10 @@ pub async fn try_migrate_server_config<S: StorageAPI>(api: Arc<S>) {
 }
 
 /// Handle the situation where the configuration file does not exist, create and save a new configuration
-async fn handle_missing_config<S: StorageAPI>(api: Arc<S>, context: &str) -> Result<Config> {
+async fn handle_missing_config<S>(api: Arc<S>, context: &str) -> Result<Config>
+where
+    S: ObjectIO + StorageAdminApi,
+{
     warn!("Configuration not found ({}): Start initializing new configuration", context);
     let cfg = if is_first_cluster_node_local().await {
         new_and_save_server_config(api.clone()).await?
@@ -1078,7 +1089,10 @@ fn handle_config_read_error(err: Error, file_path: &str) -> Result<Config> {
     Err(err)
 }
 
-pub async fn read_config_without_migrate<S: StorageAPI>(api: Arc<S>) -> Result<Config> {
+pub async fn read_config_without_migrate<S>(api: Arc<S>) -> Result<Config>
+where
+    S: ObjectIO + StorageAdminApi,
+{
     let config_file = get_config_file();
 
     // Try to read the configuration file
@@ -1089,7 +1103,10 @@ pub async fn read_config_without_migrate<S: StorageAPI>(api: Arc<S>) -> Result<C
     }
 }
 
-async fn read_server_config<S: StorageAPI>(api: Arc<S>, data: &[u8]) -> Result<Config> {
+async fn read_server_config<S>(api: Arc<S>, data: &[u8]) -> Result<Config>
+where
+    S: ObjectIO + StorageAdminApi,
+{
     // If the provided data is empty, try to read from the file again
     if data.is_empty() {
         let config_file = get_config_file();
@@ -1112,7 +1129,7 @@ async fn read_server_config<S: StorageAPI>(api: Arc<S>, data: &[u8]) -> Result<C
     Ok(cfg.merge())
 }
 
-pub async fn save_server_config<S: StorageAPI>(api: Arc<S>, cfg: &Config) -> Result<()> {
+pub async fn save_server_config<S: ObjectIO>(api: Arc<S>, cfg: &Config) -> Result<()> {
     let config_file = get_config_file();
     let existing = match read_config(api.clone(), &config_file).await {
         Ok(v) => Some(v),
@@ -1141,14 +1158,20 @@ pub async fn save_server_config<S: StorageAPI>(api: Arc<S>, cfg: &Config) -> Res
     save_config(api, &config_file, data).await
 }
 
-pub async fn lookup_configs<S: StorageAPI>(cfg: &mut Config, api: Arc<S>) {
+pub async fn lookup_configs<S>(cfg: &mut Config, api: Arc<S>)
+where
+    S: StorageAdminApi,
+{
     // TODO: from etcd
     if let Err(err) = apply_dynamic_config(cfg, api).await {
         error!("apply_dynamic_config err {:?}", &err);
     }
 }
 
-async fn apply_dynamic_config<S: StorageAPI>(cfg: &mut Config, api: Arc<S>) -> Result<()> {
+async fn apply_dynamic_config<S>(cfg: &mut Config, api: Arc<S>) -> Result<()>
+where
+    S: StorageAdminApi,
+{
     for key in SUB_SYSTEMS_DYNAMIC.iter() {
         apply_dynamic_config_for_sub_sys(cfg, api.clone(), key).await?;
     }
@@ -1156,8 +1179,11 @@ async fn apply_dynamic_config<S: StorageAPI>(cfg: &mut Config, api: Arc<S>) -> R
     Ok(())
 }
 
-async fn apply_dynamic_config_for_sub_sys<S: StorageAPI>(cfg: &mut Config, api: Arc<S>, subsys: &str) -> Result<()> {
-    let set_drive_counts = api.set_drive_counts();
+async fn apply_dynamic_config_for_sub_sys<S>(cfg: &mut Config, api: Arc<S>, subsys: &str) -> Result<()>
+where
+    S: StorageAdminApi,
+{
+    let set_drive_counts = StorageAdminApi::set_drive_counts(api.as_ref());
     if subsys == STORAGE_CLASS_SUB_SYS {
         let kvs = cfg.get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_DELIMITER).unwrap_or_default();
 
@@ -1185,7 +1211,7 @@ mod tests {
         configs_semantically_equal, decode_server_config_blob, encode_server_config_blob, is_standard_object_server_config,
         read_config_with_metadata, storage_class_kvs_mut,
     };
-    use crate::config::{Config, audit, notify, oidc};
+    use crate::config::{audit, notify, oidc};
     use crate::disk::endpoint::Endpoint;
     use crate::endpoints::SetupType;
     use crate::error::{Error, Result};
@@ -1203,6 +1229,7 @@ mod tests {
         NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
     };
     use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
+    use rustfs_config::server_config::{Config, KV, KVS};
     use rustfs_config::{
         DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MYSQL_DSN_STRING, MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_TABLE,
     };
@@ -1210,6 +1237,7 @@ mod tests {
     use rustfs_lock::client::LockClient;
     use rustfs_lock::client::local::LocalClient;
     use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
+    use rustfs_storage_api::StorageAdminApi;
     use serde_json::Value;
     use serial_test::serial;
     use std::collections::HashMap;
@@ -1702,6 +1730,14 @@ mod tests {
         async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<rustfs_lock::NamespaceLockWrapper> {
             self.set_disks.new_ns_lock(bucket, object).await
         }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageAdminApi for LockingConfigStorage {
+        type BackendInfo = rustfs_madmin::BackendInfo;
+        type StorageInfo = rustfs_madmin::StorageInfo;
+        type Disk = crate::disk::DiskStore;
+        type Error = Error;
 
         async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
             panic!("unused in test")
@@ -1715,12 +1751,15 @@ mod tests {
             panic!("unused in test")
         }
 
-        async fn get_disks(&self, _pool_idx: usize, _set_idx: usize) -> Result<Vec<Option<crate::disk::DiskStore>>> {
+        async fn disk_set_inventory(
+            &self,
+            _selector: rustfs_storage_api::DiskSetSelector,
+        ) -> Result<Vec<Option<crate::disk::DiskStore>>> {
             panic!("unused in test")
         }
 
         fn set_drive_counts(&self) -> Vec<usize> {
-            panic!("unused in test")
+            vec![self.set_disks.set_endpoints.len()]
         }
     }
 
@@ -2115,18 +2154,18 @@ mod tests {
         webhook_section.insert(DEFAULT_DELIMITER.to_string(), notify::DEFAULT_NOTIFY_WEBHOOK_KVS.clone());
         webhook_section.insert(
             "primary".to_string(),
-            crate::config::KVS(vec![
-                crate::config::KV {
+            KVS(vec![
+                KV {
                     key: ENABLE_KEY.to_string(),
                     value: EnableState::On.to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::WEBHOOK_ENDPOINT.to_string(),
                     value: "https://example.com/hook".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::WEBHOOK_QUEUE_DIR.to_string(),
                     value: "/tmp/webhook-queue".to_string(),
                     hidden_if_empty: false,
@@ -2142,18 +2181,18 @@ mod tests {
         mqtt_section.insert(DEFAULT_DELIMITER.to_string(), mqtt_default);
         mqtt_section.insert(
             "analytics".to_string(),
-            crate::config::KVS(vec![
-                crate::config::KV {
+            KVS(vec![
+                KV {
                     key: ENABLE_KEY.to_string(),
                     value: EnableState::On.to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::MQTT_BROKER.to_string(),
                     value: "tcp://127.0.0.1:1883".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::MQTT_QUEUE_DIR.to_string(),
                     value: "".to_string(),
                     hidden_if_empty: false,
@@ -2169,23 +2208,23 @@ mod tests {
         kafka_section.insert(DEFAULT_DELIMITER.to_string(), kafka_default);
         kafka_section.insert(
             "streaming".to_string(),
-            crate::config::KVS(vec![
-                crate::config::KV {
+            KVS(vec![
+                KV {
                     key: ENABLE_KEY.to_string(),
                     value: EnableState::On.to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::KAFKA_BROKERS.to_string(),
                     value: "127.0.0.1:9092,127.0.0.1:9093".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::KAFKA_ACKS.to_string(),
                     value: "all".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::KAFKA_TLS_ENABLE.to_string(),
                     value: EnableState::On.to_string(),
                     hidden_if_empty: false,
@@ -2197,33 +2236,33 @@ mod tests {
         let mut amqp_section = std::collections::HashMap::new();
         amqp_section.insert(
             "primary".to_string(),
-            crate::config::KVS(vec![
-                crate::config::KV {
+            KVS(vec![
+                KV {
                     key: ENABLE_KEY.to_string(),
                     value: EnableState::On.to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::AMQP_URL.to_string(),
                     value: "amqp://127.0.0.1:5672/%2f".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::AMQP_EXCHANGE.to_string(),
                     value: "rustfs.events".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::AMQP_ROUTING_KEY.to_string(),
                     value: "objects".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::AMQP_MANDATORY.to_string(),
                     value: "false".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::AMQP_PERSISTENT.to_string(),
                     value: "false".to_string(),
                     hidden_if_empty: false,
@@ -2304,18 +2343,18 @@ mod tests {
         webhook_section.insert(DEFAULT_DELIMITER.to_string(), audit::DEFAULT_AUDIT_WEBHOOK_KVS.clone());
         webhook_section.insert(
             "primary".to_string(),
-            crate::config::KVS(vec![
-                crate::config::KV {
+            KVS(vec![
+                KV {
                     key: ENABLE_KEY.to_string(),
                     value: EnableState::On.to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::WEBHOOK_ENDPOINT.to_string(),
                     value: "https://example.com/audit-hook".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::WEBHOOK_QUEUE_DIR.to_string(),
                     value: "/tmp/audit-queue".to_string(),
                     hidden_if_empty: false,
@@ -2327,33 +2366,33 @@ mod tests {
         let mut amqp_section = std::collections::HashMap::new();
         amqp_section.insert(
             "primary".to_string(),
-            crate::config::KVS(vec![
-                crate::config::KV {
+            KVS(vec![
+                KV {
                     key: ENABLE_KEY.to_string(),
                     value: EnableState::On.to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::AMQP_URL.to_string(),
                     value: "amqp://127.0.0.1:5672/%2f".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::AMQP_EXCHANGE.to_string(),
                     value: "rustfs.audit".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::AMQP_ROUTING_KEY.to_string(),
                     value: "audit".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::AMQP_MANDATORY.to_string(),
                     value: "false".to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::AMQP_PERSISTENT.to_string(),
                     value: "false".to_string(),
                     hidden_if_empty: false,
@@ -2369,13 +2408,13 @@ mod tests {
         mqtt_section.insert(DEFAULT_DELIMITER.to_string(), mqtt_default);
         mqtt_section.insert(
             "analytics".to_string(),
-            crate::config::KVS(vec![
-                crate::config::KV {
+            KVS(vec![
+                KV {
                     key: ENABLE_KEY.to_string(),
                     value: EnableState::On.to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::MQTT_BROKER.to_string(),
                     value: "tcp://127.0.0.1:1883".to_string(),
                     hidden_if_empty: false,
@@ -2391,13 +2430,13 @@ mod tests {
         kafka_section.insert(DEFAULT_DELIMITER.to_string(), kafka_default);
         kafka_section.insert(
             "auditlog".to_string(),
-            crate::config::KVS(vec![
-                crate::config::KV {
+            KVS(vec![
+                KV {
                     key: ENABLE_KEY.to_string(),
                     value: EnableState::On.to_string(),
                     hidden_if_empty: false,
                 },
-                crate::config::KV {
+                KV {
                     key: rustfs_config::KAFKA_BROKERS.to_string(),
                     value: "127.0.0.1:9092".to_string(),
                     hidden_if_empty: false,
@@ -2660,7 +2699,7 @@ mod tests {
 
         // Verify the decoded config has "storage_class" (with underscore) subsystem
         let kvs = decoded
-            .get_value(STORAGE_CLASS_SUB_SYS, crate::config::DEFAULT_DELIMITER)
+            .get_value(STORAGE_CLASS_SUB_SYS, rustfs_config::DEFAULT_DELIMITER)
             .expect("decoded config should have storage_class subsystem");
         assert_eq!(kvs.get("standard"), "EC:4", "standard should be EC:4");
         assert_eq!(kvs.get("rrs"), "EC:2", "rrs should be EC:2");

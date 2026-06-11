@@ -36,6 +36,7 @@ use matchit::Params;
 use matchit::Router;
 use reqwest::Url;
 use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
+use rustfs_config::server_config::Config;
 use rustfs_config::{
     ENABLE_KEY, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT,
     WEBHOOK_SKIP_TLS_VERIFY,
@@ -54,7 +55,7 @@ use rustfs_ecstore::bucket::target::{BucketTarget, BucketTargetType, BucketTarge
 use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::config::com::read_config_without_migrate;
-use rustfs_ecstore::config::{Config, get_global_server_config};
+use rustfs_ecstore::config::get_global_server_config;
 use rustfs_ecstore::global::GLOBAL_BOOT_TIME;
 use rustfs_ecstore::notification_sys::get_global_notification_sys;
 use rustfs_ecstore::rpc::PeerRestClient;
@@ -3265,22 +3266,22 @@ mod tests {
         let arn = "arn:acme:s3-object-lambda::transformer:webhook"
             .parse::<rustfs_targets::arn::ARN>()
             .expect("arn should parse");
-        let config = rustfs_ecstore::config::Config(std::collections::HashMap::from([(
+        let config = rustfs_config::server_config::Config(std::collections::HashMap::from([(
             LAMBDA_WEBHOOK_SUB_SYS.to_string(),
             std::collections::HashMap::from([(
                 "transformer".to_string(),
-                rustfs_ecstore::config::KVS(vec![
-                    rustfs_ecstore::config::KV {
+                rustfs_config::server_config::KVS(vec![
+                    rustfs_config::server_config::KV {
                         key: ENABLE_KEY.to_string(),
                         value: "on".to_string(),
                         hidden_if_empty: false,
                     },
-                    rustfs_ecstore::config::KV {
+                    rustfs_config::server_config::KV {
                         key: WEBHOOK_ENDPOINT.to_string(),
                         value: "https://example.com/transform".to_string(),
                         hidden_if_empty: false,
                     },
-                    rustfs_ecstore::config::KV {
+                    rustfs_config::server_config::KV {
                         key: WEBHOOK_AUTH_TOKEN.to_string(),
                         value: "secret-token".to_string(),
                         hidden_if_empty: true,
@@ -3302,17 +3303,17 @@ mod tests {
         let arn = "arn:acme:s3-object-lambda::transformer:webhook-csv"
             .parse::<rustfs_targets::arn::ARN>()
             .expect("arn should parse");
-        let config = rustfs_ecstore::config::Config(std::collections::HashMap::from([(
+        let config = rustfs_config::server_config::Config(std::collections::HashMap::from([(
             LAMBDA_WEBHOOK_SUB_SYS.to_string(),
             std::collections::HashMap::from([(
                 "transformer".to_string(),
-                rustfs_ecstore::config::KVS(vec![
-                    rustfs_ecstore::config::KV {
+                rustfs_config::server_config::KVS(vec![
+                    rustfs_config::server_config::KV {
                         key: ENABLE_KEY.to_string(),
                         value: "on".to_string(),
                         hidden_if_empty: false,
                     },
-                    rustfs_ecstore::config::KV {
+                    rustfs_config::server_config::KV {
                         key: WEBHOOK_ENDPOINT.to_string(),
                         value: "https://example.com/transform-csv".to_string(),
                         hidden_if_empty: false,
@@ -3330,22 +3331,22 @@ mod tests {
         let arn = "arn:acme:s3-object-lambda::transformer:webhook"
             .parse::<rustfs_targets::arn::ARN>()
             .expect("arn should parse");
-        let config = rustfs_ecstore::config::Config(std::collections::HashMap::from([(
+        let config = rustfs_config::server_config::Config(std::collections::HashMap::from([(
             LAMBDA_WEBHOOK_SUB_SYS.to_string(),
             std::collections::HashMap::from([(
                 "transformer".to_string(),
-                rustfs_ecstore::config::KVS(vec![
-                    rustfs_ecstore::config::KV {
+                rustfs_config::server_config::KVS(vec![
+                    rustfs_config::server_config::KV {
                         key: ENABLE_KEY.to_string(),
                         value: "on".to_string(),
                         hidden_if_empty: false,
                     },
-                    rustfs_ecstore::config::KV {
+                    rustfs_config::server_config::KV {
                         key: WEBHOOK_ENDPOINT.to_string(),
                         value: "https://example.com/transform".to_string(),
                         hidden_if_empty: false,
                     },
-                    rustfs_ecstore::config::KV {
+                    rustfs_config::server_config::KV {
                         key: WEBHOOK_RESPONSE_HEADER_TIMEOUT.to_string(),
                         value: "2s".to_string(),
                         hidden_if_empty: false,
@@ -3363,17 +3364,17 @@ mod tests {
         let arn = "arn:acme:s3-object-lambda::transformer:webhook"
             .parse::<rustfs_targets::arn::ARN>()
             .expect("arn should parse");
-        let config = rustfs_ecstore::config::Config(std::collections::HashMap::from([(
+        let config = rustfs_config::server_config::Config(std::collections::HashMap::from([(
             NOTIFY_WEBHOOK_SUB_SYS.to_string(),
             std::collections::HashMap::from([(
                 "transformer".to_string(),
-                rustfs_ecstore::config::KVS(vec![
-                    rustfs_ecstore::config::KV {
+                rustfs_config::server_config::KVS(vec![
+                    rustfs_config::server_config::KV {
                         key: ENABLE_KEY.to_string(),
                         value: "on".to_string(),
                         hidden_if_empty: false,
                     },
-                    rustfs_ecstore::config::KV {
+                    rustfs_config::server_config::KV {
                         key: WEBHOOK_ENDPOINT.to_string(),
                         value: "https://example.com/notify-transform".to_string(),
                         hidden_if_empty: false,
@@ -3391,22 +3392,22 @@ mod tests {
         let arn = "arn:acme:s3-object-lambda::transformer:webhook"
             .parse::<rustfs_targets::arn::ARN>()
             .expect("arn should parse");
-        let config = rustfs_ecstore::config::Config(std::collections::HashMap::from([(
+        let config = rustfs_config::server_config::Config(std::collections::HashMap::from([(
             LAMBDA_WEBHOOK_SUB_SYS.to_string(),
             std::collections::HashMap::from([(
                 "transformer".to_string(),
-                rustfs_ecstore::config::KVS(vec![
-                    rustfs_ecstore::config::KV {
+                rustfs_config::server_config::KVS(vec![
+                    rustfs_config::server_config::KV {
                         key: ENABLE_KEY.to_string(),
                         value: "on".to_string(),
                         hidden_if_empty: false,
                     },
-                    rustfs_ecstore::config::KV {
+                    rustfs_config::server_config::KV {
                         key: WEBHOOK_ENDPOINT.to_string(),
                         value: "https://example.com/transform".to_string(),
                         hidden_if_empty: false,
                     },
-                    rustfs_ecstore::config::KV {
+                    rustfs_config::server_config::KV {
                         key: WEBHOOK_RESPONSE_HEADER_TIMEOUT.to_string(),
                         value: "definitely-not-a-duration".to_string(),
                         hidden_if_empty: false,
@@ -3425,7 +3426,7 @@ mod tests {
         let unsupported = "arn:acme:s3-object-lambda::transformer:mqtt"
             .parse::<rustfs_targets::arn::ARN>()
             .expect("arn should parse");
-        let empty_config = rustfs_ecstore::config::Config(std::collections::HashMap::new());
+        let empty_config = rustfs_config::server_config::Config(std::collections::HashMap::new());
         let unsupported_err = resolve_object_lambda_webhook_config_from_server_config(&empty_config, &unsupported)
             .expect_err("unsupported target type should fail");
         assert_eq!(unsupported_err.code(), &S3ErrorCode::NotImplemented);
@@ -3433,17 +3434,17 @@ mod tests {
         let webhook = "arn:acme:s3-object-lambda::transformer:webhook"
             .parse::<rustfs_targets::arn::ARN>()
             .expect("arn should parse");
-        let disabled_config = rustfs_ecstore::config::Config(std::collections::HashMap::from([(
+        let disabled_config = rustfs_config::server_config::Config(std::collections::HashMap::from([(
             LAMBDA_WEBHOOK_SUB_SYS.to_string(),
             std::collections::HashMap::from([(
                 "transformer".to_string(),
-                rustfs_ecstore::config::KVS(vec![
-                    rustfs_ecstore::config::KV {
+                rustfs_config::server_config::KVS(vec![
+                    rustfs_config::server_config::KV {
                         key: ENABLE_KEY.to_string(),
                         value: "off".to_string(),
                         hidden_if_empty: false,
                     },
-                    rustfs_ecstore::config::KV {
+                    rustfs_config::server_config::KV {
                         key: WEBHOOK_ENDPOINT.to_string(),
                         value: "https://example.com/transform".to_string(),
                         hidden_if_empty: false,

@@ -32,7 +32,7 @@ use crate::event_notification::{EventArgs, send_event};
 use crate::global::GLOBAL_LocalNodeName;
 use crate::global::get_global_bucket_monitor;
 use crate::set_disk::get_lock_acquire_timeout;
-use crate::store_api::{DeletedObject, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete, WalkOptions};
+use crate::store_api::{DeletedObject, HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOptions, ObjectToDelete, WalkOptions};
 use crate::{StorageAPI, new_object_layer_fn};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
@@ -485,7 +485,7 @@ impl ReplicationResyncer {
         }
     }
 
-    pub async fn mark_status<S: StorageAPI>(&self, status: ResyncStatusType, opts: ResyncOpts, obj_layer: Arc<S>) -> Result<()> {
+    pub async fn mark_status<S: ObjectIO>(&self, status: ResyncStatusType, opts: ResyncOpts, obj_layer: Arc<S>) -> Result<()> {
         let bucket_status = {
             let mut status_map = self.status_map.write().await;
             let now = OffsetDateTime::now_utc();
@@ -590,7 +590,7 @@ impl ReplicationResyncer {
         bucket_status.last_update = Some(now);
     }
 
-    pub async fn persist_to_disk<S: StorageAPI>(&self, cancel_token: CancellationToken, api: Arc<S>) {
+    pub async fn persist_to_disk<S: ObjectIO>(&self, cancel_token: CancellationToken, api: Arc<S>) {
         let mut interval = tokio::time::interval(RESYNC_TIME_INTERVAL);
 
         let mut last_update_times = HashMap::new();
@@ -635,7 +635,7 @@ impl ReplicationResyncer {
         }
     }
 
-    async fn resync_bucket_mark_status<S: StorageAPI>(&self, status: ResyncStatusType, opts: ResyncOpts, storage: Arc<S>) {
+    async fn resync_bucket_mark_status<S: ObjectIO>(&self, status: ResyncStatusType, opts: ResyncOpts, storage: Arc<S>) {
         if let Err(err) = self.mark_status(status, opts.clone(), storage.clone()).await {
             error!("Failed to mark resync status: {}", err);
         }
@@ -1026,7 +1026,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
     }
 }
 
-pub(crate) async fn save_resync_status<S: StorageAPI>(
+pub(crate) async fn save_resync_status<S: ObjectIO>(
     bucket: &str,
     status: &BucketReplicationResyncStatus,
     api: Arc<S>,

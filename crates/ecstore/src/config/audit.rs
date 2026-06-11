@@ -12,8 +12,8 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::config::{KV, KVS};
 use rustfs_config::audit::AUDIT_REDIS_DEFAULT_CHANNEL;
+use rustfs_config::server_config::{KV, KVS};
 use rustfs_config::{
     AMQP_EXCHANGE, AMQP_MANDATORY, AMQP_PASSWORD, AMQP_PERSISTENT, AMQP_QUEUE_DIR, AMQP_QUEUE_LIMIT, AMQP_ROUTING_KEY,
     AMQP_TLS_CA, AMQP_TLS_CLIENT_CERT, AMQP_TLS_CLIENT_KEY, AMQP_URL, AMQP_USERNAME, COMMENT_KEY, DEFAULT_LIMIT, ENABLE_KEY,

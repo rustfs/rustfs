@@ -31,8 +31,8 @@ pub fn builtin_target_plugins() -> Vec<TargetPluginDescriptor<Event>> {
 mod tests {
     use super::builtin_target_descriptors;
     use rustfs_config::notify::NOTIFY_AMQP_KEYS;
+    use rustfs_config::server_config::KVS;
     use rustfs_config::{AMQP_EXCHANGE, AMQP_QUEUE_DIR, AMQP_ROUTING_KEY, AMQP_URL};
-    use rustfs_ecstore::config::KVS;
     use rustfs_targets::target::ChannelTargetType;
 
     fn amqp_base_config() -> KVS {

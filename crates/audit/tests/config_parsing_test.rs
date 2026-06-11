@@ -14,7 +14,7 @@
 
 //! Tests for audit configuration parsing and validation
 
-use rustfs_ecstore::config::KVS;
+use rustfs_config::server_config::KVS;
 
 #[test]
 fn test_webhook_valid_fields() {

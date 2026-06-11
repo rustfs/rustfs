@@ -85,12 +85,38 @@ config:
     scanner:
       # Scanner speed preset: fastest|fast|default|slow|slowest
       speed: ""
+      # Override scanner sleep multiplier (0-10000)
+      delay: ""
+      # Override maximum scanner sleep in seconds
+      max_wait_secs: ""
+      # Override scanner cycle interval in seconds
+      cycle_secs: ""
       # Override start delay in seconds (optional)
       start_delay_secs: ""
+      # Cap one scanner cycle's runtime in seconds (0 disables)
+      cycle_max_duration_secs: ""
+      # Cap objects processed by one scanner cycle (0 disables)
+      cycle_max_objects: ""
+      # Cap directories entered by one scanner cycle (0 disables)
+      cycle_max_directories: ""
+      # Periodic deep bitrot cycle in seconds; false/off/no/disabled disables
+      bitrot_cycle_secs: ""
       # Enable/disable scanner sleeps for throttling
       idle_mode: ""
       # Timeout for scanner cache saves in seconds (minimum 1 second)
       cache_save_timeout_secs: ""
+      # Cap concurrent scanner set tasks (0 keeps topology-derived concurrency)
+      max_concurrent_set_scans: ""
+      # Cap concurrent scanner disk bucket walks per set (0 keeps disk-count-derived concurrency)
+      max_concurrent_disk_scans: ""
+      # Yield to the async runtime every N scanned objects (0 disables extra yield)
+      yield_every_n_objects: ""
+      # Version count threshold for scanner alerts
+      alert_excess_versions: ""
+      # Retained version byte threshold for scanner alerts
+      alert_excess_version_size: ""
+      # Direct subfolder threshold for scanner alerts
+      alert_excess_folders: ""
     # Drive timeout profile preset: default|high_latency
     # - default: keep current timeout defaults.
     # - high_latency: use higher timeout defaults for scanner-sensitive operations.

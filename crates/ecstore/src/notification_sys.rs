@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::StorageAPI;
 use crate::admin_server_info::get_commit_id;
 use crate::error::{Error, Result};
 use crate::global::{GLOBAL_BOOT_TIME, get_global_endpoints};
@@ -26,6 +25,7 @@ use rustfs_madmin::health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConf
 use rustfs_madmin::metrics::RealtimeMetrics;
 use rustfs_madmin::net::NetInfo;
 use rustfs_madmin::{ItemState, ServerProperties, StorageInfo};
+use rustfs_storage_api::StorageAdminApi;
 use std::collections::hash_map::DefaultHasher;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
@@ -273,7 +273,10 @@ impl NotificationSys {
         join_all(futures).await
     }
 
-    pub async fn storage_info<S: StorageAPI>(&self, api: &S) -> rustfs_madmin::StorageInfo {
+    pub async fn storage_info<S>(&self, api: &S) -> rustfs_madmin::StorageInfo
+    where
+        S: StorageAdminApi<BackendInfo = rustfs_madmin::BackendInfo, StorageInfo = rustfs_madmin::StorageInfo>,
+    {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         let endpoints = get_global_endpoints();
         let peer_timeout = Duration::from_secs(5);
@@ -307,14 +310,14 @@ impl NotificationSys {
 
         let mut replies = join_all(futures).await;
 
-        replies.push(Some(api.local_storage_info().await));
+        replies.push(Some(StorageAdminApi::local_storage_info(api).await));
 
         let mut disks = Vec::new();
         for info in replies.into_iter().flatten() {
             disks.extend(info.disks);
         }
 
-        let backend = api.backend_info().await;
+        let backend = StorageAdminApi::backend_info(api).await;
         rustfs_madmin::StorageInfo { disks, backend }
     }
 

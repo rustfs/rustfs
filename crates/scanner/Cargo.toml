@@ -46,6 +46,7 @@ rmp-serde = { workspace = true }
 rustfs-filemeta = { workspace = true }
 tokio-util = { workspace = true }
 rustfs-ecstore = { workspace = true }
+rustfs-storage-api = { workspace = true }
 http = { workspace = true }
 rand = { workspace = true }
 s3s = { workspace = true }

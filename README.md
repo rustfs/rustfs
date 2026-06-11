@@ -210,6 +210,10 @@ make help-docker                      # Show all Docker-related commands
 
 Follow the instructions in the [Helm Chart README](https://charts.rustfs.com/) to install RustFS on a Kubernetes cluster.
 
+For scanner pacing, cycle budgets, bitrot cadence, lifecycle transition status,
+and single-node single-disk idle CPU tuning, see
+[Scanner Runtime Controls](docs/operations/scanner-runtime-controls.md).
+
 ### 5\. Nix Flake (Option 5)
 
 If you have [Nix with flakes enabled](https://nixos.wiki/wiki/Flakes#Enable_flakes):
