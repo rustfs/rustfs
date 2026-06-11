@@ -23,7 +23,12 @@ use rustfs_config::server_config::{Config, KVS};
 use rustfs_targets::{Target, arn::TargetID};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
+
+const LOG_COMPONENT_NOTIFY: &str = "notify";
+const LOG_SUBSYSTEM_CONFIG: &str = "config";
+const EVENT_NOTIFY_RUNTIME_LIFECYCLE: &str = "notify_runtime_lifecycle";
+const EVENT_NOTIFY_CONFIG_UPDATE: &str = "notify_config_update";
 
 pub(crate) fn notify_configuration_hint() -> String {
     let webhook_enable_primary = format!("{}_PRIMARY", rustfs_config::notify::ENV_NOTIFY_WEBHOOK_ENABLE);
@@ -81,7 +86,13 @@ impl NotifyConfigManager {
     }
 
     pub async fn init(&self) -> Result<(), NotificationError> {
-        info!("Initialize notification system...");
+        info!(
+            event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
+            component = LOG_COMPONENT_NOTIFY,
+            subsystem = LOG_SUBSYSTEM_CONFIG,
+            state = "initializing",
+            "Initializing notification system"
+        );
 
         let config = {
             let guard = self.config.read().await;
@@ -94,19 +105,48 @@ impl NotifyConfigManager {
 
         let targets: Vec<Box<dyn Target<Event> + Send + Sync>> = self.registry.create_targets_from_config(&config).await?;
 
-        info!("{} notification targets were created", targets.len());
+        info!(
+            event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
+            component = LOG_COMPONENT_NOTIFY,
+            subsystem = LOG_SUBSYSTEM_CONFIG,
+            state = "targets_created",
+            target_count = targets.len(),
+            "Created notification targets"
+        );
         if targets.is_empty() {
-            warn!("{}", notify_configuration_hint());
+            debug!(
+                event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
+                component = LOG_COMPONENT_NOTIFY,
+                subsystem = LOG_SUBSYSTEM_CONFIG,
+                state = "idle",
+                reason = "no_targets_configured",
+                hint = %notify_configuration_hint(),
+                "Notification runtime has no configured targets"
+            );
         }
 
         let activation = self.runtime_facade.activate_targets_with_replay(targets).await;
         self.runtime_facade.replace_targets(activation).await?;
-        info!("Notification system initialized");
+        info!(
+            event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
+            component = LOG_COMPONENT_NOTIFY,
+            subsystem = LOG_SUBSYSTEM_CONFIG,
+            state = "initialized",
+            "Initialized notification system"
+        );
         Ok(())
     }
 
     pub async fn remove_target(&self, target_id: &TargetID, target_type: &str) -> Result<(), NotificationError> {
-        info!("Attempting to remove target: {}", target_id);
+        debug!(
+            event = EVENT_NOTIFY_CONFIG_UPDATE,
+            component = LOG_COMPONENT_NOTIFY,
+            subsystem = LOG_SUBSYSTEM_CONFIG,
+            action = "remove_target",
+            target_id = %target_id,
+            target_type,
+            "Attempting to remove notification target"
+        );
 
         let ttype = target_type.to_lowercase();
         let tname = target_id.id.to_lowercase();
@@ -115,7 +155,15 @@ impl NotifyConfigManager {
             let mut changed = false;
             if let Some(targets_of_type) = config.0.get_mut(&ttype) {
                 if targets_of_type.remove(&tname).is_some() {
-                    info!("Removed target {} from configuration", target_id);
+                    info!(
+                        event = EVENT_NOTIFY_CONFIG_UPDATE,
+                        component = LOG_COMPONENT_NOTIFY,
+                        subsystem = LOG_SUBSYSTEM_CONFIG,
+                        action = "remove_target",
+                        target_id = %target_id,
+                        result = "removed",
+                        "Removed notification target from configuration"
+                    );
                     changed = true;
                 }
                 if targets_of_type.is_empty() {
@@ -123,7 +171,15 @@ impl NotifyConfigManager {
                 }
             }
             if !changed {
-                warn!("Target {} not found in configuration", target_id);
+                debug!(
+                    event = EVENT_NOTIFY_CONFIG_UPDATE,
+                    component = LOG_COMPONENT_NOTIFY,
+                    subsystem = LOG_SUBSYSTEM_CONFIG,
+                    action = "remove_target",
+                    target_id = %target_id,
+                    result = "not_found",
+                    "Notification target not found in configuration"
+                );
             }
             changed
         })
@@ -131,7 +187,15 @@ impl NotifyConfigManager {
     }
 
     pub async fn set_target_config(&self, target_type: &str, target_name: &str, kvs: KVS) -> Result<(), NotificationError> {
-        info!("Setting config for target {} of type {}", target_name, target_type);
+        debug!(
+            event = EVENT_NOTIFY_CONFIG_UPDATE,
+            component = LOG_COMPONENT_NOTIFY,
+            subsystem = LOG_SUBSYSTEM_CONFIG,
+            action = "set_target_config",
+            target_type,
+            target_name,
+            "Setting notification target configuration"
+        );
         let ttype = target_type.to_lowercase();
         let tname = target_name.to_lowercase();
         self.update_config_and_reload(|config| {
@@ -142,7 +206,15 @@ impl NotifyConfigManager {
     }
 
     pub async fn remove_target_config(&self, target_type: &str, target_name: &str) -> Result<(), NotificationError> {
-        info!("Removing config for target {} of type {}", target_name, target_type);
+        debug!(
+            event = EVENT_NOTIFY_CONFIG_UPDATE,
+            component = LOG_COMPONENT_NOTIFY,
+            subsystem = LOG_SUBSYSTEM_CONFIG,
+            action = "remove_target_config",
+            target_type,
+            target_name,
+            "Removing notification target configuration"
+        );
 
         let ttype = target_type.to_lowercase();
         let tname = target_name.to_lowercase();
@@ -166,7 +238,16 @@ impl NotifyConfigManager {
                 }
             }
             if !changed {
-                info!("Target {} of type {} not found, no changes made.", target_name, target_type);
+                debug!(
+                    event = EVENT_NOTIFY_CONFIG_UPDATE,
+                    component = LOG_COMPONENT_NOTIFY,
+                    subsystem = LOG_SUBSYSTEM_CONFIG,
+                    action = "remove_target_config",
+                    target_type = %target_type,
+                    target_name = %target_name,
+                    result = "not_found",
+                    "Notification target configuration not found"
+                );
             }
             debug!(
                 subsystem_count = config.0.len(),
@@ -178,7 +259,13 @@ impl NotifyConfigManager {
     }
 
     pub async fn reload_config(&self, new_config: Config) -> Result<(), NotificationError> {
-        info!("Reload notification configuration starts");
+        info!(
+            event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
+            component = LOG_COMPONENT_NOTIFY,
+            subsystem = LOG_SUBSYSTEM_CONFIG,
+            state = "reloading",
+            "Reloading notification configuration"
+        );
 
         self.update_config(new_config.clone()).await;
 
@@ -188,14 +275,35 @@ impl NotifyConfigManager {
             .await
             .map_err(NotificationError::Target)?;
 
-        info!("{} notification targets were created from the new configuration", targets.len());
+        info!(
+            event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
+            component = LOG_COMPONENT_NOTIFY,
+            subsystem = LOG_SUBSYSTEM_CONFIG,
+            state = "targets_created",
+            target_count = targets.len(),
+            "Created notification targets from reloaded configuration"
+        );
         if targets.is_empty() {
-            warn!("{}", notify_configuration_hint());
+            debug!(
+                event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
+                component = LOG_COMPONENT_NOTIFY,
+                subsystem = LOG_SUBSYSTEM_CONFIG,
+                state = "idle",
+                reason = "no_targets_configured",
+                hint = %notify_configuration_hint(),
+                "Notification runtime has no configured targets after reload"
+            );
         }
 
         let activation = self.runtime_facade.activate_targets_with_replay(targets).await;
         self.runtime_facade.replace_targets(activation).await?;
-        info!("Configuration reloaded end");
+        info!(
+            event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
+            component = LOG_COMPONENT_NOTIFY,
+            subsystem = LOG_SUBSYSTEM_CONFIG,
+            state = "reloaded",
+            "Reloaded notification configuration"
+        );
         Ok(())
     }
 
@@ -219,7 +327,14 @@ impl NotifyConfigManager {
             .map_err(|e| NotificationError::ReadConfig(e.to_string()))?;
 
         if !modifier(&mut new_config) {
-            info!("Configuration not changed, skipping save and reload.");
+            debug!(
+                event = EVENT_NOTIFY_CONFIG_UPDATE,
+                component = LOG_COMPONENT_NOTIFY,
+                subsystem = LOG_SUBSYSTEM_CONFIG,
+                action = "reload_if_changed",
+                result = "unchanged",
+                "Notification configuration unchanged; skipping reload"
+            );
             return Ok(());
         }
 
@@ -227,7 +342,14 @@ impl NotifyConfigManager {
             .await
             .map_err(|e| NotificationError::SaveConfig(e.to_string()))?;
 
-        info!("Configuration updated. Reloading system...");
+        info!(
+            event = EVENT_NOTIFY_CONFIG_UPDATE,
+            component = LOG_COMPONENT_NOTIFY,
+            subsystem = LOG_SUBSYSTEM_CONFIG,
+            action = "reload_if_changed",
+            result = "updated",
+            "Notification configuration updated; reloading runtime"
+        );
         self.reload_config(new_config).await
     }
 }

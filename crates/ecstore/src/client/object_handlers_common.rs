@@ -13,7 +13,12 @@
 // limitations under the License.
 
 use std::sync::Arc;
-use tracing::warn;
+use tracing::debug;
+
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
+const EVENT_LIFECYCLE_CLEANUP_SKIPPED: &str = "lifecycle_cleanup_skipped";
+const EVENT_LIFECYCLE_CLEANUP_FAILED: &str = "lifecycle_cleanup_failed";
 
 use crate::bucket::lifecycle::lifecycle;
 use crate::bucket::replication::{DeletedObjectReplicationInfo, check_replicate_delete, schedule_replication_delete};
@@ -40,7 +45,15 @@ pub async fn delete_object_versions(api: &Arc<ECStore>, bucket: &str, to_del: &[
     let version_suspended = match BucketVersioningSys::get(bucket).await {
         Ok(vc) => vc.suspended(),
         Err(err) => {
-            warn!(bucket, error = ?err, "failed to get versioning config during lifecycle noncurrent version cleanup");
+            debug!(
+                event = EVENT_LIFECYCLE_CLEANUP_SKIPPED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                bucket,
+                error = ?err,
+                reason = "versioning_config_unavailable",
+                "Skipped lifecycle noncurrent version cleanup"
+            );
             return;
         }
     };
@@ -70,12 +83,16 @@ pub async fn delete_object_versions(api: &Arc<ECStore>, bucket: &str, to_del: &[
                         .then(|| lifecycle_version_delete_replication_state(dsc.to_string(), dsc.pending_status()))
                 }
                 Err(err) => {
-                    warn!(
+                    debug!(
+                        event = EVENT_LIFECYCLE_CLEANUP_SKIPPED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
                         bucket,
                         object = %object.object_name,
                         version_id = ?version_id,
                         error = ?err,
-                        "failed to get object info during lifecycle noncurrent version cleanup; skipping delete replication scheduling"
+                        reason = "object_info_unavailable",
+                        "Skipped lifecycle delete replication scheduling"
                     );
                     None
                 }
@@ -119,7 +136,16 @@ pub async fn delete_object_versions(api: &Arc<ECStore>, bucket: &str, to_del: &[
                     .and_then(|o| o.version_id)
                     .map(|v| v.to_string())
                     .unwrap_or_default();
-                warn!(bucket, object = obj_name, version_id = %vid, error = ?e, "failed to delete noncurrent version during lifecycle cleanup");
+                debug!(
+                    event = EVENT_LIFECYCLE_CLEANUP_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    bucket,
+                    object = obj_name,
+                    version_id = %vid,
+                    error = ?e,
+                    "Failed lifecycle noncurrent version cleanup"
+                );
             }
         }
         if remaining.is_empty() {

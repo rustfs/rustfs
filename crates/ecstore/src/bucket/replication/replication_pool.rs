@@ -56,7 +56,15 @@ use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument};
+
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_REPLICATION: &str = "replication";
+const EVENT_REPLICATION_WORKER_RESIZE_SKIPPED: &str = "replication_worker_resize_skipped";
+const EVENT_REPLICATION_WORKER_RESIZED: &str = "replication_worker_resized";
+const EVENT_REPLICATION_BACKPRESSURE: &str = "replication_backpressure";
+const EVENT_REPLICATION_RESYNC_LOAD_SKIPPED: &str = "replication_resync_load_skipped";
+const EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED: &str = "replication_config_lookup_skipped";
 
 // Worker limits
 pub const WORKER_MAX_LIMIT: usize = 500;
@@ -358,18 +366,31 @@ impl<S: StorageAPI> ReplicationPool<S> {
         let mut workers = self.workers.write().await;
 
         if (check_old > 0 && workers.len() != check_old) || n == workers.len() || n < 1 {
-            warn!(
-                "resize_workers: skipping resize - check_old_mismatch={}, same_size={}, invalid_n={}",
-                check_old > 0 && workers.len() != check_old,
-                n == workers.len(),
-                n < 1
+            debug!(
+                event = EVENT_REPLICATION_WORKER_RESIZE_SKIPPED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                check_old_mismatch = check_old > 0 && workers.len() != check_old,
+                same_size = n == workers.len(),
+                invalid_target_size = n < 1,
+                current_workers = workers.len(),
+                target_workers = n,
+                "Skipped replication worker resize"
             );
             return;
         }
 
         // Add workers if needed
         if workers.len() < n {
-            info!("resize_workers: adding workers from {} to {}", workers.len(), n);
+            info!(
+                event = EVENT_REPLICATION_WORKER_RESIZED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                action = "increase",
+                from_workers = workers.len(),
+                to_workers = n,
+                "Resized replication workers"
+            );
         }
 
         while workers.len() < n {
@@ -416,7 +437,15 @@ impl<S: StorageAPI> ReplicationPool<S> {
 
         // Remove workers if needed
         if workers.len() > n {
-            warn!("resize_workers: removing workers from {} to {}", workers.len(), n);
+            info!(
+                event = EVENT_REPLICATION_WORKER_RESIZED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                action = "decrease",
+                from_workers = workers.len(),
+                to_workers = n,
+                "Resized replication workers"
+            );
         }
 
         while workers.len() > n {
@@ -607,11 +636,26 @@ impl<S: StorageAPI> ReplicationPool<S> {
 
         match priority {
             ReplicationPriority::Fast => {
-                // Log warning about unable to keep up
-                info!("Warning: Unable to keep up with incoming traffic");
+                debug!(
+                    event = EVENT_REPLICATION_BACKPRESSURE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    queue_type = "object",
+                    priority = "fast",
+                    recommendation = "none",
+                    "Replication queue is backpressured"
+                );
             }
             ReplicationPriority::Slow => {
-                info!("Warning: Unable to keep up with incoming traffic - recommend increasing replication priority to auto");
+                debug!(
+                    event = EVENT_REPLICATION_BACKPRESSURE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    queue_type = "object",
+                    priority = "slow",
+                    recommendation = "set_priority_auto",
+                    "Replication queue is backpressured"
+                );
             }
             ReplicationPriority::Auto => {
                 let max_w = std::cmp::min(max_workers, WORKER_MAX_LIMIT);
@@ -667,10 +711,26 @@ impl<S: StorageAPI> ReplicationPool<S> {
 
         match priority {
             ReplicationPriority::Fast => {
-                info!("Warning: Unable to keep up with incoming deletes");
+                debug!(
+                    event = EVENT_REPLICATION_BACKPRESSURE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    queue_type = "delete",
+                    priority = "fast",
+                    recommendation = "none",
+                    "Replication delete queue is backpressured"
+                );
             }
             ReplicationPriority::Slow => {
-                info!("Warning: Unable to keep up with incoming deletes - recommend increasing replication priority to auto");
+                debug!(
+                    event = EVENT_REPLICATION_BACKPRESSURE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    queue_type = "delete",
+                    priority = "slow",
+                    recommendation = "set_priority_auto",
+                    "Replication delete queue is backpressured"
+                );
             }
             ReplicationPriority::Auto => {
                 let max_w = std::cmp::min(max_workers, WORKER_MAX_LIMIT);
@@ -930,7 +990,15 @@ impl<S: StorageAPI> ReplicationPool<S> {
                 Ok(meta) => meta,
                 Err(err) => {
                     if !matches!(err, EcstoreError::VolumeNotFound) {
-                        warn!("Error loading resync metadata for bucket {bucket}: {err:?}");
+                        debug!(
+                            event = EVENT_REPLICATION_RESYNC_LOAD_SKIPPED,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_REPLICATION,
+                            bucket,
+                            error = ?err,
+                            reason = "metadata_load_failed",
+                            "Skipped replication resync metadata load"
+                        );
                     }
                     continue;
                 }
@@ -1179,7 +1247,15 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
     let rcfg = match metadata_sys::get_replication_config(bucket).await {
         Ok((config, _)) => config,
         Err(err) => {
-            warn!("Failed to get replication config for bucket {}: {}", bucket, err);
+            debug!(
+                event = EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                bucket,
+                error = %err,
+                reason = "config_lookup_failed",
+                "Skipped replication heal queue due to missing replication config"
+            );
 
             return;
         }
@@ -1188,7 +1264,15 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
     let tgts = match BucketTargetSys::get().list_bucket_targets(bucket).await {
         Ok(targets) => Some(targets),
         Err(err) => {
-            warn!("Failed to list bucket targets for bucket {}: {}", bucket, err);
+            debug!(
+                event = EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                bucket,
+                error = %err,
+                reason = "target_list_failed",
+                "Skipped bucket target list during replication heal queue setup"
+            );
             None
         }
     };
