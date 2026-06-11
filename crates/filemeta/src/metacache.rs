@@ -35,7 +35,7 @@ use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::spawn;
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{debug, warn};
 
 const SLASH_SEPARATOR: &str = "/";
 
@@ -313,7 +313,12 @@ impl MetaCacheEntries {
 
     pub fn resolve(&self, mut params: MetadataResolutionParams) -> Option<MetaCacheEntry> {
         if self.0.is_empty() {
-            warn!("decommission_pool: entries resolve empty");
+            debug!(
+                bucket = %params.bucket,
+                dir_quorum = params.dir_quorum,
+                obj_quorum = params.obj_quorum,
+                "metacache resolve skipped because there were no entries to reconcile"
+            );
             return None;
         }
 
@@ -327,21 +332,21 @@ impl MetaCacheEntries {
         for entry in self.0.iter().flatten() {
             let mut entry = entry.clone();
 
-            warn!("decommission_pool: entries resolve entry {:?}", entry.name);
+            debug!(entry = %entry.name, "metacache resolve examining candidate entry");
             if entry.name.is_empty() {
                 continue;
             }
             if entry.is_dir() {
                 dir_exists += 1;
                 selected = Some(entry.clone());
-                warn!("decommission_pool: entries resolve entry dir {:?}", entry.name);
+                debug!(entry = %entry.name, "metacache resolve observed directory candidate");
                 continue;
             }
 
             let xl = match entry.xl_meta() {
                 Ok(xl) => xl,
                 Err(e) => {
-                    warn!("decommission_pool: entries resolve entry xl_meta {:?}", e);
+                    debug!(entry = %entry.name, error = ?e, "metacache resolve skipped candidate with unreadable xl.meta");
                     continue;
                 }
             };
@@ -352,50 +357,70 @@ impl MetaCacheEntries {
             if selected.is_none() {
                 selected = Some(entry.clone());
                 objs_agree = 1;
-                warn!("decommission_pool: entries resolve entry selected {:?}", entry.name);
+                debug!(entry = %entry.name, "metacache resolve selected initial candidate");
                 continue;
             }
 
             if let (prefer, true) = entry.matches(selected.as_ref(), params.strict) {
                 selected = prefer;
                 objs_agree += 1;
-                warn!("decommission_pool: entries resolve entry prefer {:?}", entry.name);
+                debug!(entry = %entry.name, "metacache resolve preferred candidate during reconciliation");
                 continue;
             }
         }
 
         let Some(selected) = selected else {
-            warn!("decommission_pool: entries resolve entry no selected");
+            debug!(
+                bucket = %params.bucket,
+                dir_quorum = params.dir_quorum,
+                obj_quorum = params.obj_quorum,
+                "metacache resolve could not select any candidate entry"
+            );
             return None;
         };
 
         if selected.is_dir() && dir_exists >= params.dir_quorum {
-            warn!("decommission_pool: entries resolve entry dir selected {:?}", selected.name);
+            debug!(
+                entry = %selected.name,
+                dir_exists,
+                dir_quorum = params.dir_quorum,
+                "metacache resolve selected directory candidate after quorum reconciliation"
+            );
             return Some(selected);
         }
 
         // If we would never be able to reach read quorum.
         if objs_valid < params.obj_quorum {
-            warn!(
-                "decommission_pool: entries resolve entry not enough objects {} < {}",
-                objs_valid, params.obj_quorum
+            debug!(
+                objs_valid,
+                obj_quorum = params.obj_quorum,
+                "metacache resolve did not have enough valid object candidates to satisfy quorum"
             );
             return None;
         }
 
         if objs_agree == objs_valid {
-            warn!("decommission_pool: entries resolve entry all agree {} == {}", objs_agree, objs_valid);
+            debug!(
+                selected = %selected.name,
+                objs_agree,
+                objs_valid,
+                "metacache resolve reused selected candidate because all valid object entries agreed"
+            );
             return Some(selected);
         }
 
         let Some(cached) = selected.cached else {
-            warn!("decommission_pool: entries resolve entry no cached");
+            debug!(selected = %selected.name, "metacache resolve could not merge because selected candidate had no cached metadata");
             return None;
         };
 
         let versions = merge_file_meta_versions(params.obj_quorum, params.strict, params.requested_versions, &params.candidates);
         if versions.is_empty() {
-            warn!("decommission_pool: entries resolve entry no versions");
+            debug!(
+                selected = %selected.name,
+                requested_versions = params.requested_versions,
+                "metacache resolve produced no merged versions after reconciliation"
+            );
             return None;
         }
 
@@ -408,7 +433,11 @@ impl MetaCacheEntries {
         let metadata = match merged_cached.marshal_msg() {
             Ok(meta) => meta,
             Err(e) => {
-                warn!("decommission_pool: entries resolve entry marshal_msg {:?}", e);
+                warn!(
+                    selected = %selected.name,
+                    error = ?e,
+                    "metacache resolve failed to marshal merged metadata entry"
+                );
                 return None;
             }
         };
@@ -422,7 +451,12 @@ impl MetaCacheEntries {
             metadata,
         };
 
-        warn!("decommission_pool: entries resolve entry selected {:?}", new_selected.name);
+        debug!(
+            selected = %new_selected.name,
+            candidate_count = params.candidates.len(),
+            obj_quorum = params.obj_quorum,
+            "metacache resolve produced merged metadata entry after reconciling disagreeing candidates"
+        );
         Some(new_selected)
     }
 
