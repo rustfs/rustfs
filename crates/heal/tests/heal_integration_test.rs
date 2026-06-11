@@ -133,7 +133,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage
 
     // init bucket metadata system
     let buckets_list = ecstore
-        .list_bucket(&rustfs_ecstore::store_api::BucketOptions {
+        .list_bucket(&rustfs_storage_api::BucketOptions {
             no_metadata: true,
             ..Default::default()
         })

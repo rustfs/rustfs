@@ -12,31 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::store_api::{
-    BucketInfo as EcstoreBucketInfo, BucketOptions as EcstoreBucketOptions, MakeBucketOptions as EcstoreMakeBucketOptions,
-};
 use rustfs_ecstore::{disk::DiskStore, error::Error, store::ECStore};
-use rustfs_storage_api::{
-    BucketInfo as ApiBucketInfo, BucketOptions as ApiBucketOptions, MakeBucketOptions as ApiMakeBucketOptions, StorageAdminApi,
-};
-
-#[test]
-fn old_store_api_bucket_dto_path_reexports_storage_api_types() {
-    let ecstore_bucket: EcstoreBucketInfo = ApiBucketInfo {
-        name: "photos".to_owned(),
-        versioning: true,
-        ..Default::default()
-    };
-    let api_bucket: ApiBucketInfo = ecstore_bucket;
-
-    let ecstore_make: EcstoreMakeBucketOptions = ApiMakeBucketOptions::default();
-    let api_options: ApiBucketOptions = EcstoreBucketOptions::default();
-
-    assert_eq!(api_bucket.name, "photos");
-    assert!(api_bucket.versioning);
-    assert!(!ecstore_make.lock_enabled);
-    assert!(!api_options.no_metadata);
-}
+use rustfs_storage_api::StorageAdminApi;
 
 fn storage_admin_api_type_name<T>() -> &'static str
 where

@@ -70,10 +70,10 @@ use rustfs_ecstore::{
     store::ECStore,
     store::init_local_disks,
     store_api::BucketOperations,
-    store_api::BucketOptions,
     update_erasure_type,
 };
 use rustfs_obs::{init_obs, set_global_guard};
+use rustfs_storage_api::BucketOptions;
 use rustfs_utils::net::parse_and_resolve_address;
 use rustls::crypto::aws_lc_rs::default_provider;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};

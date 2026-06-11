@@ -17,7 +17,8 @@
 use super::{SwiftError, SwiftResult};
 use rustfs_credentials::Credentials;
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketOperations, MakeBucketOptions};
+use rustfs_ecstore::store_api::BucketOperations;
+use rustfs_storage_api::MakeBucketOptions;
 use s3s::dto::{Tag, Tagging};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;

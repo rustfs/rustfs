@@ -1282,9 +1282,10 @@ mod tests {
     use rustfs_ecstore::{
         data_usage::DATA_USAGE_CACHE_NAME,
         disk::{BUCKET_META_PREFIX, DiskStore, RUSTFS_META_BUCKET, endpoint::Endpoint},
-        store_api::{BucketInfo, ObjectInfo},
+        store_api::ObjectInfo,
     };
     use rustfs_madmin::heal_commands::HealResultItem;
+    use rustfs_storage_api::BucketInfo;
     use std::sync::Mutex;
 
     #[derive(Default)]
