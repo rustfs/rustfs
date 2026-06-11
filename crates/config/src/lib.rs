@@ -68,3 +68,5 @@ pub mod notify;
 pub mod observability;
 #[cfg(feature = "opa")]
 pub mod opa;
+#[cfg(feature = "server-config-model")]
+pub mod server_config;

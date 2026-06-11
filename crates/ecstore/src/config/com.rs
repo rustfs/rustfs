@@ -2697,7 +2697,7 @@ mod tests {
 
         // Verify the decoded config has "storage_class" (with underscore) subsystem
         let kvs = decoded
-            .get_value(STORAGE_CLASS_SUB_SYS, crate::config::DEFAULT_DELIMITER)
+            .get_value(STORAGE_CLASS_SUB_SYS, rustfs_config::DEFAULT_DELIMITER)
             .expect("decoded config should have storage_class subsystem");
         assert_eq!(kvs.get("standard"), "EC:4", "standard should be EC:4");
         assert_eq!(kvs.get("rrs"), "EC:2", "rrs should be EC:2");
