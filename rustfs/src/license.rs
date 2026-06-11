@@ -19,7 +19,11 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{error, info, warn};
+use tracing::{error, warn};
+
+const LOG_COMPONENT_LICENSE: &str = "license";
+const LOG_SUBSYSTEM_RUNTIME: &str = "runtime";
+const EVENT_LICENSE_INITIALIZATION_FAILED: &str = "license_initialization_failed";
 
 pub type LicenseResult<T> = std::result::Result<T, LicenseError>;
 pub type SharedLicenseVerifier = Arc<dyn LicenseVerifier>;
@@ -217,7 +221,36 @@ pub fn set_license_verifier(verifier: SharedLicenseVerifier) -> bool {
 /// This keeps the default API signature stable and is safe to call multiple times.
 pub fn initialize_license(raw_license: Option<String>) {
     if let Err(err) = initialize_license_result(raw_license) {
-        error!("license initialization failed: {err}");
+        match err {
+            LicenseError::Missing | LicenseError::Invalid(_) => {
+                warn!(
+                    event = EVENT_LICENSE_INITIALIZATION_FAILED,
+                    component = LOG_COMPONENT_LICENSE,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    error = %err,
+                    "License initialization failed"
+                );
+            }
+            #[cfg(feature = "license")]
+            LicenseError::Expired { .. } => {
+                warn!(
+                    event = EVENT_LICENSE_INITIALIZATION_FAILED,
+                    component = LOG_COMPONENT_LICENSE,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    error = %err,
+                    "License initialization failed"
+                );
+            }
+            LicenseError::StatePoisoned | LicenseError::Clock(_) => {
+                error!(
+                    event = EVENT_LICENSE_INITIALIZATION_FAILED,
+                    component = LOG_COMPONENT_LICENSE,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    error = %err,
+                    "License initialization failed"
+                );
+            }
+        }
     }
 }
 
@@ -231,13 +264,11 @@ pub fn initialize_license_result(raw_license: Option<String>) -> LicenseResult<(
             let now = now_epoch_secs()?;
             match license_verifier().validate(&raw_license, now) {
                 Ok(token) => {
-                    apply_valid_status(&mut state, token.clone());
-                    info!("license loaded, subject: {}", token.name);
+                    apply_valid_status(&mut state, token);
                     Ok(())
                 }
                 Err(err) => {
                     apply_invalid_status(&mut state, err.clone());
-                    warn!("license verification failed: {err}");
                     Err(err)
                 }
             }
