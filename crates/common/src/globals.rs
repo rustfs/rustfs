@@ -109,7 +109,10 @@ pub fn get_global_outbound_tls_generation() -> u64 {
 pub async fn evict_connection(addr: &str) {
     let removed = GLOBAL_CONN_MAP.write().await.remove(addr);
     if removed.is_some() {
-        tracing::warn!("Evicted stale connection from cache: {}", addr);
+        tracing::info!(
+            addr = %addr,
+            "Removed cached gRPC connection so future RPCs will attempt to establish a fresh channel"
+        );
     }
 }
 

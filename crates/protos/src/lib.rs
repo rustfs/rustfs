@@ -208,7 +208,10 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
 /// Evict a connection from the cache after a failure.
 /// This should be called when an RPC fails to ensure fresh connections are tried.
 pub async fn evict_failed_connection(addr: &str) {
-    warn!("Evicting failed gRPC connection: {}", addr);
+    warn!(
+        addr = %addr,
+        "Evicting cached gRPC connection after RPC failure; the next request will attempt to reconnect automatically"
+    );
     evict_connection(addr).await;
     TLS_GENERATION_CACHE.lock().await.remove(addr);
 }
