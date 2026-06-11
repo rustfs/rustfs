@@ -30,8 +30,8 @@ use crate::{
     store_api::{
         BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
         HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
-        MakeBucketOptions, MultipartInfo, MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOperations,
-        ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
+        MakeBucketOptions, MultipartInfo, MultipartOperations, MultipartUploadResult, NamespaceLocking, ObjectIO, ObjectInfo,
+        ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
     },
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
 };
@@ -897,7 +897,10 @@ impl HealOperations for Sets {
 }
 
 #[async_trait::async_trait]
-impl StorageAPI for Sets {
+impl StorageAPI for Sets {}
+
+#[async_trait::async_trait]
+impl NamespaceLocking for Sets {
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         self.disk_set[0].new_ns_lock(bucket, object).await
     }
