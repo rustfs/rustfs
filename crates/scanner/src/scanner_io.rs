@@ -41,8 +41,8 @@ use rustfs_ecstore::error::{Error, StorageError};
 use rustfs_ecstore::global::GLOBAL_TierConfigMgr;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::SetDisks;
-use rustfs_ecstore::store_api::{BucketInfo, BucketOperations, BucketOptions, ObjectInfo};
-use rustfs_ecstore::{StorageAPI, error::Result, store::ECStore};
+use rustfs_ecstore::store_api::{BucketInfo, BucketOperations, BucketOptions, ObjectIO, ObjectInfo};
+use rustfs_ecstore::{error::Result, store::ECStore};
 use rustfs_filemeta::FileMeta;
 use rustfs_storage_api::{DiskSetSelector, StorageAdminApi};
 use rustfs_utils::path::path_join_buf;
@@ -296,7 +296,7 @@ async fn send_cache_root_entry_info(
     bucket_result_tx.lock().await.send(cache_root_entry_info(cache)).await
 }
 
-async fn persist_and_publish_cache_snapshot<S: StorageAPI>(
+async fn persist_and_publish_cache_snapshot<S: ObjectIO>(
     store: Arc<S>,
     updates: &mpsc::Sender<DataUsageCache>,
     cache_snapshot: DataUsageCache,
