@@ -183,7 +183,15 @@ impl AuditSystem {
                 Ok(())
             }
             Err(e) => {
-                error!(error = %e, "Failed to create audit targets");
+                error!(
+                    event = EVENT_AUDIT_SYSTEM_STATE,
+                    component = LOG_COMPONENT_AUDIT,
+                    subsystem = LOG_SUBSYSTEM_SYSTEM,
+                    state = "stopped",
+                    reason = "target_creation_failed",
+                    error = %e,
+                    "Failed to create audit targets"
+                );
                 let mut state = self.state.write().await;
                 *state = AuditSystemState::Stopped;
                 Err(e)
@@ -265,7 +273,15 @@ impl AuditSystem {
 
         // Stop all stream tasks first
         if let Err(e) = self.clear_runtime_targets().await {
-            error!(error = %e, "Failed to close some audit targets");
+            error!(
+                event = EVENT_AUDIT_SYSTEM_STATE,
+                component = LOG_COMPONENT_AUDIT,
+                subsystem = LOG_SUBSYSTEM_SYSTEM,
+                state = "stopping",
+                reason = "target_shutdown_failed",
+                error = %e,
+                "Failed to close some audit targets"
+            );
         }
 
         // Clear configuration
@@ -454,7 +470,14 @@ impl AuditSystem {
                 Ok(())
             }
             Err(e) => {
-                error!(error = %e, "Failed to reload audit configuration");
+                error!(
+                    event = EVENT_AUDIT_CONFIG_RELOADED,
+                    component = LOG_COMPONENT_AUDIT,
+                    subsystem = LOG_SUBSYSTEM_SYSTEM,
+                    state = "reload_failed",
+                    error = %e,
+                    "Failed to reload audit configuration"
+                );
                 Err(e)
             }
         }
