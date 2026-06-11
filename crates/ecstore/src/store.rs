@@ -706,28 +706,6 @@ impl StorageAPI for ECStore {
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         self.handle_new_ns_lock(bucket, object).await
     }
-    #[instrument(skip(self))]
-    async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
-        self.handle_backend_info().await
-    }
-    #[instrument(skip(self))]
-    async fn storage_info(&self) -> rustfs_madmin::StorageInfo {
-        self.handle_storage_info().await
-    }
-    #[instrument(skip(self))]
-    async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
-        self.handle_local_storage_info().await
-    }
-
-    #[instrument(skip(self))]
-    async fn get_disks(&self, pool_idx: usize, set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
-        self.handle_get_disks(pool_idx, set_idx).await
-    }
-
-    #[instrument(skip(self))]
-    fn set_drive_counts(&self) -> Vec<usize> {
-        self.handle_set_drive_counts()
-    }
 }
 
 #[async_trait::async_trait]

@@ -31,6 +31,7 @@ use rustfs_config::notify::{
 };
 use rustfs_config::oidc::{IDENTITY_OPENID_KEYS, IDENTITY_OPENID_SUB_SYS, OIDC_REDIRECT_URI_DYNAMIC};
 use rustfs_config::{COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, RUSTFS_REGION};
+use rustfs_storage_api::StorageAdminApi;
 use rustfs_utils::path::SLASH_SEPARATOR;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -277,7 +278,10 @@ fn new_server_config() -> Config {
     Config::new()
 }
 
-async fn new_and_save_server_config<S: StorageAPI>(api: Arc<S>) -> Result<Config> {
+async fn new_and_save_server_config<S>(api: Arc<S>) -> Result<Config>
+where
+    S: StorageAPI + StorageAdminApi,
+{
     let mut cfg = new_server_config();
     lookup_configs(&mut cfg, api.clone()).await;
     save_server_config(api, &cfg).await?;
@@ -1059,7 +1063,10 @@ pub async fn try_migrate_server_config<S: StorageAPI>(api: Arc<S>) {
 }
 
 /// Handle the situation where the configuration file does not exist, create and save a new configuration
-async fn handle_missing_config<S: StorageAPI>(api: Arc<S>, context: &str) -> Result<Config> {
+async fn handle_missing_config<S>(api: Arc<S>, context: &str) -> Result<Config>
+where
+    S: StorageAPI + StorageAdminApi,
+{
     warn!("Configuration not found ({}): Start initializing new configuration", context);
     let cfg = if is_first_cluster_node_local().await {
         new_and_save_server_config(api.clone()).await?
@@ -1078,7 +1085,10 @@ fn handle_config_read_error(err: Error, file_path: &str) -> Result<Config> {
     Err(err)
 }
 
-pub async fn read_config_without_migrate<S: StorageAPI>(api: Arc<S>) -> Result<Config> {
+pub async fn read_config_without_migrate<S>(api: Arc<S>) -> Result<Config>
+where
+    S: StorageAPI + StorageAdminApi,
+{
     let config_file = get_config_file();
 
     // Try to read the configuration file
@@ -1089,7 +1099,10 @@ pub async fn read_config_without_migrate<S: StorageAPI>(api: Arc<S>) -> Result<C
     }
 }
 
-async fn read_server_config<S: StorageAPI>(api: Arc<S>, data: &[u8]) -> Result<Config> {
+async fn read_server_config<S>(api: Arc<S>, data: &[u8]) -> Result<Config>
+where
+    S: StorageAPI + StorageAdminApi,
+{
     // If the provided data is empty, try to read from the file again
     if data.is_empty() {
         let config_file = get_config_file();
@@ -1141,14 +1154,20 @@ pub async fn save_server_config<S: StorageAPI>(api: Arc<S>, cfg: &Config) -> Res
     save_config(api, &config_file, data).await
 }
 
-pub async fn lookup_configs<S: StorageAPI>(cfg: &mut Config, api: Arc<S>) {
+pub async fn lookup_configs<S>(cfg: &mut Config, api: Arc<S>)
+where
+    S: StorageAPI + StorageAdminApi,
+{
     // TODO: from etcd
     if let Err(err) = apply_dynamic_config(cfg, api).await {
         error!("apply_dynamic_config err {:?}", &err);
     }
 }
 
-async fn apply_dynamic_config<S: StorageAPI>(cfg: &mut Config, api: Arc<S>) -> Result<()> {
+async fn apply_dynamic_config<S>(cfg: &mut Config, api: Arc<S>) -> Result<()>
+where
+    S: StorageAPI + StorageAdminApi,
+{
     for key in SUB_SYSTEMS_DYNAMIC.iter() {
         apply_dynamic_config_for_sub_sys(cfg, api.clone(), key).await?;
     }
@@ -1156,8 +1175,11 @@ async fn apply_dynamic_config<S: StorageAPI>(cfg: &mut Config, api: Arc<S>) -> R
     Ok(())
 }
 
-async fn apply_dynamic_config_for_sub_sys<S: StorageAPI>(cfg: &mut Config, api: Arc<S>, subsys: &str) -> Result<()> {
-    let set_drive_counts = api.set_drive_counts();
+async fn apply_dynamic_config_for_sub_sys<S>(cfg: &mut Config, api: Arc<S>, subsys: &str) -> Result<()>
+where
+    S: StorageAPI + StorageAdminApi,
+{
+    let set_drive_counts = StorageAdminApi::set_drive_counts(api.as_ref());
     if subsys == STORAGE_CLASS_SUB_SYS {
         let kvs = cfg.get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_DELIMITER).unwrap_or_default();
 
@@ -1210,6 +1232,7 @@ mod tests {
     use rustfs_lock::client::LockClient;
     use rustfs_lock::client::local::LocalClient;
     use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
+    use rustfs_storage_api::StorageAdminApi;
     use serde_json::Value;
     use serial_test::serial;
     use std::collections::HashMap;
@@ -1702,6 +1725,14 @@ mod tests {
         async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<rustfs_lock::NamespaceLockWrapper> {
             self.set_disks.new_ns_lock(bucket, object).await
         }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageAdminApi for LockingConfigStorage {
+        type BackendInfo = rustfs_madmin::BackendInfo;
+        type StorageInfo = rustfs_madmin::StorageInfo;
+        type Disk = crate::disk::DiskStore;
+        type Error = Error;
 
         async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
             panic!("unused in test")
@@ -1715,12 +1746,15 @@ mod tests {
             panic!("unused in test")
         }
 
-        async fn get_disks(&self, _pool_idx: usize, _set_idx: usize) -> Result<Vec<Option<crate::disk::DiskStore>>> {
+        async fn disk_set_inventory(
+            &self,
+            _selector: rustfs_storage_api::DiskSetSelector,
+        ) -> Result<Vec<Option<crate::disk::DiskStore>>> {
             panic!("unused in test")
         }
 
         fn set_drive_counts(&self) -> Vec<usize> {
-            panic!("unused in test")
+            vec![self.set_disks.set_endpoints.len()]
         }
     }
 
