@@ -55,16 +55,14 @@ use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::notification_sys::get_global_notification_sys;
-use rustfs_ecstore::store_api::{
-    BucketOperations, BucketOptions, DeleteBucketOptions, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
-    MakeBucketOptions, ObjectInfo,
-};
+use rustfs_ecstore::store_api::{BucketOperations, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations, ObjectInfo};
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::{
     action::{Action, S3Action},
     {BucketPolicy, BucketPolicyArgs, Effect, Validator},
 };
 use rustfs_s3_ops::S3Operation;
+use rustfs_storage_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions};
 use rustfs_targets::{
     EventName,
     arn::{ARN, TargetIDError},

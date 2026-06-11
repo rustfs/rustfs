@@ -1353,11 +1353,9 @@ mod tests {
     use crate::heal::storage::HealStorageAPI;
     use crate::heal::task::{HealOptions, HealPriority, HealRequest, HealType};
     use rustfs_common::heal_channel::HealOpts;
-    use rustfs_ecstore::{
-        disk::{DiskStore, endpoint::Endpoint},
-        store_api::BucketInfo,
-    };
+    use rustfs_ecstore::disk::{DiskStore, endpoint::Endpoint};
     use rustfs_madmin::heal_commands::HealResultItem;
+    use rustfs_storage_api::BucketInfo;
 
     struct MockStorage;
 

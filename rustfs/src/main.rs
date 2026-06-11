@@ -51,7 +51,6 @@ use rustfs_ecstore::{
     store::init_local_disks,
     store::prewarm_local_disk_id_map,
     store_api::BucketOperations,
-    store_api::BucketOptions,
     update_erasure_type,
 };
 use rustfs_heal::{
@@ -60,6 +59,7 @@ use rustfs_heal::{
 use rustfs_iam::init_oidc_sys;
 use rustfs_obs::{init_metrics_runtime, init_obs, set_global_guard};
 use rustfs_scanner::init_data_scanner;
+use rustfs_storage_api::BucketOptions;
 use rustfs_utils::{
     ExternalEnvCompatReport, apply_external_env_compat, get_env_bool_with_aliases, net::parse_and_resolve_address,
 };

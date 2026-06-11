@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-config-compat-accessor-cleanup`
-- Baseline: `origin/main` at `2e3c777309a68c0a21f267d7646a9798f6052277`
+- Branch: `overtrue/arch-storage-api-dto-compat-cleanup`
+- Baseline: `origin/main` at `0a987d870b3dca248bea8d4872568a25e235d917`
 - PR type for this branch: `api-extraction`
 - Runtime behavior changes: none intended.
-- Rust code changes: remove the temporary CFG-008
-  `rustfs_ecstore::config` global server-config accessor compatibility
-  re-export after in-repo consumers moved to `rustfs_config::server_config`.
+- Rust code changes: migrate remaining in-repo bucket DTO consumers to
+  `rustfs_storage_api` and remove the temporary API-003 public ECStore
+  `store_api` bucket DTO re-export.
 - CI/script changes: none.
-- Docs changes: remove the CFG-008 cleanup-register entry and record the
-  completed compatibility cleanup in the model-boundary ADR and progress notes.
+- Docs changes: remove the API-003 cleanup-register entry and record the
+  completed storage API DTO compatibility cleanup in progress notes.
 
 ## Phase 0 Tasks
 
@@ -216,12 +216,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     mapping uses the new contract.
 - [x] `API-003` Move DTOs.
   - Current PR: `rustfs/rustfs#3314` merged.
+  - Cleanup branch: `overtrue/arch-storage-api-dto-compat-cleanup`.
   - Completed slice: move the pure bucket/options DTO subset:
     `MakeBucketOptions`, `SRBucketDeleteOp`, `DeleteBucketOptions`,
     `BucketOptions`, and `BucketInfo`.
-  - Acceptance: `rustfs-storage-api` exports these DTOs, ECStore re-exports
-    them from the old `ecstore::store_api` path, and compatibility cleanup is
-    registered with `RUSTFS_COMPAT_TODO(API-003)`.
+  - Cleanup slice: migrate in-repo external consumers to
+    `rustfs_storage_api`, keep ECStore implementation use crate-private, and
+    remove the old public `ecstore::store_api` bucket DTO re-export.
+  - Acceptance: `rustfs-storage-api` exports these DTOs, in-repo external
+    consumers no longer use the old `rustfs_ecstore::store_api` DTO path, and
+    `RUSTFS_COMPAT_TODO(API-003)` is removed from source and cleanup register.
   - Must preserve: no `ObjectOptions`, `ObjectInfo`, reader, compression,
     encryption, filemeta conversion, multipart conversion, route, storage, or
     runtime behavior changes in this PR.
@@ -355,58 +359,64 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `security-change`: make Local KMS unsafe defaults explicit development
+1. `api-extraction`: continue API-012 namespace-lock-only cleanup after all
+   callers that only need locking depend on `NamespaceLocking`.
+2. `security-change`: make Local KMS unsafe defaults explicit development
    opt-ins or production failures in KMSD-002.
-2. `security-change`: make Vault unsafe defaults explicit development opt-ins
+3. `security-change`: make Vault unsafe defaults explicit development opt-ins
    or production failures in KMSD-003.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed the diff only removes the temporary CFG-008 ECStore accessor re-export while keeping ECStore persistence, storage-class ownership, and config initialization unchanged. |
-| Migration preservation | pass | Confirmed all in-repo runtime readers and writers already use `rustfs_config::server_config`, and ECStore initialization still writes the same global snapshot through a private import. |
-| Testing/verification | pass | Confirmed focused ECStore/config compile and tests, migration guards, old-path scan, and Rust risk scan cover this compatibility cleanup; full pre-commit is skipped under the current larger-granularity instruction. |
+| Quality/architecture | pass | Confirmed the diff only removes the temporary API-003 public ECStore bucket DTO re-export and migrates remaining in-repo external consumers to `rustfs_storage_api`; bucket operation traits and runtime control flow remain unchanged. |
+| Migration preservation | pass | Confirmed ECStore keeps crate-private DTO visibility for its own implementation while no external in-repo consumer uses the old public `rustfs_ecstore::store_api` DTO path. |
+| Testing/verification | pass | Confirmed focused compile/tests, rustfs all-targets compile, heal/scanner test target compile, migration guards, dependency guard, source old-path scan, and added-line Rust risk scan cover this cleanup; full pre-commit is skipped under the current larger-granularity instruction. |
 
 ## Verification Notes
 
-Passed:
-- `cargo check -p rustfs-config -p rustfs-ecstore --lib`.
-- `cargo test -p rustfs-ecstore config --lib`; 59 passed.
+Passed after rebasing onto `0a987d870b3dca248bea8d4872568a25e235d917`:
+- `cargo check -p rustfs-storage-api -p rustfs-ecstore -p rustfs-heal -p rustfs-scanner -p rustfs-obs -p rustfs-protocols --lib`.
+- `cargo check -p rustfs --all-targets`.
+- `cargo test -p rustfs-storage-api --lib`; 7 passed.
+- `cargo test -p rustfs-ecstore --test storage_api_compat_test`; 1 passed.
+- `cargo test -p rustfs-heal --tests --no-run`.
+- `cargo test -p rustfs-scanner --tests --no-run`.
+- `cargo test -p rustfs-protocols --lib swift`; 0 matched, lib test target
+  compiled and ran successfully.
+- `cargo test -p rustfs-obs --lib stats_collector`; 14 passed.
 - `cargo fmt --all --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - `./scripts/check_metrics_migration_refs.sh`.
 - `git diff --check`.
-- CFG-008 source old-path and marker scan found no
-  `RUSTFS_COMPAT_TODO(CFG-008)`,
-  `rustfs_ecstore::config::{get_global_server_config,
-  set_global_server_config}`, or `crate::config::{get_global_server_config,
-  set_global_server_config}` matches in `crates/**/*.rs` or `rustfs/src`.
-- Added-line risk scan found no production `unwrap`/`expect`, lossy numeric
-  casts, stringly public errors, boxed dynamic errors, stdout/stderr printing,
-  or relaxed atomic ordering.
-- `cargo tree -p rustfs-config --edges normal` found no dependency on
-  `rustfs-ecstore`, `rustfs-scanner`, `rustfs-iam`, or `rustfs`.
+- API-003 source old-path and marker scan found no
+  `RUSTFS_COMPAT_TODO(API-003)` or
+  `rustfs_ecstore::store_api::{BucketInfo, BucketOptions,
+  DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp}` matches in
+  `crates/**/*.rs` or `rustfs/src`.
+- Added-line Rust risk scan found no new production `unwrap`/`expect`, lossy
+  numeric casts, stringly public errors, boxed dynamic errors, stdout/stderr
+  printing, or relaxed atomic ordering.
 
 Notes:
 - Full pre-commit may be skipped if focused tests, compile checks, and guards
   pass, per the current instruction to increase PR granularity.
-- This slice removes only the old CFG-008 global server-config accessor
-  compatibility path. ECStore retains `ConfigSys`, config persistence helpers,
-  storage-class global state, default registration wiring, startup
-  initialization, and storage behavior.
-- The old `rustfs_ecstore::config` accessor path is no longer available after
-  this cleanup. Consumers must use `rustfs_config::server_config`.
+- This slice removes only the old API-003 public bucket DTO re-export.
+  ECStore retains bucket operation traits, object/listing DTOs, storage
+  implementation wiring, and crate-private access to the storage API bucket
+  DTOs for its own trait implementations.
+- The old public `rustfs_ecstore::store_api` bucket DTO path is no longer
+  available after this cleanup. Consumers must use `rustfs_storage_api`.
 
 ## Handoff Notes
 
-- Keep this CFG-008 cleanup slice as an `api-extraction` PR that only removes
-  the temporary global server-config accessor compatibility re-export and its
-  cleanup-register entry.
-- Do not move `ConfigSys`, storage-class global state,
-  `read_config_without_migrate`, `save_server_config`, config-object helpers,
-  default registration wiring, startup wiring, storage-class helpers, ECStore
-  persistence helpers, or storage persistence logic in this PR.
+- Keep this API-003 cleanup slice as an `api-extraction` PR that only removes
+  the temporary public ECStore bucket DTO compatibility re-export, migrates
+  remaining in-repo external imports, and deletes the cleanup-register entry.
+- Do not move `ObjectOptions`, `ObjectInfo`, reader types, multipart DTOs,
+  list result DTOs, storage traits, bucket operation logic, storage runtime
+  wiring, route behavior, or storage persistence logic in this PR.
 - Do not add temporary compatibility code unless a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry are added.
