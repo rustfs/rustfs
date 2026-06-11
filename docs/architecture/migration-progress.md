@@ -5,17 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-table-catalog-bounds`
-- Baseline: `origin/main` at `2ead90d31bd713b3b36812ed718bd44e28e522d2`
-- PR type for this branch: `dependency-migration`
+- Branch: `overtrue/arch-config-model-extraction`
+- Baseline: `origin/main` at `dd5035916e62c031d40ecdf9363763a881517abb`
+- PR type for this branch: `api-extraction`
 - Runtime behavior changes: none.
-- Rust code changes: add a narrow `NamespaceLocking` operation-group trait and
-  narrow the table catalog object backend away from full `StorageAPI` when it
-  only needs object I/O, object operations, listing, and namespace locking.
+- Rust code changes: move the pure server-config model (`Config`, `KV`, `KVS`,
+  `DEFAULT_KVS`, and `register_default_kvs`) into
+  `rustfs_config::server_config`, keep the old `rustfs_ecstore::config` model
+  path as a temporary re-export, and leave persistence helpers/global server
+  config state in ECStore.
 - CI/script changes: none.
-- Docs changes: record API-011 completion, the current table catalog
-  bound-narrowing context, API-012 compatibility cleanup marker, verification
-  evidence, and expert review outcomes.
+- Docs changes: record API-012 completion, current CFG-003/CFG-004 extraction
+  context, compatibility cleanup marker, and verification evidence.
 
 ## Phase 0 Tasks
 
@@ -78,13 +79,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     `rustfs-config` as the target package, `server_config` as the future model
     module, allowed dependencies, forbidden dependencies, preserved shape, and
     extraction verification gates.
-- [ ] `CFG-003` Move pure model definitions.
-  - Next boundary: move only `Config`, `KV`, `KVS`, and default-registration
-    surface into `rustfs-config`; keep persistence helpers and global
-    server-config state in `ecstore`.
-- [ ] `CFG-004` Keep old `ecstore::config::*` compatibility path.
-  - Required compatibility: source must contain `RUSTFS_COMPAT_TODO(CFG-004)`
-    and a matching cleanup-register entry.
+- [~] `CFG-003` Move pure model definitions.
+  - Current branch: move only `Config`, `KV`, `KVS`, and
+    default-registration surface into `rustfs-config`; keep persistence helpers
+    and global server-config state in `ecstore`.
+  - Must preserve: tuple struct shapes, serde alias behavior, default
+    application, internal JSON shape, and existing persisted config semantics.
+- [~] `CFG-004` Keep old `ecstore::config::*` compatibility path.
+  - Current branch: re-export moved model types and default-registration
+    surface from `rustfs_ecstore::config` with `RUSTFS_COMPAT_TODO(CFG-004)`
+    and cleanup-register coverage.
 
 ## Phase 1 Security Governance Tasks
 
@@ -263,11 +267,12 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     required quality/architecture, migration-preservation, and
     testing/verification review passed.
 
-- [~] `API-012` Narrow table catalog object backend bounds.
-  - Current branch slice: add a narrow `NamespaceLocking` operation-group trait
-    as a compatibility facade over `StorageAPI::new_ns_lock`, then narrow
-    `EcStoreTableCatalogObjectBackend` from full `StorageAPI` to `ObjectIO`,
-    `ObjectOperations`, `ListOperations`, and `NamespaceLocking`.
+- [x] `API-012` Narrow table catalog object backend bounds.
+  - Completed slice: `rustfs/rustfs#3350` added a narrow `NamespaceLocking`
+    operation-group trait as a compatibility facade over
+    `StorageAPI::new_ns_lock`, then narrowed `EcStoreTableCatalogObjectBackend`
+    from full `StorageAPI` to `ObjectIO`, `ObjectOperations`,
+    `ListOperations`, and `NamespaceLocking`.
   - Acceptance: table catalog object backend contracts express the actual
     object read/write, metadata/delete, list, and namespace-lock capabilities
     they need, while table catalog store logic and lock behavior remain
@@ -308,70 +313,67 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `dependency-migration`: narrow table catalog object backend bounds away
-   from full `StorageAPI` by depending only on object I/O, object operations,
-   listing, and namespace locking.
-2. `api-extraction`: move only the pure server-config model into
-   rustfs-config as CFG-003.
-3. `api-extraction`: keep the old rustfs_ecstore::config::* path with
+1. `api-extraction`: move only the pure server-config model into rustfs-config
+   as CFG-003 and keep the old rustfs_ecstore::config::* path with
    RUSTFS_COMPAT_TODO(CFG-004) and cleanup-register coverage.
-4. `consumer-migration`: migrate external consumers one group at a time only
+2. `consumer-migration`: migrate external consumers one group at a time only
    after the model path and compatibility shim are stable.
-5. `security-change`: make Local KMS unsafe defaults explicit development
+3. `security-change`: make Local KMS unsafe defaults explicit development
    opt-ins or production failures in KMSD-002.
-6. `security-change`: make Vault unsafe defaults explicit development opt-ins
+4. `security-change`: make Vault unsafe defaults explicit development opt-ins
    or production failures in KMSD-003.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed the Rust diff adds only the narrow `NamespaceLocking` facade, tracks retained `StorageAPI::new_ns_lock` with `RUSTFS_COMPAT_TODO(API-012)`, and narrows table catalog backend bounds; no table catalog method body, lock implementation, object operation, or hot-path behavior changes. |
-| Migration preservation | pass | Confirmed the blanket facade keeps existing `StorageAPI::new_ns_lock` compatibility and table catalog object paths, optimistic preconditions, pagination, missing-object mapping, and write-lock behavior remain unchanged. |
-| Testing/verification | pass | Confirmed focused compile/tests, migration guards, diff hygiene, and added-line risk scan are sufficient for this dependency-boundary slice before push; full pre-commit is skipped under the current larger-granularity instruction. |
+| Quality/architecture | pass | Confirmed this stays a pure model extraction into `rustfs_config::server_config`; persistence helpers, global state, runtime consumers, startup wiring, and storage hot paths remain in ECStore or unchanged. |
+| Migration preservation | pass | Confirmed the old `rustfs_ecstore::config` model path remains available through `RUSTFS_COMPAT_TODO(CFG-004)`, while tuple shapes, serde alias behavior, defaults, marshal/unmarshal, and persisted JSON shape are preserved. |
+| Testing/verification | pass | Confirmed focused config/model tests, compile checks, dependency tree, migration guards, diff hygiene, and added-line risk scan are sufficient before push; full pre-commit is skipped under the current larger-granularity instruction. |
 
 ## Verification Notes
 
 Passed:
-- `cargo fmt --all`.
-- `cargo check -p rustfs-ecstore -p rustfs --lib`.
 - `cargo fmt --all --check`.
-- `cargo test -p rustfs table_catalog --lib`; 84 passed.
+- `cargo check -p rustfs-config --features server-config-model`.
+- `cargo check -p rustfs-config`.
+- `cargo check -p rustfs-ecstore`.
+- `cargo check -p rustfs-config -p rustfs-ecstore -p rustfs --lib`.
+- `cargo check -p rustfs-targets -p rustfs-notify -p rustfs-audit -p rustfs-iam -p rustfs-scanner -p rustfs --lib`.
+- `cargo test -p rustfs-config --features server-config-model server_config --lib`; 3 passed.
+- `cargo test -p rustfs-ecstore config --lib`; 60 passed.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - `./scripts/check_metrics_migration_refs.sh`.
 - `./scripts/check_unsafe_code_allowances.sh`.
 - `git diff --check`.
-- Rust code-quality scan on changed `.rs` files, plus added-line scan for
-  unwrap/expect, numeric casts, `Result<_, String>`, `Box<dyn Error>`,
-  println/eprintln, and `Ordering::Relaxed`; broad full-file matches are
-  pre-existing touched-file patterns, and the added-line scan found no new
-  risky code patterns.
+- `cargo tree -p rustfs-config --edges normal --features server-config-model`.
+- Added-line risk scan found no production `unwrap`/`expect`, lossy numeric
+  casts, stringly public errors, boxed dynamic errors, stdout/stderr printing,
+  or relaxed atomic ordering.
 
 Notes:
-- Full pre-commit is intentionally skipped when the focused tests and guards
+- Full pre-commit may be skipped if focused tests, compile checks, and guards
   pass, per the current instruction to increase PR granularity.
-- This slice changes trait contracts, imports, and generic bounds only; table
-  catalog helper bodies, object paths, optimistic write preconditions, list
-  pagination, missing-object mapping, and write-lock behavior are unchanged.
-- `StorageAPI::new_ns_lock` intentionally remains in place for compatibility;
-  the new `NamespaceLocking` facade only lets narrower consumers state the
-  capability they actually use.
-- The retained old `StorageAPI::new_ns_lock` surface is marked with
-  `RUSTFS_COMPAT_TODO(API-012)` and registered in
-  [`compat-cleanup-register.md`](compat-cleanup-register.md).
+- This slice moves only the pure server-config model and default-registration
+  surface. ECStore retains persistence helpers, ConfigSys, global server-config
+  state, storage-class global state, startup wiring, and all runtime consumers.
+- The old rustfs_ecstore::config model path intentionally remains as a
+  temporary compatibility re-export with `RUSTFS_COMPAT_TODO(CFG-004)` and a
+  matching cleanup-register entry.
+- A focused ECStore test proves the old path re-exports the moved model type;
+  rustfs-config tests cover KVS behavior, legacy hiddenIfEmpty alias
+  compatibility, and marshal/unmarshal internal JSON shape.
 
 ## Handoff Notes
 
-- Keep this API-012 slice as a `dependency-migration` PR that only adds the
-  narrow namespace-locking facade and narrows table catalog backend bounds.
-- Do not remove `StorageAPI` itself, object operation traits, or
-  `StorageAPI::new_ns_lock` in this PR.
-- Do not move traits into `rustfs-storage-api` or introduce additional
-  compatibility shims in this PR.
-- Do not alter table catalog object paths, metadata pointer semantics,
-  optimistic write preconditions, object listing pagination, missing-object
-  handling, namespace write-lock acquisition, scanner/heal/replication/config
-  persistence paths, object APIs, or storage hot-path consumers in this PR.
+- Keep this CFG-003/CFG-004 slice as an `api-extraction` PR that only moves the
+  pure server-config model to `rustfs_config::server_config` and keeps old
+  `rustfs_ecstore::config` model import paths compiling.
+- Do not move `ConfigSys`, `GLOBAL_SERVER_CONFIG`, storage-class global state,
+  `read_config_without_migrate`, `save_server_config`, config-object helpers,
+  startup wiring, runtime consumers, or storage persistence logic in this PR.
+- Do not migrate external consumers in this PR; consumer migration starts after
+  the new model path and compatibility shim are merged.
 - Do not add temporary compatibility code unless a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry are added.
