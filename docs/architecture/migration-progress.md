@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-admin-remaining-readers`
-- Baseline: `origin/main` at `f325b9f71ce4807488829e6f558383242bbcb6a2`
-- PR type for this branch: `consumer-migration`
+- Branch: `overtrue/arch-storage-api-next-contracts`
+- Baseline: `origin/main` at `87968275a776362e9b3734eac5bd9e3233d6cbe9`
+- PR type for this branch: `dependency-migration`
 - Runtime behavior changes: none.
-- Rust code changes: route maintenance/background read-side storage inventory
-  consumers through the inventory-facing `StorageAdminApi` contract while
-  preserving the old `StorageAPI` compatibility surface.
+- Rust code changes: remove duplicate admin-read methods from the old
+  `StorageAPI` trait after all admin inventory consumers have moved to
+  `StorageAdminApi`.
 - CI/script changes: none.
-- Docs changes: record API-007 maintenance/background inventory-reader context,
-  verification evidence, and expert review outcomes.
+- Docs changes: record API-007 completion and the current admin surface cleanup
+  context, verification evidence, and expert review outcomes.
 
 ## Phase 0 Tasks
 
@@ -192,7 +192,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     `rustfs-storage-api`.
   - Verification: focused storage-api tests, dependency tree, migration guards,
     formatting, and diff hygiene.
-- [~] `API-007` Dual-route `get_disks` consumers.
+- [x] `API-007` Dual-route `get_disks` consumers.
   - Completed first slice: `rustfs/rustfs#3331` bound `ECStore` to
     `StorageAdminApi` while keeping all consumers unchanged.
   - Completed second slice: `rustfs/rustfs#3332` migrated the admin
@@ -210,35 +210,33 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Completed sixth slice: `rustfs/rustfs#3336` migrated ECStore internal
     decommission space, local-storage-info, backend-info, drive-count, and
     disk-inventory admin handlers away from old `StorageAPI` method calls.
-  - Current branch slice: migrate maintenance/background read-side storage
-    inventory consumers in rebalance metadata initialization, heal resume disk
-    lookup, and scanner local disk scan lookup.
-  - Acceptance: these maintenance/background consumers no longer use old
-    `StorageAPI` calls for storage-info or disk-set inventory when the
-    inventory-facing `StorageAdminApi` contract already represents the same
-    read-only operation.
-  - Must preserve: old `StorageAPI` trait shape, `StorageAPI::get_disks`
-    behavior, rebalance metadata serialization/save/load, heal resume disk
-    selection, scanner local disk selection, object/rebalance object selection
-    paths, scanner data-cache persistence, heal object repair, object paths,
-    replication/config/tier persistence, and storage hot paths.
-  - Risk defense: change only trait call entry points to existing ECStore
-    `StorageAdminApi` handlers; do not migrate object APIs, config or
-    replication persistence, scanner cache writes, heal object repair, or
-    storage implementation hot paths in this PR.
-  - Verification:
-    - `cargo fmt --all && cargo fmt --all --check`.
-    - `cargo check -p rustfs-ecstore -p rustfs-heal -p rustfs-scanner`.
-    - `cargo test -p rustfs-ecstore rebalance --lib`.
-    - `cargo test -p rustfs-heal storage --lib`.
-    - `cargo test -p rustfs-scanner scanner_io --lib`.
-    - `./scripts/check_architecture_migration_rules.sh`.
-    - `./scripts/check_layer_dependencies.sh`.
-    - `./scripts/check_metrics_migration_refs.sh`.
-    - `./scripts/check_unsafe_code_allowances.sh`.
-    - `git diff --check`.
-  - Pre-push review: pending required quality/architecture,
-    migration-preservation, and testing/verification review.
+  - Completed seventh slice: `rustfs/rustfs#3337` migrated maintenance and
+    background read-side storage inventory consumers in rebalance metadata
+    initialization, heal resume disk lookup, and scanner local disk scan lookup.
+  - Completion acceptance: admin inventory consumers no longer use old
+    `StorageAPI` calls for backend info, storage info, local storage info,
+    drive-count, or disk-set inventory when the inventory-facing
+    `StorageAdminApi` contract represents the same read-only operation.
+
+- [~] `API-008` Remove duplicate old-path admin surfaces.
+  - Current branch slice: remove admin-read methods from the old `StorageAPI`
+    trait and its ECStore/Sets/SetDisks test implementations after API-007
+    migrated their consumers.
+  - Acceptance: old `StorageAPI` keeps storage operation traits and
+    `new_ns_lock`, while admin inventory surfaces live only on
+    `StorageAdminApi`.
+  - Must preserve: object API trait bounds, namespace lock behavior, bucket,
+    object, list, multipart, and heal operations; config read/write byte shape;
+    dynamic storage-class lookup; object/rebalance object selection paths;
+    scanner cache persistence; replication/tier persistence; and storage hot
+    paths.
+  - Risk defense: do not remove `StorageAPI` itself, do not move object/config
+    persistence contracts, and only replace previous `SetDisks::get_disks(0, 0)`
+    trait calls with the same internal `disk_inventory()` data source that the
+    old impl returned.
+  - Verification: pending focused compile/tests, migration guards, Rust risk
+    scan, and required quality/architecture, migration-preservation, and
+    testing/verification review.
 
 ## Phase 8 Background Controller Tasks
 
@@ -282,18 +280,21 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed the diff is limited to maintenance/background inventory-reader entry-point migration plus accurate progress notes; dependency direction, naming, and scope are clean. |
-| Migration preservation | pass | Confirmed old `StorageAPI` shape remains, ECStore old/new trait paths still delegate to the same storage-info and disk-inventory handlers, and rebalance/heal/scanner call sites only change the read-side entry point. |
-| Testing/verification | pass | Confirmed the focused ECStore/heal/scanner checks, migration guards, diff hygiene, and added-line Rust quality scan are sufficient for this equivalent read-side call-path migration while skipping full pre-commit under the current instruction. |
+| Quality/architecture | pass | Confirmed the old `StorageAPI` now keeps only operation traits and `new_ns_lock`, admin inventory surfaces remain on `StorageAdminApi`, dependency direction is clean, and scope/naming stay limited to API-008. |
+| Migration preservation | pass | Confirmed object/bucket/list/multipart/heal contracts, namespace locks, config byte paths, dynamic storage-class behavior, rebalance selection, scanner cache, heal repair, replication/tier/config persistence, and storage hot paths are preserved. |
+| Testing/verification | pass | Initially requested wider rebalance coverage; after `cargo test -p rustfs-ecstore rebalance --lib` passed, confirmed the focused matrix is sufficient for this larger dependency-migration slice while skipping full pre-commit per current instruction. |
 
 ## Verification Notes
 
 Passed:
-- `cargo fmt --all && cargo fmt --all --check`.
-- `cargo check -p rustfs-ecstore -p rustfs-heal -p rustfs-scanner`.
+- `cargo fmt --all`.
+- `cargo check -p rustfs-ecstore`.
+- `cargo fmt --all --check`.
+- `cargo check -p rustfs-storage-api -p rustfs-ecstore -p rustfs --lib`.
+- `cargo test -p rustfs-ecstore config --lib`; 59 passed.
+- `cargo test -p rustfs-ecstore store::rebalance --lib`; 19 passed.
 - `cargo test -p rustfs-ecstore rebalance --lib`; 198 passed.
-- `cargo test -p rustfs-heal storage --lib`; 3 passed.
-- `cargo test -p rustfs-scanner scanner_io --lib`; 18 passed.
+- `cargo test -p rustfs-ecstore set_disk --lib`; 86 passed.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - `./scripts/check_metrics_migration_refs.sh`.
@@ -304,29 +305,29 @@ Passed:
   println/eprintln, and `Ordering::Relaxed`.
 
 Notes:
-- Full pre-commit was intentionally skipped because the focused tests and guards
-  above passed, per the current migration instruction to increase PR granularity.
-- The broad changed-file quality scan reports pre-existing test unwrap/expect
-  plus pre-existing casts and relaxed atomics in touched ECStore files; the
+- Full pre-commit is intentionally skipped when the focused tests and guards
+  pass, per the current instruction to increase PR granularity.
+- The broad changed-file quality scan reports pre-existing unwrap/cast matches
+  and `Result<String>` business return values in touched ECStore files; the
   added-line scan found no new risky code patterns.
-- Old `StorageAPI` trait shape and implementations remain in place; ECStore old
-  and new trait paths delegate to the same storage-info and disk-inventory
-  handlers.
+- Old `StorageAPI` remains as the object/bucket/list/multipart/heal namespace
+  lock contract; only duplicate admin inventory methods are removed.
+- Config dynamic storage-class lookup now reads drive counts through
+  `StorageAdminApi`.
 - Object/rebalance object selection paths, scanner cache persistence, heal
   object repair, object APIs, replication/config/tier persistence paths, and
-  storage hot paths are unchanged.
+  storage hot paths must remain unchanged.
 - No temporary compatibility shim was added.
 
 ## Handoff Notes
 
-- Keep this API-007 slice as a maintenance/background inventory-reader
-  `consumer-migration` PR.
-- The only scanner/heal scope in this PR is read-side disk lookup for scanner
-  local disk scan and heal resume; do not migrate scanner cache writes, heal
-  object repair, object APIs, replication, config/tier persistence, or storage
-  hot-path consumers in this PR.
-- Do not remove `StorageAPI::get_disks` or route object/hot-path consumers
-  around it in this PR.
-- Do not make the old `StorageAPI` trait inherit `StorageAdminApi` in this PR.
+- Keep this API-008 slice as a `dependency-migration` PR that only removes
+  duplicate admin inventory methods from old `StorageAPI`.
+- Do not remove `StorageAPI` itself, object operation traits, or
+  `new_ns_lock` in this PR.
+- Do not migrate scanner cache writes, heal object repair, object APIs,
+  replication, config/tier persistence, or storage hot-path consumers in this
+  PR.
+- Do not make the old `StorageAPI` trait inherit `StorageAdminApi`.
 - Do not add temporary compatibility code unless a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry are added.

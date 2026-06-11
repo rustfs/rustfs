@@ -315,10 +315,8 @@ impl ECStore {
                 return (idx, 0, Vec::new());
             }
 
-            let disk_infos = match pool.get_disks_by_key(object).get_disks(0, 0).await {
-                Ok(disks) => get_disk_infos(&disks).await,
-                Err(_) => Vec::new(),
-            };
+            let disks = pool.get_disks_by_key(object).disk_inventory().await;
+            let disk_infos = get_disk_infos(&disks).await;
 
             (idx, pool.set_count, disk_infos)
         }))
