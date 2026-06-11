@@ -111,7 +111,7 @@ pub async fn evict_connection(addr: &str) {
     if removed.is_some() {
         tracing::info!(
             addr = %addr,
-            "Removed cached gRPC connection so future RPCs will establish a fresh channel"
+            "Removed cached gRPC connection so future RPCs will attempt to establish a fresh channel"
         );
     }
 }
