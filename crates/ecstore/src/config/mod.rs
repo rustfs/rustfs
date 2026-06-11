@@ -34,13 +34,10 @@ use rustfs_config::notify::{
     NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_REDIS_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
-use rustfs_config::server_config::register_default_kvs;
+use rustfs_config::server_config::{register_default_kvs, set_global_server_config};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::sync::{Arc, RwLock};
-
-// RUSTFS_COMPAT_TODO(CFG-008): keep old ecstore global server-config accessor path while runtime consumers migrate. Remove after all consumers import these accessors from rustfs_config::server_config.
-pub use rustfs_config::server_config::{get_global_server_config, set_global_server_config};
 
 pub static GLOBAL_STORAGE_CLASS: LazyLock<RwLock<storageclass::Config>> =
     LazyLock::new(|| RwLock::new(storageclass::Config::default()));
@@ -124,7 +121,7 @@ pub fn init() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_config::server_config::{Config, KVS};
+    use rustfs_config::server_config::{Config, KVS, get_global_server_config, set_global_server_config};
     use rustfs_config::{
         DEFAULT_DELIMITER, DEFAULT_HEAL_BITROT_CYCLE_SECS, DEFAULT_SCANNER_SPEED, HEAL_BITROT_CYCLE, SCANNER_CYCLE_MAX_OBJECTS,
         SCANNER_DELAY, SCANNER_MAX_WAIT, SCANNER_SPEED, SCANNER_SUB_SYS,
