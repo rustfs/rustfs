@@ -9690,6 +9690,7 @@ dependencies = [
  "rustfs-iam",
  "rustfs-io-metrics",
  "rustfs-notify",
+ "rustfs-security-governance",
  "rustfs-storage-api",
  "rustfs-utils",
  "serde",
