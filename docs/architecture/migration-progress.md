@@ -5,15 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-api-helper-cleanup`
-- Baseline: `origin/main` at `2f7cc7cb9e5891b46db6e686c67636e9343762ce`
+- Branch: `overtrue/arch-table-catalog-bounds`
+- Baseline: `origin/main` at `2ead90d31bd713b3b36812ed718bd44e28e522d2`
 - PR type for this branch: `dependency-migration`
 - Runtime behavior changes: none.
-- Rust code changes: narrow scanner data-usage cache load/save helper generic
-  bounds away from full `StorageAPI` where helpers only need object I/O.
+- Rust code changes: add a narrow `NamespaceLocking` operation-group trait and
+  narrow the table catalog object backend away from full `StorageAPI` when it
+  only needs object I/O, object operations, listing, and namespace locking.
 - CI/script changes: none.
-- Docs changes: record API-010 completion and the current scanner cache
-  bound-narrowing context, verification evidence, and expert review outcomes.
+- Docs changes: record API-011 completion, the current table catalog
+  bound-narrowing context, API-012 compatibility cleanup marker, verification
+  evidence, and expert review outcomes.
 
 ## Phase 0 Tasks
 
@@ -243,10 +245,10 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     replication, object lookups, and scheduling behavior remain on full
     `StorageAPI` where needed.
 
-- [~] `API-011` Narrow scanner cache helper storage bounds.
-  - Current branch slice: narrow scanner data-usage cache load/save and cache
-    snapshot persistence helper bounds away from full `StorageAPI` when the
-    helper only needs `ObjectIO`.
+- [x] `API-011` Narrow scanner cache helper storage bounds.
+  - Completed slice: `rustfs/rustfs#3348` narrowed scanner data-usage cache
+    load/save and cache snapshot persistence helper bounds away from full
+    `StorageAPI` when the helper only needs `ObjectIO`.
   - Acceptance: scanner cache persistence helpers express object-I/O-only
     requirements, while scanner cycle orchestration, bucket scanning, local disk
     selection, cache publication, and storage hot paths remain unchanged.
@@ -257,9 +259,31 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Risk defense: do not move traits to `rustfs-storage-api`, do not remove
     `StorageAPI`, do not alter helper bodies, and do not narrow scanner paths
     that need bucket operations, disk inventory, or full storage orchestration.
-  - Verification: focused compile/tests, migration guards, and Rust risk scan
-    passed; required quality/architecture, migration-preservation, and
-    testing/verification review is pending before push.
+  - Verification: focused compile/tests, migration guards, Rust risk scan, and
+    required quality/architecture, migration-preservation, and
+    testing/verification review passed.
+
+- [~] `API-012` Narrow table catalog object backend bounds.
+  - Current branch slice: add a narrow `NamespaceLocking` operation-group trait
+    as a compatibility facade over `StorageAPI::new_ns_lock`, then narrow
+    `EcStoreTableCatalogObjectBackend` from full `StorageAPI` to `ObjectIO`,
+    `ObjectOperations`, `ListOperations`, and `NamespaceLocking`.
+  - Acceptance: table catalog object backend contracts express the actual
+    object read/write, metadata/delete, list, and namespace-lock capabilities
+    they need, while table catalog store logic and lock behavior remain
+    unchanged.
+  - Must preserve: table catalog object paths, metadata pointer semantics,
+    optimistic write preconditions, object listing pagination, missing-object
+    handling, namespace write-lock acquisition, `StorageAPI::new_ns_lock`
+    compatibility, object APIs, scanner/heal/replication/config persistence,
+    and storage hot paths.
+  - Risk defense: do not remove `StorageAPI::new_ns_lock`, do not move traits
+    into `rustfs-storage-api`, do not change lock implementation code, do not
+    alter table catalog method bodies, and track the retained old lock method
+    with `RUSTFS_COMPAT_TODO(API-012)`.
+  - Verification: focused compile/tests, migration guards, Rust risk scan, and
+    required quality/architecture, migration-preservation, and
+    testing/verification review passed.
 
 ## Phase 8 Background Controller Tasks
 
@@ -284,8 +308,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `dependency-migration`: narrow scanner data-usage cache helper bounds away
-   from full `StorageAPI` where the helper only needs `ObjectIO`.
+1. `dependency-migration`: narrow table catalog object backend bounds away
+   from full `StorageAPI` by depending only on object I/O, object operations,
+   listing, and namespace locking.
 2. `api-extraction`: move only the pure server-config model into
    rustfs-config as CFG-003.
 3. `api-extraction`: keep the old rustfs_ecstore::config::* path with
@@ -301,18 +326,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed the Rust diff only narrows scanner cache helper bounds from `StorageAPI` to `ObjectIO`; helper bodies, scanner orchestration, bucket/disk/lifecycle/replication paths, and storage hot paths are unchanged. |
-| Migration preservation | pass | Confirmed `ObjectIO` covers the actual `get_object_reader` and `put_object` calls, while cache wire format, object paths, backup behavior, retry/timeouts, metrics, publish/update flow, scanner scheduling, concurrency, and bucket scanning remain unchanged. |
-| Testing/verification | pass | Confirmed the focused compile, `data_usage` and `scanner_io` tests, migration guards, diff hygiene, and added-line risk scan are sufficient for this generic-bound-only slice, so full pre-commit can be skipped under the current larger-granularity instruction. |
+| Quality/architecture | pass | Confirmed the Rust diff adds only the narrow `NamespaceLocking` facade, tracks retained `StorageAPI::new_ns_lock` with `RUSTFS_COMPAT_TODO(API-012)`, and narrows table catalog backend bounds; no table catalog method body, lock implementation, object operation, or hot-path behavior changes. |
+| Migration preservation | pass | Confirmed the blanket facade keeps existing `StorageAPI::new_ns_lock` compatibility and table catalog object paths, optimistic preconditions, pagination, missing-object mapping, and write-lock behavior remain unchanged. |
+| Testing/verification | pass | Confirmed focused compile/tests, migration guards, diff hygiene, and added-line risk scan are sufficient for this dependency-boundary slice before push; full pre-commit is skipped under the current larger-granularity instruction. |
 
 ## Verification Notes
 
 Passed:
 - `cargo fmt --all`.
-- `cargo check -p rustfs-scanner -p rustfs-ecstore -p rustfs --lib`.
+- `cargo check -p rustfs-ecstore -p rustfs --lib`.
 - `cargo fmt --all --check`.
-- `cargo test -p rustfs-scanner data_usage --lib`; 21 passed.
-- `cargo test -p rustfs-scanner scanner_io --lib`; 18 passed.
+- `cargo test -p rustfs table_catalog --lib`; 84 passed.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - `./scripts/check_metrics_migration_refs.sh`.
@@ -327,25 +351,27 @@ Passed:
 Notes:
 - Full pre-commit is intentionally skipped when the focused tests and guards
   pass, per the current instruction to increase PR granularity.
-- This slice changes generic bounds and imports only; helper bodies, cache
-  object paths, backup paths, retry/timeout behavior, metrics, and publish
-  logic are unchanged.
-- Scanner orchestration paths intentionally still require full `StorageAPI`
-  where they use bucket operations, disk inventory, or broader storage
-  orchestration.
-- No temporary compatibility shim was added.
+- This slice changes trait contracts, imports, and generic bounds only; table
+  catalog helper bodies, object paths, optimistic write preconditions, list
+  pagination, missing-object mapping, and write-lock behavior are unchanged.
+- `StorageAPI::new_ns_lock` intentionally remains in place for compatibility;
+  the new `NamespaceLocking` facade only lets narrower consumers state the
+  capability they actually use.
+- The retained old `StorageAPI::new_ns_lock` surface is marked with
+  `RUSTFS_COMPAT_TODO(API-012)` and registered in
+  [`compat-cleanup-register.md`](compat-cleanup-register.md).
 
 ## Handoff Notes
 
-- Keep this API-011 slice as a `dependency-migration` PR that only narrows
-  scanner data-usage cache helper generic bounds.
+- Keep this API-012 slice as a `dependency-migration` PR that only adds the
+  narrow namespace-locking facade and narrows table catalog backend bounds.
 - Do not remove `StorageAPI` itself, object operation traits, or
-  `new_ns_lock` in this PR.
-- Do not move traits into `rustfs-storage-api` or introduce new compatibility
-  shims in this PR.
-- Do not alter data-usage cache wire format, cache object paths, backup paths,
-  retry/timeout behavior, metrics, update publication, scanner cycle
-  orchestration, bucket scanning, disk scan concurrency, heal object repair,
-  object APIs, or storage hot-path consumers in this PR.
+  `StorageAPI::new_ns_lock` in this PR.
+- Do not move traits into `rustfs-storage-api` or introduce additional
+  compatibility shims in this PR.
+- Do not alter table catalog object paths, metadata pointer semantics,
+  optimistic write preconditions, object listing pagination, missing-object
+  handling, namespace write-lock acquisition, scanner/heal/replication/config
+  persistence paths, object APIs, or storage hot-path consumers in this PR.
 - Do not add temporary compatibility code unless a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry are added.
