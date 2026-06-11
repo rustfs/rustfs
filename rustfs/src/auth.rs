@@ -19,6 +19,7 @@ use rustfs_iam::error::Error as IamError;
 use rustfs_iam::sys::{
     SESSION_POLICY_NAME, get_claims_from_token_with_secret, get_claims_from_token_with_secret_allow_missing_exp,
 };
+use rustfs_obs::MaskedAccessKey;
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::{AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER};
@@ -173,15 +174,15 @@ impl S3Auth for IAMAuth {
                     return Ok(SecretKey::from(id.credentials.secret_key));
                 }
                 Ok((None, _)) => {
-                    warn!("get_secret_key failed: no such user, access_key: {access_key}");
+                    warn!(access_key = %MaskedAccessKey(access_key), "get_secret_key failed: no such user");
                 }
                 Err(e) => {
-                    warn!("get_secret_key failed: check_key error, access_key: {access_key}, error: {e:?}");
+                    warn!(access_key = %MaskedAccessKey(access_key), error = ?e, "get_secret_key failed: check_key error");
                     return Err(iam_lookup_error_to_s3_error(&e));
                 }
             }
         } else {
-            warn!("get_secret_key failed: iam not initialized, access_key: {access_key}");
+            warn!(access_key = %MaskedAccessKey(access_key), "get_secret_key failed: iam not initialized");
         }
 
         Err(s3_error!(
@@ -207,9 +208,9 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
     // Try to get Keystone credentials from task-local storage first
     // Add debug logging for UI authentication tracking
     debug!(
-        "check_key_valid: starting validation - access_key={}, session_token_len={}",
-        access_key,
-        session_token.len()
+        access_key = %MaskedAccessKey(access_key),
+        session_token_len = session_token.len(),
+        "check_key_valid: starting validation"
     );
     if let Ok(Some(credentials)) = KEYSTONE_CREDENTIALS.try_with(|creds| creds.clone()) {
         debug!("check_key_valid: Keystone credentials found in task-local storage");
@@ -290,16 +291,16 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
 
         if !ok {
             let Some(ref u) = u else {
-                warn!("check_key_valid: user not found for access_key={}", access_key);
+                warn!(access_key = %MaskedAccessKey(access_key), "check_key_valid: user not found");
                 return Err(s3_error!(InvalidAccessKeyId, "check key failed"));
             };
 
             if u.credentials.status == "off" {
-                warn!("check_key_valid: account disabled for access_key={}", access_key);
+                warn!(access_key = %MaskedAccessKey(access_key), "check_key_valid: account disabled");
                 return Err(s3_error!(InvalidRequest, "ErrAccessKeyDisabled"));
             }
 
-            warn!("check_key_valid: validation failed for access_key={}", access_key);
+            warn!(access_key = %MaskedAccessKey(access_key), "check_key_valid: validation failed");
             return Err(s3_error!(InvalidRequest, "check key failed"));
         }
 

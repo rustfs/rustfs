@@ -41,6 +41,7 @@ rustfs-ecstore = { workspace = true }
 rustfs-iam = { workspace = true }
 rustfs-io-metrics = { workspace = true }
 rustfs-notify = { workspace = true }
+rustfs-security-governance = { workspace = true }
 rustfs-storage-api = { workspace = true }
 rustfs-utils = { workspace = true, features = ["ip"] }
 chrono = { workspace = true }
