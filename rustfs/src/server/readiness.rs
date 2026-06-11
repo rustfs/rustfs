@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::server::has_path_prefix;
 use crate::server::{ServiceState, ServiceStateManager};
+use crate::server::{has_path_prefix, is_table_catalog_path};
 use bytes::Bytes;
 use http::{Request as HttpRequest, Response, StatusCode};
 use http_body::Body;
@@ -24,9 +24,9 @@ use rustfs_common::GlobalReadiness;
 use rustfs_ecstore::global::is_dist_erasure;
 use rustfs_ecstore::global::{get_global_endpoints_opt, get_global_lock_clients};
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::StorageAPI;
 use rustfs_iam::get_global_iam_sys;
 use rustfs_madmin::{Disk, StorageInfo};
+use rustfs_storage_api::StorageAdminApi;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -140,7 +140,7 @@ fn is_probe_path(path: &str) -> bool {
 
     let is_prefix_probe = has_path_prefix(path, crate::server::RUSTFS_ADMIN_PREFIX)
         || has_path_prefix(path, crate::server::MINIO_ADMIN_V3_PREFIX)
-        || has_path_prefix(path, crate::server::TABLE_CATALOG_PREFIX)
+        || is_table_catalog_path(path)
         || has_path_prefix(path, crate::server::CONSOLE_PREFIX)
         || has_path_prefix(path, crate::server::RPC_PREFIX)
         || has_path_prefix(path, crate::server::ADMIN_PREFIX)
@@ -489,7 +489,7 @@ async fn collect_dependency_readiness_uncached() -> DependencyReadiness {
 
 async fn collect_storage_readiness_uncached() -> bool {
     if let Some(store) = new_object_layer_fn() {
-        let storage_info = store.storage_info().await;
+        let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
         storage_ready_from_runtime_state(&storage_info)
     } else {
         false
@@ -721,6 +721,7 @@ mod tests {
         assert!(is_probe_path("/minio/admin/v3/info"));
         assert!(is_probe_path("/rustfs/admin/v3/info"));
         assert!(is_probe_path(&format!("{}/config", crate::server::TABLE_CATALOG_PREFIX)));
+        assert!(is_probe_path("/_iceberg/v1/config"));
         assert!(is_probe_path("/rustfs/console/"));
         assert!(!is_probe_path("/minio/adminx/object"));
         assert!(!is_probe_path("/rustfs/adminx/object"));

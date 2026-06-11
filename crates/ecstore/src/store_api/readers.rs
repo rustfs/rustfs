@@ -11,6 +11,8 @@ use rustfs_kms::{service_manager::get_global_encryption_service, types::ObjectEn
 use rustfs_utils::http::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
 use rustfs_utils::path::path_join_buf;
 #[cfg(feature = "rio-v2")]
+use serde::Deserialize;
+#[cfg(feature = "rio-v2")]
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::env;

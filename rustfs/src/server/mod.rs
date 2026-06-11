@@ -49,7 +49,8 @@ pub(crate) use module_switch::{
 pub(crate) use prefix::{
     ADMIN_PREFIX, CONSOLE_PREFIX, FAVICON_PATH, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, LICENSE,
     MINIO_ADMIN_PREFIX, MINIO_ADMIN_V3_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX,
-    TABLE_CATALOG_PREFIX, TONIC_PREFIX, VERSION, has_path_prefix, is_admin_path,
+    TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX, TONIC_PREFIX, VERSION, has_path_prefix, is_admin_path,
+    is_table_catalog_path,
 };
 pub(crate) use readiness::DependencyReadiness;
 pub(crate) use readiness::DependencyReadinessReport;

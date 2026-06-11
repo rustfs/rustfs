@@ -730,6 +730,39 @@ impl StorageAPI for ECStore {
     }
 }
 
+#[async_trait::async_trait]
+impl rustfs_storage_api::StorageAdminApi for ECStore {
+    type BackendInfo = rustfs_madmin::BackendInfo;
+    type StorageInfo = rustfs_madmin::StorageInfo;
+    type Disk = DiskStore;
+    type Error = Error;
+
+    #[instrument(skip(self))]
+    async fn backend_info(&self) -> Self::BackendInfo {
+        self.handle_backend_info().await
+    }
+
+    #[instrument(skip(self))]
+    async fn storage_info(&self) -> Self::StorageInfo {
+        self.handle_storage_info().await
+    }
+
+    #[instrument(skip(self))]
+    async fn local_storage_info(&self) -> Self::StorageInfo {
+        self.handle_local_storage_info().await
+    }
+
+    #[instrument(skip(self))]
+    async fn disk_set_inventory(&self, selector: rustfs_storage_api::DiskSetSelector) -> Result<Vec<Option<Self::Disk>>> {
+        self.handle_get_disks(selector.pool_idx, selector.set_idx).await
+    }
+
+    #[instrument(skip(self))]
+    fn set_drive_counts(&self) -> Vec<usize> {
+        self.handle_set_drive_counts()
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct PoolAvailableSpace {
     pub index: usize,

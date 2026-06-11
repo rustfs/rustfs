@@ -46,11 +46,16 @@ pub(crate) const MINIO_ADMIN_PREFIX: &str = "/minio/admin";
 /// Iceberg REST Catalog prefix for RustFS S3 Tables control-plane routes.
 pub(crate) const TABLE_CATALOG_PREFIX: &str = "/iceberg/v1";
 
+/// MinIO AIStor-compatible Iceberg REST Catalog prefix alias.
+pub(crate) const TABLE_CATALOG_COMPAT_PREFIX: &str = "/_iceberg/v1";
+
 /// Returns true for the admin prefix itself or slash-delimited children.
 pub(crate) fn is_admin_path(path: &str) -> bool {
-    has_path_prefix(path, ADMIN_PREFIX)
-        || has_path_prefix(path, MINIO_ADMIN_PREFIX)
-        || has_path_prefix(path, TABLE_CATALOG_PREFIX)
+    has_path_prefix(path, ADMIN_PREFIX) || has_path_prefix(path, MINIO_ADMIN_PREFIX) || is_table_catalog_path(path)
+}
+
+pub(crate) fn is_table_catalog_path(path: &str) -> bool {
+    has_path_prefix(path, TABLE_CATALOG_PREFIX) || has_path_prefix(path, TABLE_CATALOG_COMPAT_PREFIX)
 }
 
 pub(crate) fn has_path_prefix(path: &str, prefix: &str) -> bool {

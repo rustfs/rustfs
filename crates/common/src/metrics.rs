@@ -600,6 +600,8 @@ pub struct Metrics {
     current_scan_cycle_throttle_sleep_events_start: AtomicU64,
     current_scan_cycle_throttle_sleep_duration_millis_start: AtomicU64,
     current_scan_cycle_ilm_actions_start: AtomicU64,
+    current_scan_cycle_lifecycle_expiry_actions_start: AtomicU64,
+    current_scan_cycle_lifecycle_transition_actions_start: AtomicU64,
     current_scan_cycle_heal_objects_start: AtomicU64,
     current_scan_cycle_replication_checks_start: AtomicU64,
     current_scan_cycle_usage_saves_start: AtomicU64,
@@ -620,6 +622,8 @@ pub struct Metrics {
     last_scan_cycle_throttle_sleep_events: AtomicU64,
     last_scan_cycle_throttle_sleep_duration_millis: AtomicU64,
     last_scan_cycle_ilm_actions: AtomicU64,
+    last_scan_cycle_lifecycle_expiry_actions: AtomicU64,
+    last_scan_cycle_lifecycle_transition_actions: AtomicU64,
     last_scan_cycle_heal_objects: AtomicU64,
     last_scan_cycle_replication_checks: AtomicU64,
     last_scan_cycle_usage_saves: AtomicU64,
@@ -632,6 +636,20 @@ pub struct Metrics {
     scanner_yield_duration_millis: AtomicU64,
     scanner_throttle_sleep_duration_millis: AtomicU64,
     scanner_ilm_actions: AtomicU64,
+    scanner_lifecycle_expiry_actions: AtomicU64,
+    scanner_lifecycle_transition_actions: AtomicU64,
+    scanner_transition_queue_capacity: AtomicU64,
+    scanner_transition_queued: AtomicU64,
+    scanner_transition_active: AtomicU64,
+    scanner_transition_workers: AtomicU64,
+    scanner_transition_queue_full: AtomicU64,
+    scanner_transition_queue_send_timeout: AtomicU64,
+    scanner_transition_compensation_scheduled: AtomicU64,
+    scanner_transition_compensation_running: AtomicU64,
+    scanner_transition_queued_total: AtomicU64,
+    scanner_transition_missed_total: AtomicU64,
+    scanner_transition_completed: AtomicU64,
+    scanner_transition_failed: AtomicU64,
     scanner_throttle_idle_mode_enabled: AtomicBool,
     scanner_throttle_sleep_factor_micros: AtomicU64,
     scanner_throttle_max_sleep_millis: AtomicU64,
@@ -710,6 +728,8 @@ pub struct ScanCycleWorkSnapshot {
     throttle_sleep_events: u64,
     throttle_sleep_duration_millis: u64,
     ilm_actions: u64,
+    lifecycle_expiry_actions: u64,
+    lifecycle_transition_actions: u64,
     heal_objects: u64,
     replication_checks: u64,
     usage_saves: u64,
@@ -746,6 +766,61 @@ pub struct ScannerSourceWorkSnapshot {
 pub struct ScannerSourceCycleSnapshot {
     pub source: String,
     pub cycles: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ScannerPacingPressureSnapshot {
+    pub primary_pressure: String,
+    pub current_queued_scans: u64,
+    pub current_active_scans: u64,
+    pub last_cycle_budget_limited: bool,
+    pub last_cycle_pause_observed: bool,
+    pub last_cycle_throttle_sleep_ratio: f64,
+    pub last_cycle_yield_ratio: f64,
+    pub last_cycle_total_pause_ratio: f64,
+}
+
+impl Default for ScannerPacingPressureSnapshot {
+    fn default() -> Self {
+        Self {
+            primary_pressure: "none".to_string(),
+            current_queued_scans: 0,
+            current_active_scans: 0,
+            last_cycle_budget_limited: false,
+            last_cycle_pause_observed: false,
+            last_cycle_throttle_sleep_ratio: 0.0,
+            last_cycle_yield_ratio: 0.0,
+            last_cycle_total_pause_ratio: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScannerLifecycleTransitionStateUpdate {
+    pub queue_capacity: u64,
+    pub queued: u64,
+    pub active: u64,
+    pub workers: u64,
+    pub queue_full: u64,
+    pub queue_send_timeout: u64,
+    pub compensation_scheduled: u64,
+    pub compensation_running: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerLifecycleTransitionSnapshot {
+    pub current_queue_capacity: u64,
+    pub current_queued: u64,
+    pub current_active: u64,
+    pub current_workers: u64,
+    pub queue_full: u64,
+    pub queue_send_timeout: u64,
+    pub compensation_scheduled: u64,
+    pub compensation_running: u64,
+    pub scanner_queued: u64,
+    pub scanner_missed: u64,
+    pub completed: u64,
+    pub failed: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -801,6 +876,10 @@ pub struct ScannerMetricsReport {
     #[serde(default)]
     pub current_cycle_ilm_actions: u64,
     #[serde(default)]
+    pub current_cycle_lifecycle_expiry_actions: u64,
+    #[serde(default)]
+    pub current_cycle_lifecycle_transition_actions: u64,
+    #[serde(default)]
     pub current_cycle_heal_objects: u64,
     #[serde(default)]
     pub current_cycle_replication_checks: u64,
@@ -836,6 +915,10 @@ pub struct ScannerMetricsReport {
     #[serde(default)]
     pub last_cycle_ilm_actions: u64,
     #[serde(default)]
+    pub last_cycle_lifecycle_expiry_actions: u64,
+    #[serde(default)]
+    pub last_cycle_lifecycle_transition_actions: u64,
+    #[serde(default)]
     pub last_cycle_heal_objects: u64,
     #[serde(default)]
     pub last_cycle_replication_checks: u64,
@@ -852,6 +935,10 @@ pub struct ScannerMetricsReport {
     pub partial_cycles_directories: u64,
     #[serde(default)]
     pub partial_cycles_by_source: Vec<ScannerSourceCycleSnapshot>,
+    #[serde(default)]
+    pub pacing_pressure: ScannerPacingPressureSnapshot,
+    #[serde(default)]
+    pub lifecycle_transition: ScannerLifecycleTransitionSnapshot,
     #[serde(default)]
     pub throttle_idle_mode_enabled: bool,
     #[serde(default)]
@@ -930,6 +1017,76 @@ fn scan_cycle_result_label(result: u8) -> &'static str {
         SCAN_CYCLE_RESULT_ERROR => SCAN_CYCLE_RESULT_ERROR_LABEL,
         SCAN_CYCLE_RESULT_PARTIAL => SCAN_CYCLE_RESULT_PARTIAL_LABEL,
         _ => SCAN_CYCLE_RESULT_UNKNOWN_LABEL,
+    }
+}
+
+fn scanner_ratio(numerator: f64, denominator: f64) -> f64 {
+    if denominator <= 0.0 {
+        0.0
+    } else {
+        (numerator / denominator).clamp(0.0, 1.0)
+    }
+}
+
+fn scanner_last_cycle_budget_limited(result_code: u64, partial_reason: &str) -> bool {
+    result_code == u64::from(SCAN_CYCLE_RESULT_PARTIAL) && matches!(partial_reason, "runtime" | "objects" | "directories")
+}
+
+fn scanner_primary_pressure(
+    current_queued_scans: u64,
+    current_active_scans: u64,
+    last_cycle_budget_limited: bool,
+    last_cycle_throttle_sleep_events: u64,
+    last_cycle_yield_events: u64,
+) -> &'static str {
+    if current_queued_scans > 0 {
+        "queued_scans"
+    } else if last_cycle_budget_limited {
+        "cycle_budget"
+    } else if last_cycle_throttle_sleep_events > 0 || last_cycle_yield_events > 0 {
+        "throttle_pause"
+    } else if current_active_scans > 0 {
+        "active_scans"
+    } else {
+        "none"
+    }
+}
+
+fn scanner_pacing_pressure(metrics: &ScannerMetricsReport) -> ScannerPacingPressureSnapshot {
+    let current_queued_scans = metrics
+        .current_set_scans_queued
+        .saturating_add(metrics.current_disk_bucket_scans_queued);
+    let current_active_scans = metrics
+        .current_set_scans_active
+        .saturating_add(metrics.current_disk_bucket_scans_active)
+        .max(usize_to_u64_saturated(metrics.active_scan_paths));
+    let last_cycle_budget_limited =
+        scanner_last_cycle_budget_limited(metrics.last_cycle_result_code, metrics.last_cycle_partial_reason.as_str());
+    let last_cycle_pause_observed = metrics.last_cycle_throttle_sleep_events > 0 || metrics.last_cycle_yield_events > 0;
+    let last_cycle_throttle_sleep_ratio =
+        scanner_ratio(metrics.last_cycle_throttle_sleep_duration_seconds, metrics.last_cycle_duration_seconds);
+    let last_cycle_yield_ratio = scanner_ratio(metrics.last_cycle_yield_duration_seconds, metrics.last_cycle_duration_seconds);
+    let last_cycle_total_pause_ratio = scanner_ratio(
+        metrics.last_cycle_throttle_sleep_duration_seconds.max(0.0) + metrics.last_cycle_yield_duration_seconds.max(0.0),
+        metrics.last_cycle_duration_seconds,
+    );
+
+    ScannerPacingPressureSnapshot {
+        primary_pressure: scanner_primary_pressure(
+            current_queued_scans,
+            current_active_scans,
+            last_cycle_budget_limited,
+            metrics.last_cycle_throttle_sleep_events,
+            metrics.last_cycle_yield_events,
+        )
+        .to_string(),
+        current_queued_scans,
+        current_active_scans,
+        last_cycle_budget_limited,
+        last_cycle_pause_observed,
+        last_cycle_throttle_sleep_ratio,
+        last_cycle_yield_ratio,
+        last_cycle_total_pause_ratio,
     }
 }
 
@@ -1035,6 +1192,8 @@ impl Metrics {
             current_scan_cycle_throttle_sleep_events_start: AtomicU64::new(0),
             current_scan_cycle_throttle_sleep_duration_millis_start: AtomicU64::new(0),
             current_scan_cycle_ilm_actions_start: AtomicU64::new(0),
+            current_scan_cycle_lifecycle_expiry_actions_start: AtomicU64::new(0),
+            current_scan_cycle_lifecycle_transition_actions_start: AtomicU64::new(0),
             current_scan_cycle_heal_objects_start: AtomicU64::new(0),
             current_scan_cycle_replication_checks_start: AtomicU64::new(0),
             current_scan_cycle_usage_saves_start: AtomicU64::new(0),
@@ -1055,6 +1214,8 @@ impl Metrics {
             last_scan_cycle_throttle_sleep_events: AtomicU64::new(0),
             last_scan_cycle_throttle_sleep_duration_millis: AtomicU64::new(0),
             last_scan_cycle_ilm_actions: AtomicU64::new(0),
+            last_scan_cycle_lifecycle_expiry_actions: AtomicU64::new(0),
+            last_scan_cycle_lifecycle_transition_actions: AtomicU64::new(0),
             last_scan_cycle_heal_objects: AtomicU64::new(0),
             last_scan_cycle_replication_checks: AtomicU64::new(0),
             last_scan_cycle_usage_saves: AtomicU64::new(0),
@@ -1067,6 +1228,20 @@ impl Metrics {
             scanner_yield_duration_millis: AtomicU64::new(0),
             scanner_throttle_sleep_duration_millis: AtomicU64::new(0),
             scanner_ilm_actions: AtomicU64::new(0),
+            scanner_lifecycle_expiry_actions: AtomicU64::new(0),
+            scanner_lifecycle_transition_actions: AtomicU64::new(0),
+            scanner_transition_queue_capacity: AtomicU64::new(0),
+            scanner_transition_queued: AtomicU64::new(0),
+            scanner_transition_active: AtomicU64::new(0),
+            scanner_transition_workers: AtomicU64::new(0),
+            scanner_transition_queue_full: AtomicU64::new(0),
+            scanner_transition_queue_send_timeout: AtomicU64::new(0),
+            scanner_transition_compensation_scheduled: AtomicU64::new(0),
+            scanner_transition_compensation_running: AtomicU64::new(0),
+            scanner_transition_queued_total: AtomicU64::new(0),
+            scanner_transition_missed_total: AtomicU64::new(0),
+            scanner_transition_completed: AtomicU64::new(0),
+            scanner_transition_failed: AtomicU64::new(0),
             scanner_throttle_idle_mode_enabled: AtomicBool::new(false),
             scanner_throttle_sleep_factor_micros: AtomicU64::new(0),
             scanner_throttle_max_sleep_millis: AtomicU64::new(0),
@@ -1238,12 +1413,57 @@ impl Metrics {
         self.record_scanner_source_executed(ScannerWorkSource::Lifecycle, count);
     }
 
+    pub fn record_scanner_lifecycle_action(&self, action: IlmAction, count: u64) {
+        self.record_scanner_ilm_action(count);
+        match action {
+            IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
+                self.scanner_lifecycle_transition_actions.fetch_add(count, Ordering::Relaxed);
+            }
+            _ if action.delete() => {
+                self.scanner_lifecycle_expiry_actions.fetch_add(count, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
     pub fn record_scanner_ilm_enqueue_result(&self, count: u64, queued: bool) {
         if queued {
             self.record_scanner_source_queued(ScannerWorkSource::Lifecycle, count);
         } else {
             self.record_scanner_source_missed(ScannerWorkSource::Lifecycle, count);
         }
+    }
+
+    pub fn record_scanner_transition_enqueue_result(&self, count: u64, queued: bool) {
+        self.record_scanner_ilm_enqueue_result(count, queued);
+        if queued {
+            self.scanner_transition_queued_total.fetch_add(count, Ordering::Relaxed);
+        } else {
+            self.scanner_transition_missed_total.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_scanner_lifecycle_transition_state(&self, state: ScannerLifecycleTransitionStateUpdate) {
+        self.scanner_transition_queue_capacity
+            .store(state.queue_capacity, Ordering::Relaxed);
+        self.scanner_transition_queued.store(state.queued, Ordering::Relaxed);
+        self.scanner_transition_active.store(state.active, Ordering::Relaxed);
+        self.scanner_transition_workers.store(state.workers, Ordering::Relaxed);
+        self.scanner_transition_queue_full.store(state.queue_full, Ordering::Relaxed);
+        self.scanner_transition_queue_send_timeout
+            .store(state.queue_send_timeout, Ordering::Relaxed);
+        self.scanner_transition_compensation_scheduled
+            .store(state.compensation_scheduled, Ordering::Relaxed);
+        self.scanner_transition_compensation_running
+            .store(state.compensation_running, Ordering::Relaxed);
+    }
+
+    pub fn record_scanner_transition_completed(&self, count: u64) {
+        self.scanner_transition_completed.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn record_scanner_transition_failed(&self, count: u64) {
+        self.scanner_transition_failed.fetch_add(count, Ordering::Relaxed);
     }
 
     pub fn record_scanner_checkpoint_set(&self, version: u16, resume_after: impl Into<String>, reason: impl Into<String>) {
@@ -1544,6 +1764,10 @@ impl Metrics {
             .store(snapshot.throttle_sleep_duration_millis, Ordering::Relaxed);
         self.current_scan_cycle_ilm_actions_start
             .store(snapshot.ilm_actions, Ordering::Relaxed);
+        self.current_scan_cycle_lifecycle_expiry_actions_start
+            .store(snapshot.lifecycle_expiry_actions, Ordering::Relaxed);
+        self.current_scan_cycle_lifecycle_transition_actions_start
+            .store(snapshot.lifecycle_transition_actions, Ordering::Relaxed);
         self.current_scan_cycle_heal_objects_start
             .store(snapshot.heal_objects, Ordering::Relaxed);
         self.current_scan_cycle_replication_checks_start
@@ -1574,6 +1798,8 @@ impl Metrics {
             throttle_sleep_events: self.lifetime(Metric::ThrottleSleep),
             throttle_sleep_duration_millis: self.scanner_throttle_sleep_duration_millis.load(Ordering::Relaxed),
             ilm_actions: self.scanner_ilm_actions.load(Ordering::Relaxed),
+            lifecycle_expiry_actions: self.scanner_lifecycle_expiry_actions.load(Ordering::Relaxed),
+            lifecycle_transition_actions: self.scanner_lifecycle_transition_actions.load(Ordering::Relaxed),
             heal_objects: self.lifetime(Metric::HealAbandonedObject),
             replication_checks: self.lifetime(Metric::CheckReplication),
             usage_saves: self.lifetime(Metric::SaveUsage),
@@ -1593,6 +1819,10 @@ impl Metrics {
                 .current_scan_cycle_throttle_sleep_duration_millis_start
                 .load(Ordering::Relaxed),
             ilm_actions: self.current_scan_cycle_ilm_actions_start.load(Ordering::Relaxed),
+            lifecycle_expiry_actions: self.current_scan_cycle_lifecycle_expiry_actions_start.load(Ordering::Relaxed),
+            lifecycle_transition_actions: self
+                .current_scan_cycle_lifecycle_transition_actions_start
+                .load(Ordering::Relaxed),
             heal_objects: self.current_scan_cycle_heal_objects_start.load(Ordering::Relaxed),
             replication_checks: self.current_scan_cycle_replication_checks_start.load(Ordering::Relaxed),
             usage_saves: self.current_scan_cycle_usage_saves_start.load(Ordering::Relaxed),
@@ -1613,6 +1843,12 @@ impl Metrics {
                 .throttle_sleep_duration_millis
                 .saturating_sub(start.throttle_sleep_duration_millis),
             ilm_actions: current.ilm_actions.saturating_sub(start.ilm_actions),
+            lifecycle_expiry_actions: current
+                .lifecycle_expiry_actions
+                .saturating_sub(start.lifecycle_expiry_actions),
+            lifecycle_transition_actions: current
+                .lifecycle_transition_actions
+                .saturating_sub(start.lifecycle_transition_actions),
             heal_objects: current.heal_objects.saturating_sub(start.heal_objects),
             replication_checks: current.replication_checks.saturating_sub(start.replication_checks),
             usage_saves: current.usage_saves.saturating_sub(start.usage_saves),
@@ -1690,6 +1926,10 @@ impl Metrics {
         self.last_scan_cycle_throttle_sleep_duration_millis
             .store(work.throttle_sleep_duration_millis, Ordering::Relaxed);
         self.last_scan_cycle_ilm_actions.store(work.ilm_actions, Ordering::Relaxed);
+        self.last_scan_cycle_lifecycle_expiry_actions
+            .store(work.lifecycle_expiry_actions, Ordering::Relaxed);
+        self.last_scan_cycle_lifecycle_transition_actions
+            .store(work.lifecycle_transition_actions, Ordering::Relaxed);
         self.last_scan_cycle_heal_objects.store(work.heal_objects, Ordering::Relaxed);
         self.last_scan_cycle_replication_checks
             .store(work.replication_checks, Ordering::Relaxed);
@@ -1781,6 +2021,8 @@ impl Metrics {
             m.current_cycle_throttle_sleep_events = current_work.throttle_sleep_events;
             m.current_cycle_throttle_sleep_duration_seconds = current_work.throttle_sleep_duration_millis as f64 / 1000.0;
             m.current_cycle_ilm_actions = current_work.ilm_actions;
+            m.current_cycle_lifecycle_expiry_actions = current_work.lifecycle_expiry_actions;
+            m.current_cycle_lifecycle_transition_actions = current_work.lifecycle_transition_actions;
             m.current_cycle_heal_objects = current_work.heal_objects;
             m.current_cycle_replication_checks = current_work.replication_checks;
             m.current_cycle_usage_saves = current_work.usage_saves;
@@ -1809,6 +2051,8 @@ impl Metrics {
         m.last_cycle_throttle_sleep_duration_seconds =
             self.last_scan_cycle_throttle_sleep_duration_millis.load(Ordering::Relaxed) as f64 / 1000.0;
         m.last_cycle_ilm_actions = self.last_scan_cycle_ilm_actions.load(Ordering::Relaxed);
+        m.last_cycle_lifecycle_expiry_actions = self.last_scan_cycle_lifecycle_expiry_actions.load(Ordering::Relaxed);
+        m.last_cycle_lifecycle_transition_actions = self.last_scan_cycle_lifecycle_transition_actions.load(Ordering::Relaxed);
         m.last_cycle_heal_objects = self.last_scan_cycle_heal_objects.load(Ordering::Relaxed);
         m.last_cycle_replication_checks = self.last_scan_cycle_replication_checks.load(Ordering::Relaxed);
         m.last_cycle_usage_saves = self.last_scan_cycle_usage_saves.load(Ordering::Relaxed);
@@ -1829,6 +2073,20 @@ impl Metrics {
                     })
             })
             .collect();
+        m.lifecycle_transition = ScannerLifecycleTransitionSnapshot {
+            current_queue_capacity: self.scanner_transition_queue_capacity.load(Ordering::Relaxed),
+            current_queued: self.scanner_transition_queued.load(Ordering::Relaxed),
+            current_active: self.scanner_transition_active.load(Ordering::Relaxed),
+            current_workers: self.scanner_transition_workers.load(Ordering::Relaxed),
+            queue_full: self.scanner_transition_queue_full.load(Ordering::Relaxed),
+            queue_send_timeout: self.scanner_transition_queue_send_timeout.load(Ordering::Relaxed),
+            compensation_scheduled: self.scanner_transition_compensation_scheduled.load(Ordering::Relaxed),
+            compensation_running: self.scanner_transition_compensation_running.load(Ordering::Relaxed),
+            scanner_queued: self.scanner_transition_queued_total.load(Ordering::Relaxed),
+            scanner_missed: self.scanner_transition_missed_total.load(Ordering::Relaxed),
+            completed: self.scanner_transition_completed.load(Ordering::Relaxed),
+            failed: self.scanner_transition_failed.load(Ordering::Relaxed),
+        };
         m.throttle_idle_mode_enabled = self.scanner_throttle_idle_mode_enabled.load(Ordering::Relaxed);
         m.throttle_sleep_factor = self.scanner_throttle_sleep_factor_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
         m.throttle_max_sleep_seconds = self.scanner_throttle_max_sleep_millis.load(Ordering::Relaxed) as f64 / 1000.0;
@@ -1903,6 +2161,8 @@ impl Metrics {
                 );
             }
         }
+
+        m.pacing_pressure = scanner_pacing_pressure(&m);
 
         m
     }
@@ -2061,6 +2321,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn report_derives_scanner_pacing_pressure() {
+        let metrics = Metrics::new();
+        metrics.record_scanner_set_scan_state(Some(2), Some(3), Some(1));
+        metrics.record_scanner_disk_bucket_scan_state("0", "0", Some(1), Some(4), Some(1));
+        metrics.record_scan_cycle_partial_with_source(
+            Duration::from_secs(10),
+            ScanCyclePartialReason::Runtime,
+            Some(ScannerWorkSource::Usage),
+        );
+        metrics.record_scan_cycle_work(ScanCycleWorkSnapshot {
+            yield_events: 2,
+            yield_duration_millis: 500,
+            throttle_sleep_events: 4,
+            throttle_sleep_duration_millis: 2500,
+            ..Default::default()
+        });
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.pacing_pressure.primary_pressure, "queued_scans");
+        assert_eq!(report.pacing_pressure.current_queued_scans, 7);
+        assert_eq!(report.pacing_pressure.current_active_scans, 2);
+        assert!(report.pacing_pressure.last_cycle_budget_limited);
+        assert!(report.pacing_pressure.last_cycle_pause_observed);
+        assert_eq!(report.pacing_pressure.last_cycle_throttle_sleep_ratio, 0.25);
+        assert_eq!(report.pacing_pressure.last_cycle_yield_ratio, 0.05);
+        assert_eq!(report.pacing_pressure.last_cycle_total_pause_ratio, 0.3);
+    }
+
+    #[tokio::test]
     async fn report_includes_scanner_checkpoint_status() {
         let metrics = Metrics::new();
         metrics.record_scanner_checkpoint_set(1, "bucket/child-a", "directories");
@@ -2129,6 +2419,64 @@ mod tests {
         assert_eq!(lifecycle.executed, 1);
         assert_eq!(lifecycle.failed, 1);
         assert_eq!(lifecycle.missed, 8);
+    }
+
+    #[tokio::test]
+    async fn report_splits_scanner_lifecycle_actions_by_expiry_and_transition() {
+        let metrics = Metrics::new();
+        let start = metrics.start_scan_cycle_work();
+
+        metrics.record_scanner_lifecycle_action(IlmAction::DeleteAction, 2);
+        metrics.record_scanner_lifecycle_action(IlmAction::DeleteRestoredVersionAction, 3);
+        metrics.record_scanner_lifecycle_action(IlmAction::TransitionAction, 5);
+        metrics.record_scanner_lifecycle_action(IlmAction::TransitionVersionAction, 7);
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.current_cycle_ilm_actions, 17);
+        assert_eq!(report.current_cycle_lifecycle_expiry_actions, 5);
+        assert_eq!(report.current_cycle_lifecycle_transition_actions, 12);
+
+        metrics.finish_scan_cycle_work(start);
+        let report = metrics.report().await;
+
+        assert_eq!(report.last_cycle_ilm_actions, 17);
+        assert_eq!(report.last_cycle_lifecycle_expiry_actions, 5);
+        assert_eq!(report.last_cycle_lifecycle_transition_actions, 12);
+    }
+
+    #[tokio::test]
+    async fn report_includes_scanner_lifecycle_transition_status() {
+        let metrics = Metrics::new();
+        metrics.record_scanner_lifecycle_transition_state(ScannerLifecycleTransitionStateUpdate {
+            queue_capacity: 16,
+            queued: 5,
+            active: 2,
+            workers: 4,
+            queue_full: 3,
+            queue_send_timeout: 1,
+            compensation_scheduled: 2,
+            compensation_running: 1,
+        });
+        metrics.record_scanner_transition_enqueue_result(6, true);
+        metrics.record_scanner_transition_enqueue_result(2, false);
+        metrics.record_scanner_transition_completed(4);
+        metrics.record_scanner_transition_failed(1);
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.lifecycle_transition.current_queue_capacity, 16);
+        assert_eq!(report.lifecycle_transition.current_queued, 5);
+        assert_eq!(report.lifecycle_transition.current_active, 2);
+        assert_eq!(report.lifecycle_transition.current_workers, 4);
+        assert_eq!(report.lifecycle_transition.queue_full, 3);
+        assert_eq!(report.lifecycle_transition.queue_send_timeout, 1);
+        assert_eq!(report.lifecycle_transition.compensation_scheduled, 2);
+        assert_eq!(report.lifecycle_transition.compensation_running, 1);
+        assert_eq!(report.lifecycle_transition.scanner_queued, 6);
+        assert_eq!(report.lifecycle_transition.scanner_missed, 2);
+        assert_eq!(report.lifecycle_transition.completed, 4);
+        assert_eq!(report.lifecycle_transition.failed, 1);
     }
 
     #[tokio::test]
@@ -2354,6 +2702,7 @@ mod tests {
             heal_objects: 2,
             replication_checks: 4,
             usage_saves: 6,
+            ..Default::default()
         });
 
         let report = metrics.report().await;

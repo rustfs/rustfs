@@ -27,5 +27,14 @@ categories = ["web-programming", "development-tools", "filesystem"]
 [lib]
 doctest = false
 
+[dependencies]
+async-trait.workspace = true
+serde.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+
 [lints]
 workspace = true
