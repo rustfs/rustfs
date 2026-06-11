@@ -14,6 +14,8 @@
 
 use rustfs_security_governance::{RedactionLevel, RedactionPolicyError, RedactionRule, validate_redaction_rules};
 use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 pub const REDACTED_LOG_VALUE: &str = "***redacted***";
 
@@ -95,6 +97,27 @@ impl fmt::Debug for MaskedAccessKey<'_> {
 mod tests {
     use super::*;
 
+    fn workspace_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root should exist")
+            .to_path_buf()
+    }
+
+    fn assert_no_unmasked_access_key_logging(rel_path: &str, forbidden_patterns: &[&str]) {
+        let path = workspace_root().join(rel_path);
+        let source = fs::read_to_string(&path).unwrap_or_else(|err| panic!("failed to read {}: {}", path.display(), err));
+        for pattern in forbidden_patterns {
+            assert!(
+                !source.contains(pattern),
+                "found forbidden unmasked access_key logging pattern `{}` in {}",
+                pattern,
+                path.display()
+            );
+        }
+    }
+
     #[test]
     fn logging_redaction_rules_are_valid() {
         assert!(validate_logging_redaction_rules().is_ok());
@@ -131,5 +154,29 @@ mod tests {
     fn masked_access_key_masks_long_values() {
         assert_eq!(MaskedAccessKey("AKIAIOSFODNN7EXAMPLE").to_string(), "AKIA***MPLE");
         assert_eq!(format!("{:?}", MaskedAccessKey("keystone:user-1234")), "keys***1234");
+    }
+
+    #[test]
+    fn runtime_auth_logging_does_not_use_previous_unmasked_access_key_patterns() {
+        assert_no_unmasked_access_key_logging(
+            "rustfs/src/auth.rs",
+            &[
+                "get_secret_key failed: no such user, access_key: {access_key}",
+                "get_secret_key failed: check_key error, access_key: {access_key}, error: {e:?}",
+                "get_secret_key failed: iam not initialized, access_key: {access_key}",
+                "check_key_valid: user not found for access_key={}",
+                "check_key_valid: account disabled for access_key={}",
+                "check_key_valid: validation failed for access_key={}",
+                "check_key_valid: starting validation - access_key={}, session_token_len={}",
+            ],
+        );
+    }
+
+    #[test]
+    fn protocol_client_logging_does_not_use_previous_unmasked_access_key_pattern() {
+        assert_no_unmasked_access_key_logging(
+            "rustfs/src/protocols/client.rs",
+            &["Protocol storage client ListBuckets request: access_key={}"],
+        );
     }
 }
