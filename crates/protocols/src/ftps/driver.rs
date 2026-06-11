@@ -233,6 +233,11 @@ where
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         if let Some(key) = key {
+            // Authorize HeadObject
+            authorize_operation(session_context, &S3Action::HeadObject, &bucket, Some(&key))
+                .await
+                .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+
             match self
                 .storage
                 .head_object(
@@ -264,6 +269,11 @@ where
             }
         } else {
             // Directory metadata - use HeadBucket
+            // Authorize HeadBucket
+            authorize_operation(session_context, &S3Action::HeadBucket, &bucket, None)
+                .await
+                .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+
             let bucket_clone = bucket.clone();
             match self
                 .storage
@@ -433,6 +443,11 @@ where
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         let key = key.ok_or_else(|| Error::new(ErrorKind::PermanentFileNotAvailable, "Cannot get directory"))?;
+
+        // Authorize GetObject
+        authorize_operation(session_context, &S3Action::GetObject, &bucket, Some(&key))
+            .await
+            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
         match self
             .storage
@@ -667,6 +682,11 @@ where
         let (bucket, _key) = self
             .parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
+
+        // Authorize HeadBucket (CWD probes bucket existence)
+        authorize_operation(session_context, &S3Action::HeadBucket, &bucket, None)
+            .await
+            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
         // Check if bucket exists
         match self
