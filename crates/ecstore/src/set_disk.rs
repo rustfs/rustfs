@@ -1557,6 +1557,34 @@ impl SetDisks {
     }
 }
 
+impl SetDisks {
+    pub(crate) async fn storage_info_snapshot(&self) -> rustfs_madmin::StorageInfo {
+        let disks = self.get_disks_internal().await;
+
+        get_storage_info(&disks, &self.set_endpoints).await
+    }
+
+    pub(crate) async fn local_storage_info_snapshot(&self) -> rustfs_madmin::StorageInfo {
+        let disks = self.get_disks_internal().await;
+
+        let mut local_disks: Vec<Option<DiskStore>> = Vec::new();
+        let mut local_endpoints = Vec::new();
+
+        for (i, ep) in self.set_endpoints.iter().enumerate() {
+            if ep.is_local {
+                local_disks.push(disks[i].clone());
+                local_endpoints.push(ep.clone());
+            }
+        }
+
+        get_storage_info(&local_disks, &local_endpoints).await
+    }
+
+    pub(crate) async fn disk_inventory(&self) -> Vec<Option<DiskStore>> {
+        self.get_disks_internal().await
+    }
+}
+
 #[async_trait::async_trait]
 impl StorageAPI for SetDisks {
     #[tracing::instrument(skip(self))]
@@ -1592,30 +1620,16 @@ impl StorageAPI for SetDisks {
     }
     #[tracing::instrument(skip(self))]
     async fn storage_info(&self) -> rustfs_madmin::StorageInfo {
-        let disks = self.get_disks_internal().await;
-
-        get_storage_info(&disks, &self.set_endpoints).await
+        self.storage_info_snapshot().await
     }
     #[tracing::instrument(skip(self))]
     async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
-        let disks = self.get_disks_internal().await;
-
-        let mut local_disks: Vec<Option<DiskStore>> = Vec::new();
-        let mut local_endpoints = Vec::new();
-
-        for (i, ep) in self.set_endpoints.iter().enumerate() {
-            if ep.is_local {
-                local_disks.push(disks[i].clone());
-                local_endpoints.push(ep.clone());
-            }
-        }
-
-        get_storage_info(&local_disks, &local_endpoints).await
+        self.local_storage_info_snapshot().await
     }
 
     #[tracing::instrument(skip(self))]
     async fn get_disks(&self, _pool_idx: usize, _set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
-        Ok(self.get_disks_internal().await)
+        Ok(self.disk_inventory().await)
     }
 
     #[tracing::instrument(skip(self))]

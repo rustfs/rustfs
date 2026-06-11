@@ -287,6 +287,46 @@ impl Sets {
         self.get_disks(self.get_hashed_set_index(key))
     }
 
+    pub(crate) async fn storage_info_snapshot(&self) -> rustfs_madmin::StorageInfo {
+        let mut futures = Vec::with_capacity(self.disk_set.len());
+
+        for set in self.disk_set.iter() {
+            futures.push(set.storage_info_snapshot())
+        }
+
+        let results = join_all(futures).await;
+        let mut disks = Vec::new();
+
+        for res in results.into_iter() {
+            disks.extend_from_slice(&res.disks);
+        }
+
+        rustfs_madmin::StorageInfo {
+            disks,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) async fn local_storage_info_snapshot(&self) -> rustfs_madmin::StorageInfo {
+        let mut futures = Vec::with_capacity(self.disk_set.len());
+
+        for set in self.disk_set.iter() {
+            futures.push(set.local_storage_info_snapshot())
+        }
+
+        let results = join_all(futures).await;
+        let mut disks = Vec::new();
+
+        for res in results.into_iter() {
+            disks.extend_from_slice(&res.disks);
+        }
+
+        rustfs_madmin::StorageInfo {
+            disks,
+            ..Default::default()
+        }
+    }
+
     fn get_hashed_set_index(&self, input: &str) -> usize {
         match self.distribution_algo {
             DistributionAlgoVersion::V1 => crc_hash(input, self.disk_set.len()),
@@ -867,44 +907,11 @@ impl StorageAPI for Sets {
     }
     #[tracing::instrument(skip(self))]
     async fn storage_info(&self) -> rustfs_madmin::StorageInfo {
-        let mut futures = Vec::with_capacity(self.disk_set.len());
-
-        for set in self.disk_set.iter() {
-            futures.push(set.storage_info())
-        }
-
-        let results = join_all(futures).await;
-
-        let mut disks = Vec::new();
-
-        for res in results.into_iter() {
-            disks.extend_from_slice(&res.disks);
-        }
-
-        rustfs_madmin::StorageInfo {
-            disks,
-            ..Default::default()
-        }
+        self.storage_info_snapshot().await
     }
     #[tracing::instrument(skip(self))]
     async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
-        let mut futures = Vec::with_capacity(self.disk_set.len());
-
-        for set in self.disk_set.iter() {
-            futures.push(set.local_storage_info())
-        }
-
-        let results = join_all(futures).await;
-
-        let mut disks = Vec::new();
-
-        for res in results.into_iter() {
-            disks.extend_from_slice(&res.disks);
-        }
-        rustfs_madmin::StorageInfo {
-            disks,
-            ..Default::default()
-        }
+        self.local_storage_info_snapshot().await
     }
 
     #[tracing::instrument(skip(self))]
