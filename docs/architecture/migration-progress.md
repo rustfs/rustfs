@@ -5,15 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-admin-readiness-storage-admin`
-- Baseline: `origin/main` at `b48d7b1fa514e5da274d652a0cb7f282521f46c0`
+- Branch: `overtrue/arch-admin-observability-storage-reads`
+- Baseline: `origin/main` at `8ae0cad6671562c0fffe56a7f288cd97fb87309d`
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: migrate grouped admin/readiness read-side consumers from
-  old `StorageAPI::{backend_info, storage_info}` trait imports to the
-  inventory-facing `StorageAdminApi` contract.
+- Rust code changes: migrate grouped observability, RPC health, server-info,
+  realtime metrics, and notification read-side consumers from old
+  `StorageAPI::{backend_info, storage_info, local_storage_info}` trait imports
+  to the inventory-facing `StorageAdminApi` contract.
 - CI/script changes: none.
-- Docs changes: record API-007 grouped consumer-migration context,
+- Docs changes: record API-007 expanded read-side consumer-migration context,
   verification evidence, and expert review outcomes.
 
 ## Phase 0 Tasks
@@ -201,18 +202,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Completed third slice: `rustfs/rustfs#3333` migrated
     `DefaultAdminUsecase` storage-info reads to
     `StorageAdminApi::storage_info`.
-  - Current branch slice: migrate grouped read-side admin/readiness consumers:
-    account-info `backend_info`, rebalance status `storage_info`, and runtime
-    readiness `storage_info`.
-  - Acceptance: account-info, rebalance status, and readiness no longer import
-    old `StorageAPI` only to read admin storage information.
+  - Completed fourth slice: `rustfs/rustfs#3334` migrated account-info
+    `backend_info`, rebalance status `storage_info`, and runtime readiness
+    `storage_info`.
+  - Current branch slice: migrate grouped read-side observability and health
+    consumers: obs cluster/disk/config/erasure-set metrics, RPC local storage
+    info response construction, ECStore server-info local disk/backend reads,
+    realtime disk metrics, and notification storage-info aggregation.
+  - Acceptance: these consumers no longer import old `StorageAPI` only to read
+    admin storage information; peer RPC client calls remain unchanged.
   - Must preserve: old `StorageAPI` trait shape, `StorageAPI::get_disks`
-    behavior, account-info response shape, rebalance used-space aggregation,
-    readiness degraded-state semantics, RPC `local_storage_info`, heal/scanner
-    consumers, and storage hot paths.
+    behavior, obs metric values, RPC msgpack map encoding and response shape,
+    server-info shape, realtime metric shape, notification peer
+    aggregation/cache fallback, heal/scanner consumers, object paths,
+    replication/config persistence, and storage hot paths.
   - Risk defense: group only read-side callers that delegate to the existing
-    ECStore admin info implementation; do not migrate RPC `local_storage_info`,
-    heal, scanner, observability, or storage hot-path consumers in this PR.
+    ECStore admin info implementation; do not migrate object APIs, scanner,
+    heal, replication, config persistence, or storage implementation internals
+    in this PR.
 
 ## Phase 8 Background Controller Tasks
 
@@ -256,39 +263,48 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed the diff stays limited to three read-side consumers and migration notes, with no manifest, ECStore, storage-api, RPC, heal, scanner, observability, or hot-path scope creep. |
-| Migration preservation | pass | Confirmed the new and old ECStore trait paths still delegate to the same backend/storage-info handlers, while account-info response construction, rebalance aggregation, and readiness cache/degraded-state logic remain unchanged. |
-| Testing/verification | pass | Confirmed touched-consumer focused tests, compile checks, migration guards, diff hygiene, and full pre-commit evidence are sufficient; no missing success-path integration test is a blocker for this call-path migration. |
+| Quality/architecture | pass | Confirmed the diff stays limited to read-side consumer migration and the `rustfs-obs` contract dependency, with no object, scanner, heal, replication, config persistence, or storage hot-path scope creep. |
+| Migration preservation | pass | Confirmed obs metric calculations, RPC response encoding, server-info shape, realtime disk metric shape, notification peer aggregation/timeout/cache fallback, and peer REST calls remain unchanged. |
+| Testing/verification | pass | Confirmed focused tests, joint compile check, migration guards, diff hygiene, and added-line Rust quality scan are sufficient for this equivalent trait-entry migration while skipping full pre-commit under the current instruction. |
 
 ## Verification Notes
 
 Passed:
+- `cargo fmt --all`.
 - `cargo fmt --all --check`.
-- `cargo check -p rustfs --lib`.
-- `cargo test -p rustfs admin::handlers::account_info --lib`; 3 passed.
-- `cargo test -p rustfs admin::handlers::rebalance --lib`; 19 passed.
-- `cargo test -p rustfs server::readiness --lib`; 13 passed.
-- `cargo check -p rustfs-storage-api -p rustfs-ecstore -p rustfs --lib`.
+- `cargo check -p rustfs-storage-api -p rustfs-ecstore -p rustfs-obs -p rustfs --lib`.
+- `cargo test -p rustfs-obs stats_collector --lib`; 14 passed.
+- `cargo test -p rustfs-ecstore admin_server_info --lib`; 1 passed.
+- `cargo test -p rustfs-ecstore metrics_realtime --lib`; 5 passed.
+- `cargo test -p rustfs-ecstore notification_sys --lib`; 17 passed.
+- `cargo test -p rustfs local_storage_info_rpc_payload_uses_msgpack_map_encoding --lib`; 1 passed.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - `./scripts/check_metrics_migration_refs.sh`.
 - `./scripts/check_unsafe_code_allowances.sh`.
 - `git diff --check`.
-- `make NUM_CORES=1 pre-commit`.
+- Rust code-quality scan on changed `.rs` files, plus added-line scan for
+  unwrap/expect, numeric casts, `Result<_, String>`, `Box<dyn Error>`,
+  println/eprintln, and `Ordering::Relaxed`.
 
 Notes:
-- This branch relies on the existing direct `rustfs` dependency on
-  `rustfs-storage-api` from earlier API-007 slices.
-- No ECStore handler, old `StorageAPI` trait, RPC consumer, heal/scanner
-  consumer, observability consumer, or storage hot path is changed.
-- Full pre-commit passed with nextest `5757 passed, 111 skipped`; workspace
-  doctests passed.
+- This branch adds a direct `rustfs-obs` dependency on the existing
+  `rustfs-storage-api` workspace contract crate.
+- Full pre-commit was intentionally skipped because the focused tests and guards
+  above passed, per the current migration instruction to increase PR granularity.
+- The broad changed-file quality scan reports pre-existing test unwrap/expect
+  and pre-existing `admin_server_info.rs` println/eprintln; the added-line scan
+  found no new risky code patterns.
+- No ECStore handler implementation, old `StorageAPI` trait, peer RPC client,
+  heal/scanner consumer, object path, replication/config persistence path, or
+  storage hot path is changed.
 - No temporary compatibility shim was added.
 
 ## Handoff Notes
 
-- Keep this API-007 slice as a grouped read-side `consumer-migration` PR.
-- Do not migrate RPC `local_storage_info`, heal, scanner, observability, or
+- Keep this API-007 slice as a grouped observability/health/server-info
+  read-side `consumer-migration` PR.
+- Do not migrate object APIs, scanner, heal, replication, config persistence, or
   storage hot-path consumers in this PR.
 - Do not remove or route around `StorageAPI::get_disks` in this PR.
 - Do not make the old `StorageAPI` trait inherit `StorageAdminApi` in this PR.

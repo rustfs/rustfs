@@ -34,12 +34,13 @@ use rustfs_ecstore::bucket::metadata_sys::get_quota_config;
 use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
 use rustfs_ecstore::data_usage::load_data_usage_from_backend;
 use rustfs_ecstore::global::get_global_bucket_monitor;
+use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
-use rustfs_ecstore::{StorageAPI, new_object_layer_fn};
 use rustfs_iam::{get_global_iam_sys, oidc::oidc_plugin_authn_metrics_snapshot};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_io_metrics::{ProcessStatusSnapshot, snapshot_process_resource_and_system};
+use rustfs_storage_api::StorageAdminApi;
 use std::collections::HashMap;
 use std::time::Duration;
 use sysinfo::{Networks, System};
@@ -151,7 +152,7 @@ pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthS
         return (ClusterStats::default(), ClusterHealthStats::default());
     };
 
-    let storage_info = store.storage_info().await;
+    let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
     let raw_capacity: u64 = storage_info.disks.iter().map(|d| d.total_space).sum();
     let used: u64 = storage_info.disks.iter().map(|d| d.used_space).sum();
     let usable_capacity = get_total_usable_capacity(&storage_info.disks, &storage_info) as u64;
@@ -525,7 +526,7 @@ pub async fn collect_disk_and_system_drive_stats() -> (Vec<DiskStats>, Vec<Drive
         return (Vec::new(), Vec::new(), DriveCountStats::default());
     };
 
-    let storage_info = store.storage_info().await;
+    let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
     let disk_stats = storage_info
         .disks
         .iter()
@@ -710,7 +711,7 @@ pub fn collect_internode_network_stats() -> Option<NetworkStats> {
 /// Collect cluster config metrics from backend parity configuration.
 pub async fn collect_cluster_config_stats() -> Option<ClusterConfigStats> {
     let store = new_object_layer_fn()?;
-    let backend = store.backend_info().await;
+    let backend = StorageAdminApi::backend_info(store.as_ref()).await;
 
     Some(ClusterConfigStats {
         rrs_parity: backend.rr_sc_parity.unwrap_or_default() as u32,
@@ -724,8 +725,8 @@ pub async fn collect_erasure_set_stats() -> Vec<ErasureSetStats> {
         return Vec::new();
     };
 
-    let storage_info = store.storage_info().await;
-    let backend = store.backend_info().await;
+    let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
+    let backend = StorageAdminApi::backend_info(store.as_ref()).await;
     let mut grouped: HashMap<(usize, usize), ErasureSetStats> = HashMap::new();
 
     for disk in &storage_info.disks {
