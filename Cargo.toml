@@ -198,7 +198,7 @@ time = { version = "=0.3.47", features = ["std", "parsing", "formatting", "macro
 
 # Database
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
-tokio-postgres = { version = "0.7", default-features = false, features = ["runtime", "with-serde_json-1"] }
+tokio-postgres = { version = "0.7.18", default-features = false, features = ["runtime", "with-serde_json-1"] }
 tokio-postgres-rustls = "0.14.0"
 
 # Utilities and Tools
