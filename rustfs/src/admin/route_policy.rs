@@ -336,6 +336,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Put, "/rustfs/admin/v3/module-switches", CONFIG_UPDATE, RouteRiskLevel::High),
     admin(
         HttpMethod::Get,
+        "/rustfs/admin/v4/extensions/catalog",
+        SERVER_INFO,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v4/extensions/instances",
+        GET_BUCKET_TARGET,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
         "/rustfs/admin/v4/plugins/catalog",
         SERVER_INFO,
         RouteRiskLevel::Sensitive,

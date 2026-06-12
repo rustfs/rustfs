@@ -9074,6 +9074,7 @@ dependencies = [
  "rustfs-crypto",
  "rustfs-data-usage",
  "rustfs-ecstore",
+ "rustfs-extension-schema",
  "rustfs-filemeta",
  "rustfs-heal",
  "rustfs-iam",
