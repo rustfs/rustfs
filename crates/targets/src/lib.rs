@@ -44,9 +44,11 @@ pub use config::{
     normalize_legacy_target_instances_from_env, normalize_target_plugin_instances, normalize_target_plugin_instances_from_env,
 };
 pub use control_plane::{
-    TargetPluginEnableState, TargetPluginInstallState, TargetPluginInstallation, TargetPluginOperationalState,
-    TargetPluginRevision, TargetPluginRuntimeState, builtin_target_plugin_installation, builtin_target_plugin_operational_state,
-    external_target_plugin_installation, rollback_target_plugin_installation, runtime_state_from_status_label,
+    TargetPluginEnableState, TargetPluginExternalAction, TargetPluginExternalActionDecision, TargetPluginExternalActionError,
+    TargetPluginExternalFlowGate, TargetPluginExternalFlowGateStatus, TargetPluginInstallState, TargetPluginInstallation,
+    TargetPluginOperationalState, TargetPluginRevision, TargetPluginRuntimeState, builtin_target_plugin_installation,
+    builtin_target_plugin_operational_state, external_target_plugin_installation, plan_external_target_plugin_action,
+    rollback_target_plugin_installation, runtime_state_from_status_label,
 };
 pub use domain::TargetDomain;
 pub use error::{StoreError, TargetError};
@@ -70,7 +72,7 @@ pub use runtime::{
         OpsDiagnosticsRegistryError,
     },
     s3_hooks::{S3HookContext, S3HookDecision, S3HookRegistration, S3HookRegistry, S3HookRegistryError},
-    sidecar::{SidecarPluginRuntime, SidecarRuntimePolicy, SidecarRuntimeSafetyChecks},
+    sidecar::{SidecarPluginRuntime, SidecarRuntimePolicy, SidecarRuntimePolicyError, SidecarRuntimeSafetyChecks},
     sidecar_protocol::{SIDECAR_RUNTIME_PROTOCOL_VERSION, SidecarHandshake, SidecarPluginCapability},
     start_replay_worker,
 };
