@@ -110,7 +110,7 @@ impl NodeService {
 #[tonic::async_trait]
 impl Node for NodeService {
     async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
-        debug!("PING");
+        debug!("ping request received");
 
         let ping_req = request.into_inner();
         if ping_req.body.is_empty() {
@@ -120,7 +120,7 @@ impl Node for NodeService {
             if let Err(e) = ping_body {
                 warn!("invalid ping request body: {}", e);
             } else {
-                info!("ping_req:body(flatbuffer): {:?}", ping_body);
+                debug!("ping request body decoded successfully");
             }
         }
 
@@ -196,7 +196,7 @@ impl Node for NodeService {
 
     type WriteStreamStream = ResponseStream<WriteResponse>;
     async fn write_stream(&self, request: Request<Streaming<WriteRequest>>) -> Result<Response<Self::WriteStreamStream>, Status> {
-        info!("write_stream");
+        debug!("write_stream called (not yet implemented)");
         let _ = request;
 
         Err(unimplemented_rpc("write_stream"))
@@ -204,7 +204,7 @@ impl Node for NodeService {
 
     type ReadAtStream = ResponseStream<ReadAtResponse>;
     async fn read_at(&self, _request: Request<Streaming<ReadAtRequest>>) -> Result<Response<Self::ReadAtStream>, Status> {
-        info!("read_at");
+        debug!("read_at called (not yet implemented)");
         Err(unimplemented_rpc("read_at"))
     }
 
@@ -214,7 +214,7 @@ impl Node for NodeService {
 
     type WalkDirStream = ResponseStream<WalkDirResponse>;
     async fn walk_dir(&self, request: Request<WalkDirRequest>) -> Result<Response<Self::WalkDirStream>, Status> {
-        info!("walk_dir");
+        debug!("walk_dir request received");
         let request = request.into_inner();
         let (tx, rx) = mpsc::channel(128);
         if let Some(disk) = self.find_disk(&request.disk).await {
@@ -903,7 +903,7 @@ impl Node for NodeService {
         }))
     }
 
-    #[tracing::instrument(skip_all)]
+    #[tracing::instrument(skip_all, fields(start_rebalance))]
     async fn load_rebalance_meta(
         &self,
         request: Request<LoadRebalanceMetaRequest>,
@@ -917,21 +917,21 @@ impl Node for NodeService {
 
         let LoadRebalanceMetaRequest { start_rebalance } = request.into_inner();
 
-        warn!("handle LoadRebalanceMetaRequest");
+        info!("handling load_rebalance_meta request");
 
         store.load_rebalance_meta().await.map_err(|err| {
-            error!("load_rebalance_meta err {:?}", err);
+            error!(error = ?err, "load_rebalance_meta failed");
             Status::internal(err.to_string())
         })?;
 
-        warn!("load_rebalance_meta success");
+        info!("load_rebalance_meta completed");
 
         if start_rebalance {
-            warn!("start rebalance");
+            info!(start_rebalance, "spawning background rebalance task");
             let store = store.clone();
             spawn(async move {
                 if let Some(message) = background_rebalance_start_error_message(store.start_rebalance().await) {
-                    error!("{message}");
+                    error!(error = %message, "background rebalance start failed");
                 }
             });
         }
