@@ -55,6 +55,8 @@ pub fn example_external_webhook_plugin() -> ExampleInstallableTargetPlugin {
                 target_triple: "x86_64-unknown-linux-gnu",
                 download_uri: "https://plugins.example.test/webhook-sidecar.tar.zst",
                 digest_sha256: "0123456789abcdef0123456789abcdef",
+                signature_uri: "https://plugins.example.test/webhook-sidecar.tar.zst.sig",
+                provenance_uri: "https://plugins.example.test/webhook-sidecar.tar.zst.intoto.jsonl",
                 size_bytes: 8192,
             }],
         },
