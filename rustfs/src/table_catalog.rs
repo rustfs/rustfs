@@ -875,6 +875,7 @@ where
         let current_metadata_location = catalog.table.metadata_location.clone();
 
         let mut retained = BTreeSet::new();
+        let mut current_metadata_for_refs = None;
         let current_metadata_status =
             if is_valid_table_metadata_location(&parsed_namespace, &parsed_table, &current_metadata_location) {
                 retained.insert(current_metadata_location.clone());
@@ -883,6 +884,7 @@ where
                         match serde_json::from_slice::<serde_json::Value>(&current_metadata_object.data) {
                             Ok(current_metadata) if current_metadata.is_object() => {
                                 retained.extend(metadata_log_locations(&current_metadata, &parsed_namespace, &parsed_table));
+                                current_metadata_for_refs = Some(current_metadata);
                                 TableMetadataPointerStatus::Valid
                             }
                             Ok(_) | Err(_) => TableMetadataPointerStatus::InvalidJson,
@@ -907,6 +909,19 @@ where
 
         for metadata_location in metadata_locations.iter().rev().take(retain_recent_metadata_files) {
             retained.insert(metadata_location.clone());
+        }
+        if let Some(current_metadata) = current_metadata_for_refs.as_ref() {
+            retained.extend(
+                metadata_locations_for_protected_snapshot_refs(
+                    &self.backend,
+                    table_bucket,
+                    &parsed_namespace,
+                    &parsed_table,
+                    current_metadata,
+                    &metadata_locations,
+                )
+                .await?,
+            );
         }
 
         let orphan_metadata_candidate_locations = metadata_locations
@@ -977,6 +992,17 @@ where
         for metadata_location in metadata_locations.iter().rev().take(retain_recent_metadata_files) {
             retained.insert(metadata_location.clone());
         }
+        retained.extend(
+            metadata_locations_for_protected_snapshot_refs(
+                &self.backend,
+                table_bucket,
+                &namespace,
+                &table,
+                &current_metadata,
+                &metadata_locations,
+            )
+            .await?,
+        );
 
         let cleanup_candidate_locations = metadata_locations
             .into_iter()
@@ -1080,6 +1106,17 @@ where
         let mut protected = metadata_log_locations(&current_metadata, &namespace, &table);
         protected.insert(entry.metadata_location.clone());
         protected.extend(report.retained_metadata_locations.iter().cloned());
+        protected.extend(
+            metadata_locations_for_protected_snapshot_refs(
+                &self.backend,
+                table_bucket,
+                &namespace,
+                &table,
+                &current_metadata,
+                &report.cleanup_candidate_locations,
+            )
+            .await?,
+        );
 
         let mut cleanup_candidate_locations = BTreeSet::new();
         let now = OffsetDateTime::now_utc();
@@ -1643,6 +1680,79 @@ fn metadata_log_locations(
     }
 
     locations
+}
+
+async fn metadata_locations_for_protected_snapshot_refs<B>(
+    backend: &B,
+    table_bucket: &str,
+    namespace: &Namespace,
+    table: &IdentifierSegment,
+    current_metadata: &serde_json::Value,
+    metadata_locations: &[String],
+) -> TableCatalogStoreResult<BTreeSet<String>>
+where
+    B: TableCatalogObjectBackend,
+{
+    let protected_snapshot_ids = protected_ref_snapshot_ids(current_metadata);
+    if protected_snapshot_ids.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    let mut retained = BTreeSet::new();
+    for metadata_location in metadata_locations {
+        if !is_valid_table_metadata_location(namespace, table, metadata_location) {
+            continue;
+        }
+        let Some(metadata_object) = backend.read_object(table_bucket, metadata_location).await? else {
+            continue;
+        };
+        let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&metadata_object.data) else {
+            continue;
+        };
+        if metadata_contains_protected_snapshot_ref(&metadata, &protected_snapshot_ids) {
+            retained.insert(metadata_location.clone());
+        }
+    }
+    Ok(retained)
+}
+
+fn protected_ref_snapshot_ids(current_metadata: &serde_json::Value) -> BTreeSet<i64> {
+    let mut snapshot_ids = BTreeSet::new();
+    let current_snapshot_id = current_metadata
+        .get("current-snapshot-id")
+        .and_then(serde_json::Value::as_i64);
+    let Some(refs) = current_metadata.get("refs").and_then(serde_json::Value::as_object) else {
+        return snapshot_ids;
+    };
+
+    for reference in refs.values() {
+        if let Some(snapshot_id) = reference.get("snapshot-id").and_then(serde_json::Value::as_i64)
+            && Some(snapshot_id) != current_snapshot_id
+        {
+            snapshot_ids.insert(snapshot_id);
+        }
+    }
+    snapshot_ids
+}
+
+fn metadata_contains_protected_snapshot_ref(metadata: &serde_json::Value, protected_snapshot_ids: &BTreeSet<i64>) -> bool {
+    let current_snapshot_matches = metadata
+        .get("current-snapshot-id")
+        .and_then(serde_json::Value::as_i64)
+        .is_some_and(|snapshot_id| protected_snapshot_ids.contains(&snapshot_id));
+    if current_snapshot_matches {
+        return true;
+    }
+
+    let Some(refs) = metadata.get("refs").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    refs.values().any(|reference| {
+        reference
+            .get("snapshot-id")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|snapshot_id| protected_snapshot_ids.contains(&snapshot_id))
+    })
 }
 
 fn metadata_candidate_is_past_safety_window(mod_time: Option<OffsetDateTime>, now: OffsetDateTime) -> bool {
@@ -2854,6 +2964,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn maintenance_dry_run_keeps_metadata_for_protected_snapshot_refs() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let orphan = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let tagged = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let unreferenced = default_table_metadata_file_path(&namespace, &table, "00003.metadata.json");
+        let current = default_table_metadata_file_path(&namespace, &table, "00004.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend.seed_object(bucket, &orphan, b"{}".to_vec()).await;
+        backend
+            .seed_object(
+                bucket,
+                &tagged,
+                serde_json::to_vec(&serde_json::json!({
+                    "current-snapshot-id": 10
+                }))
+                .unwrap(),
+            )
+            .await;
+        backend
+            .seed_object(
+                bucket,
+                &unreferenced,
+                serde_json::to_vec(&serde_json::json!({
+                    "current-snapshot-id": 20
+                }))
+                .unwrap(),
+            )
+            .await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "current-snapshot-id": 30,
+                    "metadata-log": [],
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 30,
+                            "type": "branch"
+                        },
+                        "audit": {
+                            "snapshot-id": 10,
+                            "type": "tag"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let report = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .unwrap();
+
+        assert!(report.retained_metadata_locations.contains(&tagged));
+        assert_eq!(report.cleanup_candidate_locations, vec![orphan, unreferenced]);
+    }
+
+    #[tokio::test]
     async fn maintenance_dry_run_keeps_recent_metadata_files_and_ignores_non_metadata_objects() {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend.clone());
@@ -3101,6 +3276,53 @@ mod tests {
         assert_eq!(report.current_metadata_status, TableMetadataPointerStatus::Valid);
         assert_eq!(report.catalog.table.metadata_location, current);
         assert_eq!(report.orphan_metadata_candidate_locations, vec![uncommitted]);
+    }
+
+    #[tokio::test]
+    async fn orphan_metadata_scan_keeps_metadata_for_protected_snapshot_refs() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let orphan = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let tagged = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let current = default_table_metadata_file_path(&namespace, &table, "00003.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend.seed_object(bucket, &orphan, b"{}".to_vec()).await;
+        backend
+            .seed_object(
+                bucket,
+                &tagged,
+                serde_json::to_vec(&serde_json::json!({
+                    "current-snapshot-id": 10
+                }))
+                .unwrap(),
+            )
+            .await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "current-snapshot-id": 20,
+                    "metadata-log": [],
+                    "refs": {
+                        "audit": {
+                            "snapshot-id": 10,
+                            "type": "tag"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let report = store.diagnose_table_catalog(bucket, "sales", "orders", 0).await.unwrap();
+
+        assert_eq!(report.current_metadata_status, TableMetadataPointerStatus::Valid);
+        assert_eq!(report.orphan_metadata_candidate_locations, vec![orphan]);
     }
 
     #[tokio::test]
