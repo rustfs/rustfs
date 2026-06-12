@@ -28,7 +28,10 @@ use super::constants::limits::{
     SSH_MAXIMUM_PACKET_SIZE,
 };
 use super::constants::protocol::SFTP_SUBSYSTEM_NAME;
+#[cfg(not(target_os = "linux"))]
+use super::fallback_watchdog;
 use super::lifecycle::{SessionDiag, SessionRegistry, new_session_registry};
+#[cfg(target_os = "linux")]
 use super::wedge_watchdog;
 use crate::common::client::s3::StorageBackend;
 use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
@@ -281,7 +284,7 @@ pub struct SftpServer<S: StorageBackend> {
     ssh_config: Arc<SshConfigHolder>,
     storage: S,
     /// Weak refs to live per-session activity records. Walked by the
-    /// per-session wedge watchdog and by external observers that
+    /// per-session liveness watchdog and by external observers that
     /// enumerate live sessions.
     session_registry: Arc<SessionRegistry>,
     /// Process-wide accumulator of live read cache memory in bytes,
@@ -355,12 +358,14 @@ where
         let mut sessions: JoinSet<()> = JoinSet::new();
         // Parent cancellation token for the lifetime of this listener.
         // Each per-session cancel_token is a child via child_token(),
-        // and the wedge watchdog selects on the same child. On
+        // and the per-session watchdog selects on the same child. On
         // shutdown_rx fire below this token is cancelled before the
         // accept loop breaks, which cascades to every live session
-        // and every watchdog: the watchdog tasks shut their dup'd
-        // sockets so russh's inner tasks unblock at the next read,
-        // and the session tasks drop the RunningSession futures and
+        // and every watchdog. On Linux the watchdog tasks shut their
+        // dup'd sockets so russh's inner tasks unblock at the next
+        // read. On non-Linux targets there is no dup'd socket and the
+        // session tasks observe the cancellation directly. Either way
+        // the session tasks drop the RunningSession futures and
         // return. drain_sessions then catches up much faster than
         // the SHUTDOWN_DRAIN_TIMEOUT_SECS ceiling because no session
         // has to wait for the watchdog's natural tick to fire.
@@ -386,7 +391,7 @@ where
                     // its watchdog before the drain loop runs. Wedged
                     // sessions need their watchdog to call shutdown on
                     // the dup'd socket so russh's inner task can end
-                    // by EOF; otherwise drain_sessions would block on
+                    // by EOF. Otherwise drain_sessions would block on
                     // those sessions for the full
                     // SHUTDOWN_DRAIN_TIMEOUT_SECS.
                     server_shutdown_token.cancel();
@@ -461,15 +466,20 @@ where
         // shut the socket down on wedge detection without racing
         // russh for the original fd. The wedge probe itself reads
         // /proc/net/tcp[6] in lifecycle::probe_tcp_state and does
-        // not touch this dup.
-        let watchdog_socket = wedge_watchdog::dup_socket(&stream);
-        if watchdog_socket.is_none() {
-            tracing::warn!(
-                peer = %peer_addr,
-                session_id = session_diag.session_id,
-                "wedge watchdog: dup_socket failed, session has no wedge protection (rare; usually fd exhaustion)",
-            );
-        }
+        // not touch this dup. Non-Linux targets run the silence-only
+        // fallback watchdog, which needs no socket dup.
+        #[cfg(target_os = "linux")]
+        let watchdog_socket = {
+            let socket = wedge_watchdog::dup_socket(&stream);
+            if socket.is_none() {
+                tracing::warn!(
+                    peer = %peer_addr,
+                    session_id = session_diag.session_id,
+                    "wedge watchdog: dup_socket failed, session has no wedge protection (rare; usually fd exhaustion)",
+                );
+            }
+            socket
+        };
         // Per-session cancellation token. Cascades from the
         // listener-wide server_shutdown_token so a graceful server
         // shutdown ends every live session promptly without waiting
@@ -498,11 +508,21 @@ where
             session_id = session_diag.session_id,
             "SFTP accept: spawning session task",
         );
+        #[cfg(target_os = "linux")]
         sessions.spawn(run_session(
             ssh_config,
             stream,
             handler,
             watchdog_socket,
+            watchdog_session_diag,
+            session_shutdown_token,
+            peer_addr,
+        ));
+        #[cfg(not(target_os = "linux"))]
+        sessions.spawn(run_session(
+            ssh_config,
+            stream,
+            handler,
             watchdog_session_diag,
             session_shutdown_token,
             peer_addr,
@@ -643,7 +663,7 @@ async fn run_session<S>(
     ssh_config: Arc<russh::server::Config>,
     stream: tokio::net::TcpStream,
     handler: SshSessionHandler<S>,
-    watchdog_socket: Option<socket2::Socket>,
+    #[cfg(target_os = "linux")] watchdog_socket: Option<socket2::Socket>,
     watchdog_session_diag: Arc<SessionDiag>,
     cancel_token: CancellationToken,
     peer_addr: SocketAddr,
@@ -674,19 +694,23 @@ async fn run_session<S>(
         }
     };
     tracing::debug!(peer = %peer_addr, "SFTP session run_stream returned; awaiting session loop");
-    // Spawn the per-session wedge watchdog. The watchdog observes
-    // the SFTP-handler activity stamp and a non-blocking peek on
-    // the duplicated socket. On wedge detection it shuts the
-    // socket down (so russh's inner task unwedges via EOF
-    // propagation) and cancels the shared CancellationToken (so
-    // this task drops RunningSession and ends).
+    // Spawn the per-session watchdog. On Linux the wedge watchdog
+    // observes the SFTP-handler activity stamp and the kernel TCP
+    // state. On wedge detection it shuts the duplicated socket down
+    // (so russh's inner task unwedges via EOF propagation) and
+    // cancels the shared CancellationToken (so this task drops
+    // RunningSession and ends). On non-Linux targets the fallback
+    // watchdog cancels only after silence past the fallback
+    // threshold, with no socket introspection.
+    #[cfg(target_os = "linux")]
     if let Some(socket) = watchdog_socket {
         wedge_watchdog::spawn_for_session(watchdog_session_diag, socket, cancel_token.clone());
     }
+    #[cfg(not(target_os = "linux"))]
+    fallback_watchdog::spawn_for_session(watchdog_session_diag, cancel_token.clone());
     // Await the RunningSession until the client disconnects, until
-    // russh's inactivity_timeout and keepalive layers (set in
-    // build_ssh_config) close a wedged peer, or until the watchdog
-    // (or the listener-wide shutdown cascade) cancels.
+    // russh's inactivity_timeout closes a healthy idle peer, or until
+    // the watchdog (or the listener-wide shutdown cascade) cancels.
     let session_result = tokio::select! {
         res = session => Some(res),
         _ = cancel_token.cancelled() => None,
@@ -698,7 +722,7 @@ async fn run_session<S>(
     let session_result = match session_result {
         Some(r) => r,
         None => {
-            tracing::warn!(peer = %peer_addr, "SFTP session aborted by wedge watchdog");
+            tracing::warn!(peer = %peer_addr, "SFTP session cancelled (watchdog or server shutdown)");
             return;
         }
     };
@@ -1088,7 +1112,7 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
         }
     }
 
-    // Signal requests carry want_reply = false on the wire (RFC 4254
+    // Signal requests carry want_reply = false (RFC 4254
     // section 6.9), so there is no channel_failure to send. The
     // override exists to log probe attempts and to keep the SFTP
     // server SFTP-only by code rather than by relying on the russh
