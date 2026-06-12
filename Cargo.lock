@@ -9361,6 +9361,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-extension-schema"
+version = "1.0.0-beta.8"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "rustfs-filemeta"
 version = "1.0.0-beta.8"
 dependencies = [

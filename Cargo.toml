@@ -46,6 +46,7 @@ members = [
     "crates/s3select-query", # S3 Select query engine
     "crates/scanner", # Scanner for data integrity checks and health monitoring
     "crates/security-governance", # Security governance contracts
+    "crates/extension-schema", # Extension schema contracts
     "crates/signer", # client signer
     "crates/storage-api", # Storage API contracts
     "crates/targets", # Target-specific configurations and utilities
@@ -113,6 +114,7 @@ rustfs-s3select-api = { path = "crates/s3select-api", version = "1.0.0-beta.8" }
 rustfs-s3select-query = { path = "crates/s3select-query", version = "1.0.0-beta.8" }
 rustfs-scanner = { path = "crates/scanner", version = "1.0.0-beta.8" }
 rustfs-security-governance = { path = "crates/security-governance", version = "1.0.0-beta.8" }
+rustfs-extension-schema = { path = "crates/extension-schema", version = "1.0.0-beta.8" }
 rustfs-signer = { path = "crates/signer", version = "1.0.0-beta.8" }
 rustfs-storage-api = { path = "crates/storage-api", version = "1.0.0-beta.8" }
 rustfs-trusted-proxies = { path = "crates/trusted-proxies", version = "1.0.0-beta.8" }
