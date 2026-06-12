@@ -418,6 +418,10 @@ fn request_user_name(cred: &StoredCredentials) -> &str {
 }
 
 fn can_fallback_view_access_key_info(requester: &StoredCredentials, target: &StoredCredentials) -> bool {
+    if requester.is_service_account() {
+        return false;
+    }
+
     if target.is_temp() || target.is_service_account() {
         return request_user_name(requester) == target.parent_user;
     }
@@ -1556,6 +1560,23 @@ mod tests {
         };
 
         assert!(can_fallback_view_access_key_info(&requester, &target));
+    }
+
+    #[test]
+    fn fallback_access_key_info_denies_service_account_for_parent_regular_user() {
+        let requester = StoredCredentials {
+            access_key: "svc-user".to_string(),
+            session_token: "session-token".to_string(),
+            parent_user: "owner-user".to_string(),
+            claims: Some(HashMap::from([("sa-policy".to_string(), json!("inherited-policy"))])),
+            ..Default::default()
+        };
+        let target = StoredCredentials {
+            access_key: "owner-user".to_string(),
+            ..Default::default()
+        };
+
+        assert!(!can_fallback_view_access_key_info(&requester, &target));
     }
 
     #[test]
