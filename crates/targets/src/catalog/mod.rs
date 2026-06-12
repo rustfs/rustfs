@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod builtin;
+pub mod extension;
 
 use crate::control_plane::external_target_plugin_installation;
 use crate::domain::TargetDomain;
