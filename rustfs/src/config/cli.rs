@@ -72,6 +72,14 @@ pub fn preprocess_args_for_legacy(args: Vec<String>) -> Vec<String> {
     if KNOWN_SUBCOMMANDS.contains(&first.as_str()) {
         return args;
     }
+    // Preserve the traditional `rustfs help` entry point without exposing
+    // Clap's generated `help` subcommand in the top-level command list.
+    if first == "help" {
+        let mut out = vec![args[0].clone()];
+        out.extend(args[2..].iter().cloned());
+        out.push("--help".to_string());
+        return out;
+    }
     // If first arg is --info, treat it as info subcommand
     if first == "--info" {
         let mut out = vec![args[0].clone(), "info".to_string()];
@@ -323,5 +331,25 @@ pub fn default_server_opts() -> ServerOpts {
         kms_default_key_id: None,
         buffer_profile_disable: false,
         buffer_profile: "GeneralPurpose".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, preprocess_args_for_legacy};
+    use clap::Parser;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn preprocess_help_command_displays_top_level_help() {
+        let args = preprocess_args_for_legacy(vec!["rustfs".to_string(), "help".to_string()]);
+
+        assert_eq!(args, vec!["rustfs".to_string(), "--help".to_string()]);
+
+        let err = match Cli::try_parse_from(args) {
+            Ok(_) => panic!("rustfs help should display help"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
     }
 }
