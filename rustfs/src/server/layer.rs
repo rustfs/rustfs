@@ -79,8 +79,8 @@ impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrier<'a> {
 /// This layer must be placed after `SetRequestIdLayer` in the middleware stack,
 /// as it reads the `x-request-id` header that `SetRequestIdLayer` generates.
 ///
-/// Additionally, it sets the `x-amz-request-id` request header for S3 compatibility
-/// if not already present.
+/// Additionally, it stores the S3-compatible request ID alias in the request context
+/// without mutating signed request headers.
 #[derive(Clone, Default)]
 pub struct RequestContextLayer;
 
@@ -138,7 +138,7 @@ where
             .unwrap_or_else(|| request_id.clone());
 
         let ctx = RequestContext {
-            request_id: request_id.clone(),
+            request_id,
             x_amz_request_id,
             trace_id,
             span_id,
@@ -146,14 +146,6 @@ where
         };
 
         req.extensions_mut().insert(ctx);
-
-        // Set x-amz-request-id for S3 compatibility downstream
-        if !req.headers().contains_key(AMZ_REQUEST_ID)
-            && let Ok(val) = HeaderValue::from_str(&request_id)
-        {
-            req.headers_mut()
-                .insert(http::header::HeaderName::from_static(AMZ_REQUEST_ID), val);
-        }
 
         self.inner.call(req)
     }
@@ -2234,7 +2226,7 @@ mod tests {
     }
 
     #[test]
-    fn request_context_layer_populates_context_and_s3_request_id_from_x_request_id() {
+    fn request_context_layer_populates_context_without_mutating_signed_headers() {
         let mut service = RequestContextLayer.layer(CaptureService);
         let request = Request::builder()
             .uri("/bucket/object")
@@ -2252,7 +2244,7 @@ mod tests {
         assert_eq!(context.x_amz_request_id, "req-123");
         assert!(context.trace_id.is_none());
         assert!(context.span_id.is_none());
-        assert_eq!(request.headers().get(AMZ_REQUEST_ID).unwrap(), "req-123");
+        assert!(request.headers().get(AMZ_REQUEST_ID).is_none());
     }
 
     #[test]

@@ -21,7 +21,7 @@
 //!   → generates x-request-id UUID
 //!   → RequestContextLayer creates RequestContext
 //!     → stores in request.extensions()
-//!     → sets x-amz-request-id header
+//!     → stores the S3-compatible request-id alias without changing signed headers
 //! Auth (FS::check)
 //!   → copies RequestContext into ReqInfo.request_context
 //! Storage (FS methods)
