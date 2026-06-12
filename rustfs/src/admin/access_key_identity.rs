@@ -14,7 +14,9 @@
 
 use crate::admin::handlers::iam_error::iam_error_to_s3_error;
 use rustfs_credentials::Credentials as StoredCredentials;
-use rustfs_iam::error::{is_err_no_such_service_account, is_err_no_such_temp_account};
+use rustfs_iam::error::{
+    is_err_no_such_account, is_err_no_such_service_account, is_err_no_such_temp_account, is_err_no_such_user,
+};
 use rustfs_iam::store::Store as IamStore;
 use rustfs_madmin::{
     InfoAccessKeyResp, InfoServiceAccountResp, LDAPSpecificAccessKeyInfo, OpenIDSpecificAccessKeyInfo, ServiceAccountInfo,
@@ -75,10 +77,10 @@ struct AccessKeyIdentity {
 
 impl AccessKeyIdentity {
     fn from_credentials(credentials: &StoredCredentials) -> Self {
-        let user_type = if credentials.is_temp() {
-            AccessKeyUserType::Sts
-        } else if credentials.is_service_account() {
+        let user_type = if credentials.is_service_account() {
             AccessKeyUserType::ServiceAccount
+        } else if credentials.is_temp() {
+            AccessKeyUserType::Sts
         } else {
             AccessKeyUserType::User
         };
@@ -158,20 +160,8 @@ pub(crate) async fn resolve_info_access_key_resp<T: IamStore>(
     target_cred: StoredCredentials,
 ) -> S3Result<InfoAccessKeyResp> {
     let identity = AccessKeyIdentity::from_credentials(&target_cred);
-    let (user_type, info) = if target_cred.is_temp() {
-        let (_, session_policy) = iam_store.get_temporary_account(&access_key).await.map_err(|e| {
-            debug!("get temporary account failed, e: {:?}", e);
-            if is_err_no_such_temp_account(&e) {
-                s3_error!(InvalidRequest, "access key not exist")
-            } else {
-                s3_error!(InternalError, "get temporary account failed")
-            }
-        })?;
-        (
-            identity.user_type.as_str().to_string(),
-            build_info_service_account_resp(iam_store, &target_cred, session_policy).await?,
-        )
-    } else if target_cred.is_service_account() {
+    let user_type = identity.user_type.as_str().to_string();
+    let info = if target_cred.is_service_account() {
         let (_, session_policy) = iam_store.get_service_account(&access_key).await.map_err(|e| {
             debug!("get service account failed, e: {:?}", e);
             if is_err_no_such_service_account(&e) {
@@ -180,19 +170,27 @@ pub(crate) async fn resolve_info_access_key_resp<T: IamStore>(
                 s3_error!(InternalError, "get service account failed")
             }
         })?;
-        (
-            identity.user_type.as_str().to_string(),
-            build_info_service_account_resp(iam_store, &target_cred, session_policy).await?,
-        )
+        build_info_service_account_resp(iam_store, &target_cred, session_policy).await?
+    } else if target_cred.is_temp() {
+        let (_, session_policy) = iam_store.get_temporary_account(&access_key).await.map_err(|e| {
+            debug!("get temporary account failed, e: {:?}", e);
+            if is_err_no_such_temp_account(&e) {
+                s3_error!(InvalidRequest, "access key not exist")
+            } else {
+                s3_error!(InternalError, "get temporary account failed")
+            }
+        })?;
+        build_info_service_account_resp(iam_store, &target_cred, session_policy).await?
     } else {
         let user_info = iam_store.get_user_info(&access_key).await.map_err(|e| {
             debug!("get user info failed, e: {:?}", e);
-            iam_error_to_s3_error(e)
+            if is_err_no_such_user(&e) || is_err_no_such_account(&e) {
+                s3_error!(InvalidRequest, "access key not exist")
+            } else {
+                iam_error_to_s3_error(e)
+            }
         })?;
-        (
-            identity.user_type.as_str().to_string(),
-            build_info_regular_user_resp(&target_cred, &user_info),
-        )
+        build_info_regular_user_resp(&target_cred, &user_info)
     };
 
     let user_provider = identity.provider.as_str().to_string();
@@ -578,19 +576,16 @@ mod tests {
         identity
     }
 
-    fn test_iam_sys_with_identity(identity: UserIdentity) -> IamSys<InfoAccessKeyTestStore> {
+    fn test_iam_sys_with_service_account(identity: UserIdentity) -> (IamSys<InfoAccessKeyTestStore>, StoredCredentials) {
         ensure_test_global_credentials();
         let (sender, _receiver) = mpsc::channel::<i64>(1);
         let cache = Cache::default();
         let now = OffsetDateTime::now_utc();
         let identity = test_identity_with_signed_claims(identity);
-        if identity.credentials.is_temp() {
-            cache.add_or_update_sts_account(&identity.credentials.access_key, &identity, now);
-        } else {
-            cache.add_or_update_user(&identity.credentials.access_key, &identity, now);
-        }
+        let signed_credentials = identity.credentials.clone();
+        cache.add_or_update_user(&identity.credentials.access_key, &identity, now);
 
-        IamSys::new(Arc::new(IamCache {
+        let iam_sys = IamSys::new(Arc::new(IamCache {
             api: InfoAccessKeyTestStore,
             cache,
             state: Arc::new(AtomicU8::new(2)),
@@ -601,7 +596,9 @@ mod tests {
             sync_failures: AtomicU64::new(0),
             sync_successes: AtomicU64::new(0),
             last_sync_duration_millis: AtomicU64::new(0),
-        }))
+        }));
+
+        (iam_sys, signed_credentials)
     }
 
     fn test_iam_sys_with_temp_identity(identity: UserIdentity) -> IamSys<InfoAccessKeyTestStore> {
@@ -657,20 +654,6 @@ mod tests {
             json!((OffsetDateTime::now_utc() + time::Duration::hours(1)).unix_timestamp()),
         );
         claims
-    }
-
-    #[test]
-    fn regular_user_lookup_errors_match_shared_iam_mapper() {
-        let mapped = {
-            let err = IamError::NoSuchUser("missing-user".to_string());
-            debug!("get user info failed, e: {:?}", err);
-            iam_error_to_s3_error(err)
-        };
-        let expected = iam_error_to_s3_error(IamError::NoSuchUser("missing-user".to_string()));
-
-        assert_eq!(mapped.code(), expected.code());
-        assert_eq!(mapped.message(), expected.message());
-        assert_eq!(mapped.source().is_some(), expected.source().is_some());
     }
 
     #[test]
@@ -804,6 +787,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_info_access_key_resp_maps_missing_regular_user_to_access_key_not_exist() {
+        let iam_sys = test_iam_sys_with_user("existing-user", rustfs_madmin::AccountStatus::Enabled, None);
+        let credentials = StoredCredentials {
+            access_key: "missing-user".to_string(),
+            ..Default::default()
+        };
+
+        let err = resolve_info_access_key_resp(&iam_sys, "missing-user".to_string(), credentials)
+            .await
+            .expect_err("missing regular user should fail");
+
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("access key not exist"));
+    }
+
+    #[tokio::test]
     async fn resolve_info_access_key_resp_preserves_ldap_service_account_contract() {
         let policy = test_embedded_session_policy();
         let credentials = StoredCredentials {
@@ -819,9 +818,12 @@ mod tests {
             )),
             ..Default::default()
         };
-        let iam_sys = test_iam_sys_with_identity(UserIdentity::from(credentials.clone()));
+        let (iam_sys, signed_credentials) = test_iam_sys_with_service_account(UserIdentity::from(credentials.clone()));
 
-        let resp = resolve_info_access_key_resp(&iam_sys, "svc-ldap".to_string(), credentials)
+        assert!(signed_credentials.is_service_account());
+        assert!(signed_credentials.is_temp());
+
+        let resp = resolve_info_access_key_resp(&iam_sys, "svc-ldap".to_string(), signed_credentials)
             .await
             .expect("resolve ldap service account info");
 
