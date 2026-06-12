@@ -30,10 +30,9 @@ use rustfs_ecstore::{
     notification_sys::get_global_notification_sys,
     rebalance::{DiskStat, RebalSaveOpt},
     store_api::BucketOperations,
-    store_api::BucketOptions,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_storage_api::StorageAdminApi;
+use rustfs_storage_api::{BucketOptions, StorageAdminApi};
 use s3s::{
     Body, S3Request, S3Response, S3Result,
     header::{CONTENT_LENGTH, CONTENT_TYPE},

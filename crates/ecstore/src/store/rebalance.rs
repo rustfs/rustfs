@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::config::get_global_storage_class;
+use rustfs_storage_api::StorageAdminApi;
 
 struct LatestObjectInfoCandidate {
     info: Option<ObjectInfo>,
@@ -314,10 +315,8 @@ impl ECStore {
                 return (idx, 0, Vec::new());
             }
 
-            let disk_infos = match pool.get_disks_by_key(object).get_disks(0, 0).await {
-                Ok(disks) => get_disk_infos(&disks).await,
-                Err(_) => Vec::new(),
-            };
+            let disks = pool.get_disks_by_key(object).disk_inventory().await;
+            let disk_infos = get_disk_infos(&disks).await;
 
             (idx, pool.set_count, disk_infos)
         }))
@@ -700,7 +699,7 @@ impl ECStore {
         let mut drives_per_set = Vec::new();
         let mut total_sets = Vec::new();
 
-        for (idx, set_count) in self.set_drive_counts().iter().enumerate() {
+        for (idx, set_count) in StorageAdminApi::set_drive_counts(self).iter().enumerate() {
             if let Some(sc_parity) = standard_sc_parity {
                 standard_sc_data.push(set_count - sc_parity);
             }
@@ -755,7 +754,7 @@ impl ECStore {
         let mut futures = Vec::with_capacity(self.pools.len());
 
         for pool in self.pools.iter() {
-            futures.push(pool.local_storage_info())
+            futures.push(pool.local_storage_info_snapshot())
         }
 
         let results = join_all(futures).await;
@@ -776,14 +775,14 @@ impl ECStore {
             warn!("Local storage info deduplication: {} -> {}", original_count, disks.len());
         }
 
-        let backend = self.backend_info().await;
+        let backend = StorageAdminApi::backend_info(self).await;
         rustfs_madmin::StorageInfo { backend, disks }
     }
 
     #[instrument(skip(self))]
     pub(super) async fn handle_get_disks(&self, pool_idx: usize, set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
         if pool_idx < self.pools.len() && set_idx < self.pools[pool_idx].disk_set.len() {
-            self.pools[pool_idx].disk_set[set_idx].get_disks(0, 0).await
+            Ok(self.pools[pool_idx].disk_set[set_idx].disk_inventory().await)
         } else {
             Err(rebalance_disk_set_lookup_error(pool_idx, set_idx, self.pools.len()))
         }

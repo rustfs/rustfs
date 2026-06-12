@@ -7,5 +7,5 @@ setup-hooks: ## Set up git hooks
 	@echo "✅ Git hooks setup complete!"
 
 .PHONY: pre-commit
-pre-commit: fmt unsafe-code-check architecture-migration-check clippy-check compilation-check test ## Run pre-commit checks
+pre-commit: fmt unsafe-code-check architecture-migration-check logging-guardrails-check clippy-check compilation-check test ## Run pre-commit checks
 	@echo "✅ All pre-commit checks passed!"

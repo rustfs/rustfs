@@ -166,7 +166,7 @@ mod tests {
     #[tokio::test]
     async fn test_manager_operations() {
         let temp_dir = tempdir().expect("Failed to create temp dir");
-        let config = KmsConfig::local(temp_dir.path().to_path_buf());
+        let config = KmsConfig::local(temp_dir.path().to_path_buf()).with_insecure_development_defaults();
 
         let backend = Arc::new(LocalKmsBackend::new(config.clone()).await.expect("Failed to create backend"));
         let manager = KmsManager::new(backend, config);
@@ -216,7 +216,7 @@ mod tests {
     #[tokio::test]
     async fn generate_data_key_does_not_reuse_context_bound_ciphertext() {
         let temp_dir = tempdir().expect("Failed to create temp dir");
-        let config = KmsConfig::local(temp_dir.path().to_path_buf());
+        let config = KmsConfig::local(temp_dir.path().to_path_buf()).with_insecure_development_defaults();
 
         let backend = Arc::new(LocalKmsBackend::new(config.clone()).await.expect("Failed to create backend"));
         let manager = KmsManager::new(backend, config);

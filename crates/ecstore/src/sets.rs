@@ -30,8 +30,8 @@ use crate::{
     store_api::{
         BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
         HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
-        MakeBucketOptions, MultipartInfo, MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOperations,
-        ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
+        MakeBucketOptions, MultipartInfo, MultipartOperations, MultipartUploadResult, NamespaceLocking, ObjectIO, ObjectInfo,
+        ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
     },
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
 };
@@ -285,6 +285,46 @@ impl Sets {
 
     pub fn get_disks_by_key(&self, key: &str) -> Arc<SetDisks> {
         self.get_disks(self.get_hashed_set_index(key))
+    }
+
+    pub(crate) async fn storage_info_snapshot(&self) -> rustfs_madmin::StorageInfo {
+        let mut futures = Vec::with_capacity(self.disk_set.len());
+
+        for set in self.disk_set.iter() {
+            futures.push(set.storage_info_snapshot())
+        }
+
+        let results = join_all(futures).await;
+        let mut disks = Vec::new();
+
+        for res in results.into_iter() {
+            disks.extend_from_slice(&res.disks);
+        }
+
+        rustfs_madmin::StorageInfo {
+            disks,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) async fn local_storage_info_snapshot(&self) -> rustfs_madmin::StorageInfo {
+        let mut futures = Vec::with_capacity(self.disk_set.len());
+
+        for set in self.disk_set.iter() {
+            futures.push(set.local_storage_info_snapshot())
+        }
+
+        let results = join_all(futures).await;
+        let mut disks = Vec::new();
+
+        for res in results.into_iter() {
+            disks.extend_from_slice(&res.disks);
+        }
+
+        rustfs_madmin::StorageInfo {
+            disks,
+            ..Default::default()
+        }
     }
 
     fn get_hashed_set_index(&self, input: &str) -> usize {
@@ -857,64 +897,12 @@ impl HealOperations for Sets {
 }
 
 #[async_trait::async_trait]
-impl StorageAPI for Sets {
+impl StorageAPI for Sets {}
+
+#[async_trait::async_trait]
+impl NamespaceLocking for Sets {
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         self.disk_set[0].new_ns_lock(bucket, object).await
-    }
-    #[tracing::instrument(skip(self))]
-    async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
-        unimplemented!()
-    }
-    #[tracing::instrument(skip(self))]
-    async fn storage_info(&self) -> rustfs_madmin::StorageInfo {
-        let mut futures = Vec::with_capacity(self.disk_set.len());
-
-        for set in self.disk_set.iter() {
-            futures.push(set.storage_info())
-        }
-
-        let results = join_all(futures).await;
-
-        let mut disks = Vec::new();
-
-        for res in results.into_iter() {
-            disks.extend_from_slice(&res.disks);
-        }
-
-        rustfs_madmin::StorageInfo {
-            disks,
-            ..Default::default()
-        }
-    }
-    #[tracing::instrument(skip(self))]
-    async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
-        let mut futures = Vec::with_capacity(self.disk_set.len());
-
-        for set in self.disk_set.iter() {
-            futures.push(set.local_storage_info())
-        }
-
-        let results = join_all(futures).await;
-
-        let mut disks = Vec::new();
-
-        for res in results.into_iter() {
-            disks.extend_from_slice(&res.disks);
-        }
-        rustfs_madmin::StorageInfo {
-            disks,
-            ..Default::default()
-        }
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn get_disks(&self, _pool_idx: usize, _set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
-        unimplemented!()
-    }
-
-    #[tracing::instrument(skip(self))]
-    fn set_drive_counts(&self) -> Vec<usize> {
-        unimplemented!()
     }
 }
 

@@ -739,6 +739,19 @@ jobs:
             echo "# GPG signature will be added in future versions" >> "${file}.asc"
           done
 
+          cd ..
+          python3 scripts/security/generate_release_supply_chain_assets.py \
+            --asset-dir ./release-assets \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --build-type "${{ needs.build-check.outputs.build_type }}" \
+            --repository "${{ github.repository }}" \
+            --ref "${{ github.ref }}" \
+            --sha "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+          cd ./release-assets
+
           echo "📦 Prepared assets:"
           ls -la
 

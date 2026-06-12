@@ -28,7 +28,7 @@ use rustfs::init::init_sftp_system;
 
 use futures_util::future::join_all;
 use rustfs::capacity::capacity_integration::init_capacity_management;
-use rustfs::license::{current_license, init_license, license_status};
+use rustfs::license::{init_license, license_status};
 use rustfs::server::{
     ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
@@ -51,7 +51,6 @@ use rustfs_ecstore::{
     store::init_local_disks,
     store::prewarm_local_disk_id_map,
     store_api::BucketOperations,
-    store_api::BucketOptions,
     update_erasure_type,
 };
 use rustfs_heal::{
@@ -60,6 +59,7 @@ use rustfs_heal::{
 use rustfs_iam::init_oidc_sys;
 use rustfs_obs::{init_metrics_runtime, init_obs, set_global_guard};
 use rustfs_scanner::init_data_scanner;
+use rustfs_storage_api::BucketOptions;
 use rustfs_utils::{
     ExternalEnvCompatReport, apply_external_env_compat, get_env_bool_with_aliases, net::parse_and_resolve_address,
 };
@@ -73,6 +73,40 @@ const ENV_SCANNER_ENABLED: &str = "RUSTFS_SCANNER_ENABLED";
 const ENV_SCANNER_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_SCANNER";
 const ENV_HEAL_ENABLED: &str = "RUSTFS_HEAL_ENABLED";
 const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
+const LOG_COMPONENT_MAIN: &str = "main";
+const LOG_SUBSYSTEM_STARTUP: &str = "startup";
+const LOG_SUBSYSTEM_LICENSE: &str = "license";
+const LOG_SUBSYSTEM_AUTH: &str = "auth";
+const LOG_SUBSYSTEM_STORAGE: &str = "storage";
+const EVENT_EXTERNAL_ENV_COMPAT_CONFLICT: &str = "external_env_compat_conflict";
+const EVENT_EXTERNAL_ENV_COMPAT_APPLIED: &str = "external_env_compat_applied";
+const EVENT_DIAL9_RUNTIME_STATUS: &str = "dial9_runtime_status";
+const EVENT_RUNTIME_LICENSE_STATUS: &str = "runtime_license_status";
+const EVENT_OBSERVABILITY_GUARD_SET_FAILED: &str = "observability_guard_set_failed";
+const EVENT_TLS_OUTBOUND_INITIALIZED: &str = "tls_outbound_initialized";
+const EVENT_TLS_OUTBOUND_INITIALIZATION_FAILED: &str = "tls_outbound_initialization_failed";
+const EVENT_DEFAULT_CREDENTIALS_DETECTED: &str = "default_credentials_detected";
+const EVENT_SERVER_CONFIG_SANITIZED: &str = "server_config_sanitized";
+const EVENT_SERVER_STARTING: &str = "server_starting";
+const EVENT_SERVER_RUNTIME_FAILED: &str = "server_runtime_failed";
+const EVENT_ACTION_CREDENTIALS_INITIALIZATION_FAILED: &str = "action_credentials_initialization_failed";
+const EVENT_ENDPOINT_PARSING_STARTED: &str = "endpoint_parsing_started";
+const EVENT_STORAGE_POOL_FORMATTING: &str = "storage_pool_formatting";
+const EVENT_STORAGE_POOL_HOST_RISK: &str = "storage_pool_host_risk";
+const EVENT_PROTOCOL_SYSTEM_STATE: &str = "protocol_system_state";
+const EVENT_AUDIT_SYSTEM_STATE: &str = "audit_system_state";
+const EVENT_DEADLOCK_DETECTOR_STATE: &str = "deadlock_detector_state";
+const EVENT_KEYSTONE_AUTH_INITIALIZED: &str = "keystone_auth_initialized";
+const EVENT_KEYSTONE_AUTH_INITIALIZATION_FAILED: &str = "keystone_auth_initialization_failed";
+const EVENT_OIDC_INITIALIZATION_FAILED: &str = "oidc_initialization_failed";
+const EVENT_NOTIFICATION_SYSTEM_INITIALIZATION_FAILED: &str = "notification_system_initialization_failed";
+const EVENT_BACKGROUND_SERVICES_CONFIGURED: &str = "background_services_configured";
+const EVENT_SERVER_READY: &str = "server_ready";
+const EVENT_SHUTDOWN_SIGNAL_RECEIVED: &str = "shutdown_signal_received";
+const EVENT_BACKGROUND_SERVICE_SHUTDOWN: &str = "background_service_shutdown";
+const EVENT_EVENT_NOTIFIER_SHUTDOWN: &str = "event_notifier_shutdown";
+const EVENT_PROFILING_SHUTDOWN: &str = "profiling_shutdown";
+const EVENT_SERVER_SHUTDOWN_STATE: &str = "server_shutdown_state";
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -82,10 +116,6 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
-    if let Err(err) = bootstrap_external_prefix_compat() {
-        eprintln!("[WARN] Failed to bootstrap external-prefix compatibility: {err}");
-    }
-
     // Build Tokio runtime with optional dial9 telemetry support
     let runtime = rustfs::server::build_tokio_runtime().expect("Failed to build Tokio runtime");
     let result = runtime.block_on(async_main());
@@ -96,29 +126,9 @@ fn main() {
     }
 }
 
-fn bootstrap_external_prefix_compat() -> Result<()> {
+fn bootstrap_external_prefix_compat() -> Result<ExternalEnvCompatReport> {
     let env_compat_report = apply_external_env_compat();
-    if env_compat_report.conflict_count() > 0 {
-        // RUSTFS_* is the canonical namespace in this codebase, so on key conflicts we keep RUSTFS_*
-        // to preserve explicit user/operator overrides and avoid changing existing runtime behavior.
-        eprintln!(
-            "[WARN] Found {} source/RUSTFS_ conflict(s), keeping RUSTFS_ values: {}",
-            env_compat_report.conflict_count(),
-            env_compat_report.conflict_keys.join(", ")
-        );
-    }
-
-    if env_compat_report.mapped_count() == 0 {
-        return Ok(());
-    }
-
-    eprintln!(
-        "[INFO] Applying external-prefix compatibility in-process for {} variable(s): {}",
-        env_compat_report.mapped_count(),
-        format_external_prefix_mappings(&env_compat_report)
-    );
-
-    Ok(())
+    Ok(env_compat_report)
 }
 
 fn format_external_prefix_mappings(report: &ExternalEnvCompatReport) -> String {
@@ -137,6 +147,8 @@ fn is_using_default_credentials(config: &rustfs::config::Config) -> bool {
 const DEFAULT_CREDENTIALS_WARNING_MESSAGE: &str = "Detected default root credentials; set RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY to non-default values for production deployments";
 
 async fn async_main() -> Result<()> {
+    let env_compat_report = bootstrap_external_prefix_compat()?;
+
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
     let command_result = match rustfs::config::Opt::parse_command(args) {
@@ -176,30 +188,57 @@ async fn async_main() -> Result<()> {
     // Store in global storage
     match set_global_guard(guard).map_err(Error::other) {
         Ok(_) => {
-            info!(target: "rustfs::main", "Global observability guard set successfully.");
+            debug!(target: "rustfs::main", "Global observability guard set successfully.");
         }
         Err(e) => {
-            error!("Failed to set global observability guard: {}", e);
+            error!(
+                target: "rustfs::main",
+                event = EVENT_OBSERVABILITY_GUARD_SET_FAILED,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                error = %e,
+                "Failed to store global observability guard"
+            );
             return Err(e);
         }
     }
+
+    log_external_prefix_compat_report(&env_compat_report);
 
     // Check dial9 Tokio runtime telemetry status
     // Note: The actual telemetry session is created in build_tokio_runtime()
     // which stores the TelemetryGuard globally for the program duration.
     if rustfs_obs::dial9::is_enabled() {
-        info!(target: "rustfs::main", "Dial9 Tokio telemetry is configured as enabled; runtime guard was installed during startup.");
+        info!(
+            target: "rustfs::main",
+            event = EVENT_DIAL9_RUNTIME_STATUS,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            enabled = true,
+            "Dial9 Tokio runtime telemetry is enabled"
+        );
     } else {
-        info!(target: "rustfs::main", "Dial9 Tokio telemetry is not configured (set RUSTFS_RUNTIME_DIAL9_ENABLED=true to enable).");
+        debug!(
+            target: "rustfs::main",
+            event = EVENT_DIAL9_RUNTIME_STATUS,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            enabled = false,
+            "Dial9 Tokio runtime telemetry is disabled"
+        );
     }
 
-    info!("license status: {}", license_status());
-    if let Some(token) = current_license() {
-        info!("runtime license loaded: {}", token.name);
-    }
+    info!(
+        target: "rustfs::main",
+        event = EVENT_RUNTIME_LICENSE_STATUS,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_LICENSE,
+        license_status = %license_status(),
+        "Initialized runtime license state"
+    );
 
     // print startup logo
-    info!("{}", rustfs::server::LOGO);
+    debug!("{}", rustfs::server::LOGO);
 
     // Initialize performance profiling if enabled
     rustfs::profiling::init_from_env().await;
@@ -223,10 +262,26 @@ async fn async_main() -> Result<()> {
                 let generation = TlsGeneration(rustfs_common::get_global_outbound_tls_generation().saturating_add(1));
                 publish_global_outbound_tls_state(generation, &snapshot.outbound).await;
                 record_tls_generation("rustfs_server_startup", generation.0);
-                info!(target: "rustfs::main", "TLS outbound material initialized from {}", tls_path);
+                info!(
+                    target: "rustfs::main",
+                    event = EVENT_TLS_OUTBOUND_INITIALIZED,
+                    component = LOG_COMPONENT_MAIN,
+                    subsystem = LOG_SUBSYSTEM_STARTUP,
+                    tls_path,
+                    generation = generation.0,
+                    "Initialized TLS outbound material"
+                );
             }
             Err(e) => {
-                error!("Failed to initialize TLS from {}: {}", tls_path, e);
+                error!(
+                    target: "rustfs::main",
+                    event = EVENT_TLS_OUTBOUND_INITIALIZATION_FAILED,
+                    component = LOG_COMPONENT_MAIN,
+                    subsystem = LOG_SUBSYSTEM_STARTUP,
+                    tls_path,
+                    error = %e,
+                    "Failed to initialize TLS outbound material"
+                );
                 return Err(Error::other(e.to_string()));
             }
         }
@@ -239,7 +294,14 @@ async fn async_main() -> Result<()> {
     match run(*config).await {
         Ok(_) => Ok(()),
         Err(e) => {
-            error!("Server encountered an error and is shutting down: {}", e);
+            error!(
+                target: "rustfs::main",
+                event = EVENT_SERVER_RUNTIME_FAILED,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                error = %e,
+                "Server runtime failed"
+            );
             Err(e)
         }
     }
@@ -247,7 +309,23 @@ async fn async_main() -> Result<()> {
 
 #[instrument(skip(config))]
 async fn run(config: rustfs::config::Config) -> Result<()> {
-    debug!("config: {:?}", &config);
+    debug!(
+        target: "rustfs::main::run",
+        event = EVENT_SERVER_CONFIG_SANITIZED,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        address = %config.address,
+        volume_count = config.volumes.len(),
+        server_domain_count = config.server_domains.len(),
+        console_enable = config.console_enable,
+        console_address = %config.console_address,
+        tls_enabled = config.tls_path.as_deref().is_some_and(|value| !value.trim().is_empty()),
+        kms_enable = config.kms_enable,
+        kms_backend = %config.kms_backend,
+        region = config.region.as_deref().unwrap_or_default(),
+        buffer_profile = %config.buffer_profile,
+        "Loaded sanitized server configuration"
+    );
     // 1. Initialize global readiness tracker
     let readiness = Arc::new(GlobalReadiness::new());
 
@@ -263,27 +341,43 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     let server_address = server_addr.to_string();
 
     if is_using_default_credentials(&config) {
-        warn!("{}", DEFAULT_CREDENTIALS_WARNING_MESSAGE);
+        warn!(
+            target: "rustfs::main::run",
+            event = EVENT_DEFAULT_CREDENTIALS_DETECTED,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_AUTH,
+            warning = DEFAULT_CREDENTIALS_WARNING_MESSAGE,
+            "{DEFAULT_CREDENTIALS_WARNING_MESSAGE}"
+        );
     }
 
     info!(
         target: "rustfs::main::run",
+        event = EVENT_SERVER_STARTING,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
         server_address = %server_address,
         ip = %server_addr.ip(),
         port = %server_port,
         version = %rustfs::version::get_version(),
-        "Starting RustFS server at {}",
-        &server_address
+        "Starting RustFS server"
     );
 
     // Set up AK and SK
     match init_global_action_credentials(Some(config.access_key.clone()), Some(config.secret_key.clone())) {
         Ok(_) => {
-            info!(target: "rustfs::main::run", "Global action credentials initialized successfully.");
+            debug!(target: "rustfs::main::run", "Global action credentials initialized successfully.");
         }
         Err(e) => {
             let msg = format!("init global action credentials failed: {e:?}");
-            error!(target: "rustfs::main::run","{msg}");
+            error!(
+                target: "rustfs::main::run",
+                event = EVENT_ACTION_CREDENTIALS_INITIALIZATION_FAILED,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_AUTH,
+                error = %e,
+                "Failed to initialize global action credentials"
+            );
             return Err(Error::other(msg));
         }
     };
@@ -295,9 +389,12 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     // For RPC
     info!(
         target: "rustfs::main::run",
+        event = EVENT_ENDPOINT_PARSING_STARTED,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STORAGE,
         server_address = %server_address,
-        volumes = ?config.volumes,
-        "starting endpoint parsing"
+        volume_count = config.volumes.len(),
+        "Starting endpoint parsing"
     );
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), config.volumes.clone())
         .await
@@ -316,7 +413,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     update_erasure_type(setup_type).await;
 
     // Initialize the local disk
-    info!(
+    debug!(
         target: "rustfs::main::run",
         "starting local disk initialization"
     );
@@ -339,19 +436,31 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
         info!(
             target: "rustfs::main::run",
-            "Formatting {}st pool, {} set(s), {} drives per set.",
-            i + 1,
-            eps.set_count,
-            eps.drives_per_set
+            event = EVENT_STORAGE_POOL_FORMATTING,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STORAGE,
+            pool_id = i + 1,
+            set_count = eps.set_count,
+            drives_per_set = eps.drives_per_set,
+            "Formatting storage pool"
         );
 
         if eps.drives_per_set > 1 {
-            warn!(target: "rustfs::main::run","WARNING: Host local has more than 0 drives of set. A host failure will result in data becoming unavailable.");
+            warn!(
+                target: "rustfs::main::run",
+                event = EVENT_STORAGE_POOL_HOST_RISK,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STORAGE,
+                pool_id = i + 1,
+                drives_per_set = eps.drives_per_set,
+                risk = "host_failure_data_unavailable",
+                "Detected multi-drive local set host failure risk"
+            );
         }
     }
 
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
-        info!(
+        debug!(
             target: "rustfs::main::run",
             id = i,
             set_count = eps.set_count,
@@ -362,7 +471,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
         );
 
         for ep in eps.endpoints.as_ref().iter() {
-            info!(
+            debug!(
                 target: "rustfs::main::run",
                 "  - endpoint: {}", ep
             );
@@ -394,7 +503,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 
     // init store
     // 2. Start Storage Engine (ECStore)
-    info!(
+    debug!(
         target: "rustfs::main::run",
         "starting ECStore initialization"
     );
@@ -433,15 +542,37 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     #[cfg(feature = "ftps")]
     let ftp_shutdown_tx = match init_ftp_system().await {
         Ok(Some(tx)) => {
-            info!("FTP system initialized successfully");
+            info!(
+                event = EVENT_PROTOCOL_SYSTEM_STATE,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                protocol = "ftp",
+                state = "initialized",
+                "Protocol system state changed"
+            );
             Some(tx)
         }
         Ok(None) => {
-            info!("FTP system disabled");
+            info!(
+                event = EVENT_PROTOCOL_SYSTEM_STATE,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                protocol = "ftp",
+                state = "disabled",
+                "Protocol system state changed"
+            );
             None
         }
         Err(e) => {
-            error!("Failed to initialize FTP system: {}", e);
+            error!(
+                event = EVENT_PROTOCOL_SYSTEM_STATE,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                protocol = "ftp",
+                state = "initialization_failed",
+                error = %e,
+                "Protocol system state changed"
+            );
             return Err(Error::other(e));
         }
     };
@@ -453,15 +584,37 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     #[cfg(feature = "ftps")]
     let ftps_shutdown_tx = match init_ftps_system().await {
         Ok(Some(tx)) => {
-            info!("FTPS system initialized successfully");
+            info!(
+                event = EVENT_PROTOCOL_SYSTEM_STATE,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                protocol = "ftps",
+                state = "initialized",
+                "Protocol system state changed"
+            );
             Some(tx)
         }
         Ok(None) => {
-            info!("FTPS system disabled");
+            info!(
+                event = EVENT_PROTOCOL_SYSTEM_STATE,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                protocol = "ftps",
+                state = "disabled",
+                "Protocol system state changed"
+            );
             None
         }
         Err(e) => {
-            error!("Failed to initialize FTPS system: {}", e);
+            error!(
+                event = EVENT_PROTOCOL_SYSTEM_STATE,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                protocol = "ftps",
+                state = "initialization_failed",
+                error = %e,
+                "Protocol system state changed"
+            );
             return Err(Error::other(e));
         }
     };
@@ -473,15 +626,37 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     #[cfg(feature = "webdav")]
     let webdav_shutdown_tx = match init_webdav_system().await {
         Ok(Some(tx)) => {
-            info!("WebDAV system initialized successfully");
+            info!(
+                event = EVENT_PROTOCOL_SYSTEM_STATE,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                protocol = "webdav",
+                state = "initialized",
+                "Protocol system state changed"
+            );
             Some(tx)
         }
         Ok(None) => {
-            info!("WebDAV system disabled");
+            info!(
+                event = EVENT_PROTOCOL_SYSTEM_STATE,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                protocol = "webdav",
+                state = "disabled",
+                "Protocol system state changed"
+            );
             None
         }
         Err(e) => {
-            error!("Failed to initialize WebDAV system: {}", e);
+            error!(
+                event = EVENT_PROTOCOL_SYSTEM_STATE,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                protocol = "webdav",
+                state = "initialization_failed",
+                error = %e,
+                "Protocol system state changed"
+            );
             return Err(Error::other(e));
         }
     };
@@ -493,15 +668,37 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     #[cfg(feature = "sftp")]
     let sftp_shutdown_tx = match init_sftp_system().await {
         Ok(Some(tx)) => {
-            info!("SFTP system initialized successfully");
+            info!(
+                event = EVENT_PROTOCOL_SYSTEM_STATE,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                protocol = "sftp",
+                state = "initialized",
+                "Protocol system state changed"
+            );
             Some(tx)
         }
         Ok(None) => {
-            info!("SFTP system disabled");
+            info!(
+                event = EVENT_PROTOCOL_SYSTEM_STATE,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                protocol = "sftp",
+                state = "disabled",
+                "Protocol system state changed"
+            );
             None
         }
         Err(e) => {
-            error!("Failed to initialize SFTP system: {}", e);
+            error!(
+                event = EVENT_PROTOCOL_SYSTEM_STATE,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                protocol = "sftp",
+                state = "initialization_failed",
+                error = %e,
+                "Protocol system state changed"
+            );
             return Err(Error::other(e));
         }
     };
@@ -517,17 +714,46 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 
     // Start the audit system
     match start_audit_system().await {
-        Ok(_) => info!(target: "rustfs::main::run","Audit system started successfully."),
-        Err(e) => error!(target: "rustfs::main::run","Failed to start audit system: {}", e),
+        Ok(_) => info!(
+            target: "rustfs::main::run",
+            event = EVENT_AUDIT_SYSTEM_STATE,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            state = "started",
+            "Audit system state changed"
+        ),
+        Err(e) => error!(
+            target: "rustfs::main::run",
+            event = EVENT_AUDIT_SYSTEM_STATE,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            state = "start_failed",
+            error = %e,
+            "Audit system state changed"
+        ),
     }
 
     // Initialize deadlock detector if enabled
     let detector = rustfs::storage::deadlock_detector::get_deadlock_detector();
     if detector.is_enabled() {
         detector.start();
-        info!(target: "rustfs::main::run","Deadlock detector started successfully.");
+        info!(
+            target: "rustfs::main::run",
+            event = EVENT_DEADLOCK_DETECTOR_STATE,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            state = "started",
+            "Deadlock detector state changed"
+        );
     } else {
-        info!(target: "rustfs::main::run","Deadlock detector disabled.");
+        info!(
+            target: "rustfs::main::run",
+            event = EVENT_DEADLOCK_DETECTOR_STATE,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            state = "disabled",
+            "Deadlock detector state changed"
+        );
     }
 
     let buckets_list = store
@@ -566,9 +792,20 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     let keystone_config = rustfs_keystone::KeystoneConfig::from_env().map_err(Error::other)?;
     if keystone_config.enable {
         match rustfs::auth_keystone::init_keystone_auth(keystone_config).await {
-            Ok(_) => info!("Keystone authentication initialized successfully"),
+            Ok(_) => info!(
+                event = EVENT_KEYSTONE_AUTH_INITIALIZED,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_AUTH,
+                "Initialized Keystone authentication"
+            ),
             Err(e) => {
-                error!("Failed to initialize Keystone authentication: {}", e);
+                error!(
+                    event = EVENT_KEYSTONE_AUTH_INITIALIZATION_FAILED,
+                    component = LOG_COMPONENT_MAIN,
+                    subsystem = LOG_SUBSYSTEM_AUTH,
+                    error = %e,
+                    "Failed to initialize Keystone authentication"
+                );
                 // Continue without Keystone - fall back to standard auth
             }
         }
@@ -576,14 +813,26 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 
     // 3b. Initialize OIDC System (non-fatal if no providers configured)
     if let Err(e) = init_oidc_sys().await {
-        warn!("OIDC initialization failed (non-fatal): {}", e);
+        warn!(
+            event = EVENT_OIDC_INITIALIZATION_FAILED,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_AUTH,
+            error = %e,
+            "OIDC initialization failed; continuing without OIDC providers"
+        );
     }
 
     add_bucket_notification_configuration(buckets.clone()).await;
 
     // Initialize the global notification system
     new_global_notification_sys(endpoint_pools.clone()).await.map_err(|err| {
-        error!("new_global_notification_sys failed {:?}", &err);
+        error!(
+            event = EVENT_NOTIFICATION_SYSTEM_INITIALIZATION_FAILED,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            error = ?err,
+            "Failed to initialize notification system"
+        );
         Error::other(err)
     })?;
 
@@ -596,9 +845,12 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 
     info!(
         target: "rustfs::main::run",
+        event = EVENT_BACKGROUND_SERVICES_CONFIGURED,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
         enable_scanner = enable_scanner,
         enable_heal = enable_heal,
-        "Background services configuration: scanner={}, heal={}", enable_scanner, enable_heal
+        "Configured background services"
     );
 
     // Scanner depends on the heal channel/manager, so scanner implies heal.
@@ -608,7 +860,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     }
 
     if !enable_heal && !enable_scanner {
-        info!(target: "rustfs::main::run","Both scanner and heal are disabled, skipping AHM service initialization");
+        debug!(target: "rustfs::main::run","Both scanner and heal are disabled, skipping AHM service initialization");
     }
 
     // print server info
@@ -628,10 +880,14 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 
     info!(
         target: "rustfs::main::run",
-        "RustFS server version: {} started successfully at {}, current time: {}",
-        rustfs::version::get_version(),
-        &server_address,
-        jiff::Zoned::now()
+        event = EVENT_SERVER_READY,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        version = %rustfs::version::get_version(),
+        server_address = %server_address,
+        started_at = %jiff::Zoned::now(),
+        iam_bootstrap = ?iam_bootstrap,
+        "RustFS server started successfully"
     );
     if iam_bootstrap == IamBootstrapDisposition::ReadyInline {
         rustfs::server::publish_ready_when_runtime_ready(readiness.as_ref(), Some(state_manager.as_ref())).await?;
@@ -664,6 +920,32 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     Ok(())
 }
 
+fn log_external_prefix_compat_report(report: &ExternalEnvCompatReport) {
+    if report.conflict_count() > 0 {
+        warn!(
+            target: "rustfs::main",
+            event = EVENT_EXTERNAL_ENV_COMPAT_CONFLICT,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            conflict_count = report.conflict_count(),
+            conflict_keys = %report.conflict_keys.join(", "),
+            "Detected external-prefix compatibility conflicts; keeping RUSTFS_ values"
+        );
+    }
+
+    if report.mapped_count() > 0 {
+        info!(
+            target: "rustfs::main",
+            event = EVENT_EXTERNAL_ENV_COMPAT_APPLIED,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            mapped_count = report.mapped_count(),
+            mapped_pairs = %format_external_prefix_mappings(report),
+            "Applied external-prefix compatibility mappings"
+        );
+    }
+}
+
 /// Shutdown channels for every protocol server. None means the protocol was
 /// disabled at startup.
 struct ProtocolShutdownSenders {
@@ -692,6 +974,9 @@ async fn handle_shutdown(
 
     info!(
         target: "rustfs::main::handle_shutdown",
+        event = EVENT_SHUTDOWN_SIGNAL_RECEIVED,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
         signal = shutdown_signal.log_label(),
         "Shutdown signal received in main thread"
     );
@@ -706,7 +991,12 @@ async fn handle_shutdown(
     if enable_scanner {
         info!(
             target: "rustfs::main::handle_shutdown",
-            "Stopping background services (data scanner)..."
+            event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            service = "data_scanner",
+            state = "stopping",
+            "Background service shutdown started"
         );
         shutdown_background_services();
     }
@@ -714,7 +1004,12 @@ async fn handle_shutdown(
     if enable_heal || enable_scanner {
         info!(
             target: "rustfs::main::handle_shutdown",
-            "Stopping AHM services..."
+            event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            service = "ahm",
+            state = "stopping",
+            "Background service shutdown started"
         );
         shutdown_ahm_services();
     }
@@ -722,7 +1017,13 @@ async fn handle_shutdown(
     if !enable_scanner && !enable_heal {
         info!(
             target: "rustfs::main::handle_shutdown",
-            "Background services were disabled, skipping AHM shutdown"
+            event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            service = "ahm",
+            state = "skipped",
+            reason = "disabled",
+            "Background service shutdown skipped"
         );
     }
 
@@ -731,7 +1032,12 @@ async fn handle_shutdown(
     if let Some(ftp_shutdown_tx) = ftp_shutdown_tx {
         info!(
             target: "rustfs::main::handle_shutdown",
-            "Shutting down FTP server..."
+            event = EVENT_PROTOCOL_SYSTEM_STATE,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            protocol = "ftp",
+            state = "stopping",
+            "Protocol system state changed"
         );
         protocol_shutdowns.push(ftp_shutdown_tx.shutdown());
     }
@@ -739,7 +1045,12 @@ async fn handle_shutdown(
     if let Some(ftps_shutdown_tx) = ftps_shutdown_tx {
         info!(
             target: "rustfs::main::handle_shutdown",
-            "Shutting down FTPS server..."
+            event = EVENT_PROTOCOL_SYSTEM_STATE,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            protocol = "ftps",
+            state = "stopping",
+            "Protocol system state changed"
         );
         protocol_shutdowns.push(ftps_shutdown_tx.shutdown());
     }
@@ -748,7 +1059,12 @@ async fn handle_shutdown(
     if let Some(webdav_shutdown_tx) = webdav_shutdown_tx {
         info!(
             target: "rustfs::main::handle_shutdown",
-            "Shutting down WebDAV server..."
+            event = EVENT_PROTOCOL_SYSTEM_STATE,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            protocol = "webdav",
+            state = "stopping",
+            "Protocol system state changed"
         );
         protocol_shutdowns.push(webdav_shutdown_tx.shutdown());
     }
@@ -757,7 +1073,12 @@ async fn handle_shutdown(
     if let Some(sftp_shutdown_tx) = sftp_shutdown_tx {
         info!(
             target: "rustfs::main::handle_shutdown",
-            "Shutting down SFTP server..."
+            event = EVENT_PROTOCOL_SYSTEM_STATE,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            protocol = "sftp",
+            state = "stopping",
+            "Protocol system state changed"
         );
         protocol_shutdowns.push(sftp_shutdown_tx.shutdown());
     }
@@ -765,30 +1086,61 @@ async fn handle_shutdown(
     // Stop the notification system
     info!(
         target: "rustfs::main::handle_shutdown",
-        "Shutting down event notifier system..."
+        event = EVENT_EVENT_NOTIFIER_SHUTDOWN,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        state = "stopping",
+        "Event notifier shutdown started"
     );
     shutdown_event_notifier().await;
 
     // Stop the audit system
     info!(
         target: "rustfs::main::handle_shutdown",
-        "Stopping audit system..."
+        event = EVENT_AUDIT_SYSTEM_STATE,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        state = "stopping",
+        "Audit system state changed"
     );
     match stop_audit_system().await {
-        Ok(_) => info!("Audit system stopped successfully."),
-        Err(e) => error!("Failed to stop audit system: {}", e),
+        Ok(_) => info!(
+            target: "rustfs::main::handle_shutdown",
+            event = EVENT_AUDIT_SYSTEM_STATE,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            state = "stopped",
+            "Audit system state changed"
+        ),
+        Err(e) => error!(
+            target: "rustfs::main::handle_shutdown",
+            event = EVENT_AUDIT_SYSTEM_STATE,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            state = "stop_failed",
+            error = %e,
+            "Audit system state changed"
+        ),
     }
 
     // Stop profiling tasks
     info!(
         target: "rustfs::main::handle_shutdown",
-        "Stopping profiling tasks..."
+        event = EVENT_PROFILING_SHUTDOWN,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        state = "stopping",
+        "Profiling shutdown started"
     );
     rustfs::profiling::shutdown_profiling();
 
     info!(
         target: "rustfs::main::handle_shutdown",
-        "Server is stopping..."
+        event = EVENT_SERVER_SHUTDOWN_STATE,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        state = "stopping",
+        "Server shutdown state changed"
     );
     if let Some(s3_shutdown_handle) = s3_shutdown_handle {
         s3_shutdown_handle.shutdown().await;
@@ -800,7 +1152,14 @@ async fn handle_shutdown(
 
     // the last updated status is stopped
     state_manager.update(ServiceState::Stopped);
-    info!(target: "rustfs::main::handle_shutdown", "Server stopped successfully.");
+    info!(
+        target: "rustfs::main::handle_shutdown",
+        event = EVENT_SERVER_SHUTDOWN_STATE,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        state = "stopped",
+        "Server shutdown state changed"
+    );
 }
 
 #[cfg(test)]

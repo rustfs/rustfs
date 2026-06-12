@@ -51,6 +51,42 @@ grep -Eq '^[[:space:]]*replicas:[[:space:]]*1[[:space:]]*$' <<<"$rolling_output"
 scaled_to_zero_output=$(render_standalone_deployment --set replicaCount=0)
 grep -Eq '^[[:space:]]*replicas:[[:space:]]*0[[:space:]]*$' <<<"$scaled_to_zero_output"
 
+scanner_config_output=$(render_chart \
+  --set config.rustfs.scanner.speed=slow \
+  --set config.rustfs.scanner.delay=30 \
+  --set config.rustfs.scanner.max_wait_secs=15 \
+  --set config.rustfs.scanner.cycle_secs=3600 \
+  --set config.rustfs.scanner.start_delay_secs=60 \
+  --set config.rustfs.scanner.cycle_max_duration_secs=1800 \
+  --set config.rustfs.scanner.cycle_max_objects=0 \
+  --set config.rustfs.scanner.cycle_max_directories=100000 \
+  --set config.rustfs.scanner.bitrot_cycle_secs=0 \
+  --set config.rustfs.scanner.idle_mode=false \
+  --set config.rustfs.scanner.cache_save_timeout_secs=30 \
+  --set config.rustfs.scanner.max_concurrent_set_scans=2 \
+  --set config.rustfs.scanner.max_concurrent_disk_scans=1 \
+  --set config.rustfs.scanner.yield_every_n_objects=128 \
+  --set config.rustfs.scanner.alert_excess_versions=100 \
+  --set config.rustfs.scanner.alert_excess_version_size=1099511627776 \
+  --set config.rustfs.scanner.alert_excess_folders=65538)
+grep -q 'RUSTFS_SCANNER_SPEED: "slow"' <<<"$scanner_config_output"
+grep -q 'RUSTFS_SCANNER_DELAY: "30"' <<<"$scanner_config_output"
+grep -q 'RUSTFS_SCANNER_MAX_WAIT_SECS: "15"' <<<"$scanner_config_output"
+grep -q 'RUSTFS_SCANNER_CYCLE: "3600"' <<<"$scanner_config_output"
+grep -q 'RUSTFS_SCANNER_START_DELAY_SECS: "60"' <<<"$scanner_config_output"
+grep -q 'RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS: "1800"' <<<"$scanner_config_output"
+grep -q 'RUSTFS_SCANNER_CYCLE_MAX_OBJECTS: "0"' <<<"$scanner_config_output"
+grep -q 'RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES: "100000"' <<<"$scanner_config_output"
+grep -q 'RUSTFS_SCANNER_BITROT_CYCLE_SECS: "0"' <<<"$scanner_config_output"
+grep -q 'RUSTFS_SCANNER_IDLE_MODE: "false"' <<<"$scanner_config_output"
+grep -q 'RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS: "30"' <<<"$scanner_config_output"
+grep -q 'RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS: "2"' <<<"$scanner_config_output"
+grep -q 'RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS: "1"' <<<"$scanner_config_output"
+grep -q 'RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS: "128"' <<<"$scanner_config_output"
+grep -q 'RUSTFS_SCANNER_ALERT_EXCESS_VERSIONS: "100"' <<<"$scanner_config_output"
+grep -q 'RUSTFS_SCANNER_ALERT_EXCESS_VERSION_SIZE: "1099511627776"' <<<"$scanner_config_output"
+grep -q 'RUSTFS_SCANNER_ALERT_EXCESS_FOLDERS: "65538"' <<<"$scanner_config_output"
+
 # Fail-closed credential checks. Rendering must fail when no credentials,
 # existingSecret, or allowInsecureDefaults override is supplied.
 default_render_status=0

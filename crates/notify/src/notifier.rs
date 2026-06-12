@@ -21,6 +21,14 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, error, info, instrument, warn};
 
+const LOG_COMPONENT_NOTIFY: &str = "notify";
+const LOG_SUBSYSTEM_DISPATCH: &str = "dispatch";
+const EVENT_NOTIFY_DISPATCH_SKIPPED: &str = "notify_dispatch_skipped";
+const EVENT_NOTIFY_DISPATCH_FAILED: &str = "notify_dispatch_failed";
+const EVENT_NOTIFY_DISPATCH_STARTED: &str = "notify_dispatch_started";
+const EVENT_NOTIFY_DISPATCH_COMPLETED: &str = "notify_dispatch_completed";
+const EVENT_NOTIFY_RUNTIME_LIFECYCLE: &str = "notify_runtime_lifecycle";
+
 pub type SharedNotifyTargetList = Arc<RwLock<TargetList>>;
 
 /// Manages event notification to targets based on rules
@@ -83,7 +91,13 @@ impl EventNotifier {
         // The logic for sending cancel signals via stream_cancel_senders would be removed.
         // TargetList::clear_targets_only already handles calling target.close().
         target_list_guard.clear_targets_only().await; // Modified clear to not re-cancel
-        info!("Removed all targets and their streams");
+        info!(
+            event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
+            component = LOG_COMPONENT_NOTIFY,
+            subsystem = LOG_SUBSYSTEM_DISPATCH,
+            state = "targets_cleared",
+            "Removed all notify targets"
+        );
     }
 
     /// Sends an event to the appropriate targets based on the bucket rules
@@ -98,7 +112,15 @@ impl EventNotifier {
 
         let target_ids = self.rule_engine.match_targets(bucket_name, event_name, object_key).await;
         if target_ids.is_empty() {
-            debug!("No matching targets for event in bucket: {}", bucket_name);
+            debug!(
+                event = EVENT_NOTIFY_DISPATCH_SKIPPED,
+                component = LOG_COMPONENT_NOTIFY,
+                subsystem = LOG_SUBSYSTEM_DISPATCH,
+                bucket = %bucket_name,
+                object = %object_key,
+                reason = "no_matching_targets",
+                "Skipped notify dispatch"
+            );
             self.metrics.increment_skipped();
             return;
         }
@@ -107,7 +129,15 @@ impl EventNotifier {
 
         // Use scope to limit the borrow scope of target_list
         let target_list_guard = self.target_list.read().await;
-        info!("Sending event to targets: {:?}", target_ids);
+        debug!(
+            event = EVENT_NOTIFY_DISPATCH_STARTED,
+            component = LOG_COMPONENT_NOTIFY,
+            subsystem = LOG_SUBSYSTEM_DISPATCH,
+            bucket = %bucket_name,
+            object = %object_key,
+            target_count = target_ids_len,
+            "Dispatching notify event"
+        );
         for target_id in target_ids {
             // `get` now returns Option<Arc<dyn Target + Send + Sync>>
             if let Some(target_arc) = target_list_guard.get(&target_id) {
@@ -115,7 +145,14 @@ impl EventNotifier {
                 // target_arc is already Arc, clone it for the async task
                 let target_for_task = target_arc.clone();
                 if !target_for_task.is_enabled() {
-                    debug!("Skipping disabled target: {}", target_for_task.name());
+                    debug!(
+                        event = EVENT_NOTIFY_DISPATCH_SKIPPED,
+                        component = LOG_COMPONENT_NOTIFY,
+                        subsystem = LOG_SUBSYSTEM_DISPATCH,
+                        target_id = %target_for_task.id(),
+                        reason = "target_disabled",
+                        "Skipped notify dispatch target"
+                    );
                     continue;
                 }
                 let limiter = self.send_limiter.clone();
@@ -123,7 +160,14 @@ impl EventNotifier {
                 let event_clone = event.clone();
                 let is_deferred = target_for_task.store().is_some();
                 let target_name_for_task = target_for_task.name(); // Get the name before generating the task
-                debug!("Preparing to send event to target: {}", target_name_for_task);
+                debug!(
+                    event = EVENT_NOTIFY_DISPATCH_STARTED,
+                    component = LOG_COMPONENT_NOTIFY,
+                    subsystem = LOG_SUBSYSTEM_DISPATCH,
+                    target_id = %target_for_task.id(),
+                    deferred = is_deferred,
+                    "Prepared notify target dispatch"
+                );
                 // Use cloned data in closures to avoid borrowing conflicts
                 // Create an EntityTarget from the event
                 let entity_target: Arc<EntityTarget<Event>> = Arc::new(EntityTarget {
@@ -137,26 +181,56 @@ impl EventNotifier {
                     let _permit = match limiter.acquire_owned().await {
                         Ok(p) => p,
                         Err(e) => {
-                            error!("Failed to acquire send permit for target {}: {}", target_name_for_task, e);
+                            error!(
+                                event = EVENT_NOTIFY_DISPATCH_FAILED,
+                                component = LOG_COMPONENT_NOTIFY,
+                                subsystem = LOG_SUBSYSTEM_DISPATCH,
+                                target_id = %target_name_for_task,
+                                error = %e,
+                                reason = "permit_acquire_failed",
+                                "Failed to acquire notify send permit"
+                            );
                             metrics.increment_failed();
                             return;
                         }
                     };
                     if let Err(e) = target_for_task.save(entity_target.clone()).await {
                         metrics.increment_failed();
-                        error!("Failed to send event to target {}: {}", target_name_for_task, e);
+                        error!(
+                            event = EVENT_NOTIFY_DISPATCH_FAILED,
+                            component = LOG_COMPONENT_NOTIFY,
+                            subsystem = LOG_SUBSYSTEM_DISPATCH,
+                            target_id = %target_name_for_task,
+                            error = %e,
+                            reason = "send_failed",
+                            "Failed to dispatch notify event"
+                        );
                     } else {
                         if is_deferred {
                             metrics.decrement_processing();
                         } else {
                             metrics.increment_processed();
                         }
-                        debug!("Successfully saved event to target {}", target_name_for_task);
+                        debug!(
+                            event = EVENT_NOTIFY_DISPATCH_COMPLETED,
+                            component = LOG_COMPONENT_NOTIFY,
+                            subsystem = LOG_SUBSYSTEM_DISPATCH,
+                            target_id = %target_name_for_task,
+                            deferred = is_deferred,
+                            "Completed notify target dispatch"
+                        );
                     }
                 });
                 handles.push(handle);
             } else {
-                warn!("Target ID {:?} found in rules but not in target list.", target_id);
+                warn!(
+                    event = EVENT_NOTIFY_DISPATCH_FAILED,
+                    component = LOG_COMPONENT_NOTIFY,
+                    subsystem = LOG_SUBSYSTEM_DISPATCH,
+                    target_id = %target_id,
+                    reason = "target_missing_from_runtime",
+                    "Matched notify target is missing from runtime"
+                );
                 self.metrics.increment_skipped();
             }
         }
@@ -166,10 +240,24 @@ impl EventNotifier {
         // Wait for all tasks to be completed
         for handle in handles {
             if let Err(e) = handle.await {
-                error!("Task for sending/saving event failed: {}", e);
+                error!(
+                    event = EVENT_NOTIFY_DISPATCH_FAILED,
+                    component = LOG_COMPONENT_NOTIFY,
+                    subsystem = LOG_SUBSYSTEM_DISPATCH,
+                    error = %e,
+                    reason = "join_failed",
+                    "Notify dispatch task failed"
+                );
             }
         }
-        info!("Event processing initiated for {} targets for bucket: {}", target_ids_len, bucket_name);
+        debug!(
+            event = EVENT_NOTIFY_DISPATCH_COMPLETED,
+            component = LOG_COMPONENT_NOTIFY,
+            subsystem = LOG_SUBSYSTEM_DISPATCH,
+            bucket = %bucket_name,
+            target_count = target_ids_len,
+            "Finished notify dispatch fan-out"
+        );
     }
 
     /// Initializes the targets for buckets from shared target handles.
@@ -179,14 +267,24 @@ impl EventNotifier {
         target_list_guard.clear();
 
         for target in targets_to_init {
-            debug!("init bucket target: {}", target.name());
+            debug!(
+                event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
+                component = LOG_COMPONENT_NOTIFY,
+                subsystem = LOG_SUBSYSTEM_DISPATCH,
+                state = "target_init",
+                target_id = %target.id(),
+                "Initializing notify runtime target"
+            );
             target_list_guard.add(target)?;
         }
 
         info!(
-            "Initialized {} shared targets, list size: {}",
-            target_list_guard.len(),
-            target_list_guard.len()
+            event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
+            component = LOG_COMPONENT_NOTIFY,
+            subsystem = LOG_SUBSYSTEM_DISPATCH,
+            state = "targets_initialized",
+            target_count = target_list_guard.len(),
+            "Initialized notify runtime targets"
         );
         Ok(())
     }
@@ -223,7 +321,14 @@ impl TargetList {
         let id = target.id();
         if self.runtime.get_by_target_id(&id).is_some() {
             // Potentially update or log a warning/error if replacing an existing target.
-            warn!("Target with ID {} already exists in TargetList. It will be overwritten.", id);
+            warn!(
+                event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
+                component = LOG_COMPONENT_NOTIFY,
+                subsystem = LOG_SUBSYSTEM_DISPATCH,
+                state = "target_overwrite",
+                target_id = %id,
+                "Overwriting existing notify runtime target"
+            );
         }
         self.runtime.add_arc(target);
         Ok(())

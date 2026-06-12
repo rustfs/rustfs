@@ -20,7 +20,7 @@ use crate::config::{
 };
 use crate::service_manager::KmsServiceStatus;
 use crate::types::{KeyMetadata, KeyUsage};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
@@ -28,6 +28,7 @@ use std::time::Duration;
 
 /// Request to configure KMS with Local backend
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigureLocalKmsRequest {
     /// Directory to store key files
     pub key_dir: PathBuf,
@@ -47,6 +48,8 @@ pub struct ConfigureLocalKmsRequest {
     pub max_cached_keys: Option<usize>,
     /// Cache TTL in seconds
     pub cache_ttl_seconds: Option<u64>,
+    /// Allow development-only insecure defaults
+    pub allow_insecure_dev_defaults: Option<bool>,
 }
 
 impl fmt::Debug for ConfigureLocalKmsRequest {
@@ -62,16 +65,19 @@ impl fmt::Debug for ConfigureLocalKmsRequest {
             .field("enable_cache", &self.enable_cache)
             .field("max_cached_keys", &self.max_cached_keys)
             .field("cache_ttl_seconds", &self.cache_ttl_seconds)
+            .field("allow_insecure_dev_defaults", &self.allow_insecure_dev_defaults)
             .finish()
     }
 }
 
 /// Request to configure KMS with Vault KV v2 + Transit backend
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigureVaultKmsRequest {
     /// Vault server URL
     pub address: String,
     /// Authentication method
+    #[serde(deserialize_with = "deserialize_strict_vault_auth_method")]
     pub auth_method: VaultAuthMethod,
     /// Vault namespace (Vault Enterprise, optional)
     pub namespace: Option<String>,
@@ -95,14 +101,18 @@ pub struct ConfigureVaultKmsRequest {
     pub max_cached_keys: Option<usize>,
     /// Cache TTL in seconds
     pub cache_ttl_seconds: Option<u64>,
+    /// Allow development-only insecure defaults
+    pub allow_insecure_dev_defaults: Option<bool>,
 }
 
 /// Request to configure KMS with Vault Transit backend
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigureVaultTransitKmsRequest {
     /// Vault server URL
     pub address: String,
     /// Authentication method
+    #[serde(deserialize_with = "deserialize_strict_vault_auth_method")]
     pub auth_method: VaultAuthMethod,
     /// Vault namespace (Vault Enterprise, optional)
     pub namespace: Option<String>,
@@ -122,6 +132,8 @@ pub struct ConfigureVaultTransitKmsRequest {
     pub max_cached_keys: Option<usize>,
     /// Cache TTL in seconds
     pub cache_ttl_seconds: Option<u64>,
+    /// Allow development-only insecure defaults
+    pub allow_insecure_dev_defaults: Option<bool>,
 }
 
 /// Generic KMS configuration request
@@ -158,9 +170,33 @@ pub struct ConfigureKmsResponse {
 
 /// Request to start KMS service
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StartKmsRequest {
     /// Whether to force start (restart if already running)
     pub force: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+enum StrictVaultAuthMethod {
+    Token { token: String },
+    AppRole { role_id: String, secret_id: String },
+}
+
+impl From<StrictVaultAuthMethod> for VaultAuthMethod {
+    fn from(value: StrictVaultAuthMethod) -> Self {
+        match value {
+            StrictVaultAuthMethod::Token { token } => Self::Token { token },
+            StrictVaultAuthMethod::AppRole { role_id, secret_id } => Self::AppRole { role_id, secret_id },
+        }
+    }
+}
+
+fn deserialize_strict_vault_auth_method<'de, D>(deserializer: D) -> Result<VaultAuthMethod, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    StrictVaultAuthMethod::deserialize(deserializer).map(Into::into)
 }
 
 /// KMS start response
@@ -351,6 +387,7 @@ impl ConfigureLocalKmsRequest {
                 master_key: self.master_key.clone(),
                 file_permissions: self.file_permissions,
             }),
+            allow_insecure_dev_defaults: self.allow_insecure_dev_defaults.unwrap_or(false),
             timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(30)),
             retry_attempts: self.retry_attempts.unwrap_or(3),
             enable_cache: self.enable_cache.unwrap_or(true),
@@ -387,6 +424,7 @@ impl ConfigureVaultKmsRequest {
                     None
                 },
             })),
+            allow_insecure_dev_defaults: self.allow_insecure_dev_defaults.unwrap_or(false),
             timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(30)),
             retry_attempts: self.retry_attempts.unwrap_or(3),
             enable_cache: self.enable_cache.unwrap_or(true),
@@ -421,6 +459,7 @@ impl ConfigureVaultTransitKmsRequest {
                     None
                 },
             })),
+            allow_insecure_dev_defaults: self.allow_insecure_dev_defaults.unwrap_or(false),
             timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(30)),
             retry_attempts: self.retry_attempts.unwrap_or(3),
             enable_cache: self.enable_cache.unwrap_or(true),
@@ -510,6 +549,86 @@ mod tests {
     }
 
     #[test]
+    fn test_configure_request_development_defaults_require_opt_in() {
+        let local_raw = serde_json::json!({
+            "backend_type": "local",
+            "key_dir": "/tmp/kms-key-dir"
+        });
+        let request: ConfigureKmsRequest = serde_json::from_value(local_raw).expect("local request should deserialize");
+        let config = request.to_kms_config();
+        assert!(config.validate().is_err());
+
+        let local_opt_in_raw = serde_json::json!({
+            "backend_type": "local",
+            "key_dir": "/tmp/kms-key-dir",
+            "allow_insecure_dev_defaults": true
+        });
+        let request: ConfigureKmsRequest = serde_json::from_value(local_opt_in_raw).expect("local request should deserialize");
+        assert!(request.to_kms_config().validate().is_ok());
+
+        let vault_raw = serde_json::json!({
+            "backend_type": "vault",
+            "address": "http://127.0.0.1:8200",
+            "auth_method": {
+                "Token": {
+                    "token": "dev-token"
+                }
+            },
+            "skip_tls_verify": true
+        });
+        let request: ConfigureKmsRequest = serde_json::from_value(vault_raw).expect("vault request should deserialize");
+        let config = request.to_kms_config();
+        assert!(config.validate().is_err());
+
+        let vault_opt_in_raw = serde_json::json!({
+            "backend_type": "vault",
+            "address": "http://127.0.0.1:8200",
+            "auth_method": {
+                "Token": {
+                    "token": "dev-token"
+                }
+            },
+            "skip_tls_verify": true,
+            "allow_insecure_dev_defaults": true
+        });
+        let request: ConfigureKmsRequest = serde_json::from_value(vault_opt_in_raw).expect("vault request should deserialize");
+        assert!(request.to_kms_config().validate().is_ok());
+    }
+
+    #[test]
+    fn test_configure_request_rejects_unknown_fields() {
+        let raw = serde_json::json!({
+            "backend_type": "local",
+            "key_dir": "./target/kms-key-dir",
+            "unexpected_field": true
+        });
+
+        let err = serde_json::from_value::<ConfigureKmsRequest>(raw).expect_err("unknown configure field should fail");
+        assert!(err.to_string().contains("unknown field"));
+
+        let raw = serde_json::json!({
+            "backend_type": "vault",
+            "address": "http://127.0.0.1:8200",
+            "auth_method": {
+                "Token": {
+                    "token": "dev-root-token",
+                    "unexpected_field": true
+                }
+            }
+        });
+
+        let err = serde_json::from_value::<ConfigureKmsRequest>(raw).expect_err("unknown auth field should fail");
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn test_start_request_rejects_unknown_fields() {
+        let err = serde_json::from_str::<StartKmsRequest>(r#"{"force":true,"unexpected_field":true}"#)
+            .expect_err("unknown start field should fail");
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
     fn test_vault_transit_summary_reports_backend_details() {
         let config = KmsConfig {
             backend: KmsBackend::VaultTransit,
@@ -523,6 +642,7 @@ mod tests {
                 mount_path: "transit".to_string(),
                 tls: None,
             })),
+            allow_insecure_dev_defaults: true,
             timeout: Duration::from_secs(30),
             retry_attempts: 3,
             enable_cache: true,
@@ -569,6 +689,7 @@ mod tests {
             enable_cache: Some(true),
             max_cached_keys: Some(16),
             cache_ttl_seconds: Some(60),
+            allow_insecure_dev_defaults: None,
         });
         let vault = ConfigureKmsRequest::VaultTransit(ConfigureVaultTransitKmsRequest {
             address: "https://vault.example.com:8200".to_string(),
@@ -584,6 +705,7 @@ mod tests {
             enable_cache: None,
             max_cached_keys: None,
             cache_ttl_seconds: None,
+            allow_insecure_dev_defaults: None,
         });
         let approle = ConfigureKmsRequest::VaultKv2(ConfigureVaultKmsRequest {
             address: "https://vault.example.com:8200".to_string(),
@@ -602,6 +724,7 @@ mod tests {
             enable_cache: None,
             max_cached_keys: None,
             cache_ttl_seconds: None,
+            allow_insecure_dev_defaults: None,
         });
 
         let rendered = format!("{local:?}\n{vault:?}\n{approle:?}");

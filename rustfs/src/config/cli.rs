@@ -254,6 +254,10 @@ pub struct ServerOpts {
     #[arg(long, env = "RUSTFS_KMS_KEY_DIR")]
     pub kms_key_dir: Option<String>,
 
+    /// Master key for local KMS key-file encryption
+    #[arg(long, env = "RUSTFS_KMS_LOCAL_MASTER_KEY")]
+    pub kms_local_master_key: Option<String>,
+
     /// Vault address for vault backend
     #[arg(long, env = "RUSTFS_KMS_VAULT_ADDRESS")]
     pub kms_vault_address: Option<String>,
@@ -269,6 +273,10 @@ pub struct ServerOpts {
     /// Default KMS key ID for encryption
     #[arg(long, env = "RUSTFS_KMS_DEFAULT_KEY_ID")]
     pub kms_default_key_id: Option<String>,
+
+    /// Allow development-only insecure KMS defaults
+    #[arg(long, default_value_t = false, env = "RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS")]
+    pub kms_allow_insecure_dev_defaults: bool,
 
     /// Disable adaptive buffer sizing with workload profiles
     /// Set this flag to use legacy fixed-size buffer behavior from PR #869
@@ -316,10 +324,12 @@ pub fn default_server_opts() -> ServerOpts {
         kms_enable: false,
         kms_backend: "local".to_string(),
         kms_key_dir: None,
+        kms_local_master_key: None,
         kms_vault_address: None,
         kms_vault_token: None,
         kms_vault_mount_path: None,
         kms_default_key_id: None,
+        kms_allow_insecure_dev_defaults: false,
         buffer_profile_disable: false,
         buffer_profile: "GeneralPurpose".to_string(),
     }

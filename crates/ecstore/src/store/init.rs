@@ -18,6 +18,14 @@ use crate::global::{
     GLOBAL_EventNotifier, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr,
     get_global_bucket_monitor, is_dist_erasure, is_first_cluster_node_local,
 };
+use tracing::{debug, error, info, warn};
+
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_STORE_INIT: &str = "store_init";
+const EVENT_DECOMMISSION_RESUME_RETRY: &str = "decommission_resume_retry";
+const EVENT_DECOMMISSION_RESUME_FAILED: &str = "decommission_resume_failed";
+const EVENT_STORE_FORMAT_RETRY: &str = "store_format_retry";
+const EVENT_ECSTORE_INIT_STATUS: &str = "ecstore_init_status";
 
 fn pool_first_endpoint_is_local(pool: &crate::endpoints::PoolEndpoints) -> bool {
     pool.endpoints.as_ref().first().is_some_and(|endpoint| endpoint.is_local)
@@ -71,19 +79,27 @@ async fn resume_local_decommission_after_init(store: Arc<ECStore>, rx: Cancellat
                     .await
                 {
                     error!(
-                        "store init failed to resume decommission workers for pools {:?}: {}",
-                        pool_indices, spawn_err
+                        event = EVENT_DECOMMISSION_RESUME_FAILED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_STORE_INIT,
+                        pool_indices = ?pool_indices,
+                        error = %spawn_err,
+                        reason = "spawn_workers_failed",
+                        "Failed to resume decommission workers"
                     );
                 }
                 return;
             }
             Err(err) if should_retry_local_decommission_resume(&err, attempt) => {
                 warn!(
-                    "store init decommission resume missing config for pools {:?}, retry {}/{}: {}",
-                    pool_indices,
-                    attempt + 1,
-                    LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES + 1,
-                    err
+                    event = EVENT_DECOMMISSION_RESUME_RETRY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_STORE_INIT,
+                    pool_indices = ?pool_indices,
+                    retry_count = attempt + 1,
+                    retry_limit = LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES + 1,
+                    error = %err,
+                    "Retrying decommission resume after missing config"
                 );
                 tokio::select! {
                     _ = rx.cancelled() => return,
@@ -91,7 +107,15 @@ async fn resume_local_decommission_after_init(store: Arc<ECStore>, rx: Cancellat
                 }
             }
             Err(err) => {
-                error!("store init failed to resume decommission for pools {:?}: {}", pool_indices, err);
+                error!(
+                    event = EVENT_DECOMMISSION_RESUME_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_STORE_INIT,
+                    pool_indices = ?pool_indices,
+                    error = %err,
+                    reason = "resume_failed",
+                    "Failed to resume decommission"
+                );
                 return;
             }
         }
@@ -113,7 +137,13 @@ impl ECStore {
 
         let mut local_disks = Vec::new();
 
-        info!("ECStore new address: {}", address.to_string());
+        debug!(
+            event = EVENT_ECSTORE_INIT_STATUS,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_STORE_INIT,
+            address = %address,
+            "Initializing ECStore address"
+        );
         let mut host = address.ip().to_string();
         if host.is_empty() {
             host = GLOBAL_RUSTFS_HOST.read().await.to_string()
@@ -122,7 +152,14 @@ impl ECStore {
         if port.is_empty() {
             port = GLOBAL_RUSTFS_PORT.read().await.to_string()
         }
-        info!("ECStore new host: {}, port: {}", host, port);
+        debug!(
+            event = EVENT_ECSTORE_INIT_STATUS,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_STORE_INIT,
+            host = %host,
+            port = %port,
+            "Initializing ECStore host"
+        );
         init_local_peer(&endpoint_pools, &host, &port).await;
 
         // debug!("endpoint_pools: {:?}", endpoint_pools);
@@ -179,10 +216,23 @@ impl ECStore {
                     if interval < 16 {
                         interval *= 2;
                     }
-                    info!("retrying get formats after {:?}", interval);
+                    debug!(
+                        event = EVENT_STORE_FORMAT_RETRY,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_STORE_INIT,
+                        retry_count = times,
+                        retry_delay_secs = interval,
+                        "Retrying storage format load"
+                    );
                     select! {
                         _ = tokio::signal::ctrl_c() => {
-                            info!("got ctrl+c, exits");
+                            info!(
+                                event = EVENT_STORE_FORMAT_RETRY,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_STORE_INIT,
+                                reason = "ctrl_c",
+                                "Interrupted storage format retry loop"
+                            );
                             exit(0);
                         }
                         _ = sleep(Duration::from_secs(interval)) => {

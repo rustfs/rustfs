@@ -34,8 +34,9 @@ use rustfs_ecstore::bucket::target::BucketTarget;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::global::global_rustfs_port;
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
+use rustfs_ecstore::store_api::BucketOperations;
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_storage_api::BucketOptions;
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
@@ -318,11 +319,9 @@ pub struct ListRemoteTargetHandler {}
 #[async_trait::async_trait]
 impl Operation for ListRemoteTargetHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        validate_replication_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
+
         let queries = extract_query_params(&req.uri);
-        let Some(_cred) = req.credentials else {
-            error!("credentials null");
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
-        };
 
         if let Some(bucket) = queries.get("bucket") {
             if bucket.is_empty() {

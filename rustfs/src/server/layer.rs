@@ -15,6 +15,7 @@
 use crate::admin::console::is_console_path;
 use crate::admin::handlers::health::{HealthProbe, build_health_response_parts};
 use crate::error::ApiError;
+use crate::server::RemoteAddr;
 use crate::server::cors;
 use crate::server::hybrid::HybridBody;
 use crate::server::{
@@ -31,6 +32,7 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use opentelemetry::global;
 use opentelemetry::trace::TraceContextExt;
+use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::get_env_opt_str;
 use rustfs_utils::http::headers::AMZ_REQUEST_ID;
 use s3s::S3ErrorCode;
@@ -40,7 +42,12 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 use tower::{Layer, Service};
-use tracing::debug;
+use tracing::{debug, error, info};
+
+const HTTP_REQUEST_COMPLETED_EVENT: &str = "http_request_completed";
+const HTTP_REQUEST_FAILED_EVENT: &str = "http_request_failed";
+const LOG_COMPONENT_SERVER: &str = "server";
+const LOG_SUBSYSTEM_HTTP: &str = "http";
 
 /// A carrier that adapts [`HeaderMap`] for OpenTelemetry trace context propagation.
 struct HeaderMapCarrier<'a>(&'a HeaderMap);
@@ -72,8 +79,8 @@ impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrier<'a> {
 /// This layer must be placed after `SetRequestIdLayer` in the middleware stack,
 /// as it reads the `x-request-id` header that `SetRequestIdLayer` generates.
 ///
-/// Additionally, it sets the `x-amz-request-id` request header for S3 compatibility
-/// if not already present.
+/// Additionally, it stores the S3-compatible request ID alias in the request context
+/// without mutating signed request headers.
 #[derive(Clone, Default)]
 pub struct RequestContextLayer;
 
@@ -131,7 +138,7 @@ where
             .unwrap_or_else(|| request_id.clone());
 
         let ctx = RequestContext {
-            request_id: request_id.clone(),
+            request_id,
             x_amz_request_id,
             trace_id,
             span_id,
@@ -140,15 +147,175 @@ where
 
         req.extensions_mut().insert(ctx);
 
-        // Set x-amz-request-id for S3 compatibility downstream
-        if !req.headers().contains_key(AMZ_REQUEST_ID)
-            && let Ok(val) = HeaderValue::from_str(&request_id)
-        {
-            req.headers_mut()
-                .insert(http::header::HeaderName::from_static(AMZ_REQUEST_ID), val);
-        }
-
         self.inner.call(req)
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct RequestLoggingLayer;
+
+impl<S> Layer<S> for RequestLoggingLayer {
+    type Service = RequestLoggingService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RequestLoggingService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct RequestLoggingService<S> {
+    inner: S,
+}
+
+#[derive(Clone, Debug)]
+struct RequestLogContext {
+    request_id: String,
+    trace_id: Option<String>,
+    span_id: Option<String>,
+    peer_addr: String,
+    method: String,
+    uri: String,
+    request_started_at: Option<RequestContext>,
+    fallback_start: Instant,
+}
+
+impl RequestLogContext {
+    fn from_request<B>(req: &HttpRequest<B>) -> Self {
+        let request_context = req.extensions().get::<RequestContext>().cloned();
+        let request_id = request_context
+            .as_ref()
+            .map(|ctx| ctx.request_id.clone())
+            .unwrap_or_else(|| extract_request_id_from_headers(req.headers()));
+        let peer_addr = req
+            .extensions()
+            .get::<ClientInfo>()
+            .map(|info| info.real_ip.to_string())
+            .or_else(|| req.extensions().get::<RemoteAddr>().map(|addr| addr.0.to_string()))
+            .unwrap_or_else(|| "unknown".to_string());
+
+        Self {
+            request_id,
+            trace_id: request_context.as_ref().and_then(|ctx| ctx.trace_id.clone()),
+            span_id: request_context.as_ref().and_then(|ctx| ctx.span_id.clone()),
+            peer_addr,
+            method: req.method().to_string(),
+            uri: req.uri().to_string(),
+            request_started_at: request_context,
+            fallback_start: Instant::now(),
+        }
+    }
+
+    fn duration_ms(&self) -> u64 {
+        self.request_started_at
+            .as_ref()
+            .map(RequestContext::duration_ms)
+            .unwrap_or_else(|| self.fallback_start.elapsed().as_millis().try_into().unwrap_or(u64::MAX))
+    }
+
+    fn result_label(status: StatusCode) -> &'static str {
+        if status.is_server_error() {
+            "server_error"
+        } else if status.is_client_error() {
+            "client_error"
+        } else if status.is_redirection() {
+            "redirect"
+        } else {
+            "success"
+        }
+    }
+
+    fn log_response<ResBody>(&self, response: &Response<ResBody>) {
+        let duration_ms = self.duration_ms();
+        let status = response.status();
+        let status_code = status.as_u16();
+        let result = Self::result_label(status);
+        let trace_id = self.trace_id.as_deref().unwrap_or("unknown");
+        let span_id = self.span_id.as_deref().unwrap_or("unknown");
+
+        if status.is_server_error() {
+            error!(
+                event = HTTP_REQUEST_COMPLETED_EVENT,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_HTTP,
+                request_id = %self.request_id,
+                trace_id = %trace_id,
+                span_id = %span_id,
+                peer_addr = %self.peer_addr,
+                method = %self.method,
+                uri = %self.uri,
+                status_code,
+                duration_ms,
+                result,
+                "HTTP request completed"
+            );
+        } else {
+            info!(
+                event = HTTP_REQUEST_COMPLETED_EVENT,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_HTTP,
+                request_id = %self.request_id,
+                trace_id = %trace_id,
+                span_id = %span_id,
+                peer_addr = %self.peer_addr,
+                method = %self.method,
+                uri = %self.uri,
+                status_code,
+                duration_ms,
+                result,
+                "HTTP request completed"
+            );
+        }
+    }
+
+    fn log_failure<E>(&self, error: &E)
+    where
+        E: std::fmt::Display,
+    {
+        error!(
+            event = HTTP_REQUEST_FAILED_EVENT,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_HTTP,
+            request_id = %self.request_id,
+            trace_id = %self.trace_id.as_deref().unwrap_or("unknown"),
+            span_id = %self.span_id.as_deref().unwrap_or("unknown"),
+            peer_addr = %self.peer_addr,
+            method = %self.method,
+            uri = %self.uri,
+            duration_ms = self.duration_ms(),
+            result = "service_error",
+            error = %error,
+            "HTTP request failed before a response was produced"
+        );
+    }
+}
+
+impl<S, B, ResBody> Service<HttpRequest<B>> for RequestLoggingService<S>
+where
+    S: Service<HttpRequest<B>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: std::fmt::Display + Send + 'static,
+    B: Send + 'static,
+{
+    type Response = Response<ResBody>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: HttpRequest<B>) -> Self::Future {
+        let context = RequestLogContext::from_request(&req);
+        let mut inner = self.inner.clone();
+
+        Box::pin(async move {
+            let result = inner.call(req).await;
+            match &result {
+                Ok(response) => context.log_response(response),
+                Err(error) => context.log_failure(error),
+            }
+            result
+        })
     }
 }
 
@@ -309,10 +476,12 @@ fn is_empty_body_admin_path(method: &Method, uri: &http::Uri) -> bool {
                 path,
                 "/minio/admin/v3/rebalance/start"
                     | "/minio/admin/v3/rebalance/stop"
+                    | "/minio/admin/v3/background-heal/status"
                     | "/minio/admin/v3/pools/decommission"
                     | "/minio/admin/v3/pools/cancel"
                     | "/rustfs/admin/v3/rebalance/start"
                     | "/rustfs/admin/v3/rebalance/stop"
+                    | "/rustfs/admin/v3/background-heal/status"
                     | "/rustfs/admin/v3/pools/decommission"
                     | "/rustfs/admin/v3/pools/cancel"
             ) || is_heal_status_query(path, uri.query())
@@ -1145,16 +1314,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::{FAVICON_PATH, LICENSE, VERSION};
+    use crate::server::{FAVICON_PATH, LICENSE, RemoteAddr, VERSION};
     use futures::future::{Ready, ready};
     use http::Request;
     use http_body_util::BodyExt;
     use http_body_util::Full;
     use serial_test::serial;
     use std::convert::Infallible;
+    use std::io::{self, Write};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use temp_env::{async_with_vars, with_var};
+    use tracing_subscriber::{Registry, fmt::MakeWriter, layer::SubscriberExt};
 
     #[derive(Clone, Debug)]
     struct CaptureService;
@@ -1674,6 +1845,28 @@ mod tests {
     }
 
     #[test]
+    fn admin_background_heal_status_without_content_length_is_normalized() {
+        let paths = [
+            format!("{MINIO_ADMIN_V3_PREFIX}/background-heal/status"),
+            format!("{ADMIN_PREFIX}/v3/background-heal/status"),
+        ];
+
+        for path in paths {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(path.clone())
+                .header(http::header::TRANSFER_ENCODING, "chunked")
+                .body(())
+                .expect("request");
+
+            assert!(
+                should_force_zero_content_length_for_empty_body_route(&request),
+                "{path} should force Content-Length: 0"
+            );
+        }
+    }
+
+    #[test]
     fn admin_heal_start_without_status_token_is_not_normalized() {
         let request = Request::builder()
             .method(Method::POST)
@@ -2033,7 +2226,7 @@ mod tests {
     }
 
     #[test]
-    fn request_context_layer_populates_context_and_s3_request_id_from_x_request_id() {
+    fn request_context_layer_populates_context_without_mutating_signed_headers() {
         let mut service = RequestContextLayer.layer(CaptureService);
         let request = Request::builder()
             .uri("/bucket/object")
@@ -2051,7 +2244,7 @@ mod tests {
         assert_eq!(context.x_amz_request_id, "req-123");
         assert!(context.trace_id.is_none());
         assert!(context.span_id.is_none());
-        assert_eq!(request.headers().get(AMZ_REQUEST_ID).unwrap(), "req-123");
+        assert!(request.headers().get(AMZ_REQUEST_ID).is_none());
     }
 
     #[test]
@@ -2378,5 +2571,200 @@ mod tests {
             "https://allowed.example"
         );
         assert_eq!(response_headers.get(cors::response::ACCESS_CONTROL_ALLOW_METHODS).unwrap(), "GET");
+    }
+
+    #[derive(Clone)]
+    struct StatusService {
+        status: StatusCode,
+    }
+
+    impl StatusService {
+        fn new(status: StatusCode) -> Self {
+            Self { status }
+        }
+    }
+
+    impl<B> Service<Request<B>> for StatusService {
+        type Response = Response<Full<Bytes>>;
+        type Error = Infallible;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<B>) -> Self::Future {
+            ready(Ok(Response::builder()
+                .status(self.status)
+                .body(Full::from(Bytes::new()))
+                .expect("response")))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct SharedWriterGuard {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for SharedWriterGuard {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buffer.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for SharedWriter {
+        type Writer = SharedWriterGuard;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            SharedWriterGuard {
+                buffer: self.buffer.clone(),
+            }
+        }
+    }
+
+    #[test]
+    fn request_log_context_classifies_statuses() {
+        assert_eq!(RequestLogContext::result_label(StatusCode::OK), "success");
+        assert_eq!(RequestLogContext::result_label(StatusCode::TEMPORARY_REDIRECT), "redirect");
+        assert_eq!(RequestLogContext::result_label(StatusCode::BAD_REQUEST), "client_error");
+        assert_eq!(RequestLogContext::result_label(StatusCode::INTERNAL_SERVER_ERROR), "server_error");
+    }
+
+    #[test]
+    fn request_log_context_prefers_request_context_and_remote_addr_extensions() {
+        let mut request = Request::builder()
+            .method(Method::PUT)
+            .uri("/bucket/object.txt")
+            .body(())
+            .expect("request");
+        request.extensions_mut().insert(RequestContext {
+            request_id: "req-ctx".to_string(),
+            x_amz_request_id: "amz-ctx".to_string(),
+            trace_id: Some("trace-123".to_string()),
+            span_id: Some("span-456".to_string()),
+            start_time: Instant::now(),
+        });
+        request
+            .extensions_mut()
+            .insert(RemoteAddr("127.0.0.1:9000".parse().expect("socket addr")));
+
+        let context = RequestLogContext::from_request(&request);
+
+        assert_eq!(context.request_id, "req-ctx");
+        assert_eq!(context.trace_id.as_deref(), Some("trace-123"));
+        assert_eq!(context.span_id.as_deref(), Some("span-456"));
+        assert_eq!(context.peer_addr, "127.0.0.1:9000");
+        assert_eq!(context.method, "PUT");
+        assert_eq!(context.uri, "/bucket/object.txt");
+    }
+
+    #[test]
+    fn request_logging_layer_emits_single_completion_event_with_standard_fields() {
+        let writer = SharedWriter::default();
+        let captured = writer.buffer.clone();
+        let subscriber = Registry::default().with(
+            tracing_subscriber::fmt::layer()
+                .without_time()
+                .with_target(false)
+                .with_level(false)
+                .with_ansi(false)
+                .with_writer(writer),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut service = tower::ServiceBuilder::new()
+                .layer(RequestContextLayer)
+                .layer(RequestLoggingLayer)
+                .service(StatusService::new(StatusCode::OK));
+
+            let mut request: Request<Full<Bytes>> = Request::builder()
+                .method(Method::GET)
+                .uri("/bucket/object.txt")
+                .header("x-request-id", "req-123")
+                .body(Full::from(Bytes::new()))
+                .expect("request");
+            request
+                .extensions_mut()
+                .insert(RemoteAddr("127.0.0.1:9000".parse().expect("socket addr")));
+
+            let response = futures::executor::block_on(service.call(request)).expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+
+        let output = String::from_utf8(captured.lock().expect("captured logs").clone()).expect("utf8 logs");
+        assert_eq!(output.matches("HTTP request completed").count(), 1, "{output}");
+        assert!(output.contains("event"), "{output}");
+        assert!(output.contains("http_request_completed"), "{output}");
+        assert!(output.contains("component"), "{output}");
+        assert!(output.contains("server"), "{output}");
+        assert!(output.contains("subsystem"), "{output}");
+        assert!(output.contains("http"), "{output}");
+        assert!(output.contains("request_id"), "{output}");
+        assert!(output.contains("req-123"), "{output}");
+        assert!(output.contains("peer_addr"), "{output}");
+        assert!(output.contains("127.0.0.1:9000"), "{output}");
+        assert!(output.contains("method"), "{output}");
+        assert!(output.contains("GET"), "{output}");
+        assert!(output.contains("uri"), "{output}");
+        assert!(output.contains("/bucket/object.txt"), "{output}");
+        assert!(output.contains("status_code"), "{output}");
+        assert!(output.contains("200"), "{output}");
+        assert!(output.contains("result"), "{output}");
+        assert!(output.contains("success"), "{output}");
+        assert!(output.contains("duration_ms"), "{output}");
+    }
+
+    #[test]
+    fn request_logging_layer_uses_request_context_trace_fields() {
+        let writer = SharedWriter::default();
+        let captured = writer.buffer.clone();
+        let subscriber = Registry::default().with(
+            tracing_subscriber::fmt::layer()
+                .without_time()
+                .with_target(false)
+                .with_level(false)
+                .with_ansi(false)
+                .with_writer(writer),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut service = RequestLoggingLayer.layer(StatusService::new(StatusCode::INTERNAL_SERVER_ERROR));
+
+            let mut request = Request::builder()
+                .method(Method::GET)
+                .uri("/bucket/object.txt")
+                .body(())
+                .expect("request");
+            request.extensions_mut().insert(RequestContext {
+                request_id: "req-ctx".to_string(),
+                x_amz_request_id: "amz-ctx".to_string(),
+                trace_id: Some("trace-ctx".to_string()),
+                span_id: Some("span-ctx".to_string()),
+                start_time: Instant::now(),
+            });
+            request
+                .extensions_mut()
+                .insert(RemoteAddr("127.0.0.1:9000".parse().expect("socket addr")));
+
+            let response = futures::executor::block_on(service.call(request)).expect("response");
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        });
+
+        let output = String::from_utf8(captured.lock().expect("captured logs").clone()).expect("utf8 logs");
+        assert!(output.contains("http_request_completed"), "{output}");
+        assert!(output.contains("req-ctx"), "{output}");
+        assert!(output.contains("trace-ctx"), "{output}");
+        assert!(output.contains("span-ctx"), "{output}");
+        assert!(output.contains("500"), "{output}");
+        assert!(output.contains("server_error"), "{output}");
     }
 }

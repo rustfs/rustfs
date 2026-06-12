@@ -48,6 +48,9 @@ use rustfs_config::oidc::{
     OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_CONFIG_URL, OIDC_DISPLAY_NAME, OIDC_EMAIL_CLAIM, OIDC_GROUPS_CLAIM,
     OIDC_REDIRECT_URI, OIDC_REDIRECT_URI_DYNAMIC, OIDC_ROLE_POLICY, OIDC_SCOPES, OIDC_USERNAME_CLAIM,
 };
+use rustfs_config::server_config::{
+    Config as ServerConfig, DEFAULT_KVS, KV, KVS, get_global_server_config, set_global_server_config,
+};
 use rustfs_config::{
     COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, ENV_SCANNER_ALERT_EXCESS_FOLDERS,
     ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE, ENV_SCANNER_ALERT_EXCESS_VERSIONS, ENV_SCANNER_BITROT_CYCLE_SECS,
@@ -68,7 +71,6 @@ use rustfs_credentials::Credentials;
 use rustfs_ecstore::config::com::STORAGE_CLASS_SUB_SYS;
 use rustfs_ecstore::config::com::{delete_config, read_config, read_config_without_migrate, save_config, save_server_config};
 use rustfs_ecstore::config::storageclass::{INLINE_BLOCK_ENV, OPTIMIZE_ENV, RRS_ENV, STANDARD_ENV};
-use rustfs_ecstore::config::{Config as ServerConfig, DEFAULT_KVS, KV, KVS, get_global_server_config, set_global_server_config};
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::ListOperations;

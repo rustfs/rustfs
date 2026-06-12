@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::{KV, KVS};
+use rustfs_config::server_config::{KV, KVS};
 use rustfs_config::{
     ENABLE_KEY, EnableState,
     oidc::{

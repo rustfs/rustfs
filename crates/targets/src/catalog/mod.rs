@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod builtin;
+pub mod extension;
 
 use crate::control_plane::external_target_plugin_installation;
 use crate::domain::TargetDomain;
@@ -21,7 +22,7 @@ use crate::manifest::{
     TargetPluginExternalRuntimeContract, TargetPluginManifest, TargetPluginMarketplaceManifest, TargetPluginRuntimeTransport,
     installable_target_marketplace_manifest,
 };
-use crate::runtime::sidecar::SidecarPluginRuntime;
+use crate::runtime::sidecar::{SidecarPluginRuntime, SidecarRuntimePolicy, SidecarRuntimeSafetyChecks};
 use crate::runtime::sidecar_protocol::{SIDECAR_RUNTIME_PROTOCOL_VERSION, SidecarHandshake, SidecarPluginCapability};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +56,8 @@ pub fn example_external_webhook_plugin() -> ExampleInstallableTargetPlugin {
                 target_triple: "x86_64-unknown-linux-gnu",
                 download_uri: "https://plugins.example.test/webhook-sidecar.tar.zst",
                 digest_sha256: "0123456789abcdef0123456789abcdef",
+                signature_uri: "https://plugins.example.test/webhook-sidecar.tar.zst.sig",
+                provenance_uri: "https://plugins.example.test/webhook-sidecar.tar.zst.intoto.jsonl",
                 size_bytes: 8192,
             }],
         },
@@ -73,8 +76,13 @@ pub fn example_external_webhook_plugin() -> ExampleInstallableTargetPlugin {
     };
     let mut runtime = SidecarPluginRuntime::new("grpc://127.0.0.1:50051", handshake);
     runtime
-        .enable(base.plugin_id, TargetDomain::Notify)
-        .expect("example sidecar plugin handshake should validate");
+        .enable_with_policy(
+            base.plugin_id,
+            TargetDomain::Notify,
+            &SidecarRuntimePolicy::verified_external(16, std::time::Duration::from_secs(5), 3),
+            &SidecarRuntimeSafetyChecks::verified(0),
+        )
+        .expect("example sidecar plugin policy should validate");
 
     ExampleInstallableTargetPlugin {
         manifest,

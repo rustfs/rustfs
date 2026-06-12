@@ -40,7 +40,7 @@ use crate::notification_sys::get_global_notification_sys;
 use crate::set_disk::SetDisks;
 use crate::store_api::{
     BucketOperations, BucketOptions, GetObjectReader, HealOperations, MakeBucketOptions, ObjectIO, ObjectOperations,
-    ObjectOptions, StorageAPI,
+    ObjectOptions,
 };
 use crate::{global::GLOBAL_LifecycleSys, sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
@@ -53,6 +53,7 @@ use rustfs_common::defer;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_concurrency::workers::Workers;
 use rustfs_filemeta::{FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
+use rustfs_storage_api::StorageAdminApi;
 use rustfs_utils::path::{encode_dir_object, path_join, path_to_bucket_object, path_to_bucket_object_with_base_path};
 use s3s::dto::{BucketLifecycleConfiguration, DefaultRetention, ReplicationConfiguration};
 use serde::{Deserialize, Serialize};
@@ -1233,8 +1234,8 @@ impl ECStore {
 
     async fn get_decommission_pool_space_info(&self, idx: usize) -> Result<PoolSpaceInfo> {
         if let Some(sets) = self.pools.get(idx) {
-            let mut info = sets.storage_info().await;
-            info.backend = self.backend_info().await;
+            let mut info = sets.storage_info_snapshot().await;
+            info.backend = StorageAdminApi::backend_info(self).await;
 
             let total = get_total_usable_capacity(&info.disks, &info);
             let free = get_total_usable_capacity_free(&info.disks, &info);

@@ -16,7 +16,7 @@ use crate::{
     BucketNotificationConfig, Event, EventArgs, LifecycleError, NotificationError, NotificationMetricSnapshot,
     NotificationSystem, NotificationTargetMetricSnapshot,
 };
-use rustfs_ecstore::config::Config;
+use rustfs_config::server_config::Config;
 use rustfs_s3_types::EventName;
 use rustfs_targets::arn::TargetID;
 use std::sync::{Arc, OnceLock};

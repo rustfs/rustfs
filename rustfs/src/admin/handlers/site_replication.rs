@@ -30,6 +30,7 @@ use http::header::{CONTENT_TYPE, HOST};
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
+use rustfs_config::server_config::get_global_server_config;
 use rustfs_config::{
     DEFAULT_CONSOLE_ADDRESS, DEFAULT_DELIMITER, DEFAULT_RUSTFS_TLS_PATH, ENV_RUSTFS_CONSOLE_ADDRESS, ENV_RUSTFS_TLS_PATH,
     MAX_ADMIN_REQUEST_BODY_SIZE,
@@ -46,11 +47,10 @@ use rustfs_ecstore::bucket::target::{ARN, BucketTarget, BucketTargetType, Bucket
 use rustfs_ecstore::bucket::utils::{deserialize, serialize};
 use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::config::com::{delete_config, read_config, save_config};
-use rustfs_ecstore::config::get_global_server_config;
 use rustfs_ecstore::error::Error as StorageError;
 use rustfs_ecstore::global::{get_global_deployment_id, get_global_endpoints_opt, get_global_region, global_rustfs_port};
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};
+use rustfs_ecstore::store_api::BucketOperations;
 use rustfs_iam::error::is_err_no_such_service_account;
 use rustfs_iam::store::{MappedPolicy, UserType};
 use rustfs_iam::sys::{NewServiceAccountOpts, UpdateServiceAccountOpts, get_claims_from_token_with_secret};
@@ -69,6 +69,7 @@ use rustfs_policy::policy::{
 };
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
+use rustfs_storage_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};
 use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, load_global_outbound_tls_generation, load_global_outbound_tls_state};
 use rustfs_utils::http::get_source_scheme;
 use rustls_pki_types::pem::PemObject;
@@ -691,7 +692,7 @@ fn config_enabled(value: Option<String>) -> bool {
     matches!(value.as_deref(), Some("on" | "true" | "enabled"))
 }
 
-fn ldap_settings_from_kvs(kvs: &rustfs_ecstore::config::KVS) -> (LDAPSettings, LDAPConfigSettings) {
+fn ldap_settings_from_kvs(kvs: &rustfs_config::server_config::KVS) -> (LDAPSettings, LDAPConfigSettings) {
     let enabled = config_enabled(kvs.lookup("enable"));
     let settings = LDAPSettings {
         is_ldap_enabled: enabled,
@@ -4508,28 +4509,28 @@ mod tests {
 
     #[test]
     fn test_ldap_settings_from_kvs_reads_minio_style_keys() {
-        let kvs = rustfs_ecstore::config::KVS(vec![
-            rustfs_ecstore::config::KV {
+        let kvs = rustfs_config::server_config::KVS(vec![
+            rustfs_config::server_config::KV {
                 key: "enable".to_string(),
                 value: "on".to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: "user_dn_search_base_dn".to_string(),
                 value: "ou=people,dc=example,dc=com".to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: "user_dn_search_filter".to_string(),
                 value: "(uid=%s)".to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: "group_search_base_dn".to_string(),
                 value: "ou=groups,dc=example,dc=com".to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: "group_search_filter".to_string(),
                 value: "(&(objectclass=groupOfNames)(member=%s))".to_string(),
                 hidden_if_empty: false,

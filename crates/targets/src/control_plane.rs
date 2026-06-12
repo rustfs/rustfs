@@ -169,6 +169,7 @@ pub struct TargetPluginInstallPolicy {
     pub allowed_download_hosts: Vec<String>,
     pub require_https: bool,
     pub require_signature: bool,
+    pub require_provenance: bool,
 }
 
 impl Default for TargetPluginInstallPolicy {
@@ -177,7 +178,8 @@ impl Default for TargetPluginInstallPolicy {
             allowed_providers: vec!["rustfs".to_string(), "rustfs-labs".to_string()],
             allowed_download_hosts: vec!["plugins.example.test".to_string()],
             require_https: true,
-            require_signature: false,
+            require_signature: true,
+            require_provenance: true,
         }
     }
 }
@@ -199,12 +201,6 @@ pub fn validate_external_plugin_installation(
             "sidecar runtime protocol mismatch: expected {}, got {}",
             SIDECAR_RUNTIME_PROTOCOL_VERSION, runtime_contract.protocol_version
         ));
-    }
-
-    if policy.require_signature {
-        return Err(
-            "signature verification is required by install policy but manifests do not expose signatures yet".to_string(),
-        );
     }
 
     let distribution = distribution.ok_or_else(|| "external plugin is missing distribution metadata".to_string())?;
@@ -236,6 +232,33 @@ pub fn validate_external_plugin_installation(
                 artifact.artifact_id, artifact.digest_sha256
             ));
         }
+        if policy.require_signature && artifact.signature_uri.is_empty() {
+            return Err(format!("artifact {} must declare a signature uri", artifact.artifact_id));
+        }
+        if policy.require_provenance && artifact.provenance_uri.is_empty() {
+            return Err(format!("artifact {} must declare a provenance uri", artifact.artifact_id));
+        }
+        validate_artifact_uri("signature", artifact.artifact_id, artifact.signature_uri, policy)?;
+        validate_artifact_uri("provenance", artifact.artifact_id, artifact.provenance_uri, policy)?;
+    }
+
+    Ok(())
+}
+
+fn validate_artifact_uri(label: &str, artifact_id: &str, uri: &str, policy: &TargetPluginInstallPolicy) -> Result<(), String> {
+    if uri.is_empty() {
+        return Ok(());
+    }
+
+    let parsed_uri = Url::parse(uri).map_err(|err| format!("invalid artifact {label} uri {uri}: {err}"))?;
+    if policy.require_https && parsed_uri.scheme() != "https" {
+        return Err(format!("artifact {artifact_id} must use https {label} uri, got {uri}"));
+    }
+    let host = parsed_uri
+        .host_str()
+        .ok_or_else(|| format!("artifact {artifact_id} {label} uri has no host"))?;
+    if !policy.allowed_download_hosts.iter().any(|allowed| allowed == host) {
+        return Err(format!("artifact {artifact_id} {label} host {host} is not allowed"));
     }
 
     Ok(())
@@ -370,6 +393,8 @@ mod tests {
                 target_triple: "x86_64-unknown-linux-gnu",
                 download_uri: "https://plugins.example.test/webhook-sidecar.tar.zst",
                 digest_sha256: "0123456789abcdef0123456789abcdef",
+                signature_uri: "https://plugins.example.test/webhook-sidecar.tar.zst.sig",
+                provenance_uri: "https://plugins.example.test/webhook-sidecar.tar.zst.intoto.jsonl",
                 size_bytes: 8192,
             }],
         };
@@ -413,6 +438,8 @@ mod tests {
                     target_triple: "x86_64-unknown-linux-gnu",
                     download_uri: "https://plugins.example.test/webhook-sidecar.tar.zst",
                     digest_sha256: "0123456789abcdef0123456789abcdef",
+                    signature_uri: "https://plugins.example.test/webhook-sidecar.tar.zst.sig",
+                    provenance_uri: "https://plugins.example.test/webhook-sidecar.tar.zst.intoto.jsonl",
                     size_bytes: 8192,
                 }],
             }),
@@ -420,5 +447,83 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_external_installation_rejects_missing_artifact_signature() {
+        let manifest = TargetPluginManifest {
+            plugin_id: "external:webhook-sidecar",
+            display_name: "Webhook Sidecar",
+            provider: "rustfs-labs",
+            version: "1.0.0",
+            target_type: "webhook",
+            supported_domains: &[],
+            secret_fields: &[],
+        };
+        let policy = TargetPluginInstallPolicy::default();
+
+        let result = validate_external_plugin_installation(
+            &manifest,
+            &TargetPluginExternalRuntimeContract {
+                protocol_version: crate::SIDECAR_RUNTIME_PROTOCOL_VERSION,
+                transport: TargetPluginRuntimeTransport::Grpc,
+            },
+            Some(TargetPluginDistributionManifest {
+                artifacts: &[TargetPluginArtifactManifest {
+                    artifact_id: "sidecar-linux-amd64",
+                    target_triple: "x86_64-unknown-linux-gnu",
+                    download_uri: "https://plugins.example.test/webhook-sidecar.tar.zst",
+                    digest_sha256: "0123456789abcdef0123456789abcdef",
+                    signature_uri: "",
+                    provenance_uri: "https://plugins.example.test/webhook-sidecar.intoto.jsonl",
+                    size_bytes: 8192,
+                }],
+            }),
+            &policy,
+        );
+
+        assert_eq!(
+            result.as_ref().map_err(String::as_str),
+            Err("artifact sidecar-linux-amd64 must declare a signature uri")
+        );
+    }
+
+    #[test]
+    fn validate_external_installation_rejects_missing_artifact_provenance() {
+        let manifest = TargetPluginManifest {
+            plugin_id: "external:webhook-sidecar",
+            display_name: "Webhook Sidecar",
+            provider: "rustfs-labs",
+            version: "1.0.0",
+            target_type: "webhook",
+            supported_domains: &[],
+            secret_fields: &[],
+        };
+        let policy = TargetPluginInstallPolicy::default();
+
+        let result = validate_external_plugin_installation(
+            &manifest,
+            &TargetPluginExternalRuntimeContract {
+                protocol_version: crate::SIDECAR_RUNTIME_PROTOCOL_VERSION,
+                transport: TargetPluginRuntimeTransport::Grpc,
+            },
+            Some(TargetPluginDistributionManifest {
+                artifacts: &[TargetPluginArtifactManifest {
+                    artifact_id: "sidecar-linux-amd64",
+                    target_triple: "x86_64-unknown-linux-gnu",
+                    download_uri: "https://plugins.example.test/webhook-sidecar.tar.zst",
+                    digest_sha256: "0123456789abcdef0123456789abcdef",
+                    signature_uri: "https://plugins.example.test/webhook-sidecar.sig",
+                    provenance_uri: "",
+                    size_bytes: 8192,
+                }],
+            }),
+            &policy,
+        );
+
+        assert_eq!(
+            result.as_ref().map_err(String::as_str),
+            Err("artifact sidecar-linux-amd64 must declare a provenance uri")
+        );
     }
 }

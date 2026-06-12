@@ -39,8 +39,8 @@ use matchit::Params;
 use rustfs_audit::audit_system;
 use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
 use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
+use rustfs_config::server_config::{Config, KVS};
 use rustfs_config::{AUDIT_DEFAULT_DIR, EVENT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY_SIZE};
-use rustfs_ecstore::config::{Config, KVS};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::catalog::builtin::{builtin_audit_target_admin_descriptors, builtin_notify_target_admin_descriptors};
 use rustfs_targets::manifest::builtin_target_manifest;
@@ -273,18 +273,20 @@ struct ResolvedPluginInstanceTarget {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct KeyValue {
     key: String,
     value: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PluginInstanceBody {
     key_values: Vec<KeyValue>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct PluginInstanceFilters {
+pub(super) struct PluginInstanceFilters {
     domain: Option<PluginContractDomain>,
     service: Option<String>,
     status: Option<String>,
@@ -296,7 +298,7 @@ struct PluginInstanceFilters {
     marker: Option<String>,
 }
 
-fn extract_plugin_instance_filters(req: &S3Request<Body>) -> S3Result<PluginInstanceFilters> {
+pub(super) fn extract_plugin_instance_filters(req: &S3Request<Body>) -> S3Result<PluginInstanceFilters> {
     let mut filters = PluginInstanceFilters::default();
 
     if let Some(query) = req.uri.query() {
@@ -418,12 +420,15 @@ fn resolve_plugin_instance_target(instance_id: &str) -> S3Result<ResolvedPluginI
     })
 }
 
-fn filter_plugin_instances(mut instances: Vec<PluginInstanceEntry>, filters: &PluginInstanceFilters) -> Vec<PluginInstanceEntry> {
+pub(super) fn filter_plugin_instances(
+    mut instances: Vec<PluginInstanceEntry>,
+    filters: &PluginInstanceFilters,
+) -> Vec<PluginInstanceEntry> {
     instances.retain(|instance| plugin_instance_matches_filters(instance, filters));
     instances
 }
 
-fn paginate_plugin_instances(
+pub(super) fn paginate_plugin_instances(
     instances: Vec<PluginInstanceEntry>,
     filters: &PluginInstanceFilters,
 ) -> S3Result<(Vec<PluginInstanceEntry>, bool, Option<String>)> {
@@ -451,7 +456,7 @@ fn paginate_plugin_instances(
     Ok((page, truncated, next_marker))
 }
 
-fn collect_diagnostic_counts(instances: &[PluginInstanceEntry]) -> Vec<PluginInstanceDiagnosticCount> {
+pub(super) fn collect_diagnostic_counts(instances: &[PluginInstanceEntry]) -> Vec<PluginInstanceDiagnosticCount> {
     let mut counts = BTreeMap::<PluginInstanceDiagnosticCode, usize>::new();
     for instance in instances {
         for code in &instance.diagnostic_codes {
@@ -626,7 +631,7 @@ async fn collect_domain_instances(context: PluginInstanceDomainContext) -> S3Res
     Ok(entries)
 }
 
-async fn collect_all_instances() -> S3Result<Vec<PluginInstanceEntry>> {
+pub(super) async fn collect_all_instances() -> S3Result<Vec<PluginInstanceEntry>> {
     let (mut notify_instances, audit_instances) = tokio::try_join!(
         collect_domain_instances(plugin_instance_domain_context(PluginContractDomain::Notify)),
         collect_domain_instances(plugin_instance_domain_context(PluginContractDomain::Audit))
@@ -852,7 +857,7 @@ impl Operation for DeletePluginInstanceHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        PluginContractDomain, PluginInstanceFilters, collect_diagnostic_counts, collect_instance_diagnostics,
+        PluginContractDomain, PluginInstanceBody, PluginInstanceFilters, collect_diagnostic_counts, collect_instance_diagnostics,
         extract_plugin_instance_filters, filter_plugin_instances, map_instance, paginate_plugin_instances, parse_bool_filter,
         parse_instance_status, parse_limit_filter, parse_plugin_contract_domain, parse_plugin_instance_diagnostic_code,
         parse_plugin_instance_id, parse_plugin_instance_source, resolve_plugin_instance_target,
@@ -868,8 +873,8 @@ mod tests {
     use rustfs_config::audit::AUDIT_WEBHOOK_SUB_SYS;
     use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
     use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
+    use rustfs_config::server_config::{Config, KV, KVS};
     use rustfs_config::{ENABLE_KEY, WEBHOOK_AUTH_TOKEN, WEBHOOK_ENDPOINT};
-    use rustfs_ecstore::config::{Config, KV, KVS};
     use rustfs_targets::TargetDomain;
     use s3s::{Body, S3Request};
     use std::collections::HashMap;
@@ -1066,6 +1071,19 @@ mod tests {
             mapped.config.get(WEBHOOK_AUTH_TOKEN).map(String::as_str),
             Some(super::REDACTED_SECRET_VALUE)
         );
+    }
+
+    #[test]
+    fn plugin_instance_body_rejects_unknown_fields() {
+        let err = serde_json::from_str::<PluginInstanceBody>(r#"{"key_values":[],"unexpected_field":true}"#)
+            .expect_err("unknown plugin instance body field should fail");
+        assert!(err.to_string().contains("unknown field"));
+
+        let err = serde_json::from_str::<PluginInstanceBody>(
+            r#"{"key_values":[{"key":"endpoint","value":"http://example.com","extra":true}]}"#,
+        )
+        .expect_err("unknown plugin instance key-value field should fail");
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]

@@ -22,15 +22,23 @@ The exported path should be:
 rustfs_config::server_config::{Config, KV, KVS}
 ```
 
-The existing path must remain available through a temporary compatibility
-re-export:
+The extraction kept the existing path available through a temporary
+compatibility re-export:
 
 ```rust
 rustfs_ecstore::config::{Config, KV, KVS}
 ```
 
-That re-export must include `RUSTFS_COMPAT_TODO(CFG-004)` and a matching entry in
-[`compat-cleanup-register.md`](compat-cleanup-register.md).
+That re-export included `RUSTFS_COMPAT_TODO(CFG-004)` and a matching entry in
+[`compat-cleanup-register.md`](compat-cleanup-register.md) until the model
+consumers were migrated. The CFG-004 cleanup removed this old model path after
+code scans showed consumers import the model directly from `rustfs-config`.
+
+Follow-up `CFG-008` moved the process-global server-config snapshot accessors
+to `rustfs_config::server_config` after the model path stabilized. Its temporary
+`rustfs_ecstore::config::{get_global_server_config, set_global_server_config}`
+compatibility re-export was removed after in-repo runtime consumers migrated to
+the `rustfs-config` owner.
 
 ## Why `rustfs-config`
 
@@ -49,7 +57,8 @@ removing any storage or runtime dependency by itself.
 The server-config model module may use only:
 
 - `std::collections::HashMap`
-- `std::sync::{LazyLock, OnceLock}` for the default `KVS` registration surface
+- `std::sync::{LazyLock, OnceLock, RwLock}` for the default `KVS` registration
+  surface and process-global server-config snapshot
 - `serde` for `KV` and `KVS` serialization compatibility
 - `serde_json` for `Config::marshal` and `Config::unmarshal`
 - existing `rustfs-config` constants and subsystem modules
@@ -69,7 +78,8 @@ The model module must not depend on:
 - notify, audit, targets, IAM, scanner, KMS, or admin handler crates
 - async runtimes, HTTP/router crates, object-store crates, or runtime lifecycle
   state
-- global server-config snapshot state such as `GLOBAL_SERVER_CONFIG`
+- unrelated runtime global state outside the process-global server-config
+  snapshot
 - `ConfigSys`, `read_config_without_migrate`, `save_server_config`, or any
   `com.rs` persistence helper
 
@@ -92,9 +102,6 @@ Move in the first extraction:
 Keep in `ecstore`:
 
 - `ConfigSys`
-- `GLOBAL_SERVER_CONFIG`
-- `get_global_server_config`
-- `set_global_server_config`
 - `init_global_config_sys`
 - `try_migrate_server_config`
 - `read_config_without_migrate`
@@ -106,6 +113,16 @@ Keep default registration wiring in `ecstore::config::init` until a later PR
 extracts a dedicated default-registration contract. The values may be registered
 through the moved `rustfs_config::server_config::register_default_kvs`, but the
 startup order and caller remain unchanged.
+
+Move in `CFG-008`:
+
+- `GLOBAL_SERVER_CONFIG`
+- `get_global_server_config`
+- `set_global_server_config`
+
+The temporary ECStore compatibility re-export for these accessors was removed
+after code scans showed in-repo consumers use `rustfs_config::server_config`
+directly.
 
 ## Required Shape Preservation
 
@@ -129,11 +146,17 @@ The extraction PR must preserve:
 must not migrate consumers, change persistence helpers, or alter runtime
 behavior.
 
-`CFG-004` should keep the old `rustfs_ecstore::config::*` path as a temporary
-compatibility shim and register its removal condition.
+`CFG-004` kept the old `rustfs_ecstore::config::*` path as a temporary
+compatibility shim, registered its removal condition, and removed the shim after
+all in-repo consumers migrated.
 
 `CFG-005` should migrate external consumers one group at a time after the model
 and compatibility path are stable.
+
+`CFG-008` moves only the global server-config snapshot accessors to
+`rustfs-config` and migrates in-repo direct consumers. It must not move
+`ConfigSys`, storage-class global state, persistence helpers, default
+registration wiring, startup order, or storage behavior.
 
 ## Verification Gate
 
@@ -143,8 +166,9 @@ Before pushing an extraction PR, run:
 - tests for `hiddenIfEmpty` alias compatibility
 - tests for `KVS` insertion, lookup, extension, and keys behavior
 - tests for `Config::new`, `set_defaults`, `marshal`, `unmarshal`, and `merge`
-- a compile smoke test that the old `rustfs_ecstore::config::{Config, KV, KVS}`
-  path still works
+- a cleanup scan proving in-repo consumers no longer use the old
+  `rustfs_ecstore::config::{Config, KV, KVS}` model path before removing the
+  compatibility shim
 - `cargo tree -p rustfs-config --edges normal`
 - `cargo tree -p rustfs-ecstore --edges normal`
 - `./scripts/check_layer_dependencies.sh`

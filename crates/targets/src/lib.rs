@@ -27,6 +27,10 @@ pub mod store;
 pub mod sys;
 pub mod target;
 
+pub use catalog::extension::{
+    TARGET_AUDIT_CAPABILITY, TARGET_NOTIFY_CAPABILITY, builtin_target_extension_schemas, target_marketplace_extension_schema,
+    target_runtime_boundary,
+};
 pub use check::{
     check_amqp_broker_available, check_kafka_broker_available, check_mqtt_broker_available, check_mqtt_broker_available_with_tls,
     check_mysql_server_available, check_nats_server_available, check_postgres_server_available, check_pulsar_broker_available,
@@ -59,7 +63,7 @@ pub use runtime::{
     RuntimeTargetHealthState, RuntimeTargetSnapshot, SharedTarget, TargetRuntimeManager, activate_targets_with_replay,
     adapter::{BuiltinPluginRuntimeAdapter, PluginRuntimeAdapter},
     init_target_and_optionally_start_replay,
-    sidecar::SidecarPluginRuntime,
+    sidecar::{SidecarPluginRuntime, SidecarRuntimePolicy, SidecarRuntimeSafetyChecks},
     sidecar_protocol::{SIDECAR_RUNTIME_PROTOCOL_VERSION, SidecarHandshake, SidecarPluginCapability},
     start_replay_worker,
 };

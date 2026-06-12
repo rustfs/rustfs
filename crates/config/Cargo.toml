@@ -26,6 +26,8 @@ categories = ["web-programming", "development-tools", "config"]
 
 [dependencies]
 const-str = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 [lints]
 workspace = true
@@ -37,6 +39,7 @@ constants = ["dep:const-str"]
 notify = ["dep:const-str", "constants"]
 observability = ["constants"]
 opa = ["constants"]
+server-config-model = ["constants", "dep:serde", "dep:serde_json"]
 
 [lib]
 doctest = false

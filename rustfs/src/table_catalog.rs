@@ -38,7 +38,7 @@ use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::{
     set_disk::get_lock_acquire_timeout,
-    store_api::{HTTPPreconditions, ObjectOptions, PutObjReader, StorageAPI},
+    store_api::{HTTPPreconditions, NamespaceLocking, ObjectOptions, PutObjReader, StorageAPI},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use time::{Duration, OffsetDateTime};
@@ -400,6 +400,10 @@ pub(crate) enum TableCatalogPutPrecondition {
 pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
     async fn read_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>>;
 
+    async fn read_object_unlocked(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
+        self.read_object(bucket, object).await
+    }
+
     async fn object_exists(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<bool>;
 
     async fn put_object(
@@ -409,6 +413,16 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
         data: Vec<u8>,
         precondition: TableCatalogPutPrecondition,
     ) -> TableCatalogStoreResult<()>;
+
+    async fn put_object_unlocked(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: Vec<u8>,
+        precondition: TableCatalogPutPrecondition,
+    ) -> TableCatalogStoreResult<()> {
+        self.put_object(bucket, object, data, precondition).await
+    }
 
     async fn delete_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<()>;
 
@@ -548,7 +562,39 @@ where
     where
         T: DeserializeOwned,
     {
-        let Some(object_data) = self.backend.read_object(bucket, object).await? else {
+        self.read_entry_with(bucket, object, |backend, bucket, object| {
+            Box::pin(async move { backend.read_object(bucket, object).await })
+        })
+        .await
+    }
+
+    async fn read_entry_unlocked<T>(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<(T, Option<String>)>>
+    where
+        T: DeserializeOwned,
+    {
+        self.read_entry_with(bucket, object, |backend, bucket, object| {
+            Box::pin(async move { backend.read_object_unlocked(bucket, object).await })
+        })
+        .await
+    }
+
+    async fn read_entry_with<'a, T, F>(
+        &'a self,
+        bucket: &'a str,
+        object: &'a str,
+        read_object: F,
+    ) -> TableCatalogStoreResult<Option<(T, Option<String>)>>
+    where
+        T: DeserializeOwned,
+        F: FnOnce(
+            &'a B,
+            &'a str,
+            &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = TableCatalogStoreResult<Option<TableCatalogObject>>> + Send + 'a>,
+        >,
+    {
+        let Some(object_data) = read_object(&self.backend, bucket, object).await? else {
             return Ok(None);
         };
 
@@ -572,6 +618,21 @@ where
         self.backend.put_object(bucket, object, data, precondition).await
     }
 
+    async fn write_entry_unlocked<T>(
+        &self,
+        bucket: &str,
+        object: &str,
+        entry: &T,
+        precondition: TableCatalogPutPrecondition,
+    ) -> TableCatalogStoreResult<()>
+    where
+        T: Serialize,
+    {
+        let data = serde_json::to_vec(entry)
+            .map_err(|err| TableCatalogStoreError::Internal(format!("failed to serialize catalog entry {object}: {err}")))?;
+        self.backend.put_object_unlocked(bucket, object, data, precondition).await
+    }
+
     async fn require_table_bucket(&self, table_bucket: &str) -> TableCatalogStoreResult<()> {
         if self.get_table_bucket(table_bucket).await?.is_none() {
             return Err(TableCatalogStoreError::NotFound(format!("table bucket {table_bucket}")));
@@ -587,6 +648,25 @@ where
     ) -> TableCatalogStoreResult<Option<(TableEntry, String)>> {
         let table_path = self.paths.table_entry_path(table_bucket, namespace, table);
         let Some((entry, etag)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &table_path).await? else {
+            return Ok(None);
+        };
+        let Some(etag) = etag else {
+            return Err(TableCatalogStoreError::Internal(format!("catalog table entry has no etag: {table_path}")));
+        };
+        Ok(Some((entry, etag)))
+    }
+
+    async fn read_table_with_etag_unlocked(
+        &self,
+        table_bucket: &str,
+        namespace: &Namespace,
+        table: &IdentifierSegment,
+    ) -> TableCatalogStoreResult<Option<(TableEntry, String)>> {
+        let table_path = self.paths.table_entry_path(table_bucket, namespace, table);
+        let Some((entry, etag)) = self
+            .read_entry_unlocked::<TableEntry>(self.catalog_bucket(), &table_path)
+            .await?
+        else {
             return Ok(None);
         };
         let Some(etag) = etag else {
@@ -967,7 +1047,7 @@ where
 
         let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
         let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
-        let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
+        let Some((entry, _)) = self.read_table_with_etag_unlocked(table_bucket, &namespace, &table).await? else {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "table {}/{}/{}",
                 table_bucket,
@@ -1163,7 +1243,10 @@ where
         let table_path = self.paths.table_entry_path(&request.table_bucket, &namespace, &table);
         let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
 
-        let Some((current, current_etag)) = self.read_table_with_etag(&request.table_bucket, &namespace, &table).await? else {
+        let Some((current, current_etag)) = self
+            .read_table_with_etag_unlocked(&request.table_bucket, &namespace, &table)
+            .await?
+        else {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "table {}/{}/{}",
                 request.table_bucket, request.namespace, request.table
@@ -1289,7 +1372,7 @@ where
             .await?;
         }
 
-        self.write_entry(
+        self.write_entry_unlocked(
             self.catalog_bucket(),
             &table_path,
             &next,
@@ -1364,7 +1447,7 @@ impl<S> Clone for EcStoreTableCatalogObjectBackend<S> {
 
 impl<S> EcStoreTableCatalogObjectBackend<S>
 where
-    S: StorageAPI,
+    S: StorageAPI + NamespaceLocking,
 {
     pub fn new(store: Arc<S>) -> Self {
         Self { store }
@@ -1376,34 +1459,22 @@ pub(crate) type EcStoreTableCatalogStore<S> = ObjectTableCatalogStore<EcStoreTab
 #[async_trait::async_trait]
 impl<S> TableCatalogObjectBackend for EcStoreTableCatalogObjectBackend<S>
 where
-    S: StorageAPI,
+    S: StorageAPI + NamespaceLocking,
 {
     async fn read_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
-        let info = match self.store.get_object_info(bucket, object, &ObjectOptions::default()).await {
-            Ok(info) => info,
-            Err(err) if is_missing_storage_error(&err) => return Ok(None),
-            Err(err) => return Err(storage_error_to_catalog("read catalog object info", err)),
-        };
-        let mut reader = match self
-            .store
-            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
-            .await
-        {
-            Ok(reader) => reader,
-            Err(err) if is_missing_storage_error(&err) => return Ok(None),
-            Err(err) => return Err(storage_error_to_catalog("read catalog object", err)),
-        };
-        let mut data = Vec::new();
-        reader
-            .stream
-            .read_to_end(&mut data)
-            .await
-            .map_err(|err| TableCatalogStoreError::Internal(format!("failed to read catalog object {bucket}/{object}: {err}")))?;
-        Ok(Some(TableCatalogObject {
-            data,
-            etag: info.etag,
-            mod_time: info.mod_time,
-        }))
+        self.read_object_with_options(bucket, object, ObjectOptions::default()).await
+    }
+
+    async fn read_object_unlocked(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
+        self.read_object_with_options(
+            bucket,
+            object,
+            ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
     }
 
     async fn object_exists(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<bool> {
@@ -1421,16 +1492,17 @@ where
         data: Vec<u8>,
         precondition: TableCatalogPutPrecondition,
     ) -> TableCatalogStoreResult<()> {
-        let mut reader = PutObjReader::from_vec(data);
-        let opts = ObjectOptions {
-            http_preconditions: http_preconditions_for_catalog_put(precondition),
-            ..Default::default()
-        };
-        self.store
-            .put_object(bucket, object, &mut reader, &opts)
-            .await
-            .map(|_| ())
-            .map_err(|err| storage_error_to_catalog("write catalog object", err))
+        self.put_object_with_options(bucket, object, data, precondition, false).await
+    }
+
+    async fn put_object_unlocked(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: Vec<u8>,
+        precondition: TableCatalogPutPrecondition,
+    ) -> TableCatalogStoreResult<()> {
+        self.put_object_with_options(bucket, object, data, precondition, true).await
     }
 
     async fn delete_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<()> {
@@ -1481,6 +1553,65 @@ where
             .await
             .map_err(|err| TableCatalogStoreError::Internal(format!("failed to acquire catalog table lock: {err}")))?;
         Ok(Box::new(guard))
+    }
+}
+
+impl<S> EcStoreTableCatalogObjectBackend<S>
+where
+    S: StorageAPI + NamespaceLocking,
+{
+    async fn read_object_with_options(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: ObjectOptions,
+    ) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
+        let info = match self.store.get_object_info(bucket, object, &opts).await {
+            Ok(info) => info,
+            Err(err) if is_missing_storage_error(&err) => return Ok(None),
+            Err(err) => return Err(storage_error_to_catalog("read catalog object info", err)),
+        };
+        let mut reader = match self
+            .store
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+        {
+            Ok(reader) => reader,
+            Err(err) if is_missing_storage_error(&err) => return Ok(None),
+            Err(err) => return Err(storage_error_to_catalog("read catalog object", err)),
+        };
+        let mut data = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut data)
+            .await
+            .map_err(|err| TableCatalogStoreError::Internal(format!("failed to read catalog object {bucket}/{object}: {err}")))?;
+        Ok(Some(TableCatalogObject {
+            data,
+            etag: info.etag,
+            mod_time: info.mod_time,
+        }))
+    }
+
+    async fn put_object_with_options(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: Vec<u8>,
+        precondition: TableCatalogPutPrecondition,
+        no_lock: bool,
+    ) -> TableCatalogStoreResult<()> {
+        let mut reader = PutObjReader::from_vec(data);
+        let opts = ObjectOptions {
+            http_preconditions: http_preconditions_for_catalog_put(precondition),
+            no_lock,
+            ..Default::default()
+        };
+        self.store
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .map(|_| ())
+            .map_err(|err| storage_error_to_catalog("write catalog object", err))
     }
 }
 

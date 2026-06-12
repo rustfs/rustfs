@@ -26,9 +26,10 @@ use rustfs_config::oidc::{
     OIDC_DEFAULT_USERNAME_CLAIM, OIDC_DISPLAY_NAME, OIDC_EMAIL_CLAIM, OIDC_GROUPS_CLAIM, OIDC_HIDE_FROM_UI, OIDC_OTHER_AUDIENCES,
     OIDC_REDIRECT_URI, OIDC_REDIRECT_URI_DYNAMIC, OIDC_ROLE_POLICY, OIDC_ROLES_CLAIM, OIDC_SCOPES, OIDC_USERNAME_CLAIM,
 };
+use rustfs_config::server_config::Config as ServerConfig;
+use rustfs_config::server_config::get_global_server_config;
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::com::{read_config_without_migrate, save_server_config};
-use rustfs_ecstore::config::{Config as ServerConfig, get_global_server_config};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
@@ -163,7 +164,7 @@ struct OidcValidationResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct OidcConfigUpsertRequest {
     enabled: bool,
     display_name: String,
@@ -209,7 +210,7 @@ impl Default for OidcConfigUpsertRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct OidcConfigValidateRequest {
     provider_id: String,
     enabled: bool,
@@ -791,13 +792,13 @@ fn oidc_restart_required_from_active_config(config: &ServerConfig, active_config
         != rustfs_iam::oidc::load_effective_oidc_provider_configs(active_config)
 }
 
-fn default_oidc_kvs() -> s3s::S3Result<rustfs_ecstore::config::KVS> {
+fn default_oidc_kvs() -> s3s::S3Result<rustfs_config::server_config::KVS> {
     ServerConfig::new()
         .get_value(IDENTITY_OPENID_SUB_SYS, DEFAULT_DELIMITER)
         .ok_or_else(|| s3_error!(InternalError, "default OIDC configuration missing"))
 }
 
-fn set_kvs_value(kvs: &mut rustfs_ecstore::config::KVS, key: &str, value: String) {
+fn set_kvs_value(kvs: &mut rustfs_config::server_config::KVS, key: &str, value: String) {
     if let Some(existing) = kvs.0.iter_mut().find(|kv| kv.key == key) {
         existing.value = value;
         return;
@@ -1241,6 +1242,26 @@ mod tests {
 
         assert_eq!(config.client_secret.as_deref(), Some("existing-secret"));
         assert_eq!(config.roles_claim, OIDC_DEFAULT_ROLES_CLAIM);
+    }
+
+    #[test]
+    fn test_oidc_config_upsert_request_rejects_unknown_fields() {
+        let err = serde_json::from_str::<OidcConfigUpsertRequest>(
+            r#"{"config_url":"https://example.com/.well-known/openid-configuration","client_id":"client","unexpected_field":true}"#,
+        )
+        .expect_err("unknown upsert field should fail");
+
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn test_oidc_config_validate_request_rejects_unknown_fields() {
+        let err = serde_json::from_str::<OidcConfigValidateRequest>(
+            r#"{"provider_id":"default","config_url":"https://example.com/.well-known/openid-configuration","client_id":"client","unexpected_field":true}"#,
+        )
+        .expect_err("unknown validate field should fail");
+
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]
