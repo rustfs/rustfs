@@ -27,6 +27,10 @@ pub mod store;
 pub mod sys;
 pub mod target;
 
+pub use catalog::extension::{
+    TARGET_AUDIT_CAPABILITY, TARGET_NOTIFY_CAPABILITY, builtin_target_extension_schemas, target_marketplace_extension_schema,
+    target_runtime_boundary,
+};
 pub use check::{
     check_amqp_broker_available, check_kafka_broker_available, check_mqtt_broker_available, check_mqtt_broker_available_with_tls,
     check_mysql_server_available, check_nats_server_available, check_postgres_server_available, check_pulsar_broker_available,

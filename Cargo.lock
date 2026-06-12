@@ -10031,6 +10031,7 @@ dependencies = [
  "rumqttc-next",
  "rustfs-config",
  "rustfs-ecstore",
+ "rustfs-extension-schema",
  "rustfs-kafka-async",
  "rustfs-s3-types",
  "rustfs-tls-runtime",
