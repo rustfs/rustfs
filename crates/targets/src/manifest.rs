@@ -71,6 +71,8 @@ pub struct TargetPluginArtifactManifest {
     pub target_triple: &'static str,
     pub download_uri: &'static str,
     pub digest_sha256: &'static str,
+    pub signature_uri: &'static str,
+    pub provenance_uri: &'static str,
     pub size_bytes: u64,
 }
 
@@ -297,6 +299,8 @@ mod tests {
                     target_triple: "x86_64-unknown-linux-gnu",
                     download_uri: "https://plugins.example.test/webhook-plugin.tar.zst",
                     digest_sha256: "0123456789abcdef",
+                    signature_uri: "https://plugins.example.test/webhook-plugin.tar.zst.sig",
+                    provenance_uri: "https://plugins.example.test/webhook-plugin.tar.zst.intoto.jsonl",
                     size_bytes: 4096,
                 }],
             },
@@ -313,6 +317,8 @@ mod tests {
                     target_triple: "x86_64-unknown-linux-gnu",
                     download_uri: "https://plugins.example.test/webhook-plugin.tar.zst",
                     digest_sha256: "0123456789abcdef",
+                    signature_uri: "https://plugins.example.test/webhook-plugin.tar.zst.sig",
+                    provenance_uri: "https://plugins.example.test/webhook-plugin.tar.zst.intoto.jsonl",
                     size_bytes: 4096,
                 }],
             })
