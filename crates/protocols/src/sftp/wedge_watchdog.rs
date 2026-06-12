@@ -34,15 +34,17 @@
 //! backend operation that pipelines into a still-ESTABLISHED socket
 //! cannot be misdiagnosed as a wedge.
 //!
-//! Platform-conditional detection latency. On Linux the procfs probe
-//! gives a fast-kill window of WEDGE_FAST_KILL_SILENCE_SECS plus one
-//! tick (approximately 45 s) from the moment a session enters
-//! CLOSE_WAIT. On macOS, Windows, and other non-Linux targets the
-//! /proc/net/tcp files are unavailable, the read returns Err, the
-//! probe returns None, and the watchdog falls back to
-//! WEDGE_FALLBACK_KILL_SILENCE_SECS (approximately 30 minutes).
-//! Server-side resource accumulation is bounded in both cases. The
-//! recommended deployment platform is Linux.
+//! Compiled on Linux only. Non-Linux targets use fallback_watchdog, a
+//! silence-only backstop at WEDGE_FALLBACK_KILL_SILENCE_SECS without the
+//! procfs CLOSE_WAIT probe.
+//!
+//! Worst-case fast-kill latency on Linux is WEDGE_FAST_KILL_SILENCE_SECS
+//! plus one to two ticks (approximately 45 to 60 s) from the moment a
+//! session is both silent past WEDGE_FAST_KILL_SILENCE_SECS and the
+//! kernel reports CLOSE_WAIT. The WEDGE_FALLBACK_KILL_SILENCE_SECS
+//! ceiling is the backstop for the procfs probe when /proc/net/tcp is
+//! unreadable (filesystem permissions, namespace tricks) or when the
+//! wedge is in a TCP state other than CLOSE_WAIT.
 //!
 //! On cancel the watchdog calls shutdown(Both) on the duplicated
 //! socket so russh's inner select unwedges via EOF propagation,
@@ -53,7 +55,6 @@ use super::constants::limits::{WEDGE_FALLBACK_KILL_SILENCE_SECS, WEDGE_FAST_KILL
 use super::lifecycle::{SessionDiag, TcpState, probe_tcp_state};
 use socket2::Socket;
 use std::net::Shutdown;
-#[cfg(unix)]
 use std::os::fd::AsFd;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -61,8 +62,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
-/// Reason a watchdog cancelled its session. Surfaced in the warn log
-/// the watchdog emits at cancel time so operators can correlate the
+/// Reason a watchdog cancelled its session. Included in the warn log
+/// the watchdog writes at cancel time so operators can correlate the
 /// cancel with the upstream client behaviour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WedgeReason {
@@ -80,7 +81,7 @@ enum WedgeReason {
     ProbeFailedConfirmed,
     /// Silence past WEDGE_FALLBACK_KILL_SILENCE_SECS regardless of
     /// the TCP_STATE probe result. Backstop for the case where the
-    /// wedge surfaces in a state other than CLOSE_WAIT and probes
+    /// wedge is in a state other than CLOSE_WAIT and probes
     /// kept returning healthy or non-decisive.
     FallbackSilence,
 }
@@ -101,17 +102,9 @@ impl WedgeReason {
 /// racing russh for the original fd. Returns None when the dup fails.
 /// Callers should treat None as "no watchdog this session, accept-loop
 /// continues".
-#[cfg(unix)]
 pub(super) fn dup_socket(stream: &TcpStream) -> Option<Socket> {
     let cloned = stream.as_fd().try_clone_to_owned().ok()?;
     Some(Socket::from(cloned))
-}
-
-/// Non-Unix stub: AsFd on TcpStream is Unix-only. Returns None so the
-/// caller falls back to WEDGE_FALLBACK_KILL_SILENCE_SECS.
-#[cfg(not(unix))]
-pub(super) fn dup_socket(_stream: &TcpStream) -> Option<Socket> {
-    None
 }
 
 /// Spawn a per-session watchdog tick task.
@@ -127,7 +120,7 @@ pub(super) fn spawn_for_session(session_diag: Arc<SessionDiag>, socket: Socket, 
         let peer = session_diag.peer;
         let mut tick = tokio::time::interval(Duration::from_secs(WEDGE_WATCHDOG_TICK_SECS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // First tick fires immediately; skip it so the watchdog never
+        // First tick fires immediately. Skip it so the watchdog never
         // makes a decision before one full silence window has elapsed.
         tick.tick().await;
         let mut wedge_suspected = false;
@@ -171,7 +164,7 @@ pub(super) fn spawn_for_session(session_diag: Arc<SessionDiag>, socket: Socket, 
         // here makes the next I/O on the original fd return EOF,
         // which propagates through russh-sftp and drops the mpsc
         // receiver. In the clean-end case russh has already returned
-        // and dropped its half of the fd; this call sends a final
+        // and dropped its half of the fd. This call sends a final
         // FIN on the still-open dup, which the peer's stack
         // tolerates.
         let _ = socket.shutdown(Shutdown::Both);
@@ -180,7 +173,7 @@ pub(super) fn spawn_for_session(session_diag: Arc<SessionDiag>, socket: Socket, 
 
 #[derive(Debug, PartialEq, Eq)]
 enum Decision {
-    /// No wedge signal this tick; reset any suspected state.
+    /// No wedge signal this tick. Reset any suspected state.
     Quiet,
     /// First tick to observe silence past the fast threshold AND a
     /// non-healthy probe result. Hold suspected state for one more

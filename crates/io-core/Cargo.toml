@@ -30,9 +30,13 @@ workspace = true
 [dependencies]
 bytes = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "fs", "rt", "sync","io-uring"] }
+tokio = { workspace = true, features = ["io-util", "fs", "rt", "sync"] }
 memmap2 = { workspace = true }
 rustfs-io-metrics = { workspace = true }
+
+# io-uring is Linux-only. Scope the feature to Linux targets.
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio = { workspace = true, features = ["io-uring"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
