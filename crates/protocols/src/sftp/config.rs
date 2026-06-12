@@ -85,12 +85,12 @@ pub enum SftpInitError {
     #[error("SSH server error: {0}")]
     Server(String),
 
-    /// The host running the binary is not a Unix-family target. The
-    /// host-key permission enforcement (the owner-only mode-bit check)
-    /// requires Unix mode bits and has no equivalent on this platform,
-    /// so SFTP refuses to start rather than load host keys with weaker
-    /// guarantees.
-    #[error("SFTP requires a Unix-family host (current OS: {os})")]
+    /// The host running the binary is neither a Unix-family target nor
+    /// Windows. Unix enforces owner-only host-key mode bits and Windows
+    /// trusts operator-managed NTFS ACLs, but neither mechanism exists on
+    /// other targets, so SFTP refuses to start rather than load host keys
+    /// with weaker guarantees.
+    #[error("SFTP requires a Unix-family or Windows host (current OS: {os})")]
     UnsupportedPlatform { os: String },
 }
 
