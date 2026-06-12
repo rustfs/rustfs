@@ -36,7 +36,15 @@ const WAREHOUSE_PROPERTY: &str = "warehouse";
 const CATALOG_ENDPOINT_PREFIX_CONFIG_KEY: &str = "rustfs.catalog-endpoint-prefix";
 const CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY: &str = "rustfs.catalog-compat-endpoint-prefix";
 const CREDENTIAL_VENDING_CONFIG_KEY: &str = "rustfs.credential-vending";
+const CREDENTIAL_VENDING_REASON_CONFIG_KEY: &str = "rustfs.credential-vending-reason";
+const CREDENTIAL_SCOPE_CONFIG_KEY: &str = "rustfs.credential-scope";
+const CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY: &str = "rustfs.credential-scope-prefix";
+const CREDENTIAL_MODE_CONFIG_KEY: &str = "rustfs.credential-mode";
 const CREDENTIAL_VENDING_UNSUPPORTED: &str = "unsupported";
+const CREDENTIAL_VENDING_UNSUPPORTED_REASON: &str = "temporary-credentials-not-implemented";
+const CREDENTIAL_SCOPE_WAREHOUSE_PREFIX: &str = "warehouse-prefix";
+const CREDENTIAL_SCOPE_TABLE_PREFIX: &str = "table-prefix";
+const CREDENTIAL_MODE_CLIENT_PROVIDED: &str = "client-provided-s3-credentials-required";
 const TABLE_CATALOG_NAMESPACE_RESOURCE_ROOT: &str = "namespaces";
 const TABLE_CATALOG_TABLE_RESOURCE_ROOT: &str = "tables";
 const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
@@ -231,6 +239,10 @@ struct TableBucketResponse {
     compat_catalog_uri: String,
     #[serde(rename = "credential-vending")]
     credential_vending: &'static str,
+    #[serde(rename = "credential-scope")]
+    credential_scope: &'static str,
+    #[serde(rename = "credential-scope-prefix")]
+    credential_scope_prefix: String,
     #[serde(rename = "catalog-entry-present")]
     catalog_entry_present: bool,
     properties: BTreeMap<String, String>,
@@ -663,10 +675,12 @@ where
         enabled,
         catalog_type,
         warehouse: bucket.to_string(),
-        warehouse_location,
+        warehouse_location: warehouse_location.clone(),
         catalog_uri: format!("{TABLE_CATALOG_PREFIX}/{bucket}"),
         compat_catalog_uri: format!("{TABLE_CATALOG_COMPAT_PREFIX}/{bucket}"),
         credential_vending: CREDENTIAL_VENDING_UNSUPPORTED,
+        credential_scope: CREDENTIAL_SCOPE_WAREHOUSE_PREFIX,
+        credential_scope_prefix: warehouse_location.clone(),
         catalog_entry_present,
         properties,
     })
@@ -738,8 +752,16 @@ fn list_tables_response_from_entries(entries: Vec<crate::table_catalog::TableEnt
 
 fn load_table_response_from_entry(entry: crate::table_catalog::TableEntry, metadata: serde_json::Value) -> RestLoadTableResponse {
     let mut config = BTreeMap::new();
-    config.insert("warehouse-location".to_string(), entry.warehouse_location);
+    let warehouse_location = entry.warehouse_location.clone();
+    config.insert("warehouse-location".to_string(), warehouse_location.clone());
     config.insert(CREDENTIAL_VENDING_CONFIG_KEY.to_string(), CREDENTIAL_VENDING_UNSUPPORTED.to_string());
+    config.insert(
+        CREDENTIAL_VENDING_REASON_CONFIG_KEY.to_string(),
+        CREDENTIAL_VENDING_UNSUPPORTED_REASON.to_string(),
+    );
+    config.insert(CREDENTIAL_SCOPE_CONFIG_KEY.to_string(), CREDENTIAL_SCOPE_TABLE_PREFIX.to_string());
+    config.insert(CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY.to_string(), warehouse_location);
+    config.insert(CREDENTIAL_MODE_CONFIG_KEY.to_string(), CREDENTIAL_MODE_CLIENT_PROVIDED.to_string());
 
     RestLoadTableResponse {
         metadata_location: entry.metadata_location,
@@ -2780,6 +2802,8 @@ mod tests {
         assert_eq!(response.catalog_uri, "/iceberg/v1/warehouse");
         assert_eq!(response.compat_catalog_uri, "/_iceberg/v1/warehouse");
         assert_eq!(response.credential_vending, CREDENTIAL_VENDING_UNSUPPORTED);
+        assert_eq!(response.credential_scope, "warehouse-prefix");
+        assert_eq!(response.credential_scope_prefix, "s3://warehouse/");
         assert!(response.catalog_entry_present);
     }
 
@@ -3612,6 +3636,19 @@ mod tests {
         assert_eq!(response.metadata, metadata);
         assert!(response.storage_credentials.is_empty());
         assert_eq!(response.config.get("rustfs.credential-vending"), Some(&"unsupported".to_string()));
+        assert_eq!(
+            response.config.get("rustfs.credential-vending-reason"),
+            Some(&"temporary-credentials-not-implemented".to_string())
+        );
+        assert_eq!(response.config.get("rustfs.credential-scope"), Some(&"table-prefix".to_string()));
+        assert_eq!(
+            response.config.get("rustfs.credential-scope-prefix"),
+            Some(&"s3://warehouse/tables/table-id".to_string())
+        );
+        assert_eq!(
+            response.config.get("rustfs.credential-mode"),
+            Some(&"client-provided-s3-credentials-required".to_string())
+        );
         assert!(!response.config.contains_key("s3.access-key-id"));
         assert!(!response.config.contains_key("s3.secret-access-key"));
         assert!(!response.config.contains_key("s3.session-token"));

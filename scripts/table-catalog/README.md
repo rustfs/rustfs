@@ -112,7 +112,7 @@ added.
 Unsupported behavior is documented instead of hidden behind internal errors. The
 current unsupported inventory is:
 
-- credential vending: unsupported response boundary exists; real temporary credentials are not issued
+- credential vending: non-secret table scope preview exists; real temporary credentials are not issued
 - background maintenance worker: unsupported
 - manifest/data reachability cleanup: unsupported
 - snapshot expiration and compaction: unsupported
