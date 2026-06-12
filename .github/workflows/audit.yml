@@ -20,12 +20,14 @@ on:
     paths:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+      - 'deny.toml'
       - '.github/workflows/audit.yml'
   pull_request:
     branches: [ main ]
     paths:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+      - 'deny.toml'
       - '.github/workflows/audit.yml'
   schedule:
     - cron: '0 0 * * 0' # Weekly on Sunday at midnight UTC
@@ -62,6 +64,27 @@ jobs:
           name: security-audit-results-${{ github.run_number }}
           path: audit-results.json
           retention-days: 30
+
+  cargo-deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          cache-shared-key: rustfs-cargo-deny
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Run cargo-deny
+        run: cargo deny check --hide-inclusion-graph advisories sources bans licenses
 
   dependency-review:
     name: Dependency Review
