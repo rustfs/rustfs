@@ -352,19 +352,65 @@ impl RemoteDisk {
                     return;
                 }
                 _ = interval.tick() => {
-                    if Self::perform_connectivity_check(&addr).await.is_ok() {
-                        let became_online = health.mark_recovery_success(&endpoint, "connectivity_probe_success");
+                    if Self::perform_recovery_probe(&addr, &endpoint).await.is_ok() {
+                        let became_online = health.mark_recovery_success(&endpoint, "disk_info_probe_success");
                         info!("Remote disk recovery probe succeeded: {}", addr);
                         if became_online {
                             info!("Remote disk recovered: {}", addr);
                             return;
                         }
                     } else {
-                        health.mark_failure(&endpoint, "connectivity_probe_failed");
+                        health.mark_failure(&endpoint, "disk_info_probe_failed");
                     }
                 }
             }
         }
+    }
+
+    async fn perform_recovery_probe(addr: &str, endpoint: &Endpoint) -> Result<()> {
+        let mut evict_cached_connection = false;
+        let result = match timeout(get_drive_active_check_timeout(), async {
+            let opts = serde_json::to_string(&DiskInfoOptions {
+                noop: true,
+                ..Default::default()
+            })
+            .map_err(|err| (Error::other(format!("encode DiskInfoOptions failed: {err}")), false))?;
+            let addr = addr.to_string();
+            let mut client = node_service_time_out_client(&addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
+                .await
+                .map_err(|err| (Error::other(format!("can not get client, err: {err}")), true))?;
+            let request = Request::new(DiskInfoRequest {
+                disk: endpoint.to_string(),
+                opts,
+            });
+            let response = client
+                .disk_info(request)
+                .await
+                .map_err(|err| (Error::from(err), true))?
+                .into_inner();
+            if !response.success {
+                return Err((response.error.unwrap_or_default().into(), false));
+            }
+            Ok(())
+        })
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err((err, should_evict))) => {
+                evict_cached_connection = should_evict;
+                Err(err)
+            }
+            Err(_) => {
+                evict_cached_connection = true;
+                Err(DiskError::Timeout)
+            }
+        };
+
+        if evict_cached_connection {
+            evict_failed_connection(addr).await;
+        }
+
+        result
     }
 
     /// Perform basic connectivity check for remote disk
@@ -2252,6 +2298,70 @@ mod tests {
             },
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_recovery_requires_disk_rpc_readiness() {
+        init_tracing(Level::ERROR);
+        let _ = rustfs_credentials::GLOBAL_RUSTFS_RPC_SECRET.set("test-rpc-secret".to_string());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+
+        let base_addr = format!("http://{}:{}", addr.ip(), addr.port());
+        let url = url::Url::parse(&format!("{base_addr}/data/rustfs0")).unwrap();
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+        let health = Arc::new(DiskHealthTracker::new());
+        health.mark_failure(&endpoint, "test_failure");
+        health.mark_failure(&endpoint, "test_failure");
+        assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Offline);
+        let channel = TonicEndpoint::from_shared(base_addr.clone()).unwrap().connect_lazy();
+        GLOBAL_CONN_MAP.write().await.insert(base_addr.clone(), channel);
+        assert!(GLOBAL_CONN_MAP.read().await.contains_key(&base_addr));
+
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_DRIVE_RETURNING_PROBE_INTERVAL_SECS, Some("1")),
+                (rustfs_config::ENV_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS, Some("1")),
+            ],
+            async {
+                let cancel_token = CancellationToken::new();
+                let monitor = tokio::spawn(RemoteDisk::monitor_remote_disk_recovery(
+                    base_addr.clone(),
+                    endpoint,
+                    Arc::clone(&health),
+                    cancel_token.clone(),
+                ));
+
+                tokio::time::sleep(Duration::from_millis(2_500)).await;
+                cancel_token.cancel();
+                let _ = monitor.await;
+
+                assert_ne!(
+                    health.runtime_state(),
+                    RuntimeDriveHealthState::Online,
+                    "a plain TCP listener without disk_info RPC readiness must not restore the remote disk online"
+                );
+                assert!(
+                    !GLOBAL_CONN_MAP.read().await.contains_key(&base_addr),
+                    "failed recovery probes should evict stale cached gRPC channels"
+                );
+            },
+        )
+        .await;
+
+        accept_task.abort();
     }
 
     #[tokio::test]
