@@ -21,14 +21,18 @@ on:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - 'deny.toml'
-      - '.github/workflows/audit.yml'
+      - '.github/actions/**'
+      - '.github/workflows/**'
+      - 'scripts/security/check_workflow_pins.sh'
   pull_request:
     branches: [ main ]
     paths:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - 'deny.toml'
-      - '.github/workflows/audit.yml'
+      - '.github/actions/**'
+      - '.github/workflows/**'
+      - 'scripts/security/check_workflow_pins.sh'
   schedule:
     - cron: '0 0 * * 0' # Weekly on Sunday at midnight UTC
   workflow_dispatch:
@@ -85,6 +89,17 @@ jobs:
 
       - name: Run cargo-deny
         run: cargo deny check --hide-inclusion-graph advisories sources bans licenses
+
+  workflow-pin-report:
+    name: Workflow Pin Report
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Report unpinned GitHub Actions
+        run: ./scripts/security/check_workflow_pins.sh
 
   dependency-review:
     name: Dependency Review
