@@ -104,6 +104,7 @@ tempfile = { workspace = true }
 async-trait = { workspace = true }
 axum.workspace = true
 futures.workspace = true
+futures-lite.workspace = true
 futures-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
@@ -141,6 +142,7 @@ time = { workspace = true, features = ["parsing", "formatting", "serde"] }
 astral-tokio-tar = { workspace = true }
 atoi = { workspace = true }
 atomic_enum = { workspace = true }
+async_zip = { workspace = true }
 base64 = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }

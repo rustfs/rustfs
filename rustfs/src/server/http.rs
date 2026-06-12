@@ -24,7 +24,7 @@ use crate::server::{
     layer::{
         BodylessStatusFixLayer, ConditionalCorsLayer, EmptyBodyContentLengthCompatLayer, HeadRequestBodyFixLayer,
         ObjectAttributesEtagFixLayer, PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer, RequestLoggingLayer,
-        S3ErrorMessageCompatLayer,
+        S3ErrorMessageCompatLayer, redact_sensitive_uri_query,
     },
     tls_material::{
         TlsAcceptorHolder, TlsHandshakeFailureKind, build_acceptor_from_loaded, load_tls_material, spawn_reload_loop,
@@ -827,7 +827,7 @@ fn process_connection(
                             status_code = tracing::field::Empty,
                             method = %request.method(),
                             peer_addr = %peer_addr,
-                            uri = %request.uri(),
+                            uri = %redact_sensitive_uri_query(request.uri()),
                             version = ?request.version(),
                             user_agent = tracing::field::Empty,
                             content_type = tracing::field::Empty,
