@@ -14,6 +14,7 @@
 
 use crate::admin::console::is_console_path;
 use crate::admin::handlers::health::{HealthProbe, build_health_response_parts};
+use crate::admin::router::ADMIN_OBJECT_ZIP_DOWNLOADS_PATH;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::server::cors;
@@ -43,11 +44,13 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 use tower::{Layer, Service};
 use tracing::{debug, error, info};
+use url::form_urlencoded;
 
 const HTTP_REQUEST_COMPLETED_EVENT: &str = "http_request_completed";
 const HTTP_REQUEST_FAILED_EVENT: &str = "http_request_failed";
 const LOG_COMPONENT_SERVER: &str = "server";
 const LOG_SUBSYSTEM_HTTP: &str = "http";
+const REDACTED_QUERY_VALUE: &str = "redacted";
 
 /// A carrier that adapts [`HeaderMap`] for OpenTelemetry trace context propagation.
 struct HeaderMapCarrier<'a>(&'a HeaderMap);
@@ -70,6 +73,50 @@ impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrier<'a> {
             .collect::<Vec<_>>();
 
         if headers.is_empty() { None } else { Some(headers) }
+    }
+}
+
+pub(crate) fn redact_sensitive_uri_query(uri: &http::Uri) -> String {
+    let path = uri.path();
+    let object_zip_download_prefix = format!("{ADMIN_PREFIX}{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH}/");
+    if !path.starts_with(&object_zip_download_prefix) || !path.ends_with(".zip") {
+        return uri.to_string();
+    }
+
+    let Some(query) = uri.query() else {
+        return uri.to_string();
+    };
+
+    let mut redacted_token = false;
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        if key == "token" {
+            redacted_token = true;
+            serializer.append_pair(&key, REDACTED_QUERY_VALUE);
+        } else {
+            serializer.append_pair(&key, &value);
+        }
+    }
+
+    if !redacted_token {
+        return uri.to_string();
+    }
+
+    let redacted_query = serializer.finish();
+    let path_and_query = if redacted_query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{redacted_query}")
+    };
+    let mut parts = uri.clone().into_parts();
+    match path_and_query.parse() {
+        Ok(path_and_query) => {
+            parts.path_and_query = Some(path_and_query);
+            http::Uri::from_parts(parts)
+                .map(|uri| uri.to_string())
+                .unwrap_or_else(|_| uri.to_string())
+        }
+        Err(_) => uri.to_string(),
     }
 }
 
@@ -199,7 +246,7 @@ impl RequestLogContext {
             span_id: request_context.as_ref().and_then(|ctx| ctx.span_id.clone()),
             peer_addr,
             method: req.method().to_string(),
-            uri: req.uri().to_string(),
+            uri: redact_sensitive_uri_query(req.uri()),
             request_started_at: request_context,
             fallback_start: Instant::now(),
         }
@@ -2665,6 +2712,27 @@ mod tests {
         assert_eq!(context.peer_addr, "127.0.0.1:9000");
         assert_eq!(context.method, "PUT");
         assert_eq!(context.uri, "/bucket/object.txt");
+    }
+
+    #[test]
+    fn request_log_context_redacts_object_zip_download_tokens() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/rustfs/admin/v3/object-zip-downloads/download-id.zip?token=secret-token&part=1")
+            .body(())
+            .expect("request");
+
+        let context = RequestLogContext::from_request(&request);
+
+        assert_eq!(context.uri, "/rustfs/admin/v3/object-zip-downloads/download-id.zip?token=redacted&part=1");
+        assert!(!context.uri.contains("secret-token"));
+    }
+
+    #[test]
+    fn redact_sensitive_uri_query_preserves_non_zip_download_uris() {
+        let uri: http::Uri = "/rustfs/admin/v3/users?token=not-a-download-token".parse().expect("uri");
+
+        assert_eq!(redact_sensitive_uri_query(&uri), "/rustfs/admin/v3/users?token=not-a-download-token");
     }
 
     #[test]

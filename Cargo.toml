@@ -125,6 +125,7 @@ rustfs-zip = { path = "./crates/zip", version = "1.0.0-beta.8" }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"
+async_zip = { version = "0.0.18", default-features = false, features = ["tokio", "deflate"] }
 mysql_async = { version = "0.37", default-features = false, features = ["default-rustls", "tracing"] }
 async-compression = { version = "0.4.42" }
 async-recursion = "1.1.1"
@@ -133,6 +134,7 @@ async-nats = "0.49.1"
 axum = "0.8.9"
 futures = "0.3.32"
 futures-core = "0.3.32"
+futures-lite = "2.6.1"
 futures-util = "0.3.32"
 pollster = "0.4.0"
 pulsar = { version = "6.8.0", default-features = false, features = ["tokio-rustls-runtime"] }

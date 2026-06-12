@@ -225,6 +225,12 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::PUT, "/v3/module-switches"),
         admin_route(Method::GET, "/v4/extensions/catalog"),
         admin_route(Method::GET, "/v4/extensions/instances"),
+        admin_route(Method::POST, "/v3/object-zip-downloads"),
+        admin_route_sample(
+            Method::GET,
+            "/v3/object-zip-downloads/{id}.zip",
+            "/v3/object-zip-downloads/example-id.zip",
+        ),
         admin_route(Method::GET, "/v4/plugins/catalog"),
         admin_route(Method::GET, "/v4/plugins/instances"),
         admin_route_sample(Method::GET, "/v4/plugins/instances/{id}", "/v4/plugins/instances/example-id"),
@@ -544,6 +550,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/module-switches"));
     assert_route(&router, Method::GET, &admin_path("/v4/extensions/catalog"));
     assert_route(&router, Method::GET, &admin_path("/v4/extensions/instances"));
+    assert_route(&router, Method::POST, &admin_path("/v3/object-zip-downloads"));
     assert_route(&router, Method::GET, &admin_path("/v4/plugins/catalog"));
     assert_route(&router, Method::GET, &admin_path("/v4/plugins/instances"));
     assert_route(&router, Method::GET, &admin_path("/v4/plugins/instances/example-id"));
