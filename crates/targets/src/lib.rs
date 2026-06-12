@@ -63,7 +63,7 @@ pub use runtime::{
     RuntimeTargetHealthState, RuntimeTargetSnapshot, SharedTarget, TargetRuntimeManager, activate_targets_with_replay,
     adapter::{BuiltinPluginRuntimeAdapter, PluginRuntimeAdapter},
     init_target_and_optionally_start_replay,
-    sidecar::SidecarPluginRuntime,
+    sidecar::{SidecarPluginRuntime, SidecarRuntimePolicy, SidecarRuntimeSafetyChecks},
     sidecar_protocol::{SIDECAR_RUNTIME_PROTOCOL_VERSION, SidecarHandshake, SidecarPluginCapability},
     start_replay_worker,
 };
