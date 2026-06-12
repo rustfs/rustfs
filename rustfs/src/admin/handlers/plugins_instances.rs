@@ -286,7 +286,7 @@ struct PluginInstanceBody {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct PluginInstanceFilters {
+pub(super) struct PluginInstanceFilters {
     domain: Option<PluginContractDomain>,
     service: Option<String>,
     status: Option<String>,
@@ -298,7 +298,7 @@ struct PluginInstanceFilters {
     marker: Option<String>,
 }
 
-fn extract_plugin_instance_filters(req: &S3Request<Body>) -> S3Result<PluginInstanceFilters> {
+pub(super) fn extract_plugin_instance_filters(req: &S3Request<Body>) -> S3Result<PluginInstanceFilters> {
     let mut filters = PluginInstanceFilters::default();
 
     if let Some(query) = req.uri.query() {
@@ -420,12 +420,15 @@ fn resolve_plugin_instance_target(instance_id: &str) -> S3Result<ResolvedPluginI
     })
 }
 
-fn filter_plugin_instances(mut instances: Vec<PluginInstanceEntry>, filters: &PluginInstanceFilters) -> Vec<PluginInstanceEntry> {
+pub(super) fn filter_plugin_instances(
+    mut instances: Vec<PluginInstanceEntry>,
+    filters: &PluginInstanceFilters,
+) -> Vec<PluginInstanceEntry> {
     instances.retain(|instance| plugin_instance_matches_filters(instance, filters));
     instances
 }
 
-fn paginate_plugin_instances(
+pub(super) fn paginate_plugin_instances(
     instances: Vec<PluginInstanceEntry>,
     filters: &PluginInstanceFilters,
 ) -> S3Result<(Vec<PluginInstanceEntry>, bool, Option<String>)> {
@@ -453,7 +456,7 @@ fn paginate_plugin_instances(
     Ok((page, truncated, next_marker))
 }
 
-fn collect_diagnostic_counts(instances: &[PluginInstanceEntry]) -> Vec<PluginInstanceDiagnosticCount> {
+pub(super) fn collect_diagnostic_counts(instances: &[PluginInstanceEntry]) -> Vec<PluginInstanceDiagnosticCount> {
     let mut counts = BTreeMap::<PluginInstanceDiagnosticCode, usize>::new();
     for instance in instances {
         for code in &instance.diagnostic_codes {
@@ -628,7 +631,7 @@ async fn collect_domain_instances(context: PluginInstanceDomainContext) -> S3Res
     Ok(entries)
 }
 
-async fn collect_all_instances() -> S3Result<Vec<PluginInstanceEntry>> {
+pub(super) async fn collect_all_instances() -> S3Result<Vec<PluginInstanceEntry>> {
     let (mut notify_instances, audit_instances) = tokio::try_join!(
         collect_domain_instances(plugin_instance_domain_context(PluginContractDomain::Notify)),
         collect_domain_instances(plugin_instance_domain_context(PluginContractDomain::Audit))
