@@ -28,10 +28,7 @@ use rustfs_ecstore::{
     global::GLOBAL_TierConfigMgr,
     pools::path2_bucket_object_with_base_path,
     store::ECStore,
-    store_api::{
-        BucketOperations, ListOperations, MakeBucketOptions, MultipartOperations, ObjectIO, ObjectOperations, ObjectOptions,
-        PutObjReader,
-    },
+    store_api::{BucketOperations, ListOperations, MultipartOperations, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader},
     tier::{
         tier_config::{TierConfig, TierMinIO, TierType},
         warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
@@ -41,6 +38,7 @@ use rustfs_filemeta::FileMeta;
 use rustfs_scanner::scanner::init_data_scanner;
 use rustfs_scanner::scanner_folder::ScannerItem;
 use rustfs_scanner::scanner_io::ScannerIODisk;
+use rustfs_storage_api::MakeBucketOptions;
 use rustfs_utils::path::path_join_buf;
 use s3s::dto::RestoreRequest;
 use serial_test::serial;
@@ -132,7 +130,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
 
     // init bucket metadata system
     let buckets_list = ecstore
-        .list_bucket(&rustfs_ecstore::store_api::BucketOptions {
+        .list_bucket(&rustfs_storage_api::BucketOptions {
             no_metadata: true,
             ..Default::default()
         })
@@ -198,7 +196,7 @@ async fn setup_isolated_test_env(init_expiry: bool) -> (Vec<PathBuf>, Arc<ECStor
         .unwrap();
 
     let buckets_list = ecstore
-        .list_bucket(&rustfs_ecstore::store_api::BucketOptions {
+        .list_bucket(&rustfs_storage_api::BucketOptions {
             no_metadata: true,
             ..Default::default()
         })

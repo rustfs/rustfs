@@ -227,6 +227,8 @@ pub(crate) struct PluginArtifactContract {
     pub target_triple: String,
     pub download_uri: String,
     pub digest_sha256: String,
+    pub signature_uri: String,
+    pub provenance_uri: String,
     pub size_bytes: u64,
 }
 
@@ -237,6 +239,8 @@ impl From<TargetPluginArtifactManifest> for PluginArtifactContract {
             target_triple: value.target_triple.to_string(),
             download_uri: value.download_uri.to_string(),
             digest_sha256: value.digest_sha256.to_string(),
+            signature_uri: value.signature_uri.to_string(),
+            provenance_uri: value.provenance_uri.to_string(),
             size_bytes: value.size_bytes,
         }
     }
@@ -555,6 +559,8 @@ mod tests {
                     target_triple: "x86_64-unknown-linux-gnu".to_string(),
                     download_uri: "https://plugins.example.test/webhook.tar.zst".to_string(),
                     digest_sha256: "0123456789abcdef".to_string(),
+                    signature_uri: "https://plugins.example.test/webhook.tar.zst.sig".to_string(),
+                    provenance_uri: "https://plugins.example.test/webhook.tar.zst.intoto.jsonl".to_string(),
                     size_bytes: 4096,
                 }],
             }),
@@ -572,6 +578,14 @@ mod tests {
             "https://plugins.example.test/webhook.tar.zst"
         );
         assert_eq!(value["distribution"]["artifacts"][0]["digest_sha256"], "0123456789abcdef");
+        assert_eq!(
+            value["distribution"]["artifacts"][0]["signature_uri"],
+            "https://plugins.example.test/webhook.tar.zst.sig"
+        );
+        assert_eq!(
+            value["distribution"]["artifacts"][0]["provenance_uri"],
+            "https://plugins.example.test/webhook.tar.zst.intoto.jsonl"
+        );
         assert_eq!(value["distribution"]["artifacts"][0]["size_bytes"], 4096);
     }
 }

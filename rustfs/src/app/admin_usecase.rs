@@ -24,8 +24,8 @@ use rustfs_ecstore::data_usage::{apply_bucket_usage_memory_overlay, load_data_us
 use rustfs_ecstore::endpoints::EndpointServerPools;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::pools::{PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free};
-use rustfs_ecstore::store_api::StorageAPI;
 use rustfs_madmin::{InfoMessage, StorageInfo};
+use rustfs_storage_api::StorageAdminApi;
 use s3s::S3ErrorCode;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -125,7 +125,7 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
 
-        Ok(store.storage_info().await)
+        Ok(StorageAdminApi::storage_info(store.as_ref()).await)
     }
 
     pub async fn execute_query_data_usage_info(&self) -> AdminUsecaseResult<DataUsageInfo> {
@@ -139,7 +139,7 @@ impl DefaultAdminUsecase {
         })?;
         apply_bucket_usage_memory_overlay(&mut info).await;
 
-        let storage_info = store.storage_info().await;
+        let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
 
         // Keep the same capacity correction behavior as the previous admin handler implementation.
         const MAX_REASONABLE_CAPACITY: u64 = 100_000 * 1024 * 1024 * 1024 * 1024; // 100 PiB

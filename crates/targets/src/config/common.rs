@@ -15,12 +15,12 @@
 use crate::TargetError;
 use crate::target::pulsar::validate_pulsar_broker;
 use async_nats::ServerAddr;
+use rustfs_config::server_config::KVS;
 use rustfs_config::{
     DEFAULT_DELIMITER, ENABLE_KEY, EnableState, NATS_CREDENTIALS_FILE, NATS_PASSWORD, NATS_QUEUE_DIR, NATS_SUBJECT, NATS_TLS_CA,
     NATS_TLS_CLIENT_CERT, NATS_TLS_CLIENT_KEY, NATS_TOKEN, NATS_USERNAME, PULSAR_AUTH_TOKEN, PULSAR_PASSWORD, PULSAR_QUEUE_DIR,
     PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA, PULSAR_TLS_HOSTNAME_VERIFICATION, PULSAR_TOPIC, PULSAR_USERNAME,
 };
-use rustfs_ecstore::config::KVS;
 use std::collections::HashSet;
 use std::path::Path;
 use std::str::FromStr;
@@ -185,10 +185,10 @@ pub(super) fn parse_url(value: &str, field_label: &str) -> Result<Url, TargetErr
 mod tests {
     use super::{validate_nats_server_config, validate_pulsar_broker_config};
     use async_nats::ServerAddr;
+    use rustfs_config::server_config::KVS;
     use rustfs_config::{
         NATS_PASSWORD, NATS_QUEUE_DIR, NATS_SUBJECT, NATS_TOKEN, NATS_USERNAME, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TOPIC,
     };
-    use rustfs_ecstore::config::KVS;
     use std::str::FromStr;
 
     #[test]

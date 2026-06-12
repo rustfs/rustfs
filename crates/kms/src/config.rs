@@ -19,9 +19,12 @@ use rustfs_security_governance::{RedactionLevel, RedactionRule};
 use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_str};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use url::Url;
+
+pub const ENV_KMS_ALLOW_INSECURE_DEV_DEFAULTS: &str = "RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS";
+pub const ENV_KMS_VAULT_SKIP_TLS_VERIFY: &str = "RUSTFS_KMS_VAULT_SKIP_TLS_VERIFY";
 
 pub const KMS_CONFIG_REDACTION_RULES: &[RedactionRule] = &[
     RedactionRule::new("kms.local.master_key", RedactionLevel::Secret, "local backend key encryption material"),
@@ -93,6 +96,9 @@ pub struct KmsConfig {
     pub default_key_id: Option<String>,
     /// Backend-specific configuration
     pub backend_config: BackendConfig,
+    /// Allow development-only insecure defaults such as plaintext local keys or HTTP Vault.
+    #[serde(default)]
+    pub allow_insecure_dev_defaults: bool,
     /// Operation timeout
     pub timeout: Duration,
     /// Number of retry attempts
@@ -109,6 +115,7 @@ impl Default for KmsConfig {
             backend: KmsBackend::default(),
             default_key_id: None,
             backend_config: BackendConfig::default(),
+            allow_insecure_dev_defaults: false,
             timeout: Duration::from_secs(30),
             retry_attempts: 3,
             enable_cache: true,
@@ -405,6 +412,12 @@ impl KmsConfig {
         self
     }
 
+    /// Explicitly allow development-only KMS defaults.
+    pub fn with_insecure_development_defaults(mut self) -> Self {
+        self.allow_insecure_dev_defaults = true;
+        self
+    }
+
     /// Set operation timeout
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -435,10 +448,28 @@ impl KmsConfig {
                 if !config.key_dir.is_absolute() {
                     return Err(KmsError::configuration_error("Local key directory must be an absolute path"));
                 }
+
+                if !self.allow_insecure_dev_defaults {
+                    if config.master_key.as_deref().is_none_or(str::is_empty) {
+                        return Err(development_default_error(
+                            "Local KMS requires a master key outside explicit development mode",
+                        ));
+                    }
+
+                    if is_under_temp_dir(&config.key_dir) {
+                        return Err(development_default_error(
+                            "Local KMS key directory must not be under the process temp directory outside explicit development mode",
+                        ));
+                    }
+                }
             }
             BackendConfig::VaultKv2(config) => {
                 if !config.address.starts_with("http://") && !config.address.starts_with("https://") {
                     return Err(KmsError::configuration_error("Vault KV2 address must use http or https scheme"));
+                }
+
+                if !self.allow_insecure_dev_defaults {
+                    validate_vault_development_defaults("Vault KV2", &config.address, &config.auth_method, config.tls.as_ref())?;
                 }
 
                 if config.mount_path.is_empty() {
@@ -459,6 +490,15 @@ impl KmsConfig {
             BackendConfig::VaultTransit(config) => {
                 if !config.address.starts_with("http://") && !config.address.starts_with("https://") {
                     return Err(KmsError::configuration_error("Vault Transit address must use http or https scheme"));
+                }
+
+                if !self.allow_insecure_dev_defaults {
+                    validate_vault_development_defaults(
+                        "Vault Transit",
+                        &config.address,
+                        &config.auth_method,
+                        config.tls.as_ref(),
+                    )?;
                 }
 
                 if config.mount_path.is_empty() {
@@ -520,6 +560,8 @@ impl KmsConfig {
 
         // Enable cache
         config.enable_cache = get_env_bool("RUSTFS_KMS_ENABLE_CACHE", config.enable_cache);
+        config.allow_insecure_dev_defaults =
+            get_env_bool(ENV_KMS_ALLOW_INSECURE_DEV_DEFAULTS, config.allow_insecure_dev_defaults);
 
         // Backend-specific configuration
         match config.backend {
@@ -536,6 +578,7 @@ impl KmsConfig {
             KmsBackend::VaultKv2 => {
                 let address = get_env_str("RUSTFS_KMS_VAULT_ADDRESS", "http://localhost:8200");
                 let token = get_env_str("RUSTFS_KMS_VAULT_TOKEN", "dev-token");
+                let skip_tls_verify = get_env_bool(ENV_KMS_VAULT_SKIP_TLS_VERIFY, false);
 
                 config.backend_config = BackendConfig::VaultKv2(Box::new(VaultConfig {
                     address,
@@ -544,19 +587,20 @@ impl KmsConfig {
                     mount_path: get_env_str("RUSTFS_KMS_VAULT_MOUNT_PATH", "transit"),
                     kv_mount: get_env_str("RUSTFS_KMS_VAULT_KV_MOUNT", "secret"),
                     key_path_prefix: get_env_str("RUSTFS_KMS_VAULT_KEY_PREFIX", "rustfs/kms/keys"),
-                    tls: None,
+                    tls: vault_tls_config(skip_tls_verify),
                 }));
             }
             KmsBackend::VaultTransit => {
                 let address = get_env_str("RUSTFS_KMS_VAULT_ADDRESS", "http://localhost:8200");
                 let token = get_env_str("RUSTFS_KMS_VAULT_TOKEN", "dev-token");
+                let skip_tls_verify = get_env_bool(ENV_KMS_VAULT_SKIP_TLS_VERIFY, false);
 
                 config.backend_config = BackendConfig::VaultTransit(Box::new(VaultTransitConfig {
                     address,
                     auth_method: VaultAuthMethod::Token { token },
                     namespace: get_env_opt_str("RUSTFS_KMS_VAULT_NAMESPACE"),
                     mount_path: get_env_str("RUSTFS_KMS_VAULT_MOUNT_PATH", "transit"),
-                    tls: None,
+                    tls: vault_tls_config(skip_tls_verify),
                 }));
             }
         }
@@ -564,6 +608,50 @@ impl KmsConfig {
         config.validate()?;
         Ok(config)
     }
+}
+
+fn vault_tls_config(skip_tls_verify: bool) -> Option<TlsConfig> {
+    skip_tls_verify.then_some(TlsConfig {
+        ca_cert_path: None,
+        client_cert_path: None,
+        client_key_path: None,
+        skip_verify: true,
+    })
+}
+
+fn development_default_error(reason: &str) -> KmsError {
+    KmsError::configuration_error(format!("{reason}; set {ENV_KMS_ALLOW_INSECURE_DEV_DEFAULTS}=true only for development"))
+}
+
+fn is_under_temp_dir(path: &Path) -> bool {
+    path.starts_with(std::env::temp_dir())
+}
+
+fn validate_vault_development_defaults(
+    backend_name: &str,
+    address: &str,
+    auth_method: &VaultAuthMethod,
+    tls: Option<&TlsConfig>,
+) -> Result<()> {
+    if address.starts_with("http://") {
+        return Err(development_default_error(&format!(
+            "{backend_name} requires HTTPS outside explicit development mode"
+        )));
+    }
+
+    if matches!(auth_method, VaultAuthMethod::Token { token } if token == "dev-token") {
+        return Err(development_default_error(&format!(
+            "{backend_name} default dev-token is not allowed outside explicit development mode"
+        )));
+    }
+
+    if tls.is_some_and(|tls| tls.skip_verify) {
+        return Err(development_default_error(&format!(
+            "{backend_name} skip TLS verification is not allowed outside explicit development mode"
+        )));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -577,19 +665,41 @@ mod tests {
     fn test_default_config() {
         let config = KmsConfig::default();
         assert_eq!(config.backend, KmsBackend::Local);
-        assert!(config.validate().is_ok());
+        assert!(config.validate().is_err());
+        assert!(config.with_insecure_development_defaults().validate().is_ok());
     }
 
     #[test]
     fn test_local_config() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = KmsConfig::local(temp_dir.path().to_path_buf());
+        let config = KmsConfig::local(temp_dir.path().to_path_buf()).with_insecure_development_defaults();
 
         assert_eq!(config.backend, KmsBackend::Local);
         assert!(config.validate().is_ok());
 
         let local_config = config.local_config().expect("Should have local config");
         assert_eq!(local_config.key_dir, temp_dir.path());
+    }
+
+    #[test]
+    fn test_local_development_defaults_require_opt_in() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = KmsConfig::local(temp_dir.path().to_path_buf());
+
+        assert!(config.validate().is_err());
+        assert!(config.with_insecure_development_defaults().validate().is_ok());
+
+        let production_config = KmsConfig {
+            backend: KmsBackend::Local,
+            backend_config: BackendConfig::Local(LocalConfig {
+                key_dir: PathBuf::from("/var/lib/rustfs/kms"),
+                master_key: Some("production-master-key".to_string()),
+                file_permissions: Some(0o600),
+            }),
+            ..Default::default()
+        };
+
+        assert!(production_config.validate().is_ok());
     }
 
     #[test]
@@ -615,6 +725,42 @@ mod tests {
         let vault_config = config.vault_transit_config().expect("Should have vault transit config");
         assert_eq!(vault_config.address, address.as_str());
         assert_eq!(vault_config.mount_path, "transit");
+    }
+
+    #[test]
+    fn test_vault_development_defaults_require_opt_in() {
+        let http_address = Url::parse("http://127.0.0.1:8200").expect("Valid URL");
+        let https_address = Url::parse("https://vault.example.com:8200").expect("Valid URL");
+
+        let http_config = KmsConfig::vault(http_address, "vault-token".to_string());
+        assert!(http_config.validate().is_err());
+        assert!(http_config.with_insecure_development_defaults().validate().is_ok());
+
+        let dev_token_config = KmsConfig::vault(https_address.clone(), "dev-token".to_string());
+        assert!(dev_token_config.validate().is_err());
+        assert!(dev_token_config.with_insecure_development_defaults().validate().is_ok());
+
+        let skip_tls_config = KmsConfig {
+            backend: KmsBackend::VaultTransit,
+            backend_config: BackendConfig::VaultTransit(Box::new(VaultTransitConfig {
+                address: https_address.to_string(),
+                auth_method: VaultAuthMethod::Token {
+                    token: "vault-token".to_string(),
+                },
+                namespace: None,
+                mount_path: "transit".to_string(),
+                tls: Some(TlsConfig {
+                    ca_cert_path: None,
+                    client_cert_path: None,
+                    client_key_path: None,
+                    skip_verify: true,
+                }),
+            })),
+            ..Default::default()
+        };
+
+        assert!(skip_tls_config.validate().is_err());
+        assert!(skip_tls_config.with_insecure_development_defaults().validate().is_ok());
     }
 
     #[test]
@@ -710,7 +856,10 @@ mod tests {
 
     #[test]
     fn test_config_validation() {
-        let mut config = KmsConfig::default();
+        let mut config = KmsConfig {
+            allow_insecure_dev_defaults: true,
+            ..Default::default()
+        };
 
         // Valid config
         assert!(config.validate().is_ok());
@@ -756,6 +905,50 @@ mod tests {
                 assert_eq!(vault.mount_path, "transit-alt");
                 assert_eq!(vault.kv_mount, "secret-alt");
                 assert_eq!(vault.key_path_prefix, "tenant/keys");
+            },
+        );
+    }
+
+    #[test]
+    fn test_from_env_requires_vault_development_opt_in() {
+        with_vars(
+            vec![
+                ("RUSTFS_KMS_BACKEND", Some("vault")),
+                ("RUSTFS_KMS_VAULT_ADDRESS", Some("http://127.0.0.1:8200")),
+                ("RUSTFS_KMS_VAULT_TOKEN", Some("dev-token")),
+            ],
+            || {
+                let error = KmsConfig::from_env().expect_err("vault dev defaults should fail closed");
+                assert!(error.to_string().contains(ENV_KMS_ALLOW_INSECURE_DEV_DEFAULTS));
+            },
+        );
+
+        with_vars(
+            vec![
+                ("RUSTFS_KMS_BACKEND", Some("vault")),
+                ("RUSTFS_KMS_VAULT_ADDRESS", Some("http://127.0.0.1:8200")),
+                ("RUSTFS_KMS_VAULT_TOKEN", Some("dev-token")),
+                (ENV_KMS_ALLOW_INSECURE_DEV_DEFAULTS, Some("true")),
+            ],
+            || {
+                let config = KmsConfig::from_env().expect("explicit development opt-in should allow vault dev defaults");
+                assert!(config.allow_insecure_dev_defaults);
+            },
+        );
+    }
+
+    #[test]
+    fn test_from_env_rejects_vault_skip_tls_verify_without_opt_in() {
+        with_vars(
+            vec![
+                ("RUSTFS_KMS_BACKEND", Some("vault-transit")),
+                ("RUSTFS_KMS_VAULT_ADDRESS", Some("https://vault.example.com")),
+                ("RUSTFS_KMS_VAULT_TOKEN", Some("vault-token")),
+                (ENV_KMS_VAULT_SKIP_TLS_VERIFY, Some("true")),
+            ],
+            || {
+                let error = KmsConfig::from_env().expect_err("skip TLS verify should fail closed");
+                assert!(error.to_string().contains(ENV_KMS_ALLOW_INSECURE_DEV_DEFAULTS));
             },
         );
     }

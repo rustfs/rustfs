@@ -39,8 +39,8 @@ use matchit::Params;
 use rustfs_audit::audit_system;
 use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
 use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
+use rustfs_config::server_config::{Config, KVS};
 use rustfs_config::{AUDIT_DEFAULT_DIR, EVENT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY_SIZE};
-use rustfs_ecstore::config::{Config, KVS};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::catalog::builtin::{builtin_audit_target_admin_descriptors, builtin_notify_target_admin_descriptors};
 use rustfs_targets::manifest::builtin_target_manifest;
@@ -273,12 +273,14 @@ struct ResolvedPluginInstanceTarget {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct KeyValue {
     key: String,
     value: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PluginInstanceBody {
     key_values: Vec<KeyValue>,
 }
@@ -852,7 +854,7 @@ impl Operation for DeletePluginInstanceHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        PluginContractDomain, PluginInstanceFilters, collect_diagnostic_counts, collect_instance_diagnostics,
+        PluginContractDomain, PluginInstanceBody, PluginInstanceFilters, collect_diagnostic_counts, collect_instance_diagnostics,
         extract_plugin_instance_filters, filter_plugin_instances, map_instance, paginate_plugin_instances, parse_bool_filter,
         parse_instance_status, parse_limit_filter, parse_plugin_contract_domain, parse_plugin_instance_diagnostic_code,
         parse_plugin_instance_id, parse_plugin_instance_source, resolve_plugin_instance_target,
@@ -868,8 +870,8 @@ mod tests {
     use rustfs_config::audit::AUDIT_WEBHOOK_SUB_SYS;
     use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
     use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
+    use rustfs_config::server_config::{Config, KV, KVS};
     use rustfs_config::{ENABLE_KEY, WEBHOOK_AUTH_TOKEN, WEBHOOK_ENDPOINT};
-    use rustfs_ecstore::config::{Config, KV, KVS};
     use rustfs_targets::TargetDomain;
     use s3s::{Body, S3Request};
     use std::collections::HashMap;
@@ -1066,6 +1068,19 @@ mod tests {
             mapped.config.get(WEBHOOK_AUTH_TOKEN).map(String::as_str),
             Some(super::REDACTED_SECRET_VALUE)
         );
+    }
+
+    #[test]
+    fn plugin_instance_body_rejects_unknown_fields() {
+        let err = serde_json::from_str::<PluginInstanceBody>(r#"{"key_values":[],"unexpected_field":true}"#)
+            .expect_err("unknown plugin instance body field should fail");
+        assert!(err.to_string().contains("unknown field"));
+
+        let err = serde_json::from_str::<PluginInstanceBody>(
+            r#"{"key_values":[{"key":"endpoint","value":"http://example.com","extra":true}]}"#,
+        )
+        .expect_err("unknown plugin instance key-value field should fail");
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::{KV, KVS};
+use rustfs_config::server_config::{KV, KVS};
 use rustfs_config::{
     DEFAULT_SCANNER_BITROT_CYCLE_SECS, DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS, DEFAULT_SCANNER_CYCLE_MAX_DIRECTORIES,
     DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS, DEFAULT_SCANNER_CYCLE_MAX_OBJECTS, DEFAULT_SCANNER_IDLE_MODE,

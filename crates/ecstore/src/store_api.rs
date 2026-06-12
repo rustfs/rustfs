@@ -15,7 +15,6 @@
 use crate::bucket::metadata_sys::get_versioning_config;
 use crate::bucket::versioning::VersioningApi as _;
 use crate::config::storageclass;
-use crate::disk::DiskStore;
 use crate::error::{Error, Result};
 use crate::rio::{HashReader, LimitReader};
 use crate::store_utils::clean_metadata;
@@ -57,6 +56,8 @@ pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
 mod readers;
 mod traits;
 mod types;
+
+pub(crate) use rustfs_storage_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
 
 pub use readers::*;
 pub use traits::*;

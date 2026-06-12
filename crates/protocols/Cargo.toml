@@ -63,6 +63,7 @@ rustfs-credentials = { workspace = true }
 rustfs-policy = { workspace = true }
 rustfs-utils = { workspace = true }
 rustfs-config = { workspace = true }
+rustfs-storage-api = { workspace = true }
 rustfs-tls-runtime = { workspace = true, optional = true }
 
 # Async dependencies

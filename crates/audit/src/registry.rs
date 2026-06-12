@@ -14,10 +14,15 @@
 
 use crate::{AuditEntry, AuditError, AuditResult, factory::builtin_target_plugins};
 use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
-use rustfs_ecstore::config::{Config, KVS};
+use rustfs_config::server_config::{Config, KVS};
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::{SharedTarget, Target, TargetError, TargetPluginRegistry, TargetRuntimeManager};
 use tracing::info;
+
+const LOG_COMPONENT_AUDIT: &str = "audit";
+const LOG_SUBSYSTEM_REGISTRY: &str = "registry";
+const EVENT_AUDIT_TARGET_REGISTRY_KEY_CREATED: &str = "audit_target_registry_key_created";
+const EVENT_AUDIT_TARGET_REGISTRY_STATE: &str = "audit_target_registry_state";
 
 /// Registry for managing audit targets
 pub struct AuditRegistry {
@@ -155,7 +160,15 @@ impl AuditRegistry {
             if let Some(target) = self.targets.remove(&target_id)
                 && let Err(err) = target.close().await
             {
-                tracing::error!(target_id = %target_id, error = %err, "Failed to close target during shutdown");
+                tracing::error!(
+                    event = EVENT_AUDIT_TARGET_REGISTRY_STATE,
+                    component = LOG_COMPONENT_AUDIT,
+                    subsystem = LOG_SUBSYSTEM_REGISTRY,
+                    target_id = %target_id,
+                    state = "close_failed",
+                    error = %err,
+                    "Failed to close target during shutdown"
+                );
                 if first_error.is_none() {
                     first_error = Some(err);
                 }
@@ -178,7 +191,15 @@ impl AuditRegistry {
     /// * `String` - The unique key for the target.
     pub fn create_key(&self, target_type: &str, target_id: &str) -> String {
         let key = TargetID::new(target_id.to_string(), target_type.to_string());
-        info!(target_type = %target_type, "Create key for {}", key);
+        info!(
+            event = EVENT_AUDIT_TARGET_REGISTRY_KEY_CREATED,
+            component = LOG_COMPONENT_AUDIT,
+            subsystem = LOG_SUBSYSTEM_REGISTRY,
+            target_type = %target_type,
+            target_id = %target_id,
+            registry_key = %key,
+            "Created audit target registry key"
+        );
         key.to_string()
     }
 
@@ -193,7 +214,15 @@ impl AuditRegistry {
     pub fn enable_target(&self, target_type: &str, target_id: &str) -> AuditResult<()> {
         let key = self.create_key(target_type, target_id);
         if self.get_target(&key).is_some() {
-            info!("Target {}-{} enabled", target_type, target_id);
+            info!(
+                event = EVENT_AUDIT_TARGET_REGISTRY_STATE,
+                component = LOG_COMPONENT_AUDIT,
+                subsystem = LOG_SUBSYSTEM_REGISTRY,
+                target_type = %target_type,
+                target_id = %target_id,
+                state = "enabled",
+                "Audit target registry state changed"
+            );
             Ok(())
         } else {
             Err(AuditError::Configuration(
@@ -214,7 +243,15 @@ impl AuditRegistry {
     pub fn disable_target(&self, target_type: &str, target_id: &str) -> AuditResult<()> {
         let key = self.create_key(target_type, target_id);
         if self.get_target(&key).is_some() {
-            info!("Target {}-{} disabled", target_type, target_id);
+            info!(
+                event = EVENT_AUDIT_TARGET_REGISTRY_STATE,
+                component = LOG_COMPONENT_AUDIT,
+                subsystem = LOG_SUBSYSTEM_REGISTRY,
+                target_type = %target_type,
+                target_id = %target_id,
+                state = "disabled",
+                "Audit target registry state changed"
+            );
             Ok(())
         } else {
             Err(AuditError::Configuration(

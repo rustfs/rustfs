@@ -73,17 +73,56 @@ data:
   {{- end }}
   {{- end }}
   {{- with .Values.config.rustfs.scanner }}
-    {{- if .speed }}
+    {{- if ne (toString .speed) "" }}
   RUSTFS_SCANNER_SPEED: {{ .speed | quote }}
     {{- end }}
-    {{- if .start_delay_secs }}
+    {{- if ne (toString .delay) "" }}
+  RUSTFS_SCANNER_DELAY: {{ .delay | quote }}
+    {{- end }}
+    {{- if ne (toString .max_wait_secs) "" }}
+  RUSTFS_SCANNER_MAX_WAIT_SECS: {{ .max_wait_secs | quote }}
+    {{- end }}
+    {{- if ne (toString .cycle_secs) "" }}
+  RUSTFS_SCANNER_CYCLE: {{ .cycle_secs | quote }}
+    {{- end }}
+    {{- if ne (toString .start_delay_secs) "" }}
   RUSTFS_SCANNER_START_DELAY_SECS: {{ .start_delay_secs | quote }}
     {{- end }}
-    {{- if .idle_mode }}
+    {{- if ne (toString .cycle_max_duration_secs) "" }}
+  RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS: {{ .cycle_max_duration_secs | quote }}
+    {{- end }}
+    {{- if ne (toString .cycle_max_objects) "" }}
+  RUSTFS_SCANNER_CYCLE_MAX_OBJECTS: {{ .cycle_max_objects | quote }}
+    {{- end }}
+    {{- if ne (toString .cycle_max_directories) "" }}
+  RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES: {{ .cycle_max_directories | quote }}
+    {{- end }}
+    {{- if ne (toString .bitrot_cycle_secs) "" }}
+  RUSTFS_SCANNER_BITROT_CYCLE_SECS: {{ .bitrot_cycle_secs | quote }}
+    {{- end }}
+    {{- if ne (toString .idle_mode) "" }}
   RUSTFS_SCANNER_IDLE_MODE: {{ .idle_mode | quote }}
     {{- end }}
-    {{- if .cache_save_timeout_secs }}
+    {{- if ne (toString .cache_save_timeout_secs) "" }}
   RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS: {{ .cache_save_timeout_secs | quote }}
+    {{- end }}
+    {{- if ne (toString .max_concurrent_set_scans) "" }}
+  RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS: {{ .max_concurrent_set_scans | quote }}
+    {{- end }}
+    {{- if ne (toString .max_concurrent_disk_scans) "" }}
+  RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS: {{ .max_concurrent_disk_scans | quote }}
+    {{- end }}
+    {{- if ne (toString .yield_every_n_objects) "" }}
+  RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS: {{ .yield_every_n_objects | quote }}
+    {{- end }}
+    {{- if ne (toString .alert_excess_versions) "" }}
+  RUSTFS_SCANNER_ALERT_EXCESS_VERSIONS: {{ .alert_excess_versions | quote }}
+    {{- end }}
+    {{- if ne (toString .alert_excess_version_size) "" }}
+  RUSTFS_SCANNER_ALERT_EXCESS_VERSION_SIZE: {{ .alert_excess_version_size | quote }}
+    {{- end }}
+    {{- if ne (toString .alert_excess_folders) "" }}
+  RUSTFS_SCANNER_ALERT_EXCESS_FOLDERS: {{ .alert_excess_folders | quote }}
     {{- end }}
   {{- end }}
   {{- if .Values.config.rustfs.timeout_profile }}

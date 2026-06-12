@@ -22,10 +22,11 @@ use matchit::Params;
 use rustfs_credentials::get_global_action_cred;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketOperations, BucketOptions, StorageAPI};
+use rustfs_ecstore::store_api::BucketOperations;
 use rustfs_policy::policy::BucketPolicy;
 use rustfs_policy::policy::default::DEFAULT_POLICIES;
 use rustfs_policy::policy::{Args, action::Action, action::S3Action};
+use rustfs_storage_api::{BucketOptions, StorageAdminApi};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
@@ -187,7 +188,7 @@ impl Operation for AccountInfoHandler {
 
         let mut account_info = rustfs_madmin::AccountInfo {
             account_name,
-            server: store.backend_info().await,
+            server: StorageAdminApi::backend_info(store.as_ref()).await,
             policy: serde_json::Value::String(policy_str),
             ..Default::default()
         };

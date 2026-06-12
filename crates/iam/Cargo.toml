@@ -30,7 +30,7 @@ workspace = true
 
 [dependencies]
 rustfs-credentials = { workspace = true }
-rustfs-config = { workspace = true, features = ["constants"] }
+rustfs-config = { workspace = true, features = ["constants", "server-config-model"] }
 tokio.workspace = true
 time = { workspace = true, features = ["serde-human-readable"] }
 serde = { workspace = true, features = ["derive", "rc"] }

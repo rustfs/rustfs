@@ -34,9 +34,22 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | config.rustfs.metrics.enabled | bool | `false` | Toggle metrics export. |
 | config.rustfs.metrics.endpoint | string | `""` | Dedicated metrics endpoint. |
 | config.rustfs.scanner.speed | string | `""` | Scanner speed preset: `fastest`, `fast`, `default`, `slow`, `slowest`. |
+| config.rustfs.scanner.delay | string | `""` | Override scanner sleep multiplier with `RUSTFS_SCANNER_DELAY` (`0` through `10000`). |
+| config.rustfs.scanner.max_wait_secs | string | `""` | Override maximum scanner sleep in seconds with `RUSTFS_SCANNER_MAX_WAIT_SECS`. |
+| config.rustfs.scanner.cycle_secs | string | `""` | Override scanner cycle interval in seconds with `RUSTFS_SCANNER_CYCLE`. |
 | config.rustfs.scanner.start_delay_secs | string | `""` | Override scanner cycle interval in seconds with `RUSTFS_SCANNER_START_DELAY_SECS`. |
+| config.rustfs.scanner.cycle_max_duration_secs | string | `""` | Cap one scanner cycle's runtime in seconds with `RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS` (`0` disables). |
+| config.rustfs.scanner.cycle_max_objects | string | `""` | Cap objects processed by one scanner cycle with `RUSTFS_SCANNER_CYCLE_MAX_OBJECTS` (`0` disables). |
+| config.rustfs.scanner.cycle_max_directories | string | `""` | Cap directories entered by one scanner cycle with `RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES` (`0` disables). |
+| config.rustfs.scanner.bitrot_cycle_secs | string | `""` | Override periodic deep bitrot cycle with `RUSTFS_SCANNER_BITROT_CYCLE_SECS`; `false`, `off`, `no`, or `disabled` disables it. |
 | config.rustfs.scanner.idle_mode | string | `""` | Override scanner idle throttling flag (`RUSTFS_SCANNER_IDLE_MODE`). |
 | config.rustfs.scanner.cache_save_timeout_secs | string | `""` | Override scanner cache save timeout in seconds with `RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS` (minimum `1`). |
+| config.rustfs.scanner.max_concurrent_set_scans | string | `""` | Cap concurrent scanner set tasks with `RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS` (`0` keeps topology-derived concurrency). |
+| config.rustfs.scanner.max_concurrent_disk_scans | string | `""` | Cap concurrent scanner disk bucket walks per set with `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` (`0` keeps disk-count-derived concurrency). |
+| config.rustfs.scanner.yield_every_n_objects | string | `""` | Yield to the async runtime every N scanned objects with `RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS` (`0` disables extra yield). |
+| config.rustfs.scanner.alert_excess_versions | string | `""` | Set version count threshold for scanner alerts with `RUSTFS_SCANNER_ALERT_EXCESS_VERSIONS`. |
+| config.rustfs.scanner.alert_excess_version_size | string | `""` | Set retained version byte threshold for scanner alerts with `RUSTFS_SCANNER_ALERT_EXCESS_VERSION_SIZE`. |
+| config.rustfs.scanner.alert_excess_folders | string | `""` | Set direct subfolder threshold for scanner alerts with `RUSTFS_SCANNER_ALERT_EXCESS_FOLDERS`. |
 | config.rustfs.obs_endpoint.enabled | bool | `false` | Whether to send metrics/logs/traces/profilings to remote endpoint, eg, OLTP. |
 | config.rustfs.obs_endpoint.base_endpoint | string | `""` | Root OTLP/HTTP endpoint, e.g. http://otel-collector:4318. |
 | config.rustfs.obs_endpoint.use_stdout | bool | `false` | Whether to output logs to stdout in addition the OLTP. |
@@ -165,6 +178,10 @@ uer. `ClusterIssuer` or `Issuer`. |
 | gatewayApi.secretName | string | Secret tls to via RustFS using HTTPS. |
 | gatewayApi.existingGateway.name | string | `""` |  The existing gateway name, instead of creating a new one. |
 | gatewayApi.existingGateway.namespace | string | `""` |  The namespace of the existing gateway, if not the local namespace. |
+
+Scanner values map directly to scanner environment variables. For tuning
+workflow and `/v3/scanner/status` interpretation, see
+[Scanner Runtime Controls](../docs/operations/scanner-runtime-controls.md).
 
 ---
 

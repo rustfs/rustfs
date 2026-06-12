@@ -25,6 +25,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
+const LOG_COMPONENT_STARTUP_IAM: &str = "startup_iam";
+const LOG_SUBSYSTEM_BOOTSTRAP: &str = "bootstrap";
+const EVENT_IAM_BOOTSTRAP_RECOVERED: &str = "iam_bootstrap_recovered";
+const EVENT_IAM_BOOTSTRAP_RETRY_FAILED: &str = "iam_bootstrap_retry_failed";
+const EVENT_IAM_READINESS_PUBLISHED: &str = "iam_readiness_published";
+const EVENT_IAM_READINESS_PUBLICATION_FAILED: &str = "iam_readiness_publication_failed";
+const EVENT_IAM_BOOTSTRAP_DEFERRED: &str = "iam_bootstrap_deferred";
+
 const IAM_RETRY_INITIAL_INTERVAL: Duration = Duration::from_secs(5);
 const IAM_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(30);
 /// After this many retries (~5 min at initial interval), escalate log level to ERROR.
@@ -137,6 +145,9 @@ async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
             Ok(()) => {
                 let degraded_secs = degraded_since.elapsed().as_secs();
                 info!(
+                    event = EVENT_IAM_BOOTSTRAP_RECOVERED,
+                    component = LOG_COMPONENT_STARTUP_IAM,
+                    subsystem = LOG_SUBSYSTEM_BOOTSTRAP,
                     attempts,
                     degraded_duration_secs = degraded_secs,
                     "IAM bootstrap recovered after startup; publishing IAM readiness"
@@ -147,15 +158,20 @@ async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
                 let next_interval = compute_backoff_interval(attempts + 1, initial_interval, max_interval);
                 if attempts >= IAM_RETRY_ESCALATION_THRESHOLD {
                     error!(
+                        event = EVENT_IAM_BOOTSTRAP_RETRY_FAILED,
+                        component = LOG_COMPONENT_STARTUP_IAM,
+                        subsystem = LOG_SUBSYSTEM_BOOTSTRAP,
                         attempts,
                         next_retry_secs = next_interval.as_secs(),
                         degraded_duration_secs = degraded_since.elapsed().as_secs(),
                         error = %err,
-                        "IAM bootstrap retry failed after {} attempts; service remains degraded",
-                        attempts
+                        "IAM bootstrap retry failed; service remains degraded"
                     );
                 } else {
                     warn!(
+                        event = EVENT_IAM_BOOTSTRAP_RETRY_FAILED,
+                        component = LOG_COMPONENT_STARTUP_IAM,
+                        subsystem = LOG_SUBSYSTEM_BOOTSTRAP,
                         attempts,
                         next_retry_secs = next_interval.as_secs(),
                         error = %err,
@@ -173,6 +189,9 @@ async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
         match finalize_fn().await {
             Ok(()) => {
                 info!(
+                    event = EVENT_IAM_READINESS_PUBLISHED,
+                    component = LOG_COMPONENT_STARTUP_IAM,
+                    subsystem = LOG_SUBSYSTEM_BOOTSTRAP,
                     init_attempts = attempts,
                     finalize_attempts,
                     degraded_duration_secs = degraded_since.elapsed().as_secs(),
@@ -183,6 +202,9 @@ async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
             Err(err) => {
                 let retry_interval = compute_backoff_interval(finalize_attempts, initial_interval, max_interval);
                 warn!(
+                    event = EVENT_IAM_READINESS_PUBLICATION_FAILED,
+                    component = LOG_COMPONENT_STARTUP_IAM,
+                    subsystem = LOG_SUBSYSTEM_BOOTSTRAP,
                     finalize_attempts,
                     retry_secs = retry_interval.as_secs(),
                     error = %err,
@@ -290,6 +312,9 @@ pub async fn bootstrap_or_defer_iam_init(
         Err(err) => {
             let interval = initial_retry_interval();
             warn!(
+                event = EVENT_IAM_BOOTSTRAP_DEFERRED,
+                component = LOG_COMPONENT_STARTUP_IAM,
+                subsystem = LOG_SUBSYSTEM_BOOTSTRAP,
                 error = %err,
                 initial_retry_secs = interval.as_secs(),
                 max_retry_secs = IAM_RETRY_MAX_INTERVAL.as_secs(),

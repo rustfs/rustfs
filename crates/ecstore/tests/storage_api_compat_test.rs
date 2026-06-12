@@ -12,27 +12,39 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::store_api::{
-    BucketInfo as EcstoreBucketInfo, BucketOptions as EcstoreBucketOptions, MakeBucketOptions as EcstoreMakeBucketOptions,
+use rustfs_ecstore::{
+    disk::DiskStore,
+    error::Error,
+    store::ECStore,
+    store_api::{NamespaceLocking, StorageAPI},
 };
-use rustfs_storage_api::{
-    BucketInfo as ApiBucketInfo, BucketOptions as ApiBucketOptions, MakeBucketOptions as ApiMakeBucketOptions,
-};
+use rustfs_storage_api::StorageAdminApi;
+
+fn storage_admin_api_type_name<T>() -> &'static str
+where
+    T: StorageAdminApi<
+            BackendInfo = rustfs_madmin::BackendInfo,
+            StorageInfo = rustfs_madmin::StorageInfo,
+            Disk = DiskStore,
+            Error = Error,
+        >,
+{
+    std::any::type_name::<T>()
+}
+
+fn storage_api_with_namespace_locking_type_name<T>() -> &'static str
+where
+    T: StorageAPI + NamespaceLocking,
+{
+    std::any::type_name::<T>()
+}
 
 #[test]
-fn old_store_api_bucket_dto_path_reexports_storage_api_types() {
-    let ecstore_bucket: EcstoreBucketInfo = ApiBucketInfo {
-        name: "photos".to_owned(),
-        versioning: true,
-        ..Default::default()
-    };
-    let api_bucket: ApiBucketInfo = ecstore_bucket;
+fn ecstore_implements_storage_admin_api_contract() {
+    assert!(storage_admin_api_type_name::<ECStore>().ends_with("::ECStore"));
+}
 
-    let ecstore_make: EcstoreMakeBucketOptions = ApiMakeBucketOptions::default();
-    let api_options: ApiBucketOptions = EcstoreBucketOptions::default();
-
-    assert_eq!(api_bucket.name, "photos");
-    assert!(api_bucket.versioning);
-    assert!(!ecstore_make.lock_enabled);
-    assert!(!api_options.no_metadata);
+#[test]
+fn ecstore_implements_storage_api_and_namespace_locking_contracts() {
+    assert!(storage_api_with_namespace_locking_type_name::<ECStore>().ends_with("::ECStore"));
 }

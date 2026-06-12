@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{admin_server_info::get_local_server_property, new_object_layer_fn, store_api::StorageAPI};
+use crate::{admin_server_info::get_local_server_property, new_object_layer_fn};
 use chrono::Utc;
 use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, heal_channel::DriveState, metrics::global_metrics};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
@@ -22,6 +22,7 @@ use rustfs_madmin::metrics::{
     ScannerPacingPressureSnapshot as MadminScannerPacingPressureSnapshot,
     ScannerSourceCycleSnapshot as MadminScannerSourceCycleSnapshot, TimedAction as MadminTimedAction,
 };
+use rustfs_storage_api::StorageAdminApi;
 use rustfs_utils::os::get_drive_stats;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -269,7 +270,7 @@ async fn collect_local_disks_metrics(disks: &HashSet<String>) -> HashMap<String,
     };
 
     let mut metrics = HashMap::new();
-    let storage_info = store.local_storage_info().await;
+    let storage_info = StorageAdminApi::local_storage_info(store.as_ref()).await;
     for d in storage_info.disks.iter() {
         if !disks.is_empty() && !disks.contains(&d.endpoint) {
             continue;

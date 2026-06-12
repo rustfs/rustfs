@@ -14,7 +14,7 @@
 
 use super::loader::collect_merged_target_configs_from_env;
 use crate::domain::TargetDomain;
-use rustfs_ecstore::config::{Config, KVS};
+use rustfs_config::server_config::{Config, KVS};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,8 +155,8 @@ mod tests {
     use crate::manifest::builtin_target_manifest;
     use rustfs_config::audit::{AUDIT_ROUTE_PREFIX, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS};
     use rustfs_config::notify::{NOTIFY_ROUTE_PREFIX, NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS};
+    use rustfs_config::server_config::{Config, KVS};
     use rustfs_config::{ENABLE_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_LIMIT};
-    use rustfs_ecstore::config::{Config, KVS};
     use std::collections::HashMap;
 
     fn notify_webhook_descriptor() -> TargetPluginInstanceCompatDescriptor<'static> {

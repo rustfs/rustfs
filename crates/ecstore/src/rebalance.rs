@@ -24,10 +24,11 @@ use crate::global::get_global_endpoints;
 use crate::pools::ListCallback;
 use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
 use crate::store::ECStore;
-use crate::store_api::{GetObjectReader, HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions};
+use crate::store_api::{GetObjectReader, HTTPRangeSpec, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions};
 use http::HeaderMap;
 use rand::RngExt as _;
 use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
+use rustfs_storage_api::StorageAdminApi;
 use rustfs_utils::path::encode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -38,7 +39,14 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_REBALANCE: &str = "rebalance";
+const EVENT_REBALANCE_STATE: &str = "rebalance_state";
+const EVENT_REBALANCE_BUCKET: &str = "rebalance_bucket";
+const EVENT_REBALANCE_ENTRY: &str = "rebalance_entry";
+const EVENT_REBALANCE_LISTING: &str = "rebalance_listing";
 use uuid::Uuid;
 
 const REBAL_META_FMT: u16 = 1; // Replace with actual format value
@@ -565,14 +573,20 @@ impl RebalanceMeta {
     pub fn new() -> Self {
         Self::default()
     }
-    pub async fn load<S: StorageAPI>(&mut self, store: Arc<S>) -> Result<()> {
+    pub async fn load<S: ObjectIO>(&mut self, store: Arc<S>) -> Result<()> {
         self.load_with_opts(store, ObjectOptions::default()).await
     }
 
-    pub async fn load_with_opts<S: StorageAPI>(&mut self, store: Arc<S>, opts: ObjectOptions) -> Result<()> {
+    pub async fn load_with_opts<S: ObjectIO>(&mut self, store: Arc<S>, opts: ObjectOptions) -> Result<()> {
         let (data, _) = read_config_with_metadata(store, REBAL_META_NAME, &opts).await?;
         if data.is_empty() {
-            info!("rebalanceMeta load_with_opts: no data");
+            debug!(
+                event = EVENT_REBALANCE_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                state = "metadata_empty",
+                "Rebalance metadata is empty"
+            );
             return Ok(());
         }
         if data.len() <= 4 {
@@ -594,17 +608,30 @@ impl RebalanceMeta {
 
         self.last_refreshed_at = Some(OffsetDateTime::now_utc());
 
-        info!("rebalanceMeta load_with_opts: loaded meta done");
+        debug!(
+            event = EVENT_REBALANCE_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            state = "metadata_loaded",
+            "Loaded rebalance metadata"
+        );
         Ok(())
     }
 
-    pub async fn save<S: StorageAPI>(&self, store: Arc<S>) -> Result<()> {
+    pub async fn save<S: ObjectIO>(&self, store: Arc<S>) -> Result<()> {
         self.save_with_opts(store, ObjectOptions::default()).await
     }
 
-    pub async fn save_with_opts<S: StorageAPI>(&self, store: Arc<S>, opts: ObjectOptions) -> Result<()> {
+    pub async fn save_with_opts<S: ObjectIO>(&self, store: Arc<S>, opts: ObjectOptions) -> Result<()> {
         if self.pool_stats.is_empty() {
-            info!("rebalanceMeta save_with_opts: no pool stats");
+            debug!(
+                event = EVENT_REBALANCE_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                state = "metadata_save_skipped",
+                reason = "no_pool_stats",
+                "Skipped rebalance metadata save"
+            );
             return Ok(());
         }
 
@@ -624,7 +651,7 @@ impl RebalanceMeta {
 }
 
 impl ECStore {
-    async fn save_rebalance_meta_with_merge<S: StorageAPI>(
+    async fn save_rebalance_meta_with_merge<S: StorageAPI + NamespaceLocking>(
         &self,
         pool: Arc<S>,
         local_snapshot: &RebalanceMeta,
@@ -657,10 +684,15 @@ impl ECStore {
     #[tracing::instrument(skip_all)]
     pub async fn load_rebalance_meta(&self) -> Result<()> {
         let mut meta = RebalanceMeta::new();
-        info!("rebalanceMeta: store load rebalance meta");
+        debug!(
+            event = EVENT_REBALANCE_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            state = "metadata_loading",
+            "Loading rebalance metadata"
+        );
         let pool = clone_first_arc(&self.pools, "rebalanceMeta: no pools available")?;
         if resolve_rebalance_meta_load_result(meta.load(pool).await)? {
-            info!("rebalanceMeta: rebalance meta loaded0");
             {
                 let mut rebalance_meta = self.rebalance_meta.write().await;
 
@@ -669,12 +701,23 @@ impl ECStore {
                 drop(rebalance_meta);
             }
 
-            info!("rebalanceMeta: rebalance meta loaded1");
-
             resolve_load_rebalance_stats_update_result(self.update_rebalance_stats().await)?;
-            info!("rebalanceMeta: rebalance meta loaded2");
+            debug!(
+                event = EVENT_REBALANCE_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                state = "metadata_loaded",
+                "Loaded rebalance metadata"
+            );
         } else {
-            info!("rebalanceMeta: not found, rebalance not started");
+            debug!(
+                event = EVENT_REBALANCE_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                state = "metadata_missing",
+                reason = "rebalance_not_started",
+                "Rebalance metadata not found"
+            );
         }
 
         Ok(())
@@ -689,13 +732,25 @@ impl ECStore {
             clone_rebalance_pool_stats(rebalance_meta.as_ref())?
         };
 
-        info!("update_rebalance_stats: pool_stats: {:?}", &pool_stats);
+        debug!(
+            event = EVENT_REBALANCE_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            pool_count = pool_stats.len(),
+            "Refreshing rebalance stats snapshot"
+        );
 
         for i in 0..self.pools.len() {
             if pool_stats.get(i).is_none() {
-                info!("update_rebalance_stats: pool {} not found", i);
                 let mut rebalance_meta = self.rebalance_meta.write().await;
-                info!("update_rebalance_stats: pool {} not found, add", i);
+                debug!(
+                    event = EVENT_REBALANCE_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    pool_index = i,
+                    state = "pool_stat_missing",
+                    "Adding missing rebalance pool stats entry"
+                );
                 if let Some(meta) = rebalance_meta.as_mut() {
                     meta.pool_stats.push(RebalanceStats::default());
                 }
@@ -705,7 +760,13 @@ impl ECStore {
         }
 
         if ok {
-            info!("update_rebalance_stats: save rebalance meta");
+            debug!(
+                event = EVENT_REBALANCE_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                state = "metadata_saving",
+                "Saving rebalance metadata after stats refresh"
+            );
 
             let rebalance_meta = self.rebalance_meta.read().await;
             if let Some(meta) = rebalance_meta.as_ref() {
@@ -731,8 +792,15 @@ impl ECStore {
 
     #[tracing::instrument(skip(self))]
     pub async fn init_rebalance_meta(&self, bucktes: Vec<String>) -> Result<String> {
-        info!("init_rebalance_meta: start rebalance");
-        let si = self.storage_info().await;
+        info!(
+            event = EVENT_REBALANCE_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            state = "initializing",
+            bucket_count = bucktes.len(),
+            "Initializing rebalance metadata"
+        );
+        let si = StorageAdminApi::storage_info(self).await;
 
         let mut disk_stats = vec![DiskStat::default(); self.pools.len()];
 
@@ -923,7 +991,13 @@ impl ECStore {
 
     #[tracing::instrument(skip_all)]
     pub async fn start_rebalance(self: &Arc<Self>) -> Result<()> {
-        info!("start_rebalance: start rebalance");
+        info!(
+            event = EVENT_REBALANCE_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            state = "starting",
+            "Starting rebalance"
+        );
         let decommission_running = self.is_decommission_running().await;
         // let rebalance_meta = self.rebalance_meta.read().await;
 
@@ -939,7 +1013,14 @@ impl ECStore {
                 return Err(Error::ConfigNotFound);
             };
             if should_skip_start_rebalance(meta.cancel.is_some(), is_rebalance_in_progress(meta)) {
-                info!("start_rebalance: already in progress, skip duplicate start");
+                debug!(
+                    event = EVENT_REBALANCE_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    state = "start_skipped",
+                    reason = "already_in_progress",
+                    "Skipped duplicate rebalance start"
+                );
                 return Ok(());
             }
             if complete_rebalance_pools_at_goal(meta, OffsetDateTime::now_utc()) {
@@ -962,24 +1043,45 @@ impl ECStore {
         let participants = if let Some(ref meta) = *self.rebalance_meta.read().await {
             resolve_rebalance_participants(meta.pool_stats.as_slice(), self.pools.len())
         } else {
-            info!("start_rebalance:2  rebalance_meta is None exit");
+            debug!(
+                event = EVENT_REBALANCE_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                state = "start_skipped",
+                reason = "metadata_missing",
+                "Skipped rebalance start because metadata is unavailable"
+            );
             Vec::new()
         };
 
         for (idx, participating) in participants.iter().enumerate() {
             if !*participating {
-                info!("start_rebalance: pool {} is not participating, skipping", idx);
+                debug!(
+                    event = EVENT_REBALANCE_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    pool_index = idx,
+                    state = "pool_skipped",
+                    reason = "not_participating",
+                    "Skipped rebalance pool"
+                );
                 continue;
             }
 
-            if !get_global_endpoints().as_ref().get(idx).is_some_and(|v| {
-                info!("start_rebalance: pool {} endpoints: {:?}", idx, v.endpoints);
-                v.endpoints.as_ref().first().is_some_and(|e| {
-                    info!("start_rebalance: pool {} endpoint: {:?}, is_local: {}", idx, e, e.is_local);
-                    e.is_local
-                })
-            }) {
-                info!("start_rebalance: pool {} is not local, skipping", idx);
+            if !get_global_endpoints()
+                .as_ref()
+                .get(idx)
+                .is_some_and(|v| v.endpoints.as_ref().first().is_some_and(|e| e.is_local))
+            {
+                debug!(
+                    event = EVENT_REBALANCE_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    pool_index = idx,
+                    state = "pool_skipped",
+                    reason = "not_local",
+                    "Skipped non-local rebalance pool"
+                );
                 continue;
             }
 
@@ -990,12 +1092,25 @@ impl ECStore {
                 if let Err(err) = store.rebalance_buckets(rx_clone, pool_idx).await {
                     error!("Rebalance failed for pool {}: {}", pool_idx, err);
                 } else {
-                    info!("Rebalance completed for pool {}", pool_idx);
+                    info!(
+                        event = EVENT_REBALANCE_STATE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        pool_index = pool_idx,
+                        state = "completed",
+                        "Completed rebalance pool"
+                    );
                 }
             });
         }
 
-        info!("start_rebalance: rebalance started done");
+        info!(
+            event = EVENT_REBALANCE_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            state = "started",
+            "Started rebalance"
+        );
         Ok(())
     }
 
@@ -1028,9 +1143,13 @@ impl ECStore {
                                     pool_stat.info.status,
                                     &terminal_event,
                                 ) {
-                                    info!(
-                                        "rebalance_buckets: preserving stopped status for pool {}",
-                                        pool_index
+                                    debug!(
+                                        event = EVENT_REBALANCE_STATE,
+                                        component = LOG_COMPONENT_ECSTORE,
+                                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                                        pool_index,
+                                        state = "stopped_preserved",
+                                        "Preserved stopped rebalance status"
                                     );
                                 } else {
                                     apply_rebalance_terminal_event(
@@ -1057,11 +1176,27 @@ impl ECStore {
                         return Err(wrapped);
                     }
                 } else {
-                    info!(msg);
+                    debug!(
+                        event = EVENT_REBALANCE_STATE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        pool_index,
+                        state = "metadata_saved",
+                        message = %msg,
+                        "Saved rebalance metadata"
+                    );
                 }
 
                 if quit {
-                    info!("{}: exiting save_task", msg);
+                    debug!(
+                        event = EVENT_REBALANCE_STATE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        pool_index,
+                        state = "save_task_exiting",
+                        message = %msg,
+                        "Exiting rebalance save task"
+                    );
                     return Ok(());
                 }
 
@@ -1069,13 +1204,28 @@ impl ECStore {
             }
         });
 
-        info!("Pool {} rebalancing is started", pool_index);
+        info!(
+            event = EVENT_REBALANCE_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            pool_index,
+            state = "pool_started",
+            "Started rebalance worker"
+        );
         let mut final_result: Result<()> = Ok(());
         let mut deferred_buckets = HashSet::new();
 
         loop {
             if rx.is_cancelled() {
-                info!("Pool {} rebalancing is stopped", pool_index);
+                info!(
+                    event = EVENT_REBALANCE_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    pool_index,
+                    state = "pool_stopped",
+                    reason = "cancelled",
+                    "Stopped rebalance worker"
+                );
                 let err = Error::OperationCanceled;
                 final_result = Err(resolve_rebalance_terminal_error(
                     err.clone(),
@@ -1097,7 +1247,15 @@ impl ECStore {
             };
 
             if let Some(bucket) = next_bucket {
-                info!("Rebalancing bucket: start {}", bucket);
+                debug!(
+                    event = EVENT_REBALANCE_BUCKET,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    pool_index,
+                    bucket = %bucket,
+                    state = "started",
+                    "Starting rebalance bucket"
+                );
 
                 let outcome = match resolve_rebalance_bucket_result(
                     self.rebalance_bucket(rx.clone(), bucket.clone(), pool_index).await,
@@ -1128,7 +1286,16 @@ impl ECStore {
                         break;
                     }
 
-                    warn!("Rebalance bucket deferred due to transient object failures: {bucket}: {last_error}");
+                    warn!(
+                        event = EVENT_REBALANCE_BUCKET,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        pool_index,
+                        bucket = %bucket,
+                        state = "deferred",
+                        error = %last_error,
+                        "Deferred rebalance bucket after transient object failures"
+                    );
                     if let Err(err) = self.defer_rebalance_bucket(pool_index, bucket.clone(), last_error).await {
                         error!("defer_rebalance_bucket failed for pool {}: {:?}", pool_index, err);
                         final_result = Err(resolve_rebalance_terminal_error(
@@ -1140,7 +1307,15 @@ impl ECStore {
                     continue;
                 }
 
-                info!("Rebalance bucket: done {} ", bucket);
+                debug!(
+                    event = EVENT_REBALANCE_BUCKET,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    pool_index,
+                    bucket = %bucket,
+                    state = "completed",
+                    "Completed rebalance bucket"
+                );
                 if let Err(err) = self.bucket_rebalance_done(pool_index, bucket).await {
                     error!("bucket_rebalance_done failed for pool {}: {:?}", pool_index, err);
                     final_result = Err(resolve_rebalance_terminal_error(
@@ -1150,12 +1325,27 @@ impl ECStore {
                     break;
                 }
             } else {
-                info!("Rebalance bucket: no bucket to rebalance");
+                debug!(
+                    event = EVENT_REBALANCE_BUCKET,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    pool_index,
+                    state = "idle",
+                    reason = "no_bucket_to_rebalance",
+                    "No rebalance bucket available"
+                );
                 break;
             }
         }
 
-        info!("Pool {} rebalancing is done", pool_index);
+        info!(
+            event = EVENT_REBALANCE_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            pool_index,
+            state = "pool_done",
+            "Finished rebalance worker"
+        );
 
         if final_result.is_ok()
             && let Err(err) = send_rebalance_done_signal(&done_tx, Ok(()), pool_index).await
@@ -1180,7 +1370,14 @@ impl ECStore {
         {
             // Check if the pool's rebalance status is already completed
             if pool_stat.info.status == RebalStatus::Completed {
-                info!("check_if_rebalance_done: pool {} is already completed", pool_index);
+                debug!(
+                    event = EVENT_REBALANCE_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    pool_index,
+                    state = "already_completed",
+                    "Rebalance pool is already completed"
+                );
                 return true;
             }
 
@@ -1201,7 +1398,15 @@ impl ECStore {
             {
                 pool_stat.info.status = RebalStatus::Completed;
                 pool_stat.info.end_time = Some(OffsetDateTime::now_utc());
-                info!("check_if_rebalance_done: pool {} is completed, pfi: {}", pool_index, pfi);
+                info!(
+                    event = EVENT_REBALANCE_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    pool_index,
+                    state = "completed",
+                    percent_free = pfi,
+                    "Marked rebalance pool completed"
+                );
                 return true;
             }
         }
@@ -1270,21 +1475,53 @@ fn resolve_next_rebalance_bucket(meta: Option<&RebalanceMeta>, pool_index: usize
     };
 
     if pool_stat.info.status == RebalStatus::Completed || !pool_stat.participating {
-        info!("next_rebal_bucket: pool_index: {} completed or not participating", pool_index);
+        debug!(
+            event = EVENT_REBALANCE_BUCKET,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            pool_index,
+            state = "unavailable",
+            reason = "completed_or_not_participating",
+            "No rebalance bucket available"
+        );
         return Ok(None);
     }
 
     if pool_stat.buckets.is_empty() {
-        info!("next_rebal_bucket: pool_index: {} buckets is empty", pool_index);
+        debug!(
+            event = EVENT_REBALANCE_BUCKET,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            pool_index,
+            state = "unavailable",
+            reason = "bucket_queue_empty",
+            "No rebalance bucket available"
+        );
         return Ok(None);
     }
 
     if let Some(bucket) = next_rebal_bucket_from_stat(pool_stat) {
-        info!("next_rebal_bucket: pool_index: {} bucket: {}", pool_index, bucket);
+        debug!(
+            event = EVENT_REBALANCE_BUCKET,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            pool_index,
+            bucket = %bucket,
+            state = "selected",
+            "Selected rebalance bucket"
+        );
         return Ok(Some(bucket));
     }
 
-    info!("next_rebal_bucket: pool_index: {} None", pool_index);
+    debug!(
+        event = EVENT_REBALANCE_BUCKET,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_REBALANCE,
+        pool_index,
+        state = "unavailable",
+        reason = "selection_returned_none",
+        "No rebalance bucket available"
+    );
     Ok(None)
 }
 
@@ -1298,10 +1535,17 @@ fn mark_rebalance_bucket_done(meta: Option<&mut RebalanceMeta>, pool_index: usiz
         return Err(invalid_rebalance_pool_index_error(pool_index, meta.pool_stats.len()));
     };
 
-    info!("bucket_rebalance_done: buckets {:?}", &pool_stat.buckets);
-
     if take_bucket_from_rebalance_queue(pool_stat, bucket) {
-        info!("bucket_rebalance_done: bucket {} rebalanced", bucket);
+        debug!(
+            event = EVENT_REBALANCE_BUCKET,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            pool_index,
+            bucket = %bucket,
+            state = "queue_removed",
+            remaining_bucket_count = pool_stat.buckets.len(),
+            "Removed bucket from rebalance queue"
+        );
         if has_deferred_rebalance_error(pool_stat) {
             pool_stat.info.last_error = None;
         }
@@ -2035,7 +2279,16 @@ impl ECStore {
         bucket_configs: Arc<RebalanceBucketConfigs>,
         // wk: Arc<Workers>,
     ) -> Result<RebalanceEntryOutcome> {
-        info!("rebalance_entry: start rebalance_entry");
+        debug!(
+            event = EVENT_REBALANCE_ENTRY,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            bucket = %bucket,
+            object = %entry.name,
+            pool_index,
+            state = "started",
+            "Starting rebalance entry"
+        );
 
         // defer!(|| async {
         //     warn!("rebalance_entry: defer give worker start");
@@ -2044,12 +2297,32 @@ impl ECStore {
         // });
 
         if entry.is_dir() {
-            info!("rebalance_entry: entry is dir, skipping");
+            debug!(
+                event = EVENT_REBALANCE_ENTRY,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                bucket = %bucket,
+                object = %entry.name,
+                pool_index,
+                state = "skipped",
+                reason = "directory_entry",
+                "Skipped rebalance entry"
+            );
             return Ok(RebalanceEntryOutcome::Completed);
         }
 
         if self.check_if_rebalance_done(pool_index).await {
-            info!("rebalance_entry: rebalance done, skipping pool {}", pool_index);
+            debug!(
+                event = EVENT_REBALANCE_ENTRY,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                pool_index,
+                bucket = %bucket,
+                object = %entry.name,
+                state = "skipped",
+                reason = "pool_completed",
+                "Skipped rebalance entry"
+            );
             return Ok(RebalanceEntryOutcome::Completed);
         }
 
@@ -2076,16 +2349,33 @@ impl ECStore {
             .await
             {
                 expired += 1;
-                info!("rebalance_entry {} Entry {} expired by lifecycle, skipping", &bucket, version.name);
+                debug!(
+                    event = EVENT_REBALANCE_ENTRY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    pool_index,
+                    bucket = %bucket,
+                    object = %version.name,
+                    state = "skipped",
+                    reason = "expired_by_lifecycle",
+                    "Skipped rebalance version"
+                );
                 continue;
             }
 
             let remaining_versions = fivs.versions.len() - expired;
             if should_skip_rebalance_delete_marker(version, remaining_versions, bucket_configs.replication_config.is_some()) {
                 rebalanced += 1;
-                info!(
-                    "rebalance_entry Entry {} is deleted and last version without replication, skipping",
-                    version.name
+                debug!(
+                    event = EVENT_REBALANCE_ENTRY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    pool_index,
+                    bucket = %bucket,
+                    object = %version.name,
+                    state = "skipped",
+                    reason = "last_delete_marker_without_replication",
+                    "Skipped rebalance version"
                 );
                 continue;
             }
@@ -2111,7 +2401,17 @@ impl ECStore {
                 if should_count_rebalance_version_complete(&result) {
                     rebalanced += 1;
                 }
-                info!("rebalance_entry {} Entry {} is already deleted, skipping", &bucket, version.name);
+                debug!(
+                    event = EVENT_REBALANCE_ENTRY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    pool_index,
+                    bucket = %bucket,
+                    object = %version.name,
+                    state = "skipped",
+                    reason = "already_deleted",
+                    "Skipped rebalance version"
+                );
                 continue;
             }
 
@@ -2130,8 +2430,15 @@ impl ECStore {
                 if should_defer_rebalance_entry_failure(&err) {
                     let deferred_error = format!("{REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX} {err}");
                     warn!(
-                        "rebalance_entry {} deferring transient migration failure for {}/{:?}: {}",
-                        &bucket, &version.name, &version.version_id, err
+                        event = EVENT_REBALANCE_ENTRY,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        pool_index,
+                        bucket = %bucket,
+                        object = %version.name,
+                        state = "deferred",
+                        error = %err,
+                        "Deferred rebalance entry after transient migration failure"
                     );
                     if let Err(stats_err) = self.update_rebalance_last_error(pool_index, deferred_error.clone()).await {
                         error!(
@@ -2191,7 +2498,16 @@ impl ECStore {
                 entry.name.as_str(),
             )
             .map_err(|err| with_rebalance_entry_context("cleanup_source", bucket.as_str(), entry.name.as_str(), err))?;
-            info!("rebalance_entry {} Entry {} deleted successfully", &bucket, &entry.name);
+            debug!(
+                event = EVENT_REBALANCE_ENTRY,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                pool_index,
+                bucket = %bucket,
+                object = %entry.name,
+                state = "source_deleted",
+                "Deleted rebalance source entry"
+            );
         }
 
         Ok(RebalanceEntryOutcome::Completed)
@@ -2287,7 +2603,14 @@ impl ECStore {
 
                         let task = tokio::spawn(async move {
                             let _permit = permit;
-                            info!("rebalance_entry: rebalance entry task start");
+                            debug!(
+                                event = EVENT_REBALANCE_ENTRY,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                                set_index = set_idx,
+                                state = "task_started",
+                                "Started rebalance entry task"
+                            );
                             let result = this.rebalance_entry(bucket, pool_index, entry, set, bucket_configs).await;
                             if let Err(err) = &result {
                                 error!("rebalance_entry: rebalance entry failed: {err}");
@@ -2297,7 +2620,14 @@ impl ECStore {
                                     callback_rx.cancel();
                                 }
                             }
-                            info!("rebalance_entry: rebalance entry task done");
+                            debug!(
+                                event = EVENT_REBALANCE_ENTRY,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                                set_index = set_idx,
+                                state = "task_completed",
+                                "Completed rebalance entry task"
+                            );
                             result
                         });
 
@@ -2326,7 +2656,14 @@ impl ECStore {
                 if let Err(err) = &result {
                     error!("Rebalance worker {} error: {}", set_idx, err);
                 } else {
-                    info!("Rebalance worker {} done", set_idx);
+                    debug!(
+                        event = EVENT_REBALANCE_STATE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        set_index = set_idx,
+                        state = "worker_completed",
+                        "Completed rebalance worker"
+                    );
                 }
                 result
             });
@@ -2354,7 +2691,15 @@ impl ECStore {
             return Ok(RebalanceBucketOutcome::Deferred { last_error });
         }
 
-        info!("rebalance_bucket: rebalance_bucket done");
+        debug!(
+            event = EVENT_REBALANCE_BUCKET,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            pool_index,
+            bucket = %bucket,
+            state = "completed",
+            "Finished rebalance bucket"
+        );
         Ok(RebalanceBucketOutcome::Completed)
     }
 

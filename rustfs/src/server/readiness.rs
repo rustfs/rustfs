@@ -24,9 +24,9 @@ use rustfs_common::GlobalReadiness;
 use rustfs_ecstore::global::is_dist_erasure;
 use rustfs_ecstore::global::{get_global_endpoints_opt, get_global_lock_clients};
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::StorageAPI;
 use rustfs_iam::get_global_iam_sys;
 use rustfs_madmin::{Disk, StorageInfo};
+use rustfs_storage_api::StorageAdminApi;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -489,7 +489,7 @@ async fn collect_dependency_readiness_uncached() -> DependencyReadiness {
 
 async fn collect_storage_readiness_uncached() -> bool {
     if let Some(store) = new_object_layer_fn() {
-        let storage_info = store.storage_info().await;
+        let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
         storage_ready_from_runtime_state(&storage_info)
     } else {
         false

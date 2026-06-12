@@ -21,7 +21,7 @@
 //!   → generates x-request-id UUID
 //!   → RequestContextLayer creates RequestContext
 //!     → stores in request.extensions()
-//!     → sets x-amz-request-id header
+//!     → stores the S3-compatible request-id alias without changing signed headers
 //! Auth (FS::check)
 //!   → copies RequestContext into ReqInfo.request_context
 //! Storage (FS methods)
@@ -98,6 +98,11 @@ impl RequestContext {
             span_id: trace_ctx.as_ref().map(|(_, span_id)| span_id.clone()),
             start_time: Instant::now(),
         }
+    }
+
+    /// Return the elapsed request lifetime in whole milliseconds.
+    pub fn duration_ms(&self) -> u64 {
+        self.start_time.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
     }
 }
 
@@ -215,6 +220,12 @@ mod tests {
             assert_eq!(ctx.trace_id.as_deref(), Some(trace_id));
             assert!(ctx.span_id.is_some());
         });
+    }
+
+    #[test]
+    fn test_request_context_duration_ms_is_non_negative() {
+        let ctx = RequestContext::fallback();
+        assert!(ctx.duration_ms() <= 10);
     }
 
     #[test]

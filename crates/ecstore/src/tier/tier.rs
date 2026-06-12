@@ -46,12 +46,11 @@ use crate::tier::{
     warm_backend::{check_warm_backend, new_warm_backend},
 };
 use crate::{
-    StorageAPI,
     config::com::{CONFIG_PREFIX, read_config},
     disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET},
     global::is_first_cluster_node_local,
     store::ECStore,
-    store_api::{ObjectIO as _, ObjectOptions, PutObjReader},
+    store_api::{ObjectIO, ObjectOperations, ObjectOptions, PutObjReader},
 };
 use rustfs_rio::HashReader;
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join};
@@ -1033,14 +1032,14 @@ impl TierConfigMgr {
         self.save_tiering_config(api).await
     }
 
-    pub async fn save_tiering_config<S: StorageAPI>(&self, api: Arc<S>) -> std::result::Result<(), std::io::Error> {
+    pub async fn save_tiering_config<S: ObjectIO>(&self, api: Arc<S>) -> std::result::Result<(), std::io::Error> {
         let data = encode_external_tiering_config_blob(self)?;
         let config_file = tier_config_path(TIER_CONFIG_FILE);
 
         self.save_config(api, &config_file, data).await
     }
 
-    pub async fn save_config<S: StorageAPI>(
+    pub async fn save_config<S: ObjectIO>(
         &self,
         api: Arc<S>,
         file: &str,
@@ -1058,7 +1057,7 @@ impl TierConfigMgr {
         .await
     }
 
-    pub async fn save_config_with_opts<S: StorageAPI>(
+    pub async fn save_config_with_opts<S: ObjectIO>(
         &self,
         api: Arc<S>,
         file: &str,
@@ -1100,7 +1099,7 @@ impl TierConfigMgr {
     }
 }
 
-async fn new_and_save_tiering_config<S: StorageAPI>(api: Arc<S>) -> Result<TierConfigMgr> {
+async fn new_and_save_tiering_config<S: ObjectIO>(api: Arc<S>) -> Result<TierConfigMgr> {
     let mut cfg = TierConfigMgr {
         driver_cache: HashMap::new(),
         tiers: HashMap::new(),
@@ -1159,7 +1158,7 @@ async fn load_tier_config(api: Arc<ECStore>) -> std::result::Result<TierConfigMg
     }
 }
 
-async fn read_tier_config_from_bucket<S: StorageAPI>(
+async fn read_tier_config_from_bucket<S: ObjectIO>(
     api: Arc<S>,
     bucket: &str,
     path: &str,
@@ -1177,7 +1176,7 @@ async fn read_tier_config_from_bucket<S: StorageAPI>(
     Ok(Some(data))
 }
 
-async fn write_tier_config_to_rustfs<S: StorageAPI>(api: Arc<S>, path: &str, data: Bytes) -> io::Result<()> {
+async fn write_tier_config_to_rustfs<S: ObjectIO>(api: Arc<S>, path: &str, data: Bytes) -> io::Result<()> {
     let mut put_data = PutObjReader::from_vec(data.to_vec());
     api.put_object(
         RUSTFS_META_BUCKET,
@@ -1193,7 +1192,10 @@ async fn write_tier_config_to_rustfs<S: StorageAPI>(api: Arc<S>, path: &str, dat
     Ok(())
 }
 
-pub async fn try_migrate_tiering_config<S: StorageAPI>(api: Arc<S>) {
+pub async fn try_migrate_tiering_config<S>(api: Arc<S>)
+where
+    S: ObjectIO + ObjectOperations,
+{
     let target_path = tier_config_path(TIER_CONFIG_FILE);
     if api
         .get_object_info(
@@ -1228,10 +1230,20 @@ pub async fn try_migrate_tiering_config<S: StorageAPI>(api: Arc<S>) {
                     return;
                 }
             }
-            Err(err) => warn!("legacy tier config is incompatible, skip local migration: {}", err),
+            Err(err) => debug!(
+                bucket = RUSTFS_META_BUCKET,
+                path = %legacy_path,
+                error = %err,
+                "Skipping incompatible legacy tier config migration"
+            ),
         },
         Ok(None) => {}
-        Err(err) => warn!("read legacy local tier config failed: {}", err),
+        Err(err) => debug!(
+            bucket = RUSTFS_META_BUCKET,
+            path = %legacy_path,
+            error = %err,
+            "Skipping legacy tier config migration after read failure"
+        ),
     }
 
     match read_tier_config_from_bucket(api.clone(), MIGRATING_META_BUCKET, &target_path, &opts).await {
@@ -1241,10 +1253,20 @@ pub async fn try_migrate_tiering_config<S: StorageAPI>(api: Arc<S>) {
                     info!("Migrated compatible tier config from migrating metadata bucket");
                 }
             }
-            Err(err) => warn!("migrating tier config is incompatible, skip migration: {}", err),
+            Err(err) => debug!(
+                bucket = MIGRATING_META_BUCKET,
+                path = %target_path,
+                error = %err,
+                "Skipping incompatible migrating tier config"
+            ),
         },
         Ok(None) => {}
-        Err(err) => warn!("read migrating tier config failed: {}", err),
+        Err(err) => debug!(
+            bucket = MIGRATING_META_BUCKET,
+            path = %target_path,
+            error = %err,
+            "Skipping migrating tier config after read failure"
+        ),
     }
 }
 

@@ -26,8 +26,9 @@ use openidconnect::{
 };
 use reqwest::Client;
 use rustfs_config::oidc::*;
+use rustfs_config::server_config::get_global_server_config;
+use rustfs_config::server_config::{Config as ServerConfig, KVS};
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
-use rustfs_ecstore::config::{Config as ServerConfig, KVS, get_global_server_config};
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -1867,17 +1868,17 @@ mod tests {
     fn test_parse_persisted_provider_config() {
         let mut cfg = ServerConfig::new();
         let mut kvs = KVS(vec![
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: ENABLE_KEY.to_string(),
                 value: EnableState::Off.to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: OIDC_CONFIG_URL.to_string(),
                 value: String::new(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: OIDC_CLIENT_ID.to_string(),
                 value: String::new(),
                 hidden_if_empty: false,
@@ -1908,17 +1909,17 @@ mod tests {
     fn test_parse_persisted_provider_config_omitted_roles_claim_is_empty() {
         let mut cfg = ServerConfig::new();
         let mut kvs = KVS(vec![
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: ENABLE_KEY.to_string(),
                 value: EnableState::Off.to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: OIDC_CONFIG_URL.to_string(),
                 value: String::new(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: OIDC_CLIENT_ID.to_string(),
                 value: String::new(),
                 hidden_if_empty: false,
@@ -2125,17 +2126,17 @@ mod tests {
     fn test_parse_persisted_hide_from_ui_off_is_false() {
         let mut cfg = ServerConfig::new();
         let mut kvs = KVS(vec![
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: ENABLE_KEY.to_string(),
                 value: EnableState::On.to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: OIDC_CONFIG_URL.to_string(),
                 value: "https://example.com/.well-known/openid-configuration".to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: OIDC_CLIENT_ID.to_string(),
                 value: "console".to_string(),
                 hidden_if_empty: false,
@@ -2157,17 +2158,17 @@ mod tests {
     fn test_parse_persisted_hide_from_ui_missing_defaults_false() {
         let mut cfg = ServerConfig::new();
         let kvs = KVS(vec![
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: ENABLE_KEY.to_string(),
                 value: EnableState::On.to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: OIDC_CONFIG_URL.to_string(),
                 value: "https://example.com/.well-known/openid-configuration".to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: OIDC_CLIENT_ID.to_string(),
                 value: "console".to_string(),
                 hidden_if_empty: false,
@@ -2188,17 +2189,17 @@ mod tests {
     fn test_parse_persisted_hide_from_ui() {
         let mut cfg = ServerConfig::new();
         let mut kvs = KVS(vec![
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: ENABLE_KEY.to_string(),
                 value: EnableState::On.to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: OIDC_CONFIG_URL.to_string(),
                 value: "https://example.com/.well-known/openid-configuration".to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: OIDC_CLIENT_ID.to_string(),
                 value: "console".to_string(),
                 hidden_if_empty: false,

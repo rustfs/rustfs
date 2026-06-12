@@ -26,7 +26,7 @@ use crate::{
     runtime_view::NotifyRuntimeView,
     status_view::NotifyStatusView,
 };
-use rustfs_ecstore::config::Config;
+use rustfs_config::server_config::Config;
 use rustfs_targets::ReplayWorkerManager;
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore, broadcast};
@@ -81,7 +81,7 @@ mod tests {
         integration::NotificationMetrics, notification_system_subscriber::NotificationSystemSubscriberView,
         notifier::EventNotifier, pipeline::LiveEventHistory, registry::TargetRegistry, rule_engine::NotifyRuleEngine,
     };
-    use rustfs_ecstore::config::Config;
+    use rustfs_config::server_config::Config;
     use rustfs_targets::ReplayWorkerManager;
     use std::sync::Arc;
     use tokio::sync::{RwLock, Semaphore, broadcast};

@@ -25,15 +25,14 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_ecstore::rebalance::RebalanceMeta;
 use rustfs_ecstore::{
-    StorageAPI,
     error::StorageError,
     new_object_layer_fn,
     notification_sys::get_global_notification_sys,
     rebalance::{DiskStat, RebalSaveOpt},
     store_api::BucketOperations,
-    store_api::BucketOptions,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_storage_api::{BucketOptions, StorageAdminApi};
 use s3s::{
     Body, S3Request, S3Response, S3Result,
     header::{CONTENT_LENGTH, CONTENT_TYPE},
@@ -347,7 +346,7 @@ impl Operation for RebalanceStatus {
         }
 
         // Compute disk usage percentage
-        let si = store.storage_info().await;
+        let si = StorageAdminApi::storage_info(store.as_ref()).await;
         let mut disk_stats = vec![DiskStat::default(); store.pools.len()];
 
         for disk in si.disks.iter() {

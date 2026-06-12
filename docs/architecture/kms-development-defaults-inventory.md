@@ -46,32 +46,56 @@ current KMS development defaults before any production default hardening.
 - Existing validation does not fail closed for HTTP Vault addresses, dev-token,
   missing local master key, temp key dirs, or explicit `skip_tls_verify = true`.
 
-## Hardening Follow-Ups
+## Hardening Behavior
 
-`KMSD-002` should make Local KMS unsafe defaults explicit development opt-ins or
+`KMSD-002` makes Local KMS unsafe defaults explicit development opt-ins or
 production failures:
 
-- no local master key;
-- local key directory under the process temp directory;
-- local env defaults that cannot pass validation without an absolute path.
+- no local master key fails validation unless
+  `allow_insecure_dev_defaults = true`;
+- local key directories under the process temp directory fail validation unless
+  `allow_insecure_dev_defaults = true`;
+- `RUSTFS_KMS_LOCAL_MASTER_KEY` is the production-safe local CLI/env path for
+  encrypted local key files;
+- `RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS=true` is the development-only escape
+  hatch for local plaintext or temp-dir setups.
 
-`KMSD-003` should make Vault unsafe defaults explicit development opt-ins or
+`KMSD-003` makes Vault unsafe defaults explicit development opt-ins or
 production failures:
 
-- HTTP Vault addresses;
-- default dev-token credentials;
-- explicit `skip_tls_verify = true`.
+- HTTP Vault addresses fail validation unless explicit development opt-in is set;
+- default `dev-token` credentials fail validation unless explicit development
+  opt-in is set;
+- explicit `skip_tls_verify = true` fails validation unless explicit development
+  opt-in is set;
+- `RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS=true` applies to `KmsConfig::from_env`;
+- admin configure requests can set `allow_insecure_dev_defaults = true` for the
+  same development-only behavior.
 
-Both follow-ups must preserve existing development workflows through documented
-compatibility behavior or explicit development mode. They must not modify KMS
-runtime logic only to satisfy tests.
+These checks run in `KmsConfig::validate()` so CLI startup, persisted dynamic
+configuration, service-manager start/reconfigure, and direct backend
+construction use the same fail-closed behavior.
 
-## Test Expectations For Follow-Ups
+## Compatibility Notes
 
-- Add focused negative tests before changing production default behavior.
-- Keep persisted config serialization compatibility tests separate from runtime
-  fail-closed tests.
-- Cover both env-loaded configuration and admin configure request conversion.
-- Prove development opt-in paths remain explicit and searchable.
-- Do not alter KMS key operation behavior, authorization actions, cache behavior,
-  or storage hot paths while hardening defaults.
+- Production Local KMS deployments should configure an absolute key directory
+  outside the process temp directory and set `RUSTFS_KMS_LOCAL_MASTER_KEY`.
+- Local development setups that intentionally store plaintext key files or use
+  temp directories must set `RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS=true` or the
+  admin request field `allow_insecure_dev_defaults = true`.
+- Production Vault deployments should use HTTPS, non-default credentials, and
+  TLS verification.
+- Local Vault development setups that intentionally use HTTP, `dev-token`, or
+  skip TLS verification must set the same explicit development opt-in.
+- Legacy persisted KMS config JSON remains deserializable; old unsafe persisted
+  values default to production mode and fail validation until secured or
+  explicitly marked development-only.
+
+## Test Coverage
+
+- Local production fail-closed and development opt-in validation.
+- Vault HTTP, default token, and skip-TLS fail-closed validation plus explicit
+  development opt-in.
+- `KmsConfig::from_env()` development default rejection and opt-in behavior.
+- Admin configure request conversion to the same validation behavior.
+- KMS service manager rejects unsafe configs before moving to `Configured`.

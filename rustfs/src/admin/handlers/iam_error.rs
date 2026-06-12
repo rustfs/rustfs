@@ -15,7 +15,7 @@
 use rustfs_iam::error::Error as IamError;
 use s3s::{S3Error, S3ErrorCode};
 
-pub(super) fn iam_error_to_s3_error(err: IamError) -> S3Error {
+pub(crate) fn iam_error_to_s3_error(err: IamError) -> S3Error {
     let code = match &err {
         IamError::NoSuchUser(_)
         | IamError::NoSuchAccount(_)
