@@ -66,7 +66,7 @@ rustfs-config = { workspace = true }
 rustfs-tls-runtime = { workspace = true, optional = true }
 
 # Async dependencies
-tokio = { workspace = true, features = ["fs", "io-util", "sync", "time","io-uring"] }
+tokio = { workspace = true, features = ["fs", "io-util", "sync", "time"] }
 tracing = { workspace = true }
 futures-util = { workspace = true }
 
@@ -130,7 +130,12 @@ socket2 = { workspace = true, optional = true }
 tempfile = { workspace = true }
 proptest = "1"
 tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+# io-uring is Linux-only. Scope the feature to Linux targets.
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio = { workspace = true, features = ["io-uring"] }

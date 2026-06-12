@@ -40,14 +40,14 @@ pub mod s3_error_codes {
     /// AWS S3 error code returned by HeadBucket when the bucket does
     /// not exist.
     pub const NO_SUCH_BUCKET: &str = "NoSuchBucket";
-    /// Generic "not found" string emitted by S3-compatible backends
+    /// Generic "not found" string returned by S3-compatible backends
     /// (MinIO, Wasabi, ecstore) that do not always use the AWS
     /// NoSuchKey / NoSuchBucket vocabulary on every miss.
     pub const NOT_FOUND: &str = "NotFound";
     /// AWS error code returned when an IAM policy denies the requested
     /// action on the resource.
     pub const ACCESS_DENIED: &str = "AccessDenied";
-    /// Generic forbidden string emitted by S3-compatible backends that
+    /// Generic forbidden string returned by S3-compatible backends that
     /// do not always use the AWS AccessDenied vocabulary.
     pub const FORBIDDEN: &str = "Forbidden";
     /// Returned by AbortMultipartUpload when the upload_id is no
@@ -89,7 +89,7 @@ pub mod posix {
     /// POSIX file-type mask (S_IFMT). Isolates the four high bits of a
     /// mode value so the file-type field can be compared against
     /// S_IFDIR, S_IFREG, S_IFLNK, and the other POSIX type constants.
-    /// Compiled in test builds only; the runtime path reads the full
+    /// Compiled in test builds only. The runtime path reads the full
     /// mode from POSIX_DIR_MODE / POSIX_FILE_MODE.
     #[cfg(test)]
     pub const POSIX_TYPE_MASK: u32 = 0o170000;
@@ -177,29 +177,33 @@ pub mod limits {
     /// inside the post-handshake session loop.
     pub const HANDSHAKE_DEADLINE_SECS: u64 = 30;
 
-    /// Tick interval for the per-session wedge watchdog. Worst-case
-    /// detection latency is WEDGE_FAST_KILL_SILENCE_SECS + one tick.
+    /// Tick interval for the per-session watchdog on every platform.
+    /// On Linux worst-case detection latency is
+    /// WEDGE_FAST_KILL_SILENCE_SECS plus one to two ticks. On non-Linux
+    /// targets the fallback watchdog uses the same tick to check silence
+    /// against WEDGE_FALLBACK_KILL_SILENCE_SECS.
     pub const WEDGE_WATCHDOG_TICK_SECS: u64 = 15;
 
     /// Silence threshold at which a session whose underlying TCP socket
     /// is in CLOSE_WAIT is force-cancelled by the watchdog.
     ///
     /// A healthy session is never simultaneously silent at the SFTP
-    /// handler AND in CLOSE_WAIT: peer FIN normally surfaces as Ok(0)
+    /// handler AND in CLOSE_WAIT: peer FIN normally appears as Ok(0)
     /// on the SSH library read poll within milliseconds. 30 s leaves
     /// room for two keepalive intervals (15 s each) before the
     /// watchdog overrides, so a transient scheduler stall does not
     /// trip it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub const WEDGE_FAST_KILL_SILENCE_SECS: u64 = 30;
 
-    /// Fallback silence threshold. The only kill path on non-Linux
-    /// targets, where /proc/net/tcp is unavailable and the watchdog's
-    /// CLOSE_WAIT probe always returns None. On Linux it is the
-    /// backstop for cases where /proc/net/tcp is unreadable for some
-    /// other reason (filesystem permissions, namespace tricks) or
-    /// where the wedge surfaces in a state other than CLOSE_WAIT.
-    /// 1800 s sits above russh's default inactivity_timeout (600 s)
-    /// so russh's own inactivity close fires first on a healthy idle session.
+    /// Fallback silence threshold. On Linux it is the backstop for
+    /// cases where /proc/net/tcp is unreadable (filesystem permissions,
+    /// namespace tricks) or where the wedge is in a state other than
+    /// CLOSE_WAIT. On non-Linux targets it is the only kill path from
+    /// the fallback watchdog module, because /proc/net/tcp does not
+    /// exist and the CLOSE_WAIT probe is unavailable. 1800 s sits above
+    /// russh's default inactivity_timeout (600 s) so russh's own
+    /// inactivity close fires first on a healthy idle session.
     pub const WEDGE_FALLBACK_KILL_SILENCE_SECS: u64 = 1800;
 
     // The three constants below override russh defaults for the SSH
@@ -250,7 +254,7 @@ pub mod limits {
     /// carrying a body larger than this is rejected with EntityTooLarge.
     /// Mirrors the MAX_PART_SIZE constant in ecstore but cannot be
     /// imported from there. AWS sets S3_COPY_OBJECT_MAX_SIZE and
-    /// S3_MAX_PART_SIZE independently to 5 GiB; the values are not
+    /// S3_MAX_PART_SIZE independently to 5 GiB. The values are not
     /// coupled. Future S3 versions could move them apart, so they
     /// remain separate constants.
     pub const S3_MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
@@ -289,7 +293,7 @@ pub mod limits {
     /// Default per-call deadline applied to every StorageBackend
     /// invocation issued by the SFTP driver. A backend that does not
     /// respond within this many seconds returns Failure to the client
-    /// and emits a warn log naming the backend method. Used when
+    /// and logs a warning naming the backend method. Used when
     /// RUSTFS_SFTP_BACKEND_OP_TIMEOUT_SECS is unset or out of range.
     /// The keepalive timer (KEEPALIVE_INTERVAL_SECS times KEEPALIVE_MAX,
     /// approximately 45 s) closes a stuck SSH transport but cannot detect

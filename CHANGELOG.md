@@ -52,8 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Path canonicalisation rejects paths containing `\0`, `\r`, or `\n` and resolves traversal via `path::clean()` before any backend dispatch
 - Cipher / KEX / MAC / host-key algorithm allowlists are hardcoded with no environment override. Strict-KEX (CVE-2023-48795 / Terrapin) marker presence asserted by unit test
 - Per-session handle cap (default 64, configurable 8 to 1024) with UUID-generated handle ids
-- Crate-level `#![deny(unsafe_code)]` is in force across `crates/protocols`. Socket fd duplication for the watchdog uses the safe `AsFd::try_clone_to_owned` path (Linux/Unix); non-Unix falls back to the inactivity ceiling
-- `cfg(unix)` gating around platform-specific imports (`std::os::fd::AsFd`, `std::os::unix::fs::PermissionsExt`); non-Unix targets fail SFTP at config-load with `SftpInitError::UnsupportedPlatform`
+- Crate-level `#![deny(unsafe_code)]` is in force across `crates/protocols`. Socket fd duplication for the watchdog uses the safe `AsFd::try_clone_to_owned` path (Linux). Non-Linux targets use the inactivity-ceiling watchdog
+- Platform-specific imports are cfg-gated. Unix enforces owner-only host-key mode bits (no group or other permission bits). Windows loads host keys without a mode check and trusts operator-managed NTFS ACLs. Targets that are neither Unix nor Windows fail SFTP at config-load with SftpInitError::UnsupportedPlatform
 
 ### Documentation
 - Updated `crates/keystone/README.md` with complete integration architecture and workflow
@@ -76,7 +76,7 @@ New environment variables:
 - `RUSTFS_KEYSTONE_VERIFY_SSL` - Verify SSL certificates (default: true)
 - `RUSTFS_SFTP_ENABLE` - Enable/disable SFTP (default: false)
 - `RUSTFS_SFTP_ADDRESS` - Listen address (default: 0.0.0.0:2222)
-- `RUSTFS_SFTP_HOST_KEY_DIR` - Directory containing host key files (must exist; each file must be 0o600 or 0o400)
+- `RUSTFS_SFTP_HOST_KEY_DIR` - Directory containing host key files (must exist). On Unix each file must grant no group or other permission bits (owner access only). On Windows the files load without a mode check and rustfs trusts the directory NTFS ACL
 - `RUSTFS_SFTP_IDLE_TIMEOUT` - Session idle timeout in seconds (default: 600)
 - `RUSTFS_SFTP_PART_SIZE` - Multipart part size in bytes (default: 16 MiB)
 - `RUSTFS_SFTP_READ_ONLY` - Reject write packets at the protocol layer (default: false)

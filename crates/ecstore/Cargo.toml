@@ -96,7 +96,7 @@ hyper-util.workspace = true
 hyper-rustls.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
-tokio = { workspace = true, features = ["io-util", "sync", "signal","io-uring"] }
+tokio = { workspace = true, features = ["io-util", "sync", "signal"] }
 tonic.workspace = true
 xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
 tower.workspace = true
@@ -162,3 +162,7 @@ harness = false
 
 [lib]
 doctest = false
+
+# io-uring is Linux-only. Scope the feature to Linux targets.
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio = { workspace = true, features = ["io-uring"] }
