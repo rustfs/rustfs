@@ -194,7 +194,7 @@ zeroize = { version = "1.8.2", features = ["derive"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 humantime = "2.3.0"
 jiff = { version = "0.2.28", features = ["serde"] }
-time = { version = "0.3.48", features = ["std", "parsing", "formatting", "macros", "serde"] }
+time = { version = "=0.3.47", features = ["std", "parsing", "formatting", "macros", "serde"] }
 
 # Database
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
