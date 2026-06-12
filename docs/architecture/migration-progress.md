@@ -5,17 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-config-consumers`
-- Baseline: `origin/main` at `22059911807158aae9617415a916cf1156558b7b`
-- PR type for this branch: `consumer-migration`
-- Runtime behavior changes: none.
-- Rust code changes: migrate admin/runtime/audit/notify/targets/iam and
-  ECStore service/default model consumers from the temporary
-  `rustfs_ecstore::config` model path to `rustfs_config::server_config`, and
-  enable the `server-config-model` feature in affected crates.
+- Branch: `overtrue/arch-kms-dev-defaults`
+- Baseline: `origin/main` at `a85cc0354c02fc55e2dd8eb64cfc6155c37921c7`
+- PR type for this branch: `security-change`
+- Runtime behavior changes: KMS development-only defaults now fail closed unless
+  `RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS=true` or an admin configure request
+  sets `allow_insecure_dev_defaults=true`.
+- Rust code changes: harden Local KMS missing-master-key/temp-dir defaults,
+  Vault HTTP/default-token/skip-TLS defaults, KMS service-manager validation,
+  admin configure request conversion, and server CLI KMS configuration.
 - CI/script changes: none.
-- Docs changes: record CFG-005/CFG-006 consumer-migration context, verification
-  evidence, and the preserved ECStore runtime-state boundary.
+- Docs changes: record KMS compatibility notes and mark `KMSD-002` through
+  `KMSD-005` complete.
 
 ## Phase 0 Tasks
 
@@ -84,10 +85,13 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     and global server-config state remain in `ecstore`.
   - Must preserve: tuple struct shapes, serde alias behavior, default
     application, internal JSON shape, and existing persisted config semantics.
-- [x] `CFG-004` Keep old `ecstore::config::*` compatibility path.
+- [x] `CFG-004` Keep and clean up old `ecstore::config::*` compatibility path.
   - Completed slice: `rustfs/rustfs#3351` re-exported moved model types and
     default-registration surface from `rustfs_ecstore::config` with
     `RUSTFS_COMPAT_TODO(CFG-004)` and cleanup-register coverage.
+  - Cleanup slice: remove the temporary model re-export and smoke test after
+    CFG-005/CFG-006/CFG-007 migrated all in-repo consumers to
+    `rustfs_config::server_config`.
 - [x] `CFG-005` Migrate external server-config model consumers.
   - Current branch: migrate admin handlers, admin services, runtime context,
     server audit/event setup, and the audit/notify/targets/iam crates from the
@@ -104,6 +108,31 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     model import path except the deliberate compatibility smoke test; the old
     public re-export remains available for downstream callers until CFG-004 is
     cleaned up.
+- [x] `CFG-007` Migrate scanner runtime-config model consumer.
+  - Current branch: migrate scanner runtime-config parsing and validation from
+    the temporary `rustfs_ecstore::config::{Config, KVS}` model path to
+    `rustfs_config::server_config`.
+  - Acceptance: scanner uses the model crate for pure server-config types while
+    still using ECStore for the global server-config accessor; scanner defaults,
+    env overrides, persisted-config validation, cycle scheduling, bitrot-cycle
+    compatibility, cache timeout, and alert threshold semantics remain
+    unchanged.
+- [x] `CFG-008` Move global server-config accessors.
+  - Current branch: move `GLOBAL_SERVER_CONFIG`,
+    `get_global_server_config`, and `set_global_server_config` to
+    `rustfs_config::server_config`; migrate in-repo runtime consumers to the
+    new owner.
+  - Compatibility: keep
+    `rustfs_ecstore::config::{get_global_server_config,
+    set_global_server_config}` as a temporary re-export with
+    `RUSTFS_COMPAT_TODO(CFG-008)`.
+  - Cleanup slice: remove the temporary accessor re-export after code scans
+    showed in-repo consumers import accessors from
+    `rustfs_config::server_config`.
+  - Acceptance: ECStore still owns `ConfigSys`, config persistence helpers,
+    storage-class global state, default registration wiring, and startup
+    initialization; global server-config reads and writes keep the same
+    `std::sync::RwLock<Option<Config>>` clone semantics.
 
 ## Phase 1 Security Governance Tasks
 
@@ -165,6 +194,27 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     authorization, startup order, storage path, or crate boundary changes.
   - Verification: docs diff review, migration guards, metrics reference guard,
     and `git diff --check`.
+- [x] `KMSD-002` Make Local KMS unsafe defaults explicit dev opt-in.
+  - Acceptance: Local KMS now rejects missing master keys and process-temp key
+    directories unless `allow_insecure_dev_defaults` is explicitly set.
+  - Compatibility: server CLI/config now accepts `RUSTFS_KMS_LOCAL_MASTER_KEY`
+    for production local encryption and
+    `RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS=true` for development-only local
+    setups.
+- [x] `KMSD-003` Make Vault unsafe defaults explicit dev opt-in.
+  - Acceptance: Vault KV2 and Vault Transit now reject HTTP addresses,
+    `dev-token`, and `skip_tls_verify` unless explicit development opt-in is set.
+  - Compatibility: the KMS env loader and admin configure requests support the
+    same explicit development opt-in.
+- [x] `KMSD-004` Add production KMS default tests.
+  - Acceptance: focused tests cover Local and Vault production rejection plus
+    explicit development opt-in paths across config, env loading, admin request
+    conversion, and service-manager validation.
+- [x] `KMSD-005` Write KMS compatibility notes.
+  - Acceptance:
+    [`kms-development-defaults-inventory.md`](kms-development-defaults-inventory.md)
+    now records the production-safe alternatives and explicit development opt-in
+    behavior for deployments that relied on old defaults.
 
 ## Phase 2 Storage API Tasks
 
@@ -189,12 +239,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     mapping uses the new contract.
 - [x] `API-003` Move DTOs.
   - Current PR: `rustfs/rustfs#3314` merged.
+  - Cleanup branch: `overtrue/arch-storage-api-dto-compat-cleanup`.
   - Completed slice: move the pure bucket/options DTO subset:
     `MakeBucketOptions`, `SRBucketDeleteOp`, `DeleteBucketOptions`,
     `BucketOptions`, and `BucketInfo`.
-  - Acceptance: `rustfs-storage-api` exports these DTOs, ECStore re-exports
-    them from the old `ecstore::store_api` path, and compatibility cleanup is
-    registered with `RUSTFS_COMPAT_TODO(API-003)`.
+  - Cleanup slice: migrate in-repo external consumers to
+    `rustfs_storage_api`, keep ECStore implementation use crate-private, and
+    remove the old public `ecstore::store_api` bucket DTO re-export.
+  - Acceptance: `rustfs-storage-api` exports these DTOs, in-repo external
+    consumers no longer use the old `rustfs_ecstore::store_api` DTO path, and
+    `RUSTFS_COMPAT_TODO(API-003)` is removed from source and cleanup register.
   - Must preserve: no `ObjectOptions`, `ObjectInfo`, reader, compression,
     encryption, filemeta conversion, multipart conversion, route, storage, or
     runtime behavior changes in this PR.
@@ -242,9 +296,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Completed slice: `rustfs/rustfs#3340` removed duplicate admin-read methods
     from the old `StorageAPI` trait and its ECStore/Sets/SetDisks/test
     implementations after API-007 migrated their consumers.
-  - Acceptance: old `StorageAPI` keeps storage operation traits and
-    `new_ns_lock`, while admin inventory surfaces live only on
-    `StorageAdminApi`.
+  - Acceptance: old `StorageAPI` keeps storage operation traits while admin
+    inventory surfaces live only on `StorageAdminApi`.
 
 - [x] `API-009` Narrow metadata helper storage bounds.
   - Completed slice: `rustfs/rustfs#3343` narrowed server config, tier config,
@@ -284,23 +337,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 - [x] `API-012` Narrow table catalog object backend bounds.
   - Completed slice: `rustfs/rustfs#3350` added a narrow `NamespaceLocking`
-    operation-group trait as a compatibility facade over
-    `StorageAPI::new_ns_lock`, then narrowed `EcStoreTableCatalogObjectBackend`
-    from full `StorageAPI` to `ObjectIO`, `ObjectOperations`,
-    `ListOperations`, and `NamespaceLocking`.
+    operation-group trait as a compatibility facade, then narrowed
+    `EcStoreTableCatalogObjectBackend` from full `StorageAPI` to `ObjectIO`,
+    `ObjectOperations`, `ListOperations`, and `NamespaceLocking`.
+  - Cleanup slice: migrate the remaining scanner leader-lock and self-copy
+    object use-case namespace-lock consumers to `NamespaceLocking`, implement
+    namespace locking directly on ECStore storage types, and remove the
+    temporary namespace-lock compatibility method from the full storage trait
+    and cleanup register entry.
   - Acceptance: table catalog object backend contracts express the actual
     object read/write, metadata/delete, list, and namespace-lock capabilities
-    they need, while table catalog store logic and lock behavior remain
-    unchanged.
+    they need; namespace-lock consumers depend on `NamespaceLocking` instead of
+    full `StorageAPI`; and storage lock behavior remains unchanged.
   - Must preserve: table catalog object paths, metadata pointer semantics,
     optimistic write preconditions, object listing pagination, missing-object
-    handling, namespace write-lock acquisition, `StorageAPI::new_ns_lock`
-    compatibility, object APIs, scanner/heal/replication/config persistence,
-    and storage hot paths.
-  - Risk defense: do not remove `StorageAPI::new_ns_lock`, do not move traits
-    into `rustfs-storage-api`, do not change lock implementation code, do not
-    alter table catalog method bodies, and track the retained old lock method
-    with `RUSTFS_COMPAT_TODO(API-012)`.
+    handling, namespace write-lock acquisition, object APIs,
+    scanner/heal/replication/config persistence, and storage hot paths.
+  - Risk defense: do not move traits into `rustfs-storage-api`, do not change
+    lock implementation code, do not alter table catalog method bodies, and do
+    not retain stale API-012 compatibility markers after the old `StorageAPI`
+    lock method is removed.
   - Verification: focused compile/tests, migration guards, Rust risk scan, and
     required quality/architecture, migration-preservation, and
     testing/verification review passed.
@@ -328,68 +384,53 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `api-extraction`: remove the temporary `rustfs_ecstore::config` model
-   re-export after downstream compatibility policy allows CFG-004 cleanup.
-2. `security-change`: make Local KMS unsafe defaults explicit development
-   opt-ins or production failures in KMSD-002.
-3. `security-change`: make Vault unsafe defaults explicit development opt-ins
-   or production failures in KMSD-003.
+1. `security-change`: apply IAM and plugin secret redaction in `S-014`.
+2. `security-change`: classify and add strict serde ingress tests in `S-015`.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed this is only a model-consumer migration and feature-gate update; ECStore persistence helpers, global state, startup wiring, config persistence, and storage hot paths stay unchanged. |
-| Migration preservation | pass | Confirmed the old `rustfs_ecstore::config` model path remains available through `RUSTFS_COMPAT_TODO(CFG-004)`, with no tuple-shape, serde, default, or persisted JSON changes. |
-| Testing/verification | pass | Confirmed focused config/admin/audit/notify/targets/iam tests, compile checks, migration guards, boundary scans, and added-line risk scan are sufficient; full pre-commit is skipped under the current larger-granularity instruction. |
+| Quality/architecture | pass | Confirmed KMS unsafe-development defaults are enforced in `KmsConfig::validate()` and reused by env loading, admin configure conversion, service-manager lifecycle, and direct backend construction. |
+| Migration preservation | pass | Confirmed KMS runtime key operations, cache behavior, redaction behavior, storage SSE call sites, and admin route contracts keep their existing shapes except for the explicit development opt-in field. |
+| Testing/verification | pass | Confirmed KMS crate tests, rustfs config/SSE focused tests, rustfs lib/test compile, migration guards, format check, and diff check cover this larger security-change slice; full pre-commit is skipped under the current larger-granularity instruction. |
 
 ## Verification Notes
 
-Passed:
+Passed on `a85cc0354c02fc55e2dd8eb64cfc6155c37921c7`:
+- `cargo check -p rustfs --lib --tests`.
+- `cargo check -p rustfs-kms --tests`.
+- `cargo test -p rustfs-kms --no-fail-fast`; 57 passed, 1 ignored, doc-test
+  passed.
+- `cargo clippy -p rustfs-kms --all-targets -- -D warnings`.
+- `cargo test -p rustfs --lib config::config_test --no-fail-fast`; 20 passed.
+- `cargo test -p rustfs --lib storage::sse::tests::test_kms --no-fail-fast`;
+  1 passed.
+- `cargo test -p rustfs --lib -- --list | rg "sse.*kms|kms.*sse|config::config_test::tests::test_config_new_defaults"`.
 - `cargo fmt --all --check`.
-- `cargo check -p rustfs-config -p rustfs-audit -p rustfs-notify -p rustfs-targets -p rustfs-iam -p rustfs-ecstore -p rustfs --lib`.
-- `cargo test -p rustfs-config --features server-config-model --lib`; 29 passed.
-- `cargo test -p rustfs-ecstore config --lib`; 60 passed.
-- `cargo test -p rustfs-targets config --lib`; 65 passed.
-- `cargo test -p rustfs-notify config_manager --lib`; 12 passed.
-- `cargo test -p rustfs-audit --lib`; 5 passed.
-- `cargo test -p rustfs-iam oidc --lib`; 53 passed.
-- `cargo test -p rustfs admin::handlers::config_admin --lib`; 29 passed.
-- `cargo test -p rustfs admin::service::config --lib`; 6 passed.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - `./scripts/check_metrics_migration_refs.sh`.
-- `./scripts/check_unsafe_code_allowances.sh`.
 - `git diff --check`.
-- External old-model path scan:
-  `rustfs_ecstore::config::{Config, KV, KVS}` is absent from `rustfs/src`,
-  `crates/audit`, `crates/notify`, `crates/targets`, and `crates/iam`.
-- ECStore runtime helper scan: no `rustfs_config::server_config::{init,
-  get_global_server_config, set_global_server_config,
-  set_global_storage_class, com, storageclass}` usage exists.
-- Added-line risk scan found no production `unwrap`/`expect`, lossy numeric
-  casts, stringly public errors, boxed dynamic errors, stdout/stderr printing,
-  or relaxed atomic ordering.
 
 Notes:
 - Full pre-commit may be skipped if focused tests, compile checks, and guards
   pass, per the current instruction to increase PR granularity.
-- This slice migrates model consumers only. ECStore retains persistence helpers,
-  ConfigSys, global server-config state, storage-class global state, startup
-  wiring, and all storage/config persistence logic.
-- The old rustfs_ecstore::config model path intentionally remains as a
-  temporary compatibility re-export with `RUSTFS_COMPAT_TODO(CFG-004)` and a
-  matching cleanup-register entry.
-- The remaining ECStore old-path references are limited to the deliberate
-  compatibility smoke test in `crates/ecstore/src/config/mod.rs`.
+- `cargo test -p rustfs --lib storage::sse::tests::test_sse_kms --no-fail-fast`
+  and `cargo test -p rustfs --lib test_sse_kms_roundtrip --no-fail-fast`
+  matched 0 tests because the `rio-v2` roundtrip test is feature-gated out of
+  the default `rustfs --lib` test binary.
+- This slice includes a minimal compile unblock after PR #3365: table catalog's
+  ECStore object backend now declares `NamespaceLocking` where it calls
+  `new_ns_lock`; the lock path itself is unchanged.
+- This slice does not change KMS authorization actions, key operation behavior,
+  storage encryption metadata formats, or cache semantics.
 
 ## Handoff Notes
 
-- Keep this CFG-005/CFG-006 slice as a `consumer-migration` PR that only
-  updates model type imports and affected crate feature gates.
-- Do not move `ConfigSys`, `GLOBAL_SERVER_CONFIG`, storage-class global state,
-  `read_config_without_migrate`, `save_server_config`, config-object helpers,
-  startup wiring, storage-class helpers, ECStore persistence helpers, or storage
-  persistence logic in this PR.
-- Do not add temporary compatibility code unless a matching
-  `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry are added.
+- Keep this KMS slice as a `security-change` PR covering KMSD-002 through
+  KMSD-005 plus the minimal table catalog compile unblock from PR #3365.
+- Do not change KMS key operation behavior, storage SSE metadata formats, IAM
+  policy actions, admin route wiring, or cache semantics in this PR.
+- If more time is available before the next slice, start `S-014` with IAM/plugin
+  secret redaction; otherwise start `S-015` strict serde ingress tests.

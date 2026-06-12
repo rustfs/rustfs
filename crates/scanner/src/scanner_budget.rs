@@ -184,11 +184,14 @@ mod tests {
             },
         );
 
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        let token = budget.token();
+        tokio::time::timeout(Duration::from_secs(1), token.cancelled())
+            .await
+            .expect("runtime budget did not cancel child token");
 
         assert!(budget.budget_elapsed());
         assert_eq!(budget.reason(), Some(ScannerCycleBudgetReason::Runtime));
-        assert!(budget.token().is_cancelled());
+        assert!(token.is_cancelled());
     }
 
     #[test]

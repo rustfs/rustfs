@@ -53,7 +53,7 @@
 //!     let service_manager = init_global_kms_service_manager();
 //!
 //!     // Configure with local backend
-//!     let config = KmsConfig::local(PathBuf::from("./kms_keys"));
+//!     let config = KmsConfig::local(PathBuf::from("./kms_keys")).with_insecure_development_defaults();
 //!     service_manager.configure(config).await?;
 //!
 //!     // Start the KMS service
@@ -135,7 +135,7 @@ mod tests {
 
         // Test configuration and start
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = KmsConfig::local(temp_dir.path().to_path_buf());
+        let config = KmsConfig::local(temp_dir.path().to_path_buf()).with_insecure_development_defaults();
 
         manager.configure(config).await.expect("Configuration should succeed");
         manager.start().await.expect("Start should succeed");
@@ -160,7 +160,7 @@ mod tests {
 
         // Start first service
         let temp_dir1 = TempDir::new().expect("Failed to create temp dir");
-        let config1 = KmsConfig::local(temp_dir1.path().to_path_buf());
+        let config1 = KmsConfig::local(temp_dir1.path().to_path_buf()).with_insecure_development_defaults();
         manager
             .configure(config1.clone())
             .await
@@ -176,7 +176,7 @@ mod tests {
 
         // Reconfigure to new service (zero-downtime)
         let temp_dir2 = TempDir::new().expect("Failed to create temp dir");
-        let config2 = KmsConfig::local(temp_dir2.path().to_path_buf());
+        let config2 = KmsConfig::local(temp_dir2.path().to_path_buf()).with_insecure_development_defaults();
         manager.reconfigure(config2).await.expect("Reconfiguration should succeed");
 
         // Verify version 2
@@ -205,7 +205,7 @@ mod tests {
         let base_path = temp_dir.path().to_path_buf();
 
         // Initial configuration
-        let config1 = KmsConfig::local(base_path.clone());
+        let config1 = KmsConfig::local(base_path.clone()).with_insecure_development_defaults();
         manager.configure(config1).await.expect("Configuration should succeed");
         manager.start().await.expect("Start should succeed");
 
@@ -215,7 +215,7 @@ mod tests {
             let manager_clone = manager.clone();
             let path = base_path.clone();
             let handle = tokio::spawn(async move {
-                let config = KmsConfig::local(path);
+                let config = KmsConfig::local(path).with_insecure_development_defaults();
                 manager_clone.reconfigure(config).await
             });
             handles.push(handle);

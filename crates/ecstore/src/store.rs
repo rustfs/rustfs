@@ -33,8 +33,8 @@ use crate::bucket::utils::check_object_args;
 use crate::bucket::utils::check_put_object_args;
 use crate::bucket::utils::check_put_object_part_args;
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
+use crate::config::get_global_storage_class;
 use crate::config::storageclass;
-use crate::config::{get_global_server_config, get_global_storage_class};
 use crate::disk::endpoint::{Endpoint, EndpointType};
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions};
 use crate::error::{Error, Result};
@@ -67,7 +67,8 @@ use crate::{
     store_api::{
         BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
         HTTPRangeSpec, HealOperations, ListObjectsV2Info, ListOperations, MakeBucketOptions, MultipartOperations,
-        MultipartUploadResult, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
+        MultipartUploadResult, NamespaceLocking, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo,
+        PutObjReader, StorageAPI,
     },
     store_init,
 };
@@ -77,7 +78,7 @@ use lazy_static::lazy_static;
 use rand::RngExt as _;
 use rustfs_common::heal_channel::{HealItemType, HealOpts};
 use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, GLOBAL_RUSTFS_HOST, GLOBAL_RUSTFS_PORT};
-use rustfs_config::server_config::Config;
+use rustfs_config::server_config::{Config, get_global_server_config, set_global_server_config};
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::{LocalClient, LockClient, NamespaceLockWrapper};
 use rustfs_madmin::heal_commands::HealResultItem;
@@ -216,12 +217,12 @@ impl std::fmt::Debug for ECStore {
 impl ECStore {
     /// Get server configuration (delegates to global)
     pub fn get_server_config(&self) -> Option<Config> {
-        crate::config::get_global_server_config()
+        get_global_server_config()
     }
 
     /// Set server configuration (delegates to global)
     pub fn set_server_config(&self, cfg: Config) {
-        crate::config::set_global_server_config(cfg);
+        set_global_server_config(cfg);
     }
 
     /// Get storage class configuration (delegates to global)
@@ -703,7 +704,10 @@ impl HealOperations for ECStore {
 }
 
 #[async_trait::async_trait]
-impl StorageAPI for ECStore {
+impl StorageAPI for ECStore {}
+
+#[async_trait::async_trait]
+impl NamespaceLocking for ECStore {
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         self.handle_new_ns_lock(bucket, object).await
     }

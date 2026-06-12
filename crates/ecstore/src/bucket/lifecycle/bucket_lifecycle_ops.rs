@@ -81,6 +81,16 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use xxhash_rust::xxh64;
 
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
+const EVENT_LIFECYCLE_WORKER_STATE: &str = "lifecycle_worker_state";
+const EVENT_LIFECYCLE_TRANSITION_COMPENSATION: &str = "lifecycle_transition_compensation";
+const EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP: &str = "lifecycle_stale_multipart_cleanup";
+const EVENT_LIFECYCLE_SCAN_SKIPPED: &str = "lifecycle_scan_skipped";
+const EVENT_LIFECYCLE_TIER_AUDIT: &str = "lifecycle_tier_audit";
+const EVENT_LIFECYCLE_TIER_OPERATION_FAILED: &str = "lifecycle_tier_operation_failed";
+const EVENT_LIFECYCLE_DELETE_FAILED: &str = "lifecycle_delete_failed";
+
 pub type TimeFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
 pub type TraceFn =
     Arc<dyn Fn(String, HashMap<String, String>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
@@ -189,7 +199,15 @@ impl LifecycleSys {
             Ok((lc, _)) => Some(lc),
             Err(Error::ConfigNotFound) => None,
             Err(err) => {
-                warn!(bucket, error = ?err, "failed to load lifecycle config");
+                debug!(
+                    event = EVENT_LIFECYCLE_SCAN_SKIPPED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    bucket,
+                    error = ?err,
+                    reason = "lifecycle_config_unavailable",
+                    "Skipped lifecycle config lookup"
+                );
                 None
             }
         }
@@ -204,13 +222,16 @@ impl LifecycleSys {
             let name = name.clone();
             let version_id = version_id.clone();
             Box::pin(async move {
-                info!(
+                debug!(
                     bucket = %bucket,
                     object = %name,
                     version_id = %version_id,
                     action = %_action,
-                    "ILM lifecycle trace: {} on {}/{} (version: {})",
-                    _action, bucket, name, version_id
+                    event = EVENT_LIFECYCLE_WORKER_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    state = "trace",
+                    "Lifecycle trace event"
                 );
             })
         })
@@ -482,7 +503,14 @@ impl ExpiryState {
         loop {
             select! {
                 _ = cancel_token.cancelled() => {
-                    info!("lifecycle expiry worker received shutdown signal, exiting");
+                    debug!(
+                        event = EVENT_LIFECYCLE_WORKER_STATE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                        state = "stopped",
+                        reason = "shutdown_signal",
+                        "Lifecycle expiry worker stopped"
+                    );
                     break;
                 }
                 v = rx.recv() => {
@@ -513,12 +541,16 @@ impl ExpiryState {
                     else if v.as_any().is::<Jentry>() {
                         let v = v.as_any().downcast_ref::<Jentry>().expect("Jentry downcast failed");
                         if let Err(err) = delete_object_from_remote_tier(&v.obj_name, &v.version_id, &v.tier_name).await {
-                            warn!(
+                            debug!(
+                                event = EVENT_LIFECYCLE_WORKER_STATE,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
                                 object = %v.obj_name,
                                 version_id = %v.version_id,
                                 tier = %v.tier_name,
                                 error = ?err,
-                                "failed to delete transitioned object from remote tier"
+                                reason = "remote_tier_delete_failed",
+                                "Lifecycle worker skipped remote tier delete"
                             );
                         }
                     }
@@ -532,14 +564,18 @@ impl ExpiryState {
                         )
                         .await
                         {
-                            warn!(
+                            debug!(
                                 bucket = %oi.bucket,
                                 object = %oi.name,
                                 remote_object = %oi.transitioned_object.name,
                                 remote_version_id = %oi.transitioned_object.version_id,
                                 tier = %oi.transitioned_object.tier,
                                 error = ?err,
-                                "failed to sweep transitioned free version from remote tier"
+                                event = EVENT_LIFECYCLE_WORKER_STATE,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                                reason = "remote_tier_delete_failed",
+                                "Lifecycle worker skipped remote tier delete"
                             );
                             continue;
                         }
@@ -562,14 +598,18 @@ impl ExpiryState {
                                 }
                                 Err(err) if is_err_version_not_found(&err) || is_err_object_not_found(&err) => continue,
                                 Err(err) => {
-                                    warn!(
+                                    debug!(
+                                        event = EVENT_LIFECYCLE_WORKER_STATE,
+                                        component = LOG_COMPONENT_ECSTORE,
+                                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
                                         bucket = %oi.bucket,
                                         object = %oi.name,
                                         remote_object = %oi.transitioned_object.name,
                                         remote_version_id = %oi.transitioned_object.version_id,
                                         tier = %oi.transitioned_object.tier,
                                         error = ?err,
-                                        "failed to delete transitioned free version after remote tier sweep"
+                                        reason = "local_free_version_delete_failed",
+                                        "Lifecycle worker failed local free-version cleanup"
                                     );
                                     break;
                                 }
@@ -577,19 +617,29 @@ impl ExpiryState {
                         }
 
                         if !deleted_locally {
-                            warn!(
+                            debug!(
+                                event = EVENT_LIFECYCLE_WORKER_STATE,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
                                 bucket = %oi.bucket,
                                 object = %oi.name,
                                 remote_object = %oi.transitioned_object.name,
                                 remote_version_id = %oi.transitioned_object.version_id,
                                 tier = %oi.transitioned_object.tier,
-                                "transitioned free version was not found during local cleanup"
+                                reason = "local_free_version_missing",
+                                "Lifecycle worker could not find transitioned free version locally"
                             );
                         }
                     }
                     else {
                         //info!("Invalid work type - {:?}", v);
-                        warn!("lifecycle worker received unsupported operation type");
+                        debug!(
+                            event = EVENT_LIFECYCLE_WORKER_STATE,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                            state = "unsupported_task",
+                            "Lifecycle worker received unsupported operation type"
+                        );
                     }
                 }
             }
@@ -689,14 +739,37 @@ impl TransitionState {
                 scheduled.lock().unwrap().remove(&bucket);
                 Self::add_counter(&state.compensation_running_tasks, -1);
                 state.record_scanner_transition_state();
-                warn!(bucket = %bucket, "transition compensation skipped because object layer is unavailable");
+                debug!(
+                    event = EVENT_LIFECYCLE_TRANSITION_COMPENSATION,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    bucket = %bucket,
+                    state = "skipped",
+                    reason = "object_layer_unavailable",
+                    "Skipped transition compensation"
+                );
                 return;
             };
 
             if let Err(err) = enqueue_transition_for_existing_objects(api, &bucket).await {
-                warn!(bucket = %bucket, error = ?err, "transition compensation backfill failed");
+                warn!(
+                    event = EVENT_LIFECYCLE_TRANSITION_COMPENSATION,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    bucket = %bucket,
+                    state = "failed",
+                    error = ?err,
+                    "Transition compensation backfill failed"
+                );
             } else {
-                info!(bucket = %bucket, "transition compensation backfill completed");
+                info!(
+                    event = EVENT_LIFECYCLE_TRANSITION_COMPENSATION,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    bucket = %bucket,
+                    state = "completed",
+                    "Completed transition compensation backfill"
+                );
             }
 
             scheduled.lock().unwrap().remove(&bucket);
@@ -744,43 +817,59 @@ impl TransitionState {
         match failure {
             ImmediateEnqueueFailure::ForcedTimeout => {
                 Self::inc_counter(&self.queue_send_timeout_tasks);
-                warn!(
+                debug!(
                     bucket = %oi.bucket,
                     object = %oi.name,
                     source = ?src,
                     compensation_scheduled = scheduled,
+                    event = EVENT_LIFECYCLE_TRANSITION_COMPENSATION,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    state = "queue_timeout_forced",
                     "transition enqueue forced into timeout path for test fault injection"
                 );
             }
             ImmediateEnqueueFailure::QueueClosed { timeout_ms } => match timeout_ms {
                 Some(timeout_ms) => {
-                    warn!(
+                    debug!(
                         bucket = %oi.bucket,
                         object = %oi.name,
                         source = ?src,
                         timeout_ms,
                         compensation_scheduled = scheduled,
+                        event = EVENT_LIFECYCLE_TRANSITION_COMPENSATION,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                        state = "queue_closed",
                         "transition enqueue failed because the queue is closed"
                     );
                 }
                 None => {
-                    warn!(
+                    debug!(
                         bucket = %oi.bucket,
                         object = %oi.name,
                         source = ?src,
                         compensation_scheduled = scheduled,
+                        event = EVENT_LIFECYCLE_TRANSITION_COMPENSATION,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                        state = "queue_closed",
                         "transition enqueue failed because the queue is closed"
                     );
                 }
             },
             ImmediateEnqueueFailure::QueueSendTimedOut { timeout_ms } => {
                 Self::inc_counter(&self.queue_send_timeout_tasks);
-                warn!(
+                debug!(
                     bucket = %oi.bucket,
                     object = %oi.name,
                     source = ?src,
                     timeout_ms,
                     compensation_scheduled = scheduled,
+                    event = EVENT_LIFECYCLE_TRANSITION_COMPENSATION,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    state = "queue_send_timed_out",
                     "transition enqueue timed out under backpressure"
                 );
             }
@@ -850,10 +939,14 @@ impl TransitionState {
                 );
             }
             Err(async_channel::TrySendError::Closed(_)) => {
-                warn!(
+                debug!(
                     bucket = %oi.bucket,
                     object = %oi.name,
                     source = ?src,
+                    event = EVENT_LIFECYCLE_TRANSITION_COMPENSATION,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    state = "queue_closed",
                     "transition enqueue failed because the queue is closed"
                 );
             }
@@ -866,12 +959,16 @@ impl TransitionState {
     pub async fn init(api: Arc<ECStore>) {
         let (configured, absolute_max, n) = resolve_transition_worker_count();
         info!(
+            event = EVENT_LIFECYCLE_WORKER_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
             configured_transition_workers = configured,
             absolute_max_workers = absolute_max,
             effective_transition_workers = n,
             transition_queue_capacity = GLOBAL_TransitionState.transition_queue_capacity,
             transition_queue_send_timeout_ms = GLOBAL_TransitionState.transition_queue_send_timeout.as_millis() as u64,
-            "transition worker count resolved"
+            state = "configured",
+            "Lifecycle worker state resolved"
         );
 
         //let mut transition_state = GLOBAL_TransitionState.write().await;
@@ -942,14 +1039,24 @@ impl TransitionState {
                             ..Default::default()
                         };
 
-                        if let Err(err) = transition_object(api.clone(), &task.obj_info, LcAuditEvent::new(task.event.clone(), task.src.clone())).await {
-                            global_metrics().record_scanner_transition_failed(1);
-                            if !is_err_version_not_found(&err) && !is_err_object_not_found(&err) && !is_network_or_host_down(&err.to_string(), false) && !err.to_string().contains("use of closed network connection") {
-                                error!("Transition to {} failed for {}/{} version:{} with {}",
-                                    task.event.storage_class, task.obj_info.bucket, task.obj_info.name, task.obj_info.version_id.map(|v| v.to_string()).unwrap_or_default(), err.to_string());
-                            }
-                            // Send s3:ObjectTransition:Failed event
-                            send_event(EventArgs {
+                            if let Err(err) = transition_object(api.clone(), &task.obj_info, LcAuditEvent::new(task.event.clone(), task.src.clone())).await {
+                                global_metrics().record_scanner_transition_failed(1);
+                                if !is_err_version_not_found(&err) && !is_err_object_not_found(&err) && !is_network_or_host_down(&err.to_string(), false) && !err.to_string().contains("use of closed network connection") {
+                                    error!(
+                                        event = EVENT_LIFECYCLE_TIER_OPERATION_FAILED,
+                                        component = LOG_COMPONENT_ECSTORE,
+                                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                                        bucket = %task.obj_info.bucket,
+                                        object = %task.obj_info.name,
+                                        version_id = %task.obj_info.version_id.map(|v| v.to_string()).unwrap_or_default(),
+                                        tier = %task.event.storage_class,
+                                        operation = "transition_object",
+                                        error = %err,
+                                        "Lifecycle tier operation failed"
+                                    );
+                                }
+                                // Send s3:ObjectTransition:Failed event
+                                send_event(EventArgs {
                                 event_name: EventName::ObjectTransitionFailed.to_string(),
                                 bucket_name: obj_info_for_event.bucket.clone(),
                                 object: obj_info_for_event,
@@ -1052,13 +1159,17 @@ impl TransitionState {
         GLOBAL_TransitionState.record_scanner_transition_state();
 
         info!(
+            event = EVENT_LIFECYCLE_WORKER_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
             requested_transition_workers = requested,
             effective_transition_workers = n,
             absolute_max_workers = absolute_max,
             previous_transition_workers = previous_num_workers,
             current_transition_workers = current_workers,
             pruned_finished_transition_workers = pruned_finished_workers,
-            "transition workers updated"
+            state = "resized",
+            "Lifecycle worker state updated"
         );
     }
 }
@@ -1189,7 +1300,15 @@ async fn read_stale_multipart_candidate(
     ) {
         Ok(file_info) => (Some(file_info.metadata), file_info.mod_time),
         Err(err) => {
-            warn!(path = %metadata_path, error = ?err, "failed to parse multipart metadata during stale cleanup");
+            warn!(
+                event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                path = %metadata_path,
+                error = ?err,
+                reason = "multipart_metadata_parse_failed",
+                "Skipped multipart metadata parse during stale cleanup"
+            );
             (None, None)
         }
     };
@@ -1229,7 +1348,14 @@ async fn cleanup_empty_multipart_sha_dirs_on_local_disks(set: &Arc<SetDisks>) {
             Ok(entries) => entries,
             Err(err) => {
                 if err != DiskError::FileNotFound && err != DiskError::VolumeNotFound {
-                    warn!(error = ?err, "failed to list multipart root during empty sha cleanup");
+                    debug!(
+                        event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                        error = ?err,
+                        reason = "multipart_root_list_failed",
+                        "Skipped empty multipart sha cleanup"
+                    );
                 }
                 continue;
             }
@@ -1244,7 +1370,15 @@ async fn cleanup_empty_multipart_sha_dirs_on_local_disks(set: &Arc<SetDisks>) {
                 Ok(entries) => entries,
                 Err(err) => {
                     if err != DiskError::FileNotFound && err != DiskError::VolumeNotFound {
-                        warn!(sha_dir = %sha_dir, error = ?err, "failed to list multipart sha dir during empty sha cleanup");
+                        debug!(
+                            event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                            sha_dir = %sha_dir,
+                            error = ?err,
+                            reason = "multipart_sha_dir_list_failed",
+                            "Skipped empty multipart sha cleanup"
+                        );
                     }
                     continue;
                 }
@@ -1260,7 +1394,15 @@ async fn cleanup_empty_multipart_sha_dirs_on_local_disks(set: &Arc<SetDisks>) {
                 && err != DiskError::FileNotFound
                 && err != DiskError::VolumeNotFound
             {
-                warn!(sha_dir = %sha_dir, error = ?err, "failed to remove empty multipart sha dir");
+                debug!(
+                    event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    sha_dir = %sha_dir,
+                    error = ?err,
+                    reason = "multipart_sha_dir_remove_failed",
+                    "Failed to remove empty multipart sha dir"
+                );
             }
         }
     }
@@ -1282,7 +1424,14 @@ async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: Offset
             Ok(entries) => entries,
             Err(err) => {
                 if err != DiskError::FileNotFound && err != DiskError::VolumeNotFound {
-                    warn!(error = ?err, "failed to list multipart root during stale cleanup");
+                    debug!(
+                        event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                        error = ?err,
+                        reason = "multipart_root_list_failed",
+                        "Skipped stale multipart cleanup"
+                    );
                 }
                 continue;
             }
@@ -1297,7 +1446,15 @@ async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: Offset
                 Ok(entries) => entries,
                 Err(err) => {
                     if err != DiskError::FileNotFound && err != DiskError::VolumeNotFound {
-                        warn!(sha_dir = %sha_dir, error = ?err, "failed to list multipart sha dir during stale cleanup");
+                        debug!(
+                            event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                            sha_dir = %sha_dir,
+                            error = ?err,
+                            reason = "multipart_sha_dir_list_failed",
+                            "Skipped stale multipart cleanup"
+                        );
                     }
                     continue;
                 }
@@ -1317,7 +1474,15 @@ async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: Offset
                     Ok(candidate) => candidate,
                     Err(err) => {
                         if err != DiskError::FileNotFound {
-                            warn!(path = %candidate_path, error = ?err, "failed to read multipart metadata during stale cleanup");
+                            debug!(
+                                event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                                path = %candidate_path,
+                                error = ?err,
+                                reason = "multipart_metadata_read_failed",
+                                "Multipart metadata unavailable during stale cleanup"
+                            );
                         }
                         let initiated = initiated_from_upload_dir(&upload_dir, None);
                         StaleMultipartUploadCandidate {
@@ -1351,18 +1516,39 @@ async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: Offset
                 deleted += 1;
                 let upload_id = encode_stale_upload_id(&upload_dir);
                 if let Some(metadata) = candidate.metadata.as_ref() {
-                    info!(
+                    debug!(
                         bucket = metadata.get(RUSTFS_MULTIPART_BUCKET_KEY).cloned().unwrap_or_default(),
                         object = metadata.get(RUSTFS_MULTIPART_OBJECT_KEY).cloned().unwrap_or_default(),
                         upload_id = %upload_id,
                         due = ?due,
-                        "removed stale multipart upload"
+                        event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                        state = "removed",
+                        "Removed stale multipart upload"
                     );
                 } else {
-                    info!(path = %candidate.path, upload_id = %upload_id, due = ?due, "removed stale multipart upload");
+                    debug!(
+                        path = %candidate.path,
+                        upload_id = %upload_id,
+                        due = ?due,
+                        event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                        state = "removed",
+                        "Removed stale multipart upload"
+                    );
                 }
             }
-            Err(err) => warn!(path = %candidate.path, error = ?err, "failed to remove stale multipart upload"),
+            Err(err) => debug!(
+                event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                path = %candidate.path,
+                error = ?err,
+                reason = "multipart_remove_failed",
+                "Failed to remove stale multipart upload"
+            ),
         }
     }
 
@@ -1402,7 +1588,13 @@ pub fn init_background_stale_multipart_upload_cleanup(api: Arc<ECStore>) {
 
             let deleted = cleanup_stale_multipart_uploads_once_at(api, OffsetDateTime::now_utc(), default_expiry).await;
             if deleted > 0 {
-                info!(deleted, "completed stale multipart cleanup pass");
+                debug!(
+                    event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    deleted,
+                    "Completed stale multipart cleanup pass"
+                );
             }
         }
     });
@@ -1702,14 +1894,35 @@ pub async fn expire_transitioned_object(
     )
     .await;
     if let Err(e) = &ret {
-        error!("Failed to delete remote transitioned object {}: {:?}", oi.transitioned_object.name, e);
+        error!(
+            event = EVENT_LIFECYCLE_TIER_OPERATION_FAILED,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+            bucket = %oi.bucket,
+            object = %oi.name,
+            tier = %oi.transitioned_object.tier,
+            tier_object = %oi.transitioned_object.name,
+            tier_version_id = %oi.transitioned_object.version_id,
+            operation = "delete_remote_transitioned_object",
+            error = ?e,
+            "Lifecycle tier operation failed"
+        );
     }
     mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, ret.is_ok());
 
     let dobj = match api.delete_object(&oi.bucket, &oi.name, opts).await {
         Ok(obj) => obj,
         Err(e) => {
-            error!("Failed to delete transitioned object {}/{}: {:?}", oi.bucket, oi.name, e);
+            error!(
+                event = EVENT_LIFECYCLE_DELETE_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                bucket = %oi.bucket,
+                object = %oi.name,
+                operation = "delete_transitioned_object",
+                error = ?e,
+                "Lifecycle delete failed"
+            );
             // Return the original object info if deletion fails
             oi.clone()
         }
@@ -1796,10 +2009,13 @@ pub fn audit_tier_actions(_tier: &str, bytes: i64) -> TimeFn {
         let tier = tier.clone();
         Box::pin(async move {
             info!(
+                event = EVENT_LIFECYCLE_TIER_AUDIT,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
                 tier = %tier,
                 bytes = bytes,
-                "ILM tier transition audit: completed transition of {} bytes to tier '{}'",
-                bytes, tier
+                state = "transition_completed",
+                "Lifecycle tier transition audit completed"
             );
         })
     })
@@ -1846,13 +2062,17 @@ pub async fn get_transitioned_object_reader(
         .await
         .map_err(|e| {
             tracing::error!(
+                event = EVENT_LIFECYCLE_TIER_OPERATION_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
                 bucket = %bucket,
                 object = %object,
                 tier = %oi.transitioned_object.tier,
                 tier_object = %oi.transitioned_object.name,
                 tier_version_id = %oi.transitioned_object.version_id,
                 error = %e,
-                "tier GET failed"
+                operation = "tier_get",
+                "Lifecycle tier operation failed"
             );
             e
         })?;
@@ -2061,9 +2281,14 @@ pub async fn eval_action_from_lifecycle(
     oi: &ObjectInfo,
 ) -> lifecycle::Event {
     let event = lc.eval(&oi.to_lifecycle_opts()).await;
-    //if serverDebugLog {
-    info!("lifecycle: Secondary scan: {}", event.action);
-    //}
+    debug!(
+        event = EVENT_LIFECYCLE_SCAN_SKIPPED,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+        action = ?event.action,
+        state = "evaluated",
+        "Evaluated lifecycle action during secondary scan"
+    );
 
     let lock_enabled = if let Some(lr) = lr { lr.mode.is_some() } else { false };
 
@@ -2079,15 +2304,25 @@ pub async fn eval_action_from_lifecycle(
             if lock_enabled && check_object_lock_for_deletion(&oi.bucket, oi, false).await.is_some() {
                 //if serverDebugLog {
                 if oi.version_id.is_some() {
-                    info!(
-                        "lifecycle: {} v({}) is locked, not deleting",
-                        oi.name,
-                        oi.version_id.map(|v| v.to_string()).unwrap_or_default()
+                    debug!(
+                        event = EVENT_LIFECYCLE_SCAN_SKIPPED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                        object = %oi.name,
+                        version_id = %oi.version_id.map(|v| v.to_string()).unwrap_or_default(),
+                        reason = "object_locked",
+                        "Skipped lifecycle delete because object version is locked"
                     );
                 } else {
-                    info!("lifecycle: {} is locked, not deleting", oi.name);
+                    debug!(
+                        event = EVENT_LIFECYCLE_SCAN_SKIPPED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                        object = %oi.name,
+                        reason = "object_locked",
+                        "Skipped lifecycle delete because object is locked"
+                    );
                 }
-                //}
                 return lifecycle::Event::default();
             }
             if let Some(rcfg) = rcfg
@@ -2154,7 +2389,16 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     let mut dobj = match api.delete_object(&oi.bucket, &encode_dir_object(&oi.name), opts).await {
         Ok(dobj) => dobj,
         Err(e) => {
-            error!("delete_object error: {:?}", e);
+            error!(
+                event = EVENT_LIFECYCLE_DELETE_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                bucket = %oi.bucket,
+                object = %oi.name,
+                operation = "delete_object",
+                error = ?e,
+                "Lifecycle delete failed"
+            );
             return false;
         }
     };

@@ -37,6 +37,7 @@ use matchit::Router;
 use reqwest::Url;
 use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
 use rustfs_config::server_config::Config;
+use rustfs_config::server_config::get_global_server_config;
 use rustfs_config::{
     ENABLE_KEY, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT,
     WEBHOOK_SKIP_TLS_VERIFY,
@@ -55,11 +56,10 @@ use rustfs_ecstore::bucket::target::{BucketTarget, BucketTargetType, BucketTarge
 use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::config::com::read_config_without_migrate;
-use rustfs_ecstore::config::get_global_server_config;
 use rustfs_ecstore::global::GLOBAL_BOOT_TIME;
 use rustfs_ecstore::notification_sys::get_global_notification_sys;
 use rustfs_ecstore::rpc::PeerRestClient;
-use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
+use rustfs_ecstore::store_api::BucketOperations;
 use rustfs_ecstore::{
     global::{get_global_bucket_monitor, get_global_deployment_id, get_global_region},
     new_object_layer_fn,
@@ -70,6 +70,7 @@ use rustfs_notify::{Event as NotificationEvent, notification_system};
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_types::EventName;
 use rustfs_signer::pre_sign_v4;
+use rustfs_storage_api::BucketOptions;
 use rustfs_utils::http::{
     SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_REQUEST,
     SUFFIX_SOURCE_VERSION_ID, get_source_scheme, insert_header,

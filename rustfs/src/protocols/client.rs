@@ -22,6 +22,10 @@ use s3s::{S3, S3Request, S3Result};
 use tokio_stream::Stream;
 use tracing::trace;
 
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_STORAGE_CLIENT: &str = "storage_client";
+const EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST: &str = "protocol_storage_client_request";
+
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
@@ -71,6 +75,18 @@ fn append_query_param(uri: &mut String, first: &mut bool, key: &str, value: Opti
 fn parse_protocol_uri(uri: String, context: String) -> S3Result<http::Uri> {
     uri.parse()
         .map_err(|e| s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("invalid URI for {context}: {e}")))
+}
+
+fn trace_protocol_request(operation: &str, bucket: Option<&str>, object: Option<&str>) {
+    trace!(
+        event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_STORAGE_CLIENT,
+        operation,
+        bucket = bucket.unwrap_or_default(),
+        object = object.unwrap_or_default(),
+        "Protocol storage client request"
+    );
 }
 
 fn build_bucket_uri(bucket: &str, query: &[(&str, Option<&str>)]) -> S3Result<http::Uri> {
@@ -182,9 +198,16 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         secret_key: &str,
         start_pos: Option<u64>,
     ) -> Result<GetObjectOutput, Self::Error> {
+        trace_protocol_request("get_object", Some(bucket), Some(key));
         trace!(
-            "Protocol storage client GetObject request: bucket={}, key={}, start_pos={:?}",
-            bucket, key, start_pos
+            event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_STORAGE_CLIENT,
+            operation = "get_object",
+            bucket,
+            object = %key,
+            start_pos = ?start_pos,
+            "Protocol storage client request details"
         );
 
         let mut builder = GetObjectInput::builder().bucket(bucket.to_string()).key(key.to_string());
@@ -229,7 +252,15 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         access_key: &str,
         secret_key: &str,
     ) -> Result<PutObjectOutput, Self::Error> {
-        trace!("Protocol storage client PutObject request: bucket={}, key={:?}", input.bucket, input.key);
+        trace!(
+            event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_STORAGE_CLIENT,
+            operation = "put_object",
+            bucket = %input.bucket,
+            object = %input.key,
+            "Protocol storage client request"
+        );
 
         let bucket = input.bucket.clone();
         let key = input.key.clone();
@@ -274,7 +305,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         access_key: &str,
         secret_key: &str,
     ) -> Result<DeleteObjectOutput, Self::Error> {
-        trace!("Protocol storage client DeleteObject request: bucket={}, key={}", bucket, key);
+        trace_protocol_request("delete_object", Some(bucket), Some(key));
 
         let input = DeleteObjectInput::builder()
             .bucket(bucket.to_string())
@@ -312,7 +343,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         access_key: &str,
         secret_key: &str,
     ) -> Result<HeadObjectOutput, Self::Error> {
-        trace!("Protocol storage client HeadObject request: bucket={}, key={}", bucket, key);
+        trace_protocol_request("head_object", Some(bucket), Some(key));
 
         let input = HeadObjectInput::builder()
             .bucket(bucket.to_string())
@@ -344,7 +375,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
     }
 
     async fn head_bucket(&self, bucket: &str, access_key: &str, secret_key: &str) -> Result<HeadBucketOutput, Self::Error> {
-        trace!("Protocol storage client HeadBucket request: bucket={}", bucket);
+        trace_protocol_request("head_bucket", Some(bucket), None);
 
         let input = HeadBucketInput::builder().bucket(bucket.to_string()).build().map_err(|e| {
             s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build HeadBucketInput: {}", e))
@@ -377,7 +408,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         access_key: &str,
         secret_key: &str,
     ) -> Result<ListObjectsV2Output, Self::Error> {
-        trace!("Protocol storage client ListObjectsV2 request: bucket={}", input.bucket);
+        trace_protocol_request("list_objects_v2", Some(&input.bucket), None);
 
         let bucket = input.bucket.clone();
         let uri = build_bucket_uri(&bucket, &[("list-type", Some("2"))])?;
@@ -402,7 +433,14 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
     }
 
     async fn list_buckets(&self, access_key: &str, secret_key: &str) -> Result<ListBucketsOutput, Self::Error> {
-        trace!(access_key = %MaskedAccessKey(access_key), "Protocol storage client ListBuckets request");
+        trace!(
+            event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_STORAGE_CLIENT,
+            operation = "list_buckets",
+            access_key = %MaskedAccessKey(access_key),
+            "Protocol storage client request"
+        );
 
         let input = ListBucketsInput::builder().build().map_err(|e| {
             s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build ListBucketsInput: {}", e))
@@ -429,7 +467,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
     }
 
     async fn create_bucket(&self, bucket: &str, access_key: &str, secret_key: &str) -> Result<CreateBucketOutput, Self::Error> {
-        trace!("Protocol storage client CreateBucket request: bucket={}", bucket);
+        trace_protocol_request("create_bucket", Some(bucket), None);
 
         let input = CreateBucketInput::builder().bucket(bucket.to_string()).build().map_err(|e| {
             s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build CreateBucketInput: {}", e))
@@ -465,9 +503,17 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         start_pos: u64,
         length: u64,
     ) -> Result<GetObjectOutput, Self::Error> {
+        trace_protocol_request("get_object_range", Some(bucket), Some(key));
         trace!(
-            "Protocol storage client GetObjectRange request: bucket={}, key={}, start={}, length={}",
-            bucket, key, start_pos, length
+            event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_STORAGE_CLIENT,
+            operation = "get_object_range",
+            bucket,
+            object = %key,
+            range_start = start_pos,
+            range_length = length,
+            "Protocol storage client request details"
         );
 
         let range = s3s::dto::Range::Int {
@@ -511,7 +557,15 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         access_key: &str,
         secret_key: &str,
     ) -> Result<CopyObjectOutput, Self::Error> {
-        trace!("Protocol storage client CopyObject request: bucket={}, key={}", input.bucket, input.key);
+        trace!(
+            event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_STORAGE_CLIENT,
+            operation = "copy_object",
+            bucket = %input.bucket,
+            object = %input.key,
+            "Protocol storage client request"
+        );
 
         let bucket = input.bucket.clone();
         let key = input.key.clone();
@@ -538,7 +592,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
     }
 
     async fn delete_bucket(&self, bucket: &str, access_key: &str, secret_key: &str) -> Result<DeleteBucketOutput, Self::Error> {
-        trace!("Protocol storage client DeleteBucket request: bucket={}", bucket);
+        trace_protocol_request("delete_bucket", Some(bucket), None);
 
         let input = DeleteBucketInput::builder().bucket(bucket.to_string()).build().map_err(|e| {
             s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build DeleteBucketInput: {}", e))
@@ -572,8 +626,13 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         secret_key: &str,
     ) -> Result<CreateMultipartUploadOutput, Self::Error> {
         trace!(
-            "Protocol storage client CreateMultipartUpload request: bucket={}, key={}",
-            input.bucket, input.key
+            event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_STORAGE_CLIENT,
+            operation = "create_multipart_upload",
+            bucket = %input.bucket,
+            object = %input.key,
+            "Protocol storage client request"
         );
 
         let bucket = input.bucket.clone();
@@ -607,8 +666,14 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         secret_key: &str,
     ) -> Result<UploadPartOutput, Self::Error> {
         trace!(
-            "Protocol storage client UploadPart request: bucket={}, key={}, part_number={}",
-            input.bucket, input.key, input.part_number
+            event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_STORAGE_CLIENT,
+            operation = "upload_part",
+            bucket = %input.bucket,
+            object = %input.key,
+            part_number = input.part_number,
+            "Protocol storage client request"
         );
 
         let bucket = input.bucket.clone();
@@ -673,8 +738,13 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         secret_key: &str,
     ) -> Result<CompleteMultipartUploadOutput, Self::Error> {
         trace!(
-            "Protocol storage client CompleteMultipartUpload request: bucket={}, key={}",
-            input.bucket, input.key
+            event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_STORAGE_CLIENT,
+            operation = "complete_multipart_upload",
+            bucket = %input.bucket,
+            object = %input.key,
+            "Protocol storage client request"
         );
 
         let bucket = input.bucket.clone();
@@ -709,8 +779,14 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         secret_key: &str,
     ) -> Result<AbortMultipartUploadOutput, Self::Error> {
         trace!(
-            "Protocol storage client AbortMultipartUpload request: bucket={}, key={}, upload_id={}",
-            input.bucket, input.key, input.upload_id
+            event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_STORAGE_CLIENT,
+            operation = "abort_multipart_upload",
+            bucket = %input.bucket,
+            object = %input.key,
+            upload_id = %input.upload_id,
+            "Protocol storage client request"
         );
 
         let bucket = input.bucket.clone();
@@ -745,8 +821,14 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         secret_key: &str,
     ) -> Result<UploadPartCopyOutput, Self::Error> {
         trace!(
-            "Protocol storage client UploadPartCopy request: bucket={}, key={}, part_number={}",
-            input.bucket, input.key, input.part_number
+            event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_STORAGE_CLIENT,
+            operation = "upload_part_copy",
+            bucket = %input.bucket,
+            object = %input.key,
+            part_number = input.part_number,
+            "Protocol storage client request"
         );
 
         let bucket = input.bucket.clone();

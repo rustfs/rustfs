@@ -14,10 +14,14 @@
 
 use super::*;
 
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_HEAL: &str = "heal";
+const EVENT_HEAL_FORMAT_COMPLETED: &str = "heal_format_completed";
+const EVENT_HEAL_OBJECT_STARTED: &str = "heal_object_started";
+
 impl ECStore {
     #[instrument(skip(self))]
     pub(super) async fn handle_heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
-        info!("heal_format");
         let mut r = HealResultItem {
             heal_item_type: HealItemType::Metadata.to_string(),
             detail: "disk-format".to_string(),
@@ -43,10 +47,27 @@ impl ECStore {
             r.after.drives.append(&mut result.after.drives);
         }
         if count_no_heal == self.pools.len() {
-            info!("heal format success, NoHealRequired");
+            info!(
+                event = EVENT_HEAL_FORMAT_COMPLETED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_HEAL,
+                dry_run,
+                result = "no_heal_required",
+                pool_count = self.pools.len(),
+                "Heal format completed"
+            );
             return Ok((r, Some(StorageError::NoHealRequired)));
         }
-        info!("heal format success result: {:?}", r);
+        info!(
+            event = EVENT_HEAL_FORMAT_COMPLETED,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_HEAL,
+            dry_run,
+            result = "healed_or_inspected",
+            disk_count = r.disk_count,
+            set_count = r.set_count,
+            "Heal format completed"
+        );
         Ok((r, None))
     }
 
@@ -65,7 +86,17 @@ impl ECStore {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
-        info!("ECStore heal_object");
+        info!(
+            event = EVENT_HEAL_OBJECT_STARTED,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_HEAL,
+            bucket = %bucket,
+            object = %object,
+            version_id = %version_id,
+            remove = opts.remove,
+            scan_mode = ?opts.scan_mode,
+            "Heal object started"
+        );
         let object = encode_dir_object(object);
 
         let mut futures = Vec::with_capacity(self.pools.len());

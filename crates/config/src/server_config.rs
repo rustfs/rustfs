@@ -14,11 +14,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{LazyLock, OnceLock};
+use std::sync::{LazyLock, OnceLock, RwLock};
 
 use crate::{COMMENT_KEY, DEFAULT_DELIMITER};
 
 pub static DEFAULT_KVS: LazyLock<OnceLock<HashMap<String, KVS>>> = LazyLock::new(OnceLock::new);
+pub static GLOBAL_SERVER_CONFIG: LazyLock<RwLock<Option<Config>>> = LazyLock::new(|| RwLock::new(None));
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct KV {
@@ -174,6 +175,16 @@ pub fn register_default_kvs(kvs: HashMap<String, KVS>) {
     let _ = DEFAULT_KVS.set(p);
 }
 
+pub fn get_global_server_config() -> Option<Config> {
+    GLOBAL_SERVER_CONFIG.read().ok().and_then(|guard| (*guard).clone())
+}
+
+pub fn set_global_server_config(cfg: Config) {
+    if let Ok(mut guard) = GLOBAL_SERVER_CONFIG.write() {
+        *guard = Some(cfg);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +236,18 @@ mod tests {
             "EC:4"
         );
         assert_eq!(loaded.merge(), loaded);
+    }
+
+    #[test]
+    fn global_server_config_set_and_get_roundtrip() {
+        let mut cfg = Config(HashMap::new());
+        let mut kvs = KVS::new();
+        kvs.insert("standard".to_string(), "EC:4".to_string());
+        cfg.0
+            .insert("storage_class".to_string(), HashMap::from([(DEFAULT_DELIMITER.to_string(), kvs)]));
+
+        set_global_server_config(cfg.clone());
+
+        assert_eq!(get_global_server_config(), Some(cfg));
     }
 }

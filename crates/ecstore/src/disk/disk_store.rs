@@ -45,6 +45,11 @@ use uuid::Uuid;
 /// Disk health status constants
 const DISK_HEALTH_OK: u32 = 0;
 const DISK_HEALTH_FAULTY: u32 = 1;
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_DISK: &str = "disk";
+const EVENT_DISK_HEALTH_CHECK_FAILED: &str = "disk_health_check_failed";
+const EVENT_DISK_RECOVERY_PROBE_STATE: &str = "disk_recovery_probe_state";
+const EVENT_DISK_TIMEOUT_POLICY_FALLBACK: &str = "disk_timeout_policy_fallback";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TimeoutHealthAction {
@@ -118,10 +123,14 @@ fn resolve_drive_timeout_profile_from_env() -> DriveTimeoutProfile {
         return profile;
     }
     warn!(
+        event = EVENT_DISK_TIMEOUT_POLICY_FALLBACK,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_DISK,
         env = rustfs_config::ENV_DRIVE_TIMEOUT_PROFILE,
         value = %raw,
         default = rustfs_config::DEFAULT_DRIVE_TIMEOUT_PROFILE,
-        "Invalid drive timeout profile; falling back to default"
+        reason = "invalid_timeout_profile",
+        "Disk timeout policy fell back to default"
     );
     DriveTimeoutProfile::parse(rustfs_config::DEFAULT_DRIVE_TIMEOUT_PROFILE).unwrap_or(DriveTimeoutProfile::Default)
 }
@@ -211,10 +220,14 @@ fn resolve_drive_timeout_health_policy_from_env() -> TimeoutHealthPolicy {
         return policy;
     }
     warn!(
+        event = EVENT_DISK_TIMEOUT_POLICY_FALLBACK,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_DISK,
         env = rustfs_config::ENV_DRIVE_TIMEOUT_HEALTH_ACTION,
         value = %raw,
         default = rustfs_config::DEFAULT_DRIVE_TIMEOUT_HEALTH_ACTION,
-        "Invalid drive timeout health action policy; falling back to default"
+        reason = "invalid_health_action_policy",
+        "Disk timeout policy fell back to default"
     );
     TimeoutHealthPolicy::parse(rustfs_config::DEFAULT_DRIVE_TIMEOUT_HEALTH_ACTION).unwrap_or(TimeoutHealthPolicy::MarkFailure)
 }
@@ -636,6 +649,11 @@ impl LocalDiskWrapper {
         self.health.reset_for_store_init_retry(&self.disk.endpoint());
     }
 
+    #[cfg(test)]
+    pub fn health_check_enabled_for_test(&self) -> bool {
+        self.health_check
+    }
+
     /// Enable health monitoring after disk creation.
     /// Used to defer health checks until after startup format loading completes.
     pub fn enable_health_check(&self) {
@@ -719,7 +737,14 @@ impl LocalDiskWrapper {
                         && health.mark_failure(&disk.endpoint(), "active_health_check_failed")
                     {
                         // Health check failed, disk is considered faulty
-                        warn!("health check: failed, disk is considered faulty");
+                        warn!(
+                            event = EVENT_DISK_HEALTH_CHECK_FAILED,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_DISK,
+                            endpoint = %disk.endpoint(),
+                            reason = "faulty_disk",
+                            "Disk health check marked disk faulty"
+                        );
 
                         health.increment_waiting(); // Balance the increment from failed operation
 
@@ -756,9 +781,14 @@ impl LocalDiskWrapper {
             // Verify data integrity
             if read_data.len() != test_data.len() {
                 warn!(
-                    "health check: test file data length mismatch: expected {} bytes, got {}",
-                    test_data.len(),
-                    read_data.len()
+                    event = EVENT_DISK_HEALTH_CHECK_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK,
+                    endpoint = %disk.endpoint(),
+                    reason = "data_length_mismatch",
+                    expected_bytes = test_data.len(),
+                    actual_bytes = read_data.len(),
+                    "Disk health check detected data length mismatch"
                 );
                 if check_faulty_only {
                     return Ok(());
@@ -787,7 +817,15 @@ impl LocalDiskWrapper {
             Ok(result) => match result {
                 Ok(()) => Ok(()),
                 Err(e) => {
-                    warn!("health check: failed: {:?}", e);
+                    warn!(
+                        event = EVENT_DISK_HEALTH_CHECK_FAILED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK,
+                        endpoint = %disk.endpoint(),
+                        reason = "operation_failed",
+                        error = ?e,
+                        "Disk health check failed"
+                    );
 
                     if e == DiskError::FaultyDisk {
                         return Err(e);
@@ -798,7 +836,15 @@ impl LocalDiskWrapper {
             },
             Err(_) => {
                 // Timeout occurred
-                warn!("health check: timeout after {:?}", timeout_duration);
+                warn!(
+                    event = EVENT_DISK_HEALTH_CHECK_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK,
+                    endpoint = %disk.endpoint(),
+                    reason = "timeout",
+                    timeout_secs = timeout_duration.as_secs(),
+                    "Disk health check timed out"
+                );
                 Err(DiskError::FaultyDisk)
             }
         }
@@ -835,17 +881,40 @@ impl LocalDiskWrapper {
                         Ok(_) => {
                             let state_before = health.runtime_state();
                             let is_online = health.mark_recovery_success(&disk.endpoint(), "recovery_probe_success");
-                            info!("Disk {} recovery probe succeeded; state={:?}", disk.to_string(), state_before);
+                            info!(
+                                event = EVENT_DISK_RECOVERY_PROBE_STATE,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_DISK,
+                                endpoint = %disk.endpoint(),
+                                state = "probe_succeeded",
+                                previous_state = ?state_before,
+                                "Disk recovery probe state changed"
+                            );
                             if !is_online {
                                 continue;
                             }
-                            info!("Disk {} is back online", disk.to_string());
+                            info!(
+                                event = EVENT_DISK_RECOVERY_PROBE_STATE,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_DISK,
+                                endpoint = %disk.endpoint(),
+                                state = "online",
+                                "Disk recovery probe restored disk online"
+                            );
                             health.decrement_waiting();
                             return;
                         }
                         Err(e) => {
                             health.mark_failure(&disk.endpoint(), "recovery_probe_failed");
-                            warn!("Disk {} still faulty: {:?}", disk.to_string(), e);
+                            warn!(
+                                event = EVENT_DISK_RECOVERY_PROBE_STATE,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_DISK,
+                                endpoint = %disk.endpoint(),
+                                state = "still_faulty",
+                                error = ?e,
+                                "Disk recovery probe detected disk still faulty"
+                            );
                         }
                     }
                 }
@@ -946,7 +1015,14 @@ impl LocalDiskWrapper {
     {
         // Check if disk is faulty
         if self.health.is_faulty() {
-            warn!("local disk {} health is faulty, returning error", self.to_string());
+            warn!(
+                event = EVENT_DISK_HEALTH_CHECK_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK,
+                endpoint = %self.endpoint(),
+                reason = "disk_marked_faulty",
+                "Disk health check rejected operation because disk is marked faulty"
+            );
             return Err(DiskError::FaultyDisk);
         }
 
@@ -996,10 +1072,14 @@ impl LocalDiskWrapper {
                 )
                 .increment(1);
                 warn!(
+                    event = EVENT_DISK_HEALTH_CHECK_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK,
                     endpoint = %self.endpoint(),
                     op,
                     timeout_ms = timeout_duration.as_millis(),
-                    "Local disk operation timed out"
+                    reason = "operation_timeout",
+                    "Disk operation timed out"
                 );
                 Err(DiskError::Timeout)
             }

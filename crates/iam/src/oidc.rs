@@ -26,9 +26,9 @@ use openidconnect::{
 };
 use reqwest::Client;
 use rustfs_config::oidc::*;
+use rustfs_config::server_config::get_global_server_config;
 use rustfs_config::server_config::{Config as ServerConfig, KVS};
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
-use rustfs_ecstore::config::get_global_server_config;
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;

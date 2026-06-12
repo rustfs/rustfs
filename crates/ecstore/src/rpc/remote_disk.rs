@@ -221,6 +221,11 @@ impl RemoteDisk {
         self.health.reset_for_store_init_retry(&self.endpoint);
     }
 
+    #[cfg(test)]
+    pub fn health_check_enabled_for_test(&self) -> bool {
+        self.health_check
+    }
+
     fn spawn_recovery_monitor_if_needed(&self) {
         if !self.health_check {
             return;

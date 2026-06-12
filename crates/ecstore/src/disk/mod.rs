@@ -435,6 +435,14 @@ impl Disk {
         }
     }
 
+    #[cfg(test)]
+    pub fn health_check_enabled_for_test(&self) -> bool {
+        match self {
+            Disk::Local(local_disk) => local_disk.health_check_enabled_for_test(),
+            Disk::Remote(remote_disk) => remote_disk.health_check_enabled_for_test(),
+        }
+    }
+
     pub fn record_capacity_probe(&self, total: u64, used: u64, free: u64) {
         match self {
             Disk::Local(local_disk) => local_disk.record_capacity_probe(total, used, free),

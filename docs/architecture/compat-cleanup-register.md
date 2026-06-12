@@ -18,24 +18,6 @@ for later deletion.
   - Why: legacy KMS create-key and key-status admin grants must keep working during the dedicated KMS policy migration.
   - Removal condition: remove after KMS admin clients and built-in policies use `kms:Configure`, `kms:DescribeKey`, and `kms:ListKeys`.
   - Status: planned cleanup.
-- `RUSTFS_COMPAT_TODO(API-003)`
-  - Task: `API-003`
-  - File: `crates/ecstore/src/store_api/types.rs`
-  - Why: old `ecstore::store_api` bucket DTO import paths must keep compiling while storage API consumers migrate.
-  - Removal condition: remove after all consumers import bucket DTOs from the storage API crate.
-  - Status: planned cleanup.
-- `RUSTFS_COMPAT_TODO(API-012)`
-  - Task: `API-012`
-  - File: `crates/ecstore/src/store_api/traits.rs`
-  - Why: old `StorageAPI::new_ns_lock` callers must keep compiling while namespace-lock-only consumers migrate to NamespaceLocking.
-  - Removal condition: remove after all namespace-lock-only consumers depend on NamespaceLocking and StorageAPI no longer owns namespace lock capability.
-  - Status: planned cleanup.
-- `RUSTFS_COMPAT_TODO(CFG-004)`
-  - Task: `CFG-004`
-  - File: `crates/ecstore/src/config/mod.rs`
-  - Why: old `rustfs_ecstore::config` model import paths must keep compiling while server-config model consumers migrate.
-  - Removal condition: remove after all consumers import Config, KV, KVS, DEFAULT_KVS, and register_default_kvs from rustfs_config::server_config.
-  - Status: planned cleanup.
 
 ## Review Checklist
 

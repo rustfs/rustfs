@@ -2814,7 +2814,7 @@ mod tests {
         let manager = rustfs_kms::init_global_kms_service_manager();
         let temp_dir = TempDir::new().expect("temp dir");
         manager
-            .reconfigure(KmsConfig::local(temp_dir.path().to_path_buf()))
+            .reconfigure(KmsConfig::local(temp_dir.path().to_path_buf()).with_insecure_development_defaults())
             .await
             .expect("kms reconfigure should succeed");
         manager
@@ -3429,7 +3429,7 @@ mod tests {
 
         let first_dir = TempDir::new().expect("first temp dir");
         manager
-            .reconfigure(KmsConfig::local(first_dir.path().to_path_buf()))
+            .reconfigure(KmsConfig::local(first_dir.path().to_path_buf()).with_insecure_development_defaults())
             .await
             .expect("first KMS reconfigure should succeed");
         manager
@@ -3456,7 +3456,7 @@ mod tests {
 
         let second_dir = TempDir::new().expect("second temp dir");
         manager
-            .reconfigure(KmsConfig::local(second_dir.path().to_path_buf()))
+            .reconfigure(KmsConfig::local(second_dir.path().to_path_buf()).with_insecure_development_defaults())
             .await
             .expect("second KMS reconfigure should succeed");
         manager
