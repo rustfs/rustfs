@@ -86,6 +86,7 @@ rustfs-security-governance = { workspace = true }
 rustfs-data-usage = { workspace = true }
 rustfs-s3select-api = { workspace = true }
 rustfs-s3select-query = { workspace = true }
+rustfs-extension-schema = { workspace = true }
 rustfs-targets = { workspace = true }
 rustfs-storage-api = { workspace = true }
 rustfs-tls-runtime = { workspace = true }
