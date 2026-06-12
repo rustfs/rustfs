@@ -45,7 +45,7 @@ use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 use rustfs_ecstore::error::Error as EcstoreError;
 use rustfs_ecstore::global::is_erasure_sd;
 use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::{BucketOperations, NamespaceLocking as _};
+use rustfs_ecstore::store_api::{BucketOperations, NamespaceLocking as _, ObjectIO};
 use rustfs_storage_api::BucketOptions;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -738,7 +738,7 @@ impl Drop for ScannerScanModeGuard {
 #[instrument(skip(ctx, storeapi))]
 pub async fn store_data_usage_in_backend(
     ctx: CancellationToken,
-    storeapi: Arc<ECStore>,
+    storeapi: Arc<impl ObjectIO>,
     mut receiver: mpsc::Receiver<DataUsageInfo>,
 ) {
     let mut attempts = 1u32;
@@ -747,6 +747,18 @@ pub async fn store_data_usage_in_backend(
         let _activity_guard = ScannerActivityGuard::new();
         if ctx.is_cancelled() {
             break;
+        }
+
+        if let Ok(buf) = read_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await
+            && let Ok(existing) = serde_json::from_slice::<DataUsageInfo>(&buf)
+            && let (Some(new_ts), Some(existing_ts)) = (data_usage_info.last_update, existing.last_update)
+            && new_ts <= existing_ts
+        {
+            info!(
+                "Skip persisting data usage: incoming last_update {:?} <= existing {:?}",
+                new_ts, existing_ts
+            );
+            continue;
         }
 
         // Serialize to JSON
@@ -785,8 +797,13 @@ pub async fn store_data_usage_in_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_ecstore::store_api::{GetObjectReader, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader};
     use serial_test::serial;
+    use std::collections::HashMap;
+    use std::io::Cursor;
     use temp_env::{with_var, with_var_unset};
+    use tokio::io::AsyncReadExt;
+    use tokio::sync::Mutex;
 
     struct ScannerDefaultSpeedGuard;
 
@@ -815,6 +832,51 @@ mod tests {
     impl Drop for ScannerDefaultCycleGuard {
         fn drop(&mut self) {
             set_scanner_default_cycle_secs(None);
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct MemoryConfigStore {
+        objects: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    fn memory_config_key(bucket: &str, object: &str) -> String {
+        format!("{bucket}/{object}")
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectIO for MemoryConfigStore {
+        async fn get_object_reader(
+            &self,
+            bucket: &str,
+            object: &str,
+            _range: Option<rustfs_ecstore::store_api::HTTPRangeSpec>,
+            _h: http::HeaderMap,
+            _opts: &ObjectOptions,
+        ) -> rustfs_ecstore::error::Result<GetObjectReader> {
+            let objects = self.objects.lock().await;
+            let data = objects
+                .get(&memory_config_key(bucket, object))
+                .cloned()
+                .ok_or(rustfs_ecstore::error::Error::FileNotFound)?;
+
+            Ok(GetObjectReader {
+                stream: Box::new(Cursor::new(data)),
+                object_info: ObjectInfo::default(),
+            })
+        }
+
+        async fn put_object(
+            &self,
+            bucket: &str,
+            object: &str,
+            data: &mut PutObjReader,
+            _opts: &ObjectOptions,
+        ) -> rustfs_ecstore::error::Result<ObjectInfo> {
+            let mut buf = Vec::new();
+            data.stream.read_to_end(&mut buf).await?;
+            self.objects.lock().await.insert(memory_config_key(bucket, object), buf);
+            Ok(ObjectInfo::default())
         }
     }
 
@@ -1020,6 +1082,39 @@ mod tests {
         assert_eq!(global_metrics().current_scan_mode(), HealScanMode::Unknown);
 
         global_metrics().set_cycle(None).await;
+    }
+
+    #[tokio::test]
+    async fn test_store_data_usage_in_backend_preserves_newer_snapshot() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let (sender, receiver) = mpsc::channel(2);
+        let ctx = CancellationToken::new();
+
+        let newer = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+            buckets_count: 2,
+            ..Default::default()
+        };
+        let older = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+            buckets_count: 1,
+            ..Default::default()
+        };
+
+        sender.send(newer).await.expect("newer usage snapshot should enqueue");
+        sender.send(older).await.expect("older usage snapshot should enqueue");
+        drop(sender);
+
+        store_data_usage_in_backend(ctx, store.clone(), receiver).await;
+
+        let objects = store.objects.lock().await;
+        let saved = objects
+            .get(&memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()))
+            .expect("data usage config should be saved");
+        let saved = serde_json::from_slice::<DataUsageInfo>(saved).expect("saved usage snapshot should decode");
+
+        assert_eq!(saved.buckets_count, 2);
+        assert_eq!(saved.last_update, Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)));
     }
 
     #[test]
