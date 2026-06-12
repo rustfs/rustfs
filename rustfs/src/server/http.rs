@@ -19,7 +19,7 @@ use crate::auth_keystone;
 use crate::config;
 use crate::server::{
     ReadinessGateLayer, RemoteAddr, ShutdownHandle,
-    compress::{CompressionConfig, PathAwareCompressionPredicate, PathCategoryInjectionLayer},
+    compress::{HttpCompressionConfig, PathAwareHttpCompressionPredicate, PathCategoryInjectionLayer},
     hybrid::hybrid,
     layer::{
         BodylessStatusFixLayer, ConditionalCorsLayer, EmptyBodyContentLengthCompatLayer, HeadRequestBodyFixLayer,
@@ -409,7 +409,7 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
     // Create shutdown channel
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
     // Create compression configuration from environment variables
-    let compression_config = CompressionConfig::from_env();
+    let compression_config = HttpCompressionConfig::from_env();
     if compression_config.enabled {
         info!(
             "HTTP response compression enabled: extensions={:?}, mime_patterns={:?}, min_size={} bytes",
@@ -600,7 +600,7 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
 struct ConnectionContext {
     http_server: Arc<ConnBuilder<TokioExecutor>>,
     s3_service: S3Service,
-    compression_config: CompressionConfig,
+    compression_config: HttpCompressionConfig,
     is_console: bool,
     readiness: Arc<GlobalReadiness>,
     /// Pre-computed Keystone auth provider (avoids per-connection OnceLock read).
@@ -939,7 +939,7 @@ fn process_connection(
             .layer(PropagateRequestIdLayer::x_request_id())
             // Compress responses based on whitelist configuration
             // Only compresses when enabled and matches configured extensions/MIME types
-            .layer(CompressionLayer::new().compress_when(PathAwareCompressionPredicate::new(compression_config)))
+            .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config)))
             .layer(PathCategoryInjectionLayer)
             .layer(S3ErrorMessageCompatLayer)
             .layer(ObjectAttributesEtagFixLayer)

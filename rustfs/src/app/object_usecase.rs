@@ -69,7 +69,7 @@ use rustfs_ecstore::bucket::{
     versioning_sys::BucketVersioningSys,
 };
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
-use rustfs_ecstore::compress::{MIN_COMPRESSIBLE_SIZE, is_compressible};
+use rustfs_ecstore::compress::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
 use rustfs_ecstore::config::storageclass;
 use rustfs_ecstore::disk::{error::DiskError, error_reduce::is_all_buckets_not_found};
 use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
@@ -1928,7 +1928,7 @@ impl DefaultObjectUsecase {
 
         let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
 
-        let should_compress = is_compressible(&req.headers, &key) && size > MIN_COMPRESSIBLE_SIZE as i64;
+        let should_compress = is_disk_compressible(&req.headers, &key) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64;
         let mut write_plan = WritePlan::new();
         let mut reader = if should_compress {
             let algorithm = CompressionAlgorithm::default();
@@ -2902,7 +2902,7 @@ impl DefaultObjectUsecase {
 
         let mut compress_metadata = HashMap::new();
 
-        let should_compress = is_compressible(&req.headers, &key) && actual_size > MIN_COMPRESSIBLE_SIZE as i64;
+        let should_compress = is_disk_compressible(&req.headers, &key) && actual_size > MIN_DISK_COMPRESSIBLE_SIZE as i64;
 
         if should_compress {
             insert_str(
@@ -4411,7 +4411,8 @@ impl DefaultObjectUsecase {
 
             let actual_size = size;
 
-            let should_compress = !is_dir && is_compressible(&HeaderMap::new(), &fpath) && size > MIN_COMPRESSIBLE_SIZE as i64;
+            let should_compress =
+                !is_dir && is_disk_compressible(&HeaderMap::new(), &fpath) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64;
 
             let mut write_plan = WritePlan::new();
             let mut hrd = if is_dir {
