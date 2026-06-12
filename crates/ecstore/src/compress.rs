@@ -12,55 +12,111 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_utils::string::{has_pattern, has_string_suffix_in_slice};
+use rustfs_utils::string::{has_pattern, has_string_suffix_in_slice, match_simple};
 use std::env;
 use std::sync::OnceLock;
 use tracing::debug;
 
-pub const MIN_COMPRESSIBLE_SIZE: usize = 4096;
+pub const MIN_DISK_COMPRESSIBLE_SIZE: usize = 4096;
 
-// Environment variable name to control whether compression is enabled
-pub const ENV_COMPRESSION_ENABLED: &str = "RUSTFS_COMPRESSION_ENABLED";
+// Environment variable name to control whether object disk compression is enabled.
+pub const ENV_DISK_COMPRESSION_ENABLED: &str = "RUSTFS_COMPRESSION_ENABLED";
+
+// Environment variable for file extensions to include in object disk compression.
+pub const ENV_DISK_COMPRESSION_EXTENSIONS: &str = "RUSTFS_COMPRESSION_EXTENSIONS";
+
+// Environment variable for MIME types to include in object disk compression.
+pub const ENV_DISK_COMPRESSION_MIME_TYPES: &str = "RUSTFS_COMPRESSION_MIME_TYPES";
 
 // Environment variable for additional extensions to exclude from compression (comma-separated, e.g. ".foo,.bar")
 pub const ENV_ADDED_EXCLUDE_COMPRESS_EXTENSIONS: &str = "RUSTFS_ADDED_EXCLUDE_COMPRESS_EXTENSIONS";
 
+pub const DEFAULT_DISK_COMPRESS_EXTENSIONS: &str = ".txt,.log,.csv,.json,.tar,.xml,.bin";
+pub const DEFAULT_DISK_COMPRESS_MIME_TYPES: &str = "text/*,application/json,application/xml,binary/octet-stream";
+
+#[derive(Debug)]
+struct DiskCompressionConfig {
+    enabled: bool,
+    extensions: Vec<String>,
+    mime_types: Vec<String>,
+    added_exclude_extensions: Vec<String>,
+}
+
 /// Parses RUSTFS_COMPRESSION_ENABLED. Called once at first use via OnceLock.
-fn parse_compression_enabled() -> bool {
-    env::var(ENV_COMPRESSION_ENABLED)
-        .map(|s| s.to_lowercase() == "true")
+fn parse_disk_compression_enabled() -> bool {
+    env::var(ENV_DISK_COMPRESSION_ENABLED)
+        .map(|s| matches!(s.to_ascii_lowercase().as_str(), "true" | "on" | "1"))
         .unwrap_or(false)
+}
+
+fn parse_csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+fn normalize_extensions(extensions: Vec<String>) -> Vec<String> {
+    extensions
+        .into_iter()
+        .map(|v| if v.starts_with('.') { v } else { format!(".{v}") })
+        .collect()
+}
+
+fn has_config_pattern(patterns: &[String], match_str: &str) -> bool {
+    patterns.iter().any(|pattern| match_simple(pattern, match_str))
+}
+
+fn has_object_content_encoding(headers: &http::HeaderMap) -> bool {
+    for value in headers.get_all(http::header::CONTENT_ENCODING) {
+        let Ok(content_encoding) = value.to_str() else {
+            return true;
+        };
+
+        for encoding in content_encoding.split(',').map(str::trim) {
+            if !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity") && !encoding.eq_ignore_ascii_case("aws-chunked")
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn parse_disk_compression_extensions() -> Vec<String> {
+    let extensions = env::var(ENV_DISK_COMPRESSION_EXTENSIONS).unwrap_or_else(|_| DEFAULT_DISK_COMPRESS_EXTENSIONS.to_string());
+    normalize_extensions(parse_csv(&extensions))
+}
+
+fn parse_disk_compression_mime_types() -> Vec<String> {
+    let mime_types = env::var(ENV_DISK_COMPRESSION_MIME_TYPES).unwrap_or_else(|_| DEFAULT_DISK_COMPRESS_MIME_TYPES.to_string());
+    parse_csv(&mime_types)
 }
 
 /// Parses RUSTFS_ADDED_EXCLUDE_COMPRESS_EXTENSIONS (comma-separated). Called once at first use via OnceLock.
 pub(crate) fn parse_added_exclude_extensions() -> Vec<String> {
     env::var(ENV_ADDED_EXCLUDE_COMPRESS_EXTENSIONS)
         .ok()
-        .map(|s| {
-            s.split(',')
-                .map(|v| {
-                    let v = v.trim().to_lowercase();
-                    if v.is_empty() {
-                        String::new()
-                    } else if v.starts_with('.') {
-                        v
-                    } else {
-                        format!(".{v}")
-                    }
-                })
-                .filter(|v| !v.is_empty())
-                .collect()
-        })
+        .map(|s| normalize_extensions(parse_csv(&s)))
         .unwrap_or_default()
 }
 
-// Parsed once at first use, then reused for all is_compressible() checks.
-static COMPRESSION_ENABLED: OnceLock<bool> = OnceLock::new();
-static ADDED_EXCLUDE_COMPRESS_EXTENSIONS: OnceLock<Vec<String>> = OnceLock::new();
+fn parse_disk_compression_config() -> DiskCompressionConfig {
+    DiskCompressionConfig {
+        enabled: parse_disk_compression_enabled(),
+        extensions: parse_disk_compression_extensions(),
+        mime_types: parse_disk_compression_mime_types(),
+        added_exclude_extensions: parse_added_exclude_extensions(),
+    }
+}
+
+// Parsed once at first use, then reused for all disk compression checks.
+static DISK_COMPRESSION_CONFIG: OnceLock<DiskCompressionConfig> = OnceLock::new();
 
 // Some standard object extensions which we strictly dis-allow for compression.
 #[rustfmt::skip]
-pub const STANDARD_EXCLUDE_COMPRESS_EXTENSIONS: &[&str] = &[
+pub const DISK_COMPRESSION_EXCLUDED_EXTENSIONS: &[&str] = &[
     // Compressed archives
     ".gz", ".bz2", ".rar", ".zip", ".7z", ".xz", ".zst", ".lz4", ".br", ".lzo", ".sz", ".tgz",
     // Images
@@ -78,7 +134,7 @@ pub const STANDARD_EXCLUDE_COMPRESS_EXTENSIONS: &[&str] = &[
 ];
 
 // Some standard content-types which we strictly dis-allow for compression.
-pub const STANDARD_EXCLUDE_COMPRESS_CONTENT_TYPES: &[&str] = &[
+pub const DISK_COMPRESSION_EXCLUDED_CONTENT_TYPES: &[&str] = &[
     "video/*",
     "audio/*",
     "image/*",
@@ -107,35 +163,53 @@ pub const STANDARD_EXCLUDE_COMPRESS_CONTENT_TYPES: &[&str] = &[
     "font/*",
 ];
 
-pub fn is_compressible(headers: &http::HeaderMap, object_name: &str) -> bool {
-    // Check if compression is enabled (read once at first use, then fixed for process lifetime)
-    if !*COMPRESSION_ENABLED.get_or_init(parse_compression_enabled) {
-        debug!("Compression is disabled by environment variable");
+pub fn is_disk_compressible(headers: &http::HeaderMap, object_name: &str) -> bool {
+    is_disk_compressible_with_config(headers, object_name, DISK_COMPRESSION_CONFIG.get_or_init(parse_disk_compression_config))
+}
+
+fn is_disk_compressible_with_config(headers: &http::HeaderMap, object_name: &str, config: &DiskCompressionConfig) -> bool {
+    // Check if disk compression is enabled (read once at first use, then fixed for process lifetime)
+    if !config.enabled {
+        debug!("Disk compression is disabled by environment variable");
         return false;
     }
 
     let content_type = headers.get("content-type").and_then(|s| s.to_str().ok()).unwrap_or("");
 
-    // TODO: crypto request return false
-
-    if has_string_suffix_in_slice(object_name, STANDARD_EXCLUDE_COMPRESS_EXTENSIONS) {
-        debug!("object_name: {} is not compressible", object_name);
+    if has_object_content_encoding(headers) {
+        debug!("object_name: {} is already content-encoded; skipping disk compression", object_name);
         return false;
     }
 
-    let added = ADDED_EXCLUDE_COMPRESS_EXTENSIONS.get_or_init(parse_added_exclude_extensions);
-    if !added.is_empty() && has_string_suffix_in_slice(object_name, added) {
-        debug!("object_name: {} is not compressible (added exclusion)", object_name);
+    if has_string_suffix_in_slice(object_name, DISK_COMPRESSION_EXCLUDED_EXTENSIONS) {
+        debug!("object_name: {} is not disk-compressible", object_name);
         return false;
     }
 
-    if !content_type.is_empty() && has_pattern(STANDARD_EXCLUDE_COMPRESS_CONTENT_TYPES, content_type) {
-        debug!("content_type: {} is not compressible", content_type);
+    if !config.added_exclude_extensions.is_empty() && has_string_suffix_in_slice(object_name, &config.added_exclude_extensions) {
+        debug!("object_name: {} is not disk-compressible (added exclusion)", object_name);
         return false;
     }
-    true
 
-    // TODO: check from config
+    if !content_type.is_empty() && has_pattern(DISK_COMPRESSION_EXCLUDED_CONTENT_TYPES, content_type) {
+        debug!("content_type: {} is not disk-compressible", content_type);
+        return false;
+    }
+
+    if config.extensions.is_empty() && config.mime_types.is_empty() {
+        return true;
+    }
+
+    if !config.extensions.is_empty() && has_string_suffix_in_slice(object_name, &config.extensions) {
+        return true;
+    }
+
+    if !content_type.is_empty() && !config.mime_types.is_empty() && has_config_pattern(&config.mime_types, content_type) {
+        return true;
+    }
+
+    debug!("object_name: {} does not match disk compression include filters", object_name);
+    false
 }
 
 #[cfg(test)]
@@ -144,117 +218,169 @@ mod tests {
     use temp_env;
 
     #[test]
-    fn test_parse_compression_enabled() {
-        temp_env::with_var(ENV_COMPRESSION_ENABLED, Some("true"), || {
-            assert!(parse_compression_enabled());
+    fn test_parse_disk_compression_enabled() {
+        temp_env::with_var(ENV_DISK_COMPRESSION_ENABLED, Some("true"), || {
+            assert!(parse_disk_compression_enabled());
         });
-        temp_env::with_var(ENV_COMPRESSION_ENABLED, Some("false"), || {
-            assert!(!parse_compression_enabled());
+        temp_env::with_var(ENV_DISK_COMPRESSION_ENABLED, Some("on"), || {
+            assert!(parse_disk_compression_enabled());
         });
-        temp_env::with_var(ENV_COMPRESSION_ENABLED, Some("FALSE"), || {
-            assert!(!parse_compression_enabled());
+        temp_env::with_var(ENV_DISK_COMPRESSION_ENABLED, Some("false"), || {
+            assert!(!parse_disk_compression_enabled());
         });
-        temp_env::with_var_unset(ENV_COMPRESSION_ENABLED, || {
-            assert!(!parse_compression_enabled());
+        temp_env::with_var(ENV_DISK_COMPRESSION_ENABLED, Some("FALSE"), || {
+            assert!(!parse_disk_compression_enabled());
+        });
+        temp_env::with_var_unset(ENV_DISK_COMPRESSION_ENABLED, || {
+            assert!(!parse_disk_compression_enabled());
         });
     }
 
     #[test]
-    fn test_is_compressible() {
+    fn test_parse_disk_compression_includes() {
+        temp_env::with_var(ENV_DISK_COMPRESSION_EXTENSIONS, Some(".txt,log, .json"), || {
+            assert_eq!(parse_disk_compression_extensions(), [".txt", ".log", ".json"]);
+        });
+        temp_env::with_var(ENV_DISK_COMPRESSION_MIME_TYPES, Some("text/*, application/json"), || {
+            assert_eq!(parse_disk_compression_mime_types(), ["text/*", "application/json"]);
+        });
+        temp_env::with_var_unset(ENV_DISK_COMPRESSION_EXTENSIONS, || {
+            assert_eq!(
+                parse_disk_compression_extensions(),
+                [".txt", ".log", ".csv", ".json", ".tar", ".xml", ".bin"]
+            );
+        });
+        temp_env::with_var_unset(ENV_DISK_COMPRESSION_MIME_TYPES, || {
+            assert_eq!(
+                parse_disk_compression_mime_types(),
+                ["text/*", "application/json", "application/xml", "binary/octet-stream"]
+            );
+        });
+    }
+
+    fn test_config() -> DiskCompressionConfig {
+        DiskCompressionConfig {
+            enabled: true,
+            extensions: normalize_extensions(parse_csv(DEFAULT_DISK_COMPRESS_EXTENSIONS)),
+            mime_types: parse_csv(DEFAULT_DISK_COMPRESS_MIME_TYPES),
+            added_exclude_extensions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_is_disk_compressible() {
         use http::HeaderMap;
 
-        let headers = HeaderMap::new();
+        let config = test_config();
+        let mut headers = HeaderMap::new();
+        // Test non-compressible extensions - compressed archives
+        headers.insert("content-type", "text/plain".parse().expect("valid content type"));
+        assert!(!is_disk_compressible_with_config(&headers, "file.gz", &config));
+        assert!(!is_disk_compressible_with_config(&headers, "file.zip", &config));
+        assert!(!is_disk_compressible_with_config(&headers, "file.7z", &config));
+        assert!(!is_disk_compressible_with_config(&headers, "file.zst", &config));
+        assert!(!is_disk_compressible_with_config(&headers, "file.br", &config));
+        assert!(!is_disk_compressible_with_config(&headers, "file.tgz", &config));
 
-        // COMPRESSION_ENABLED is cached in OnceLock at first use; test with "true" so extension/content-type logic is exercised.
-        // For env false/unset behavior see test_parse_compression_enabled.
-        temp_env::with_var(ENV_COMPRESSION_ENABLED, Some("true"), || {
-            assert!(is_compressible(&headers, "file.txt"));
-        });
+        // Test non-compressible extensions - images
+        assert!(!is_disk_compressible_with_config(&headers, "file.jpg", &config));
+        assert!(!is_disk_compressible_with_config(&headers, "file.jpeg", &config));
+        assert!(!is_disk_compressible_with_config(&headers, "file.png", &config));
+        assert!(!is_disk_compressible_with_config(&headers, "file.gif", &config));
+        assert!(!is_disk_compressible_with_config(&headers, "file.webp", &config));
+        assert!(!is_disk_compressible_with_config(&headers, "file.avif", &config));
 
-        temp_env::with_var(ENV_COMPRESSION_ENABLED, Some("true"), || {
-            let mut headers = HeaderMap::new();
-            // Test non-compressible extensions - compressed archives
-            headers.insert("content-type", "text/plain".parse().unwrap());
-            assert!(!is_compressible(&headers, "file.gz"));
-            assert!(!is_compressible(&headers, "file.zip"));
-            assert!(!is_compressible(&headers, "file.7z"));
-            assert!(!is_compressible(&headers, "file.zst"));
-            assert!(!is_compressible(&headers, "file.br"));
-            assert!(!is_compressible(&headers, "file.tgz"));
+        // Test non-compressible extensions - video
+        assert!(!is_disk_compressible_with_config(&headers, "file.mp4", &config));
+        assert!(!is_disk_compressible_with_config(&headers, "file.mkv", &config));
+        assert!(!is_disk_compressible_with_config(&headers, "file.webm", &config));
 
-            // Test non-compressible extensions - images
-            assert!(!is_compressible(&headers, "file.jpg"));
-            assert!(!is_compressible(&headers, "file.jpeg"));
-            assert!(!is_compressible(&headers, "file.png"));
-            assert!(!is_compressible(&headers, "file.gif"));
-            assert!(!is_compressible(&headers, "file.webp"));
-            assert!(!is_compressible(&headers, "file.avif"));
+        // Test non-compressible extensions - audio
+        assert!(!is_disk_compressible_with_config(&headers, "file.mp3", &config));
+        assert!(!is_disk_compressible_with_config(&headers, "file.aac", &config));
+        assert!(!is_disk_compressible_with_config(&headers, "file.ogg", &config));
+        assert!(!is_disk_compressible_with_config(&headers, "file.flac", &config));
+        assert!(!is_disk_compressible_with_config(&headers, "file.opus", &config));
 
-            // Test non-compressible extensions - video
-            assert!(!is_compressible(&headers, "file.mp4"));
-            assert!(!is_compressible(&headers, "file.mkv"));
-            assert!(!is_compressible(&headers, "file.webm"));
+        // Test non-compressible extensions - documents
+        assert!(!is_disk_compressible_with_config(&headers, "file.pdf", &config));
+        assert!(!is_disk_compressible_with_config(&headers, "file.docx", &config));
+        assert!(!is_disk_compressible_with_config(&headers, "file.xlsx", &config));
+        assert!(!is_disk_compressible_with_config(&headers, "file.pptx", &config));
 
-            // Test non-compressible extensions - audio
-            assert!(!is_compressible(&headers, "file.mp3"));
-            assert!(!is_compressible(&headers, "file.aac"));
-            assert!(!is_compressible(&headers, "file.ogg"));
-            assert!(!is_compressible(&headers, "file.flac"));
-            assert!(!is_compressible(&headers, "file.opus"));
+        // Test non-compressible extensions - packages
+        assert!(!is_disk_compressible_with_config(&headers, "file.deb", &config));
+        assert!(!is_disk_compressible_with_config(&headers, "file.rpm", &config));
+        assert!(!is_disk_compressible_with_config(&headers, "file.jar", &config));
 
-            // Test non-compressible extensions - documents
-            assert!(!is_compressible(&headers, "file.pdf"));
-            assert!(!is_compressible(&headers, "file.docx"));
-            assert!(!is_compressible(&headers, "file.xlsx"));
-            assert!(!is_compressible(&headers, "file.pptx"));
+        // Test non-compressible extensions - web fonts
+        assert!(!is_disk_compressible_with_config(&headers, "file.woff2", &config));
 
-            // Test non-compressible extensions - packages
-            assert!(!is_compressible(&headers, "file.deb"));
-            assert!(!is_compressible(&headers, "file.rpm"));
-            assert!(!is_compressible(&headers, "file.jar"));
+        // Test non-compressible content types
+        headers.insert("content-type", "video/mp4".parse().expect("valid content type"));
+        assert!(!is_disk_compressible_with_config(&headers, "file.txt", &config));
 
-            // Test non-compressible extensions - web fonts
-            assert!(!is_compressible(&headers, "file.woff2"));
+        headers.insert("content-type", "audio/mpeg".parse().expect("valid content type"));
+        assert!(!is_disk_compressible_with_config(&headers, "file.txt", &config));
 
-            // Test non-compressible content types
-            headers.insert("content-type", "video/mp4".parse().unwrap());
-            assert!(!is_compressible(&headers, "file.txt"));
+        headers.insert("content-type", "image/png".parse().expect("valid content type"));
+        assert!(!is_disk_compressible_with_config(&headers, "file.txt", &config));
 
-            headers.insert("content-type", "audio/mpeg".parse().unwrap());
-            assert!(!is_compressible(&headers, "file.txt"));
+        headers.insert("content-type", "image/webp".parse().expect("valid content type"));
+        assert!(!is_disk_compressible_with_config(&headers, "file.txt", &config));
 
-            headers.insert("content-type", "image/png".parse().unwrap());
-            assert!(!is_compressible(&headers, "file.txt"));
+        headers.insert("content-type", "application/zip".parse().expect("valid content type"));
+        assert!(!is_disk_compressible_with_config(&headers, "file.txt", &config));
 
-            headers.insert("content-type", "image/webp".parse().unwrap());
-            assert!(!is_compressible(&headers, "file.txt"));
+        headers.insert("content-type", "application/x-gzip".parse().expect("valid content type"));
+        assert!(!is_disk_compressible_with_config(&headers, "file.txt", &config));
 
-            headers.insert("content-type", "application/zip".parse().unwrap());
-            assert!(!is_compressible(&headers, "file.txt"));
+        headers.insert("content-type", "application/x-7z-compressed".parse().expect("valid content type"));
+        assert!(!is_disk_compressible_with_config(&headers, "file.txt", &config));
 
-            headers.insert("content-type", "application/x-gzip".parse().unwrap());
-            assert!(!is_compressible(&headers, "file.txt"));
+        headers.insert("content-type", "application/pdf".parse().expect("valid content type"));
+        assert!(!is_disk_compressible_with_config(&headers, "file.txt", &config));
 
-            headers.insert("content-type", "application/x-7z-compressed".parse().unwrap());
-            assert!(!is_compressible(&headers, "file.txt"));
+        headers.insert("content-type", "font/woff2".parse().expect("valid content type"));
+        assert!(!is_disk_compressible_with_config(&headers, "file.txt", &config));
 
-            headers.insert("content-type", "application/pdf".parse().unwrap());
-            assert!(!is_compressible(&headers, "file.txt"));
+        // Test compressible cases
+        headers.insert("content-type", "text/plain".parse().expect("valid content type"));
+        assert!(is_disk_compressible_with_config(&headers, "file.txt", &config));
+        assert!(is_disk_compressible_with_config(&headers, "file.log", &config));
 
-            headers.insert("content-type", "font/woff2".parse().unwrap());
-            assert!(!is_compressible(&headers, "file.txt"));
+        headers.insert("content-type", "text/html".parse().expect("valid content type"));
+        assert!(is_disk_compressible_with_config(&headers, "file.html", &config));
 
-            // Test compressible cases
-            headers.insert("content-type", "text/plain".parse().unwrap());
-            assert!(is_compressible(&headers, "file.txt"));
-            assert!(is_compressible(&headers, "file.log"));
+        headers.insert("content-type", "application/json".parse().expect("valid content type"));
+        assert!(is_disk_compressible_with_config(&headers, "file.json", &config));
 
-            headers.insert("content-type", "text/html".parse().unwrap());
-            assert!(is_compressible(&headers, "file.html"));
+        headers.insert("content-type", "application/octet-stream".parse().expect("valid content type"));
+        assert!(!is_disk_compressible_with_config(&headers, "file.data", &config));
+    }
 
-            headers.insert("content-type", "application/json".parse().unwrap());
-            assert!(is_compressible(&headers, "file.json"));
-        });
+    #[test]
+    fn test_content_encoding_skips_disk_compression() {
+        use http::{HeaderMap, HeaderValue};
+
+        let config = test_config();
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "text/plain".parse().expect("valid content type"));
+
+        headers.insert(http::header::CONTENT_ENCODING, HeaderValue::from_static("zstd"));
+        assert!(!is_disk_compressible_with_config(&headers, "file.txt", &config));
+
+        headers.insert(http::header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        assert!(!is_disk_compressible_with_config(&headers, "file.txt", &config));
+
+        headers.insert(http::header::CONTENT_ENCODING, HeaderValue::from_static("aws-chunked,gzip"));
+        assert!(!is_disk_compressible_with_config(&headers, "file.txt", &config));
+
+        headers.insert(http::header::CONTENT_ENCODING, HeaderValue::from_static("aws-chunked"));
+        assert!(is_disk_compressible_with_config(&headers, "file.txt", &config));
+
+        headers.insert(http::header::CONTENT_ENCODING, HeaderValue::from_static("identity"));
+        assert!(is_disk_compressible_with_config(&headers, "file.txt", &config));
     }
 
     #[test]
@@ -274,16 +400,32 @@ mod tests {
     }
 
     #[test]
-    fn test_added_exclude_compress_extensions_default_compressible() {
+    fn test_added_exclude_compress_extensions_excludes_included_extension() {
         use http::HeaderMap;
 
         let mut headers = HeaderMap::new();
-        headers.insert("content-type", "text/plain".parse().unwrap());
-        temp_env::with_var(ENV_COMPRESSION_ENABLED, Some("true"), || {
-            temp_env::with_var_unset(ENV_ADDED_EXCLUDE_COMPRESS_EXTENSIONS, || {
-                assert!(is_compressible(&headers, "file.foo"));
-                assert!(is_compressible(&headers, "file.bar"));
-            });
-        });
+        headers.insert("content-type", "text/plain".parse().expect("valid content type"));
+        let mut config = test_config();
+        config.added_exclude_extensions = vec![".txt".to_string()];
+
+        assert!(!is_disk_compressible_with_config(&headers, "file.txt", &config));
+        assert!(is_disk_compressible_with_config(&headers, "file.log", &config));
+    }
+
+    #[test]
+    fn test_empty_includes_compress_everything_except_exclusions() {
+        use http::HeaderMap;
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/octet-stream".parse().expect("valid content type"));
+        let config = DiskCompressionConfig {
+            enabled: true,
+            extensions: Vec::new(),
+            mime_types: Vec::new(),
+            added_exclude_extensions: Vec::new(),
+        };
+
+        assert!(is_disk_compressible_with_config(&headers, "file.data", &config));
+        assert!(!is_disk_compressible_with_config(&headers, "file.zip", &config));
     }
 }
