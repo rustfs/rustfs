@@ -34,6 +34,7 @@ use tracing::{error, info};
 use urlencoding;
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateKmsKeyRequest {
     pub key_usage: Option<KeyUsage>,
     pub description: Option<String>,
@@ -49,6 +50,7 @@ pub struct CreateKmsKeyResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateKeyApiRequest {
     pub key_usage: Option<KeyUsage>,
     pub description: Option<String>,
@@ -74,6 +76,7 @@ pub struct ListKeysApiResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GenerateDataKeyApiRequest {
     pub key_id: String,
     pub key_spec: KeySpec,
@@ -321,6 +324,7 @@ impl Operation for DescribeKeyHandler {
 #[cfg(test)]
 mod tests {
     use super::{
+        CancelKmsKeyDeletionRequest, CreateKeyApiRequest, CreateKmsKeyRequest, DeleteKmsKeyRequest, GenerateDataKeyApiRequest,
         extract_key_id, kms_create_key_actions, kms_delete_key_actions, kms_describe_key_actions, kms_generate_data_key_actions,
         kms_list_keys_actions,
     };
@@ -399,6 +403,23 @@ mod tests {
 
         assert_has_action(&kms_generate_data_key_actions(), Action::KmsAction(KmsAction::GenerateDataKeyAction));
         assert_has_action(&kms_delete_key_actions(), Action::KmsAction(KmsAction::DeleteKeyAction));
+    }
+
+    #[test]
+    fn kms_key_request_bodies_reject_unknown_fields() {
+        let cases = [
+            serde_json::from_str::<CreateKeyApiRequest>(r#"{"unexpected_field":true}"#).map(|_| ()),
+            serde_json::from_str::<CreateKmsKeyRequest>(r#"{"unexpected_field":true}"#).map(|_| ()),
+            serde_json::from_str::<GenerateDataKeyApiRequest>(r#"{"key_id":"key","key_spec":"Aes256","unexpected_field":true}"#)
+                .map(|_| ()),
+            serde_json::from_str::<DeleteKmsKeyRequest>(r#"{"key_id":"key","unexpected_field":true}"#).map(|_| ()),
+            serde_json::from_str::<CancelKmsKeyDeletionRequest>(r#"{"key_id":"key","unexpected_field":true}"#).map(|_| ()),
+        ];
+
+        for result in cases {
+            let err = result.expect_err("unknown KMS key request field should fail");
+            assert!(err.to_string().contains("unknown field"));
+        }
     }
 }
 
@@ -650,6 +671,7 @@ impl Operation for CreateKmsKeyHandler {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteKmsKeyRequest {
     pub key_id: String,
     pub pending_window_in_days: Option<u32>,
@@ -801,6 +823,7 @@ impl Operation for DeleteKmsKeyHandler {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancelKmsKeyDeletionRequest {
     pub key_id: String,
 }
