@@ -58,6 +58,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, warn};
 
+const LOG_COMPONENT_STORAGE: &str = "storage";
+const LOG_SUBSYSTEM_RPC: &str = "rpc";
+
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
 fn unimplemented_rpc(method: &str) -> Status {
@@ -110,17 +113,25 @@ impl NodeService {
 #[tonic::async_trait]
 impl Node for NodeService {
     async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
-        debug!("ping request received");
-
         let ping_req = request.into_inner();
         if ping_req.body.is_empty() {
-            debug!("ping_req received empty body; treating request as liveness probe");
+            debug!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_RPC,
+                event = "ping_request",
+                request_type = "liveness_probe",
+                "RPC ping request received"
+            );
         } else {
             let ping_body = flatbuffers::root::<PingBody>(&ping_req.body);
             if let Err(e) = ping_body {
-                warn!("invalid ping request body: {}", e);
-            } else {
-                debug!("ping request body decoded successfully");
+                warn!(
+                    component = LOG_COMPONENT_STORAGE,
+                    subsystem = LOG_SUBSYSTEM_RPC,
+                    event = "ping_request_decode_failed",
+                    error = %e,
+                    "Failed to decode RPC ping request body"
+                );
             }
         }
 
@@ -196,7 +207,6 @@ impl Node for NodeService {
 
     type WriteStreamStream = ResponseStream<WriteResponse>;
     async fn write_stream(&self, request: Request<Streaming<WriteRequest>>) -> Result<Response<Self::WriteStreamStream>, Status> {
-        debug!("write_stream called (not yet implemented)");
         let _ = request;
 
         Err(unimplemented_rpc("write_stream"))
@@ -204,7 +214,6 @@ impl Node for NodeService {
 
     type ReadAtStream = ResponseStream<ReadAtResponse>;
     async fn read_at(&self, _request: Request<Streaming<ReadAtRequest>>) -> Result<Response<Self::ReadAtStream>, Status> {
-        debug!("read_at called (not yet implemented)");
         Err(unimplemented_rpc("read_at"))
     }
 
@@ -214,7 +223,6 @@ impl Node for NodeService {
 
     type WalkDirStream = ResponseStream<WalkDirResponse>;
     async fn walk_dir(&self, request: Request<WalkDirRequest>) -> Result<Response<Self::WalkDirStream>, Status> {
-        debug!("walk_dir request received");
         let request = request.into_inner();
         let (tx, rx) = mpsc::channel(128);
         if let Some(disk) = self.find_disk(&request.disk).await {
@@ -229,7 +237,13 @@ impl Node for NodeService {
                 let (rd, mut wr) = tokio::io::duplex(64);
                 let job1 = spawn(async move {
                     if let Err(err) = disk.walk_dir(opts, &mut wr).await {
-                        error!("walk_dir failed: {err:?}");
+                        error!(
+                            component = LOG_COMPONENT_STORAGE,
+                            subsystem = LOG_SUBSYSTEM_RPC,
+                            event = "walk_dir_failed",
+                            error = ?err,
+                            "walk_dir RPC failed"
+                        );
                     }
                 });
                 let job2 = spawn(async move {
@@ -250,7 +264,13 @@ impl Node for NodeService {
                                                 .await
                                                 .is_err()
                                             {
-                                                warn!("walk_dir stream receiver dropped while sending meta cache entry");
+                                                warn!(
+                                                    component = LOG_COMPONENT_STORAGE,
+                                                    subsystem = LOG_SUBSYSTEM_RPC,
+                                                    event = "walk_dir_stream_closed",
+                                                    stage = "entry_send",
+                                                    "walk_dir stream receiver dropped"
+                                                );
                                                 break;
                                             }
                                         }
@@ -264,7 +284,13 @@ impl Node for NodeService {
                                                 .await
                                                 .is_err()
                                             {
-                                                warn!("walk_dir stream receiver dropped while sending serialization error");
+                                                warn!(
+                                                    component = LOG_COMPONENT_STORAGE,
+                                                    subsystem = LOG_SUBSYSTEM_RPC,
+                                                    event = "walk_dir_stream_closed",
+                                                    stage = "serialization_error_send",
+                                                    "walk_dir stream receiver dropped"
+                                                );
                                                 break;
                                             }
                                         }
@@ -298,7 +324,13 @@ impl Node for NodeService {
                                     break;
                                 }
 
-                                warn!("walk_dir metacache read error: {err:?}");
+                                warn!(
+                                    component = LOG_COMPONENT_STORAGE,
+                                    subsystem = LOG_SUBSYSTEM_RPC,
+                                    event = "walk_dir_metacache_read_failed",
+                                    error = ?err,
+                                    "walk_dir metacache read failed"
+                                );
 
                                 let _ = tx
                                     .send(Ok(WalkDirResponse {

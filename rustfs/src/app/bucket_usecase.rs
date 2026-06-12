@@ -81,6 +81,9 @@ use std::{
     sync::Arc,
 };
 use tracing::{debug, error, info, instrument, warn};
+
+const LOG_COMPONENT_APP: &str = "app";
+const LOG_SUBSYSTEM_BUCKET: &str = "bucket";
 use urlencoding::encode;
 
 fn serialize_config<T: xml::Serialize>(value: &T) -> S3Result<Vec<u8>> {
@@ -1148,7 +1151,14 @@ impl DefaultBucketUsecase {
                 if err == StorageError::ConfigNotFound {
                     return Err(s3_error!(ServerSideEncryptionConfigurationNotFoundError));
                 }
-                warn!("get_sse_config err {:?}", err);
+                warn!(
+                    component = LOG_COMPONENT_APP,
+                    subsystem = LOG_SUBSYSTEM_BUCKET,
+                    event = "bucket_sse_config_load_failed",
+                    bucket = %bucket,
+                    error = ?err,
+                    "Failed to load bucket SSE configuration"
+                );
                 return Err(ApiError::from(err).into());
             }
         };
@@ -1180,7 +1190,14 @@ impl DefaultBucketUsecase {
                         "The CORS configuration does not exist".to_string(),
                     ));
                 }
-                warn!("get_cors_config err {:?}", &err);
+                warn!(
+                    component = LOG_COMPONENT_APP,
+                    subsystem = LOG_SUBSYSTEM_BUCKET,
+                    event = "bucket_cors_config_load_failed",
+                    bucket = %bucket,
+                    error = ?err,
+                    "Failed to load bucket CORS configuration"
+                );
                 return Err(ApiError::from(err).into());
             }
         };
@@ -1235,7 +1252,14 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         let has_notification_config = metadata_sys::get_notification_config(&bucket).await.unwrap_or_else(|err| {
-            warn!("get_notification_config err {:?}", err);
+            warn!(
+                component = LOG_COMPONENT_APP,
+                subsystem = LOG_SUBSYSTEM_BUCKET,
+                event = "bucket_notification_config_load_failed",
+                bucket = %bucket,
+                error = ?err,
+                "Failed to load bucket notification configuration"
+            );
             None
         });
 
@@ -1428,7 +1452,14 @@ impl DefaultBucketUsecase {
                 if err == StorageError::ConfigNotFound {
                     return Err(S3Error::with_message(S3ErrorCode::NoSuchTagSet, "The TagSet does not exist".to_string()));
                 }
-                warn!("get_tagging_config err {:?}", &err);
+                warn!(
+                    component = LOG_COMPONENT_APP,
+                    subsystem = LOG_SUBSYSTEM_BUCKET,
+                    event = "bucket_tagging_config_load_failed",
+                    bucket = %bucket,
+                    error = ?err,
+                    "Failed to load bucket tagging configuration"
+                );
                 return Err(ApiError::from(err).into());
             }
         };
@@ -1571,7 +1602,14 @@ impl DefaultBucketUsecase {
             Ok((cfg, _)) => cfg,
             Err(StorageError::ConfigNotFound) => ObjectLockConfiguration::default(),
             Err(err) => {
-                warn!("get_object_lock_config err {:?}", err);
+                warn!(
+                    component = LOG_COMPONENT_APP,
+                    subsystem = LOG_SUBSYSTEM_BUCKET,
+                    event = "bucket_object_lock_config_load_failed",
+                    bucket = %bucket,
+                    error = ?err,
+                    "Failed to load bucket object lock configuration"
+                );
                 return Err(ApiError::from(err).into());
             }
         };
@@ -1740,7 +1778,14 @@ impl DefaultBucketUsecase {
                 }
                 Err(err) => {
                     if err != StorageError::ConfigNotFound {
-                        warn!("get_public_access_block_config err {:?}", &err);
+                        warn!(
+                            component = LOG_COMPONENT_APP,
+                            subsystem = LOG_SUBSYSTEM_BUCKET,
+                            event = "bucket_public_access_block_load_failed",
+                            bucket = %bucket,
+                            error = ?err,
+                            "Failed to load bucket public access block configuration"
+                        );
                         return Err(ApiError::from(err).into());
                     }
                 }

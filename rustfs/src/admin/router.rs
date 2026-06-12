@@ -101,6 +101,10 @@ use tracing::{error, warn};
 use url::form_urlencoded;
 use uuid::Uuid;
 
+const LOG_COMPONENT_ADMIN: &str = "admin";
+const LOG_SUBSYSTEM_OBJECT_LAMBDA: &str = "object_lambda";
+const LOG_SUBSYSTEM_LIVE_EVENTS: &str = "live_events";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplicationExtRoute {
     MetricsV1,
@@ -629,7 +633,13 @@ async fn load_current_server_config() -> S3Result<Config> {
         match read_config_without_migrate(store).await {
             Ok(config) => return Ok(config),
             Err(err) => {
-                warn!("failed to reload current server config for object lambda request: {err}");
+                warn!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_OBJECT_LAMBDA,
+                    event = "object_lambda_config_reload_failed",
+                    error = %err,
+                    "Failed to reload current server config for object lambda request"
+                );
             }
         }
     }
@@ -653,8 +663,11 @@ fn build_object_lambda_http_client(config: &ObjectLambdaWebhookConfig) -> S3Resu
 
     if config.skip_tls_verify {
         warn!(
-            "Object Lambda webhook target '{}' is configured to skip TLS certificate verification. This permits MITM attacks and should not be used in production.",
-            config.endpoint
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_OBJECT_LAMBDA,
+            event = "object_lambda_tls_verification_disabled",
+            endpoint = %config.endpoint,
+            "Object Lambda target is configured to skip TLS certificate verification"
         );
         builder = builder.danger_accept_invalid_certs(true);
     } else if !config.client_ca.is_empty() {
@@ -1206,11 +1219,25 @@ async fn fan_in_remote_live_events(
             {
                 Ok(Ok(batch)) => batch,
                 Ok(Err(err)) => {
-                    warn!("failed to fetch live events from peer {}: {err}", peer.client.host);
+                    warn!(
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_LIVE_EVENTS,
+                        event = "peer_live_events_fetch_failed",
+                        peer = %peer.client.host,
+                        error = %err,
+                        "Failed to fetch live events from peer"
+                    );
                     break;
                 }
                 Err(_) => {
-                    warn!("timed out fetching live events from peer {}", peer.client.host);
+                    warn!(
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_LIVE_EVENTS,
+                        event = "peer_live_events_fetch_failed",
+                        peer = %peer.client.host,
+                        error = "timeout",
+                        "Failed to fetch live events from peer"
+                    );
                     break;
                 }
             };
@@ -1231,13 +1258,28 @@ async fn fan_in_remote_live_events(
                                     }
                                 }
                                 Err(err) => {
-                                    warn!("failed to serialize remote listen notification event: {err}");
+                                    warn!(
+                                        component = LOG_COMPONENT_ADMIN,
+                                        subsystem = LOG_SUBSYSTEM_LIVE_EVENTS,
+                                        event = "live_event_serialize_failed",
+                                        source = "remote_peer",
+                                        peer = %peer.client.host,
+                                        error = %err,
+                                        "Failed to serialize live event"
+                                    );
                                 }
                             }
                         }
                     }
                     Err(err) => {
-                        warn!("failed to decode live events from peer {}: {err}", peer.client.host);
+                        warn!(
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_LIVE_EVENTS,
+                            event = "peer_live_events_decode_failed",
+                            peer = %peer.client.host,
+                            error = %err,
+                            "Failed to decode live events from peer"
+                        );
                     }
                 }
             }
@@ -1290,12 +1332,25 @@ fn build_listen_notification_response(uri: &Uri, bucket: Option<&str>) -> S3Resu
                                         }
                                     }
                                     Err(err) => {
-                                        warn!("failed to serialize listen notification event: {err}");
+                                        warn!(
+                                            component = LOG_COMPONENT_ADMIN,
+                                            subsystem = LOG_SUBSYSTEM_LIVE_EVENTS,
+                                            event = "live_event_serialize_failed",
+                                            source = "local_stream",
+                                            error = %err,
+                                            "Failed to serialize live event"
+                                        );
                                     }
                                 }
                             }
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                                warn!("listen notification stream lagged and skipped {skipped} events");
+                                warn!(
+                                    component = LOG_COMPONENT_ADMIN,
+                                    subsystem = LOG_SUBSYSTEM_LIVE_EVENTS,
+                                    event = "live_event_stream_lagged",
+                                    skipped,
+                                    "Live event stream lagged"
+                                );
                             }
                             Err(broadcast::error::RecvError::Closed) => break,
                         }

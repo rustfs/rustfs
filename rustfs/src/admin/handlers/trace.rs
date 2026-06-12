@@ -20,7 +20,6 @@ use matchit::Params;
 use rustfs_ecstore::rpc::PeerRestClient;
 use rustfs_madmin::service_commands::ServiceTraceOpts;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
-use tracing::warn;
 
 #[allow(dead_code)]
 fn extract_trace_options(uri: &Uri) -> S3Result<ServiceTraceOpts> {
@@ -38,8 +37,6 @@ pub struct Trace {}
 #[async_trait::async_trait]
 impl Operation for Trace {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle Trace");
-
         let _trace_opts = extract_trace_options(&req.uri)?;
 
         // let (tx, rx) = mpsc::channel(10000);
