@@ -20,7 +20,7 @@ use crate::config::{
 };
 use crate::service_manager::KmsServiceStatus;
 use crate::types::{KeyMetadata, KeyUsage};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
@@ -28,6 +28,7 @@ use std::time::Duration;
 
 /// Request to configure KMS with Local backend
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigureLocalKmsRequest {
     /// Directory to store key files
     pub key_dir: PathBuf,
@@ -71,10 +72,12 @@ impl fmt::Debug for ConfigureLocalKmsRequest {
 
 /// Request to configure KMS with Vault KV v2 + Transit backend
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigureVaultKmsRequest {
     /// Vault server URL
     pub address: String,
     /// Authentication method
+    #[serde(deserialize_with = "deserialize_strict_vault_auth_method")]
     pub auth_method: VaultAuthMethod,
     /// Vault namespace (Vault Enterprise, optional)
     pub namespace: Option<String>,
@@ -104,10 +107,12 @@ pub struct ConfigureVaultKmsRequest {
 
 /// Request to configure KMS with Vault Transit backend
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigureVaultTransitKmsRequest {
     /// Vault server URL
     pub address: String,
     /// Authentication method
+    #[serde(deserialize_with = "deserialize_strict_vault_auth_method")]
     pub auth_method: VaultAuthMethod,
     /// Vault namespace (Vault Enterprise, optional)
     pub namespace: Option<String>,
@@ -165,9 +170,33 @@ pub struct ConfigureKmsResponse {
 
 /// Request to start KMS service
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StartKmsRequest {
     /// Whether to force start (restart if already running)
     pub force: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+enum StrictVaultAuthMethod {
+    Token { token: String },
+    AppRole { role_id: String, secret_id: String },
+}
+
+impl From<StrictVaultAuthMethod> for VaultAuthMethod {
+    fn from(value: StrictVaultAuthMethod) -> Self {
+        match value {
+            StrictVaultAuthMethod::Token { token } => Self::Token { token },
+            StrictVaultAuthMethod::AppRole { role_id, secret_id } => Self::AppRole { role_id, secret_id },
+        }
+    }
+}
+
+fn deserialize_strict_vault_auth_method<'de, D>(deserializer: D) -> Result<VaultAuthMethod, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    StrictVaultAuthMethod::deserialize(deserializer).map(Into::into)
 }
 
 /// KMS start response
@@ -564,6 +593,39 @@ mod tests {
         });
         let request: ConfigureKmsRequest = serde_json::from_value(vault_opt_in_raw).expect("vault request should deserialize");
         assert!(request.to_kms_config().validate().is_ok());
+    }
+
+    #[test]
+    fn test_configure_request_rejects_unknown_fields() {
+        let raw = serde_json::json!({
+            "backend_type": "local",
+            "key_dir": "./target/kms-key-dir",
+            "unexpected_field": true
+        });
+
+        let err = serde_json::from_value::<ConfigureKmsRequest>(raw).expect_err("unknown configure field should fail");
+        assert!(err.to_string().contains("unknown field"));
+
+        let raw = serde_json::json!({
+            "backend_type": "vault",
+            "address": "http://127.0.0.1:8200",
+            "auth_method": {
+                "Token": {
+                    "token": "dev-root-token",
+                    "unexpected_field": true
+                }
+            }
+        });
+
+        let err = serde_json::from_value::<ConfigureKmsRequest>(raw).expect_err("unknown auth field should fail");
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn test_start_request_rejects_unknown_fields() {
+        let err = serde_json::from_str::<StartKmsRequest>(r#"{"force":true,"unexpected_field":true}"#)
+            .expect_err("unknown start field should fail");
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]

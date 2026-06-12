@@ -164,7 +164,7 @@ struct OidcValidationResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct OidcConfigUpsertRequest {
     enabled: bool,
     display_name: String,
@@ -210,7 +210,7 @@ impl Default for OidcConfigUpsertRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct OidcConfigValidateRequest {
     provider_id: String,
     enabled: bool,
@@ -1242,6 +1242,26 @@ mod tests {
 
         assert_eq!(config.client_secret.as_deref(), Some("existing-secret"));
         assert_eq!(config.roles_claim, OIDC_DEFAULT_ROLES_CLAIM);
+    }
+
+    #[test]
+    fn test_oidc_config_upsert_request_rejects_unknown_fields() {
+        let err = serde_json::from_str::<OidcConfigUpsertRequest>(
+            r#"{"config_url":"https://example.com/.well-known/openid-configuration","client_id":"client","unexpected_field":true}"#,
+        )
+        .expect_err("unknown upsert field should fail");
+
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn test_oidc_config_validate_request_rejects_unknown_fields() {
+        let err = serde_json::from_str::<OidcConfigValidateRequest>(
+            r#"{"provider_id":"default","config_url":"https://example.com/.well-known/openid-configuration","client_id":"client","unexpected_field":true}"#,
+        )
+        .expect_err("unknown validate field should fail");
+
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]
