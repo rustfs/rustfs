@@ -416,6 +416,50 @@ jobs:
   # Note: Manifest creation is no longer needed as we only build one variant
   # Multi-arch manifests are automatically created by docker/build-push-action
 
+  # Report-only container image vulnerability scan
+  scan-docker-image:
+    name: Scan Docker Images
+    needs: [ build-check, build-docker ]
+    if: needs.build-check.outputs.should_build == 'true' && needs.build-check.outputs.should_push == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: musl
+            suffix: ""
+          - variant: glibc
+            suffix: "-glibc"
+    steps:
+      - name: Login to GitHub Container Registry
+        # docker/login-action v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_USERNAME }}
+          password: ${{ secrets.GHCR_PASSWORD }}
+
+      - name: Scan image with Trivy
+        # aquasecurity/trivy-action v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        with:
+          image-ref: ${{ env.REGISTRY_GHCR }}:${{ needs.build-check.outputs.version }}${{ matrix.suffix }}
+          format: sarif
+          output: trivy-${{ matrix.variant }}.sarif
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          exit-code: "0"
+
+      - name: Upload container scan report
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: container-image-scan-${{ matrix.variant }}
+          path: trivy-${{ matrix.variant }}.sarif
+          if-no-files-found: error
+          retention-days: 30
+
   # Docker build summary
   docker-summary:
     name: Docker Build Summary
