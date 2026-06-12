@@ -16,6 +16,137 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+DEFAULT_PROFILE = "rustfs"
+
+PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
+    "rustfs": {
+        "catalog_uri": "{endpoint}/iceberg",
+        "rest_path": "/iceberg",
+        "rest_signing_name": "s3",
+        "warehouse": "{bucket}",
+        "credential_mode": "static-s3-credentials",
+        "status": "automated-smoke-target",
+    },
+    "rustfs-compat": {
+        "catalog_uri": "{endpoint}/_iceberg",
+        "rest_path": "/_iceberg",
+        "rest_signing_name": "s3tables",
+        "warehouse": "{bucket}",
+        "credential_mode": "static-s3-credentials",
+        "status": "compatibility-smoke-target",
+    },
+    "aws-s3tables": {
+        "catalog_uri": "https://s3tables.{region}.amazonaws.com/iceberg",
+        "rest_path": "/iceberg",
+        "rest_signing_name": "s3tables",
+        "warehouse": "arn:aws:s3tables:{region}:{account_id}:bucket/{table_bucket}",
+        "credential_mode": "aws-iam-or-session-credentials",
+        "status": "reference-only",
+    },
+    "minio-aistor": {
+        "catalog_uri": "{endpoint}/_iceberg",
+        "rest_path": "/_iceberg",
+        "rest_signing_name": "s3tables",
+        "warehouse": "{warehouse}",
+        "credential_mode": "policy-scoped-s3-credentials",
+        "status": "reference-only",
+    },
+    "cloudflare-r2-data-catalog": {
+        "catalog_uri": "{catalog_uri}",
+        "rest_path": "/catalog",
+        "rest_signing_name": "s3",
+        "warehouse": "{warehouse_name}",
+        "credential_mode": "catalog-vended",
+        "status": "reference-only",
+    },
+    "oss-tables": {
+        "catalog_uri": "{endpoint}/iceberg",
+        "rest_path": "/iceberg",
+        "rest_signing_name": "s3",
+        "warehouse": "{warehouse}",
+        "credential_mode": "sigv4-s3fileio-credentials",
+        "status": "reference-only",
+    },
+}
+
+CLIENT_MATRIX: list[dict[str, str]] = [
+    {
+        "client": "PyIceberg",
+        "status": "automated",
+        "coverage": "create namespace, create table, append, reload, scan",
+        "entrypoint": "scripts/table-catalog/pyiceberg_smoke.py",
+    },
+    {
+        "client": "Spark Iceberg REST catalog",
+        "status": "manual-ready",
+        "coverage": "create/load/append/reload to be verified against a running RustFS endpoint",
+        "entrypoint": "scripts/table-catalog/README.md",
+    },
+    {
+        "client": "Trino Iceberg REST catalog",
+        "status": "documented-not-automated",
+        "coverage": "configuration reference only until a repeatable container harness is added",
+        "entrypoint": "scripts/table-catalog/README.md",
+    },
+    {
+        "client": "DuckDB Iceberg",
+        "status": "documented-not-automated",
+        "coverage": "read path reference only; write/commit is not claimed",
+        "entrypoint": "scripts/table-catalog/README.md",
+    },
+    {
+        "client": "Databend",
+        "status": "documented-not-automated",
+        "coverage": "S3 data-plane reference only; Iceberg REST catalog integration is not claimed",
+        "entrypoint": "scripts/table-catalog/README.md",
+    },
+    {
+        "client": "Snowflake Open Catalog / Iceberg integrations",
+        "status": "documented-not-automated",
+        "coverage": "reference only; no RustFS automated smoke claim",
+        "entrypoint": "scripts/table-catalog/README.md",
+    },
+]
+
+UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
+    {
+        "capability": "credential-vending",
+        "status": "unsupported-response-boundary",
+        "pg_owner": "PG2",
+        "expected_behavior": "load table advertises rustfs.credential-vending=unsupported and returns no long-lived credentials",
+    },
+    {
+        "capability": "background-maintenance-worker",
+        "status": "unsupported",
+        "pg_owner": "PG4",
+        "expected_behavior": "manual maintenance APIs may exist, but background-enabled maintenance is rejected",
+    },
+    {
+        "capability": "manifest-data-reachability-cleanup",
+        "status": "unsupported",
+        "pg_owner": "PG4",
+        "expected_behavior": "metadata-only cleanup must not delete manifest, data, or delete files",
+    },
+    {
+        "capability": "snapshot-expiration-and-compaction",
+        "status": "unsupported",
+        "pg_owner": "PG5",
+        "expected_behavior": "no automatic snapshot expiration or data rewrite is claimed",
+    },
+    {
+        "capability": "iceberg-views",
+        "status": "unsupported",
+        "pg_owner": "PG6",
+        "expected_behavior": "view routes should return a stable unsupported response until implemented",
+    },
+    {
+        "capability": "multi-table-transactions",
+        "status": "not-planned-short-term",
+        "pg_owner": "PG6",
+        "expected_behavior": "RustFS S3 Tables only claims single-table commit atomicity",
+    },
+]
+
 
 @dataclass(frozen=True)
 class RuntimeDeps:
@@ -29,9 +160,48 @@ class RuntimeDeps:
     load_catalog: Any
 
 
+def env_or_none(key: str) -> str | None:
+    value = os.getenv(key)
+    if value is None or value == "":
+        return None
+    return value
+
+
+def vendor_profiles() -> dict[str, dict[str, str]]:
+    return {name: values.copy() for name, values in PROFILE_DEFAULTS.items()}
+
+
+def client_matrix() -> list[dict[str, str]]:
+    return [entry.copy() for entry in CLIENT_MATRIX]
+
+
+def unsupported_inventory() -> list[dict[str, str]]:
+    return [entry.copy() for entry in UNSUPPORTED_INVENTORY]
+
+
+def normalized_rest_path(rest_path: str) -> str:
+    stripped = rest_path.strip()
+    if not stripped:
+        raise ValueError("REST catalog path cannot be empty")
+    if not stripped.startswith("/"):
+        stripped = f"/{stripped}"
+    return stripped.rstrip("/")
+
+
+def apply_profile_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    defaults = PROFILE_DEFAULTS[args.profile]
+    if args.rest_path is None:
+        args.rest_path = defaults["rest_path"]
+    args.rest_path = normalized_rest_path(args.rest_path)
+    if args.rest_signing_name is None:
+        args.rest_signing_name = defaults["rest_signing_name"]
+    return args
+
+
 def parse_args() -> argparse.Namespace:
     run_id = str(int(time.time()))
     parser = argparse.ArgumentParser(description="Run a PyIceberg smoke test against RustFS table catalog APIs.")
+    parser.add_argument("--profile", choices=sorted(PROFILE_DEFAULTS), default=env_or_none("RUSTFS_TABLE_PROFILE") or DEFAULT_PROFILE)
     parser.add_argument("--endpoint", default=os.getenv("RUSTFS_ENDPOINT", "http://127.0.0.1:9000"))
     parser.add_argument("--access-key", default=os.getenv("RUSTFS_ACCESS_KEY", "rustfsadmin"))
     parser.add_argument("--secret-key", default=os.getenv("RUSTFS_SECRET_KEY", "rustfsadmin"))
@@ -40,12 +210,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--namespace", default=os.getenv("RUSTFS_TABLE_NAMESPACE", f"smoke{run_id}"))
     parser.add_argument("--table", default=os.getenv("RUSTFS_TABLE_NAME", f"events{run_id}"))
     parser.add_argument("--catalog-name", default=os.getenv("RUSTFS_TABLE_CATALOG_NAME", "rustfs"))
-    parser.add_argument("--rest-signing-name", default=os.getenv("RUSTFS_TABLE_REST_SIGNING_NAME", "s3"))
+    parser.add_argument("--rest-path", default=env_or_none("RUSTFS_TABLE_REST_PATH"))
+    parser.add_argument("--rest-signing-name", default=env_or_none("RUSTFS_TABLE_REST_SIGNING_NAME"))
     parser.add_argument("--timeout", type=float, default=float(os.getenv("RUSTFS_TABLE_SMOKE_TIMEOUT", "20")))
     parser.add_argument("--cleanup", action="store_true", help="Drop the smoke table and namespace before exiting.")
     parser.add_argument("--replace", action="store_true", help="Drop an existing table with the same identifier first.")
     parser.add_argument("--insecure", action="store_true", help="Disable TLS verification for HTTPS endpoints.")
-    return parser.parse_args()
+    parser.add_argument("--print-client-matrix", action="store_true", help="Print the current client conformance matrix as JSON and exit.")
+    parser.add_argument("--print-vendor-profiles", action="store_true", help="Print vendor connection profile references as JSON and exit.")
+    parser.add_argument("--print-unsupported-inventory", action="store_true", help="Print PG1 unsupported capability inventory as JSON and exit.")
+    return apply_profile_defaults(parser.parse_args())
 
 
 def load_runtime_deps() -> RuntimeDeps:
@@ -181,14 +355,14 @@ def ensure_bucket(args: argparse.Namespace, deps: RuntimeDeps) -> None:
 
 def enable_table_bucket(args: argparse.Namespace, deps: RuntimeDeps) -> None:
     encoded_bucket = urllib.parse.quote(args.bucket, safe="")
-    signed_rest_request(args, deps, "PUT", f"/iceberg/v1/buckets/{encoded_bucket}")
+    signed_rest_request(args, deps, "PUT", f"{args.rest_path}/v1/buckets/{encoded_bucket}")
 
 
 def catalog_properties(args: argparse.Namespace) -> dict[str, str]:
     endpoint = normalized_endpoint(args.endpoint)
     properties = {
         "type": "rest",
-        "uri": f"{endpoint}/iceberg",
+        "uri": f"{endpoint}{args.rest_path}",
         "warehouse": args.bucket,
         "prefix": args.bucket,
         "py-io-impl": "pyiceberg.io.pyarrow.PyArrowFileIO",
@@ -204,6 +378,24 @@ def catalog_properties(args: argparse.Namespace) -> dict[str, str]:
     if args.insecure:
         properties["s3.verify-ssl"] = "false"
     return properties
+
+
+def print_json_document(document: Any) -> None:
+    print(json.dumps(document, indent=2, sort_keys=True))
+
+
+def printed_metadata(args: argparse.Namespace) -> bool:
+    printed = False
+    if args.print_client_matrix:
+        print_json_document({"client_matrix": client_matrix()})
+        printed = True
+    if args.print_vendor_profiles:
+        print_json_document({"vendor_profiles": vendor_profiles()})
+        printed = True
+    if args.print_unsupported_inventory:
+        print_json_document({"unsupported_inventory": unsupported_inventory()})
+        printed = True
+    return printed
 
 
 def install_rustfs_rest_sigv4_adapter(catalog: Any, args: argparse.Namespace, deps: RuntimeDeps) -> None:
@@ -294,10 +486,10 @@ def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> None:
     print(f"[1/7] ensuring S3 bucket {args.bucket}")
     ensure_bucket(args, deps)
 
-    print(f"[2/7] enabling RustFS table bucket {args.bucket}")
+    print(f"[2/7] enabling RustFS table bucket {args.bucket} through {args.rest_path}/v1")
     enable_table_bucket(args, deps)
 
-    print(f"[3/7] loading PyIceberg REST catalog at {endpoint}/iceberg")
+    print(f"[3/7] loading PyIceberg REST catalog at {endpoint}{args.rest_path}")
     catalog = deps.load_catalog(args.catalog_name, **catalog_properties(args))
     install_rustfs_rest_sigv4_adapter(catalog, args, deps)
     identifier = table_identifier(args)
@@ -344,6 +536,8 @@ def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> None:
 def main() -> int:
     args = parse_args()
     try:
+        if printed_metadata(args):
+            return 0
         deps = load_runtime_deps()
         run_smoke(args, deps)
         return 0
