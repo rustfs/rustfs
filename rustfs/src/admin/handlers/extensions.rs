@@ -28,7 +28,10 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_extension_schema::{ExtensionKind, ExtensionSchema};
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_targets::{builtin_extension_schemas, catalog::example_external_webhook_plugin, target_marketplace_extension_schema};
+use rustfs_targets::{
+    TargetPluginExternalFlowGate, TargetPluginExternalFlowGateStatus, builtin_extension_schemas,
+    catalog::example_external_webhook_plugin, target_marketplace_extension_schema,
+};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
@@ -52,6 +55,7 @@ pub fn register_extension_route(r: &mut S3Router<AdminOperation>) -> std::io::Re
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ExtensionCatalogResponse {
     pub extensions: Vec<ExtensionSchema>,
+    pub external_plugin_flow: TargetPluginExternalFlowGateStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -89,7 +93,10 @@ fn build_extension_catalog_response() -> ExtensionCatalogResponse {
     extensions.push(target_marketplace_extension_schema(&example.manifest));
     extensions.sort_by(|a, b| a.extension_id.cmp(&b.extension_id));
 
-    ExtensionCatalogResponse { extensions }
+    ExtensionCatalogResponse {
+        extensions,
+        external_plugin_flow: TargetPluginExternalFlowGate::default().status(),
+    }
 }
 
 fn map_extension_instance(instance: PluginInstanceEntry) -> ExtensionInstanceEntry {
@@ -279,6 +286,13 @@ mod tests {
             .expect("builtin ops diagnostics extension should be present");
         assert_eq!(diagnostics.kind, ExtensionKind::OpsDiagnostics);
         assert_eq!(diagnostics.runtime.boundary, ExtensionRuntimeBoundary::Builtin);
+
+        assert!(!response.external_plugin_flow.enabled);
+        assert!(response.external_plugin_flow.install_requires_signature);
+        assert!(response.external_plugin_flow.install_requires_provenance);
+        assert!(response.external_plugin_flow.runtime_requires_sandbox);
+        assert!(response.external_plugin_flow.runtime_requires_provenance);
+        assert!(!response.external_plugin_flow.circuit_breaker_closed);
 
         assert!(validate_extension_schemas(&response.extensions).is_ok());
     }
