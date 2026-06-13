@@ -5,18 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-kms-dev-defaults`
-- Baseline: `origin/main` at `a85cc0354c02fc55e2dd8eb64cfc6155c37921c7`
-- PR type for this branch: `security-change`
-- Runtime behavior changes: KMS development-only defaults now fail closed unless
-  `RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS=true` or an admin configure request
-  sets `allow_insecure_dev_defaults=true`.
-- Rust code changes: harden Local KMS missing-master-key/temp-dir defaults,
-  Vault HTTP/default-token/skip-TLS defaults, KMS service-manager validation,
-  admin configure request conversion, and server CLI KMS configuration.
+- Branch: `overtrue/arch-background-controller-pilot`
+- Baseline: `origin/main` at `bda0b1f3dd923f728e4d2ff2f17bde2755a6cb5e`
+- PR type for this branch: `behavior-change`
+- Runtime behavior changes: none; the memory observability controller pilot only
+  returns read-only snapshot/reconcile data and never starts, stops, resizes, or
+  wakes workers.
+- Rust code changes: add a memory observability controller snapshot and
+  reconcile plan with explicit no-op worker mutation.
 - CI/script changes: none.
-- Docs changes: record KMS compatibility notes and mark `KMSD-002` through
-  `KMSD-005` complete.
+- Docs changes: record `BGC-004` controller pilot scope and update background
+  controller migration progress.
 
 ## Phase 0 Tasks
 
@@ -381,56 +380,65 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     start/stop path, storage write, readiness change, peer signal, or runtime
     behavior change.
   - Verification: docs-only architecture checks and diff hygiene.
+- [x] `BGC-003` Add read-only status snapshot.
+  - Acceptance: memory observability exposes a typed status snapshot that reports
+    service state, metrics enablement, configured interval, cancellation source,
+    and shutdown handle shape.
+  - Must preserve: no controller framework, admin route, worker lifecycle
+    change, storage write, readiness change, peer signal, or metrics emission
+    behavior change.
+  - Verification: focused memory observability tests, compile checks, migration
+    guards, formatting, and pre-commit quality gate.
+- [x] `BGC-004` Pilot one controller.
+  - Acceptance: memory observability exposes a typed controller snapshot and
+    reconcile plan that compare desired state with current status.
+  - Must preserve: no admin route, scheduler, service registry, worker
+    lifecycle mutation, storage write, readiness signal, peer signal, or metrics
+    emission behavior change.
+  - Verification: focused controller tests prove repeated reconcile is
+    idempotent, cancellation state is preserved, and worker mutation remains
+    none.
 
 ## Next PRs
 
-1. `security-change`: apply IAM and plugin secret redaction in `S-014`.
-2. `security-change`: classify and add strict serde ingress tests in `S-015`.
+1. `test-only`: add controller harness coverage for cancellation and
+   duplicate-worker prevention in `TEST-BGC-001`.
+2. `behavior-change`: add the next low-risk background status surface before
+   broader reconcile work.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed KMS unsafe-development defaults are enforced in `KmsConfig::validate()` and reused by env loading, admin configure conversion, service-manager lifecycle, and direct backend construction. |
-| Migration preservation | pass | Confirmed KMS runtime key operations, cache behavior, redaction behavior, storage SSE call sites, and admin route contracts keep their existing shapes except for the explicit development opt-in field. |
-| Testing/verification | pass | Confirmed KMS crate tests, rustfs config/SSE focused tests, rustfs lib/test compile, migration guards, format check, and diff check cover this larger security-change slice; full pre-commit is skipped under the current larger-granularity instruction. |
+| Quality/architecture | pass | Confirmed the controller pilot stays local to `memory_observability`, uses typed desired/status/reconcile structs, and does not add a generic scheduler or admin route. |
+| Migration preservation | pass | Confirmed reconcile reports `worker_mutation: none`, preserving sampler startup, cancellation, interval defaulting, and metrics emission behavior. |
+| Testing/verification | pass | Focused tests, compile checks, formatting, diff hygiene, migration guards, Rust risk scan, and `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `a85cc0354c02fc55e2dd8eb64cfc6155c37921c7`:
-- `cargo check -p rustfs --lib --tests`.
-- `cargo check -p rustfs-kms --tests`.
-- `cargo test -p rustfs-kms --no-fail-fast`; 57 passed, 1 ignored, doc-test
-  passed.
-- `cargo clippy -p rustfs-kms --all-targets -- -D warnings`.
-- `cargo test -p rustfs --lib config::config_test --no-fail-fast`; 20 passed.
-- `cargo test -p rustfs --lib storage::sse::tests::test_kms --no-fail-fast`;
-  1 passed.
-- `cargo test -p rustfs --lib -- --list | rg "sse.*kms|kms.*sse|config::config_test::tests::test_config_new_defaults"`.
+Passed on `bda0b1f3dd923f728e4d2ff2f17bde2755a6cb5e`:
+- `cargo test -p rustfs memory_observability --lib`; 8 passed.
+- `cargo check -p rustfs --lib`.
+- `cargo fmt --all`.
 - `cargo fmt --all --check`.
+- `git diff --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - `./scripts/check_metrics_migration_refs.sh`.
-- `git diff --check`.
+- Rust risk scan for unwrap/expect/casts/string errors/debug output in
+  `rustfs/src/memory_observability.rs`; only test `expect` calls matched.
+- `make pre-commit`; all checks passed, including nextest 5865 passed and 111
+  skipped.
 
 Notes:
-- Full pre-commit may be skipped if focused tests, compile checks, and guards
-  pass, per the current instruction to increase PR granularity.
-- `cargo test -p rustfs --lib storage::sse::tests::test_sse_kms --no-fail-fast`
-  and `cargo test -p rustfs --lib test_sse_kms_roundtrip --no-fail-fast`
-  matched 0 tests because the `rio-v2` roundtrip test is feature-gated out of
-  the default `rustfs --lib` test binary.
-- This slice includes a minimal compile unblock after PR #3365: table catalog's
-  ECStore object backend now declares `NamespaceLocking` where it calls
-  `new_ns_lock`; the lock path itself is unchanged.
-- This slice does not change KMS authorization actions, key operation behavior,
-  storage encryption metadata formats, or cache semantics.
+- This slice adds reconcile data only. It does not apply reconcile output to the
+  running sampler.
+- There is no admin/API exposure in this PR; future controller harness work
+  should stay isolated from scanner, heal, lifecycle, and replication.
 
 ## Handoff Notes
 
-- Keep this KMS slice as a `security-change` PR covering KMSD-002 through
-  KMSD-005 plus the minimal table catalog compile unblock from PR #3365.
-- Do not change KMS key operation behavior, storage SSE metadata formats, IAM
-  policy actions, admin route wiring, or cache semantics in this PR.
-- If more time is available before the next slice, start `S-014` with IAM/plugin
-  secret redaction; otherwise start `S-015` strict serde ingress tests.
+- Next migration slice can start `TEST-BGC-001` with a fake-clock and
+  cancellation-token harness around the memory observability pilot.
+- Keep scanner, heal, lifecycle, replication, disk health, and config reload out
+  of broad controller movement until dedicated preservation tests exist.
