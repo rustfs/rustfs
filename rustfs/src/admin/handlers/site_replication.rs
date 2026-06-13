@@ -1801,8 +1801,7 @@ fn merge_bucket_status_info(status: &mut SRStatusInfo, site_infos: &BTreeMap<Str
                     object_lock_config_mismatch: object_lock_mismatch,
                     policy_mismatch,
                     sse_config_mismatch: sse_mismatch,
-                    replication_cfg_mismatch: replication_mismatch
-                        && bucket_info.is_some_and(|b| b.replication_config.is_some()),
+                    replication_cfg_mismatch: replication_mismatch && bucket_info.is_some_and(|b| b.replication_config.is_some()),
                     quota_cfg_mismatch: quota_mismatch,
                     cors_cfg_mismatch: cors_mismatch,
                     api_version: Some(SITE_REPL_API_VERSION.to_string()),
@@ -2048,9 +2047,10 @@ async fn build_status_info(state: &SiteReplicationState, local_peer: &PeerInfo, 
             .sites
             .keys()
             .map(|dep_id| {
-                let has_issue = status.bucket_stats.values().any(|by_dep| {
-                    by_dep.get(dep_id.as_str()).is_some_and(|s| s.replication_cfg_mismatch)
-                });
+                let has_issue = status
+                    .bucket_stats
+                    .values()
+                    .any(|by_dep| by_dep.get(dep_id.as_str()).is_some_and(|s| s.replication_cfg_mismatch));
                 (dep_id.clone(), has_issue)
             })
             .collect();
@@ -2561,9 +2561,7 @@ async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local
         }
         // Kick a resync toward every remote peer so existing objects travel across.
         for peer in state.peers.values() {
-            if peer.deployment_id == local_peer.deployment_id
-                || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
-            {
+            if peer.deployment_id == local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
                 continue;
             }
             let result = start_site_bucket_resync(name, peer, &resync_id).await;
@@ -3674,11 +3672,15 @@ impl Operation for SiteReplicationResyncOpHandler {
                 status
             }
             SITE_REPL_RESYNC_STATUS => {
-                let status = state.resync_status.get(&peer.deployment_id).cloned().unwrap_or_else(|| SRResyncOpStatus {
-                    op_type: SITE_REPL_RESYNC_STATUS.to_string(),
-                    status: "not-found".to_string(),
-                    ..Default::default()
-                });
+                let status = state
+                    .resync_status
+                    .get(&peer.deployment_id)
+                    .cloned()
+                    .unwrap_or_else(|| SRResyncOpStatus {
+                        op_type: SITE_REPL_RESYNC_STATUS.to_string(),
+                        status: "not-found".to_string(),
+                        ..Default::default()
+                    });
                 return json_response(&status);
             }
             _ => return Err(s3_error!(InvalidRequest, "unsupported resync operation")),
@@ -3752,14 +3754,8 @@ impl Operation for SRRotateServiceAccountHandler {
             if same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
                 continue;
             }
-            if let Err(err) = send_peer_admin_request(
-                &peer.endpoint,
-                SITE_REPLICATION_PEER_JOIN_PATH,
-                &svc_ak,
-                &new_sk,
-                &join_req,
-            )
-            .await
+            if let Err(err) =
+                send_peer_admin_request(&peer.endpoint, SITE_REPLICATION_PEER_JOIN_PATH, &svc_ak, &new_sk, &join_req).await
             {
                 let detail = summarize_peer_error_detail(&format!("{}: {err}", peer.endpoint));
                 warn!(peer = %peer.endpoint, error = %detail, "site replication service account rotation failed for peer");
@@ -4899,7 +4895,7 @@ mod tests {
             "photos".to_string(),
             SRBucketInfo {
                 bucket: "photos".to_string(),
-                replication_config: Some(repl_xml.clone()),
+                replication_config: Some(repl_xml),
                 ..Default::default()
             },
         );
@@ -4915,12 +4911,9 @@ mod tests {
             },
         );
 
-        let site_infos: BTreeMap<String, SRInfo> = [
-            ("dep-a".to_string(), site_a_info),
-            ("dep-b".to_string(), site_b_info),
-        ]
-        .into_iter()
-        .collect();
+        let site_infos: BTreeMap<String, SRInfo> = [("dep-a".to_string(), site_a_info), ("dep-b".to_string(), site_b_info)]
+            .into_iter()
+            .collect();
 
         let mut status = SRStatusInfo {
             sites: site_infos
@@ -5027,14 +5020,13 @@ mod tests {
         };
 
         // Peer that has complete config for 2-site setup
-        assert!(site_replication_rule_complete(
-            &build_site_replication_rule("arn:rustfs:replication::dep-b:bucket", 1, "site-repl-dep-b")
-        ));
+        assert!(site_replication_rule_complete(&build_site_replication_rule(
+            "arn:rustfs:replication::dep-b:bucket",
+            1,
+            "site-repl-dep-b"
+        )));
         assert_eq!(
-            site_replication_config_mismatch(
-                vec![Some(&repl_complete_xml), Some(&repl_complete_xml)].into_iter(),
-                2
-            ),
+            site_replication_config_mismatch(vec![Some(&repl_complete_xml), Some(&repl_complete_xml)].into_iter(), 2),
             (2, false),
             "complete rules on both sites → no mismatch"
         );
@@ -5091,9 +5083,8 @@ mod tests {
         assert!(state.resync_status.is_empty(), "resync_status must be cleared on remove --all");
 
         // Even if peers returned 403 (desynced account), status still reports success
-        let status = site_replication_remove_status(&[
-            "https://remote.example.com: peer/remove returned 403 Forbidden".to_string(),
-        ]);
+        let status =
+            site_replication_remove_status(&["https://remote.example.com: peer/remove returned 403 Forbidden".to_string()]);
         assert_eq!(
             status.status, SITE_REPL_REMOVE_SUCCESS,
             "local remove reports success even when peer notifications fail"
@@ -5115,7 +5106,7 @@ mod tests {
         let mut existing_rules = vec![rule_b.clone()];
 
         // Desired config has rules for both dep-b and dep-c (3-site setup)
-        let desired_rules = vec![rule_b.clone(), rule_c.clone()];
+        let desired_rules = vec![rule_b, rule_c];
 
         // Simulate the reconcile: collect existing site-repl rule IDs
         let existing_ids: std::collections::HashSet<String> = existing_rules
@@ -5137,10 +5128,7 @@ mod tests {
         assert!(added, "missing rule should have been added");
         assert_eq!(existing_rules.len(), 2, "should now have rules for both peers");
 
-        let rule_ids: Vec<&str> = existing_rules
-            .iter()
-            .filter_map(|r| r.id.as_deref())
-            .collect();
+        let rule_ids: Vec<&str> = existing_rules.iter().filter_map(|r| r.id.as_deref()).collect();
         assert!(rule_ids.contains(&"site-repl-dep-b"));
         assert!(rule_ids.contains(&"site-repl-dep-c"));
     }
