@@ -46,6 +46,10 @@ use std::time::Duration;
 use sysinfo::{Networks, System};
 use tracing::{instrument, warn};
 
+const LOG_COMPONENT_OBS: &str = "obs";
+const LOG_SUBSYSTEM_METRICS_COLLECTOR: &str = "metrics_collector";
+const EVENT_METRICS_COLLECTOR_STATE: &str = "metrics_collector_state";
+
 fn current_scanner_cycle_age_seconds(
     current_cycle: u64,
     current_started: chrono::DateTime<Utc>,
@@ -178,7 +182,7 @@ pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthS
     let (buckets_count, objects_count) = match load_data_usage_from_backend(store.clone()).await {
         Ok(data_usage) => (data_usage.buckets_count, data_usage.objects_total_count),
         Err(e) => {
-            warn!("Failed to load data usage from backend: {}", e);
+            warn!(event = EVENT_METRICS_COLLECTOR_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_COLLECTOR, collector = "cluster_stats", result = "data_usage_load_failed", error = %e, "metrics collector state changed");
             // Fall back to bucket list for buckets_count, objects_count stays 0.
             let buckets = store
                 .list_bucket(&BucketOptions {
@@ -187,7 +191,7 @@ pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthS
                 })
                 .await
                 .unwrap_or_else(|err| {
-                    warn!("Failed to list buckets for cluster metrics: {}", err);
+                    warn!(event = EVENT_METRICS_COLLECTOR_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_COLLECTOR, collector = "cluster_stats", result = "bucket_list_failed", error = %err, "metrics collector state changed");
                     Vec::new()
                 });
             (buckets.len() as u64, 0)
@@ -246,7 +250,7 @@ pub async fn collect_bucket_stats() -> Vec<BucketStats> {
     let data_usage = match load_data_usage_from_backend(store.clone()).await {
         Ok(info) => Some(info),
         Err(e) => {
-            warn!("Failed to load data usage for bucket metrics: {}", e);
+            warn!(event = EVENT_METRICS_COLLECTOR_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_COLLECTOR, collector = "bucket_stats", result = "data_usage_load_failed", error = %e, "metrics collector state changed");
             None
         }
     };
@@ -261,7 +265,7 @@ pub async fn collect_bucket_stats() -> Vec<BucketStats> {
     {
         Ok(buckets) => buckets,
         Err(e) => {
-            warn!("Failed to list buckets for bucket metrics: {}", e);
+            warn!(event = EVENT_METRICS_COLLECTOR_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_COLLECTOR, collector = "bucket_stats", result = "bucket_list_failed", error = %e, "metrics collector state changed");
             return Vec::new();
         }
     };
@@ -310,10 +314,7 @@ pub fn collect_bucket_replication_bandwidth_stats() -> Vec<BucketReplicationBand
         .map(|(opts, details)| {
             let target_arn = opts.replication_arn;
             let limit_bytes_per_sec = u64::try_from(details.limit_bytes_per_sec).unwrap_or_else(|_| {
-                warn!(
-                    "Invalid bandwidth limit value for target {:?}: {}",
-                    target_arn, details.limit_bytes_per_sec
-                );
+                warn!(event = EVENT_METRICS_COLLECTOR_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_COLLECTOR, collector = "bucket_replication_bandwidth", result = "invalid_limit_value", target_arn = ?target_arn, limit_value = details.limit_bytes_per_sec, "metrics collector state changed");
                 0
             });
 
