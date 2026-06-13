@@ -344,10 +344,11 @@ mod tests {
         IAM_RETRY_ESCALATION_THRESHOLD, IAM_RETRY_INITIAL_INTERVAL, IAM_RETRY_MAX_INTERVAL, compute_backoff_interval,
         run_iam_recovery_loop,
     };
+    use rustfs_common::{GlobalReadiness, SystemStage};
     use std::io::Error;
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
 
@@ -411,6 +412,51 @@ mod tests {
 
         assert_eq!(init_calls_for_assert.load(Ordering::SeqCst), 1);
         assert_eq!(finalize_calls_for_assert.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_loop_can_publish_iam_and_full_ready_after_degraded_init() {
+        let init_calls = Arc::new(AtomicUsize::new(0));
+        let readiness = Arc::new(GlobalReadiness::new());
+        let observed_iam_ready = Arc::new(AtomicBool::new(false));
+
+        let init_calls_for_assert = init_calls.clone();
+        let readiness_for_finalize = readiness.clone();
+        let observed_iam_ready_for_finalize = observed_iam_ready.clone();
+
+        run_iam_recovery_loop(
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            None,
+            move || {
+                let init_calls = init_calls.clone();
+                Box::pin(async move {
+                    let call = init_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    if call == 1 {
+                        Err(Error::other("degraded init"))
+                    } else {
+                        Ok(())
+                    }
+                })
+            },
+            move || {
+                let readiness = readiness_for_finalize.clone();
+                let observed_iam_ready = observed_iam_ready_for_finalize.clone();
+                Box::pin(async move {
+                    readiness.mark_stage(SystemStage::IamReady);
+                    if matches!(readiness.current_stage(), SystemStage::IamReady) {
+                        observed_iam_ready.store(true, Ordering::SeqCst);
+                    }
+                    readiness.mark_stage(SystemStage::FullReady);
+                    Ok(())
+                })
+            },
+        )
+        .await;
+
+        assert_eq!(init_calls_for_assert.load(Ordering::SeqCst), 2);
+        assert!(observed_iam_ready.load(Ordering::SeqCst));
+        assert!(readiness.is_ready());
     }
 
     #[tokio::test(start_paused = true)]
