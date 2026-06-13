@@ -112,12 +112,26 @@ added.
 Unsupported behavior is documented instead of hidden behind internal errors. The
 current unsupported inventory is:
 
-- credential vending: non-secret table scope preview exists; real temporary credentials are not issued
+- credential vending: non-secret table scope preview and credentials endpoint exist; real temporary credentials are not issued
 - background maintenance worker: unsupported
 - manifest/data reachability cleanup: unsupported
 - snapshot expiration and compaction: unsupported
 - Iceberg views: unsupported
 - multi-table transactions: not a short-term production claim
+
+## Credential Boundary
+
+RustFS advertises table credential scope metadata without returning reusable
+storage secrets. `loadTable` includes the table warehouse prefix in the response
+config, and the standard credentials endpoint is registered:
+
+```text
+GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials
+```
+
+The endpoint returns an empty `storage-credentials` list until temporary,
+table-scoped credential issuance is implemented. Clients should continue using
+their configured S3 credentials for object data access.
 
 ## Spark Manual Baseline
 
