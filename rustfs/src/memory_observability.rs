@@ -16,6 +16,7 @@ use rustfs_io_metrics::{
     record_cgroup_memory_split, record_cpu_usage, record_memory_usage, record_process_memory_split,
     snapshot_process_resource_and_system,
 };
+use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
@@ -28,6 +29,37 @@ static MEMORY_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
 
 const ENV_MEMORY_OBSERVABILITY_INTERVAL_SECS: &str = "RUSTFS_MEMORY_OBSERVABILITY_INTERVAL_SECS";
 const DEFAULT_MEMORY_OBSERVABILITY_INTERVAL_SECS: u64 = 15;
+const MEMORY_OBSERVABILITY_SERVICE_NAME: &str = "memory_observability";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryObservabilityServiceState {
+    Disabled,
+    Running,
+    Stopping,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryObservabilityCancellationSource {
+    RuntimeToken,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryObservabilityShutdownHandle {
+    RuntimeTokenOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MemoryObservabilityStatusSnapshot {
+    pub service: &'static str,
+    pub state: MemoryObservabilityServiceState,
+    pub metrics_enabled: bool,
+    pub interval_secs: u64,
+    pub cancellation_source: MemoryObservabilityCancellationSource,
+    pub shutdown_handle: MemoryObservabilityShutdownHandle,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct CgroupMemorySnapshot {
@@ -116,6 +148,41 @@ fn read_cgroup_memory_snapshot() -> Option<CgroupMemorySnapshot> {
     read_cgroup_v2().or_else(read_cgroup_v1)
 }
 
+fn configured_memory_observability_interval_secs() -> u64 {
+    rustfs_utils::get_env_u64(ENV_MEMORY_OBSERVABILITY_INTERVAL_SECS, DEFAULT_MEMORY_OBSERVABILITY_INTERVAL_SECS).max(1)
+}
+
+fn build_memory_observability_status_snapshot(
+    metrics_enabled: bool,
+    interval_secs: u64,
+    cancellation_requested: bool,
+) -> MemoryObservabilityStatusSnapshot {
+    let state = if !metrics_enabled {
+        MemoryObservabilityServiceState::Disabled
+    } else if cancellation_requested {
+        MemoryObservabilityServiceState::Stopping
+    } else {
+        MemoryObservabilityServiceState::Running
+    };
+
+    MemoryObservabilityStatusSnapshot {
+        service: MEMORY_OBSERVABILITY_SERVICE_NAME,
+        state,
+        metrics_enabled,
+        interval_secs: interval_secs.max(1),
+        cancellation_source: MemoryObservabilityCancellationSource::RuntimeToken,
+        shutdown_handle: MemoryObservabilityShutdownHandle::RuntimeTokenOnly,
+    }
+}
+
+pub fn memory_observability_status_snapshot(ctx: &CancellationToken) -> MemoryObservabilityStatusSnapshot {
+    build_memory_observability_status_snapshot(
+        rustfs_obs::observability_metric_enabled(),
+        configured_memory_observability_interval_secs(),
+        ctx.is_cancelled(),
+    )
+}
+
 async fn record_memory_snapshot() {
     match tokio::task::spawn_blocking(|| {
         let (resource, process) = snapshot_process_resource_and_system();
@@ -148,8 +215,7 @@ async fn record_memory_snapshot() {
 }
 
 pub fn init_memory_observability(ctx: CancellationToken) {
-    let interval_secs =
-        rustfs_utils::get_env_u64(ENV_MEMORY_OBSERVABILITY_INTERVAL_SECS, DEFAULT_MEMORY_OBSERVABILITY_INTERVAL_SECS);
+    let interval_secs = configured_memory_observability_interval_secs();
     let interval = Duration::from_secs(interval_secs.max(1));
 
     tokio::spawn(async move {
@@ -172,7 +238,10 @@ pub fn init_memory_observability(ctx: CancellationToken) {
 
 #[cfg(test)]
 mod tests {
-    use super::{CgroupMemorySnapshot, parse_kv_stats, read_optional_u64};
+    use super::{
+        CgroupMemorySnapshot, MemoryObservabilityCancellationSource, MemoryObservabilityServiceState,
+        MemoryObservabilityShutdownHandle, build_memory_observability_status_snapshot, parse_kv_stats, read_optional_u64,
+    };
     use std::fs;
     use std::path::PathBuf;
 
@@ -205,5 +274,28 @@ mod tests {
         assert_eq!(snapshot.file_bytes, None);
         assert_eq!(snapshot.active_file_bytes, None);
         assert_eq!(snapshot.inactive_file_bytes, None);
+    }
+
+    #[test]
+    fn memory_observability_snapshot_reports_disabled_when_metrics_are_disabled() {
+        let snapshot = build_memory_observability_status_snapshot(false, 15, false);
+
+        assert_eq!(snapshot.service, "memory_observability");
+        assert_eq!(snapshot.state, MemoryObservabilityServiceState::Disabled);
+        assert!(!snapshot.metrics_enabled);
+        assert_eq!(snapshot.interval_secs, 15);
+        assert_eq!(snapshot.cancellation_source, MemoryObservabilityCancellationSource::RuntimeToken);
+        assert_eq!(snapshot.shutdown_handle, MemoryObservabilityShutdownHandle::RuntimeTokenOnly);
+    }
+
+    #[test]
+    fn memory_observability_snapshot_reports_running_and_stopping_states() {
+        let running = build_memory_observability_status_snapshot(true, 0, false);
+        let stopping = build_memory_observability_status_snapshot(true, 30, true);
+
+        assert_eq!(running.state, MemoryObservabilityServiceState::Running);
+        assert_eq!(running.interval_secs, 1);
+        assert_eq!(stopping.state, MemoryObservabilityServiceState::Stopping);
+        assert_eq!(stopping.interval_secs, 30);
     }
 }

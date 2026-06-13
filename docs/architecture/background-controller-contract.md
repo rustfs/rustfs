@@ -103,6 +103,17 @@ Any future `BGC-003` status implementation must satisfy all of these:
 - scanner, heal, lifecycle, and replication status must not hide their queue and
   admission coupling.
 
+## BGC-003 Snapshot Pilot
+
+The first read-only snapshot is memory observability status. It reports the
+service name, whether observability metrics currently enable the sampler, the
+configured sampler interval, runtime-token cancellation state, and the absence
+of a dedicated shutdown handle.
+
+This snapshot intentionally does not define an admin route, scheduler, service
+registry, worker start/stop path, readiness signal, peer signal, storage write,
+or metrics emission change.
+
 ## Future Reconcile Rules
 
 Future reconcile work is allowed only after a read-only status snapshot exists.
