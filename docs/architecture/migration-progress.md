@@ -142,9 +142,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     without semantic changes.
   - Must preserve: AppContext construction, default adapters, global singleton
     initialization, resolver fallback order, and all consumer import paths.
-  - Verification: formatting, `cargo check -p rustfs --lib`, migration guards,
-    diff hygiene, Rust risk scan, and partial `make pre-commit` through
-    workspace dev check plus nextest.
+  - Verification: formatting, compile checks, migration guards, diff hygiene,
+    Rust risk scan, and full `make pre-commit`.
 - [ ] `CTX-002` Add resolver compatibility tests.
   - Do: test context-first and global fallback for KMS runtime, bucket
     metadata, object store, endpoints, tier config, server config, and buffer
@@ -472,23 +471,21 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 |---|---|---|
 | Quality/architecture | pass | Pure module split behind the existing `app::context` root; no service container, public API, or runtime behavior added. |
 | Migration preservation | pass | Re-exports preserve `crate::app::context::*`; AppContext construction, default handles, singleton initialization, and resolver fallback order are unchanged. |
-| Testing/verification | pass-with-caveat | Focused compile, formatting, diff hygiene, migration guards, Rust risk scan, and partial `make pre-commit` passed through workspace dev check and nextest; final pre-commit phase was stopped by request. |
+| Testing/verification | pass | Focused compile, formatting, diff hygiene, migration guards, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed before rebase from `982812614f9af47a3e24701640facf1f5daab9d7`:
+Passed on `af291afb930e072d162ff10c63e33c091b706e58`:
 - `cargo fmt --all`.
 - `cargo fmt --all --check`.
 - `cargo check -p rustfs --lib`.
+- `cargo check -p rustfs --bin rustfs`.
 - `git diff --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - Rust risk scan for changed Rust files; no matches.
-- Partial `make pre-commit`; workspace dev check passed, nextest passed with
-  5883 passed and 111 skipped, then the final pre-commit phase was stopped by
-  request.
-- Rebased onto `af291afb930e072d162ff10c63e33c091b706e58`; post-rebase
-  `git diff --check` passed.
+- `make pre-commit`; all checks passed, including nextest 5883 passed and 111
+  skipped.
 
 Notes:
 - This slice moves code between files only; it keeps `crate::app::context::*`
