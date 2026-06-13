@@ -61,6 +61,62 @@ pub struct MemoryObservabilityStatusSnapshot {
     pub shutdown_handle: MemoryObservabilityShutdownHandle,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryObservabilityDesiredState {
+    Disabled,
+    Enabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MemoryObservabilityDesiredSnapshot {
+    pub state: MemoryObservabilityDesiredState,
+    pub interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MemoryObservabilityControllerSnapshot {
+    pub desired: MemoryObservabilityDesiredSnapshot,
+    pub status: MemoryObservabilityStatusSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryObservabilityWorkerMutation {
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MemoryObservabilityReconcilePlan {
+    pub service: &'static str,
+    pub desired: MemoryObservabilityDesiredSnapshot,
+    pub current_state: MemoryObservabilityServiceState,
+    pub worker_mutation: MemoryObservabilityWorkerMutation,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemoryObservabilityController;
+
+impl MemoryObservabilityController {
+    pub fn snapshot(&self, ctx: &CancellationToken) -> MemoryObservabilityControllerSnapshot {
+        memory_observability_controller_snapshot(ctx)
+    }
+
+    pub fn reconcile(&self, ctx: &CancellationToken) -> MemoryObservabilityReconcilePlan {
+        let snapshot = self.snapshot(ctx);
+        self.reconcile_snapshot(snapshot)
+    }
+
+    pub fn reconcile_snapshot(&self, snapshot: MemoryObservabilityControllerSnapshot) -> MemoryObservabilityReconcilePlan {
+        MemoryObservabilityReconcilePlan {
+            service: MEMORY_OBSERVABILITY_SERVICE_NAME,
+            desired: snapshot.desired,
+            current_state: snapshot.status.state,
+            worker_mutation: MemoryObservabilityWorkerMutation::None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct CgroupMemorySnapshot {
     current_bytes: Option<u64>,
@@ -152,6 +208,19 @@ fn configured_memory_observability_interval_secs() -> u64 {
     rustfs_utils::get_env_u64(ENV_MEMORY_OBSERVABILITY_INTERVAL_SECS, DEFAULT_MEMORY_OBSERVABILITY_INTERVAL_SECS).max(1)
 }
 
+fn build_memory_observability_desired_snapshot(metrics_enabled: bool, interval_secs: u64) -> MemoryObservabilityDesiredSnapshot {
+    let state = if metrics_enabled {
+        MemoryObservabilityDesiredState::Enabled
+    } else {
+        MemoryObservabilityDesiredState::Disabled
+    };
+
+    MemoryObservabilityDesiredSnapshot {
+        state,
+        interval_secs: interval_secs.max(1),
+    }
+}
+
 fn build_memory_observability_status_snapshot(
     metrics_enabled: bool,
     interval_secs: u64,
@@ -177,6 +246,25 @@ fn build_memory_observability_status_snapshot(
 
 pub fn memory_observability_status_snapshot(ctx: &CancellationToken) -> MemoryObservabilityStatusSnapshot {
     build_memory_observability_status_snapshot(
+        rustfs_obs::observability_metric_enabled(),
+        configured_memory_observability_interval_secs(),
+        ctx.is_cancelled(),
+    )
+}
+
+fn build_memory_observability_controller_snapshot(
+    metrics_enabled: bool,
+    interval_secs: u64,
+    cancellation_requested: bool,
+) -> MemoryObservabilityControllerSnapshot {
+    MemoryObservabilityControllerSnapshot {
+        desired: build_memory_observability_desired_snapshot(metrics_enabled, interval_secs),
+        status: build_memory_observability_status_snapshot(metrics_enabled, interval_secs, cancellation_requested),
+    }
+}
+
+pub fn memory_observability_controller_snapshot(ctx: &CancellationToken) -> MemoryObservabilityControllerSnapshot {
+    build_memory_observability_controller_snapshot(
         rustfs_obs::observability_metric_enabled(),
         configured_memory_observability_interval_secs(),
         ctx.is_cancelled(),
@@ -239,8 +327,10 @@ pub fn init_memory_observability(ctx: CancellationToken) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CgroupMemorySnapshot, MemoryObservabilityCancellationSource, MemoryObservabilityServiceState,
-        MemoryObservabilityShutdownHandle, build_memory_observability_status_snapshot, parse_kv_stats, read_optional_u64,
+        CgroupMemorySnapshot, MemoryObservabilityCancellationSource, MemoryObservabilityController,
+        MemoryObservabilityDesiredState, MemoryObservabilityServiceState, MemoryObservabilityShutdownHandle,
+        MemoryObservabilityWorkerMutation, build_memory_observability_controller_snapshot,
+        build_memory_observability_status_snapshot, parse_kv_stats, read_optional_u64,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -297,5 +387,42 @@ mod tests {
         assert_eq!(running.interval_secs, 1);
         assert_eq!(stopping.state, MemoryObservabilityServiceState::Stopping);
         assert_eq!(stopping.interval_secs, 30);
+    }
+
+    #[test]
+    fn memory_observability_controller_reconcile_is_idempotent() {
+        let controller = MemoryObservabilityController;
+        let snapshot = build_memory_observability_controller_snapshot(true, 15, false);
+
+        let first = controller.reconcile_snapshot(snapshot);
+        let second = controller.reconcile_snapshot(snapshot);
+
+        assert_eq!(first, second);
+        assert_eq!(first.desired.state, MemoryObservabilityDesiredState::Enabled);
+        assert_eq!(first.current_state, MemoryObservabilityServiceState::Running);
+        assert_eq!(first.worker_mutation, MemoryObservabilityWorkerMutation::None);
+    }
+
+    #[test]
+    fn memory_observability_controller_preserves_cancellation_state_without_worker_mutation() {
+        let controller = MemoryObservabilityController;
+        let snapshot = build_memory_observability_controller_snapshot(true, 30, true);
+        let plan = controller.reconcile_snapshot(snapshot);
+
+        assert_eq!(snapshot.status.state, MemoryObservabilityServiceState::Stopping);
+        assert_eq!(plan.current_state, MemoryObservabilityServiceState::Stopping);
+        assert_eq!(plan.worker_mutation, MemoryObservabilityWorkerMutation::None);
+    }
+
+    #[test]
+    fn memory_observability_controller_reports_disabled_desired_state_without_starting_worker() {
+        let controller = MemoryObservabilityController;
+        let snapshot = build_memory_observability_controller_snapshot(false, 0, false);
+        let plan = controller.reconcile_snapshot(snapshot);
+
+        assert_eq!(snapshot.desired.state, MemoryObservabilityDesiredState::Disabled);
+        assert_eq!(snapshot.desired.interval_secs, 1);
+        assert_eq!(plan.current_state, MemoryObservabilityServiceState::Disabled);
+        assert_eq!(plan.worker_mutation, MemoryObservabilityWorkerMutation::None);
     }
 }
