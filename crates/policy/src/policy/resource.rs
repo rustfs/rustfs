@@ -31,8 +31,33 @@ use super::{
     variables::PolicyVariableResolver,
 };
 
-#[derive(Serialize, Clone, Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct ResourceSet(pub HashSet<Resource>);
+
+impl Serialize for ResourceSet {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+
+        let mut resources: Vec<String> = self
+            .0
+            .iter()
+            .map(|resource| match resource {
+                Resource::S3(value) => format!("{}{}", Resource::S3_PREFIX, value),
+                Resource::Kms(value) => value.clone(),
+            })
+            .collect();
+        resources.sort_unstable();
+
+        let mut seq = serializer.serialize_seq(Some(resources.len()))?;
+        for resource in resources {
+            seq.serialize_element(&resource)?;
+        }
+        seq.end()
+    }
+}
 
 impl ResourceSet {
     /// Returns true if the resource set is empty.
@@ -208,11 +233,10 @@ impl Resource {
 impl TryFrom<&str> for Resource {
     type Error = Error;
     fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
-        let resource = if value.starts_with(Self::S3_PREFIX) {
-            Resource::S3(value.strip_prefix(Self::S3_PREFIX).unwrap().into())
-        } else {
+        let Some(value) = value.strip_prefix(Self::S3_PREFIX) else {
             return Err(IamError::InvalidResource("unknown".into(), value.into()).into());
         };
+        let resource = Resource::S3(value.into());
 
         resource.is_valid()?;
         Ok(resource)

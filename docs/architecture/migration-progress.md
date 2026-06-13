@@ -5,18 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-kms-dev-defaults`
-- Baseline: `origin/main` at `a85cc0354c02fc55e2dd8eb64cfc6155c37921c7`
-- PR type for this branch: `security-change`
-- Runtime behavior changes: KMS development-only defaults now fail closed unless
-  `RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS=true` or an admin configure request
-  sets `allow_insecure_dev_defaults=true`.
-- Rust code changes: harden Local KMS missing-master-key/temp-dir defaults,
-  Vault HTTP/default-token/skip-TLS defaults, KMS service-manager validation,
-  admin configure request conversion, and server CLI KMS configuration.
+- Branch: `overtrue/arch-app-context-tests`
+- Baseline: `origin/main` at `cb37a64a81bb857ea22efd2ebb015fbd3b64bef0`
+- PR type for this branch: `test-only`
+- Runtime behavior changes: none; resolver/global fallback semantics and IAM
+  degraded recovery behavior are unchanged.
+- Rust code changes: add AppContext resolver compatibility tests and IAM
+  deferred recovery readiness coverage.
 - CI/script changes: none.
-- Docs changes: record KMS compatibility notes and mark `KMSD-002` through
-  `KMSD-005` complete.
+- Docs changes: record `CTX-002`/`CTX-003` completion and verification scope.
 
 ## Phase 0 Tasks
 
@@ -133,6 +130,35 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     storage-class global state, default registration wiring, and startup
     initialization; global server-config reads and writes keep the same
     `std::sync::RwLock<Option<Config>>` clone semantics.
+
+## Phase 1b Context Foundation Tasks
+
+- [x] `CTX-001` Split AppContext files.
+  - Current branch: split `rustfs/src/app/context.rs` into `interfaces`,
+    `handles`, `global`, and `compat` submodules.
+  - Acceptance: old `crate::app::context::*` imports continue to compile via
+    re-exports; context-first and global fallback resolver bodies are moved
+    without semantic changes.
+  - Must preserve: AppContext construction, default adapters, global singleton
+    initialization, resolver fallback order, and all consumer import paths.
+  - Verification: formatting, compile checks, migration guards, diff hygiene,
+    Rust risk scan, and full `make pre-commit`.
+- [x] `CTX-002` Add resolver compatibility tests.
+  - Do: test context-first and global fallback for KMS runtime, bucket
+    metadata, object store, endpoints, tier config, server config, and buffer
+    config.
+  - Acceptance: context wins when present and global fallback works when absent.
+  - Verification: focused resolver compatibility test, formatting, compile
+    checks, migration guards, diff hygiene, Rust risk scan, and full
+    `make pre-commit`.
+- [x] `CTX-003` Add IAM deferred recovery readiness test.
+  - Do: verify IAM degraded recovery can still publish `IamReady` and
+    `FullReady`.
+  - Acceptance: boot/lifecycle changes cannot lose deferred readiness
+    publication.
+  - Verification: focused IAM recovery test, formatting, compile checks,
+    migration guards, diff hygiene, Rust risk scan, and full
+    `make pre-commit`.
 
 ## Phase 1 Security Governance Tasks
 
@@ -381,56 +407,101 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     start/stop path, storage write, readiness change, peer signal, or runtime
     behavior change.
   - Verification: docs-only architecture checks and diff hygiene.
+- [x] `BGC-003` Add read-only status snapshot.
+  - Acceptance: memory observability exposes a typed status snapshot that reports
+    service state, metrics enablement, configured interval, cancellation source,
+    and shutdown handle shape.
+  - Must preserve: no controller framework, admin route, worker lifecycle
+    change, storage write, readiness change, peer signal, or metrics emission
+    behavior change.
+  - Verification: focused memory observability tests, compile checks, migration
+    guards, formatting, and pre-commit quality gate.
+- [x] `BGC-004` Pilot one controller.
+  - Acceptance: memory observability exposes a typed controller snapshot and
+    reconcile plan that compare desired state with current status.
+  - Must preserve: no admin route, scheduler, service registry, worker
+    lifecycle mutation, storage write, readiness signal, peer signal, or metrics
+    emission behavior change.
+  - Verification: focused controller tests prove repeated reconcile is
+    idempotent, cancellation state is preserved, and worker mutation remains
+    none.
+- [x] `TEST-BGC-001` Add controller harness coverage.
+  - Acceptance: controller tests cover cancellation state, repeated reconcile,
+    paused-time stability, and no worker mutation for the low-risk controller
+    surfaces.
+  - Must preserve: no worker spawn, start, stop, resize, wakeup, storage write,
+    readiness signal, peer signal, or metrics emission behavior change.
+  - Verification: focused memory observability and allocator reclaim controller
+    tests.
+- [x] `BGC-005` Add allocator reclaim controller/status surface.
+  - Acceptance: allocator reclaim exposes typed desired/status/controller
+    snapshots and a typed reconcile plan that reports backend, effective force,
+    idle interval, runtime cancellation, shutdown handle shape, and no-op worker
+    mutation.
+  - Must preserve: existing allocator reclaim enablement, backend-specific force
+    handling, idle-streak logic, metrics emission, runtime-token cancellation,
+    and startup call shape.
+  - Verification: focused allocator reclaim tests, compile checks, formatting,
+    migration guards, Rust risk scan, and pre-commit quality gate.
+- [x] `BGC-006` Add metrics runtime controller/status surface.
+  - Acceptance: metrics runtime exposes typed desired/status/controller
+    snapshots and a typed reconcile plan that reports observability enablement,
+    collector task count, configured intervals, runtime cancellation, shutdown
+    handle shape, and no-op worker mutation.
+  - Must preserve: existing metrics collector grouping, interval parsing,
+    replication bandwidth tombstone cycles, metrics emission, runtime-token
+    cancellation, and startup call shape.
+  - Verification: focused metrics runtime tests, compile checks, formatting,
+    migration guards, Rust risk scan, and pre-commit quality gate.
+- [x] `TEST-BGC-002` Preserve config reload and shutdown assumptions.
+  - Acceptance: dynamic server-config reload reports no worker mutation for
+    scanner/heal runtime config, bucket lifecycle/replication config files are
+    not dynamic server-config reload targets, and background shutdown keeps
+    scanner before AHM while preserving the scanner-implies-AHM dependency.
+  - Must preserve: no scanner, heal, lifecycle, replication, audit, storage
+    class, peer-signal, readiness, or worker lifecycle behavior change.
+  - Verification: focused config reload and shutdown tests, compile checks,
+    formatting, diff hygiene, and Rust risk scan.
 
 ## Next PRs
 
-1. `security-change`: apply IAM and plugin secret redaction in `S-014`.
-2. `security-change`: classify and add strict serde ingress tests in `S-015`.
+1. `pure-move`: start `R-009` boot wrapper with the IAM degraded readiness
+   contract covered.
+2. `consumer-migration`: migrate a small consumer group to AppContext-first
+   access with resolver fallback tests in place.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed KMS unsafe-development defaults are enforced in `KmsConfig::validate()` and reused by env loading, admin configure conversion, service-manager lifecycle, and direct backend construction. |
-| Migration preservation | pass | Confirmed KMS runtime key operations, cache behavior, redaction behavior, storage SSE call sites, and admin route contracts keep their existing shapes except for the explicit development opt-in field. |
-| Testing/verification | pass | Confirmed KMS crate tests, rustfs config/SSE focused tests, rustfs lib/test compile, migration guards, format check, and diff check cover this larger security-change slice; full pre-commit is skipped under the current larger-granularity instruction. |
+| Quality/architecture | pass | Test-focused slice; resolver helpers stay private, AppContext test constructor is `#[cfg(test)]`, and no service container or registry is added. |
+| Migration preservation | pass | Context-first plus fallback semantics are asserted, object-store resolution remains AppContext-only, and IAM recovery still publishes `IamReady` before `FullReady`. |
+| Testing/verification | pass | Focused resolver/IAM tests, formatting, compile check, diff hygiene, migration guards, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `a85cc0354c02fc55e2dd8eb64cfc6155c37921c7`:
-- `cargo check -p rustfs --lib --tests`.
-- `cargo check -p rustfs-kms --tests`.
-- `cargo test -p rustfs-kms --no-fail-fast`; 57 passed, 1 ignored, doc-test
-  passed.
-- `cargo clippy -p rustfs-kms --all-targets -- -D warnings`.
-- `cargo test -p rustfs --lib config::config_test --no-fail-fast`; 20 passed.
-- `cargo test -p rustfs --lib storage::sse::tests::test_kms --no-fail-fast`;
-  1 passed.
-- `cargo test -p rustfs --lib -- --list | rg "sse.*kms|kms.*sse|config::config_test::tests::test_config_new_defaults"`.
+Passed on `cb37a64a81bb857ea22efd2ebb015fbd3b64bef0`:
+- `cargo fmt --all`.
 - `cargo fmt --all --check`.
+- `cargo test -p rustfs app::context::compat::tests::resolver_helpers_are_context_first_and_fallback_when_context_is_absent -- --nocapture`.
+- `cargo test -p rustfs startup_iam::tests::recovery_loop_can_publish_iam_and_full_ready_after_degraded_init -- --nocapture`.
+- `cargo check -p rustfs --lib`.
+- `git diff --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
-- `./scripts/check_metrics_migration_refs.sh`.
-- `git diff --check`.
+- Rust risk scan for changed Rust files; matches are test-only `expect`
+  assertions, with no production `unwrap`/`expect`, numeric cast, string error,
+  boxed error, print macro, or relaxed-ordering match.
+- `make pre-commit`; all checks passed, including nextest 5891 passed and
+  111 skipped, plus doctests.
 
 Notes:
-- Full pre-commit may be skipped if focused tests, compile checks, and guards
-  pass, per the current instruction to increase PR granularity.
-- `cargo test -p rustfs --lib storage::sse::tests::test_sse_kms --no-fail-fast`
-  and `cargo test -p rustfs --lib test_sse_kms_roundtrip --no-fail-fast`
-  matched 0 tests because the `rio-v2` roundtrip test is feature-gated out of
-  the default `rustfs --lib` test binary.
-- This slice includes a minimal compile unblock after PR #3365: table catalog's
-  ECStore object backend now declares `NamespaceLocking` where it calls
-  `new_ns_lock`; the lock path itself is unchanged.
-- This slice does not change KMS authorization actions, key operation behavior,
-  storage encryption metadata formats, or cache semantics.
+- This slice adds coverage before further consumer migration.
+- Resolver helpers preserve the same AppContext-first and fallback order.
+- IAM degraded recovery keeps `IamReady` publication before `FullReady`.
 
 ## Handoff Notes
 
-- Keep this KMS slice as a `security-change` PR covering KMSD-002 through
-  KMSD-005 plus the minimal table catalog compile unblock from PR #3365.
-- Do not change KMS key operation behavior, storage SSE metadata formats, IAM
-  policy actions, admin route wiring, or cache semantics in this PR.
-- If more time is available before the next slice, start `S-014` with IAM/plugin
-  secret redaction; otherwise start `S-015` strict serde ingress tests.
+- CTX-002 and CTX-003 are complete.
+- Keep the next consumer or boot wrapper PR small and preserve global fallback
+  until the planned cleanup phase.

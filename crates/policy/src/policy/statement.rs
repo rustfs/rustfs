@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Statement {
-    #[serde(rename = "Sid", default)]
+    #[serde(rename = "Sid", default, skip_serializing_if = "ID::is_empty")]
     pub sid: ID,
     #[serde(rename = "Effect")]
     pub effect: Effect,
@@ -36,7 +36,7 @@ pub struct Statement {
     pub resources: ResourceSet,
     #[serde(rename = "NotResource", default, skip_serializing_if = "ResourceSet::is_empty")]
     pub not_resources: ResourceSet,
-    #[serde(rename = "Condition", default)]
+    #[serde(rename = "Condition", default, skip_serializing_if = "Functions::is_empty")]
     pub conditions: Functions,
 }
 
@@ -151,7 +151,7 @@ impl Statement {
             }
         }
 
-        let family_count = saw_s3 as u8 + saw_admin as u8 + saw_sts as u8 + saw_kms as u8;
+        let family_count = u8::from(saw_s3) + u8::from(saw_admin) + u8::from(saw_sts) + u8::from(saw_kms);
 
         if family_count != 1 {
             return Some(ActionFamily::Mixed);

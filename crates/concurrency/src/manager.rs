@@ -233,12 +233,16 @@ impl ConcurrencyManager {
         }
 
         tracing::info!(
-            "Concurrency manager started (timeout={}, lock={}, deadlock={}, backpressure={}, scheduler={})",
-            self.is_timeout_enabled(),
-            self.is_lock_enabled(),
-            self.is_deadlock_enabled(),
-            self.is_backpressure_enabled(),
-            self.is_scheduler_enabled()
+            event = "concurrency_manager.lifecycle",
+            component = "concurrency",
+            subsystem = "manager",
+            state = "started",
+            timeout_enabled = self.is_timeout_enabled(),
+            lock_enabled = self.is_lock_enabled(),
+            deadlock_enabled = self.is_deadlock_enabled(),
+            backpressure_enabled = self.is_backpressure_enabled(),
+            scheduler_enabled = self.is_scheduler_enabled(),
+            "concurrency manager state changed"
         );
     }
 
@@ -249,7 +253,13 @@ impl ConcurrencyManager {
             self.deadlock.stop().await;
         }
 
-        tracing::info!("Concurrency manager stopped");
+        tracing::info!(
+            event = "concurrency_manager.lifecycle",
+            component = "concurrency",
+            subsystem = "manager",
+            state = "stopped",
+            "concurrency manager state changed"
+        );
     }
 }
 

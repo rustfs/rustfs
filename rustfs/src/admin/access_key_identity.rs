@@ -891,10 +891,7 @@ mod tests {
         assert_eq!(resp.open_id_specific_info.display_name.as_deref(), Some("RustFS User"));
         assert_eq!(resp.open_id_specific_info.display_name_claim.as_deref(), Some("name"));
         assert_eq!(resp.open_id_specific_info.config_name, None);
-        assert_eq!(
-            resp.info.policy,
-            Some("{\n  \"ID\": \"\",\n  \"Version\": \"\",\n  \"Statement\": []\n}".to_string())
-        );
+        assert_eq!(resp.info.policy, Some("{\n  \"Version\": \"\",\n  \"Statement\": []\n}".to_string()));
 
         let body = serde_json::to_value(&resp).expect("serialize openid sts response");
         assert_eq!(body.get("userType").and_then(|v| v.as_str()), Some("STS"));
@@ -932,7 +929,7 @@ mod tests {
         assert_eq!(body.get("description").and_then(|v| v.as_str()), Some("openid derived temporary account"));
         assert_eq!(
             body.get("policy").and_then(|v| v.as_str()),
-            Some("{\n  \"ID\": \"\",\n  \"Version\": \"\",\n  \"Statement\": []\n}")
+            Some("{\n  \"Version\": \"\",\n  \"Statement\": []\n}")
         );
     }
 }

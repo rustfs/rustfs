@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
-use tracing::info;
+use tracing::{debug, trace};
 
 /// Cooperative worker-slot controller for async tasks.
 pub struct Workers {
@@ -43,12 +43,30 @@ impl Workers {
     pub async fn take(&self) {
         loop {
             let mut available = self.available.lock().await;
-            info!("worker take, {}", *available);
             if *available == 0 {
+                trace!(
+                    event = "worker_slot.acquire",
+                    component = "concurrency",
+                    subsystem = "workers",
+                    state = "waiting",
+                    available_slots = *available,
+                    total_slots = self.limit,
+                    "worker slot pending"
+                );
                 drop(available);
                 self.notify.notified().await;
             } else {
                 *available -= 1;
+                trace!(
+                    event = "worker_slot.acquire",
+                    component = "concurrency",
+                    subsystem = "workers",
+                    state = "granted",
+                    available_slots = *available,
+                    total_slots = self.limit,
+                    permits_in_use = self.limit.saturating_sub(*available),
+                    "worker slot updated"
+                );
                 break;
             }
         }
@@ -57,8 +75,17 @@ impl Workers {
     /// Release a worker slot.
     pub async fn give(&self) {
         let mut available = self.available.lock().await;
-        info!("worker give, {}", *available);
         *available = (*available).saturating_add(1).min(self.limit); // avoid over-release beyond limit
+        trace!(
+            event = "worker_slot.release",
+            component = "concurrency",
+            subsystem = "workers",
+            state = "released",
+            available_slots = *available,
+            total_slots = self.limit,
+            permits_in_use = self.limit.saturating_sub(*available),
+            "worker slot updated"
+        );
         self.notify.notify_one(); // Notify a waiting task
     }
 
@@ -70,11 +97,30 @@ impl Workers {
                 if *available == self.limit {
                     break;
                 }
+                trace!(
+                    event = "worker_slot.wait",
+                    component = "concurrency",
+                    subsystem = "workers",
+                    state = "waiting",
+                    available_slots = *available,
+                    total_slots = self.limit,
+                    permits_in_use = self.limit.saturating_sub(*available),
+                    "worker drain pending"
+                );
             }
             // Wait until all slots are freed
             self.notify.notified().await;
         }
-        info!("worker wait end");
+        debug!(
+            event = "worker_slot.wait",
+            component = "concurrency",
+            subsystem = "workers",
+            state = "drained",
+            available_slots = self.limit,
+            total_slots = self.limit,
+            permits_in_use = 0,
+            "worker drain complete"
+        );
     }
 
     /// Return the current number of available worker slots.

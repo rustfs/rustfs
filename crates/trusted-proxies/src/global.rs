@@ -43,7 +43,14 @@ pub fn init() {
     ENABLED.get_or_init(|| enabled);
 
     if !enabled {
-        tracing::info!("Trusted Proxies module is disabled via configuration");
+        tracing::info!(
+            event = "trusted_proxies.lifecycle",
+            component = "trusted_proxies",
+            subsystem = "global",
+            state = "disabled",
+            enabled,
+            "trusted proxies state changed"
+        );
         return;
     }
 
@@ -66,7 +73,17 @@ pub fn init() {
         )
     });
 
-    tracing::info!("Trusted Proxies module initialized");
+    tracing::info!(
+        event = "trusted_proxies.lifecycle",
+        component = "trusted_proxies",
+        subsystem = "global",
+        state = "initialized",
+        enabled,
+        metrics_enabled = config.monitoring.metrics_enabled,
+        trusted_proxy_count = config.proxy.proxies.len(),
+        validation_mode = config.proxy.validation_mode.as_str(),
+        "trusted proxies state changed"
+    );
     ConfigLoader::print_summary(&config);
 }
 

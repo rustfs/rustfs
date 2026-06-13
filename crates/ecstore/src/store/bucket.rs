@@ -100,6 +100,19 @@ impl ECStore {
 
         if let Err(err) = self.peer_sys.make_bucket(bucket, opts).await {
             let err = to_object_err(err.into(), vec![bucket]);
+            if is_err_bucket_exists(&err)
+                && let Err(heal_err) = self
+                    .handle_heal_bucket(
+                        bucket,
+                        &HealOpts {
+                            recreate: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            {
+                warn!("best-effort bucket heal after BucketExists failed: {heal_err}");
+            }
             if !is_err_bucket_exists(&err) {
                 error!("make bucket failed: {err}");
                 let _ = self
