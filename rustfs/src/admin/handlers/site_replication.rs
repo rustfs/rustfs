@@ -1982,15 +1982,18 @@ async fn build_status_info(state: &SiteReplicationState, local_peer: &PeerInfo, 
     let metrics_requested = opts.metrics || opts.include_all_defaults() || opts.entity == SREntityType::Bucket;
 
     let mut site_infos = BTreeMap::new();
+    let mut reachable_peers = HashSet::new();
     for (deployment_id, peer) in &state.peers {
         if deployment_id == &local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
             site_infos.insert(deployment_id.clone(), local_info.take().unwrap_or_default());
+            reachable_peers.insert(deployment_id.clone());
             continue;
         }
 
         match fetch_peer_sr_info(peer, state, uri).await {
             Ok(peer_info) => {
                 site_infos.insert(deployment_id.clone(), filter_sr_info(peer_info, &opts));
+                reachable_peers.insert(deployment_id.clone());
             }
             Err(err) => {
                 warn!(peer = %peer.endpoint, error = ?err, "site replication peer metainfo fetch failed");
@@ -2032,6 +2035,31 @@ async fn build_status_info(state: &SiteReplicationState, local_peer: &PeerInfo, 
         merge_status_info_for_site(&mut status, deployment_id, info, &opts);
     }
     prune_in_sync_status_details(&mut status, &opts);
+
+    // Fix 2: derive sync_state from real signals — reachability + replication rule completeness
+    // instead of always returning SyncStatus::Unknown as stored in the persisted peer map.
+    {
+        let peer_has_replication_issue: HashMap<String, bool> = status
+            .sites
+            .keys()
+            .map(|dep_id| {
+                let has_issue = status.bucket_stats.values().any(|by_dep| {
+                    by_dep.get(dep_id.as_str()).is_some_and(|s| s.replication_cfg_mismatch)
+                });
+                (dep_id.clone(), has_issue)
+            })
+            .collect();
+
+        for (deployment_id, peer) in status.sites.iter_mut() {
+            if !reachable_peers.contains(deployment_id) {
+                peer.sync_state = SyncStatus::Unknown;
+            } else if peer_has_replication_issue.get(deployment_id).copied().unwrap_or(false) {
+                peer.sync_state = SyncStatus::Disable;
+            } else {
+                peer.sync_state = SyncStatus::Enable;
+            }
+        }
+    }
 
     if metrics_requested {
         status.metrics = build_metrics_summary(local_peer).await;
