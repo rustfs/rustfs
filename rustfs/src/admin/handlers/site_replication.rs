@@ -2556,7 +2556,16 @@ async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local
             warn!(bucket = %name, error = ?err, "site replication backfill: replication config setup failed");
         }
         // Broadcast the bucket to peers so they create it too (idempotent on the peer side).
-        if let Err(err) = site_replication_make_bucket_hook(name, false).await {
+        // Read the real lock_enabled flag so peers recreate the bucket with the same object-lock
+        // setting — object lock cannot be added after bucket creation.
+        let lock_enabled = match metadata_sys::get(name).await {
+            Ok(bm) => bm.lock_enabled,
+            Err(err) => {
+                warn!(bucket = %name, error = ?err, "site replication backfill: failed to read bucket metadata, assuming lock_enabled=false");
+                false
+            }
+        };
+        if let Err(err) = site_replication_make_bucket_hook(name, lock_enabled).await {
             warn!(bucket = %name, error = ?err, "site replication backfill: make-bucket broadcast failed");
         }
         // Kick a resync toward every remote peer so existing objects travel across.
