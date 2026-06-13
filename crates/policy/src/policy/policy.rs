@@ -57,7 +57,7 @@ impl Args<'_> {
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
-    #[serde(default, rename = "ID")]
+    #[serde(default, rename = "ID", skip_serializing_if = "ID::is_empty")]
     pub id: ID,
     #[serde(default, rename = "Version")]
     pub version: String,
@@ -1915,6 +1915,80 @@ mod test {
             matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::NonResource)),
             "Error should be NonResource, got: {:?}",
             result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_iam_policy_serialize_omits_empty_fields() {
+        let policy = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[{
+    "Effect":"Allow",
+    "Action":["s3:GetObject","s3:PutObject"],
+    "Resource":["arn:aws:s3:::example-bucket/*"]
+  }]
+}"#,
+        )
+        .expect("policy without optional fields should parse");
+
+        let value = serde_json::to_value(&policy).expect("policy should serialize");
+        let policy_object = value.as_object().expect("policy should serialize as an object");
+        assert!(!policy_object.contains_key("ID"), "empty ID should be omitted");
+
+        let statements = value["Statement"].as_array().expect("Statement should serialize as an array");
+        let statement = statements
+            .first()
+            .expect("serialized policy should include the statement")
+            .as_object()
+            .expect("statement should serialize as an object");
+        assert!(!statement.contains_key("Sid"), "empty Sid should be omitted");
+        assert!(!statement.contains_key("Condition"), "empty Condition should be omitted");
+    }
+
+    #[test]
+    fn test_policy_action_and_resource_serialization_is_stable() {
+        let policy = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[{
+    "Effect":"Allow",
+    "Action":["s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:GetObject"],
+    "Resource":["arn:aws:s3:::example-bucket/*","arn:aws:s3:::example-bucket"]
+  }]
+}"#,
+        )
+        .expect("policy with multiple actions and resources should parse");
+
+        let first = serde_json::to_value(&policy).expect("policy should serialize");
+        let second = serde_json::to_value(&policy).expect("policy should serialize consistently");
+        assert_eq!(first, second, "policy serialization should be deterministic");
+
+        let statement = first["Statement"][0]
+            .as_object()
+            .expect("statement should serialize as an object");
+        let actions: Vec<_> = statement["Action"]
+            .as_array()
+            .expect("Action should serialize as an array")
+            .iter()
+            .map(|action| action.as_str().expect("Action entries should be strings"))
+            .collect();
+        assert_eq!(
+            actions,
+            vec!["s3:DeleteObject", "s3:GetObject", "s3:ListBucket", "s3:PutObject"],
+            "Action serialization should use a stable order"
+        );
+
+        let resources: Vec<_> = statement["Resource"]
+            .as_array()
+            .expect("Resource should serialize as an array")
+            .iter()
+            .map(|resource| resource.as_str().expect("Resource entries should be strings"))
+            .collect();
+        assert_eq!(
+            resources,
+            vec!["arn:aws:s3:::example-bucket", "arn:aws:s3:::example-bucket/*"],
+            "Resource serialization should use a stable order"
         );
     }
 

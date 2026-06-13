@@ -36,10 +36,12 @@ impl Serialize for ActionSet {
 
         // Always serialize as array, even for single action, to match S3 specification
         // and ensure compatibility with AWS SDK clients that expect array format
-        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
-        for action in &self.0 {
-            let action_str: &str = action.into();
-            seq.serialize_element(action_str)?;
+        let mut actions: Vec<&str> = self.0.iter().map(Into::into).collect();
+        actions.sort_unstable();
+
+        let mut seq = serializer.serialize_seq(Some(actions.len()))?;
+        for action in actions {
+            seq.serialize_element(action)?;
         }
         seq.end()
     }
@@ -532,6 +534,8 @@ pub enum AdminAction {
     GetTableLifecycleAction,
     #[strum(serialize = "admin:SetTableLifecycle")]
     SetTableLifecycleAction,
+    #[strum(serialize = "admin:GetTableCredentials")]
+    GetTableCredentialsAction,
     #[strum(serialize = "admin:RunTableMaintenance")]
     RunTableMaintenanceAction,
     #[strum(serialize = "admin:GetTableMetadataLocation")]
@@ -580,6 +584,7 @@ impl AdminAction {
                 | AdminAction::DeleteTableAction
                 | AdminAction::GetTableLifecycleAction
                 | AdminAction::SetTableLifecycleAction
+                | AdminAction::GetTableCredentialsAction
                 | AdminAction::RunTableMaintenanceAction
                 | AdminAction::GetTableMetadataLocationAction
                 | AdminAction::SetTableMetadataLocationAction
@@ -666,6 +671,7 @@ impl AdminAction {
                 | AdminAction::DeleteTableAction
                 | AdminAction::GetTableLifecycleAction
                 | AdminAction::SetTableLifecycleAction
+                | AdminAction::GetTableCredentialsAction
                 | AdminAction::RunTableMaintenanceAction
                 | AdminAction::GetTableMetadataLocationAction
                 | AdminAction::SetTableMetadataLocationAction
@@ -867,6 +873,8 @@ mod tests {
             AdminAction::try_from("admin:SetTableLifecycle").expect("Should parse SetTableLifecycle action");
         let run_maintenance_action =
             AdminAction::try_from("admin:RunTableMaintenance").expect("Should parse RunTableMaintenance action");
+        let get_credentials_action =
+            AdminAction::try_from("admin:GetTableCredentials").expect("Should parse GetTableCredentials action");
 
         assert_eq!(get_action, AdminAction::GetTableAction);
         assert_eq!(set_action, AdminAction::SetTableAction);
@@ -877,6 +885,7 @@ mod tests {
         assert_eq!(get_lifecycle_action, AdminAction::GetTableLifecycleAction);
         assert_eq!(set_lifecycle_action, AdminAction::SetTableLifecycleAction);
         assert_eq!(run_maintenance_action, AdminAction::RunTableMaintenanceAction);
+        assert_eq!(get_credentials_action, AdminAction::GetTableCredentialsAction);
         assert!(get_action.is_valid());
         assert!(set_action.is_valid());
         assert!(create_action.is_valid());
@@ -886,6 +895,7 @@ mod tests {
         assert!(get_lifecycle_action.is_valid());
         assert!(set_lifecycle_action.is_valid());
         assert!(run_maintenance_action.is_valid());
+        assert!(get_credentials_action.is_valid());
     }
 
     #[test]

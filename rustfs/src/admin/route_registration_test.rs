@@ -317,6 +317,11 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             "/analytics/namespaces/sales/tables/orders",
         ),
         table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/credentials",
+            "/analytics/namespaces/sales/tables/orders/credentials",
+        ),
+        table_route_sample(
             Method::POST,
             "/{warehouse}/namespaces/{namespace}/tables/{table}",
             "/analytics/namespaces/sales/tables/orders",
@@ -408,6 +413,11 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             Method::HEAD,
             "/{warehouse}/namespaces/{namespace}/tables/{table}",
             "/analytics/namespaces/sales/tables/orders",
+        ),
+        compat_table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/credentials",
+            "/analytics/namespaces/sales/tables/orders/credentials",
         ),
         compat_table_route_sample(
             Method::POST,
@@ -588,6 +598,11 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces/sales/tables"));
     assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces/sales/register"));
     assert_route(&router, Method::GET, &table_catalog_path("/analytics/namespaces/sales/tables/orders"));
+    assert_route(
+        &router,
+        Method::GET,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/credentials"),
+    );
     assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces/sales/tables/orders"));
     assert_route(&router, Method::DELETE, &table_catalog_path("/analytics/namespaces/sales/tables/orders"));
     assert_route(
@@ -654,6 +669,11 @@ fn test_register_routes_cover_representative_admin_paths() {
         &router,
         Method::GET,
         &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/credentials"),
     );
     assert_route(
         &router,

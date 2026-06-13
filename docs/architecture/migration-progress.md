@@ -5,17 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-background-controller-pilot`
-- Baseline: `origin/main` at `bda0b1f3dd923f728e4d2ff2f17bde2755a6cb5e`
-- PR type for this branch: `behavior-change`
-- Runtime behavior changes: none; the memory observability controller pilot only
-  returns read-only snapshot/reconcile data and never starts, stops, resizes, or
-  wakes workers.
-- Rust code changes: add a memory observability controller snapshot and
-  reconcile plan with explicit no-op worker mutation.
+- Branch: `overtrue/arch-app-context-split`
+- Baseline: `origin/main` at `af291afb930e072d162ff10c63e33c091b706e58`
+- PR type for this branch: `pure-move`
+- Runtime behavior changes: none; `crate::app::context::*` remains the public
+  import path and resolver/global fallback semantics are unchanged.
+- Rust code changes: split `rustfs/src/app/context.rs` into module-local
+  `interfaces`, `handles`, `global`, and `compat` files behind the existing
+  `app::context` module.
 - CI/script changes: none.
-- Docs changes: record `BGC-004` controller pilot scope and update background
-  controller migration progress.
+- Docs changes: record `CTX-001` AppContext file split scope.
 
 ## Phase 0 Tasks
 
@@ -132,6 +131,29 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     storage-class global state, default registration wiring, and startup
     initialization; global server-config reads and writes keep the same
     `std::sync::RwLock<Option<Config>>` clone semantics.
+
+## Phase 1b Context Foundation Tasks
+
+- [x] `CTX-001` Split AppContext files.
+  - Current branch: split `rustfs/src/app/context.rs` into `interfaces`,
+    `handles`, `global`, and `compat` submodules.
+  - Acceptance: old `crate::app::context::*` imports continue to compile via
+    re-exports; context-first and global fallback resolver bodies are moved
+    without semantic changes.
+  - Must preserve: AppContext construction, default adapters, global singleton
+    initialization, resolver fallback order, and all consumer import paths.
+  - Verification: formatting, compile checks, migration guards, diff hygiene,
+    Rust risk scan, and full `make pre-commit`.
+- [ ] `CTX-002` Add resolver compatibility tests.
+  - Do: test context-first and global fallback for KMS runtime, bucket
+    metadata, object store, endpoints, tier config, server config, and buffer
+    config.
+  - Acceptance: context wins when present and global fallback works when absent.
+- [ ] `CTX-003` Add IAM deferred recovery readiness test.
+  - Do: verify IAM degraded recovery can still publish `IamReady` and
+    `FullReady`.
+  - Acceptance: boot/lifecycle changes cannot lose deferred readiness
+    publication.
 
 ## Phase 1 Security Governance Tasks
 
@@ -398,47 +420,80 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: focused controller tests prove repeated reconcile is
     idempotent, cancellation state is preserved, and worker mutation remains
     none.
+- [x] `TEST-BGC-001` Add controller harness coverage.
+  - Acceptance: controller tests cover cancellation state, repeated reconcile,
+    paused-time stability, and no worker mutation for the low-risk controller
+    surfaces.
+  - Must preserve: no worker spawn, start, stop, resize, wakeup, storage write,
+    readiness signal, peer signal, or metrics emission behavior change.
+  - Verification: focused memory observability and allocator reclaim controller
+    tests.
+- [x] `BGC-005` Add allocator reclaim controller/status surface.
+  - Acceptance: allocator reclaim exposes typed desired/status/controller
+    snapshots and a typed reconcile plan that reports backend, effective force,
+    idle interval, runtime cancellation, shutdown handle shape, and no-op worker
+    mutation.
+  - Must preserve: existing allocator reclaim enablement, backend-specific force
+    handling, idle-streak logic, metrics emission, runtime-token cancellation,
+    and startup call shape.
+  - Verification: focused allocator reclaim tests, compile checks, formatting,
+    migration guards, Rust risk scan, and pre-commit quality gate.
+- [x] `BGC-006` Add metrics runtime controller/status surface.
+  - Acceptance: metrics runtime exposes typed desired/status/controller
+    snapshots and a typed reconcile plan that reports observability enablement,
+    collector task count, configured intervals, runtime cancellation, shutdown
+    handle shape, and no-op worker mutation.
+  - Must preserve: existing metrics collector grouping, interval parsing,
+    replication bandwidth tombstone cycles, metrics emission, runtime-token
+    cancellation, and startup call shape.
+  - Verification: focused metrics runtime tests, compile checks, formatting,
+    migration guards, Rust risk scan, and pre-commit quality gate.
+- [x] `TEST-BGC-002` Preserve config reload and shutdown assumptions.
+  - Acceptance: dynamic server-config reload reports no worker mutation for
+    scanner/heal runtime config, bucket lifecycle/replication config files are
+    not dynamic server-config reload targets, and background shutdown keeps
+    scanner before AHM while preserving the scanner-implies-AHM dependency.
+  - Must preserve: no scanner, heal, lifecycle, replication, audit, storage
+    class, peer-signal, readiness, or worker lifecycle behavior change.
+  - Verification: focused config reload and shutdown tests, compile checks,
+    formatting, diff hygiene, and Rust risk scan.
 
 ## Next PRs
 
-1. `test-only`: add controller harness coverage for cancellation and
-   duplicate-worker prevention in `TEST-BGC-001`.
-2. `behavior-change`: add the next low-risk background status surface before
-   broader reconcile work.
+1. `test-only`: add CTX-002 resolver compatibility tests before migrating more
+   consumers to AppContext-first access.
+2. `test-only`: add CTX-003 IAM deferred recovery readiness coverage before
+   boot phase extraction.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed the controller pilot stays local to `memory_observability`, uses typed desired/status/reconcile structs, and does not add a generic scheduler or admin route. |
-| Migration preservation | pass | Confirmed reconcile reports `worker_mutation: none`, preserving sampler startup, cancellation, interval defaulting, and metrics emission behavior. |
-| Testing/verification | pass | Focused tests, compile checks, formatting, diff hygiene, migration guards, Rust risk scan, and `make pre-commit` passed. |
+| Quality/architecture | pass | Pure module split behind the existing `app::context` root; no service container, public API, or runtime behavior added. |
+| Migration preservation | pass | Re-exports preserve `crate::app::context::*`; AppContext construction, default handles, singleton initialization, and resolver fallback order are unchanged. |
+| Testing/verification | pass | Focused compile, formatting, diff hygiene, migration guards, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `bda0b1f3dd923f728e4d2ff2f17bde2755a6cb5e`:
-- `cargo test -p rustfs memory_observability --lib`; 8 passed.
-- `cargo check -p rustfs --lib`.
+Passed on `af291afb930e072d162ff10c63e33c091b706e58`:
 - `cargo fmt --all`.
 - `cargo fmt --all --check`.
+- `cargo check -p rustfs --lib`.
+- `cargo check -p rustfs --bin rustfs`.
 - `git diff --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
-- `./scripts/check_metrics_migration_refs.sh`.
-- Rust risk scan for unwrap/expect/casts/string errors/debug output in
-  `rustfs/src/memory_observability.rs`; only test `expect` calls matched.
-- `make pre-commit`; all checks passed, including nextest 5865 passed and 111
+- Rust risk scan for changed Rust files; no matches.
+- `make pre-commit`; all checks passed, including nextest 5883 passed and 111
   skipped.
 
 Notes:
-- This slice adds reconcile data only. It does not apply reconcile output to the
-  running sampler.
-- There is no admin/API exposure in this PR; future controller harness work
-  should stay isolated from scanner, heal, lifecycle, and replication.
+- This slice moves code between files only; it keeps `crate::app::context::*`
+  imports working through the module root.
+- Resolver bodies still use the same AppContext-first and global fallback order.
 
 ## Handoff Notes
 
-- Next migration slice can start `TEST-BGC-001` with a fake-clock and
-  cancellation-token harness around the memory observability pilot.
-- Keep scanner, heal, lifecycle, replication, disk health, and config reload out
-  of broad controller movement until dedicated preservation tests exist.
+- CTX-002 should add resolver compatibility tests before moving consumers.
+- CTX-003 should protect IAM degraded-readiness publication before boot
+  extraction.

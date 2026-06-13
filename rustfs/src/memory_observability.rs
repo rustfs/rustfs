@@ -327,9 +327,9 @@ pub fn init_memory_observability(ctx: CancellationToken) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CgroupMemorySnapshot, MemoryObservabilityCancellationSource, MemoryObservabilityController,
-        MemoryObservabilityDesiredState, MemoryObservabilityServiceState, MemoryObservabilityShutdownHandle,
-        MemoryObservabilityWorkerMutation, build_memory_observability_controller_snapshot,
+        CgroupMemorySnapshot, MEMORY_OBSERVABILITY_SERVICE_NAME, MemoryObservabilityCancellationSource,
+        MemoryObservabilityController, MemoryObservabilityDesiredState, MemoryObservabilityServiceState,
+        MemoryObservabilityShutdownHandle, MemoryObservabilityWorkerMutation, build_memory_observability_controller_snapshot,
         build_memory_observability_status_snapshot, parse_kv_stats, read_optional_u64,
     };
     use std::fs;
@@ -424,5 +424,23 @@ mod tests {
         assert_eq!(snapshot.desired.interval_secs, 1);
         assert_eq!(plan.current_state, MemoryObservabilityServiceState::Disabled);
         assert_eq!(plan.worker_mutation, MemoryObservabilityWorkerMutation::None);
+    }
+
+    #[test]
+    fn memory_observability_controller_harness_never_mutates_workers() {
+        let controller = MemoryObservabilityController;
+        let snapshots = [
+            build_memory_observability_controller_snapshot(true, 15, false),
+            build_memory_observability_controller_snapshot(true, 15, true),
+            build_memory_observability_controller_snapshot(false, 15, false),
+        ];
+
+        for snapshot in snapshots {
+            let plan = controller.reconcile_snapshot(snapshot);
+
+            assert_eq!(plan.service, MEMORY_OBSERVABILITY_SERVICE_NAME);
+            assert_eq!(plan.current_state, snapshot.status.state);
+            assert_eq!(plan.worker_mutation, MemoryObservabilityWorkerMutation::None);
+        }
     }
 }

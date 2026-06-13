@@ -36,7 +36,15 @@ const WAREHOUSE_PROPERTY: &str = "warehouse";
 const CATALOG_ENDPOINT_PREFIX_CONFIG_KEY: &str = "rustfs.catalog-endpoint-prefix";
 const CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY: &str = "rustfs.catalog-compat-endpoint-prefix";
 const CREDENTIAL_VENDING_CONFIG_KEY: &str = "rustfs.credential-vending";
+const CREDENTIAL_VENDING_REASON_CONFIG_KEY: &str = "rustfs.credential-vending-reason";
+const CREDENTIAL_SCOPE_CONFIG_KEY: &str = "rustfs.credential-scope";
+const CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY: &str = "rustfs.credential-scope-prefix";
+const CREDENTIAL_MODE_CONFIG_KEY: &str = "rustfs.credential-mode";
 const CREDENTIAL_VENDING_UNSUPPORTED: &str = "unsupported";
+const CREDENTIAL_VENDING_UNSUPPORTED_REASON: &str = "temporary-credentials-not-implemented";
+const CREDENTIAL_SCOPE_WAREHOUSE_PREFIX: &str = "warehouse-prefix";
+const CREDENTIAL_SCOPE_TABLE_PREFIX: &str = "table-prefix";
+const CREDENTIAL_MODE_CLIENT_PROVIDED: &str = "client-provided-s3-credentials-required";
 const TABLE_CATALOG_NAMESPACE_RESOURCE_ROOT: &str = "namespaces";
 const TABLE_CATALOG_TABLE_RESOURCE_ROOT: &str = "tables";
 const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
@@ -50,6 +58,7 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "POST /v1/{prefix}/namespaces/{namespace}/register",
     "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}",
     "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+    "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials",
     "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}",
     "DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}",
     "PUT /buckets/{warehouse}",
@@ -64,6 +73,7 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "POST /{warehouse}/namespaces/{namespace}/register",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}",
     "HEAD /{warehouse}/namespaces/{namespace}/tables/{table}",
+    "GET /{warehouse}/namespaces/{namespace}/tables/{table}/credentials",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}",
     "DELETE /{warehouse}/namespaces/{namespace}/tables/{table}",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata",
@@ -91,6 +101,7 @@ static CREATE_TABLE_HANDLER: RestCreateTableHandler = RestCreateTableHandler {};
 static REGISTER_TABLE_HANDLER: RestRegisterTableHandler = RestRegisterTableHandler {};
 static LOAD_TABLE_HANDLER: RestLoadTableHandler = RestLoadTableHandler {};
 static TABLE_EXISTS_HANDLER: RestTableExistsHandler = RestTableExistsHandler {};
+static LOAD_CREDENTIALS_HANDLER: RestLoadCredentialsHandler = RestLoadCredentialsHandler {};
 static COMMIT_TABLE_HANDLER: RestCommitTableHandler = RestCommitTableHandler {};
 static DROP_TABLE_HANDLER: RestDropTableHandler = RestDropTableHandler {};
 static GET_TABLE_METADATA_LOCATION_HANDLER: GetTableMetadataLocationHandler = GetTableMetadataLocationHandler {};
@@ -231,6 +242,10 @@ struct TableBucketResponse {
     compat_catalog_uri: String,
     #[serde(rename = "credential-vending")]
     credential_vending: &'static str,
+    #[serde(rename = "credential-scope")]
+    credential_scope: &'static str,
+    #[serde(rename = "credential-scope-prefix")]
+    credential_scope_prefix: String,
     #[serde(rename = "catalog-entry-present")]
     catalog_entry_present: bool,
     properties: BTreeMap<String, String>,
@@ -270,6 +285,12 @@ struct RestLoadTableResponse {
     metadata_location: String,
     metadata: serde_json::Value,
     config: BTreeMap<String, String>,
+    #[serde(rename = "storage-credentials")]
+    storage_credentials: Vec<RestStorageCredential>,
+}
+
+#[derive(Debug, Serialize)]
+struct RestLoadCredentialsResponse {
     #[serde(rename = "storage-credentials")]
     storage_credentials: Vec<RestStorageCredential>,
 }
@@ -366,6 +387,11 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         Method::HEAD,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}").as_str(),
         AdminOperation(&TABLE_EXISTS_HANDLER),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/credentials").as_str(),
+        AdminOperation(&LOAD_CREDENTIALS_HANDLER),
     )?;
     r.insert(
         Method::POST,
@@ -663,10 +689,12 @@ where
         enabled,
         catalog_type,
         warehouse: bucket.to_string(),
-        warehouse_location,
+        warehouse_location: warehouse_location.clone(),
         catalog_uri: format!("{TABLE_CATALOG_PREFIX}/{bucket}"),
         compat_catalog_uri: format!("{TABLE_CATALOG_COMPAT_PREFIX}/{bucket}"),
         credential_vending: CREDENTIAL_VENDING_UNSUPPORTED,
+        credential_scope: CREDENTIAL_SCOPE_WAREHOUSE_PREFIX,
+        credential_scope_prefix: warehouse_location,
         catalog_entry_present,
         properties,
     })
@@ -738,13 +766,27 @@ fn list_tables_response_from_entries(entries: Vec<crate::table_catalog::TableEnt
 
 fn load_table_response_from_entry(entry: crate::table_catalog::TableEntry, metadata: serde_json::Value) -> RestLoadTableResponse {
     let mut config = BTreeMap::new();
-    config.insert("warehouse-location".to_string(), entry.warehouse_location);
+    let warehouse_location = entry.warehouse_location.clone();
+    config.insert("warehouse-location".to_string(), warehouse_location.clone());
     config.insert(CREDENTIAL_VENDING_CONFIG_KEY.to_string(), CREDENTIAL_VENDING_UNSUPPORTED.to_string());
+    config.insert(
+        CREDENTIAL_VENDING_REASON_CONFIG_KEY.to_string(),
+        CREDENTIAL_VENDING_UNSUPPORTED_REASON.to_string(),
+    );
+    config.insert(CREDENTIAL_SCOPE_CONFIG_KEY.to_string(), CREDENTIAL_SCOPE_TABLE_PREFIX.to_string());
+    config.insert(CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY.to_string(), warehouse_location);
+    config.insert(CREDENTIAL_MODE_CONFIG_KEY.to_string(), CREDENTIAL_MODE_CLIENT_PROVIDED.to_string());
 
     RestLoadTableResponse {
         metadata_location: entry.metadata_location,
         metadata,
         config,
+        storage_credentials: Vec::new(),
+    }
+}
+
+fn load_credentials_response_from_entry(_entry: crate::table_catalog::TableEntry) -> RestLoadCredentialsResponse {
+    RestLoadCredentialsResponse {
         storage_credentials: Vec::new(),
     }
 }
@@ -1819,6 +1861,25 @@ where
     Ok(exists_status(exists))
 }
 
+async fn load_credentials_response<S>(
+    store: &S,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+) -> S3Result<RestLoadCredentialsResponse>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let Some(entry) = store
+        .load_table(bucket, &namespace.public_name(), table)
+        .await
+        .map_err(catalog_store_error)?
+    else {
+        return Err(s3_error!(InvalidRequest, "table not found"));
+    };
+    Ok(load_credentials_response_from_entry(entry))
+}
+
 async fn get_table_metadata_location_response<S>(
     store: &S,
     bucket: &str,
@@ -2285,6 +2346,22 @@ impl Operation for RestTableExistsHandler {
     }
 }
 
+pub struct RestLoadCredentialsHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestLoadCredentialsHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableCredentialsAction).await?;
+        let store = table_catalog_store()?;
+        let response = load_credentials_response(&store, &warehouse, &namespace, &table).await?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
 pub struct RestCommitTableHandler {}
 
 #[async_trait::async_trait]
@@ -2544,6 +2621,11 @@ mod tests {
                 .endpoints
                 .contains(&"HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}")
         );
+        assert!(
+            response
+                .endpoints
+                .contains(&"GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials")
+        );
         assert!(response.endpoints.contains(&"GET /{warehouse}/namespaces"));
         assert!(response.endpoints.contains(&"POST /{warehouse}/namespaces"));
         assert!(response.endpoints.contains(&"HEAD /{warehouse}/namespaces/{namespace}"));
@@ -2571,6 +2653,11 @@ mod tests {
             response
                 .endpoints
                 .contains(&"POST /{warehouse}/namespaces/{namespace}/tables/{table}")
+        );
+        assert!(
+            response
+                .endpoints
+                .contains(&"GET /{warehouse}/namespaces/{namespace}/tables/{table}/credentials")
         );
     }
 
@@ -2600,6 +2687,7 @@ mod tests {
             ("RestRegisterTableHandler", "AdminAction::RegisterTableAction"),
             ("RestLoadTableHandler", "AdminAction::GetTableMetadataAction"),
             ("RestTableExistsHandler", "AdminAction::GetTableAction"),
+            ("RestLoadCredentialsHandler", "AdminAction::GetTableCredentialsAction"),
             ("RestCommitTableHandler", "AdminAction::CommitTableAction"),
             ("RestDropTableHandler", "AdminAction::DeleteTableAction"),
             ("GetTableMetadataLocationHandler", "AdminAction::GetTableMetadataLocationAction"),
@@ -2631,6 +2719,7 @@ mod tests {
         for (handler, action) in [
             ("RestLoadTableHandler", "AdminAction::GetTableMetadataAction"),
             ("RestTableExistsHandler", "AdminAction::GetTableAction"),
+            ("RestLoadCredentialsHandler", "AdminAction::GetTableCredentialsAction"),
             ("RestCommitTableHandler", "AdminAction::CommitTableAction"),
             ("RestDropTableHandler", "AdminAction::DeleteTableAction"),
             ("GetTableMetadataLocationHandler", "AdminAction::GetTableMetadataLocationAction"),
@@ -2702,6 +2791,7 @@ mod tests {
         let _: &RestRegisterTableHandler = &REGISTER_TABLE_HANDLER;
         let _: &RestLoadTableHandler = &LOAD_TABLE_HANDLER;
         let _: &RestTableExistsHandler = &TABLE_EXISTS_HANDLER;
+        let _: &RestLoadCredentialsHandler = &LOAD_CREDENTIALS_HANDLER;
         let _: &RestCommitTableHandler = &COMMIT_TABLE_HANDLER;
         let _: &RestDropTableHandler = &DROP_TABLE_HANDLER;
         let _: &GetTableMetadataLocationHandler = &GET_TABLE_METADATA_LOCATION_HANDLER;
@@ -2727,6 +2817,7 @@ mod tests {
         assert_operation::<RestRegisterTableHandler>();
         assert_operation::<RestLoadTableHandler>();
         assert_operation::<RestTableExistsHandler>();
+        assert_operation::<RestLoadCredentialsHandler>();
         assert_operation::<RestCommitTableHandler>();
         assert_operation::<RestDropTableHandler>();
         assert_operation::<GetTableMetadataLocationHandler>();
@@ -2780,6 +2871,8 @@ mod tests {
         assert_eq!(response.catalog_uri, "/iceberg/v1/warehouse");
         assert_eq!(response.compat_catalog_uri, "/_iceberg/v1/warehouse");
         assert_eq!(response.credential_vending, CREDENTIAL_VENDING_UNSUPPORTED);
+        assert_eq!(response.credential_scope, "warehouse-prefix");
+        assert_eq!(response.credential_scope_prefix, "s3://warehouse/");
         assert!(response.catalog_entry_present);
     }
 
@@ -3612,9 +3705,47 @@ mod tests {
         assert_eq!(response.metadata, metadata);
         assert!(response.storage_credentials.is_empty());
         assert_eq!(response.config.get("rustfs.credential-vending"), Some(&"unsupported".to_string()));
+        assert_eq!(
+            response.config.get("rustfs.credential-vending-reason"),
+            Some(&"temporary-credentials-not-implemented".to_string())
+        );
+        assert_eq!(response.config.get("rustfs.credential-scope"), Some(&"table-prefix".to_string()));
+        assert_eq!(
+            response.config.get("rustfs.credential-scope-prefix"),
+            Some(&"s3://warehouse/tables/table-id".to_string())
+        );
+        assert_eq!(
+            response.config.get("rustfs.credential-mode"),
+            Some(&"client-provided-s3-credentials-required".to_string())
+        );
         assert!(!response.config.contains_key("s3.access-key-id"));
         assert!(!response.config.contains_key("s3.secret-access-key"));
         assert!(!response.config.contains_key("s3.session-token"));
+    }
+
+    #[test]
+    fn load_credentials_response_never_returns_static_s3_credentials() {
+        let response = load_credentials_response_from_entry(crate::table_catalog::TableEntry {
+            version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+            table_bucket: "warehouse".to_string(),
+            namespace: "analytics".to_string(),
+            table: "events".to_string(),
+            table_id: "table-id".to_string(),
+            table_uuid: "table-uuid".to_string(),
+            format: "ICEBERG".to_string(),
+            format_version: 2,
+            warehouse_location: "s3://warehouse/tables/table-id".to_string(),
+            metadata_location: ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json"
+                .to_string(),
+            version_token: "token-v1".to_string(),
+            generation: 1,
+            state: crate::table_catalog::TableCatalogEntryState::Active,
+            properties: BTreeMap::new(),
+            created_at: None,
+            updated_at: None,
+        });
+
+        assert!(response.storage_credentials.is_empty());
     }
 
     #[test]
