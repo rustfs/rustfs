@@ -6,6 +6,8 @@ admission, scanner-driven heal/bitrot checks, and namespace alerts.
 
 For operator-facing runtime controls, status fields, and tuning workflows, see
 [Scanner Runtime Controls](../../docs/operations/scanner-runtime-controls.md).
+For repeatable scanner-pressure validation, see
+[Scanner Benchmark Runbook](../../docs/operations/scanner-benchmark-runbook.md).
 
 Chinese documentation is available in [README.zh-CN.md](README.zh-CN.md).
 
