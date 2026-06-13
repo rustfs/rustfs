@@ -43,6 +43,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, watch};
 use tracing::{debug, info, warn};
 
+const LOG_COMPONENT_CAPACITY: &str = "capacity";
+const LOG_SUBSYSTEM_REFRESH: &str = "refresh";
+const LOG_SUBSYSTEM_RUNTIME: &str = "runtime";
+const EVENT_CAPACITY_REFRESH_CACHE_UPDATED: &str = "capacity_refresh_cache_updated";
+const EVENT_CAPACITY_REFRESH_WRITE_RECORDED: &str = "capacity_refresh_write_recorded";
+const EVENT_CAPACITY_REFRESH_DEBOUNCE_STATE: &str = "capacity_refresh_debounce_state";
+const EVENT_CAPACITY_REFRESH_PANIC: &str = "capacity_refresh_panic";
+const EVENT_CAPACITY_REFRESH_RUNTIME_SUMMARY: &str = "capacity_refresh_runtime_summary";
+const EVENT_CAPACITY_REFRESH_INTERVAL_CLAMPED: &str = "capacity_refresh_interval_clamped";
+const EVENT_CAPACITY_REFRESH_SCHEDULED: &str = "capacity_refresh_scheduled";
+const EVENT_CAPACITY_REFRESH_SKIPPED: &str = "capacity_refresh_skipped";
+
 // ============================================================================
 // Configuration Functions
 // ============================================================================
@@ -649,8 +661,16 @@ impl HybridCapacityManager {
         }
 
         debug!(
-            "Capacity updated: {} bytes, files={}, estimated={}, source: {:?}",
-            total_used, update.file_count, update.is_estimated, source
+            event = EVENT_CAPACITY_REFRESH_CACHE_UPDATED,
+            component = LOG_COMPONENT_CAPACITY,
+            subsystem = LOG_SUBSYSTEM_REFRESH,
+            result = "updated",
+            total_used,
+            file_count = update.file_count,
+            estimated = update.is_estimated,
+            source = source.as_metric_label(),
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "capacity refresh cache updated"
         );
         record_capacity_current_bytes(total_used);
         record_capacity_update_completed(source.as_metric_label(), start.elapsed(), total_used, update.is_estimated);
@@ -664,8 +684,13 @@ impl HybridCapacityManager {
 
         record_capacity_write_operation(recent_write_count);
         debug!(
-            "Write operation recorded: total writes = {}, recent writes = {}",
-            record.write_count, recent_write_count
+            event = EVENT_CAPACITY_REFRESH_WRITE_RECORDED,
+            component = LOG_COMPONENT_CAPACITY,
+            subsystem = LOG_SUBSYSTEM_REFRESH,
+            state = "recorded",
+            total_writes = record.write_count,
+            recent_writes = recent_write_count,
+            "capacity refresh write recorded"
         );
     }
 
@@ -721,15 +746,27 @@ impl HybridCapacityManager {
 
                 if time_since_write < self.config.write_trigger_delay {
                     debug!(
-                        "Write-triggered refresh still debounced ({:?} ago, trigger_delay={:?}, writes/min={})",
-                        time_since_write, self.config.write_trigger_delay, write_frequency
+                        event = EVENT_CAPACITY_REFRESH_DEBOUNCE_STATE,
+                        component = LOG_COMPONENT_CAPACITY,
+                        subsystem = LOG_SUBSYSTEM_REFRESH,
+                        state = "debounced",
+                        time_since_write_ms = time_since_write.as_millis() as u64,
+                        trigger_delay_ms = self.config.write_trigger_delay.as_millis() as u64,
+                        writes_per_minute = write_frequency,
+                        "capacity refresh debounce state changed"
                     );
                     return false;
                 }
 
                 debug!(
-                    "Write-triggered refresh eligible after debounce ({:?} ago, trigger_delay={:?}, writes/min={})",
-                    time_since_write, self.config.write_trigger_delay, write_frequency
+                    event = EVENT_CAPACITY_REFRESH_DEBOUNCE_STATE,
+                    component = LOG_COMPONENT_CAPACITY,
+                    subsystem = LOG_SUBSYSTEM_REFRESH,
+                    state = "eligible",
+                    time_since_write_ms = time_since_write.as_millis() as u64,
+                    trigger_delay_ms = self.config.write_trigger_delay.as_millis() as u64,
+                    writes_per_minute = write_frequency,
+                    "capacity refresh debounce state changed"
                 );
                 return true;
             }
@@ -808,7 +845,15 @@ impl HybridCapacityManager {
 
         let refresh_start = Instant::now();
         let result = AssertUnwindSafe(refresh_fn()).catch_unwind().await.unwrap_or_else(|err| {
-            warn!(error = ?err, "capacity refresh function panicked");
+            warn!(
+                event = EVENT_CAPACITY_REFRESH_PANIC,
+                component = LOG_COMPONENT_CAPACITY,
+                subsystem = LOG_SUBSYSTEM_REFRESH,
+                result = "panic",
+                source = source.as_metric_label(),
+                error = ?err,
+                "capacity refresh panicked"
+            );
             Err("capacity refresh panicked".to_string())
         });
         if let Ok(update) = &result {
@@ -860,7 +905,15 @@ impl HybridCapacityManager {
         tokio::spawn(async move {
             let refresh_start = Instant::now();
             let result = AssertUnwindSafe(refresh_fn()).catch_unwind().await.unwrap_or_else(|err| {
-                warn!(error = ?err, "capacity refresh function panicked");
+                warn!(
+                    event = EVENT_CAPACITY_REFRESH_PANIC,
+                    component = LOG_COMPONENT_CAPACITY,
+                    subsystem = LOG_SUBSYSTEM_REFRESH,
+                    result = "panic",
+                    source = source.as_metric_label(),
+                    error = ?err,
+                    "capacity refresh panicked"
+                );
                 Err("capacity refresh panicked".to_string())
             });
             if let Ok(update) = &result {
@@ -909,22 +962,30 @@ impl HybridCapacityManager {
 
         if let Some(cached) = cached {
             info!(
+                event = EVENT_CAPACITY_REFRESH_RUNTIME_SUMMARY,
+                component = LOG_COMPONENT_CAPACITY,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                state = "cache_present",
                 total_used = cached.total_used,
                 file_count = cached.file_count,
                 estimated = cached.is_estimated,
-                source = ?cached.source,
+                source = cached.source.as_metric_label(),
                 cache_age_secs = cached.last_update.elapsed().as_secs(),
                 writes_per_minute = recent_write_frequency,
                 dirty_disk_count = dirty_disks.len(),
                 refresh_inflight = refresh_running,
-                "Capacity metrics summary"
+                "capacity refresh runtime summary"
             );
         } else {
             info!(
+                event = EVENT_CAPACITY_REFRESH_RUNTIME_SUMMARY,
+                component = LOG_COMPONENT_CAPACITY,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                state = "cache_empty",
                 writes_per_minute = recent_write_frequency,
                 dirty_disk_count = dirty_disks.len(),
                 refresh_inflight = refresh_running,
-                "Capacity metrics summary (cache empty)"
+                "capacity refresh runtime summary"
             );
         }
     }
@@ -967,11 +1028,31 @@ pub async fn start_background_task(disks: Vec<CapacityDiskRef>) {
 
     // Prevent panic in tokio::time::interval when misconfigured to 0
     if refresh_interval.is_zero() {
-        warn!("RUSTFS_CAPACITY_SCHEDULED_INTERVAL is configured as 0; clamping to 1s to avoid panic");
+        warn!(
+            event = EVENT_CAPACITY_REFRESH_INTERVAL_CLAMPED,
+            component = LOG_COMPONENT_CAPACITY,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            result = "clamped",
+            env_var = ENV_CAPACITY_SCHEDULED_INTERVAL,
+            configured_secs = 0,
+            effective_secs = 1,
+            reason = "zero_interval",
+            "capacity refresh interval clamped"
+        );
         refresh_interval = Duration::from_secs(1);
     }
     if metrics_interval.is_zero() {
-        warn!("RUSTFS_CAPACITY_METRICS_INTERVAL is configured as 0; clamping to 1s to avoid panic");
+        warn!(
+            event = EVENT_CAPACITY_REFRESH_INTERVAL_CLAMPED,
+            component = LOG_COMPONENT_CAPACITY,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            result = "clamped",
+            env_var = ENV_CAPACITY_METRICS_INTERVAL,
+            configured_secs = 0,
+            effective_secs = 1,
+            reason = "zero_interval",
+            "capacity refresh interval clamped"
+        );
         metrics_interval = Duration::from_secs(1);
     }
 
@@ -981,10 +1062,10 @@ pub async fn start_background_task(disks: Vec<CapacityDiskRef>) {
         loop {
             timer.tick().await;
 
-            info!("Starting scheduled capacity update");
             let start = Instant::now();
             let manager = manager_for_refresh.clone();
             let disks = disks.clone();
+            let disk_count = disks.len();
             let started = manager
                 .clone()
                 .spawn_refresh_if_needed(
@@ -994,9 +1075,26 @@ pub async fn start_background_task(disks: Vec<CapacityDiskRef>) {
                 .await;
 
             if started {
-                debug!("Scheduled capacity refresh started in {:?}", start.elapsed());
+                debug!(
+                    event = EVENT_CAPACITY_REFRESH_SCHEDULED,
+                    component = LOG_COMPONENT_CAPACITY,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    state = "started",
+                    source = DataSource::Scheduled.as_metric_label(),
+                    disk_count,
+                    enqueue_latency_ms = start.elapsed().as_millis() as u64,
+                    "capacity refresh scheduled"
+                );
             } else {
-                debug!("Scheduled capacity refresh skipped because another refresh is already in progress");
+                debug!(
+                    event = EVENT_CAPACITY_REFRESH_SKIPPED,
+                    component = LOG_COMPONENT_CAPACITY,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    state = "inflight",
+                    source = DataSource::Scheduled.as_metric_label(),
+                    disk_count,
+                    "capacity refresh skipped"
+                );
             }
         }
     });
