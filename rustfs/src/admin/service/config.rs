@@ -42,6 +42,22 @@ pub fn is_dynamic_config_subsystem(sub_system: &str) -> bool {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DynamicConfigWorkerMutation {
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DynamicConfigReloadPlan {
+    worker_mutation: DynamicConfigWorkerMutation,
+}
+
+fn dynamic_config_reload_plan(sub_system: &str) -> Option<DynamicConfigReloadPlan> {
+    is_dynamic_config_subsystem(sub_system).then_some(DynamicConfigReloadPlan {
+        worker_mutation: DynamicConfigWorkerMutation::None,
+    })
+}
+
 fn internal_error(message: impl Into<String>) -> S3Error {
     S3Error::with_message(S3ErrorCode::InternalError, message.into())
 }
@@ -257,7 +273,7 @@ pub async fn validate_server_config(config: &ServerConfig, sub_system: Option<&s
 }
 
 pub async fn apply_dynamic_config_for_subsystem(config: &ServerConfig, sub_system: &str) -> S3Result<bool> {
-    if !is_dynamic_config_subsystem(sub_system) {
+    if dynamic_config_reload_plan(sub_system).is_none() {
         return Ok(false);
     }
 
@@ -359,6 +375,10 @@ mod tests {
     use rustfs_config::oidc::{OIDC_CLIENT_ID, OIDC_CONFIG_URL, OIDC_SCOPES};
     use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
     use rustfs_config::{MQTT_BROKER, MQTT_QUEUE_DIR, MQTT_TOPIC, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR};
+    use rustfs_ecstore::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG};
+
+    const LIFECYCLE_RELOAD_LABEL: &str = "lifecycle";
+    const REPLICATION_RELOAD_LABEL: &str = "replication";
 
     #[test]
     fn dynamic_config_subsystems_match_runtime_apply_support() {
@@ -369,6 +389,31 @@ mod tests {
         assert!(is_dynamic_config_subsystem(STORAGE_CLASS_SUB_SYS));
         assert!(!is_dynamic_config_subsystem("identity_openid"));
         assert!(!is_dynamic_config_subsystem("notify_webhook"));
+    }
+
+    #[test]
+    fn background_config_reload_plan_never_mutates_workers() {
+        for sub_system in [
+            STORAGE_CLASS_SUB_SYS,
+            AUDIT_WEBHOOK_SUB_SYS,
+            AUDIT_MQTT_SUB_SYS,
+            SCANNER_SUB_SYS,
+            HEAL_SUB_SYS,
+        ] {
+            assert_eq!(
+                dynamic_config_reload_plan(sub_system).map(|plan| plan.worker_mutation),
+                Some(DynamicConfigWorkerMutation::None)
+            );
+        }
+
+        for bucket_config in [
+            BUCKET_LIFECYCLE_CONFIG,
+            BUCKET_REPLICATION_CONFIG,
+            LIFECYCLE_RELOAD_LABEL,
+            REPLICATION_RELOAD_LABEL,
+        ] {
+            assert_eq!(dynamic_config_reload_plan(bucket_config), None);
+        }
     }
 
     #[test]
