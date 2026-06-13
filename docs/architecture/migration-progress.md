@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-config-reload-preservation`
-- Baseline: `origin/main` at `6b1e114b39a51166a872388ad64f86ee3d910864`
-- PR type for this branch: `test-only`
-- Runtime behavior changes: none; config reload and shutdown behavior are
-  preserved while their no-worker-mutation and shutdown-order assumptions are
-  made testable.
-- Rust code changes: add module-local config reload and background shutdown
-  plans plus focused tests for `TEST-BGC-002`.
+- Branch: `overtrue/arch-app-context-split`
+- Baseline: `origin/main` at `af291afb930e072d162ff10c63e33c091b706e58`
+- PR type for this branch: `pure-move`
+- Runtime behavior changes: none; `crate::app::context::*` remains the public
+  import path and resolver/global fallback semantics are unchanged.
+- Rust code changes: split `rustfs/src/app/context.rs` into module-local
+  `interfaces`, `handles`, `global`, and `compat` files behind the existing
+  `app::context` module.
 - CI/script changes: none.
-- Docs changes: record `TEST-BGC-002` config reload preservation coverage.
+- Docs changes: record `CTX-001` AppContext file split scope.
 
 ## Phase 0 Tasks
 
@@ -131,6 +131,30 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     storage-class global state, default registration wiring, and startup
     initialization; global server-config reads and writes keep the same
     `std::sync::RwLock<Option<Config>>` clone semantics.
+
+## Phase 1b Context Foundation Tasks
+
+- [x] `CTX-001` Split AppContext files.
+  - Current branch: split `rustfs/src/app/context.rs` into `interfaces`,
+    `handles`, `global`, and `compat` submodules.
+  - Acceptance: old `crate::app::context::*` imports continue to compile via
+    re-exports; context-first and global fallback resolver bodies are moved
+    without semantic changes.
+  - Must preserve: AppContext construction, default adapters, global singleton
+    initialization, resolver fallback order, and all consumer import paths.
+  - Verification: formatting, `cargo check -p rustfs --lib`, migration guards,
+    diff hygiene, Rust risk scan, and partial `make pre-commit` through
+    workspace dev check plus nextest.
+- [ ] `CTX-002` Add resolver compatibility tests.
+  - Do: test context-first and global fallback for KMS runtime, bucket
+    metadata, object store, endpoints, tier config, server config, and buffer
+    config.
+  - Acceptance: context wins when present and global fallback works when absent.
+- [ ] `CTX-003` Add IAM deferred recovery readiness test.
+  - Do: verify IAM degraded recovery can still publish `IamReady` and
+    `FullReady`.
+  - Acceptance: boot/lifecycle changes cannot lose deferred readiness
+    publication.
 
 ## Phase 1 Security Governance Tasks
 
@@ -437,45 +461,42 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `behavior-change`: add another low-risk read-only status surface now that
-   config-reload and shutdown assumptions have dedicated preservation tests.
-2. `test-only`: extend preservation coverage only if the next controller touches
-   additional startup/shutdown or config reload assumptions.
+1. `test-only`: add CTX-002 resolver compatibility tests before migrating more
+   consumers to AppContext-first access.
+2. `test-only`: add CTX-003 IAM deferred recovery readiness coverage before
+   boot phase extraction.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed the new plans are module-local test seams only and do not add a generic scheduler, registry, route, or public API. |
-| Migration preservation | pass | Confirmed reload plans report `worker_mutation: none`, bucket lifecycle/replication remain outside dynamic server-config reload, and shutdown keeps scanner before AHM. |
-| Testing/verification | pass | Focused tests, formatting, diff hygiene, migration guards, Rust risk scan, and `make pre-commit` passed. |
+| Quality/architecture | pass | Pure module split behind the existing `app::context` root; no service container, public API, or runtime behavior added. |
+| Migration preservation | pass | Re-exports preserve `crate::app::context::*`; AppContext construction, default handles, singleton initialization, and resolver fallback order are unchanged. |
+| Testing/verification | pass-with-caveat | Focused compile, formatting, diff hygiene, migration guards, Rust risk scan, and partial `make pre-commit` passed through workspace dev check and nextest; final pre-commit phase was stopped by request. |
 
 ## Verification Notes
 
-Passed on `6b1e114b39a51166a872388ad64f86ee3d910864`:
-- `cargo test -p rustfs --bin rustfs background_shutdown_plan_keeps_scanner_before_ahm`; 1 passed.
-- `cargo test -p rustfs background_config_reload_plan_never_mutates_workers`; 1 passed.
+Passed before rebase from `982812614f9af47a3e24701640facf1f5daab9d7`:
 - `cargo fmt --all`.
 - `cargo fmt --all --check`.
+- `cargo check -p rustfs --lib`.
 - `git diff --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
-- Rust risk scan for changed Rust files; only pre-existing test `expect`,
-  startup `expect`, import alias `as`, and startup `eprintln!` matches remain;
-  added-line risky-pattern scan found no matches.
-- `make pre-commit`; all checks passed, including nextest 5882 passed and 111
-  skipped.
+- Rust risk scan for changed Rust files; no matches.
+- Partial `make pre-commit`; workspace dev check passed, nextest passed with
+  5883 passed and 111 skipped, then the final pre-commit phase was stopped by
+  request.
+- Rebased onto `af291afb930e072d162ff10c63e33c091b706e58`; post-rebase
+  `git diff --check` passed.
 
 Notes:
-- This slice does not make dynamic config reload start, stop, restart, resize,
-  or wake scanner/heal/lifecycle/replication workers.
-- The shutdown plan preserves the existing scanner before AHM order and keeps
-  scanner shutdown implying AHM shutdown.
+- This slice moves code between files only; it keeps `crate::app::context::*`
+  imports working through the module root.
+- Resolver bodies still use the same AppContext-first and global fallback order.
 
 ## Handoff Notes
 
-- Next migration slice can add another low-risk read-only background status
-  surface while keeping worker lifecycle mutations out of scope.
-- Keep scanner, heal, lifecycle, replication, disk health, and config reload
-  behavior changes out of broad controller movement until each has dedicated
-  status snapshots.
+- CTX-002 should add resolver compatibility tests before moving consumers.
+- CTX-003 should protect IAM degraded-readiness publication before boot
+  extraction.
