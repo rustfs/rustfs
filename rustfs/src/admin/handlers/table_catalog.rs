@@ -24,14 +24,26 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::{bucket::metadata_sys, new_object_layer_fn, store::ECStore};
-use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_iam::{manager::get_token_signing_key, sys::SESSION_POLICY_NAME};
+use rustfs_policy::{
+    auth::get_new_credentials_with_metadata,
+    policy::{
+        Policy,
+        action::{Action, AdminAction},
+    },
+};
 use s3s::{Body, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::BTreeMap;
-use time::OffsetDateTime;
+use std::collections::{BTreeMap, HashMap};
+use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 const JSON_CONTENT_TYPE: &str = "application/json";
+const ENV_TABLE_CATALOG_CREDENTIAL_VENDING: &str = "RUSTFS_TABLE_CATALOG_CREDENTIAL_VENDING";
+const ENV_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: &str = "RUSTFS_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS";
+const DEFAULT_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 15 * 60;
+const MIN_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60;
+const MAX_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60 * 60;
 const WAREHOUSE_PROPERTY: &str = "warehouse";
 const CATALOG_ENDPOINT_PREFIX_CONFIG_KEY: &str = "rustfs.catalog-endpoint-prefix";
 const CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY: &str = "rustfs.catalog-compat-endpoint-prefix";
@@ -40,11 +52,17 @@ const CREDENTIAL_VENDING_REASON_CONFIG_KEY: &str = "rustfs.credential-vending-re
 const CREDENTIAL_SCOPE_CONFIG_KEY: &str = "rustfs.credential-scope";
 const CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY: &str = "rustfs.credential-scope-prefix";
 const CREDENTIAL_MODE_CONFIG_KEY: &str = "rustfs.credential-mode";
+const CREDENTIAL_EXPIRATION_CONFIG_KEY: &str = "rustfs.credential-expiration-unix-seconds";
 const CREDENTIAL_VENDING_UNSUPPORTED: &str = "unsupported";
+const CREDENTIAL_VENDING_SUPPORTED: &str = "supported";
 const CREDENTIAL_VENDING_UNSUPPORTED_REASON: &str = "temporary-credentials-not-implemented";
 const CREDENTIAL_SCOPE_WAREHOUSE_PREFIX: &str = "warehouse-prefix";
 const CREDENTIAL_SCOPE_TABLE_PREFIX: &str = "table-prefix";
 const CREDENTIAL_MODE_CLIENT_PROVIDED: &str = "client-provided-s3-credentials-required";
+const CREDENTIAL_MODE_CATALOG_VENDED: &str = "catalog-vended-temporary-credentials";
+const S3_ACCESS_KEY_ID_CONFIG_KEY: &str = "s3.access-key-id";
+const S3_SECRET_ACCESS_KEY_CONFIG_KEY: &str = "s3.secret-access-key";
+const S3_SESSION_TOKEN_CONFIG_KEY: &str = "s3.session-token";
 const TABLE_CATALOG_NAMESPACE_RESOURCE_ROOT: &str = "namespaces";
 const TABLE_CATALOG_TABLE_RESOURCE_ROOT: &str = "tables";
 const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
@@ -277,6 +295,127 @@ struct RestListTablesResponse {
 struct RestStorageCredential {
     prefix: String,
     config: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+struct TableCredentialScope {
+    scope_prefix: String,
+    object_prefix: String,
+}
+
+#[derive(Debug, Clone)]
+struct TableCredentialIssueRequest<'a> {
+    entry: &'a crate::table_catalog::TableEntry,
+    principal: Option<&'a rustfs_credentials::Credentials>,
+    scope_prefix: String,
+    object_prefix: String,
+}
+
+#[derive(Debug, Clone)]
+struct IssuedTableCredentials {
+    access_key_id: String,
+    secret_access_key: String,
+    session_token: String,
+    expiration: OffsetDateTime,
+}
+
+#[async_trait::async_trait]
+trait TableCredentialIssuer: Sync {
+    async fn issue_table_credentials(&self, request: TableCredentialIssueRequest<'_>)
+    -> S3Result<Option<IssuedTableCredentials>>;
+}
+
+#[cfg(test)]
+struct DisabledTableCredentialIssuer;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl TableCredentialIssuer for DisabledTableCredentialIssuer {
+    async fn issue_table_credentials(
+        &self,
+        _request: TableCredentialIssueRequest<'_>,
+    ) -> S3Result<Option<IssuedTableCredentials>> {
+        Ok(None)
+    }
+}
+
+struct IamTableCredentialIssuer {
+    enabled: bool,
+    ttl_seconds: i64,
+}
+
+impl IamTableCredentialIssuer {
+    fn from_env() -> Self {
+        Self {
+            enabled: table_credential_vending_enabled(),
+            ttl_seconds: table_credential_ttl_seconds(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl TableCredentialIssuer for IamTableCredentialIssuer {
+    async fn issue_table_credentials(
+        &self,
+        request: TableCredentialIssueRequest<'_>,
+    ) -> S3Result<Option<IssuedTableCredentials>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+
+        let Some(principal) = request.principal else {
+            return Err(s3_error!(InvalidRequest, "authentication required for table credentials"));
+        };
+        if principal.is_temp() || principal.is_service_account() {
+            return Err(s3_error!(
+                AccessDenied,
+                "table credential vending does not allow chained temporary credentials"
+            ));
+        }
+
+        let policy = table_credential_session_policy(&request.entry.table_bucket, &request.object_prefix)?;
+        let policy_buf = serde_json::to_vec(&policy)
+            .map_err(|err| s3_error!(InternalError, "failed to serialize table credential session policy: {}", err))?;
+        let expiration = OffsetDateTime::now_utc().saturating_add(Duration::seconds(self.ttl_seconds));
+        let mut claims: HashMap<String, serde_json::Value> = principal.claims.clone().unwrap_or_default();
+        claims.insert(
+            "exp".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(expiration.unix_timestamp())),
+        );
+        claims.insert("parent".to_string(), serde_json::Value::String(principal.access_key.clone()));
+        claims.insert(
+            SESSION_POLICY_NAME.to_string(),
+            serde_json::Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&policy_buf)),
+        );
+        claims.insert(
+            "rustfs:table-bucket".to_string(),
+            serde_json::Value::String(request.entry.table_bucket.clone()),
+        );
+        claims.insert("rustfs:table-id".to_string(), serde_json::Value::String(request.entry.table_id.clone()));
+        claims.insert(
+            "rustfs:credential-scope-prefix".to_string(),
+            serde_json::Value::String(request.scope_prefix.clone()),
+        );
+
+        let secret = get_token_signing_key().ok_or_else(|| s3_error!(InternalError, "token signing key not initialized"))?;
+        let mut credential = get_new_credentials_with_metadata(&claims, &secret)
+            .map_err(|err| s3_error!(InternalError, "failed to generate table credentials: {}", err))?;
+        credential.parent_user = principal.access_key.clone();
+        credential.groups = principal.groups.clone();
+
+        let iam_store = rustfs_iam::get().map_err(|_| s3_error!(InternalError, "iam not init"))?;
+        iam_store
+            .set_temp_user(&credential.access_key, &credential, None)
+            .await
+            .map_err(|_| s3_error!(InternalError, "failed to store table credentials"))?;
+
+        Ok(Some(IssuedTableCredentials {
+            access_key_id: credential.access_key,
+            secret_access_key: credential.secret_key,
+            session_token: credential.session_token,
+            expiration,
+        }))
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -575,6 +714,15 @@ async fn authorize_table_catalog_resource_request(
     .await
 }
 
+async fn table_catalog_request_principal(req: &S3Request<Body>) -> S3Result<rustfs_credentials::Credentials> {
+    let Some(input_cred) = &req.credentials else {
+        return Err(s3_error!(InvalidRequest, "authentication required"));
+    };
+    let (cred, _owner) =
+        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+    Ok(cred)
+}
+
 async fn read_json_body<T: DeserializeOwned>(mut input: Body) -> S3Result<T> {
     let body = input
         .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
@@ -764,6 +912,118 @@ fn list_tables_response_from_entries(entries: Vec<crate::table_catalog::TableEnt
     Ok(RestListTablesResponse { identifiers })
 }
 
+fn table_credential_vending_enabled() -> bool {
+    std::env::var(ENV_TABLE_CATALOG_CREDENTIAL_VENDING)
+        .ok()
+        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "enabled"))
+        .unwrap_or(false)
+}
+
+fn table_credential_ttl_seconds() -> i64 {
+    std::env::var(ENV_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .map(|seconds| seconds.clamp(MIN_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS, MAX_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS))
+        .unwrap_or(DEFAULT_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS)
+}
+
+fn table_credential_scope(entry: &crate::table_catalog::TableEntry) -> S3Result<TableCredentialScope> {
+    let location = entry
+        .warehouse_location
+        .strip_prefix("s3://")
+        .ok_or_else(|| s3_error!(InvalidRequest, "table warehouse location must be an s3 URI"))?;
+    let (bucket, object_prefix) = location
+        .split_once('/')
+        .ok_or_else(|| s3_error!(InvalidRequest, "table warehouse location must include an object prefix"))?;
+    if bucket != entry.table_bucket {
+        return Err(s3_error!(InvalidRequest, "table warehouse location must be inside the table bucket"));
+    }
+    let object_prefix = normalize_table_credential_object_prefix(object_prefix)?;
+    Ok(TableCredentialScope {
+        scope_prefix: format!("s3://{bucket}/{object_prefix}"),
+        object_prefix,
+    })
+}
+
+fn normalize_table_credential_object_prefix(object_prefix: &str) -> S3Result<String> {
+    let object_prefix = object_prefix.strip_suffix('/').unwrap_or(object_prefix);
+    if object_prefix.is_empty() {
+        return Err(s3_error!(InvalidRequest, "table credential scope prefix is empty"));
+    }
+    if object_prefix.contains('\\') {
+        return Err(s3_error!(
+            InvalidRequest,
+            "table credential scope prefix contains an invalid path separator"
+        ));
+    }
+    if object_prefix
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(s3_error!(
+            InvalidRequest,
+            "table credential scope prefix contains an invalid path segment"
+        ));
+    }
+
+    let mut normalized = object_prefix.to_string();
+    normalized.push('/');
+    Ok(normalized)
+}
+
+fn table_credential_session_policy(bucket: &str, object_prefix: &str) -> S3Result<Policy> {
+    let object_prefix = normalize_table_credential_object_prefix(object_prefix)?;
+    let policy = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "s3:GetObject",
+                    "s3:PutObject",
+                    "s3:DeleteObject",
+                    "s3:AbortMultipartUpload",
+                    "s3:ListMultipartUploadParts"
+                ],
+                "Resource": [
+                    format!("arn:aws:s3:::{bucket}/{object_prefix}*")
+                ]
+            },
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "s3:GetBucketLocation"
+                ],
+                "Resource": [
+                    format!("arn:aws:s3:::{bucket}")
+                ]
+            }
+        ]
+    });
+    let data = serde_json::to_vec(&policy)
+        .map_err(|err| s3_error!(InternalError, "failed to serialize table credential policy: {}", err))?;
+    Policy::parse_config(&data).map_err(|err| s3_error!(InvalidRequest, "invalid table credential policy: {}", err))
+}
+
+fn storage_credential_from_issued(scope: TableCredentialScope, issued: IssuedTableCredentials) -> RestStorageCredential {
+    let mut config = BTreeMap::new();
+    config.insert(S3_ACCESS_KEY_ID_CONFIG_KEY.to_string(), issued.access_key_id);
+    config.insert(S3_SECRET_ACCESS_KEY_CONFIG_KEY.to_string(), issued.secret_access_key);
+    config.insert(S3_SESSION_TOKEN_CONFIG_KEY.to_string(), issued.session_token);
+    config.insert(CREDENTIAL_VENDING_CONFIG_KEY.to_string(), CREDENTIAL_VENDING_SUPPORTED.to_string());
+    config.insert(CREDENTIAL_MODE_CONFIG_KEY.to_string(), CREDENTIAL_MODE_CATALOG_VENDED.to_string());
+    config.insert(CREDENTIAL_SCOPE_CONFIG_KEY.to_string(), CREDENTIAL_SCOPE_TABLE_PREFIX.to_string());
+    config.insert(CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY.to_string(), scope.scope_prefix.clone());
+    config.insert(
+        CREDENTIAL_EXPIRATION_CONFIG_KEY.to_string(),
+        issued.expiration.unix_timestamp().to_string(),
+    );
+    RestStorageCredential {
+        prefix: scope.scope_prefix,
+        config,
+    }
+}
+
 fn load_table_response_from_entry(entry: crate::table_catalog::TableEntry, metadata: serde_json::Value) -> RestLoadTableResponse {
     let mut config = BTreeMap::new();
     let warehouse_location = entry.warehouse_location.clone();
@@ -785,10 +1045,23 @@ fn load_table_response_from_entry(entry: crate::table_catalog::TableEntry, metad
     }
 }
 
-fn load_credentials_response_from_entry(_entry: crate::table_catalog::TableEntry) -> RestLoadCredentialsResponse {
-    RestLoadCredentialsResponse {
-        storage_credentials: Vec::new(),
-    }
+async fn load_credentials_response_from_entry(
+    entry: &crate::table_catalog::TableEntry,
+    issuer: &dyn TableCredentialIssuer,
+    principal: Option<&rustfs_credentials::Credentials>,
+) -> S3Result<RestLoadCredentialsResponse> {
+    let scope = table_credential_scope(entry)?;
+    let request = TableCredentialIssueRequest {
+        entry,
+        principal,
+        scope_prefix: scope.scope_prefix.clone(),
+        object_prefix: scope.object_prefix.clone(),
+    };
+    let storage_credentials = match issuer.issue_table_credentials(request).await? {
+        Some(issued) => vec![storage_credential_from_issued(scope, issued)],
+        None => Vec::new(),
+    };
+    Ok(RestLoadCredentialsResponse { storage_credentials })
 }
 
 fn commit_table_response_from_result(
@@ -1866,6 +2139,8 @@ async fn load_credentials_response<S>(
     bucket: &str,
     namespace: &crate::table_catalog::Namespace,
     table: &str,
+    issuer: &dyn TableCredentialIssuer,
+    principal: Option<&rustfs_credentials::Credentials>,
 ) -> S3Result<RestLoadCredentialsResponse>
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
@@ -1877,7 +2152,7 @@ where
     else {
         return Err(s3_error!(InvalidRequest, "table not found"));
     };
-    Ok(load_credentials_response_from_entry(entry))
+    load_credentials_response_from_entry(&entry, issuer, principal).await
 }
 
 async fn get_table_metadata_location_response<S>(
@@ -2356,8 +2631,10 @@ impl Operation for RestLoadCredentialsHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableCredentialsAction).await?;
+        let principal = table_catalog_request_principal(&req).await?;
         let store = table_catalog_store()?;
-        let response = load_credentials_response(&store, &warehouse, &namespace, &table).await?;
+        let issuer = IamTableCredentialIssuer::from_env();
+        let response = load_credentials_response(&store, &warehouse, &namespace, &table, &issuer, Some(&principal)).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -3679,28 +3956,7 @@ mod tests {
             "table-uuid": "table-uuid",
             "location": "s3://warehouse/tables/table-id"
         });
-        let response = load_table_response_from_entry(
-            crate::table_catalog::TableEntry {
-                version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
-                table_bucket: "warehouse".to_string(),
-                namespace: "analytics".to_string(),
-                table: "events".to_string(),
-                table_id: "table-id".to_string(),
-                table_uuid: "table-uuid".to_string(),
-                format: "ICEBERG".to_string(),
-                format_version: 2,
-                warehouse_location: "s3://warehouse/tables/table-id".to_string(),
-                metadata_location:
-                    ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json".to_string(),
-                version_token: "token-v1".to_string(),
-                generation: 1,
-                state: crate::table_catalog::TableCatalogEntryState::Active,
-                properties: BTreeMap::new(),
-                created_at: None,
-                updated_at: None,
-            },
-            metadata.clone(),
-        );
+        let response = load_table_response_from_entry(table_entry_for_credentials(), metadata.clone());
 
         assert_eq!(response.metadata, metadata);
         assert!(response.storage_credentials.is_empty());
@@ -3723,9 +3979,8 @@ mod tests {
         assert!(!response.config.contains_key("s3.session-token"));
     }
 
-    #[test]
-    fn load_credentials_response_never_returns_static_s3_credentials() {
-        let response = load_credentials_response_from_entry(crate::table_catalog::TableEntry {
+    fn table_entry_for_credentials() -> crate::table_catalog::TableEntry {
+        crate::table_catalog::TableEntry {
             version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
             table_bucket: "warehouse".to_string(),
             namespace: "analytics".to_string(),
@@ -3743,9 +3998,152 @@ mod tests {
             properties: BTreeMap::new(),
             created_at: None,
             updated_at: None,
-        });
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_table_credential_issuer_keeps_credentials_empty() {
+        let issuer = DisabledTableCredentialIssuer;
+        let response = load_credentials_response_from_entry(&table_entry_for_credentials(), &issuer, None)
+            .await
+            .expect("disabled issuer should build an empty response");
 
         assert!(response.storage_credentials.is_empty());
+    }
+
+    struct TestTableCredentialIssuer;
+
+    #[async_trait::async_trait]
+    impl TableCredentialIssuer for TestTableCredentialIssuer {
+        async fn issue_table_credentials(
+            &self,
+            request: TableCredentialIssueRequest<'_>,
+        ) -> S3Result<Option<IssuedTableCredentials>> {
+            assert_eq!(request.entry.table_bucket, "warehouse");
+            assert_eq!(request.scope_prefix, "s3://warehouse/tables/table-id/");
+            assert_eq!(request.object_prefix, "tables/table-id/");
+            Ok(Some(IssuedTableCredentials {
+                access_key_id: "temporary-access-key".to_string(),
+                secret_access_key: "temporary-secret-key".to_string(),
+                session_token: "temporary-session-token".to_string(),
+                expiration: OffsetDateTime::from_unix_timestamp(1_800_000_000).expect("test timestamp should be valid"),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_issuer_returns_temporary_scoped_storage_credentials() {
+        let issuer = TestTableCredentialIssuer;
+        let principal = rustfs_credentials::Credentials {
+            access_key: "parent-access-key".to_string(),
+            secret_key: "parent-secret-key".to_string(),
+            ..Default::default()
+        };
+
+        let response = load_credentials_response_from_entry(&table_entry_for_credentials(), &issuer, Some(&principal))
+            .await
+            .expect("issuer should build a scoped credential response");
+
+        assert_eq!(response.storage_credentials.len(), 1);
+        let credential = &response.storage_credentials[0];
+        assert_eq!(credential.prefix, "s3://warehouse/tables/table-id/");
+        assert_eq!(credential.config.get("s3.access-key-id"), Some(&"temporary-access-key".to_string()));
+        assert_eq!(credential.config.get("s3.secret-access-key"), Some(&"temporary-secret-key".to_string()));
+        assert_eq!(credential.config.get("s3.session-token"), Some(&"temporary-session-token".to_string()));
+        assert_eq!(
+            credential.config.get("rustfs.credential-mode"),
+            Some(&"catalog-vended-temporary-credentials".to_string())
+        );
+        assert_eq!(
+            credential.config.get("rustfs.credential-scope-prefix"),
+            Some(&"s3://warehouse/tables/table-id/".to_string())
+        );
+        assert_eq!(
+            credential.config.get("rustfs.credential-expiration-unix-seconds"),
+            Some(&"1800000000".to_string())
+        );
+        assert!(!credential.config.contains_key("rustfs.credential-vending-reason"));
+    }
+
+    #[tokio::test]
+    async fn table_credential_session_policy_is_limited_to_table_prefix() {
+        let policy =
+            table_credential_session_policy("warehouse", "tables/table-id/").expect("table credential policy should build");
+        let groups = None;
+        let conditions = std::collections::HashMap::new();
+        let claims = std::collections::HashMap::new();
+
+        assert!(
+            policy
+                .is_allowed(&rustfs_policy::policy::Args {
+                    account: "temporary-access-key",
+                    groups: &groups,
+                    action: Action::S3Action(rustfs_policy::policy::action::S3Action::GetObjectAction),
+                    bucket: "warehouse",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "tables/table-id/data/file.parquet",
+                    claims: &claims,
+                    deny_only: false,
+                })
+                .await
+        );
+        assert!(
+            policy
+                .is_allowed(&rustfs_policy::policy::Args {
+                    account: "temporary-access-key",
+                    groups: &groups,
+                    action: Action::S3Action(rustfs_policy::policy::action::S3Action::GetBucketLocationAction),
+                    bucket: "warehouse",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "",
+                    claims: &claims,
+                    deny_only: false,
+                })
+                .await
+        );
+        assert!(
+            !policy
+                .is_allowed(&rustfs_policy::policy::Args {
+                    account: "temporary-access-key",
+                    groups: &groups,
+                    action: Action::S3Action(rustfs_policy::policy::action::S3Action::GetObjectAction),
+                    bucket: "warehouse",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "tables/other/data/file.parquet",
+                    claims: &claims,
+                    deny_only: false,
+                })
+                .await
+        );
+        assert!(
+            !policy
+                .is_allowed(&rustfs_policy::policy::Args {
+                    account: "temporary-access-key",
+                    groups: &groups,
+                    action: Action::S3Action(rustfs_policy::policy::action::S3Action::PutObjectAction),
+                    bucket: "other-warehouse",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "tables/table-id/data/file.parquet",
+                    claims: &claims,
+                    deny_only: false,
+                })
+                .await
+        );
+    }
+
+    #[test]
+    fn table_credential_scope_rejects_cross_bucket_or_unsafe_prefix() {
+        let mut entry = table_entry_for_credentials();
+        entry.warehouse_location = "s3://other-warehouse/tables/table-id".to_string();
+        assert!(table_credential_scope(&entry).is_err());
+
+        let mut entry = table_entry_for_credentials();
+        entry.warehouse_location = "s3://warehouse/tables/../table-id".to_string();
+        assert!(table_credential_scope(&entry).is_err());
     }
 
     #[test]

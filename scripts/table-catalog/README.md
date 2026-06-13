@@ -112,7 +112,7 @@ added.
 Unsupported behavior is documented instead of hidden behind internal errors. The
 current unsupported inventory is:
 
-- credential vending: non-secret table scope preview and credentials endpoint exist; real temporary credentials are not issued
+- credential vending: table scope preview and credentials endpoint exist; temporary credentials are available only when explicitly enabled and are not yet covered by automated client profiles
 - background maintenance worker: unsupported
 - manifest/data reachability cleanup: unsupported
 - snapshot expiration and compaction: unsupported
@@ -122,16 +122,28 @@ current unsupported inventory is:
 ## Credential Boundary
 
 RustFS advertises table credential scope metadata without returning reusable
-storage secrets. `loadTable` includes the table warehouse prefix in the response
-config, and the standard credentials endpoint is registered:
+storage secrets by default. `loadTable` includes the table warehouse prefix in
+the response config, and the standard credentials endpoint is registered:
 
 ```text
 GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials
 ```
 
-The endpoint returns an empty `storage-credentials` list until temporary,
-table-scoped credential issuance is implemented. Clients should continue using
-their configured S3 credentials for object data access.
+The endpoint returns an empty `storage-credentials` list unless table catalog
+credential vending is explicitly enabled. When enabled, RustFS issues temporary
+table-scoped S3 credentials through the credentials endpoint. Those credentials
+are constrained to the table warehouse prefix and include a session token and
+expiration. The automated smoke profiles still use configured S3 credentials for
+object data access until a catalog-vended credential profile is added.
+
+Enablement is server-side and fail-closed:
+
+```text
+RUSTFS_TABLE_CATALOG_CREDENTIAL_VENDING=enabled
+RUSTFS_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS=900
+```
+
+The TTL is clamped to the supported short-lived range by the server.
 
 ## Spark Manual Baseline
 
