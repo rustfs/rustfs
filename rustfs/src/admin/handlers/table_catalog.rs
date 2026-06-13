@@ -321,6 +321,10 @@ struct IssuedTableCredentials {
 
 #[async_trait::async_trait]
 trait TableCredentialIssuer: Sync {
+    fn enabled(&self) -> bool {
+        true
+    }
+
     async fn issue_table_credentials(&self, request: TableCredentialIssueRequest<'_>)
     -> S3Result<Option<IssuedTableCredentials>>;
 }
@@ -331,6 +335,10 @@ struct DisabledTableCredentialIssuer;
 #[cfg(test)]
 #[async_trait::async_trait]
 impl TableCredentialIssuer for DisabledTableCredentialIssuer {
+    fn enabled(&self) -> bool {
+        false
+    }
+
     async fn issue_table_credentials(
         &self,
         _request: TableCredentialIssueRequest<'_>,
@@ -355,6 +363,10 @@ impl IamTableCredentialIssuer {
 
 #[async_trait::async_trait]
 impl TableCredentialIssuer for IamTableCredentialIssuer {
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
     async fn issue_table_credentials(
         &self,
         request: TableCredentialIssueRequest<'_>,
@@ -400,8 +412,7 @@ impl TableCredentialIssuer for IamTableCredentialIssuer {
         let secret = get_token_signing_key().ok_or_else(|| s3_error!(InternalError, "token signing key not initialized"))?;
         let mut credential = get_new_credentials_with_metadata(&claims, &secret)
             .map_err(|err| s3_error!(InternalError, "failed to generate table credentials: {}", err))?;
-        credential.parent_user = principal.access_key.clone();
-        credential.groups = principal.groups.clone();
+        bind_table_credential_parent(&mut credential, principal);
 
         let iam_store = rustfs_iam::get().map_err(|_| s3_error!(InternalError, "iam not init"))?;
         iam_store
@@ -416,6 +427,10 @@ impl TableCredentialIssuer for IamTableCredentialIssuer {
             expiration,
         }))
     }
+}
+
+fn bind_table_credential_parent(credential: &mut rustfs_credentials::Credentials, principal: &rustfs_credentials::Credentials) {
+    credential.parent_user = principal.access_key.clone();
 }
 
 #[derive(Debug, Serialize)]
@@ -1050,6 +1065,11 @@ async fn load_credentials_response_from_entry(
     issuer: &dyn TableCredentialIssuer,
     principal: Option<&rustfs_credentials::Credentials>,
 ) -> S3Result<RestLoadCredentialsResponse> {
+    if !issuer.enabled() {
+        return Ok(RestLoadCredentialsResponse {
+            storage_credentials: Vec::new(),
+        });
+    }
     let scope = table_credential_scope(entry)?;
     let request = TableCredentialIssueRequest {
         entry,
@@ -4011,6 +4031,19 @@ mod tests {
         assert!(response.storage_credentials.is_empty());
     }
 
+    #[tokio::test]
+    async fn disabled_table_credential_issuer_skips_scope_validation() {
+        let issuer = DisabledTableCredentialIssuer;
+        let mut entry = table_entry_for_credentials();
+        entry.warehouse_location = "s3://warehouse/".to_string();
+
+        let response = load_credentials_response_from_entry(&entry, &issuer, None)
+            .await
+            .expect("disabled issuer should not validate credential scopes");
+
+        assert!(response.storage_credentials.is_empty());
+    }
+
     struct TestTableCredentialIssuer;
 
     #[async_trait::async_trait]
@@ -4063,6 +4096,21 @@ mod tests {
             Some(&"1800000000".to_string())
         );
         assert!(!credential.config.contains_key("rustfs.credential-vending-reason"));
+    }
+
+    #[test]
+    fn table_credentials_do_not_snapshot_parent_groups() {
+        let principal = rustfs_credentials::Credentials {
+            access_key: "parent-access-key".to_string(),
+            groups: Some(vec!["analytics-writers".to_string()]),
+            ..Default::default()
+        };
+        let mut credential = rustfs_credentials::Credentials::default();
+
+        bind_table_credential_parent(&mut credential, &principal);
+
+        assert_eq!(credential.parent_user, "parent-access-key");
+        assert!(credential.groups.is_none());
     }
 
     #[tokio::test]
