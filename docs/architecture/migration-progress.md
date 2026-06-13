@@ -5,17 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-background-controller-pilot`
-- Baseline: `origin/main` at `bda0b1f3dd923f728e4d2ff2f17bde2755a6cb5e`
+- Branch: `overtrue/arch-background-controller-harness-and-status`
+- Baseline: `origin/main` at `624de3114398338c80b87c9b452fc70b1d76fa8a`
 - PR type for this branch: `behavior-change`
-- Runtime behavior changes: none; the memory observability controller pilot only
-  returns read-only snapshot/reconcile data and never starts, stops, resizes, or
-  wakes workers.
-- Rust code changes: add a memory observability controller snapshot and
-  reconcile plan with explicit no-op worker mutation.
+- Runtime behavior changes: none; the allocator reclaim controller/status
+  surface only returns read-only snapshot/reconcile data and never starts,
+  stops, resizes, or wakes workers.
+- Rust code changes: add allocator reclaim status/controller snapshots,
+  reconcile plans with explicit no-op worker mutation, and controller harness
+  tests for memory observability plus allocator reclaim.
 - CI/script changes: none.
-- Docs changes: record `BGC-004` controller pilot scope and update background
-  controller migration progress.
+- Docs changes: record `TEST-BGC-001` harness coverage and the allocator reclaim
+  controller/status slice.
 
 ## Phase 0 Tasks
 
@@ -398,26 +399,45 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: focused controller tests prove repeated reconcile is
     idempotent, cancellation state is preserved, and worker mutation remains
     none.
+- [x] `TEST-BGC-001` Add controller harness coverage.
+  - Acceptance: controller tests cover cancellation state, repeated reconcile,
+    paused-time stability, and no worker mutation for the low-risk controller
+    surfaces.
+  - Must preserve: no worker spawn, start, stop, resize, wakeup, storage write,
+    readiness signal, peer signal, or metrics emission behavior change.
+  - Verification: focused memory observability and allocator reclaim controller
+    tests.
+- [x] `BGC-005` Add allocator reclaim controller/status surface.
+  - Acceptance: allocator reclaim exposes typed desired/status/controller
+    snapshots and a typed reconcile plan that reports backend, effective force,
+    idle interval, runtime cancellation, shutdown handle shape, and no-op worker
+    mutation.
+  - Must preserve: existing allocator reclaim enablement, backend-specific force
+    handling, idle-streak logic, metrics emission, runtime-token cancellation,
+    and startup call shape.
+  - Verification: focused allocator reclaim tests, compile checks, formatting,
+    migration guards, Rust risk scan, and pre-commit quality gate.
 
 ## Next PRs
 
-1. `test-only`: add controller harness coverage for cancellation and
-   duplicate-worker prevention in `TEST-BGC-001`.
-2. `behavior-change`: add the next low-risk background status surface before
+1. `behavior-change`: add the next low-risk background status surface before
    broader reconcile work.
+2. `test-only`: add config-reload preservation coverage for scanner/heal/
+   lifecycle/replication in `TEST-BGC-002`.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed the controller pilot stays local to `memory_observability`, uses typed desired/status/reconcile structs, and does not add a generic scheduler or admin route. |
-| Migration preservation | pass | Confirmed reconcile reports `worker_mutation: none`, preserving sampler startup, cancellation, interval defaulting, and metrics emission behavior. |
+| Quality/architecture | pass | Confirmed allocator reclaim follows the established typed desired/status/reconcile shape without adding a generic scheduler, registry, or admin route. |
+| Migration preservation | pass | Confirmed reconcile reports `worker_mutation: none`, preserving enablement, force handling, idle-streak logic, cancellation, and metrics emission behavior. |
 | Testing/verification | pass | Focused tests, compile checks, formatting, diff hygiene, migration guards, Rust risk scan, and `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `bda0b1f3dd923f728e4d2ff2f17bde2755a6cb5e`:
-- `cargo test -p rustfs memory_observability --lib`; 8 passed.
+Passed on `624de3114398338c80b87c9b452fc70b1d76fa8a`:
+- `cargo test -p rustfs allocator_reclaim --lib`; 9 passed.
+- `cargo test -p rustfs memory_observability --lib`; 9 passed.
 - `cargo check -p rustfs --lib`.
 - `cargo fmt --all`.
 - `cargo fmt --all --check`.
@@ -425,20 +445,20 @@ Passed on `bda0b1f3dd923f728e4d2ff2f17bde2755a6cb5e`:
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - `./scripts/check_metrics_migration_refs.sh`.
-- Rust risk scan for unwrap/expect/casts/string errors/debug output in
-  `rustfs/src/memory_observability.rs`; only test `expect` calls matched.
-- `make pre-commit`; all checks passed, including nextest 5865 passed and 111
+- Rust risk scan for changed Rust files; only test `expect` calls and existing
+  internal allocator reclaim `Result<(), String>` helpers matched.
+- `make pre-commit`; all checks passed, including nextest 5874 passed and 111
   skipped.
 
 Notes:
-- This slice adds reconcile data only. It does not apply reconcile output to the
-  running sampler.
+- This slice adds reconcile/status data only. It does not apply reconcile output
+  to the running allocator reclaim loop or memory observability sampler.
 - There is no admin/API exposure in this PR; future controller harness work
   should stay isolated from scanner, heal, lifecycle, and replication.
 
 ## Handoff Notes
 
-- Next migration slice can start `TEST-BGC-001` with a fake-clock and
-  cancellation-token harness around the memory observability pilot.
+- Next migration slice can start another read-only low-risk status surface or
+  `TEST-BGC-002` config-reload preservation coverage.
 - Keep scanner, heal, lifecycle, replication, disk health, and config reload out
   of broad controller movement until dedicated preservation tests exist.
