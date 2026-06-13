@@ -241,6 +241,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/site-replication/status"),
         admin_route(Method::POST, "/v3/site-replication/devnull"),
         admin_route(Method::POST, "/v3/site-replication/netperf"),
+        admin_route(Method::POST, "/v3/site-replication/rotate-svc-acct"),
         admin_route(Method::PUT, "/v3/site-replication/peer/join"),
         admin_route(Method::PUT, "/v3/site-replication/peer/bucket-ops"),
         admin_route(Method::PUT, "/v3/site-replication/peer/iam-item"),
@@ -769,6 +770,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/site-replication/status"));
     assert_route(&router, Method::POST, &admin_path("/v3/site-replication/devnull"));
     assert_route(&router, Method::POST, &admin_path("/v3/site-replication/netperf"));
+    assert_route(&router, Method::POST, &admin_path("/v3/site-replication/rotate-svc-acct"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/join"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/bucket-ops"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/iam-item"));
