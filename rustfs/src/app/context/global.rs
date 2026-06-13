@@ -114,6 +114,39 @@ impl AppContext {
     }
 }
 
+#[cfg(test)]
+pub(super) struct AppContextTestInterfaces {
+    pub(super) iam: Arc<dyn IamInterface>,
+    pub(super) kms: Arc<dyn KmsInterface>,
+    pub(super) kms_runtime: Arc<dyn KmsRuntimeInterface>,
+    pub(super) notify: Arc<dyn NotifyInterface>,
+    pub(super) bucket_metadata: Arc<dyn BucketMetadataInterface>,
+    pub(super) endpoints: Arc<dyn EndpointsInterface>,
+    pub(super) region: Arc<dyn RegionInterface>,
+    pub(super) tier_config: Arc<dyn TierConfigInterface>,
+    pub(super) server_config: Arc<dyn ServerConfigInterface>,
+    pub(super) buffer_config: Arc<dyn BufferConfigInterface>,
+}
+
+#[cfg(test)]
+impl AppContext {
+    pub(super) fn with_test_interfaces(object_store: Arc<ECStore>, interfaces: AppContextTestInterfaces) -> Self {
+        Self {
+            object_store,
+            iam: interfaces.iam,
+            kms: interfaces.kms,
+            kms_runtime: interfaces.kms_runtime,
+            notify: interfaces.notify,
+            bucket_metadata: interfaces.bucket_metadata,
+            endpoints: interfaces.endpoints,
+            region: interfaces.region,
+            tier_config: interfaces.tier_config,
+            server_config: interfaces.server_config,
+            buffer_config: interfaces.buffer_config,
+        }
+    }
+}
+
 static APP_CONTEXT_SINGLETON: OnceLock<Arc<AppContext>> = OnceLock::new();
 
 /// Initialize global application context once and return the canonical instance.
