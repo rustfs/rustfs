@@ -18,6 +18,15 @@ checked_files=(
   "crates/ecstore/src/store/peer.rs"
   "crates/ecstore/src/store/init.rs"
   "crates/ecstore/src/tier/tier.rs"
+  "crates/heal/src/heal/manager.rs"
+  "crates/heal/src/heal/storage.rs"
+  "crates/heal/src/heal/task.rs"
+  "crates/heal/src/heal/erasure_healer.rs"
+  "crates/heal/src/heal/resume.rs"
+  "crates/heal/src/heal/channel.rs"
+  "crates/scanner/src/scanner.rs"
+  "crates/scanner/src/scanner_io.rs"
+  "crates/scanner/src/scanner_folder.rs"
   "crates/concurrency/src/workers.rs"
   "crates/concurrency/src/manager.rs"
   "crates/concurrency/src/lock.rs"
@@ -126,6 +135,31 @@ forbidden_patterns=(
   'warn!("KMS initialization skipped: {e}")'
   'warn!("Audit system: {e}")'
   'warn!("notification system: {e}")'
+  'info!("Starting HealManager")'
+  'info!("Stopping HealManager")'
+  'info!("HealManager started successfully")'
+  'info!("HealManager stopped successfully")'
+  'info!("Healing MRF: {}")'
+  'info!("Step 1: Performing MRF heal using ecstore")'
+  'info!("Skipping initial data scanner delay because persisted data usage cache is cold")'
+  'error!("Failed to run data scanner: {e}")'
+  'warn!("Failed to read background heal info from {}: {}")'
+  'error!("Failed to marshal background heal info: {}")'
+  'warn!("Failed to save background heal info to {}: {}")'
+  'debug!("nsscanner_cache: no online disks available for set")'
+  'debug!("scan_folder: Preemptively compacting: {}, entries: {}")'
+  'warn!("scan_folder: failed to scan child folder {}: {}")'
+  'error!("scan_folder: failed to list path: {}/{}: {}")'
+  'info!("Cancelled active heal task: {}")'
+  'info!("Cancelled queued heal task: {}")'
+  'info!("Cancelled {} heal task(s) for path: {}")'
+  'info!("Heal scheduler received shutdown signal")'
+  'info!("Heal queue has {} pending requests, {} tasks active")'
+  'error!("Heal channel processor failed: {}")'
+  'info!("Heal manager with channel processor initialized successfully")'
+  '"scanner deep heal downgraded to normal during new-object cooldown"'
+  '"scanner detected folder with excessive direct subfolders"'
+  '"scan_folder: failed to get size for item {}: {}"'
   'info!("worker take, {}", *available)'
   'info!("worker give, {}", *available)'
   'info!("worker wait end")'
