@@ -5,16 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-app-context-split`
-- Baseline: `origin/main` at `af291afb930e072d162ff10c63e33c091b706e58`
-- PR type for this branch: `pure-move`
-- Runtime behavior changes: none; `crate::app::context::*` remains the public
-  import path and resolver/global fallback semantics are unchanged.
-- Rust code changes: split `rustfs/src/app/context.rs` into module-local
-  `interfaces`, `handles`, `global`, and `compat` files behind the existing
-  `app::context` module.
+- Branch: `overtrue/arch-app-context-tests`
+- Baseline: `origin/main` at `cb37a64a81bb857ea22efd2ebb015fbd3b64bef0`
+- PR type for this branch: `test-only`
+- Runtime behavior changes: none; resolver/global fallback semantics and IAM
+  degraded recovery behavior are unchanged.
+- Rust code changes: add AppContext resolver compatibility tests and IAM
+  deferred recovery readiness coverage.
 - CI/script changes: none.
-- Docs changes: record `CTX-001` AppContext file split scope.
+- Docs changes: record `CTX-002`/`CTX-003` completion and verification scope.
 
 ## Phase 0 Tasks
 
@@ -144,16 +143,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     initialization, resolver fallback order, and all consumer import paths.
   - Verification: formatting, compile checks, migration guards, diff hygiene,
     Rust risk scan, and full `make pre-commit`.
-- [ ] `CTX-002` Add resolver compatibility tests.
+- [x] `CTX-002` Add resolver compatibility tests.
   - Do: test context-first and global fallback for KMS runtime, bucket
     metadata, object store, endpoints, tier config, server config, and buffer
     config.
   - Acceptance: context wins when present and global fallback works when absent.
-- [ ] `CTX-003` Add IAM deferred recovery readiness test.
+  - Verification: focused resolver compatibility test, formatting, compile
+    checks, migration guards, diff hygiene, Rust risk scan, and full
+    `make pre-commit`.
+- [x] `CTX-003` Add IAM deferred recovery readiness test.
   - Do: verify IAM degraded recovery can still publish `IamReady` and
     `FullReady`.
   - Acceptance: boot/lifecycle changes cannot lose deferred readiness
     publication.
+  - Verification: focused IAM recovery test, formatting, compile checks,
+    migration guards, diff hygiene, Rust risk scan, and full
+    `make pre-commit`.
 
 ## Phase 1 Security Governance Tasks
 
@@ -460,40 +465,43 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `test-only`: add CTX-002 resolver compatibility tests before migrating more
-   consumers to AppContext-first access.
-2. `test-only`: add CTX-003 IAM deferred recovery readiness coverage before
-   boot phase extraction.
+1. `pure-move`: start `R-009` boot wrapper with the IAM degraded readiness
+   contract covered.
+2. `consumer-migration`: migrate a small consumer group to AppContext-first
+   access with resolver fallback tests in place.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Pure module split behind the existing `app::context` root; no service container, public API, or runtime behavior added. |
-| Migration preservation | pass | Re-exports preserve `crate::app::context::*`; AppContext construction, default handles, singleton initialization, and resolver fallback order are unchanged. |
-| Testing/verification | pass | Focused compile, formatting, diff hygiene, migration guards, Rust risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | pass | Test-focused slice; resolver helpers stay private, AppContext test constructor is `#[cfg(test)]`, and no service container or registry is added. |
+| Migration preservation | pass | Context-first plus fallback semantics are asserted, object-store resolution remains AppContext-only, and IAM recovery still publishes `IamReady` before `FullReady`. |
+| Testing/verification | pass | Focused resolver/IAM tests, formatting, compile check, diff hygiene, migration guards, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `af291afb930e072d162ff10c63e33c091b706e58`:
+Passed on `cb37a64a81bb857ea22efd2ebb015fbd3b64bef0`:
 - `cargo fmt --all`.
 - `cargo fmt --all --check`.
+- `cargo test -p rustfs app::context::compat::tests::resolver_helpers_are_context_first_and_fallback_when_context_is_absent -- --nocapture`.
+- `cargo test -p rustfs startup_iam::tests::recovery_loop_can_publish_iam_and_full_ready_after_degraded_init -- --nocapture`.
 - `cargo check -p rustfs --lib`.
-- `cargo check -p rustfs --bin rustfs`.
 - `git diff --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
-- Rust risk scan for changed Rust files; no matches.
-- `make pre-commit`; all checks passed, including nextest 5883 passed and 111
-  skipped.
+- Rust risk scan for changed Rust files; matches are test-only `expect`
+  assertions, with no production `unwrap`/`expect`, numeric cast, string error,
+  boxed error, print macro, or relaxed-ordering match.
+- `make pre-commit`; all checks passed, including nextest 5891 passed and
+  111 skipped, plus doctests.
 
 Notes:
-- This slice moves code between files only; it keeps `crate::app::context::*`
-  imports working through the module root.
-- Resolver bodies still use the same AppContext-first and global fallback order.
+- This slice adds coverage before further consumer migration.
+- Resolver helpers preserve the same AppContext-first and fallback order.
+- IAM degraded recovery keeps `IamReady` publication before `FullReady`.
 
 ## Handoff Notes
 
-- CTX-002 should add resolver compatibility tests before moving consumers.
-- CTX-003 should protect IAM degraded-readiness publication before boot
-  extraction.
+- CTX-002 and CTX-003 are complete.
+- Keep the next consumer or boot wrapper PR small and preserve global fallback
+  until the planned cleanup phase.
