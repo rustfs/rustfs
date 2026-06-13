@@ -5,16 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-app-context-split`
-- Baseline: `origin/main` at `af291afb930e072d162ff10c63e33c091b706e58`
-- PR type for this branch: `pure-move`
-- Runtime behavior changes: none; `crate::app::context::*` remains the public
-  import path and resolver/global fallback semantics are unchanged.
-- Rust code changes: split `rustfs/src/app/context.rs` into module-local
-  `interfaces`, `handles`, `global`, and `compat` files behind the existing
-  `app::context` module.
+- Branch: `overtrue/arch-context-resolver-compat-tests`
+- Baseline: `origin/main` at `0d16a86d9f374f46786d60227b90b35ad96a7c85`
+- PR type for this branch: `test-only`
+- Runtime behavior changes: none; resolver precedence is factored through
+  private helpers without changing public resolver inputs or outputs.
+- Rust code changes: add resolver contract tests for optional, context-only,
+  presence-aware, and required AppContext resolver families.
 - CI/script changes: none.
-- Docs changes: record `CTX-001` AppContext file split scope.
+- Docs changes: record `CTX-002` resolver compatibility test scope.
 
 ## Phase 0 Tasks
 
@@ -144,11 +143,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     initialization, resolver fallback order, and all consumer import paths.
   - Verification: formatting, compile checks, migration guards, diff hygiene,
     Rust risk scan, and full `make pre-commit`.
-- [ ] `CTX-002` Add resolver compatibility tests.
-  - Do: test context-first and global fallback for KMS runtime, bucket
-    metadata, object store, endpoints, tier config, server config, and buffer
-    config.
+- [x] `CTX-002` Add resolver compatibility tests.
+  - Current branch: private resolver precedence helpers cover global-backed
+    optional resolvers (KMS runtime, bucket metadata, endpoints), context-only
+    object store, presence-aware server config, and required-value resolvers
+    (tier config, buffer config) without initializing process-global AppContext
+    state.
   - Acceptance: context wins when present and global fallback works when absent.
+  - Must preserve: resolver public inputs, outputs, and AppContext-first/global
+    fallback order.
+  - Verification: focused resolver contract tests, formatting, compile checks,
+    migration guards, diff hygiene, Rust risk scan, and full `make pre-commit`.
 - [ ] `CTX-003` Add IAM deferred recovery readiness test.
   - Do: verify IAM degraded recovery can still publish `IamReady` and
     `FullReady`.
@@ -460,40 +465,43 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `test-only`: add CTX-002 resolver compatibility tests before migrating more
-   consumers to AppContext-first access.
-2. `test-only`: add CTX-003 IAM deferred recovery readiness coverage before
+1. `test-only`: add CTX-003 IAM deferred recovery readiness coverage before
    boot phase extraction.
+2. Next AppContext consumer migration guard before moving runtime or storage-api
+   call sites.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Pure module split behind the existing `app::context` root; no service container, public API, or runtime behavior added. |
-| Migration preservation | pass | Re-exports preserve `crate::app::context::*`; AppContext construction, default handles, singleton initialization, and resolver fallback order are unchanged. |
-| Testing/verification | pass | Focused compile, formatting, diff hygiene, migration guards, Rust risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | pass | Private helpers are module-local test seams; no service container, public API, consumer migration, or runtime behavior added. |
+| Migration preservation | pass | Public resolver inputs/outputs remain unchanged; object store stays context-only and server config preserves fallback only when AppContext is absent. |
+| Testing/verification | pass | Focused resolver tests, formatting, compile check, diff hygiene, migration guards, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `af291afb930e072d162ff10c63e33c091b706e58`:
+Passed on `0d16a86d9f374f46786d60227b90b35ad96a7c85`:
 - `cargo fmt --all`.
+- `cargo test -p rustfs optional_resolvers_keep_context_first_global_fallback_contract --lib`.
+- `cargo test -p rustfs required_resolvers_keep_context_first_global_fallback_contract --lib`.
 - `cargo fmt --all --check`.
 - `cargo check -p rustfs --lib`.
-- `cargo check -p rustfs --bin rustfs`.
 - `git diff --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - Rust risk scan for changed Rust files; no matches.
-- `make pre-commit`; all checks passed, including nextest 5883 passed and 111
+- `make pre-commit`; all checks passed, including nextest 5885 passed and 111
   skipped.
 
 Notes:
-- This slice moves code between files only; it keeps `crate::app::context::*`
-  imports working through the module root.
-- Resolver bodies still use the same AppContext-first and global fallback order.
+- This slice avoids initializing process-global AppContext state in tests.
+- Public resolver behavior stays on the same AppContext-first and global
+  fallback order.
+- Object store remains context-only when AppContext is absent.
+- Server config keeps the stricter existing fallback boundary: when AppContext
+  exists but has no config, it does not fall back to global config.
 
 ## Handoff Notes
 
-- CTX-002 should add resolver compatibility tests before moving consumers.
 - CTX-003 should protect IAM degraded-readiness publication before boot
   extraction.
