@@ -113,7 +113,7 @@ http-body.workspace = true
 http-body-util.workspace = true
 reqwest = { workspace = true }
 socket2 = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util", "io-uring"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util"] }
 tokio-rustls = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 tokio-stream.workspace = true
@@ -179,6 +179,8 @@ hashbrown = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
+# io-uring is Linux-only. Scope the feature to Linux targets.
+tokio = { workspace = true, features = ["io-uring"] }
 
 [target.'cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))'.dependencies]
 mimalloc = { workspace = true }

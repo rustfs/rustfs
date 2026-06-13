@@ -39,6 +39,10 @@ use std::sync::{LazyLock, RwLock};
 use std::time::Duration;
 use tracing::warn;
 
+const LOG_COMPONENT_SCANNER: &str = "scanner";
+const LOG_SUBSYSTEM_RUNTIME_CONFIG: &str = "runtime_config";
+const EVENT_SCANNER_RUNTIME_CONFIG_PARSE: &str = "scanner_runtime_config_parse";
+
 const ENV_SCANNER_START_DELAY_SECS_DEPRECATED: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
 const NO_DEFAULT_CYCLE_OVERRIDE: u64 = 0;
 const MAX_SCANNER_DELAY_FACTOR: f64 = 10_000.0;
@@ -274,7 +278,17 @@ fn parse_env_delay(key: &'static str, value: String, fallback: f64) -> f64 {
     match parse_config_delay(key, value.clone()) {
         Ok(parsed) => parsed,
         Err(_) => {
-            warn!(env = key, value, fallback, "Invalid scanner delay config, using derived value");
+            warn!(
+                target: "rustfs::scanner::runtime_config",
+                event = EVENT_SCANNER_RUNTIME_CONFIG_PARSE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME_CONFIG,
+                env = key,
+                value,
+                fallback,
+                state = "invalid_delay",
+                "Scanner runtime config used derived delay fallback"
+            );
             fallback
         }
     }
@@ -294,10 +308,15 @@ fn parse_env_bitrot_cycle(value: String) -> Option<Duration> {
         "false" | "off" | "no" | "disabled" => None,
         value => value.parse::<u64>().ok().map(Duration::from_secs).or_else(|| {
             warn!(
+                target: "rustfs::scanner::runtime_config",
+                event = EVENT_SCANNER_RUNTIME_CONFIG_PARSE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME_CONFIG,
                 env = ENV_SCANNER_BITROT_CYCLE_SECS,
                 value,
                 default_secs = DEFAULT_HEAL_BITROT_CYCLE_SECS,
-                "Invalid scanner bitrot cycle, using default"
+                state = "invalid_bitrot_cycle",
+                "Scanner runtime config used default bitrot cycle"
             );
             Some(Duration::from_secs(DEFAULT_HEAL_BITROT_CYCLE_SECS))
         }),

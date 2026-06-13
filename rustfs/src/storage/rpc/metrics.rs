@@ -27,7 +27,7 @@ impl NodeService {
         let t: MetricType = match Deserialize::deserialize(&mut buf_t) {
             Ok(t) => t,
             Err(err) => {
-                error!("Failed to deserialize metric_type: {}", err);
+                error!(error = %err, "failed to deserialize metric_type");
                 return Ok(Response::new(GetMetricsResponse {
                     success: false,
                     realtime_metrics: Bytes::new(),
@@ -41,7 +41,7 @@ impl NodeService {
         let opts: CollectMetricsOpts = match Deserialize::deserialize(&mut buf_o) {
             Ok(opts) => opts,
             Err(err) => {
-                error!("Failed to deserialize opts: {}", err);
+                error!(error = %err, "failed to deserialize opts");
                 return Ok(Response::new(GetMetricsResponse {
                     success: false,
                     realtime_metrics: Bytes::new(),

@@ -28,7 +28,7 @@ use super::constants::limits::{
     READ_CACHE_TOTAL_MEM_MIN, READ_CACHE_WINDOW_DEFAULT, READ_CACHE_WINDOW_MAX, READ_CACHE_WINDOW_MIN, S3_MAX_PART_SIZE,
     S3_MIN_PART_SIZE,
 };
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use russh::keys::PublicKeyBase64;
 use std::net::SocketAddr;
 #[cfg(unix)]
@@ -39,7 +39,6 @@ use thiserror::Error;
 /// Upper bound on file size accepted as a candidate host key (1 MiB).
 /// Guards against accidentally reading huge non-key files in the host
 /// key directory. Real keys are well under 10 KiB.
-#[cfg(unix)]
 const MAX_HOST_KEY_FILE_SIZE: u64 = 1024 * 1024;
 
 /// PEM pre-encapsulation boundary marker prefix per RFC 7468 section 3.
@@ -47,7 +46,6 @@ const MAX_HOST_KEY_FILE_SIZE: u64 = 1024 * 1024;
 /// space, the label, and five more hyphens. Used to distinguish a file
 /// that looks like a private key but failed to decode (passphrase, corrupt)
 /// from a file that is genuinely something else (a .pub key, a README).
-#[cfg(unix)]
 const PEM_BEGIN_MARKER: &str = "-----BEGIN";
 
 /// Errors that can occur during SFTP server initialization.
@@ -64,15 +62,15 @@ pub enum SftpInitError {
     #[error("host key directory does not exist or is not readable: {path}: {source}")]
     HostKeyDirUnreadable { path: PathBuf, source: std::io::Error },
 
-    /// A host-key file in the directory has world-readable or
-    /// group-readable bits set. Mode must be 0o600 or 0o400 so a
+    /// A host-key file in the directory has group or other permission
+    /// bits set. The mode must grant no access beyond the owner so a
     /// local non-root user cannot impersonate the SFTP server.
-    #[error("host key file has insecure permissions {mode:#o}: {path} (must be 0o600 or 0o400)")]
+    #[error("host key file has insecure permissions {mode:#o}: {path} (group and other permission bits must be unset)")]
     InsecureHostKeyPermissions { path: PathBuf, mode: u32 },
 
     /// The host-key directory contained no decodable private keys.
     /// Operators must place at least one ed25519 / ECDSA / RSA-SHA256
-    /// private key with mode 0o600 in the directory before startup.
+    /// private key with owner-only permissions in the directory before startup.
     #[error("no valid host keys found in {path}")]
     NoHostKeysFound { path: PathBuf },
 
@@ -87,12 +85,12 @@ pub enum SftpInitError {
     #[error("SSH server error: {0}")]
     Server(String),
 
-    /// The host running the binary is not a Unix-family target. The
-    /// host-key permission enforcement (mode 0o600 / 0o400 check)
-    /// requires Unix mode bits and has no equivalent on this platform,
-    /// so SFTP refuses to start rather than load host keys with weaker
-    /// guarantees.
-    #[error("SFTP requires a Unix-family host (current OS: {os})")]
+    /// The host running the binary is neither a Unix-family target nor
+    /// Windows. Unix enforces owner-only host-key mode bits and Windows
+    /// trusts operator-managed NTFS ACLs, but neither mechanism exists on
+    /// other targets, so SFTP refuses to start rather than load host keys
+    /// with weaker guarantees.
+    #[error("SFTP requires a Unix-family or Windows host (current OS: {os})")]
     UnsupportedPlatform { os: String },
 }
 
@@ -196,7 +194,7 @@ impl SftpConfig {
     /// None passes through unchanged. Some(n) is returned unchanged
     /// when n is in the inclusive range
     /// HANDLES_PER_SESSION_MIN..=HANDLES_PER_SESSION_MAX. Out-of-range
-    /// inputs return None and emit a warn log naming the requested
+    /// inputs return None and log a warning naming the requested
     /// value and the bounds. The driver applies
     /// DEFAULT_HANDLES_PER_SESSION when the value is None.
     pub fn resolve_handles_per_session(raw: Option<usize>) -> Option<usize> {
@@ -220,7 +218,7 @@ impl SftpConfig {
     /// read. None passes through unchanged. Some(n) is returned
     /// unchanged when n is in the inclusive range
     /// BACKEND_OP_TIMEOUT_MIN_SECS..=BACKEND_OP_TIMEOUT_MAX_SECS.
-    /// Out-of-range inputs return None and emit a warn log naming the
+    /// Out-of-range inputs return None and log a warning naming the
     /// requested value and the bounds. The driver applies
     /// DEFAULT_BACKEND_OP_TIMEOUT_SECS when the value is None.
     pub fn resolve_backend_op_timeout_secs(raw: Option<u64>) -> Option<u64> {
@@ -246,7 +244,7 @@ impl SftpConfig {
     /// populate path so reads do not retain any buffer between
     /// FXP_READs. Some(n) where n is in the inclusive range
     /// READ_CACHE_WINDOW_MIN..=READ_CACHE_WINDOW_MAX is returned
-    /// unchanged. Other values return None and emit a warn log
+    /// unchanged. Other values return None and log a warning
     /// naming the requested value and the bounds. The driver applies
     /// READ_CACHE_WINDOW_DEFAULT when the value is None.
     pub fn resolve_read_cache_window_bytes(raw: Option<u64>) -> Option<u64> {
@@ -270,7 +268,7 @@ impl SftpConfig {
     /// Resolve the read_cache_total_mem_bytes value from a raw env-var
     /// read. None passes through unchanged. Some(n) is returned
     /// unchanged when n is at or above READ_CACHE_TOTAL_MEM_MIN.
-    /// Below-min inputs return None and emit a warn log naming the
+    /// Below-min inputs return None and log a warning naming the
     /// requested value and the bound. The driver applies
     /// READ_CACHE_TOTAL_MEM_DEFAULT when the value is None.
     pub fn resolve_read_cache_total_mem_bytes(raw: Option<u64>) -> Option<u64> {
@@ -310,19 +308,16 @@ impl SftpConfig {
     /// matches the secret handling in the existing S3 and FTPS auth
     /// paths.
     ///
-    /// Returns SftpInitError::UnsupportedPlatform when built for a
-    /// non-Unix target. The mode-bit permission enforcement has no
-    /// portable equivalent off Unix, and starting SFTP without it
-    /// would silently weaken host-key protection.
-    #[cfg(not(unix))]
-    pub async fn load_host_keys(_host_key_dir: &Path) -> Result<Vec<russh::keys::PrivateKey>, SftpInitError> {
-        Err(SftpInitError::UnsupportedPlatform {
-            os: std::env::consts::OS.to_string(),
-        })
-    }
-
-    #[cfg(unix)]
+    /// On Unix the loader enforces owner-only mode bits (group and other
+    /// must have no permission). On Windows it loads without a mode check
+    /// and trusts operator-managed NTFS ACLs, matching the convention the
+    /// other secret-bearing subsystems use. Targets that are neither Unix
+    /// nor Windows return SftpInitError::UnsupportedPlatform.
+    #[cfg(any(unix, windows))]
     pub async fn load_host_keys(host_key_dir: &Path) -> Result<Vec<russh::keys::PrivateKey>, SftpInitError> {
+        #[cfg(windows)]
+        warn_once_windows(host_key_dir);
+
         let mut entries = tokio::fs::read_dir(host_key_dir)
             .await
             .map_err(|e| SftpInitError::HostKeyDirUnreadable {
@@ -365,13 +360,10 @@ impl SftpConfig {
                 continue;
             }
 
-            // Permission check: hard error on insecure permissions.
-            // A world-readable private key lets any local user impersonate
-            // the SFTP server. OpenSSH enforces the same restriction.
-            let mode = metadata.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
-                return Err(SftpInitError::InsecureHostKeyPermissions { path, mode });
-            }
+            // A world-readable private key lets any local user impersonate the
+            // SFTP server, the same restriction OpenSSH enforces. Platform
+            // behaviour is documented on check_host_key_permissions.
+            check_host_key_permissions(&path, &metadata)?;
 
             let data = match tokio::fs::read_to_string(&path).await {
                 Ok(d) => d,
@@ -455,6 +447,55 @@ impl SftpConfig {
 
         Ok(keys)
     }
+
+    /// Targets that are neither Unix nor Windows are unsupported. Returns
+    /// SftpInitError::UnsupportedPlatform without reading the directory.
+    #[cfg(not(any(unix, windows)))]
+    pub async fn load_host_keys(_host_key_dir: &Path) -> Result<Vec<russh::keys::PrivateKey>, SftpInitError> {
+        Err(SftpInitError::UnsupportedPlatform {
+            os: std::env::consts::OS.to_string(),
+        })
+    }
+}
+
+/// Log the Windows operator-facing host-key warning at most once per
+/// process. rustfs trusts operator-managed NTFS ACLs on Windows, the same
+/// convention the other secret-bearing subsystems use.
+#[cfg(windows)]
+fn warn_once_windows(host_key_dir: &Path) {
+    use std::sync::Once;
+    static WARN: Once = Once::new();
+    WARN.call_once(|| {
+        tracing::warn!(
+            target: "rustfs_protocols::sftp::host_key",
+            host_key_dir = %host_key_dir.display(),
+            "SFTP host key file permission enforcement is not active on \
+             Windows. rustfs trusts operator-managed NTFS ACLs on the \
+             host-key directory. Restrict read access to the running rustfs \
+             service account, NT AUTHORITY\\SYSTEM, and \
+             BUILTIN\\Administrators. Default ProgramData inheritance grants \
+             BUILTIN\\Users read access."
+        );
+    });
+}
+
+/// Per-file host-key permission check. Unix enforces owner-only mode bits
+/// (group and other must have no permission). Windows performs no check and
+/// trusts operator-managed NTFS ACLs.
+#[cfg(any(unix, windows))]
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn check_host_key_permissions(path: &Path, metadata: &std::fs::Metadata) -> Result<(), SftpInitError> {
+    #[cfg(unix)]
+    {
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(SftpInitError::InsecureHostKeyPermissions {
+                path: path.to_path_buf(),
+                mode,
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -466,23 +507,23 @@ mod tests {
 
     // PEM boundary markers (RFC 7468 five-hyphen / BEGIN-or-END /
     // label / five-hyphen) are composed at runtime by build_pem_block
-    // so the source file emits no contiguous private-key marker that
+    // so the source file contains no contiguous private-key marker that
     // secret scanners would flag. Throwaway test-vector keys.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const PEM_BOUNDARY_DASHES: &str = "-----";
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const PEM_OPENSSH_LABEL: &str = "OPENSSH PRIVATE KEY";
 
     /// Wrap a base64 body in the OpenSSH-format PEM boundary markers.
     /// The boundary string is composed at runtime from PEM_BOUNDARY_DASHES
     /// and PEM_OPENSSH_LABEL so the source file does not contain the full
     /// marker as a contiguous literal.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn build_pem_block(body: &str) -> String {
         format!("{d}BEGIN {l}{d}\n{body}\n{d}END {l}{d}\n", d = PEM_BOUNDARY_DASHES, l = PEM_OPENSSH_LABEL,)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn test_ed25519_pem() -> String {
         // Throwaway Ed25519 private key, no passphrase.
         build_pem_block(
@@ -609,7 +650,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     async fn load_host_keys_fails_when_dir_missing() {
         let path = PathBuf::from("/this/path/does/not/exist/sftp-host-keys");
         let err = SftpConfig::load_host_keys(&path).await.expect_err("missing dir must error");
@@ -617,7 +658,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     async fn load_host_keys_fails_when_dir_empty() {
         let dir = TempDir::new().expect("tempdir");
         let err = SftpConfig::load_host_keys(dir.path())
@@ -627,13 +668,17 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(unix))]
-    async fn load_host_keys_rejects_non_unix_platform() {
+    #[cfg(windows)]
+    async fn load_host_keys_loads_valid_ed25519_on_windows() {
         let dir = TempDir::new().expect("tempdir");
-        let err = SftpConfig::load_host_keys(dir.path())
+        let key_path = dir.path().join("ssh_host_ed25519_key");
+        // Windows does not enforce mode bits. The host key loads
+        // regardless of the inherited tempdir ACL.
+        std::fs::write(&key_path, test_ed25519_pem()).expect("write key");
+        let keys = SftpConfig::load_host_keys(dir.path())
             .await
-            .expect_err("non-Unix platforms must be rejected");
-        assert!(matches!(err, SftpInitError::UnsupportedPlatform { .. }));
+            .expect("valid ed25519 key must load on Windows");
+        assert_eq!(keys.len(), 1);
     }
 
     #[tokio::test]

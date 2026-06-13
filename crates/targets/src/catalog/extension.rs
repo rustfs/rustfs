@@ -21,11 +21,82 @@ use crate::manifest::{
 };
 use rustfs_extension_schema::{
     EXTENSION_SCHEMA_VERSION, ExtensionCapabilityRef, ExtensionKind, ExtensionRuntimeBoundary, ExtensionRuntimeContract,
-    ExtensionSchema,
+    ExtensionSchema, OPS_DIAGNOSTICS_CAPABILITY, OpsDiagnosticSurface, OpsDiagnosticsContract, S3_POST_AUTH_HOOK_CAPABILITY,
+    S3HookContract, S3HookPoint,
 };
 
+pub const OPS_DIAGNOSTICS_EXTENSION_API_VERSION: &str = "rustfs.ops-diagnostics.v1";
+pub const S3_HOOK_EXTENSION_API_VERSION: &str = "rustfs.s3-hook.v1";
 pub const TARGET_AUDIT_CAPABILITY: &str = "target.audit.v1";
 pub const TARGET_NOTIFY_CAPABILITY: &str = "target.notify.v1";
+
+pub fn builtin_extension_schemas() -> Vec<ExtensionSchema> {
+    let mut schemas = builtin_target_extension_schemas();
+    schemas.push(builtin_s3_hook_extension_schema());
+    schemas.push(builtin_ops_diagnostics_extension_schema());
+    schemas
+}
+
+pub fn builtin_s3_hook_extension_schema() -> ExtensionSchema {
+    ExtensionSchema {
+        schema_version: EXTENSION_SCHEMA_VERSION.to_string(),
+        extension_id: "builtin:s3-post-auth-hooks".to_string(),
+        display_name: "S3 Post-Auth Hook Registry".to_string(),
+        provider: "rustfs".to_string(),
+        version: "1.0.0".to_string(),
+        kind: ExtensionKind::S3Hook,
+        runtime: ExtensionRuntimeContract {
+            api_version: S3_HOOK_EXTENSION_API_VERSION.to_string(),
+            boundary: ExtensionRuntimeBoundary::Builtin,
+        },
+        capabilities: vec![ExtensionCapabilityRef::new(S3_POST_AUTH_HOOK_CAPABILITY)],
+        disabled_by_default: false,
+    }
+}
+
+pub fn builtin_s3_hook_contract() -> S3HookContract {
+    S3HookContract {
+        hook_points: vec![
+            S3HookPoint::PostAuthGetObject,
+            S3HookPoint::PostAuthPutObject,
+            S3HookPoint::PostAuthDeleteObject,
+            S3HookPoint::PostAuthListObjects,
+        ],
+        mutates_object_data: false,
+        bypasses_iam: false,
+    }
+}
+
+pub fn builtin_ops_diagnostics_extension_schema() -> ExtensionSchema {
+    ExtensionSchema {
+        schema_version: EXTENSION_SCHEMA_VERSION.to_string(),
+        extension_id: "builtin:ops-diagnostics".to_string(),
+        display_name: "Ops Diagnostics".to_string(),
+        provider: "rustfs".to_string(),
+        version: "1.0.0".to_string(),
+        kind: ExtensionKind::OpsDiagnostics,
+        runtime: ExtensionRuntimeContract {
+            api_version: OPS_DIAGNOSTICS_EXTENSION_API_VERSION.to_string(),
+            boundary: ExtensionRuntimeBoundary::Builtin,
+        },
+        capabilities: vec![ExtensionCapabilityRef::new(OPS_DIAGNOSTICS_CAPABILITY)],
+        disabled_by_default: false,
+    }
+}
+
+pub fn builtin_ops_diagnostics_contract() -> OpsDiagnosticsContract {
+    OpsDiagnosticsContract {
+        surfaces: vec![
+            OpsDiagnosticSurface::Metrics,
+            OpsDiagnosticSurface::Trace,
+            OpsDiagnosticSurface::Profile,
+            OpsDiagnosticSurface::Health,
+            OpsDiagnosticSurface::Diagnostics,
+        ],
+        mutates_object_data: false,
+        requires_admin_action: true,
+    }
+}
 
 pub fn target_marketplace_extension_schema(manifest: &TargetPluginMarketplaceManifest) -> ExtensionSchema {
     let boundary = target_runtime_boundary(manifest.entrypoint_kind);
@@ -88,7 +159,10 @@ fn target_domain_capability(domain: TargetDomain) -> ExtensionCapabilityRef {
 #[cfg(test)]
 mod tests {
     use super::{
-        TARGET_AUDIT_CAPABILITY, TARGET_NOTIFY_CAPABILITY, builtin_target_extension_schemas, target_marketplace_extension_schema,
+        OPS_DIAGNOSTICS_EXTENSION_API_VERSION, S3_HOOK_EXTENSION_API_VERSION, TARGET_AUDIT_CAPABILITY, TARGET_NOTIFY_CAPABILITY,
+        builtin_extension_schemas, builtin_ops_diagnostics_contract, builtin_ops_diagnostics_extension_schema,
+        builtin_s3_hook_contract, builtin_s3_hook_extension_schema, builtin_target_extension_schemas,
+        target_marketplace_extension_schema,
     };
     use crate::catalog::example_external_webhook_plugin;
     use crate::domain::TargetDomain;
@@ -97,7 +171,9 @@ mod tests {
         builtin_target_marketplace_manifest,
     };
     use rustfs_extension_schema::{
-        EXTENSION_SCHEMA_VERSION, ExtensionKind, ExtensionRuntimeBoundary, validate_extension_schemas,
+        EXTENSION_SCHEMA_VERSION, ExtensionKind, ExtensionRuntimeBoundary, OPS_DIAGNOSTICS_CAPABILITY, OpsDiagnosticSurface,
+        S3_POST_AUTH_HOOK_CAPABILITY, S3HookPoint, validate_extension_schemas, validate_ops_diagnostics_contract,
+        validate_s3_hook_contract,
     };
 
     #[test]
@@ -175,5 +251,67 @@ mod tests {
         );
         assert!(schemas.iter().all(|schema| !schema.disabled_by_default));
         assert!(validate_extension_schemas(&schemas).is_ok());
+    }
+
+    #[test]
+    fn builtin_extension_catalog_includes_hooks_and_ops_diagnostics() {
+        let schemas = builtin_extension_schemas();
+        let mut extension_ids = schemas.iter().map(|schema| schema.extension_id.as_str()).collect::<Vec<_>>();
+        extension_ids.sort_unstable();
+
+        assert_eq!(schemas.len(), 11);
+        assert!(extension_ids.contains(&"builtin:s3-post-auth-hooks"));
+        assert!(extension_ids.contains(&"builtin:ops-diagnostics"));
+        assert!(validate_extension_schemas(&schemas).is_ok());
+    }
+
+    #[test]
+    fn builtin_s3_hook_schema_declares_post_auth_noop_contract() {
+        let schema = builtin_s3_hook_extension_schema();
+        let contract = builtin_s3_hook_contract();
+
+        assert_eq!(schema.kind, ExtensionKind::S3Hook);
+        assert_eq!(schema.runtime.boundary, ExtensionRuntimeBoundary::Builtin);
+        assert_eq!(schema.runtime.api_version, S3_HOOK_EXTENSION_API_VERSION);
+        assert_eq!(schema.capabilities[0].as_str(), S3_POST_AUTH_HOOK_CAPABILITY);
+        assert!(!schema.disabled_by_default);
+        assert_eq!(
+            contract.hook_points,
+            vec![
+                S3HookPoint::PostAuthGetObject,
+                S3HookPoint::PostAuthPutObject,
+                S3HookPoint::PostAuthDeleteObject,
+                S3HookPoint::PostAuthListObjects,
+            ]
+        );
+        assert!(contract.hook_points.iter().all(|hook_point| hook_point.is_post_auth()));
+        assert!(!contract.mutates_object_data);
+        assert!(!contract.bypasses_iam);
+        assert!(validate_s3_hook_contract(&contract).is_ok());
+    }
+
+    #[test]
+    fn builtin_ops_diagnostics_schema_is_admin_read_only() {
+        let schema = builtin_ops_diagnostics_extension_schema();
+        let contract = builtin_ops_diagnostics_contract();
+
+        assert_eq!(schema.kind, ExtensionKind::OpsDiagnostics);
+        assert_eq!(schema.runtime.boundary, ExtensionRuntimeBoundary::Builtin);
+        assert_eq!(schema.runtime.api_version, OPS_DIAGNOSTICS_EXTENSION_API_VERSION);
+        assert_eq!(schema.capabilities[0].as_str(), OPS_DIAGNOSTICS_CAPABILITY);
+        assert!(!schema.disabled_by_default);
+        assert_eq!(
+            contract.surfaces,
+            vec![
+                OpsDiagnosticSurface::Metrics,
+                OpsDiagnosticSurface::Trace,
+                OpsDiagnosticSurface::Profile,
+                OpsDiagnosticSurface::Health,
+                OpsDiagnosticSurface::Diagnostics,
+            ]
+        );
+        assert!(!contract.mutates_object_data);
+        assert!(contract.requires_admin_action);
+        assert!(validate_ops_diagnostics_contract(&contract).is_ok());
     }
 }

@@ -41,7 +41,7 @@ async-compression = { workspace = true, features = [
     "zstd",
     "xz",
 ] }
-tokio = { workspace = true, features = ["io-uring","fs","io-util","macros"] }
+tokio = { workspace = true, features = ["fs","io-util","macros"] }
 tokio-stream = { workspace = true }
 astral-tokio-tar = { workspace = true }
 thiserror = { workspace = true }
@@ -54,3 +54,7 @@ tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+# io-uring is Linux-only. Scope the feature to Linux targets.
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio = { workspace = true, features = ["io-uring"] }

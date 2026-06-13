@@ -90,7 +90,10 @@ const EVENT_SERVER_CONFIG_SANITIZED: &str = "server_config_sanitized";
 const EVENT_SERVER_STARTING: &str = "server_starting";
 const EVENT_SERVER_RUNTIME_FAILED: &str = "server_runtime_failed";
 const EVENT_ACTION_CREDENTIALS_INITIALIZATION_FAILED: &str = "action_credentials_initialization_failed";
+const EVENT_OBSERVABILITY_GUARD_SET: &str = "observability_guard_set";
+const EVENT_CRYPTO_PROVIDER_STATE: &str = "crypto_provider_state";
 const EVENT_ENDPOINT_PARSING_STARTED: &str = "endpoint_parsing_started";
+const EVENT_STARTUP_STORAGE_STAGE: &str = "startup_storage_stage";
 const EVENT_STORAGE_POOL_FORMATTING: &str = "storage_pool_formatting";
 const EVENT_STORAGE_POOL_HOST_RISK: &str = "storage_pool_host_risk";
 const EVENT_PROTOCOL_SYSTEM_STATE: &str = "protocol_system_state";
@@ -188,7 +191,14 @@ async fn async_main() -> Result<()> {
     // Store in global storage
     match set_global_guard(guard).map_err(Error::other) {
         Ok(_) => {
-            debug!(target: "rustfs::main", "Global observability guard set successfully.");
+            debug!(
+                target: "rustfs::main",
+                event = EVENT_OBSERVABILITY_GUARD_SET,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                result = "ok",
+                "Stored global observability guard"
+            );
         }
         Err(e) => {
             error!(
@@ -249,7 +259,15 @@ async fn async_main() -> Result<()> {
     // Make sure to use a modern encryption suite
     if default_provider().install_default().is_err() {
         // A crypto provider is already installed (e.g. by the host process); this is fine.
-        debug!("rustls crypto provider already installed, skipping aws-lc-rs default install");
+        debug!(
+            target: "rustfs::main",
+            event = EVENT_CRYPTO_PROVIDER_STATE,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            provider = "aws_lc_rs",
+            state = "already_installed",
+            "Rustls crypto provider state checked"
+        );
     }
     // Initialize TLS outbound material (root CAs, mTLS identity) if configured.
     // Server-side TLS acceptor is built separately inside start_http_server().
@@ -415,6 +433,11 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     // Initialize the local disk
     debug!(
         target: "rustfs::main::run",
+        event = EVENT_STARTUP_STORAGE_STAGE,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STORAGE,
+        stage = "local_disk_initialization",
+        state = "starting",
         "starting local disk initialization"
     );
     init_local_disks(endpoint_pools.clone())
@@ -505,6 +528,11 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     // 2. Start Storage Engine (ECStore)
     debug!(
         target: "rustfs::main::run",
+        event = EVENT_STARTUP_STORAGE_STAGE,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STORAGE,
+        stage = "ecstore_initialization",
+        state = "starting",
         "starting ECStore initialization"
     );
     let store = ECStore::new(server_addr, endpoint_pools.clone(), ctx.clone())
@@ -524,7 +552,17 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     // // Initialize global configuration system
     let mut retry_count = 0;
     while let Err(e) = ecconfig::init_global_config_sys(store.clone()).await {
-        error!("ecstore config::init_global_config_sys failed {:?}", e);
+        error!(
+            target: "rustfs::main::run",
+            event = EVENT_STARTUP_STORAGE_STAGE,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STORAGE,
+            stage = "global_config_initialization",
+            state = "retrying",
+            retry_count = retry_count + 1,
+            error = ?e,
+            "Startup storage stage failed"
+        );
         // TODO: check error type
         retry_count += 1;
         if retry_count > 15 {
@@ -860,7 +898,17 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     }
 
     if !enable_heal && !enable_scanner {
-        debug!(target: "rustfs::main::run","Both scanner and heal are disabled, skipping AHM service initialization");
+        debug!(
+            target: "rustfs::main::run",
+            event = EVENT_BACKGROUND_SERVICES_CONFIGURED,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            enable_scanner = false,
+            enable_heal = false,
+            ahm_state = "skipped",
+            reason = "disabled",
+            "Background services configured"
+        );
     }
 
     // print server info
@@ -916,7 +964,15 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     )
     .await;
 
-    info!(target: "rustfs::main::run","server is stopped state: {:?}", state_manager.current_state());
+    info!(
+        target: "rustfs::main::run",
+        event = EVENT_SERVER_SHUTDOWN_STATE,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        state = ?state_manager.current_state(),
+        result = "stopped",
+        "Server shutdown state changed"
+    );
     Ok(())
 }
 
@@ -955,6 +1011,23 @@ struct ProtocolShutdownSenders {
     sftp: Option<ShutdownHandle>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundShutdownStep {
+    DataScanner,
+    Ahm,
+}
+
+fn background_shutdown_steps(enable_scanner: bool, enable_heal: bool) -> Vec<BackgroundShutdownStep> {
+    let mut steps = Vec::with_capacity(2);
+    if enable_scanner {
+        steps.push(BackgroundShutdownStep::DataScanner);
+    }
+    if enable_heal || enable_scanner {
+        steps.push(BackgroundShutdownStep::Ahm);
+    }
+    steps
+}
+
 /// Handles the shutdown process of the server
 async fn handle_shutdown(
     state_manager: &ServiceStateManager,
@@ -988,33 +1061,37 @@ async fn handle_shutdown(
     let enable_heal = get_env_bool_with_aliases(ENV_HEAL_ENABLED, &[ENV_HEAL_ENABLED_DEPRECATED], true);
 
     // Stop background services based on what was enabled.
-    if enable_scanner {
-        info!(
-            target: "rustfs::main::handle_shutdown",
-            event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            service = "data_scanner",
-            state = "stopping",
-            "Background service shutdown started"
-        );
-        shutdown_background_services();
+    let background_steps = background_shutdown_steps(enable_scanner, enable_heal);
+    for step in &background_steps {
+        match step {
+            BackgroundShutdownStep::DataScanner => {
+                info!(
+                    target: "rustfs::main::handle_shutdown",
+                    event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+                    component = LOG_COMPONENT_MAIN,
+                    subsystem = LOG_SUBSYSTEM_STARTUP,
+                    service = "data_scanner",
+                    state = "stopping",
+                    "Background service shutdown started"
+                );
+                shutdown_background_services();
+            }
+            BackgroundShutdownStep::Ahm => {
+                info!(
+                    target: "rustfs::main::handle_shutdown",
+                    event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+                    component = LOG_COMPONENT_MAIN,
+                    subsystem = LOG_SUBSYSTEM_STARTUP,
+                    service = "ahm",
+                    state = "stopping",
+                    "Background service shutdown started"
+                );
+                shutdown_ahm_services();
+            }
+        }
     }
 
-    if enable_heal || enable_scanner {
-        info!(
-            target: "rustfs::main::handle_shutdown",
-            event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            service = "ahm",
-            state = "stopping",
-            "Background service shutdown started"
-        );
-        shutdown_ahm_services();
-    }
-
-    if !enable_scanner && !enable_heal {
+    if background_steps.is_empty() {
         info!(
             target: "rustfs::main::handle_shutdown",
             event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
@@ -1211,5 +1288,19 @@ mod tests {
         assert!(DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_config::ENV_RUSTFS_SECRET_KEY));
         assert!(!DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_credentials::DEFAULT_ACCESS_KEY));
         assert!(!DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_credentials::DEFAULT_SECRET_KEY));
+    }
+
+    #[test]
+    fn background_shutdown_plan_keeps_scanner_before_ahm() {
+        assert_eq!(
+            background_shutdown_steps(true, true),
+            vec![BackgroundShutdownStep::DataScanner, BackgroundShutdownStep::Ahm]
+        );
+        assert_eq!(
+            background_shutdown_steps(true, false),
+            vec![BackgroundShutdownStep::DataScanner, BackgroundShutdownStep::Ahm]
+        );
+        assert_eq!(background_shutdown_steps(false, true), vec![BackgroundShutdownStep::Ahm]);
+        assert!(background_shutdown_steps(false, false).is_empty());
     }
 }

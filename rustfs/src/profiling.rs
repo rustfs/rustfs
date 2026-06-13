@@ -79,6 +79,9 @@ mod linux_impl {
     use tokio_util::sync::CancellationToken;
     use tracing::{debug, info, warn};
 
+    const LOG_COMPONENT_PROFILING: &str = "profiling";
+    const LOG_SUBSYSTEM_PROFILING: &str = "profiling";
+
     static CPU_CONT_GUARD: OnceLock<Arc<Mutex<Option<pprof::ProfilerGuard<'static>>>>> = OnceLock::new();
     static PROFILING_CANCEL_TOKEN: OnceLock<CancellationToken> = OnceLock::new();
 
@@ -95,7 +98,15 @@ mod linux_impl {
         let dir = get_env_str(ENV_OUTPUT_DIR, DEFAULT_OUTPUT_DIR);
         let p = PathBuf::from(dir);
         if let Err(e) = create_dir_all(&p) {
-            warn!("profiling: create output dir {} failed: {}, fallback to current dir", p.display(), e);
+            warn!(
+                component = LOG_COMPONENT_PROFILING,
+                subsystem = LOG_SUBSYSTEM_PROFILING,
+                event = "profiling_output_dir_fallback",
+                path = %p.display(),
+                error = %e,
+                fallback = ".",
+                "Profiling output directory fallback applied"
+            );
             return PathBuf::from(".");
         }
         p
@@ -130,7 +141,14 @@ mod linux_impl {
         let report = guard.report().build().map_err(|e| format!("build report failed: {e}"))?;
         let out = output_dir().join(format!("cpu_profile_{}.pb", ts()));
         write_pprof_report_pb(&report, &out)?;
-        info!("CPU profile exported: {}", out.display());
+        info!(
+            component = LOG_COMPONENT_PROFILING,
+            subsystem = LOG_SUBSYSTEM_PROFILING,
+            event = "profiling_dump_exported",
+            profile_type = "cpu",
+            path = %out.display(),
+            "Profiling dump exported"
+        );
         Ok(out)
     }
 
@@ -139,7 +157,14 @@ mod linux_impl {
         if let Some(cell) = CPU_CONT_GUARD.get() {
             let guard_slot = cell.lock().await;
             if let Some(ref guard) = *guard_slot {
-                debug!("profiling: using continuous profiler guard for CPU dump");
+                debug!(
+                    component = LOG_COMPONENT_PROFILING,
+                    subsystem = LOG_SUBSYSTEM_PROFILING,
+                    event = "profiling_dump_source",
+                    profile_type = "cpu",
+                    source = "continuous_guard",
+                    "Using continuous CPU profiling guard for dump"
+                );
                 return dump_cpu_with_guard(guard).await;
             }
         }
@@ -168,7 +193,14 @@ mod linux_impl {
 
         let bytes = prof_ctl.dump_pprof().map_err(|e| format!("dump pprof failed: {e}"))?;
         f.write_all(&bytes).map_err(|e| format!("write file failed: {e}"))?;
-        info!("Memory profile exported: {}", out.display());
+        info!(
+            component = LOG_COMPONENT_PROFILING,
+            subsystem = LOG_SUBSYSTEM_PROFILING,
+            event = "profiling_dump_exported",
+            profile_type = "memory",
+            path = %out.display(),
+            "Profiling dump exported"
+        );
         Ok(out)
     }
 
@@ -229,7 +261,14 @@ mod linux_impl {
         let cell = CPU_CONT_GUARD.get_or_init(|| Arc::new(Mutex::new(None))).clone();
         let mut slot = cell.lock().await;
         if slot.is_some() {
-            warn!("profiling: continuous CPU guard already running");
+            warn!(
+                component = LOG_COMPONENT_PROFILING,
+                subsystem = LOG_SUBSYSTEM_PROFILING,
+                event = "profiling_state",
+                profile_type = "cpu_continuous",
+                state = "already_running",
+                "Profiling state changed"
+            );
             return;
         }
         match pprof::ProfilerGuardBuilder::default()
@@ -239,20 +278,53 @@ mod linux_impl {
         {
             Ok(guard) => {
                 *slot = Some(guard);
-                info!(freq = freq_hz, "start continuous CPU profiling");
+                info!(
+                    component = LOG_COMPONENT_PROFILING,
+                    subsystem = LOG_SUBSYSTEM_PROFILING,
+                    event = "profiling_state",
+                    profile_type = "cpu_continuous",
+                    state = "started",
+                    freq_hz,
+                    "Profiling state changed"
+                );
             }
-            Err(e) => warn!("start continuous CPU profiling failed: {e}"),
+            Err(e) => warn!(
+                component = LOG_COMPONENT_PROFILING,
+                subsystem = LOG_SUBSYSTEM_PROFILING,
+                event = "profiling_state",
+                profile_type = "cpu_continuous",
+                state = "start_failed",
+                error = %e,
+                "Profiling state changed"
+            ),
         }
     }
 
     // Internal: start periodic CPU sampling loop
     async fn start_cpu_periodic(freq_hz: i32, interval: Duration, duration: Duration, token: CancellationToken) {
-        info!(freq = freq_hz, ?interval, ?duration, "start periodic CPU profiling");
+        info!(
+            component = LOG_COMPONENT_PROFILING,
+            subsystem = LOG_SUBSYSTEM_PROFILING,
+            event = "profiling_state",
+            profile_type = "cpu_periodic",
+            state = "started",
+            freq_hz,
+            ?interval,
+            ?duration,
+            "Profiling state changed"
+        );
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = token.cancelled() => {
-                        info!("periodic CPU profiling task cancelled");
+                        info!(
+                            component = LOG_COMPONENT_PROFILING,
+                            subsystem = LOG_SUBSYSTEM_PROFILING,
+                            event = "profiling_state",
+                            profile_type = "cpu_periodic",
+                            state = "cancelled",
+                            "Profiling state changed"
+                        );
                         break;
                     }
                     _ = sleep(interval) => {}
@@ -272,7 +344,14 @@ mod linux_impl {
 
                 tokio::select! {
                     _ = token.cancelled() => {
-                        info!("periodic CPU profiling task cancelled during capture");
+                        info!(
+                            component = LOG_COMPONENT_PROFILING,
+                            subsystem = LOG_SUBSYSTEM_PROFILING,
+                            event = "profiling_state",
+                            profile_type = "cpu_periodic",
+                            state = "cancelled_during_capture",
+                            "Profiling state changed"
+                        );
                         break;
                     }
                     _ = sleep(duration) => {}
@@ -284,7 +363,14 @@ mod linux_impl {
                         if let Err(e) = write_pprof_report_pb(&report, &out) {
                             warn!("write periodic CPU pprof failed: {e}");
                         } else {
-                            info!("periodic CPU profile exported: {}", out.display());
+                            info!(
+                                component = LOG_COMPONENT_PROFILING,
+                                subsystem = LOG_SUBSYSTEM_PROFILING,
+                                event = "profiling_dump_exported",
+                                profile_type = "cpu_periodic",
+                                path = %out.display(),
+                                "Profiling dump exported"
+                            );
                         }
                     }
                     Err(e) => warn!("periodic CPU report build failed: {e}"),
@@ -296,12 +382,27 @@ mod linux_impl {
     // Internal: start periodic memory dump when jemalloc profiling is active
     #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
     async fn start_memory_periodic(interval: Duration, token: CancellationToken) {
-        info!(?interval, "start periodic memory pprof dump");
+        info!(
+            component = LOG_COMPONENT_PROFILING,
+            subsystem = LOG_SUBSYSTEM_PROFILING,
+            event = "profiling_state",
+            profile_type = "memory_periodic",
+            state = "started",
+            ?interval,
+            "Profiling state changed"
+        );
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = token.cancelled() => {
-                        info!("periodic memory profiling task cancelled");
+                        info!(
+                            component = LOG_COMPONENT_PROFILING,
+                            subsystem = LOG_SUBSYSTEM_PROFILING,
+                            event = "profiling_state",
+                            profile_type = "memory_periodic",
+                            state = "cancelled",
+                            "Profiling state changed"
+                        );
                         break;
                     }
                     _ = sleep(interval) => {}
@@ -328,7 +429,14 @@ mod linux_impl {
                             if let Err(e) = f.write_all(&bytes) {
                                 tracing::error!("periodic mem dump write failed: {}", e);
                             } else {
-                                info!("periodic memory profile dumped to {}", out.display());
+                                info!(
+                                    component = LOG_COMPONENT_PROFILING,
+                                    subsystem = LOG_SUBSYSTEM_PROFILING,
+                                    event = "profiling_dump_exported",
+                                    profile_type = "memory_periodic",
+                                    path = %out.display(),
+                                    "Profiling dump exported"
+                                );
                             }
                         }
                         Err(e) => tracing::error!("periodic mem dump failed: {}", e),

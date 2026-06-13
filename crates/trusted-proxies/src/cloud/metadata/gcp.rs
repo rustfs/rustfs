@@ -46,7 +46,15 @@ impl GcpMetadataFetcher {
     async fn get_metadata(&self, path: &str) -> Result<String, AppError> {
         let url = format!("{}/computeMetadata/v1/{}", self.metadata_endpoint, path);
 
-        debug!("Fetching GCP metadata from: {}", url);
+        debug!(
+            event = "trusted_proxies.cloud_metadata",
+            component = "trusted_proxies",
+            subsystem = "gcp_metadata",
+            provider = "gcp",
+            operation = "metadata_request",
+            path = %path,
+            "trusted proxy cloud metadata request started"
+        );
 
         match self.client.get(&url).header("Metadata-Flavor", "Google").send().await {
             Ok(response) => {
@@ -57,12 +65,32 @@ impl GcpMetadataFetcher {
                         .map_err(|e| AppError::cloud(format!("Failed to read GCP metadata response: {}", e)))?;
                     Ok(text)
                 } else {
-                    debug!("GCP metadata request failed with status: {}", response.status());
+                    debug!(
+                        event = "trusted_proxies.cloud_metadata",
+                        component = "trusted_proxies",
+                        subsystem = "gcp_metadata",
+                        provider = "gcp",
+                        operation = "metadata_request",
+                        path = %path,
+                        result = "http_error",
+                        status = %response.status(),
+                        "trusted proxy cloud metadata request failed"
+                    );
                     Err(AppError::cloud(format!("GCP metadata API returned status: {}", response.status())))
                 }
             }
             Err(e) => {
-                debug!("GCP metadata request failed: {}", e);
+                debug!(
+                    event = "trusted_proxies.cloud_metadata",
+                    component = "trusted_proxies",
+                    subsystem = "gcp_metadata",
+                    provider = "gcp",
+                    operation = "metadata_request",
+                    path = %path,
+                    result = "request_failed",
+                    error = %e,
+                    "trusted proxy cloud metadata request failed"
+                );
                 Err(AppError::cloud(format!("GCP metadata request failed: {}", e)))
             }
         }
@@ -123,7 +151,17 @@ impl CloudMetadataFetcher for GcpMetadataFetcher {
                     .collect();
 
                 if interface_indices.is_empty() {
-                    warn!("No network interfaces found in GCP metadata");
+                    warn!(
+                        event = "trusted_proxies.cloud_metadata",
+                        component = "trusted_proxies",
+                        subsystem = "gcp_metadata",
+                        provider = "gcp",
+                        operation = "network_cidrs",
+                        source = "metadata",
+                        result = "fallback",
+                        reason = "no_interfaces",
+                        "trusted proxy cloud metadata fallback applied"
+                    );
                     return Self::default_gcp_network_ranges();
                 }
 
@@ -149,21 +187,61 @@ impl CloudMetadataFetcher for GcpMetadataFetcher {
                             }
                         }
                         Err(e) => {
-                            debug!("Failed to get IP/mask for GCP interface {}: {}", index, e);
+                            debug!(
+                                event = "trusted_proxies.cloud_metadata",
+                                component = "trusted_proxies",
+                                subsystem = "gcp_metadata",
+                                provider = "gcp",
+                                operation = "network_interface",
+                                interface_index = index,
+                                result = "request_failed",
+                                error = %e,
+                                "trusted proxy cloud metadata request failed"
+                            );
                         }
                     }
                 }
 
                 if cidrs.is_empty() {
-                    warn!("Could not determine network CIDRs from GCP metadata, falling back to defaults");
+                    warn!(
+                        event = "trusted_proxies.cloud_metadata",
+                        component = "trusted_proxies",
+                        subsystem = "gcp_metadata",
+                        provider = "gcp",
+                        operation = "network_cidrs",
+                        source = "metadata",
+                        result = "fallback",
+                        reason = "empty_metadata",
+                        "trusted proxy cloud metadata fallback applied"
+                    );
                     Self::default_gcp_network_ranges()
                 } else {
-                    info!("Successfully fetched {} network CIDRs from GCP metadata", cidrs.len());
+                    info!(
+                        event = "trusted_proxies.cloud_metadata",
+                        component = "trusted_proxies",
+                        subsystem = "gcp_metadata",
+                        provider = "gcp",
+                        operation = "network_cidrs",
+                        source = "metadata",
+                        result = "loaded",
+                        range_count = cidrs.len(),
+                        "trusted proxy cloud metadata loaded"
+                    );
                     Ok(cidrs)
                 }
             }
             Err(e) => {
-                warn!("Failed to fetch GCP network metadata: {}", e);
+                warn!(
+                    event = "trusted_proxies.cloud_metadata",
+                    component = "trusted_proxies",
+                    subsystem = "gcp_metadata",
+                    provider = "gcp",
+                    operation = "network_cidrs",
+                    source = "metadata",
+                    result = "fallback",
+                    error = %e,
+                    "trusted proxy cloud metadata fallback applied"
+                );
                 Self::default_gcp_network_ranges()
             }
         }
@@ -189,7 +267,15 @@ impl GcpMetadataFetcher {
             ipv4_prefix: Option<String>,
         }
 
-        debug!("Fetching GCP IP ranges from: {}", url);
+        debug!(
+            event = "trusted_proxies.cloud_metadata",
+            component = "trusted_proxies",
+            subsystem = "gcp_metadata",
+            provider = "gcp",
+            operation = "public_ip_ranges",
+            source = %url,
+            "trusted proxy cloud metadata request started"
+        );
 
         match self.client.get(url).timeout(Duration::from_secs(10)).send().await {
             Ok(response) => {
@@ -209,15 +295,45 @@ impl GcpMetadataFetcher {
                         }
                     }
 
-                    info!("Successfully fetched {} GCP public IP ranges", networks.len());
+                    info!(
+                        event = "trusted_proxies.cloud_metadata",
+                        component = "trusted_proxies",
+                        subsystem = "gcp_metadata",
+                        provider = "gcp",
+                        operation = "public_ip_ranges",
+                        source = "api",
+                        result = "loaded",
+                        range_count = networks.len(),
+                        "trusted proxy cloud metadata loaded"
+                    );
                     Ok(networks)
                 } else {
-                    debug!("Failed to fetch GCP IP ranges: HTTP {}", response.status());
+                    debug!(
+                        event = "trusted_proxies.cloud_metadata",
+                        component = "trusted_proxies",
+                        subsystem = "gcp_metadata",
+                        provider = "gcp",
+                        operation = "public_ip_ranges",
+                        source = %url,
+                        result = "http_error",
+                        status = %response.status(),
+                        "trusted proxy cloud metadata request failed"
+                    );
                     Self::default_gcp_ip_ranges()
                 }
             }
             Err(e) => {
-                debug!("Failed to fetch GCP IP ranges: {}", e);
+                debug!(
+                    event = "trusted_proxies.cloud_metadata",
+                    component = "trusted_proxies",
+                    subsystem = "gcp_metadata",
+                    provider = "gcp",
+                    operation = "public_ip_ranges",
+                    source = %url,
+                    result = "request_failed",
+                    error = %e,
+                    "trusted proxy cloud metadata request failed"
+                );
                 Self::default_gcp_ip_ranges()
             }
         }
@@ -280,7 +396,17 @@ impl GcpMetadataFetcher {
 
         match networks {
             Ok(networks) => {
-                debug!("Using default GCP public IP ranges");
+                debug!(
+                    event = "trusted_proxies.cloud_metadata",
+                    component = "trusted_proxies",
+                    subsystem = "gcp_metadata",
+                    provider = "gcp",
+                    operation = "public_ip_ranges",
+                    result = "fallback",
+                    source = "default_ranges",
+                    range_count = networks.len(),
+                    "trusted proxy cloud metadata fallback applied"
+                );
                 Ok(networks)
             }
             Err(e) => Err(AppError::cloud(format!("Failed to parse default GCP ranges: {}", e))),
@@ -300,7 +426,17 @@ impl GcpMetadataFetcher {
 
         match networks {
             Ok(networks) => {
-                debug!("Using default GCP VPC network ranges");
+                debug!(
+                    event = "trusted_proxies.cloud_metadata",
+                    component = "trusted_proxies",
+                    subsystem = "gcp_metadata",
+                    provider = "gcp",
+                    operation = "network_cidrs",
+                    result = "fallback",
+                    source = "default_ranges",
+                    range_count = networks.len(),
+                    "trusted proxy cloud metadata fallback applied"
+                );
                 Ok(networks)
             }
             Err(e) => Err(AppError::cloud(format!("Failed to parse default GCP network ranges: {}", e))),

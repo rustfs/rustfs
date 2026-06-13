@@ -16,8 +16,9 @@
 //!
 //! Holds the per-session activity stamp and the weak-ref registry the
 //! accept loop walks. Both are load-bearing infrastructure for the
-//! per-session wedge watchdog (wedge_watchdog.rs): the watchdog uses
-//! the activity stamp to decide whether a session is silent, and the
+//! per-session liveness watchdog (wedge_watchdog.rs on Linux,
+//! fallback_watchdog.rs elsewhere): the watchdog uses the activity
+//! stamp to decide whether a session is silent, and the
 //! TCP-state probe to disambiguate slow operations from CLOSE_WAIT.
 //!
 //! Activity stamps are written from every SFTP handler entry/exit and
@@ -26,10 +27,11 @@
 //!
 //! The TCP-state probe parses /proc/net/tcp and /proc/net/tcp6, looks
 //! up the row matching the (local, peer) tuple, and returns the kernel
-//! TCP state. Only Linux exposes the procfs files. On other targets
-//! the probe returns None and the watchdog falls back to its absolute
-//! silence threshold. Live ports are hex'd in the kernel's
-//! per-architecture byte order (little-endian within each 4-byte chunk).
+//! TCP state. Only Linux exposes the procfs files. On non-Linux
+//! targets the probe is not called. The session watchdog
+//! (fallback_watchdog) decides from the SFTP-handler activity stamp
+//! alone. Live ports are hex'd in the kernel's per-architecture byte
+//! order (little-endian within each 4-byte chunk).
 
 use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
@@ -45,29 +47,36 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 /// Length of an IPv6 address in bytes.
 const IPV6_BYTES: usize = 16;
 /// Length of an IPv4 address in bytes.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const IPV4_BYTES: usize = 4;
 /// Hex characters used to render one byte in the procfs format
 /// (matches the {:02X} format spec at the call sites).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const HEX_CHARS_PER_BYTE: usize = 2;
 /// Hex characters used to render the 16-bit port in the procfs format
 /// (matches the {:04X} format spec at the call sites).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const PORT_HEX_CHARS: usize = 4;
 /// Number of bytes per chunk in the IPv6 procfs format. Bytes inside
-/// each chunk are emitted in reverse (little-endian within the chunk).
+/// each chunk are ordered in reverse (little-endian within the chunk).
 const TCP6_CHUNK_BYTES: usize = 4;
 /// Number of 4-byte chunks the IPv6 procfs format renders. The
 /// const_assert below pins this against IPV6_BYTES so any future drift
-/// surfaces at compile time.
+/// appears at compile time.
 const TCP6_CHUNK_COUNT: usize = IPV6_BYTES / TCP6_CHUNK_BYTES;
 const _: () = assert!(TCP6_CHUNK_COUNT * TCP6_CHUNK_BYTES == IPV6_BYTES);
 /// First line of /proc/net/tcp[6] is the column header. Data rows
 /// follow.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const PROC_NET_TCP_HEADER_LINES: usize = 1;
 /// Linux TCP_ESTABLISHED state value (include/uapi/linux/tcp.h).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const TCP_STATE_ESTABLISHED: u8 = 0x01;
 /// Linux TCP_CLOSE_WAIT state value (include/uapi/linux/tcp.h).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const TCP_STATE_CLOSE_WAIT: u8 = 0x08;
 /// Procfs renders the TCP state as a hexadecimal byte.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const TCP_STATE_RADIX: u32 = 16;
 
 /// Per-session activity record. Constructed once per accepted SSH
@@ -118,6 +127,7 @@ pub(super) fn new_session_registry() -> SessionRegistry {
 /// Kernel TCP state for one connection, as reported by /proc/net/tcp[6].
 /// Values follow the Linux TCP state numbering used in the procfs files.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) enum TcpState {
     /// 0x01. Connection is open and exchanging data.
     Established,
@@ -141,6 +151,7 @@ pub(super) enum TcpState {
 ///   connection has been finalised by the kernel and removed from the
 ///   table, or one or both addresses do not have a renderable form
 ///   for the relevant procfs file.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) fn probe_tcp_state(local: SocketAddr, peer: SocketAddr) -> Option<TcpState> {
     if let Ok(content) = std::fs::read_to_string("/proc/net/tcp")
         && let Some(state) = lookup_tcp_state(&content, local, peer, false)
@@ -159,6 +170,7 @@ pub(super) fn probe_tcp_state(local: SocketAddr, peer: SocketAddr) -> Option<Tcp
 /// ipv6_file flag selects the address-rendering convention. tcp6
 /// uses 32-character hex strings and tcp uses 8-character, both with
 /// little-endian byte order within each 4-byte chunk.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn lookup_tcp_state(content: &str, local: SocketAddr, peer: SocketAddr, ipv6_file: bool) -> Option<TcpState> {
     let local_hex = render_proc_net_tcp_addr(local, ipv6_file)?;
     let peer_hex = render_proc_net_tcp_addr(peer, ipv6_file)?;
@@ -198,6 +210,7 @@ fn lookup_tcp_state(content: &str, local: SocketAddr, peer: SocketAddr, ipv6_fil
 /// IPv4 SocketAddrs presented to tcp6 are mapped via ::ffff:a.b.c.d
 /// before rendering. IPv4-mapped IPv6 SocketAddrs presented to tcp
 /// are unwrapped before rendering. Mismatches return None.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn render_proc_net_tcp_addr(addr: SocketAddr, ipv6_file: bool) -> Option<String> {
     // Rendered length: address bytes encoded as 2 hex chars each + ':'
     // separator + 4 hex port digits. Same shape for tcp and tcp6;
@@ -283,7 +296,7 @@ mod tests {
     fn render_distinct_ipv6_bytes_for_tcp6_file() {
         // Bytes 00..0F, one distinct value per octet, exercise every
         // index in the chunk-and-reverse loop. Each 4-byte chunk is
-        // emitted little-endian-within-chunk, so chunk 0 (bytes
+        // ordered little-endian-within-chunk, so chunk 0 (bytes
         // 00 01 02 03) renders as "03020100" and so on through chunk 3.
         let addr = SocketAddr::V6(SocketAddrV6::new(
             Ipv6Addr::from([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF]),

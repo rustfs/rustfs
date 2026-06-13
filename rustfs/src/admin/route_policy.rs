@@ -41,6 +41,7 @@ const GET_REPLICATION_METRICS: AdminActionRef = AdminActionRef::new("GetReplicat
 const GET_TABLE: AdminActionRef = AdminActionRef::new("GetTableAction");
 const GET_TABLE_BUCKET: AdminActionRef = AdminActionRef::new("GetTableBucketAction");
 const GET_TABLE_CATALOG: AdminActionRef = AdminActionRef::new("GetTableCatalogAction");
+const GET_TABLE_CREDENTIALS: AdminActionRef = AdminActionRef::new("GetTableCredentialsAction");
 const GET_TABLE_LIFECYCLE: AdminActionRef = AdminActionRef::new("GetTableLifecycleAction");
 const GET_TABLE_METADATA: AdminActionRef = AdminActionRef::new("GetTableMetadataAction");
 const GET_TABLE_METADATA_LOCATION: AdminActionRef = AdminActionRef::new("GetTableMetadataLocationAction");
@@ -336,6 +337,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Put, "/rustfs/admin/v3/module-switches", CONFIG_UPDATE, RouteRiskLevel::High),
     admin(
         HttpMethod::Get,
+        "/rustfs/admin/v4/extensions/catalog",
+        SERVER_INFO,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v4/extensions/instances",
+        GET_BUCKET_TARGET,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
         "/rustfs/admin/v4/plugins/catalog",
         SERVER_INFO,
         RouteRiskLevel::Sensitive,
@@ -423,6 +436,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         "/rustfs/admin/v3/site-replication/netperf",
         SITE_REPLICATION_INFO,
         RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/site-replication/rotate-svc-acct",
+        SITE_REPLICATION_OPERATION,
+        RouteRiskLevel::Sensitive,
     ),
     admin(
         HttpMethod::Put,
@@ -622,6 +641,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::Sensitive,
     ),
     admin(
+        HttpMethod::Head,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}",
+        GET_TABLE_NAMESPACE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
         HttpMethod::Delete,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}",
         DELETE_TABLE_NAMESPACE,
@@ -649,6 +674,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HttpMethod::Get,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
         GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Head,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
+        GET_TABLE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/credentials",
+        GET_TABLE_CREDENTIALS,
         RouteRiskLevel::Sensitive,
     ),
     admin(
@@ -755,6 +792,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::Sensitive,
     ),
     admin(
+        HttpMethod::Head,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}",
+        GET_TABLE_NAMESPACE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
         HttpMethod::Delete,
         "/_iceberg/v1/{warehouse}/namespaces/{namespace}",
         DELETE_TABLE_NAMESPACE,
@@ -782,6 +825,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HttpMethod::Get,
         "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
         GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Head,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
+        GET_TABLE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/credentials",
+        GET_TABLE_CREDENTIALS,
         RouteRiskLevel::Sensitive,
     ),
     admin(
@@ -1039,11 +1094,13 @@ mod tests {
         let table_specs = ADMIN_ROUTE_POLICY_SPECS
             .iter()
             .filter(|spec| spec.path().starts_with("/iceberg/v1") || spec.path().starts_with("/_iceberg/v1"));
-        assert_eq!(table_specs.count(), 46);
+        assert_eq!(table_specs.count(), 52);
         assert_action(HttpMethod::Put, "/iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET);
         assert_action(HttpMethod::Get, "/_iceberg/v1/buckets/{warehouse}", GET_TABLE_BUCKET);
         assert_action(HttpMethod::Get, "/iceberg/v1/{warehouse}/namespaces", GET_TABLE_NAMESPACE);
         assert_action(HttpMethod::Get, "/_iceberg/v1/{warehouse}/namespaces", GET_TABLE_NAMESPACE);
+        assert_action(HttpMethod::Head, "/iceberg/v1/{warehouse}/namespaces/{namespace}", GET_TABLE_NAMESPACE);
+        assert_action(HttpMethod::Head, "/_iceberg/v1/{warehouse}/namespaces/{namespace}", GET_TABLE_NAMESPACE);
         assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables", CREATE_TABLE);
         assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables", CREATE_TABLE);
         assert_action(
@@ -1053,8 +1110,33 @@ mod tests {
         );
         assert_action(
             HttpMethod::Get,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/credentials",
+            GET_TABLE_CREDENTIALS,
+        );
+        assert_action(
+            HttpMethod::Get,
             "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
             GET_TABLE_METADATA,
+        );
+        assert_action(
+            HttpMethod::Head,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
+            GET_TABLE,
+        );
+        assert_action(
+            HttpMethod::Head,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
+            GET_TABLE,
+        );
+        assert_action(
+            HttpMethod::Get,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/credentials",
+            GET_TABLE_CREDENTIALS,
+        );
+        assert_action(
+            HttpMethod::Get,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/credentials",
+            GET_TABLE_CREDENTIALS,
         );
         assert_action(
             HttpMethod::Post,
