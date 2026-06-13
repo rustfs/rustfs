@@ -102,7 +102,15 @@ impl DeadlockManager {
         *running = true;
         drop(running);
 
-        tracing::info!("Deadlock detection started");
+        tracing::info!(
+            event = "deadlock_monitor.lifecycle",
+            component = "concurrency",
+            subsystem = "deadlock",
+            state = "started",
+            check_interval_ms = self.config.check_interval.as_millis(),
+            hang_threshold_ms = self.config.hang_threshold.as_millis(),
+            "deadlock monitor state changed"
+        );
     }
 
     /// Stop the deadlock detection
@@ -110,7 +118,15 @@ impl DeadlockManager {
         let mut running = self.running.lock().await;
         *running = false;
 
-        tracing::info!("Deadlock detection stopped");
+        tracing::info!(
+            event = "deadlock_monitor.lifecycle",
+            component = "concurrency",
+            subsystem = "deadlock",
+            state = "stopped",
+            check_interval_ms = self.config.check_interval.as_millis(),
+            hang_threshold_ms = self.config.hang_threshold.as_millis(),
+            "deadlock monitor state changed"
+        );
     }
 
     /// Create a request tracker
