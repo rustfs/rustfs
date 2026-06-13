@@ -333,6 +333,11 @@ pub fn register_site_replication_route(r: &mut S3Router<AdminOperation>) -> std:
             AdminOperation(&SiteReplicationResyncOpHandler {}),
         ),
         (Method::PUT, "/v3/site-replication/state/edit", AdminOperation(&SRStateEditHandler {})),
+        (
+            Method::POST,
+            "/v3/site-replication/rotate-svc-acct",
+            AdminOperation(&SRRotateServiceAccountHandler {}),
+        ),
     ] {
         r.insert(method, format!("{ADMIN_PREFIX}{path}").as_str(), operation)?;
     }
@@ -3597,6 +3602,73 @@ impl Operation for SRStateEditHandler {
         let state = apply_state_edit_req(load_site_replication_state().await?, body);
         save_site_replication_state(&state).await?;
         Ok(empty_response(StatusCode::OK))
+    }
+}
+
+/// Fix 5: when `site-replicator-0` is desynced between peers (e.g. after a failed `rm` left
+/// stale state), `peer/remove` and other admin calls return 403. This handler generates a fresh
+/// service-account secret, applies it locally, and pushes a `peer/join` to each peer using the
+/// same service-account credentials. A peer whose secret is already correct will accept the
+/// update idempotently; a peer whose secret was stale will be repaired.
+pub struct SRRotateServiceAccountHandler {}
+
+#[async_trait::async_trait]
+impl Operation for SRRotateServiceAccountHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
+        let mut state = load_site_replication_state().await?;
+        if !state.enabled() {
+            return Err(s3_error!(InvalidRequest, "site replication is not configured"));
+        }
+        let local_peer = current_local_peer(&req, &state);
+
+        // Force generation of a new secret by passing a state with empty secret key.
+        let rotation_state = SiteReplicationState {
+            service_account_access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+            service_account_secret_key: String::new(),
+            ..state.clone()
+        };
+        let (svc_ak, new_sk) = ensure_site_replicator_service_account(&cred.access_key, &rotation_state).await?;
+
+        state.service_account_access_key = svc_ak.clone();
+        state.service_account_secret_key = new_sk.clone();
+
+        let join_req = SRPeerJoinReq {
+            svc_acct_access_key: svc_ak.clone(),
+            svc_acct_secret_key: new_sk.clone(),
+            svc_acct_parent: cred.access_key.clone(),
+            peers: state.peers.clone(),
+            updated_at: state.updated_at,
+        };
+
+        let mut peer_errors = Vec::new();
+        for peer in state.peers.values() {
+            if same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
+                continue;
+            }
+            if let Err(err) = send_peer_admin_request(
+                &peer.endpoint,
+                SITE_REPLICATION_PEER_JOIN_PATH,
+                &svc_ak,
+                &new_sk,
+                &join_req,
+            )
+            .await
+            {
+                let detail = summarize_peer_error_detail(&format!("{}: {err}", peer.endpoint));
+                warn!(peer = %peer.endpoint, error = %detail, "site replication service account rotation failed for peer");
+                peer_errors.push(detail);
+            }
+        }
+
+        persist_site_replication_state(&state).await?;
+
+        json_response(&ReplicateEditStatus {
+            success: peer_errors.is_empty(),
+            status: if peer_errors.is_empty() { "Success" } else { "Partial" }.to_string(),
+            err_detail: peer_errors.join("; "),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        })
     }
 }
 
