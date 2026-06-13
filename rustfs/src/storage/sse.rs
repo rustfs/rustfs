@@ -92,6 +92,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, RwLock};
 use tracing::{debug, error};
 
+const LOG_COMPONENT_STORAGE: &str = "storage";
+const LOG_SUBSYSTEM_SSE: &str = "sse";
+
 const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
 const INTERNAL_ENCRYPTION_KEY_HEADER: &str = "x-rustfs-encryption-key";
 const INTERNAL_ENCRYPTION_IV_HEADER: &str = "x-rustfs-encryption-iv";
@@ -211,14 +214,28 @@ async fn prepare_sse_configuration(
 
     // Get bucket default encryption configuration.
     let bucket_sse_config_result = metadata_sys::get_sse_config(bucket).await;
-    debug!("bucket_sse_config_result={:?}", bucket_sse_config_result);
+    debug!(
+        component = LOG_COMPONENT_STORAGE,
+        subsystem = LOG_SUBSYSTEM_SSE,
+        event = "bucket_sse_config_lookup",
+        bucket = %bucket,
+        found = bucket_sse_config_result.is_ok(),
+        "Bucket SSE configuration lookup completed"
+    );
 
     if let Ok((bucket_sse_config, _timestamp)) = bucket_sse_config_result {
         let effective_sse = server_side_encryption.clone().or_else(|| {
             bucket_sse_config.rules.first().and_then(|rule| {
-                debug!("Processing SSE rule: {:?}", rule);
                 rule.apply_server_side_encryption_by_default.as_ref().map(|sse| {
-                    debug!("Found SSE default: {:?}", sse);
+                    debug!(
+                        component = LOG_COMPONENT_STORAGE,
+                        subsystem = LOG_SUBSYSTEM_SSE,
+                        event = "bucket_sse_default_applied",
+                        bucket = %bucket,
+                        algorithm = sse.sse_algorithm.as_str(),
+                        has_kms_key_id = sse.kms_master_key_id.is_some(),
+                        "Bucket SSE default resolved"
+                    );
                     match sse.sse_algorithm.as_str() {
                         "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
                         "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
@@ -231,7 +248,15 @@ async fn prepare_sse_configuration(
             return Ok(None);
         }
 
-        debug!("effective_sse={:?} (original={:?})", effective_sse, server_side_encryption);
+        debug!(
+            component = LOG_COMPONENT_STORAGE,
+            subsystem = LOG_SUBSYSTEM_SSE,
+            event = "effective_sse_resolved",
+            bucket = %bucket,
+            requested = ?server_side_encryption,
+            effective = ?effective_sse,
+            "Resolved effective SSE configuration"
+        );
 
         let effective_kms_key_id = resolve_effective_kms_key_id(effective_sse.as_ref(), ssekms_key_id, || {
             bucket_sse_config.rules.first().and_then(|rule| {
