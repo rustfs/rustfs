@@ -68,6 +68,16 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+const LOG_COMPONENT_SCANNER: &str = "scanner";
+const LOG_SUBSYSTEM_FOLDER: &str = "folder";
+const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
+const LOG_SUBSYSTEM_HEAL: &str = "heal";
+const EVENT_SCANNER_FOLDER_STATE: &str = "scanner_folder_state";
+const EVENT_SCANNER_LIFECYCLE_ACTION: &str = "scanner_lifecycle_action";
+const EVENT_SCANNER_HEAL_ADMISSION: &str = "scanner_heal_admission";
+const EVENT_SCANNER_ALERT_STATE: &str = "scanner_alert_state";
+const EVENT_SCANNER_COMPAT_STATE: &str = "scanner_compat_state";
+
 const DATA_USAGE_UPDATE_DIR_CYCLES: u32 = 16;
 const DATA_SCANNER_COMPACT_LEAST_OBJECT: usize = 500;
 const DATA_SCANNER_COMPACT_AT_CHILDREN: usize = 10000;
@@ -361,8 +371,13 @@ fn warn_inline_heal_compat_requested() {
 
     SCANNER_INLINE_HEAL_WARN_ONCE.call_once(|| {
         warn!(
+            target: "rustfs::scanner::folder",
+            event = EVENT_SCANNER_COMPAT_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_HEAL,
             env = rustfs_config::ENV_SCANNER_INLINE_HEAL_ENABLE,
-            "Inline scanner heal rollback is no longer supported; continuing to enqueue heal candidates asynchronously"
+            state = "inline_heal_rollback_unsupported",
+            "Scanner inline-heal rollback is unsupported; using async heal admission"
         );
     });
 }
@@ -541,13 +556,18 @@ async fn send_required_scanner_heal_request(
 
     record_high_priority_heal_escalation(candidate_type, priority, result);
     error!(
+        target: "rustfs::scanner::folder",
+        event = EVENT_SCANNER_HEAL_ADMISSION,
+        component = LOG_COMPONENT_SCANNER,
+        subsystem = LOG_SUBSYSTEM_HEAL,
         candidate_type,
         bucket,
         object = object.unwrap_or(""),
         priority = heal_priority_label(priority),
         admission = result.result_label(),
         reason = result.reason_label(),
-        "High-priority heal request was not admitted; escalating to scanner failure"
+        state = "high_priority_not_admitted",
+        "Scanner high-priority heal admission failed"
     );
     Err(build_high_priority_heal_admission_error(candidate_type, bucket, object, priority, result))
 }
@@ -601,15 +621,39 @@ impl ScannerItem {
         size_summary: &mut SizeSummary,
     ) {
         if object_infos.is_empty() {
-            debug!("apply_actions: no object infos for object: {}", self.object_path());
+            debug!(
+                target: "rustfs::scanner::folder",
+                event = EVENT_SCANNER_LIFECYCLE_ACTION,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                object_path = %self.object_path(),
+                state = "no_object_versions",
+                "Scanner lifecycle action skipped"
+            );
             return;
         }
-        debug!("apply_actions: applying actions for object: {}", self.object_path());
+        debug!(
+            target: "rustfs::scanner::folder",
+            event = EVENT_SCANNER_LIFECYCLE_ACTION,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+            object_path = %self.object_path(),
+            state = "started",
+            "Scanner lifecycle action evaluation started"
+        );
 
         let versioning_config = match BucketVersioningSys::get(&self.bucket).await {
             Ok(versioning_config) => versioning_config,
             Err(_) => {
-                warn!("apply_actions: Failed to get versioning configuration for bucket {}", self.bucket);
+                warn!(
+                    target: "rustfs::scanner::folder",
+                    event = EVENT_SCANNER_LIFECYCLE_ACTION,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    bucket = %self.bucket,
+                    state = "versioning_lookup_failed",
+                    "Scanner lifecycle action skipped"
+                );
                 return;
             }
         };
@@ -620,7 +664,16 @@ impl ScannerItem {
                 let actual_size = match oi.get_actual_size() {
                     Ok(size) => size,
                     Err(_) => {
-                        warn!("apply_actions: Failed to get actual size for object {}", oi.name);
+                        warn!(
+                            target: "rustfs::scanner::folder",
+                            event = EVENT_SCANNER_LIFECYCLE_ACTION,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                            bucket = %self.bucket,
+                            object = %oi.name,
+                            state = "size_lookup_failed",
+                            "Scanner lifecycle action used fallback size"
+                        );
                         continue;
                     }
                 };
@@ -634,7 +687,15 @@ impl ScannerItem {
 
             self.alert_excessive_versions(object_infos.len(), cumulative_size);
 
-            debug!("apply_actions: done for now no lifecycle config");
+            debug!(
+                target: "rustfs::scanner::folder",
+                event = EVENT_SCANNER_LIFECYCLE_ACTION,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                object_path = %self.object_path(),
+                state = "no_lifecycle_config",
+                "Scanner lifecycle action finished without lifecycle rules"
+            );
             return;
         };
 
@@ -651,7 +712,16 @@ impl ScannerItem {
         {
             Ok(events) => events,
             Err(e) => {
-                warn!("apply_actions: Failed to evaluate lifecycle for object: {}", e);
+                warn!(
+                    target: "rustfs::scanner::folder",
+                    event = EVENT_SCANNER_LIFECYCLE_ACTION,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    object_path = %self.object_path(),
+                    state = "evaluate_failed",
+                    error = %e,
+                    "Scanner lifecycle action evaluation failed"
+                );
                 return;
             }
         };
@@ -666,7 +736,16 @@ impl ScannerItem {
                 let actual_size = match oi.get_actual_size() {
                     Ok(size) => size,
                     Err(_) => {
-                        warn!("apply_actions: Failed to get actual size for object {}", oi.name);
+                        warn!(
+                            target: "rustfs::scanner::folder",
+                            event = EVENT_SCANNER_LIFECYCLE_ACTION,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                            bucket = %self.bucket,
+                            object = %oi.name,
+                            state = "size_lookup_failed",
+                            "Scanner lifecycle action used fallback size"
+                        );
                         0
                     }
                 };
@@ -676,7 +755,17 @@ impl ScannerItem {
 
                 match event.action {
                     IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction => {
-                        debug!("apply_actions: applying expiry rule for object: {} {}", oi.name, event.action);
+                        debug!(
+                            target: "rustfs::scanner::folder",
+                            event = EVENT_SCANNER_LIFECYCLE_ACTION,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                            bucket = %self.bucket,
+                            object = %oi.name,
+                            action = %event.action,
+                            state = "apply_expiry_rule",
+                            "Scanner lifecycle action dispatched"
+                        );
                         let done_ilm = Metrics::time_ilm(event.action);
                         let queued = apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
                         if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
@@ -693,7 +782,16 @@ impl ScannerItem {
                                 let retained_size = match retained.get_actual_size() {
                                     Ok(size) => size,
                                     Err(_) => {
-                                        warn!("apply_actions: Failed to get actual size for object {}", retained.name);
+                                        warn!(
+                                            target: "rustfs::scanner::folder",
+                                            event = EVENT_SCANNER_LIFECYCLE_ACTION,
+                                            component = LOG_COMPONENT_SCANNER,
+                                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                                            bucket = %self.bucket,
+                                            object = %retained.name,
+                                            state = "size_lookup_failed",
+                                            "Scanner lifecycle action used fallback size"
+                                        );
                                         0
                                     }
                                 };
@@ -709,7 +807,17 @@ impl ScannerItem {
                     }
 
                     IlmAction::DeleteAction | IlmAction::DeleteRestoredAction | IlmAction::DeleteRestoredVersionAction => {
-                        debug!("apply_actions: applying expiry rule for object: {} {}", oi.name, event.action);
+                        debug!(
+                            target: "rustfs::scanner::folder",
+                            event = EVENT_SCANNER_LIFECYCLE_ACTION,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                            bucket = %self.bucket,
+                            object = %oi.name,
+                            action = %event.action,
+                            state = "apply_expiry_rule",
+                            "Scanner lifecycle action dispatched"
+                        );
                         let done_ilm = Metrics::time_ilm(event.action);
                         let queued = apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
                         if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
@@ -737,7 +845,17 @@ impl ScannerItem {
                         noncurrent_events.push(event.clone());
                     }
                     IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
-                        debug!("apply_actions: applying transition rule for object: {} {}", oi.name, event.action);
+                        debug!(
+                            target: "rustfs::scanner::folder",
+                            event = EVENT_SCANNER_LIFECYCLE_ACTION,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                            bucket = %self.bucket,
+                            object = %oi.name,
+                            action = %event.action,
+                            state = "apply_transition_rule",
+                            "Scanner lifecycle action dispatched"
+                        );
                         let done_ilm = Metrics::time_ilm(event.action);
                         let queued = apply_transition_rule(event, &LcEventSrc::Scanner, oi).await;
                         if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
@@ -853,10 +971,15 @@ impl ScannerItem {
     async fn enqueue_heal(&mut self, oi: &ObjectInfo) {
         let done_heal = Metrics::time(Metric::HealAbandonedObject);
         debug!(
-            "enqueue_heal: bucket: {}, object_path: {}, version_id: {}",
-            self.bucket,
-            self.object_path(),
-            oi.version_id.unwrap_or_default()
+            target: "rustfs::scanner::folder",
+            event = EVENT_SCANNER_HEAL_ADMISSION,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_HEAL,
+            bucket = %self.bucket,
+            object = %self.object_path(),
+            version_id = %oi.version_id.unwrap_or_default(),
+            state = "request_started",
+            "Scanner heal admission started"
         );
 
         let now = OffsetDateTime::now_utc();
@@ -868,6 +991,10 @@ impl ScannerItem {
                 age.whole_seconds().max(0)
             });
             info!(
+                target: "rustfs::scanner::folder",
+                event = EVENT_SCANNER_HEAL_ADMISSION,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_HEAL,
                 bucket = %self.bucket,
                 object = %self.object_path(),
                 version_id = %oi.version_id.unwrap_or_default(),
@@ -875,7 +1002,8 @@ impl ScannerItem {
                 cooldown_secs = cooldown.as_secs(),
                 original_scan_mode = %HealScanMode::Deep.as_str(),
                 effective_scan_mode = %scan_mode.as_str(),
-                "scanner deep heal downgraded to normal during new-object cooldown"
+                state = "downgraded_to_normal",
+                "Scanner heal admission downgraded deep scan during cooldown"
             );
         }
 
@@ -898,13 +1026,28 @@ impl ScannerItem {
             Ok(HealAdmissionResult::Accepted | HealAdmissionResult::Merged) => {}
             Ok(result @ (HealAdmissionResult::Full | HealAdmissionResult::Dropped(_))) => {
                 warn!(
+                    target: "rustfs::scanner::folder",
+                    event = EVENT_SCANNER_HEAL_ADMISSION,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_HEAL,
                     bucket = %self.bucket,
                     object = %self.object_path(),
                     admission = %describe_heal_admission(result),
-                    "enqueue_heal: low-priority heal request was not admitted"
+                    state = "not_admitted",
+                    "Scanner heal admission rejected low-priority request"
                 );
             }
-            Err(e) => warn!("enqueue_heal: failed to submit heal request: {}", e),
+            Err(e) => warn!(
+                target: "rustfs::scanner::folder",
+                event = EVENT_SCANNER_HEAL_ADMISSION,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_HEAL,
+                bucket = %self.bucket,
+                object = %self.object_path(),
+                state = "submit_failed",
+                error = %e,
+                "Scanner heal admission submission failed"
+            ),
         }
         if admitted {
             done_heal();
@@ -922,11 +1065,16 @@ impl ScannerItem {
             )
             .increment(1);
             warn!(
+                target: "rustfs::scanner::folder",
+                event = EVENT_SCANNER_ALERT_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_FOLDER,
                 bucket = %self.bucket,
                 object = %self.object_path(),
                 versions = remaining_versions,
                 threshold = scanner_excess_versions_threshold(),
-                "scanner detected object with excessive retained versions"
+                state = "excess_versions",
+                "Scanner alert recorded excessive retained versions"
             );
         }
         if too_large_versions {
@@ -937,12 +1085,17 @@ impl ScannerItem {
             )
             .increment(1);
             warn!(
+                target: "rustfs::scanner::folder",
+                event = EVENT_SCANNER_ALERT_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_FOLDER,
                 bucket = %self.bucket,
                 object = %self.object_path(),
                 versions = remaining_versions,
                 cumulative_size,
                 threshold = scanner_excess_version_size_threshold(),
-                "scanner detected object with excessive retained version size"
+                state = "excess_version_size",
+                "Scanner alert recorded excessive retained version size"
             );
         }
     }
@@ -1077,11 +1230,16 @@ impl FolderScanner {
         )
         .increment(1);
         warn!(
+            target: "rustfs::scanner::folder",
+            event = EVENT_SCANNER_ALERT_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_FOLDER,
             root = %self.root,
             folder,
             folders = total_folders,
             threshold,
-            "scanner detected folder with excessive direct subfolders"
+            state = "excess_folders",
+            "Scanner alert recorded excessive direct subfolders"
         );
     }
 
@@ -1140,7 +1298,16 @@ impl FolderScanner {
         {
             // Try to send without blocking
             if let Err(e) = updates.send(flat.clone()).await {
-                error!("send_update: failed to send update: {}", e);
+                error!(
+                    target: "rustfs::scanner::folder",
+                    event = EVENT_SCANNER_FOLDER_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_FOLDER,
+                    root = %self.new_cache.info.name,
+                    state = "update_send_failed",
+                    error = %e,
+                    "Scanner folder update send failed"
+                );
             }
             self.last_update = SystemTime::now();
         }
@@ -1190,7 +1357,16 @@ impl FolderScanner {
                 abandoned_children = self.old_cache.find_children_copy(this_hash.clone());
             }
 
-            debug!("scan_folder : {}/{}", &self.root, &folder.name);
+            debug!(
+                target: "rustfs::scanner::folder",
+                event = EVENT_SCANNER_FOLDER_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_FOLDER,
+                root = %self.root,
+                folder = %folder.name,
+                state = "scan_started",
+                "Scanner folder state updated"
+            );
             let (_, prefix) = path2_bucket_object_with_base_path(&self.root, &folder.name);
 
             let active_life_cycle = if self
@@ -1224,12 +1400,29 @@ impl FolderScanner {
 
             let dir_path = path_join_buf(&[&self.root, &folder.name]);
 
-            debug!("scan_folder: dir_path: {:?}", dir_path);
+            debug!(
+                target: "rustfs::scanner::folder",
+                event = EVENT_SCANNER_FOLDER_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_FOLDER,
+                dir_path = ?dir_path,
+                state = "dir_open",
+                "Scanner folder state updated"
+            );
 
             let mut dir_reader = match tokio::fs::read_dir(&dir_path).await {
                 Ok(dir_reader) => dir_reader,
                 Err(e) if e.kind() == ErrorKind::NotFound => {
-                    warn!("scan_folder: directory disappeared before read {}: {}", dir_path, e);
+                    warn!(
+                        target: "rustfs::scanner::folder",
+                        event = EVENT_SCANNER_FOLDER_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_FOLDER,
+                        dir_path = %dir_path,
+                        state = "dir_missing_before_read",
+                        error = %e,
+                        "Scanner folder state updated"
+                    );
                     return Ok(());
                 }
                 Err(e) => return Err(ScannerError::Io(e)),
@@ -1240,11 +1433,29 @@ impl FolderScanner {
                     Ok(Some(entry)) => entry,
                     Ok(None) => break,
                     Err(e) if e.kind() == ErrorKind::NotFound => {
-                        warn!("scan_folder: directory disappeared during iteration {}: {}", dir_path, e);
+                        warn!(
+                            target: "rustfs::scanner::folder",
+                            event = EVENT_SCANNER_FOLDER_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_FOLDER,
+                            dir_path = %dir_path,
+                            state = "dir_missing_during_iteration",
+                            error = %e,
+                            "Scanner folder state updated"
+                        );
                         break;
                     }
                     Err(e) if e.kind() == ErrorKind::NotADirectory => {
-                        warn!("scan_folder: path became non-directory during iteration {}: {}", dir_path, e);
+                        warn!(
+                            target: "rustfs::scanner::folder",
+                            event = EVENT_SCANNER_FOLDER_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_FOLDER,
+                            dir_path = %dir_path,
+                            state = "dir_became_non_directory",
+                            error = %e,
+                            "Scanner folder state updated"
+                        );
                         break;
                     }
                     Err(e) => return Err(ScannerError::Io(e)),
@@ -1269,11 +1480,29 @@ impl FolderScanner {
                 let mut entry_type = match entry.file_type().await {
                     Ok(entry_type) => entry_type,
                     Err(e) if e.kind() == ErrorKind::NotFound => {
-                        warn!("scan_folder: entry disappeared before type lookup {}: {}", entry_name, e);
+                        warn!(
+                            target: "rustfs::scanner::folder",
+                            event = EVENT_SCANNER_FOLDER_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_FOLDER,
+                            entry = %entry_name,
+                            state = "entry_missing_before_type_lookup",
+                            error = %e,
+                            "Scanner folder state updated"
+                        );
                         continue;
                     }
                     Err(e) if e.kind() == ErrorKind::TooManyLinks => {
-                        warn!("scan_folder: entry hit symlink loop before type lookup {}: {}", entry_name, e);
+                        warn!(
+                            target: "rustfs::scanner::folder",
+                            event = EVENT_SCANNER_FOLDER_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_FOLDER,
+                            entry = %entry_name,
+                            state = "entry_symlink_loop_before_type_lookup",
+                            error = %e,
+                            "Scanner folder state updated"
+                        );
                         continue;
                     }
                     Err(e) => return Err(ScannerError::Io(e)),
@@ -1283,18 +1512,44 @@ impl FolderScanner {
                     let metadata = match tokio::fs::metadata(&file_path).await {
                         Ok(metadata) => metadata,
                         Err(e) if e.kind() == ErrorKind::NotFound => {
-                            warn!("scan_folder: symlink target disappeared before metadata lookup {}: {}", file_path, e);
+                            warn!(
+                                target: "rustfs::scanner::folder",
+                                event = EVENT_SCANNER_FOLDER_STATE,
+                                component = LOG_COMPONENT_SCANNER,
+                                subsystem = LOG_SUBSYSTEM_FOLDER,
+                                file_path = %file_path,
+                                state = "symlink_target_missing_before_metadata",
+                                error = %e,
+                                "Scanner folder state updated"
+                            );
                             continue;
                         }
                         Err(e) if e.kind() == ErrorKind::TooManyLinks => {
-                            warn!("scan_folder: symlink target hit loop before metadata lookup {}: {}", file_path, e);
+                            warn!(
+                                target: "rustfs::scanner::folder",
+                                event = EVENT_SCANNER_FOLDER_STATE,
+                                component = LOG_COMPONENT_SCANNER,
+                                subsystem = LOG_SUBSYSTEM_FOLDER,
+                                file_path = %file_path,
+                                state = "symlink_target_loop_before_metadata",
+                                error = %e,
+                                "Scanner folder state updated"
+                            );
                             continue;
                         }
                         Err(e) => return Err(ScannerError::Io(e)),
                     };
 
                     if metadata.is_dir() {
-                        warn!("scan_folder: ignoring symlinked directory {}", file_path);
+                        warn!(
+                            target: "rustfs::scanner::folder",
+                            event = EVENT_SCANNER_FOLDER_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_FOLDER,
+                            file_path = %file_path,
+                            state = "symlink_directory_ignored",
+                            "Scanner folder state updated"
+                        );
                         continue;
                     }
 
@@ -1384,8 +1639,15 @@ impl FolderScanner {
 
                             if should_log_failed_object(into.failed_objects) {
                                 warn!(
+                                    target: "rustfs::scanner::folder",
+                                    event = EVENT_SCANNER_FOLDER_STATE,
+                                    component = LOG_COMPONENT_SCANNER,
+                                    subsystem = LOG_SUBSYSTEM_FOLDER,
+                                    path = %item.path,
                                     failed_objects = into.failed_objects,
-                                    "scan_folder: failed to get size for item {}: {}", item.path, e
+                                    state = "get_size_failed",
+                                    error = %e,
+                                    "Scanner folder failed to get object size"
                                 );
                             }
                         }
@@ -1426,7 +1688,15 @@ impl FolderScanner {
 
             if found_objects && is_erasure().await {
                 // If we found an object in erasure mode, we skip subdirs (only datadirs)...
-                info!("scan_folder: done for now found an object in erasure mode");
+                info!(
+                    target: "rustfs::scanner::folder",
+                    event = EVENT_SCANNER_FOLDER_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_FOLDER,
+                    folder = %folder.name,
+                    state = "erasure_object_found",
+                    "Scanner folder stopped descending after finding erasure object"
+                );
                 break;
             }
 
@@ -1445,7 +1715,16 @@ impl FolderScanner {
                 existing_folders.clear();
 
                 if self.data_usage_scanner_debug {
-                    debug!("scan_folder: Preemptively compacting: {}, entries: {}", folder.name, new_folders.len());
+                    debug!(
+                        target: "rustfs::scanner::folder",
+                        event = EVENT_SCANNER_FOLDER_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_FOLDER,
+                        folder = %folder.name,
+                        entry_count = new_folders.len(),
+                        state = "preemptive_compaction",
+                        "Scanner folder switched to compacted mode"
+                    );
                 }
             }
 
@@ -1570,7 +1849,17 @@ impl FolderScanner {
                         if ctx.is_cancelled() {
                             return Err(e);
                         }
-                        warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
+                        warn!(
+                            target: "rustfs::scanner::folder",
+                            event = EVENT_SCANNER_FOLDER_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_FOLDER,
+                            folder = %folder.name,
+                            child_folder = %folder_item.name,
+                            state = "child_scan_failed",
+                            error = %e,
+                            "Scanner child folder scan failed"
+                        );
                         continue;
                     }
                     tokio::task::yield_now().await;
@@ -1596,13 +1885,31 @@ impl FolderScanner {
 
             // Scan for healing
             if abandoned_children.is_empty() || !self.should_heal().await {
-                debug!("scan_folder: done for now abandoned children are empty or we are not healing");
+                debug!(
+                    target: "rustfs::scanner::folder",
+                    event = EVENT_SCANNER_FOLDER_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_FOLDER,
+                    folder = %folder.name,
+                    state = "heal_skip_no_abandoned_children",
+                    "Scanner folder skipped heal scan for abandoned children"
+                );
                 // If we are not heal scanning, return now.
                 break;
             }
 
             if self.disks.is_empty() || self.disks_quorum == 0 {
-                debug!("scan_folder: done for now disks are empty or quorum is 0");
+                debug!(
+                    target: "rustfs::scanner::folder",
+                    event = EVENT_SCANNER_FOLDER_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_FOLDER,
+                    folder = %folder.name,
+                    disks = self.disks.len(),
+                    quorum = self.disks_quorum,
+                    state = "heal_skip_no_quorum",
+                    "Scanner folder skipped heal scan because quorum is unavailable"
+                );
                 break;
             }
 
@@ -1660,7 +1967,16 @@ impl FolderScanner {
                                 let agreed_tx = agreed_tx.clone();
                                 Box::pin(async move {
                                     if let Err(e) = agreed_tx.send(entry_name).await {
-                                        error!("scan_folder: list_path_raw: failed to send entry name: {}: {}", entry.name, e);
+                                        error!(
+                                            target: "rustfs::scanner::folder",
+                                            event = EVENT_SCANNER_FOLDER_STATE,
+                                            component = LOG_COMPONENT_SCANNER,
+                                            subsystem = LOG_SUBSYSTEM_FOLDER,
+                                            entry = %entry.name,
+                                            state = "list_path_agreed_send_failed",
+                                            error = %e,
+                                            "Scanner list_path_raw agreed callback failed"
+                                        );
                                     }
                                 })
                             })),
@@ -1668,7 +1984,15 @@ impl FolderScanner {
                                 let partial_tx = partial_tx.clone();
                                 Box::pin(async move {
                                     if let Err(e) = partial_tx.send(entries).await {
-                                        error!("scan_folder: list_path_raw: failed to send partial err: {}", e);
+                                        error!(
+                                            target: "rustfs::scanner::folder",
+                                            event = EVENT_SCANNER_FOLDER_STATE,
+                                            component = LOG_COMPONENT_SCANNER,
+                                            subsystem = LOG_SUBSYSTEM_FOLDER,
+                                            state = "list_path_partial_send_failed",
+                                            error = %e,
+                                            "Scanner list_path_raw partial callback failed"
+                                        );
                                     }
                                 })
                             })),
@@ -1677,7 +2001,15 @@ impl FolderScanner {
                                 let errs_clone = errs.to_vec();
                                 Box::pin(async move {
                                     if let Err(e) = finished_tx.send(errs_clone).await {
-                                        error!("scan_folder: list_path_raw: failed to send finished errs: {}", e);
+                                        error!(
+                                            target: "rustfs::scanner::folder",
+                                            event = EVENT_SCANNER_FOLDER_STATE,
+                                            component = LOG_COMPONENT_SCANNER,
+                                            subsystem = LOG_SUBSYSTEM_FOLDER,
+                                            state = "list_path_finished_send_failed",
+                                            error = %e,
+                                            "Scanner list_path_raw finished callback failed"
+                                        );
                                     }
                                 })
                             })),
@@ -1686,7 +2018,17 @@ impl FolderScanner {
                     )
                     .await
                     {
-                        error!("scan_folder: failed to list path: {}/{}: {}", bucket_clone, prefix_clone, e);
+                        error!(
+                            target: "rustfs::scanner::folder",
+                            event = EVENT_SCANNER_FOLDER_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_FOLDER,
+                            bucket = %bucket_clone,
+                            prefix = %prefix_clone,
+                            state = "list_path_failed",
+                            error = %e,
+                            "Scanner list_path_raw failed"
+                        );
                     }
                 });
 
@@ -1745,7 +2087,17 @@ impl FolderScanner {
                            let fivs = match entry.file_info_versions(&bucket) {
                             Ok(fivs) => fivs,
                             Err(e) => {
-                                error!("scan_folder: list_path_raw: failed to get file info versions: {}", e);
+                                error!(
+                                    target: "rustfs::scanner::folder",
+                                    event = EVENT_SCANNER_FOLDER_STATE,
+                                    component = LOG_COMPONENT_SCANNER,
+                                    subsystem = LOG_SUBSYSTEM_FOLDER,
+                                    bucket = %bucket,
+                                    entry = %entry.name,
+                                    state = "file_info_versions_failed",
+                                    error = %e,
+                                    "Scanner list_path_raw failed to resolve file versions"
+                                );
                                 send_required_scanner_heal_request(
                                     "object",
                                     &bucket,
@@ -1789,7 +2141,15 @@ impl FolderScanner {
                                 finished_closed = true;
                                 continue;
                             };
-                            error!("scan_folder: list_path_raw: failed to get finished errs: {:?}", errs);
+                            error!(
+                                target: "rustfs::scanner::folder",
+                                event = EVENT_SCANNER_FOLDER_STATE,
+                                component = LOG_COMPONENT_SCANNER,
+                                subsystem = LOG_SUBSYSTEM_FOLDER,
+                                state = "list_path_finished_with_errors",
+                                errors = ?errs,
+                                "Scanner list_path_raw finished with disk errors"
+                            );
                             child_ctx.cancel();
                         }
                         _ = child_ctx.cancelled() => {
@@ -1820,7 +2180,17 @@ impl FolderScanner {
                             if ctx.is_cancelled() {
                                 return Err(e);
                             }
-                            warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
+                            warn!(
+                                target: "rustfs::scanner::folder",
+                                event = EVENT_SCANNER_FOLDER_STATE,
+                                component = LOG_COMPONENT_SCANNER,
+                                subsystem = LOG_SUBSYSTEM_FOLDER,
+                                folder = %folder.name,
+                                child_folder = %folder_item.name,
+                                state = "heal_child_scan_failed",
+                                error = %e,
+                                "Scanner heal child folder scan failed"
+                            );
                             continue;
                         }
                         tokio::task::yield_now().await;
