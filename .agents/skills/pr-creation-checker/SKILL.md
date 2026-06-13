@@ -30,7 +30,9 @@ Use this skill before `gh pr create`, before `gh pr edit`, or when reviewing whe
 - Treat introducing a new hardcoded literal where a project constant already exists as a likely regression risk; require either a refactor to reuse the constant or an explicit exception explanation in the PR body.
 
 3. Verify readiness requirements
-- Require `make pre-commit` before marking the PR ready.
+- Require `make pre-commit` before marking PRs ready when the diff changes Rust code, product behavior, CI behavior, runtime configuration, security-sensitive logic, migrations, storage, auth, networking, or other high-risk paths.
+- For documentation-only, agent-instruction-only, or local developer-tooling-only changes, allow focused verification instead of `make pre-commit` when it directly validates the changed surface.
+- For focused verification, explain why the full gate was not run and list the scope-specific commands in the PR body.
 - If `make` is unavailable, use the equivalent commands from `.config/make/`.
 - Add scope-specific verification commands when the changed area needs more than the baseline.
 - If required checks fail, stop and return `BLOCKED`.
@@ -79,7 +81,8 @@ Use this skill before `gh pr create`, before `gh pr edit`, or when reviewing whe
 
 ## Blocker rules
 
-- Return `BLOCKED` if `make pre-commit` has not passed.
+- Return `BLOCKED` if a code, behavior, CI, runtime configuration, security-sensitive, migration, storage, auth, networking, or other high-risk change has not passed `make pre-commit`.
+- Return `BLOCKED` if a documentation-only, agent-instruction-only, or local developer-tooling-only change lacks focused verification for the changed surface.
 - Return `BLOCKED` if the diff contains unrelated changes that are not acknowledged.
 - Return `BLOCKED` if required template sections are missing.
 - Return `BLOCKED` if the title/body is not in English.

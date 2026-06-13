@@ -3,30 +3,9 @@
 repos:
   - repo: local
     hooks:
-      - id: cargo-fmt
-        name: cargo fmt
-        entry: cargo fmt --all --check
-        language: system
-        types: [rust]
-        pass_filenames: false
-
-      - id: cargo-clippy
-        name: cargo clippy
-        entry: cargo clippy --all-targets --all-features -- -D warnings
-        language: system
-        types: [rust]
-        pass_filenames: false
-
-      - id: cargo-check
-        name: cargo check
-        entry: cargo check --all-targets
-        language: system
-        types: [rust]
-        pass_filenames: false
-
-      - id: cargo-test
-        name: cargo test
-        entry: bash -c 'cargo test --workspace --exclude e2e_test && cargo test --all --doc'
+      - id: rustfs-dev-check
+        name: rustfs dev-check
+        entry: make dev-check
         language: system
         types: [rust]
         pass_filenames: false
