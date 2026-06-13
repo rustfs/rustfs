@@ -19,7 +19,7 @@ use http::Request;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower::Service;
-use tracing::debug;
+use tracing::{debug, trace, warn};
 
 /// Tower Service for the trusted proxy middleware.
 #[derive(Clone)]
@@ -64,7 +64,13 @@ where
     fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
         // If the middleware is disabled, pass the request through immediately.
         if !self.enabled {
-            debug!("Trusted proxy middleware is disabled");
+            debug!(
+                event = "proxy_validation.middleware",
+                component = "trusted_proxies",
+                subsystem = "middleware",
+                state = "disabled",
+                "trusted proxy middleware bypassed"
+            );
             return self.inner.call(req);
         }
 
@@ -77,20 +83,65 @@ where
         match self.validator.validate_request(peer_addr, req.headers()) {
             Ok(client_info) => {
                 // Insert the verified client info into the request extensions.
-                req.extensions_mut().insert(client_info);
-
                 let duration = start_time.elapsed();
-                debug!("Proxy validation successful in {:?}", duration);
+                trace!(
+                    event = "proxy_validation.middleware",
+                    component = "trusted_proxies",
+                    subsystem = "middleware",
+                    result = if client_info.is_from_trusted_proxy {
+                        "trusted_proxy"
+                    } else {
+                        "direct"
+                    },
+                    peer_ip = peer_addr
+                        .map(|addr| addr.ip().to_string())
+                        .unwrap_or_else(|| "0.0.0.0".to_string()),
+                    client_ip = %client_info.real_ip,
+                    proxy_hops = client_info.proxy_hops,
+                    warning_count = client_info.warnings.len(),
+                    validation_mode = client_info.validation_mode.as_str(),
+                    duration_ms = duration.as_millis(),
+                    "trusted proxy evaluation completed"
+                );
+
+                req.extensions_mut().insert(client_info);
             }
             Err(err) => {
                 // If the error is recoverable, fallback to a direct connection info.
                 if err.is_recoverable() {
+                    let duration = start_time.elapsed();
+                    warn!(
+                        event = "proxy_validation.middleware",
+                        component = "trusted_proxies",
+                        subsystem = "middleware",
+                        result = "fallback",
+                        fallback = "socket_peer",
+                        peer_ip = peer_addr
+                            .map(|addr| addr.ip().to_string())
+                            .unwrap_or_else(|| "0.0.0.0".to_string()),
+                        error = %err,
+                        duration_ms = duration.as_millis(),
+                        "trusted proxy validation fell back to direct peer"
+                    );
                     let client_info = ClientInfo::direct(
                         peer_addr.unwrap_or_else(|| std::net::SocketAddr::new(std::net::IpAddr::from([0, 0, 0, 0]), 0)),
                     );
                     req.extensions_mut().insert(client_info);
                 } else {
-                    debug!("Unrecoverable proxy validation error: {}", err);
+                    let duration = start_time.elapsed();
+                    warn!(
+                        event = "proxy_validation.middleware",
+                        component = "trusted_proxies",
+                        subsystem = "middleware",
+                        result = "error",
+                        fallback = "none",
+                        peer_ip = peer_addr
+                            .map(|addr| addr.ip().to_string())
+                            .unwrap_or_else(|| "0.0.0.0".to_string()),
+                        error = %err,
+                        duration_ms = duration.as_millis(),
+                        "trusted proxy validation failed"
+                    );
                 }
             }
         }

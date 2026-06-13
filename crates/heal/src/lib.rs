@@ -22,6 +22,10 @@ use std::sync::{Arc, OnceLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
+const LOG_COMPONENT_HEAL: &str = "heal";
+const LOG_SUBSYSTEM_RUNTIME: &str = "runtime";
+const EVENT_HEAL_RUNTIME_STATE: &str = "heal_runtime_state";
+
 // Global cancellation token for heal and related services
 static GLOBAL_AHM_SERVICES_CANCEL_TOKEN: OnceLock<CancellationToken> = OnceLock::new();
 
@@ -92,12 +96,27 @@ pub async fn init_heal_manager(
         if let Some(processor_guard) = GLOBAL_HEAL_CHANNEL_PROCESSOR.get() {
             let mut processor = processor_guard.lock().await;
             if let Err(e) = processor.start(receiver).await {
-                error!("Heal channel processor failed: {}", e);
+                error!(
+                    target: "rustfs::heal",
+                    event = EVENT_HEAL_RUNTIME_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    state = "channel_processor_failed",
+                    error = %e,
+                    "Heal runtime channel processor failed"
+                );
             }
         }
     });
 
-    info!("Heal manager with channel processor initialized successfully");
+    info!(
+        target: "rustfs::heal",
+        event = EVENT_HEAL_RUNTIME_STATE,
+        component = LOG_COMPONENT_HEAL,
+        subsystem = LOG_SUBSYSTEM_RUNTIME,
+        state = "initialized",
+        "Heal runtime initialized"
+    );
     Ok(heal_manager)
 }
 

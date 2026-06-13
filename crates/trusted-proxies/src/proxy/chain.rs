@@ -81,7 +81,15 @@ impl ProxyChainAnalyzer {
         current_proxy_ip: IpAddr,
         headers: &HeaderMap,
     ) -> Result<ChainAnalysis, ProxyError> {
-        trace!("Analyzing proxy chain: {:?} with current proxy: {}", proxy_chain, current_proxy_ip);
+        trace!(
+            event = "proxy_chain.analyze",
+            component = "trusted_proxies",
+            subsystem = "chain",
+            validation_mode = self.config.validation_mode.as_str(),
+            proxy_chain_len = proxy_chain.len(),
+            current_proxy_ip = %current_proxy_ip,
+            "proxy chain analysis started"
+        );
 
         // Validate all IP addresses in the chain.
         self.validate_ip_addresses(proxy_chain)?;

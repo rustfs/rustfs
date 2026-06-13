@@ -176,11 +176,26 @@ impl ConfigLoader {
     pub fn from_env_or_default() -> AppConfig {
         match Self::from_env() {
             Ok(config) => {
-                info!("Configuration loaded successfully from environment variables");
+                info!(
+                    event = "trusted_proxies.config",
+                    component = "trusted_proxies",
+                    subsystem = "config_loader",
+                    result = "loaded",
+                    source = "environment",
+                    "trusted proxies configuration loaded"
+                );
                 config
             }
             Err(e) => {
-                tracing::warn!("Failed to load configuration from environment: {}. Using defaults", e);
+                tracing::warn!(
+                    event = "trusted_proxies.config",
+                    component = "trusted_proxies",
+                    subsystem = "config_loader",
+                    result = "fallback",
+                    source = "defaults",
+                    error = %e,
+                    "trusted proxies configuration fell back to defaults"
+                );
                 Self::default_config()
             }
         }
@@ -214,20 +229,38 @@ impl ConfigLoader {
 
     /// Prints a summary of the configuration to the log.
     pub fn print_summary(config: &AppConfig) {
-        info!("=== Application Configuration ===");
-        info!("Server: {}", config.server_addr);
-        info!("Trusted Proxies: {}", config.proxy.proxies.len());
-        info!("Validation Mode: {:?}", config.proxy.validation_mode);
-        info!("Cache Capacity: {}", config.cache.capacity);
-        info!("Metrics Enabled: {}", config.monitoring.metrics_enabled);
-        info!("Cloud Metadata: {}", config.cloud.metadata_enabled);
-
-        if config.monitoring.log_failed_validations {
-            info!("Failed validations will be logged");
-        }
+        info!(
+            event = "trusted_proxies.config",
+            component = "trusted_proxies",
+            subsystem = "config_loader",
+            result = "summary",
+            server_addr = %config.server_addr,
+            trusted_proxy_count = config.proxy.proxies.len(),
+            validation_mode = config.proxy.validation_mode.as_str(),
+            cache_capacity = config.cache.capacity,
+            cache_ttl_seconds = config.cache.ttl_seconds,
+            cache_cleanup_interval_seconds = config.cache.cleanup_interval_seconds,
+            metrics_enabled = config.monitoring.metrics_enabled,
+            structured_logging = config.monitoring.structured_logging,
+            tracing_enabled = config.monitoring.tracing_enabled,
+            log_failed_validations = config.monitoring.log_failed_validations,
+            cloud_metadata_enabled = config.cloud.metadata_enabled,
+            cloud_metadata_timeout_seconds = config.cloud.metadata_timeout_seconds,
+            cloudflare_ips_enabled = config.cloud.cloudflare_ips_enabled,
+            forced_provider = config.cloud.forced_provider.as_deref().unwrap_or("none"),
+            "trusted proxies configuration summarized"
+        );
 
         if !config.proxy.proxies.is_empty() {
-            tracing::debug!("Trusted networks: {:?}", config.proxy.get_network_strings());
+            tracing::debug!(
+                event = "trusted_proxies.config",
+                component = "trusted_proxies",
+                subsystem = "config_loader",
+                result = "trusted_networks",
+                trusted_proxy_count = config.proxy.proxies.len(),
+                trusted_networks = ?config.proxy.get_network_strings(),
+                "trusted proxies networks enumerated"
+            );
         }
     }
 }

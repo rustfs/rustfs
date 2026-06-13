@@ -1,0 +1,4 @@
+interface:
+  display_name: "RustFS Logging Governance"
+  short_description: "Standardize RustFS logs with structured events and guardrails."
+  default_prompt: "Use $rustfs-logging-governance to standardize or review RustFS logging, reduce noise, and update guardrails."
