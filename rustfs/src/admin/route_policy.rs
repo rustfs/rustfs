@@ -437,6 +437,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::High,
     ),
     admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/site-replication/rotate-svc-acct",
+        SITE_REPLICATION_OPERATION,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
         HttpMethod::Put,
         "/rustfs/admin/v3/site-replication/peer/join",
         SITE_REPLICATION_ADD,

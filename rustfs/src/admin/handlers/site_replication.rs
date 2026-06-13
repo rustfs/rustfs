@@ -2464,14 +2464,51 @@ async fn ensure_site_replication_bucket_replication_config(
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
 ) -> S3Result<()> {
-    match metadata_sys::get_replication_config(bucket).await {
-        Ok(_) => return Ok(()),
-        Err(StorageError::ConfigNotFound) => {}
+    // Fix 6: reconcile rather than early-returning when any config already exists.
+    // The old code bailed on Ok(_), so the second site joined a replicated bucket and
+    // ended up with NO rule pointing back to the first site. Objects on that site could
+    // never travel back, producing the "one-directional" replication symptom.
+    let Some(desired) = build_site_replication_config(bucket, state, local_peer)? else {
+        return Ok(());
+    };
+
+    // Load the existing rules (may be empty if never configured).
+    let mut existing_rules = match metadata_sys::get_replication_config(bucket).await {
+        Ok((existing, _)) => existing.rules,
+        Err(StorageError::ConfigNotFound) => Vec::new(),
         Err(err) => return Err(ApiError::from(err).into()),
+    };
+
+    // Collect the IDs of existing site-repl-* rules so we don't duplicate them.
+    let existing_rule_ids: HashSet<String> = existing_rules
+        .iter()
+        .filter_map(|r| r.id.as_deref())
+        .filter(|id| id.starts_with("site-repl-"))
+        .map(String::from)
+        .collect();
+
+    let mut added = false;
+    for rule in desired.rules {
+        let rule_id = rule.id.as_deref().unwrap_or("");
+        if !existing_rule_ids.contains(rule_id) {
+            existing_rules.push(rule);
+            added = true;
+        }
     }
 
-    let Some(config) = build_site_replication_config(bucket, state, local_peer)? else {
+    if !added {
+        // All desired rules are already present — nothing to write.
         return Ok(());
+    }
+
+    // Re-assign contiguous priorities to avoid conflicts with any preserved rules.
+    for (i, rule) in existing_rules.iter_mut().enumerate() {
+        rule.priority = Some((i + 1) as i32);
+    }
+
+    let config = ReplicationConfiguration {
+        role: String::new(),
+        rules: existing_rules,
     };
 
     let data = serialize(&config)
