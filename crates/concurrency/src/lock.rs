@@ -138,9 +138,13 @@ impl<G> OptimizedLockGuard<G> {
         lock_metrics::record_lock_hold_time(hold_time);
 
         tracing::debug!(
+            event = "lock_guard.release",
+            component = "concurrency",
+            subsystem = "lock",
+            release_mode = "early",
             resource = %self.resource,
             hold_time_ms = hold_time.as_millis(),
-            "Lock released early (optimization active)"
+            "lock guard released"
         );
     }
 
@@ -161,9 +165,13 @@ impl<G> Drop for OptimizedLockGuard<G> {
             lock_metrics::record_lock_hold_time(hold_time);
 
             tracing::debug!(
+                event = "lock_guard.release",
+                component = "concurrency",
+                subsystem = "lock",
+                release_mode = "drop",
                 resource = %self.resource,
                 hold_time_ms = hold_time.as_millis(),
-                "Lock released on drop (normal release)"
+                "lock guard released"
             );
         }
     }
