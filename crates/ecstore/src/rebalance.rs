@@ -1023,7 +1023,11 @@ impl ECStore {
                 );
                 return Ok(());
             }
-            if complete_rebalance_pools_at_goal(meta, OffsetDateTime::now_utc()) {
+            let now = OffsetDateTime::now_utc();
+            if complete_rebalance_pools_at_goal(meta, now) {
+                meta_to_save = Some(meta.clone());
+            }
+            if complete_rebalance_pools_with_empty_queue(meta, now) {
                 meta_to_save = Some(meta.clone());
             }
             meta.cancel = Some(cancel_tx);
@@ -1054,6 +1058,19 @@ impl ECStore {
             Vec::new()
         };
 
+        if !participants.iter().any(|participating| *participating) {
+            debug!(
+                event = EVENT_REBALANCE_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                state = "start_skipped",
+                reason = "no_participants",
+                "Skipped rebalance start because no pools are participating"
+            );
+            return Ok(());
+        }
+
+        let mut workers_started = 0usize;
         for (idx, participating) in participants.iter().enumerate() {
             if !*participating {
                 debug!(
@@ -1088,6 +1105,7 @@ impl ECStore {
             let pool_idx = idx;
             let store = self.clone();
             let rx_clone = rx.clone();
+            workers_started += 1;
             tokio::spawn(async move {
                 if let Err(err) = store.rebalance_buckets(rx_clone, pool_idx).await {
                     error!("Rebalance failed for pool {}: {}", pool_idx, err);
@@ -1102,6 +1120,18 @@ impl ECStore {
                     );
                 }
             });
+        }
+
+        if workers_started == 0 {
+            debug!(
+                event = EVENT_REBALANCE_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                state = "start_skipped",
+                reason = "no_local_participants",
+                "Skipped rebalance start because no local pools are participating"
+            );
+            return Ok(());
         }
 
         info!(
@@ -1605,6 +1635,23 @@ fn complete_rebalance_pools_at_goal(meta: &mut RebalanceMeta, now: OffsetDateTim
             pool_stat.info.last_error = None;
             changed = true;
         }
+    }
+
+    changed
+}
+
+fn complete_rebalance_pools_with_empty_queue(meta: &mut RebalanceMeta, now: OffsetDateTime) -> bool {
+    let mut changed = false;
+
+    for pool_stat in meta.pool_stats.iter_mut() {
+        if !is_rebalance_pool_started(pool_stat) || !pool_stat.buckets.is_empty() {
+            continue;
+        }
+
+        pool_stat.info.status = RebalStatus::Completed;
+        pool_stat.info.end_time = Some(now);
+        pool_stat.info.last_error = None;
+        changed = true;
     }
 
     changed
@@ -2859,23 +2906,24 @@ mod rebalance_unit_tests {
         RebalSaveOpt, RebalStatus, RebalanceBucketOutcome, RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta, RebalanceStats,
         RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event, apply_stopped_at,
         classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
-        complete_rebalance_pools_at_goal, defer_bucket_in_rebalance_queue, ensure_rebalance_listing_disks_available,
-        ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, has_deferred_rebalance_error,
-        is_rebalance_stopped_terminal_event, is_transient_rebalance_error, load_rebalance_bucket_configs,
-        mark_rebalance_bucket_done, merge_rebalance_meta, migrate_entry_version, migrate_entry_version_with_retry_wait,
-        next_rebal_bucket_from_stat, rebalance_delete_marker_opts, rebalance_listing_retry_delay,
-        rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error,
-        rebalance_migration_retry_delay, resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket,
-        resolve_rebalance_bucket_error, resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
-        resolve_rebalance_file_info_versions_result, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
-        resolve_rebalance_migrate_result_error, resolve_rebalance_optional_bucket_config_result, resolve_rebalance_participants,
-        resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error,
-        resolve_rebalance_worker_result, send_rebalance_done_signal, should_accept_rebalance_stats_update,
-        should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete, should_defer_rebalance_entry_failure,
-        should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
-        should_retry_rebalance_listing, should_skip_rebalance_delete_marker, should_skip_start_rebalance,
-        stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue, validate_start_rebalance_state,
-        wait_rebalance_listing_retry, with_rebalance_entry_context,
+        complete_rebalance_pools_at_goal, complete_rebalance_pools_with_empty_queue, defer_bucket_in_rebalance_queue,
+        ensure_rebalance_listing_disks_available, ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index,
+        has_deferred_rebalance_error, is_rebalance_stopped_terminal_event, is_transient_rebalance_error,
+        load_rebalance_bucket_configs, mark_rebalance_bucket_done, merge_rebalance_meta, migrate_entry_version,
+        migrate_entry_version_with_retry_wait, next_rebal_bucket_from_stat, rebalance_delete_marker_opts,
+        rebalance_listing_retry_delay, rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error,
+        rebalance_meta_load_unknown_version_error, rebalance_migration_retry_delay, resolve_load_rebalance_stats_update_result,
+        resolve_next_rebalance_bucket, resolve_rebalance_bucket_error, resolve_rebalance_bucket_result,
+        resolve_rebalance_entry_cleanup_delete_result, resolve_rebalance_file_info_versions_result,
+        resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result, resolve_rebalance_migrate_result_error,
+        resolve_rebalance_optional_bucket_config_result, resolve_rebalance_participants, resolve_rebalance_save_task_result,
+        resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error, resolve_rebalance_worker_result,
+        send_rebalance_done_signal, should_accept_rebalance_stats_update, should_cleanup_rebalance_source_entry,
+        should_count_rebalance_version_complete, should_defer_rebalance_entry_failure, should_ignore_rebalance_data_usage_cache,
+        should_pool_participate, should_preserve_rebalance_stopped_state, should_retry_rebalance_listing,
+        should_skip_rebalance_delete_marker, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
+        take_bucket_from_rebalance_queue, validate_start_rebalance_state, wait_rebalance_listing_retry,
+        with_rebalance_entry_context,
     };
     use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -5014,6 +5062,41 @@ mod rebalance_unit_tests {
         assert!(!complete_rebalance_pools_at_goal(&mut meta, now));
         assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Started);
         assert!(has_deferred_rebalance_error(&meta.pool_stats[0]));
+    }
+
+    #[test]
+    fn test_complete_rebalance_pools_with_empty_queue_marks_started_participants_completed() {
+        let now = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+        let mut meta = RebalanceMeta {
+            pool_stats: vec![
+                RebalanceStats {
+                    participating: true,
+                    buckets: Vec::new(),
+                    info: RebalanceInfo {
+                        status: RebalStatus::Started,
+                        last_error: Some("stale error".to_string()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                RebalanceStats {
+                    participating: true,
+                    buckets: vec!["bucket-a".to_string()],
+                    info: RebalanceInfo {
+                        status: RebalStatus::Started,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(complete_rebalance_pools_with_empty_queue(&mut meta, now));
+        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Completed);
+        assert_eq!(meta.pool_stats[0].info.end_time, Some(now));
+        assert!(meta.pool_stats[0].info.last_error.is_none());
+        assert_eq!(meta.pool_stats[1].info.status, RebalStatus::Started);
     }
 
     #[test]
