@@ -16,6 +16,7 @@ use crate::TargetDomain;
 use crate::runtime::sidecar_protocol::SidecarHandshake;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use thiserror::Error;
 
 const DEFAULT_FAILURE_THRESHOLD: usize = 3;
 
@@ -60,6 +61,10 @@ impl SidecarRuntimePolicy {
     pub fn failure_threshold(&self) -> usize {
         self.failure_threshold.max(1)
     }
+
+    pub fn validate_activation(&self, safety_checks: &SidecarRuntimeSafetyChecks) -> Result<(), SidecarRuntimePolicyError> {
+        validate_runtime_policy(self, safety_checks)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +82,21 @@ impl SidecarRuntimeSafetyChecks {
             queue_depth,
         }
     }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum SidecarRuntimePolicyError {
+    #[error("external sidecar runtime is disabled by policy")]
+    ExternalSidecarDisabled,
+
+    #[error("sidecar runtime requires sandbox isolation")]
+    SandboxRequired,
+
+    #[error("sidecar runtime requires verified provenance")]
+    ProvenanceRequired,
+
+    #[error("sidecar runtime queue depth {queue_depth} exceeds policy bound {max_queue_depth}")]
+    QueueDepthExceeded { queue_depth: usize, max_queue_depth: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,7 +152,7 @@ impl SidecarPluginRuntime {
                 self.handshake.plugin_id, required_domain
             ));
         }
-        validate_runtime_policy(policy, safety_checks)?;
+        policy.validate_activation(safety_checks).map_err(|err| err.to_string())?;
 
         self.healthy = true;
         self.degraded_to_builtin = false;
@@ -188,21 +208,24 @@ impl SidecarPluginRuntime {
     }
 }
 
-fn validate_runtime_policy(policy: &SidecarRuntimePolicy, safety_checks: &SidecarRuntimeSafetyChecks) -> Result<(), String> {
+fn validate_runtime_policy(
+    policy: &SidecarRuntimePolicy,
+    safety_checks: &SidecarRuntimeSafetyChecks,
+) -> Result<(), SidecarRuntimePolicyError> {
     if !policy.allow_external_sidecars {
-        return Err("external sidecar runtime is disabled by policy".to_string());
+        return Err(SidecarRuntimePolicyError::ExternalSidecarDisabled);
     }
     if policy.require_sandbox && !safety_checks.sandboxed {
-        return Err("sidecar runtime requires sandbox isolation".to_string());
+        return Err(SidecarRuntimePolicyError::SandboxRequired);
     }
     if policy.require_provenance && !safety_checks.provenance_verified {
-        return Err("sidecar runtime requires verified provenance".to_string());
+        return Err(SidecarRuntimePolicyError::ProvenanceRequired);
     }
     if safety_checks.queue_depth > policy.max_queue_depth {
-        return Err(format!(
-            "sidecar runtime queue depth {} exceeds policy bound {}",
-            safety_checks.queue_depth, policy.max_queue_depth
-        ));
+        return Err(SidecarRuntimePolicyError::QueueDepthExceeded {
+            queue_depth: safety_checks.queue_depth,
+            max_queue_depth: policy.max_queue_depth,
+        });
     }
     Ok(())
 }

@@ -69,7 +69,7 @@ use rustfs_ecstore::bucket::{
     versioning_sys::BucketVersioningSys,
 };
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
-use rustfs_ecstore::compress::{MIN_COMPRESSIBLE_SIZE, is_compressible};
+use rustfs_ecstore::compress::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
 use rustfs_ecstore::config::storageclass;
 use rustfs_ecstore::disk::{error::DiskError, error_reduce::is_all_buckets_not_found};
 use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
@@ -1822,19 +1822,22 @@ impl DefaultObjectUsecase {
 
         let store = get_validated_store(&bucket).await?;
 
-        // TDD: Get bucket default encryption configuration
         let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
-        debug!("TDD: bucket_sse_config={:?}", bucket_sse_config);
+        debug!(
+            target: "rustfs::app::object_usecase",
+            component = "app",
+            subsystem = "object",
+            event = "bucket_sse_config_lookup",
+            bucket = %bucket,
+            found = bucket_sse_config.is_some(),
+            "Bucket SSE configuration lookup completed"
+        );
 
-        // TDD: Determine effective encryption configuration (request overrides bucket default)
         let original_sse = server_side_encryption.clone();
         let mut effective_sse = server_side_encryption.or_else(|| {
             bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-                debug!("TDD: Processing bucket SSE config: {:?}", config);
                 config.rules.first().and_then(|rule| {
-                    debug!("TDD: Processing SSE rule: {:?}", rule);
                     rule.apply_server_side_encryption_by_default.as_ref().map(|sse| {
-                        debug!("TDD: Found SSE default: {:?}", sse);
                         match sse.sse_algorithm.as_str() {
                             "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
                             "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
@@ -1844,7 +1847,16 @@ impl DefaultObjectUsecase {
                 })
             })
         });
-        debug!("TDD: effective_sse={:?} (original={:?})", effective_sse, original_sse);
+        debug!(
+            target: "rustfs::app::object_usecase",
+            component = "app",
+            subsystem = "object",
+            event = "effective_sse_resolved",
+            bucket = %bucket,
+            requested = ?original_sse,
+            effective = ?effective_sse,
+            "Resolved effective SSE configuration"
+        );
 
         let mut effective_kms_key_id = ssekms_key_id.or_else(|| {
             bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
@@ -1928,7 +1940,7 @@ impl DefaultObjectUsecase {
 
         let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
 
-        let should_compress = is_compressible(&req.headers, &key) && size > MIN_COMPRESSIBLE_SIZE as i64;
+        let should_compress = is_disk_compressible(&req.headers, &key) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64;
         let mut write_plan = WritePlan::new();
         let mut reader = if should_compress {
             let algorithm = CompressionAlgorithm::default();
@@ -2902,7 +2914,7 @@ impl DefaultObjectUsecase {
 
         let mut compress_metadata = HashMap::new();
 
-        let should_compress = is_compressible(&req.headers, &key) && actual_size > MIN_COMPRESSIBLE_SIZE as i64;
+        let should_compress = is_disk_compressible(&req.headers, &key) && actual_size > MIN_DISK_COMPRESSIBLE_SIZE as i64;
 
         if should_compress {
             insert_str(
@@ -4411,7 +4423,8 @@ impl DefaultObjectUsecase {
 
             let actual_size = size;
 
-            let should_compress = !is_dir && is_compressible(&HeaderMap::new(), &fpath) && size > MIN_COMPRESSIBLE_SIZE as i64;
+            let should_compress =
+                !is_dir && is_disk_compressible(&HeaderMap::new(), &fpath) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64;
 
             let mut write_plan = WritePlan::new();
             let mut hrd = if is_dir {

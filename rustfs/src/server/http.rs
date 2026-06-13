@@ -19,7 +19,7 @@ use crate::auth_keystone;
 use crate::config;
 use crate::server::{
     ReadinessGateLayer, RemoteAddr, ShutdownHandle,
-    compress::{CompressionConfig, PathAwareCompressionPredicate, PathCategoryInjectionLayer},
+    compress::{HttpCompressionConfig, PathAwareHttpCompressionPredicate, PathCategoryInjectionLayer},
     hybrid::hybrid,
     layer::{
         BodylessStatusFixLayer, ConditionalCorsLayer, EmptyBodyContentLengthCompatLayer, HeadRequestBodyFixLayer,
@@ -84,9 +84,21 @@ const LOG_COMPONENT_SERVER: &str = "server";
 const LOG_SUBSYSTEM_HTTP: &str = "http";
 const LOG_SUBSYSTEM_TRANSPORT: &str = "transport";
 const LOG_SUBSYSTEM_TLS: &str = "tls";
+const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const EVENT_TLS_HANDSHAKE_FAILED: &str = "tls_handshake_failed";
 const EVENT_HTTP_TRANSPORT_CLOSED: &str = "http_transport_closed";
 const EVENT_HTTP_TRANSPORT_FAILED: &str = "http_transport_failed";
+const EVENT_SOCKET_FALLBACK: &str = "socket_fallback";
+const EVENT_HTTP_BIND_FAILED: &str = "http_bind_failed";
+const EVENT_HTTP_STARTUP_ENDPOINTS: &str = "http_startup_endpoints";
+const EVENT_HTTP_HOST_ROUTING: &str = "http_host_routing";
+const EVENT_HTTP_COMPRESSION_STATE: &str = "http_compression_state";
+const EVENT_HTTP_TRANSPORT_PARAMETERS: &str = "http_transport_parameters";
+const EVENT_HTTP_ACCEPT_LOOP_STATE: &str = "http_accept_loop_state";
+const EVENT_HTTP_CONNECTION_DRAIN: &str = "http_connection_drain";
+const EVENT_PEER_ADDR_UNAVAILABLE: &str = "peer_addr_unavailable";
+const EVENT_RPC_SIGNATURE_VERIFICATION_FAILED: &str = "rpc_signature_verification_failed";
+const EVENT_GRPC_TRACE_CONTEXT_PROPAGATION_FAILED: &str = "grpc_trace_context_propagation_failed";
 
 static ACTIVE_HTTP_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
@@ -223,7 +235,15 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
         ) {
             Ok(s) => s,
             Err(e) => {
-                warn!("Failed to create socket for {:?}: {}, falling back to IPv4", server_addr, e);
+                warn!(
+                    event = EVENT_SOCKET_FALLBACK,
+                    component = LOG_COMPONENT_SERVER,
+                    subsystem = LOG_SUBSYSTEM_STARTUP,
+                    from_addr = %server_addr,
+                    fallback = "ipv4",
+                    error = %e,
+                    "Socket creation fell back to IPv4"
+                );
                 let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
                 server_addr = ipv4_addr;
                 socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?
@@ -235,7 +255,15 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
         if server_addr.is_ipv6()
             && let Err(e) = socket.set_only_v6(false)
         {
-            warn!("Failed to set IPV6_V6ONLY=false, attempting IPv4 fallback: {}", e);
+            warn!(
+                event = EVENT_SOCKET_FALLBACK,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                from_addr = %server_addr,
+                fallback = "ipv4",
+                error = %e,
+                "Dual-stack socket setup fell back to IPv4"
+            );
             let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
             server_addr = ipv4_addr;
             socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
@@ -258,7 +286,14 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
             // 2. Enable SO_REUSEPORT for better multi-core scalability on supported platforms
             #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
             if let Err(e) = socket.set_reuse_port(true) {
-                debug!("Failed to set SO_REUSEPORT: {}", e);
+                debug!(
+                    event = "socket_option_unavailable",
+                    component = LOG_COMPONENT_SERVER,
+                    subsystem = LOG_SUBSYSTEM_STARTUP,
+                    option = "SO_REUSEPORT",
+                    error = %e,
+                    "Socket option is unavailable"
+                );
             }
 
             // 3. Set system-level TCP KeepAlive to protect long connections
@@ -275,7 +310,14 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
 
         // Attempt bind; if bind fails for IPv6, try IPv4 fallback once more.
         if let Err(bind_err) = socket.bind(&server_addr.into()) {
-            warn!("Failed to bind to {}: {}.", server_addr, bind_err);
+            warn!(
+                event = EVENT_HTTP_BIND_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                bind_addr = %server_addr,
+                error = %bind_err,
+                "HTTP listener bind failed"
+            );
             if server_addr.is_ipv6() {
                 // Try IPv4 fallback
                 let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
@@ -336,7 +378,13 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
     let local_ip = match rustfs_utils::get_local_ip() {
         Some(ip) => ip,
         None => {
-            warn!("Unable to obtain local IP address, using fallback IP: {}", local_addr.ip());
+            warn!(
+                event = "local_ip_fallback",
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                fallback_ip = %local_addr.ip(),
+                "Falling back to listener IP for startup endpoint logging"
+            );
             local_addr.ip()
         }
     };
@@ -357,18 +405,36 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
 
         info!(
             target: "rustfs::console::startup",
-            "Console WebUI available at: {protocol}://{local_ip_str}:{local_port}/rustfs/console/index.html"
+            event = EVENT_HTTP_STARTUP_ENDPOINTS,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            service = "console",
+            endpoint = %format!("{protocol}://{local_ip_str}:{local_port}/rustfs/console/index.html"),
+            "Startup endpoint available"
         );
         info!(
             target: "rustfs::console::startup",
-            "Console WebUI (localhost): {protocol}://127.0.0.1:{local_port}/rustfs/console/index.html",
-
+            event = EVENT_HTTP_STARTUP_ENDPOINTS,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            service = "console_localhost",
+            endpoint = %format!("{protocol}://127.0.0.1:{local_port}/rustfs/console/index.html"),
+            "Startup endpoint available"
         );
     } else {
-        info!(target: "rustfs::main::startup", "RustFS API: {api_endpoints}  {localhost_endpoint}");
-        info!(target: "rustfs::main::startup", "RustFS Start Time: {now_time}");
-        info!(target: "rustfs::main::startup","For more information, visit https://rustfs.com/docs/");
-        info!(target: "rustfs::main::startup", "To enable the console, restart the server with --console-enable and a valid --console-address.");
+        info!(
+            target: "rustfs::main::startup",
+            event = EVENT_HTTP_STARTUP_ENDPOINTS,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            service = "s3_api",
+            api_endpoint = %api_endpoints,
+            localhost_endpoint = %localhost_endpoint,
+            started_at = %now_time,
+            console_enabled = false,
+            docs_url = "https://rustfs.com/docs/",
+            "Startup endpoints ready"
+        );
     }
 
     // Setup S3 service
@@ -399,7 +465,15 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
                 }
             }
 
-            info!("virtual-hosted-style requests are enabled use domain_name {:?}", &domain_sets);
+            info!(
+                event = EVENT_HTTP_HOST_ROUTING,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_HTTP,
+                state = "enabled",
+                domain_count = domain_sets.len(),
+                domains = ?domain_sets,
+                "Virtual-hosted-style routing configured"
+            );
             b.set_host(MultiDomain::new(domain_sets).map_err(Error::other)?);
         }
 
@@ -409,14 +483,26 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
     // Create shutdown channel
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
     // Create compression configuration from environment variables
-    let compression_config = CompressionConfig::from_env();
+    let compression_config = HttpCompressionConfig::from_env();
     if compression_config.enabled {
         info!(
-            "HTTP response compression enabled: extensions={:?}, mime_patterns={:?}, min_size={} bytes",
-            compression_config.extensions, compression_config.mime_patterns, compression_config.min_size
+            event = EVENT_HTTP_COMPRESSION_STATE,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_HTTP,
+            state = "enabled",
+            extensions = ?compression_config.extensions,
+            mime_patterns = ?compression_config.mime_patterns,
+            min_size_bytes = compression_config.min_size,
+            "HTTP response compression state changed"
         );
     } else {
-        debug!("HTTP response compression is disabled");
+        debug!(
+            event = EVENT_HTTP_COMPRESSION_STATE,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_HTTP,
+            state = "disabled",
+            "HTTP response compression state changed"
+        );
     }
 
     let is_console = config.console_enable;
@@ -460,18 +546,19 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
             rustfs_utils::get_env_usize(rustfs_config::ENV_HTTP1_MAX_BUF_SIZE, rustfs_config::DEFAULT_HTTP1_MAX_BUF_SIZE);
 
         info!(
-            "HTTP transport parameters: h2_stream_window={}, h2_conn_window={}, h2_max_frame={}, \
-             h2_max_header_list={}, h2_max_concurrent_streams={}, h2_keepalive_interval={}s, \
-             h2_keepalive_timeout={}s, http1_header_timeout={}s, http1_max_buf={}",
+            event = EVENT_HTTP_TRANSPORT_PARAMETERS,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_TRANSPORT,
             h2_stream_window,
             h2_conn_window,
             h2_max_frame_size,
             h2_max_header_list_size,
             h2_max_concurrent_streams,
-            h2_keep_alive_interval,
-            h2_keep_alive_timeout,
-            http1_header_read_timeout,
+            h2_keep_alive_interval_secs = h2_keep_alive_interval,
+            h2_keep_alive_timeout_secs = h2_keep_alive_timeout,
+            http1_header_read_timeout_secs = http1_header_read_timeout,
             http1_max_buf_size,
+            "HTTP transport parameters configured"
         );
 
         let mut conn_builder = ConnBuilder::new(TokioExecutor::new());
@@ -500,7 +587,13 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
 
         let http_server = Arc::new(conn_builder);
         let graceful = GracefulShutdown::new();
-        debug!("graceful initiated");
+        debug!(
+            event = EVENT_HTTP_ACCEPT_LOOP_STATE,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_TRANSPORT,
+            state = "started",
+            "HTTP accept loop started"
+        );
 
         loop {
             trace!("Waiting for new connection");
@@ -511,12 +604,25 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
                         res = listener.accept() => match res {
                             Ok(conn) => conn,
                             Err(err) => {
-                                error!("error accepting connection: {err}");
+                                error!(
+                                    event = EVENT_HTTP_ACCEPT_LOOP_STATE,
+                                    component = LOG_COMPONENT_SERVER,
+                                    subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                                    state = "accept_failed",
+                                    error = %err,
+                                    "HTTP accept loop state changed"
+                                );
                                 continue;
                             }
                         },
                         _ = shutdown_rx.recv() => {
-                            info!("Shutdown signal received in worker thread");
+                            info!(
+                                event = EVENT_HTTP_ACCEPT_LOOP_STATE,
+                                component = LOG_COMPONENT_SERVER,
+                                subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                                state = "shutdown_signal_received",
+                                "HTTP accept loop state changed"
+                            );
                             break;
                         }
                     }
@@ -527,12 +633,25 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
                         res = listener.accept() => match res {
                             Ok(conn) => conn,
                             Err(err) => {
-                                error!("error accepting connection: {err}");
+                                error!(
+                                    event = EVENT_HTTP_ACCEPT_LOOP_STATE,
+                                    component = LOG_COMPONENT_SERVER,
+                                    subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                                    state = "accept_failed",
+                                    error = %err,
+                                    "HTTP accept loop state changed"
+                                );
                                 continue;
                             }
                         },
                         _ = shutdown_rx.recv() => {
-                            info!("Shutdown signal received in worker thread");
+                            info!(
+                                event = EVENT_HTTP_ACCEPT_LOOP_STATE,
+                                component = LOG_COMPONENT_SERVER,
+                                subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                                state = "shutdown_signal_received",
+                                "HTTP accept loop state changed"
+                            );
                             break;
                         }
                     }
@@ -581,14 +700,35 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
 
         let active_connections = graceful.count();
         if active_connections > 0 {
-            info!(active_connections, "Draining active HTTP connections before shutdown");
+            info!(
+                event = EVENT_HTTP_CONNECTION_DRAIN,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                state = "draining",
+                active_connections,
+                "HTTP connection drain started"
+            );
         }
         tokio::select! {
             () = graceful.shutdown() => {
-                debug!("Gracefully shutdown!");
+                debug!(
+                    event = EVENT_HTTP_CONNECTION_DRAIN,
+                    component = LOG_COMPONENT_SERVER,
+                    subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                    state = "completed",
+                    "HTTP connection drain completed"
+                );
             },
             () = tokio::time::sleep(Duration::from_secs(10)) => {
-                warn!(active_connections, "Timed out waiting for HTTP connections to drain during shutdown");
+                warn!(
+                    event = EVENT_HTTP_CONNECTION_DRAIN,
+                    component = LOG_COMPONENT_SERVER,
+                    subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                    state = "timeout",
+                    active_connections,
+                    timeout_secs = 10,
+                    "HTTP connection drain timed out"
+                );
             }
         }
     });
@@ -600,7 +740,7 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
 struct ConnectionContext {
     http_server: Arc<ConnBuilder<TokioExecutor>>,
     s3_service: S3Service,
-    compression_config: CompressionConfig,
+    compression_config: HttpCompressionConfig,
     is_console: bool,
     readiness: Arc<GlobalReadiness>,
     /// Pre-computed Keystone auth provider (avoids per-connection OnceLock read).
@@ -726,6 +866,9 @@ fn process_connection(
             Ok(addr) => Some(RemoteAddr(addr)),
             Err(e) => {
                 warn!(
+                    event = EVENT_PEER_ADDR_UNAVAILABLE,
+                    component = LOG_COMPONENT_SERVER,
+                    subsystem = LOG_SUBSYSTEM_HTTP,
                     error = %e,
                     "Failed to obtain peer address; policy evaluation may fall back to a default source IP"
                 );
@@ -939,7 +1082,7 @@ fn process_connection(
             .layer(PropagateRequestIdLayer::x_request_id())
             // Compress responses based on whitelist configuration
             // Only compresses when enabled and matches configured extensions/MIME types
-            .layer(CompressionLayer::new().compress_when(PathAwareCompressionPredicate::new(compression_config)))
+            .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config)))
             .layer(PathCategoryInjectionLayer)
             .layer(S3ErrorMessageCompatLayer)
             .layer(ObjectAttributesEtagFixLayer)
@@ -1084,7 +1227,13 @@ fn handle_connection_error(peer_addr: Option<&str>, err: &(dyn std::error::Error
 #[allow(clippy::result_large_err)]
 fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
     verify_rpc_signature(TONIC_RPC_PREFIX, &Method::GET, req.metadata().as_ref()).map_err(|e| {
-        error!("RPC signature verification failed: {}", e);
+        error!(
+            event = EVENT_RPC_SIGNATURE_VERIFICATION_FAILED,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_HTTP,
+            error = %e,
+            "RPC signature verification failed"
+        );
         Status::unauthenticated("No valid auth token")
     })?;
 
@@ -1099,7 +1248,13 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             "Extracted trace context from incoming gRPC metadata"
         );
         if let Err(e) = tracing::Span::current().set_parent(parent_context) {
-            warn!("Failed to propagate tracing context from gRPC metadata: `{:?}`", e);
+            warn!(
+                event = EVENT_GRPC_TRACE_CONTEXT_PROPAGATION_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_HTTP,
+                error = ?e,
+                "Failed to propagate tracing context from gRPC metadata"
+            );
         }
     }
     Ok(req)

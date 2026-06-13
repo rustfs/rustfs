@@ -50,6 +50,9 @@ use time::OffsetDateTime;
 use tracing::warn;
 use url::form_urlencoded;
 
+const LOG_COMPONENT_ADMIN: &str = "admin";
+const LOG_SUBSYSTEM_POLICY: &str = "policy";
+
 pub fn register_iam_policy_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
         Method::GET,
@@ -113,8 +116,6 @@ pub struct ListCannedPolicies {}
 #[async_trait::async_trait]
 impl Operation for ListCannedPolicies {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle ListCannedPolicies");
-
         let Some(input_cred) = req.credentials else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
@@ -145,7 +146,14 @@ impl Operation for ListCannedPolicies {
         let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
 
         let policies = iam_store.list_polices(&query.bucket).await.map_err(|e| {
-            warn!("list policies failed, e: {:?}", e);
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_POLICY,
+                event = "policy_list_failed",
+                bucket = %query.bucket,
+                error = ?e,
+                "Failed to list canned policies"
+            );
             S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
         })?;
 
@@ -172,8 +180,6 @@ pub struct AddCannedPolicy {}
 #[async_trait::async_trait]
 impl Operation for AddCannedPolicy {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle AddCannedPolicy");
-
         let Some(input_cred) = req.credentials else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
@@ -213,13 +219,27 @@ impl Operation for AddCannedPolicy {
         let policy_bytes = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
-                warn!("get body failed, e: {:?}", e);
+                warn!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_POLICY,
+                    event = "policy_body_read_failed",
+                    policy = %query.name,
+                    error = ?e,
+                    "Failed to read policy request body"
+                );
                 return Err(s3_error!(InvalidRequest, "policy configuration body too large or failed to read"));
             }
         };
 
         let policy = Policy::parse_config(policy_bytes.as_ref()).map_err(|e| {
-            warn!("parse policy failed, e: {:?}", e);
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_POLICY,
+                event = "policy_parse_failed",
+                policy = %query.name,
+                error = ?e,
+                "Failed to parse canned policy"
+            );
             S3Error::with_message(S3ErrorCode::InvalidRequest, e.to_string())
         })?;
 
@@ -229,7 +249,14 @@ impl Operation for AddCannedPolicy {
         let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
 
         let updated_at = iam_store.set_policy(&query.name, policy.clone()).await.map_err(|e| {
-            warn!("set policy failed, e: {:?}", e);
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_POLICY,
+                event = "policy_set_failed",
+                policy = %query.name,
+                error = ?e,
+                "Failed to persist canned policy"
+            );
             S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
         })?;
 
@@ -259,8 +286,6 @@ pub struct InfoCannedPolicy {}
 #[async_trait::async_trait]
 impl Operation for InfoCannedPolicy {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle InfoCannedPolicy");
-
         let Some(input_cred) = req.credentials else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
@@ -300,7 +325,14 @@ impl Operation for InfoCannedPolicy {
         let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
 
         let pd = iam_store.info_policy(&query.name).await.map_err(|e| {
-            warn!("info policy failed, e: {:?}", e);
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_POLICY,
+                event = "policy_info_failed",
+                policy = %query.name,
+                error = ?e,
+                "Failed to load canned policy"
+            );
             S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
         })?;
 
@@ -317,8 +349,6 @@ pub struct RemoveCannedPolicy {}
 #[async_trait::async_trait]
 impl Operation for RemoveCannedPolicy {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle RemoveCannedPolicy");
-
         let Some(input_cred) = req.credentials else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
@@ -353,7 +383,14 @@ impl Operation for RemoveCannedPolicy {
         let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
 
         iam_store.delete_policy(&query.name, true).await.map_err(|e| {
-            warn!("delete policy failed, e: {:?}", e);
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_POLICY,
+                event = "policy_delete_failed",
+                policy = %query.name,
+                error = ?e,
+                "Failed to delete canned policy"
+            );
             S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
         })?;
 
@@ -391,8 +428,6 @@ pub struct SetPolicyForUserOrGroup {}
 #[async_trait::async_trait]
 impl Operation for SetPolicyForUserOrGroup {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle SetPolicyForUserOrGroup");
-
         let Some(input_cred) = req.credentials else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
@@ -435,7 +470,15 @@ impl Operation for SetPolicyForUserOrGroup {
                 }
                 Err(err) => {
                     if !is_err_no_such_user(&err) {
-                        warn!("is temp user failed, e: {:?}", err);
+                        warn!(
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_POLICY,
+                            event = "policy_target_validation_failed",
+                            target = %query.user_or_group,
+                            check = "is_temp_user",
+                            error = ?err,
+                            "Failed to validate policy target"
+                        );
                         return Err(S3Error::with_message(S3ErrorCode::InternalError, err.to_string()));
                     }
                 }
@@ -456,7 +499,15 @@ impl Operation for SetPolicyForUserOrGroup {
             }
         } else {
             iam_store.get_group_description(&query.user_or_group).await.map_err(|e| {
-                warn!("get group description failed, e: {:?}", e);
+                warn!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_POLICY,
+                    event = "policy_target_validation_failed",
+                    target = %query.user_or_group,
+                    check = "group_description",
+                    error = ?e,
+                    "Failed to validate policy target"
+                );
                 iam_error_to_s3_error(e)
             })?;
         }
@@ -465,7 +516,16 @@ impl Operation for SetPolicyForUserOrGroup {
             .policy_db_set(&query.user_or_group, rustfs_iam::store::UserType::Reg, query.is_group, &query.policy_name)
             .await
             .map_err(|e| {
-                warn!("policy db set failed, e: {:?}", e);
+                warn!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_POLICY,
+                    event = "policy_mapping_set_failed",
+                    target = %query.user_or_group,
+                    policy = %query.policy_name,
+                    is_group = query.is_group,
+                    error = ?e,
+                    "Failed to update policy mapping"
+                );
                 S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
             })?;
 
@@ -674,7 +734,14 @@ async fn collect_group_policy_mappings(
 
     for group in groups {
         let group_desc = iam_store.get_group_description(&group).await.map_err(|e| {
-            warn!("get group description failed, e: {:?}", e);
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_POLICY,
+                event = "policy_group_lookup_failed",
+                group = %group,
+                error = ?e,
+                "Failed to load group policy mapping"
+            );
             iam_error_to_s3_error(e)
         })?;
         let policies = split_policy_names(&group_desc.policy);
@@ -715,7 +782,13 @@ async fn handle_builtin_policy_entities(req: S3Request<Body>) -> S3Result<S3Resp
 
     let all_group_policy_mappings = collect_group_policy_mappings(&iam_store, &[]).await?;
     let users = iam_store.list_users().await.map_err(|e| {
-        warn!("list users failed, e: {:?}", e);
+        warn!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_POLICY,
+            event = "policy_user_list_failed",
+            error = ?e,
+            "Failed to list users for policy entities"
+        );
         S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
     })?;
 
@@ -847,7 +920,15 @@ async fn handle_builtin_policy_association(req: S3Request<Body>, is_attach: bool
             Ok((false, _)) => {}
             Err(err) => {
                 if !is_err_no_such_user(&err) {
-                    warn!("is temp user failed, e: {:?}", err);
+                    warn!(
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_POLICY,
+                        event = "policy_target_validation_failed",
+                        target = %assoc_req.user,
+                        check = "is_temp_user",
+                        error = ?err,
+                        "Failed to validate policy association target"
+                    );
                     return Err(S3Error::with_message(S3ErrorCode::InternalError, err.to_string()));
                 }
             }
@@ -866,14 +947,28 @@ async fn handle_builtin_policy_association(req: S3Request<Body>, is_attach: bool
         }
 
         let user_info = iam_store.get_user_info(&assoc_req.user).await.map_err(|e| {
-            warn!("get user info failed, e: {:?}", e);
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_POLICY,
+                event = "policy_user_info_failed",
+                target = %assoc_req.user,
+                error = ?e,
+                "Failed to load policy association target"
+            );
             iam_error_to_s3_error(e)
         })?;
 
         (assoc_req.user, false, direct_user_policy_names(&user_info))
     } else {
         let group_desc = iam_store.get_group_description(&assoc_req.group).await.map_err(|e| {
-            warn!("get group description failed, e: {:?}", e);
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_POLICY,
+                event = "policy_group_lookup_failed",
+                group = %assoc_req.group,
+                error = ?e,
+                "Failed to load policy association target"
+            );
             iam_error_to_s3_error(e)
         })?;
 
@@ -890,7 +985,16 @@ async fn handle_builtin_policy_association(req: S3Request<Body>, is_attach: bool
         .policy_db_set(&target_name, rustfs_iam::store::UserType::Reg, is_group, &updated_policies.join(","))
         .await
         .map_err(|e| {
-            warn!("policy db set failed, e: {:?}", e);
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_POLICY,
+                event = "policy_mapping_set_failed",
+                target = %target_name,
+                policy_count = updated_policies.len(),
+                is_group,
+                error = ?e,
+                "Failed to update policy association"
+            );
             S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
         })?;
 

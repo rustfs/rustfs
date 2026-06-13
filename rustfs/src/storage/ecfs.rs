@@ -52,8 +52,13 @@ use rustfs_utils::http::headers::{
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use std::fmt::Debug;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
+
+const LOG_COMPONENT_STORAGE: &str = "storage";
+const LOG_SUBSYSTEM_OBJECT: &str = "object";
+const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
+const LOG_SUBSYSTEM_TAGGING: &str = "tagging";
 
 #[derive(Debug, Clone)]
 pub struct FS {
@@ -394,7 +399,13 @@ impl S3 for FS {
         validate_table_catalog_object_mutation(&bucket, &object).await?;
 
         let Some(store) = new_object_layer_fn() else {
-            error!("Store not initialized");
+            error!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_TAGGING,
+                event = "object_tagging_store_uninitialized",
+                operation = "delete",
+                "Object tagging operation failed because storage is not initialized"
+            );
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -407,7 +418,15 @@ impl S3 for FS {
         let delete_tags_result = store.delete_object_tags(&bucket, &object, &opts).await;
         Self::record_replication_tagging_metric(&bucket, &object, "DeleteObjectTagging", delete_tags_result.is_err()).await;
         delete_tags_result.map_err(|e| {
-            error!("Failed to delete object tags: {}", e);
+            error!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_TAGGING,
+                event = "object_tagging_delete_failed",
+                bucket = %bucket,
+                object = %object,
+                error = %e,
+                "Failed to delete object tags"
+            );
             ApiError::from(e)
         })?;
 
@@ -698,7 +717,15 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let object_info = store.get_object_info(&bucket, &key, &opts).await.map_err(|e| {
-            error!("get_object_info failed, {}", e.to_string());
+            error!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_OBJECT,
+                event = "object_info_load_failed",
+                bucket = %bucket,
+                object = %key,
+                error = %e,
+                "Failed to load object info"
+            );
             s3_error!(InternalError, "{}", e.to_string())
         })?;
 
@@ -753,7 +780,14 @@ impl S3 for FS {
                         "Object Lock configuration does not exist for this bucket".to_string(),
                     ));
                 }
-                warn!("get_object_lock_config err {:?}", err);
+                warn!(
+                    component = LOG_COMPONENT_STORAGE,
+                    subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
+                    event = "object_lock_config_load_failed",
+                    bucket = %bucket,
+                    error = ?err,
+                    "Failed to load bucket object lock configuration"
+                );
                 return Err(S3Error::with_message(
                     S3ErrorCode::InternalError,
                     "Failed to load Object Lock configuration".to_string(),
@@ -787,7 +821,15 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let object_info = store.get_object_info(&bucket, &key, &opts).await.map_err(|e| {
-            error!("get_object_info failed, {}", e.to_string());
+            error!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_OBJECT,
+                event = "object_info_load_failed",
+                bucket = %bucket,
+                object = %key,
+                error = %e,
+                "Failed to load object info"
+            );
             s3_error!(InternalError, "{}", e.to_string())
         })?;
 
@@ -820,10 +862,16 @@ impl S3 for FS {
         let bucket = req.input.bucket.as_str();
         let object = req.input.key.as_str();
 
-        info!("Starting get_object_tagging for bucket: {}, object: {}", bucket, object);
-
         let Some(store) = new_object_layer_fn() else {
-            error!("Store not initialized");
+            error!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_TAGGING,
+                event = "object_tagging_store_uninitialized",
+                operation = "get",
+                bucket = %bucket,
+                object = %object,
+                "Object tagging operation failed because storage is not initialized"
+            );
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -837,15 +885,39 @@ impl S3 for FS {
         Self::record_replication_tagging_metric(bucket, object, "GetObjectTagging", tags_result.is_err()).await;
         let tags = tags_result.map_err(|e| {
             if is_err_object_not_found(&e) {
-                error!("Object not found: {}", e);
+                debug!(
+                    component = LOG_COMPONENT_STORAGE,
+                    subsystem = LOG_SUBSYSTEM_TAGGING,
+                    event = "object_tagging_not_found",
+                    bucket = %bucket,
+                    object = %object,
+                    error = %e,
+                    "Object tags not found"
+                );
                 return s3_error!(NoSuchKey);
             }
-            error!("Failed to get object tags: {}", e);
+            error!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_TAGGING,
+                event = "object_tagging_get_failed",
+                bucket = %bucket,
+                object = %object,
+                error = %e,
+                "Failed to load object tags"
+            );
             ApiError::from(e).into()
         })?;
 
         let tag_set = decode_tags(tags.as_str());
-        debug!("Decoded tag set: {:?}", tag_set);
+        debug!(
+            component = LOG_COMPONENT_STORAGE,
+            subsystem = LOG_SUBSYSTEM_TAGGING,
+            event = "object_tagging_decoded",
+            bucket = %bucket,
+            object = %object,
+            tag_count = tag_set.len(),
+            "Decoded object tags"
+        );
 
         counter!("rustfs_get_object_tagging_success").increment(1);
         let duration = start_time.elapsed();
