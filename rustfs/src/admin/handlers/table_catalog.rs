@@ -694,7 +694,7 @@ where
         compat_catalog_uri: format!("{TABLE_CATALOG_COMPAT_PREFIX}/{bucket}"),
         credential_vending: CREDENTIAL_VENDING_UNSUPPORTED,
         credential_scope: CREDENTIAL_SCOPE_WAREHOUSE_PREFIX,
-        credential_scope_prefix: warehouse_location.clone(),
+        credential_scope_prefix: warehouse_location,
         catalog_entry_present,
         properties,
     })
