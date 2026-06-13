@@ -62,6 +62,10 @@ use super::{SwiftError, SwiftResult};
 use std::collections::HashSet;
 use tracing::{debug, warn};
 
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SWIFT_SYMLINK: &str = "swift_symlink";
+const EVENT_SWIFT_SYMLINK_STATE: &str = "swift_symlink_state";
+
 /// Maximum symlink follow depth to prevent infinite loops
 const MAX_SYMLINK_DEPTH: u8 = 5;
 
@@ -158,7 +162,15 @@ pub fn extract_symlink_target(headers: &http::HeaderMap) -> SwiftResult<Option<S
             .map_err(|_| SwiftError::BadRequest("Invalid X-Object-Symlink-Target header".to_string()))?;
 
         let target = SymlinkTarget::parse(target_str)?;
-        debug!("Extracted symlink target: container={:?}, object={}", target.container, target.object);
+        debug!(
+            event = EVENT_SWIFT_SYMLINK_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_SYMLINK,
+            state = "target_extracted",
+            container = ?target.container,
+            object = %target.object,
+            "swift symlink state changed"
+        );
         Ok(Some(target))
     } else {
         Ok(None)
@@ -196,10 +208,14 @@ pub fn check_circular_reference(visited: &HashSet<SymlinkPath>, account: &str, c
 
     if visited.contains(&path) {
         warn!(
+            event = EVENT_SWIFT_SYMLINK_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_SYMLINK,
             account = %account,
             container = %container,
             object = %object,
-            "Circular symlink reference detected"
+            result = "circular_reference_detected",
+            "swift symlink state changed"
         );
         return Err(SwiftError::Conflict(format!(
             "Circular symlink reference detected: {}/{}/{}",

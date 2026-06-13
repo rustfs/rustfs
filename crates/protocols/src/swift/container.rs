@@ -27,13 +27,25 @@ use s3s::dto::{Tag, Tagging};
 use sha2::{Digest, Sha256};
 use tracing::{debug, error};
 
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SWIFT_CONTAINER: &str = "swift_container";
+const EVENT_SWIFT_CONTAINER_STORAGE_STATE: &str = "swift_container_storage_state";
+
 /// Sanitize storage layer errors for client responses
 ///
 /// Logs detailed error server-side while returning generic message to client.
 /// This prevents information disclosure vulnerabilities.
 fn sanitize_storage_error<E: std::fmt::Display>(operation: &str, error: E) -> SwiftError {
     // Log detailed error server-side
-    error!("Storage operation '{}' failed: {}", operation, error);
+    error!(
+        event = EVENT_SWIFT_CONTAINER_STORAGE_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SWIFT_CONTAINER,
+        operation = %operation,
+        error = %error,
+        result = "failed",
+        "swift container storage state changed"
+    );
 
     // Return generic error to client
     SwiftError::InternalServerError(format!("{} operation failed", operation))
@@ -246,6 +258,17 @@ pub async fn list_containers(account: &str, credentials: &Credentials) -> SwiftR
         .filter(|info| mapper.bucket_belongs_to_project(&info.name, &project_id))
         .filter_map(|info| bucket_info_to_container(info, &mapper, &project_id))
         .collect();
+
+    debug!(
+        event = EVENT_SWIFT_CONTAINER_STORAGE_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SWIFT_CONTAINER,
+        operation = "list_containers",
+        account = %account,
+        container_count = containers.len(),
+        result = "ok",
+        "swift container storage state changed"
+    );
 
     Ok(containers)
 }

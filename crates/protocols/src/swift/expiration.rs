@@ -57,6 +57,10 @@ use super::{SwiftError, SwiftResult};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SWIFT_EXPIRATION: &str = "swift_expiration";
+const EVENT_SWIFT_EXPIRATION_STATE: &str = "swift_expiration_state";
+
 /// Parse X-Delete-At header value
 ///
 /// Returns Unix timestamp in seconds
@@ -92,7 +96,7 @@ pub fn extract_expiration(headers: &http::HeaderMap) -> SwiftResult<Option<u64>>
         && let Ok(value_str) = delete_after.to_str()
     {
         let delete_at = parse_delete_after(value_str)?;
-        debug!("X-Delete-After: {} seconds -> X-Delete-At: {}", value_str, delete_at);
+        debug!(event = EVENT_SWIFT_EXPIRATION_STATE, component = LOG_COMPONENT_PROTOCOLS, subsystem = LOG_SUBSYSTEM_SWIFT_EXPIRATION, state = "delete_after_parsed", delete_after = %value_str, delete_at, "swift expiration state changed");
         return Ok(Some(delete_at));
     }
 
@@ -101,7 +105,14 @@ pub fn extract_expiration(headers: &http::HeaderMap) -> SwiftResult<Option<u64>>
         && let Ok(value_str) = delete_at.to_str()
     {
         let timestamp = parse_delete_at(value_str)?;
-        debug!("X-Delete-At: {}", timestamp);
+        debug!(
+            event = EVENT_SWIFT_EXPIRATION_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_EXPIRATION,
+            state = "delete_at_parsed",
+            delete_at = timestamp,
+            "swift expiration state changed"
+        );
         return Ok(Some(timestamp));
     }
 
@@ -137,7 +148,14 @@ pub fn validate_expiration(delete_at: u64) -> SwiftResult<()> {
     // Warn if expiration is more than 10 years in the future
     let ten_years = 10 * 365 * 24 * 60 * 60;
     if delete_at > now + ten_years {
-        debug!("X-Delete-At timestamp is more than 10 years in the future: {}", delete_at);
+        debug!(
+            event = EVENT_SWIFT_EXPIRATION_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_EXPIRATION,
+            result = "far_future_timestamp",
+            delete_at,
+            "swift expiration state changed"
+        );
     }
 
     Ok(())
