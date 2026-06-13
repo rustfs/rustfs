@@ -2488,6 +2488,56 @@ pub async fn site_replication_peer_deployment_id_for_endpoint(endpoint: &str) ->
     peer_deployment_id_for_endpoint(&state, endpoint)
 }
 
+/// Fix 1: after persisting a new site-replication state (add or join), enumerate every bucket
+/// that already exists locally, wire up versioning + targets + replication config for each, and
+/// kick a resync toward every remote peer so pre-existing objects back-fill. Errors are logged
+/// but never abort the caller — the admin can run a manual resync if needed.
+async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local_peer: &PeerInfo) {
+    let Some(store) = new_object_layer_fn() else {
+        return;
+    };
+    let buckets = match store.list_bucket(&BucketOptions::default()).await {
+        Ok(b) => b,
+        Err(err) => {
+            warn!(error = ?err, "site replication backfill: failed to list buckets");
+            return;
+        }
+    };
+
+    let resync_id = Uuid::new_v4().to_string();
+    for bucket in &buckets {
+        let name = &bucket.name;
+
+        if let Err(err) = ensure_site_replication_bucket_versioning(name).await {
+            warn!(bucket = %name, error = ?err, "site replication backfill: versioning setup failed");
+            continue;
+        }
+        if let Err(err) = ensure_site_replication_bucket_targets(name, state, local_peer, None).await {
+            warn!(bucket = %name, error = ?err, "site replication backfill: targets setup failed");
+        }
+        if let Err(err) = ensure_site_replication_bucket_replication_config(name, state, local_peer).await {
+            warn!(bucket = %name, error = ?err, "site replication backfill: replication config setup failed");
+        }
+        // Broadcast the bucket to peers so they create it too (idempotent on the peer side).
+        if let Err(err) = site_replication_make_bucket_hook(name, false).await {
+            warn!(bucket = %name, error = ?err, "site replication backfill: make-bucket broadcast failed");
+        }
+        // Kick a resync toward every remote peer so existing objects travel across.
+        for peer in state.peers.values() {
+            if peer.deployment_id == local_peer.deployment_id
+                || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
+            {
+                continue;
+            }
+            let result = start_site_bucket_resync(name, peer, &resync_id).await;
+            if result.status == "failed" {
+                warn!(bucket = %name, peer = %peer.endpoint, detail = %result.err_detail,
+                      "site replication backfill: resync kick failed");
+            }
+        }
+    }
+}
+
 async fn start_site_bucket_resync(bucket: &str, peer: &PeerInfo, resync_id: &str) -> ResyncBucketStatus {
     let mut bucket_status = ResyncBucketStatus {
         bucket: bucket.to_string(),
@@ -3031,6 +3081,12 @@ impl Operation for SiteReplicationAddHandler {
         }
 
         persist_site_replication_state(&state).await?;
+
+        // Fix 1: back-fill pre-existing buckets so objects created before `replicate add`
+        // are not silently left out of replication. Failures are logged but do not abort
+        // the overall add operation — the admin can trigger a manual resync if needed.
+        backfill_existing_buckets_after_add(&state, &local_peer).await;
+
         json_response(&ReplicateAddStatus {
             success: true,
             status: SITE_REPL_ADD_SUCCESS.to_string(),
@@ -3244,6 +3300,9 @@ impl Operation for SRPeerJoinHandler {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| local_peer.name.clone());
         persist_site_replication_state(&state).await?;
+        // Fix 1 (receiving side): ensure the joining peer also sets up replication for any
+        // buckets it already owns so the reverse direction works from the start.
+        backfill_existing_buckets_after_add(&state, &local_peer).await;
         json_response(&SRPeerJoinResponse {
             peer: state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
         })
