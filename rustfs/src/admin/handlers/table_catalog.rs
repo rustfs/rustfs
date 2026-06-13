@@ -43,11 +43,13 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /v1/{prefix}/namespaces",
     "POST /v1/{prefix}/namespaces",
     "GET /v1/{prefix}/namespaces/{namespace}",
+    "HEAD /v1/{prefix}/namespaces/{namespace}",
     "DELETE /v1/{prefix}/namespaces/{namespace}",
     "GET /v1/{prefix}/namespaces/{namespace}/tables",
     "POST /v1/{prefix}/namespaces/{namespace}/tables",
     "POST /v1/{prefix}/namespaces/{namespace}/register",
     "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+    "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}",
     "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}",
     "DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}",
     "PUT /buckets/{warehouse}",
@@ -55,11 +57,13 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /{warehouse}/namespaces",
     "POST /{warehouse}/namespaces",
     "GET /{warehouse}/namespaces/{namespace}",
+    "HEAD /{warehouse}/namespaces/{namespace}",
     "DELETE /{warehouse}/namespaces/{namespace}",
     "GET /{warehouse}/namespaces/{namespace}/tables",
     "POST /{warehouse}/namespaces/{namespace}/tables",
     "POST /{warehouse}/namespaces/{namespace}/register",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}",
+    "HEAD /{warehouse}/namespaces/{namespace}/tables/{table}",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}",
     "DELETE /{warehouse}/namespaces/{namespace}/tables/{table}",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata",
@@ -80,11 +84,13 @@ static GET_TABLE_BUCKET_HANDLER: GetTableBucketHandler = GetTableBucketHandler {
 static LIST_NAMESPACES_HANDLER: RestListNamespacesHandler = RestListNamespacesHandler {};
 static CREATE_NAMESPACE_HANDLER: RestCreateNamespaceHandler = RestCreateNamespaceHandler {};
 static GET_NAMESPACE_HANDLER: RestGetNamespaceHandler = RestGetNamespaceHandler {};
+static NAMESPACE_EXISTS_HANDLER: RestNamespaceExistsHandler = RestNamespaceExistsHandler {};
 static DROP_NAMESPACE_HANDLER: RestDropNamespaceHandler = RestDropNamespaceHandler {};
 static LIST_TABLES_HANDLER: RestListTablesHandler = RestListTablesHandler {};
 static CREATE_TABLE_HANDLER: RestCreateTableHandler = RestCreateTableHandler {};
 static REGISTER_TABLE_HANDLER: RestRegisterTableHandler = RestRegisterTableHandler {};
 static LOAD_TABLE_HANDLER: RestLoadTableHandler = RestLoadTableHandler {};
+static TABLE_EXISTS_HANDLER: RestTableExistsHandler = RestTableExistsHandler {};
 static COMMIT_TABLE_HANDLER: RestCommitTableHandler = RestCommitTableHandler {};
 static DROP_TABLE_HANDLER: RestDropTableHandler = RestDropTableHandler {};
 static GET_TABLE_METADATA_LOCATION_HANDLER: GetTableMetadataLocationHandler = GetTableMetadataLocationHandler {};
@@ -327,6 +333,11 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         AdminOperation(&GET_NAMESPACE_HANDLER),
     )?;
     r.insert(
+        Method::HEAD,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}").as_str(),
+        AdminOperation(&NAMESPACE_EXISTS_HANDLER),
+    )?;
+    r.insert(
         Method::DELETE,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}").as_str(),
         AdminOperation(&DROP_NAMESPACE_HANDLER),
@@ -350,6 +361,11 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         Method::GET,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}").as_str(),
         AdminOperation(&LOAD_TABLE_HANDLER),
+    )?;
+    r.insert(
+        Method::HEAD,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}").as_str(),
+        AdminOperation(&TABLE_EXISTS_HANDLER),
     )?;
     r.insert(
         Method::POST,
@@ -432,6 +448,18 @@ fn build_json_response<T: Serialize>(status: StatusCode, body: &T) -> S3Result<S
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static(JSON_CONTENT_TYPE));
     Ok(S3Response::with_headers((status, Body::from(data)), headers))
+}
+
+fn empty_response(status: StatusCode) -> S3Response<(StatusCode, Body)> {
+    S3Response::new((status, Body::default()))
+}
+
+fn exists_status(exists: bool) -> StatusCode {
+    if exists {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
 }
 
 async fn authorize_table_catalog_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
@@ -1651,6 +1679,18 @@ where
     namespace_response_from_entry(entry)
 }
 
+async fn namespace_exists_status<S>(store: &S, bucket: &str, namespace: &crate::table_catalog::Namespace) -> S3Result<StatusCode>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let exists = store
+        .get_namespace(bucket, &namespace.public_name())
+        .await
+        .map_err(catalog_store_error)?
+        .is_some();
+    Ok(exists_status(exists))
+}
+
 async fn drop_namespace_in_store<S>(store: &S, bucket: &str, namespace: &str) -> S3Result<()>
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
@@ -1760,6 +1800,23 @@ where
     };
     let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
     Ok(load_table_response_from_entry(entry, metadata))
+}
+
+async fn table_exists_status<S>(
+    store: &S,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+) -> S3Result<StatusCode>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let exists = store
+        .load_table(bucket, &namespace.public_name(), table)
+        .await
+        .map_err(catalog_store_error)?
+        .is_some();
+    Ok(exists_status(exists))
 }
 
 async fn get_table_metadata_location_response<S>(
@@ -2125,7 +2182,21 @@ impl Operation for RestDropNamespaceHandler {
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::DeleteTableNamespaceAction).await?;
         let store = table_catalog_store()?;
         drop_namespace_in_store(&store, &warehouse, &namespace.public_name()).await?;
-        Ok(S3Response::new((StatusCode::NO_CONTENT, Body::default())))
+        Ok(empty_response(StatusCode::NO_CONTENT))
+    }
+}
+
+pub struct RestNamespaceExistsHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestNamespaceExistsHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let resource = TableCatalogResource::namespace(&warehouse, &namespace);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableNamespaceAction).await?;
+        let store = table_catalog_store()?;
+        Ok(empty_response(namespace_exists_status(&store, &warehouse, &namespace).await?))
     }
 }
 
@@ -2199,6 +2270,21 @@ impl Operation for RestLoadTableHandler {
     }
 }
 
+pub struct RestTableExistsHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestTableExistsHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableAction).await?;
+        let store = table_catalog_store()?;
+        Ok(empty_response(table_exists_status(&store, &warehouse, &namespace, &table).await?))
+    }
+}
+
 pub struct RestCommitTableHandler {}
 
 #[async_trait::async_trait]
@@ -2229,7 +2315,7 @@ impl Operation for RestDropTableHandler {
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::DeleteTableAction).await?;
         let store = table_catalog_store()?;
         drop_table_in_store(&store, &warehouse, &namespace, &table).await?;
-        Ok(S3Response::new((StatusCode::NO_CONTENT, Body::default())))
+        Ok(empty_response(StatusCode::NO_CONTENT))
     }
 }
 
@@ -2447,13 +2533,20 @@ mod tests {
         );
         assert!(response.overrides.is_empty());
         assert!(response.endpoints.contains(&"GET /v1/{prefix}/namespaces"));
+        assert!(response.endpoints.contains(&"HEAD /v1/{prefix}/namespaces/{namespace}"));
         assert!(
             response
                 .endpoints
                 .contains(&"GET /v1/{prefix}/namespaces/{namespace}/tables/{table}")
         );
+        assert!(
+            response
+                .endpoints
+                .contains(&"HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}")
+        );
         assert!(response.endpoints.contains(&"GET /{warehouse}/namespaces"));
         assert!(response.endpoints.contains(&"POST /{warehouse}/namespaces"));
+        assert!(response.endpoints.contains(&"HEAD /{warehouse}/namespaces/{namespace}"));
         assert!(
             response
                 .endpoints
@@ -2468,6 +2561,11 @@ mod tests {
             response
                 .endpoints
                 .contains(&"GET /{warehouse}/namespaces/{namespace}/tables/{table}")
+        );
+        assert!(
+            response
+                .endpoints
+                .contains(&"HEAD /{warehouse}/namespaces/{namespace}/tables/{table}")
         );
         assert!(
             response
@@ -2495,11 +2593,13 @@ mod tests {
             ("RestListNamespacesHandler", "AdminAction::GetTableNamespaceAction"),
             ("RestCreateNamespaceHandler", "AdminAction::SetTableNamespaceAction"),
             ("RestGetNamespaceHandler", "AdminAction::GetTableNamespaceAction"),
+            ("RestNamespaceExistsHandler", "AdminAction::GetTableNamespaceAction"),
             ("RestDropNamespaceHandler", "AdminAction::DeleteTableNamespaceAction"),
             ("RestListTablesHandler", "AdminAction::GetTableAction"),
             ("RestCreateTableHandler", "AdminAction::CreateTableAction"),
             ("RestRegisterTableHandler", "AdminAction::RegisterTableAction"),
             ("RestLoadTableHandler", "AdminAction::GetTableMetadataAction"),
+            ("RestTableExistsHandler", "AdminAction::GetTableAction"),
             ("RestCommitTableHandler", "AdminAction::CommitTableAction"),
             ("RestDropTableHandler", "AdminAction::DeleteTableAction"),
             ("GetTableMetadataLocationHandler", "AdminAction::GetTableMetadataLocationAction"),
@@ -2530,6 +2630,7 @@ mod tests {
 
         for (handler, action) in [
             ("RestLoadTableHandler", "AdminAction::GetTableMetadataAction"),
+            ("RestTableExistsHandler", "AdminAction::GetTableAction"),
             ("RestCommitTableHandler", "AdminAction::CommitTableAction"),
             ("RestDropTableHandler", "AdminAction::DeleteTableAction"),
             ("GetTableMetadataLocationHandler", "AdminAction::GetTableMetadataLocationAction"),
@@ -2594,11 +2695,13 @@ mod tests {
         let _: &RestListNamespacesHandler = &LIST_NAMESPACES_HANDLER;
         let _: &RestCreateNamespaceHandler = &CREATE_NAMESPACE_HANDLER;
         let _: &RestGetNamespaceHandler = &GET_NAMESPACE_HANDLER;
+        let _: &RestNamespaceExistsHandler = &NAMESPACE_EXISTS_HANDLER;
         let _: &RestDropNamespaceHandler = &DROP_NAMESPACE_HANDLER;
         let _: &RestListTablesHandler = &LIST_TABLES_HANDLER;
         let _: &RestCreateTableHandler = &CREATE_TABLE_HANDLER;
         let _: &RestRegisterTableHandler = &REGISTER_TABLE_HANDLER;
         let _: &RestLoadTableHandler = &LOAD_TABLE_HANDLER;
+        let _: &RestTableExistsHandler = &TABLE_EXISTS_HANDLER;
         let _: &RestCommitTableHandler = &COMMIT_TABLE_HANDLER;
         let _: &RestDropTableHandler = &DROP_TABLE_HANDLER;
         let _: &GetTableMetadataLocationHandler = &GET_TABLE_METADATA_LOCATION_HANDLER;
@@ -2617,11 +2720,13 @@ mod tests {
         assert_operation::<RestListNamespacesHandler>();
         assert_operation::<RestCreateNamespaceHandler>();
         assert_operation::<RestGetNamespaceHandler>();
+        assert_operation::<RestNamespaceExistsHandler>();
         assert_operation::<RestDropNamespaceHandler>();
         assert_operation::<RestListTablesHandler>();
         assert_operation::<RestCreateTableHandler>();
         assert_operation::<RestRegisterTableHandler>();
         assert_operation::<RestLoadTableHandler>();
+        assert_operation::<RestTableExistsHandler>();
         assert_operation::<RestCommitTableHandler>();
         assert_operation::<RestDropTableHandler>();
         assert_operation::<GetTableMetadataLocationHandler>();
@@ -2819,6 +2924,94 @@ mod tests {
             vec!["analytics".to_string(), "daily_events".to_string()]
         );
         assert_eq!(response.identifiers[0].name, "events");
+    }
+
+    #[tokio::test]
+    async fn namespace_exists_status_uses_head_rest_semantics() {
+        let store = TestTableCatalogStore::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+
+        assert_eq!(
+            namespace_exists_status(&store, "warehouse", &namespace)
+                .await
+                .expect("missing namespace check should succeed"),
+            StatusCode::NOT_FOUND
+        );
+
+        create_namespace_response(
+            &store,
+            "warehouse",
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+
+        assert_eq!(
+            namespace_exists_status(&store, "warehouse", &namespace)
+                .await
+                .expect("existing namespace check should succeed"),
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    async fn table_exists_status_uses_head_rest_semantics() {
+        let store = TestTableCatalogStore::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+
+        create_namespace_response(
+            &store,
+            "warehouse",
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+
+        assert_eq!(
+            table_exists_status(&store, "warehouse", &namespace, "events")
+                .await
+                .expect("missing table check should succeed"),
+            StatusCode::NOT_FOUND
+        );
+
+        store
+            .create_table(crate::table_catalog::TableEntry {
+                version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+                table_bucket: "warehouse".to_string(),
+                namespace: namespace.public_name(),
+                table: "events".to_string(),
+                table_id: "table-id".to_string(),
+                table_uuid: "table-uuid".to_string(),
+                format: "ICEBERG".to_string(),
+                format_version: 2,
+                warehouse_location: "s3://warehouse/tables/table-id".to_string(),
+                metadata_location:
+                    ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json"
+                        .to_string(),
+                version_token: "token-v1".to_string(),
+                generation: 1,
+                state: crate::table_catalog::TableCatalogEntryState::Active,
+                properties: BTreeMap::new(),
+                created_at: None,
+                updated_at: None,
+            })
+            .await
+            .expect("table should be created");
+
+        assert_eq!(
+            table_exists_status(&store, "warehouse", &namespace, "events")
+                .await
+                .expect("existing table check should succeed"),
+            StatusCode::NO_CONTENT
+        );
     }
 
     #[test]

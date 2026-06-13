@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Unit tests for the RustFS table catalog PyIceberg smoke helper."""
+
+from __future__ import annotations
+
+import os
+import sys
+import unittest
+from unittest import mock
+
+import pyiceberg_smoke
+
+
+class PyIcebergSmokeConfigTest(unittest.TestCase):
+    def parse_with_args(self, argv: list[str]) -> object:
+        env_keys = [
+            key
+            for key in os.environ
+            if key.startswith("RUSTFS_") or key.startswith("AWS_")
+        ]
+        with mock.patch.object(sys, "argv", ["pyiceberg_smoke.py", *argv]):
+            with mock.patch.dict(os.environ, {key: "" for key in env_keys}, clear=False):
+                for key in env_keys:
+                    os.environ.pop(key, None)
+                return pyiceberg_smoke.parse_args()
+
+    def test_default_profile_uses_canonical_rustfs_catalog_uri(self) -> None:
+        args = self.parse_with_args(["--endpoint", "http://rustfs.local:9000", "--bucket", "lake"])
+
+        self.assertEqual(args.profile, "rustfs")
+        self.assertEqual(args.rest_path, "/iceberg")
+        self.assertEqual(args.rest_signing_name, "s3")
+        self.assertEqual(pyiceberg_smoke.catalog_properties(args)["uri"], "http://rustfs.local:9000/iceberg")
+        self.assertEqual(pyiceberg_smoke.catalog_properties(args)["warehouse"], "lake")
+
+    def test_compat_profile_uses_alias_catalog_and_s3tables_signing_name(self) -> None:
+        args = self.parse_with_args([
+            "--profile",
+            "rustfs-compat",
+            "--endpoint",
+            "https://rustfs.example",
+            "--bucket",
+            "warehouse",
+        ])
+
+        self.assertEqual(args.rest_path, "/_iceberg")
+        self.assertEqual(args.rest_signing_name, "s3tables")
+        self.assertEqual(pyiceberg_smoke.catalog_properties(args)["uri"], "https://rustfs.example/_iceberg")
+
+    def test_vendor_profiles_cover_reference_catalogs(self) -> None:
+        profiles = pyiceberg_smoke.vendor_profiles()
+
+        self.assertIn("rustfs", profiles)
+        self.assertIn("rustfs-compat", profiles)
+        self.assertIn("aws-s3tables", profiles)
+        self.assertIn("minio-aistor", profiles)
+        self.assertIn("cloudflare-r2-data-catalog", profiles)
+        self.assertIn("oss-tables", profiles)
+        self.assertEqual(profiles["minio-aistor"]["rest_signing_name"], "s3tables")
+        self.assertEqual(profiles["cloudflare-r2-data-catalog"]["credential_mode"], "catalog-vended")
+
+    def test_unsupported_inventory_names_stable_boundaries(self) -> None:
+        inventory = pyiceberg_smoke.unsupported_inventory()
+        capabilities = {entry["capability"] for entry in inventory}
+
+        self.assertIn("credential-vending", capabilities)
+        self.assertIn("iceberg-views", capabilities)
+        self.assertIn("background-maintenance-worker", capabilities)
+        for entry in inventory:
+            self.assertIn("status", entry)
+            self.assertIn("roadmap_area", entry)
+
+
+if __name__ == "__main__":
+    unittest.main()
