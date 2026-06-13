@@ -5,18 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-background-controller-harness-and-status`
-- Baseline: `origin/main` at `624de3114398338c80b87c9b452fc70b1d76fa8a`
+- Branch: `overtrue/arch-metrics-runtime-controller-status`
+- Baseline: `origin/main` at `76b375c478a8c2f5c79e62e848156a55915ed769`
 - PR type for this branch: `behavior-change`
-- Runtime behavior changes: none; the allocator reclaim controller/status
-  surface only returns read-only snapshot/reconcile data and never starts,
-  stops, resizes, or wakes workers.
-- Rust code changes: add allocator reclaim status/controller snapshots,
-  reconcile plans with explicit no-op worker mutation, and controller harness
-  tests for memory observability plus allocator reclaim.
+- Runtime behavior changes: none; the metrics runtime controller/status surface
+  only returns read-only snapshot/reconcile data and never starts, stops,
+  resizes, or wakes collectors.
+- Rust code changes: add metrics runtime status/controller snapshots and
+  reconcile plans with explicit no-op worker mutation.
 - CI/script changes: none.
-- Docs changes: record `TEST-BGC-001` harness coverage and the allocator reclaim
-  controller/status slice.
+- Docs changes: record `BGC-006` metrics runtime controller/status scope.
 
 ## Phase 0 Tasks
 
@@ -417,27 +415,37 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     and startup call shape.
   - Verification: focused allocator reclaim tests, compile checks, formatting,
     migration guards, Rust risk scan, and pre-commit quality gate.
+- [x] `BGC-006` Add metrics runtime controller/status surface.
+  - Acceptance: metrics runtime exposes typed desired/status/controller
+    snapshots and a typed reconcile plan that reports observability enablement,
+    collector task count, configured intervals, runtime cancellation, shutdown
+    handle shape, and no-op worker mutation.
+  - Must preserve: existing metrics collector grouping, interval parsing,
+    replication bandwidth tombstone cycles, metrics emission, runtime-token
+    cancellation, and startup call shape.
+  - Verification: focused metrics runtime tests, compile checks, formatting,
+    migration guards, Rust risk scan, and pre-commit quality gate.
 
 ## Next PRs
 
-1. `behavior-change`: add the next low-risk background status surface before
-   broader reconcile work.
-2. `test-only`: add config-reload preservation coverage for scanner/heal/
+1. `test-only`: add config-reload preservation coverage for scanner/heal/
    lifecycle/replication in `TEST-BGC-002`.
+2. `behavior-change`: add another low-risk read-only status surface only after
+   preserving config-reload and shutdown assumptions.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed allocator reclaim follows the established typed desired/status/reconcile shape without adding a generic scheduler, registry, or admin route. |
-| Migration preservation | pass | Confirmed reconcile reports `worker_mutation: none`, preserving enablement, force handling, idle-streak logic, cancellation, and metrics emission behavior. |
+| Quality/architecture | pass | Confirmed metrics runtime follows the established typed desired/status/reconcile shape without adding a generic scheduler, registry, or admin route. |
+| Migration preservation | pass | Confirmed reconcile reports `worker_mutation: none`, preserving collector grouping, interval parsing, tombstone cycles, cancellation, and metrics emission behavior. |
 | Testing/verification | pass | Focused tests, compile checks, formatting, diff hygiene, migration guards, Rust risk scan, and `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `624de3114398338c80b87c9b452fc70b1d76fa8a`:
-- `cargo test -p rustfs allocator_reclaim --lib`; 9 passed.
-- `cargo test -p rustfs memory_observability --lib`; 9 passed.
+Passed on `76b375c478a8c2f5c79e62e848156a55915ed769`:
+- `cargo test -p rustfs-obs metrics_runtime --lib`; 4 passed.
+- `cargo check -p rustfs-obs`.
 - `cargo check -p rustfs --lib`.
 - `cargo fmt --all`.
 - `cargo fmt --all --check`.
@@ -445,20 +453,20 @@ Passed on `624de3114398338c80b87c9b452fc70b1d76fa8a`:
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - `./scripts/check_metrics_migration_refs.sh`.
-- Rust risk scan for changed Rust files; only test `expect` calls and existing
-  internal allocator reclaim `Result<(), String>` helpers matched.
-- `make pre-commit`; all checks passed, including nextest 5874 passed and 111
+- Rust risk scan for changed Rust files; only an existing doc-comment
+  `println!` example and an existing bounded scheduler numeric cast matched.
+- `make pre-commit`; all checks passed, including nextest 5880 passed and 111
   skipped.
 
 Notes:
 - This slice adds reconcile/status data only. It does not apply reconcile output
-  to the running allocator reclaim loop or memory observability sampler.
+  to the running metrics collectors.
 - There is no admin/API exposure in this PR; future controller harness work
   should stay isolated from scanner, heal, lifecycle, and replication.
 
 ## Handoff Notes
 
-- Next migration slice can start another read-only low-risk status surface or
-  `TEST-BGC-002` config-reload preservation coverage.
+- Next migration slice should start `TEST-BGC-002` config-reload preservation
+  coverage before broader controller surfaces.
 - Keep scanner, heal, lifecycle, replication, disk health, and config reload out
   of broad controller movement until dedicated preservation tests exist.

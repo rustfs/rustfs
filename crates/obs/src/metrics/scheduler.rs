@@ -85,6 +85,7 @@ use rustfs_audit::audit_target_metrics;
 use rustfs_ecstore::global::get_global_bucket_monitor;
 use rustfs_notify::{notification_metrics_snapshot, notification_target_metrics};
 use rustfs_utils::get_env_opt_u64;
+use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -99,13 +100,285 @@ const DEFAULT_SYSTEM_METRICS_INTERVAL: Duration = Duration::from_secs(15);
 const ENV_SYSTEM_METRICS_INTERVAL: &str = "RUSTFS_METRICS_SYSTEM_INTERVAL_SEC";
 /// Legacy environment variable for system monitoring interval
 const LEGACY_SYSTEM_METRICS_INTERVAL: &str = "RUSTFS_OBS_METRICS_SYSTEM_INTERVAL_MS";
+const LEGACY_CLUSTER_INTERVAL: &str = "RUSTFS_METRICS_CLUSTER_INTERVAL";
+const LEGACY_BUCKET_INTERVAL: &str = "RUSTFS_METRICS_BUCKET_INTERVAL";
+const LEGACY_NODE_INTERVAL: &str = "RUSTFS_METRICS_NODE_INTERVAL";
+const LEGACY_REPLICATION_BANDWIDTH_INTERVAL: &str = "RUSTFS_METRICS_BUCKET_REPLICATION_BANDWIDTH_INTERVAL";
+const LEGACY_RESOURCE_INTERVAL: &str = "RUSTFS_METRICS_RESOURCE_INTERVAL";
+const LEGACY_AUDIT_INTERVAL: &str = "RUSTFS_METRICS_AUDIT_INTERVAL";
+const LEGACY_NOTIFICATION_INTERVAL: &str = "RUSTFS_METRICS_NOTIFICATION_INTERVAL";
+const LEGACY_DEFAULT_INTERVAL: &str = "RUSTFS_METRICS_DEFAULT_INTERVAL";
 
 /// Default cycles to emit zero for removed replication bandwidth series before letting them expire.
 const DEFAULT_REPL_BW_ZERO_TOMBSTONE_CYCLES: u8 = 3;
 /// Env var that overrides the zero-emission tombstone cycles for removed replication bandwidth series.
 const ENV_REPL_BW_ZERO_TOMBSTONE_CYCLES: &str = "RUSTFS_METRICS_REPL_BW_ZERO_TOMBSTONE_CYCLES";
+const METRICS_RUNTIME_SERVICE_NAME: &str = "metrics_runtime";
+const METRICS_RUNTIME_COLLECTOR_TASKS: u8 = 10;
 
 type ReplBwKey = (String, String); // (bucket, target_arn)
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricsRuntimeServiceState {
+    Disabled,
+    Running,
+    Stopping,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricsRuntimeCancellationSource {
+    RuntimeToken,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricsRuntimeShutdownHandle {
+    RuntimeTokenOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MetricsRuntimeIntervalsSnapshot {
+    pub cluster_interval_secs: u64,
+    pub bucket_interval_secs: u64,
+    pub bucket_replication_bandwidth_interval_secs: u64,
+    pub node_interval_secs: u64,
+    pub resource_interval_secs: u64,
+    pub audit_interval_secs: u64,
+    pub notification_interval_secs: u64,
+    pub system_interval_secs: u64,
+    pub process_interval_secs: u64,
+    pub replication_bandwidth_zero_tombstone_cycles: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MetricsRuntimeStatusSnapshot {
+    pub service: &'static str,
+    pub state: MetricsRuntimeServiceState,
+    pub metrics_enabled: bool,
+    pub collector_tasks: u8,
+    pub intervals: MetricsRuntimeIntervalsSnapshot,
+    pub cancellation_source: MetricsRuntimeCancellationSource,
+    pub shutdown_handle: MetricsRuntimeShutdownHandle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricsRuntimeDesiredState {
+    Disabled,
+    Enabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MetricsRuntimeDesiredSnapshot {
+    pub state: MetricsRuntimeDesiredState,
+    pub collector_tasks: u8,
+    pub intervals: MetricsRuntimeIntervalsSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MetricsRuntimeControllerSnapshot {
+    pub desired: MetricsRuntimeDesiredSnapshot,
+    pub status: MetricsRuntimeStatusSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricsRuntimeWorkerMutation {
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MetricsRuntimeReconcilePlan {
+    pub service: &'static str,
+    pub desired: MetricsRuntimeDesiredSnapshot,
+    pub current_state: MetricsRuntimeServiceState,
+    pub worker_mutation: MetricsRuntimeWorkerMutation,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MetricsRuntimeController;
+
+impl MetricsRuntimeController {
+    pub fn snapshot(&self, token: &CancellationToken) -> MetricsRuntimeControllerSnapshot {
+        metrics_runtime_controller_snapshot(token)
+    }
+
+    pub fn reconcile(&self, token: &CancellationToken) -> MetricsRuntimeReconcilePlan {
+        let snapshot = self.snapshot(token);
+        self.reconcile_snapshot(snapshot)
+    }
+
+    pub fn reconcile_snapshot(&self, snapshot: MetricsRuntimeControllerSnapshot) -> MetricsRuntimeReconcilePlan {
+        MetricsRuntimeReconcilePlan {
+            service: METRICS_RUNTIME_SERVICE_NAME,
+            desired: snapshot.desired,
+            current_state: snapshot.status.state,
+            worker_mutation: MetricsRuntimeWorkerMutation::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MetricsRuntimeConfig {
+    cluster_interval: Duration,
+    bucket_interval: Duration,
+    bucket_replication_bandwidth_interval: Duration,
+    node_interval: Duration,
+    resource_interval: Duration,
+    audit_interval: Duration,
+    notification_interval: Duration,
+    system_interval: Duration,
+    process_interval: Duration,
+    replication_bandwidth_zero_tombstone_cycles: u8,
+}
+
+fn parse_repl_bw_zero_tombstone_cycles() -> u8 {
+    get_env_opt_u64(ENV_REPL_BW_ZERO_TOMBSTONE_CYCLES)
+        .filter(|&v| v > 0)
+        .map(|v| u8::try_from(v).unwrap_or(u8::MAX))
+        .unwrap_or(DEFAULT_REPL_BW_ZERO_TOMBSTONE_CYCLES)
+}
+
+/// Parse metrics interval from environment variables with fallback to default.
+///
+/// Priority: primary_env > legacy_env > default_env > legacy_default > default_value
+fn parse_metrics_interval(primary_env: &str, legacy_env: &str, default_interval: Duration) -> Duration {
+    get_env_opt_u64(primary_env)
+        .or_else(|| get_env_opt_u64(legacy_env))
+        .or_else(|| get_env_opt_u64(ENV_DEFAULT_METRICS_INTERVAL))
+        .or_else(|| get_env_opt_u64(LEGACY_DEFAULT_INTERVAL))
+        .filter(|&v| v > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(default_interval)
+}
+
+fn parse_system_metrics_interval() -> Duration {
+    get_env_opt_u64(ENV_SYSTEM_METRICS_INTERVAL)
+        .or_else(|| get_env_opt_u64(LEGACY_SYSTEM_METRICS_INTERVAL).map(|ms| ms / 1000))
+        .or_else(|| get_env_opt_u64(ENV_DEFAULT_METRICS_INTERVAL))
+        .filter(|&v| v > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_SYSTEM_METRICS_INTERVAL)
+}
+
+fn configured_metrics_runtime_config() -> MetricsRuntimeConfig {
+    let cluster_interval =
+        parse_metrics_interval(ENV_CLUSTER_METRICS_INTERVAL, LEGACY_CLUSTER_INTERVAL, DEFAULT_CLUSTER_METRICS_INTERVAL);
+    let bucket_interval =
+        parse_metrics_interval(ENV_BUCKET_METRICS_INTERVAL, LEGACY_BUCKET_INTERVAL, DEFAULT_BUCKET_METRICS_INTERVAL);
+    let bucket_replication_bandwidth_interval = parse_metrics_interval(
+        ENV_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL,
+        LEGACY_REPLICATION_BANDWIDTH_INTERVAL,
+        DEFAULT_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL,
+    );
+    let node_interval = parse_metrics_interval(ENV_NODE_METRICS_INTERVAL, LEGACY_NODE_INTERVAL, DEFAULT_NODE_METRICS_INTERVAL);
+    let resource_interval =
+        parse_metrics_interval(ENV_RESOURCE_METRICS_INTERVAL, LEGACY_RESOURCE_INTERVAL, DEFAULT_RESOURCE_METRICS_INTERVAL);
+    let audit_interval =
+        parse_metrics_interval(ENV_AUDIT_METRICS_INTERVAL, LEGACY_AUDIT_INTERVAL, DEFAULT_AUDIT_METRICS_INTERVAL);
+    let notification_interval = parse_metrics_interval(
+        ENV_NOTIFICATION_METRICS_INTERVAL,
+        LEGACY_NOTIFICATION_INTERVAL,
+        DEFAULT_NOTIFICATION_METRICS_INTERVAL,
+    );
+    let system_interval = parse_system_metrics_interval();
+    let process_interval = resource_interval.min(system_interval);
+
+    MetricsRuntimeConfig {
+        cluster_interval,
+        bucket_interval,
+        bucket_replication_bandwidth_interval,
+        node_interval,
+        resource_interval,
+        audit_interval,
+        notification_interval,
+        system_interval,
+        process_interval,
+        replication_bandwidth_zero_tombstone_cycles: parse_repl_bw_zero_tombstone_cycles(),
+    }
+}
+
+fn metrics_runtime_intervals_snapshot(config: MetricsRuntimeConfig) -> MetricsRuntimeIntervalsSnapshot {
+    MetricsRuntimeIntervalsSnapshot {
+        cluster_interval_secs: config.cluster_interval.as_secs(),
+        bucket_interval_secs: config.bucket_interval.as_secs(),
+        bucket_replication_bandwidth_interval_secs: config.bucket_replication_bandwidth_interval.as_secs(),
+        node_interval_secs: config.node_interval.as_secs(),
+        resource_interval_secs: config.resource_interval.as_secs(),
+        audit_interval_secs: config.audit_interval.as_secs(),
+        notification_interval_secs: config.notification_interval.as_secs(),
+        system_interval_secs: config.system_interval.as_secs(),
+        process_interval_secs: config.process_interval.as_secs(),
+        replication_bandwidth_zero_tombstone_cycles: config.replication_bandwidth_zero_tombstone_cycles,
+    }
+}
+
+fn build_metrics_runtime_status_snapshot(
+    metrics_enabled: bool,
+    cancellation_requested: bool,
+    config: MetricsRuntimeConfig,
+) -> MetricsRuntimeStatusSnapshot {
+    let state = if !metrics_enabled {
+        MetricsRuntimeServiceState::Disabled
+    } else if cancellation_requested {
+        MetricsRuntimeServiceState::Stopping
+    } else {
+        MetricsRuntimeServiceState::Running
+    };
+
+    MetricsRuntimeStatusSnapshot {
+        service: METRICS_RUNTIME_SERVICE_NAME,
+        state,
+        metrics_enabled,
+        collector_tasks: METRICS_RUNTIME_COLLECTOR_TASKS,
+        intervals: metrics_runtime_intervals_snapshot(config),
+        cancellation_source: MetricsRuntimeCancellationSource::RuntimeToken,
+        shutdown_handle: MetricsRuntimeShutdownHandle::RuntimeTokenOnly,
+    }
+}
+
+fn build_metrics_runtime_desired_snapshot(metrics_enabled: bool, config: MetricsRuntimeConfig) -> MetricsRuntimeDesiredSnapshot {
+    let state = if metrics_enabled {
+        MetricsRuntimeDesiredState::Enabled
+    } else {
+        MetricsRuntimeDesiredState::Disabled
+    };
+
+    MetricsRuntimeDesiredSnapshot {
+        state,
+        collector_tasks: METRICS_RUNTIME_COLLECTOR_TASKS,
+        intervals: metrics_runtime_intervals_snapshot(config),
+    }
+}
+
+fn build_metrics_runtime_controller_snapshot(
+    metrics_enabled: bool,
+    cancellation_requested: bool,
+    config: MetricsRuntimeConfig,
+) -> MetricsRuntimeControllerSnapshot {
+    MetricsRuntimeControllerSnapshot {
+        desired: build_metrics_runtime_desired_snapshot(metrics_enabled, config),
+        status: build_metrics_runtime_status_snapshot(metrics_enabled, cancellation_requested, config),
+    }
+}
+
+pub fn metrics_runtime_status_snapshot(token: &CancellationToken) -> MetricsRuntimeStatusSnapshot {
+    build_metrics_runtime_status_snapshot(
+        crate::observability_metric_enabled(),
+        token.is_cancelled(),
+        configured_metrics_runtime_config(),
+    )
+}
+
+pub fn metrics_runtime_controller_snapshot(token: &CancellationToken) -> MetricsRuntimeControllerSnapshot {
+    build_metrics_runtime_controller_snapshot(
+        crate::observability_metric_enabled(),
+        token.is_cancelled(),
+        configured_metrics_runtime_config(),
+    )
+}
 
 fn repl_bw_live_keys(stats: &[BucketReplicationBandwidthStats]) -> HashSet<ReplBwKey> {
     stats.iter().map(|s| (s.bucket.clone(), s.target_arn.clone())).collect()
@@ -202,59 +475,14 @@ fn expire_repl_bw_zero_tombstones(monitor_available: bool, zero_tombstones: &mut
 /// - `RUSTFS_METRICS_BUCKET_REPLICATION_BANDWIDTH_INTERVAL`
 /// - `RUSTFS_METRICS_RESOURCE_INTERVAL`
 pub fn init_metrics_runtime(token: CancellationToken) {
-    const LEGACY_CLUSTER_INTERVAL: &str = "RUSTFS_METRICS_CLUSTER_INTERVAL";
-    const LEGACY_BUCKET_INTERVAL: &str = "RUSTFS_METRICS_BUCKET_INTERVAL";
-    const LEGACY_NODE_INTERVAL: &str = "RUSTFS_METRICS_NODE_INTERVAL";
-    const LEGACY_REPLICATION_BANDWIDTH_INTERVAL: &str = "RUSTFS_METRICS_BUCKET_REPLICATION_BANDWIDTH_INTERVAL";
-    const LEGACY_RESOURCE_INTERVAL: &str = "RUSTFS_METRICS_RESOURCE_INTERVAL";
-    const LEGACY_AUDIT_INTERVAL: &str = "RUSTFS_METRICS_AUDIT_INTERVAL";
-    const LEGACY_NOTIFICATION_INTERVAL: &str = "RUSTFS_METRICS_NOTIFICATION_INTERVAL";
-    const LEGACY_DEFAULT_INTERVAL: &str = "RUSTFS_METRICS_DEFAULT_INTERVAL";
-
-    fn parse_repl_bw_zero_tombstone_cycles() -> u8 {
-        get_env_opt_u64(ENV_REPL_BW_ZERO_TOMBSTONE_CYCLES)
-            .filter(|&v| v > 0)
-            .map(|v| v.min(u8::MAX as u64) as u8)
-            .unwrap_or(DEFAULT_REPL_BW_ZERO_TOMBSTONE_CYCLES)
-    }
-
-    /// Parse metrics interval from environment variables with fallback to default.
-    ///
-    /// Priority: primary_env > legacy_env > default_env > legacy_default > default_value
-    fn parse_metrics_interval(primary_env: &str, legacy_env: &str, default_interval: Duration) -> Duration {
-        get_env_opt_u64(primary_env)
-            .or_else(|| get_env_opt_u64(legacy_env))
-            .or_else(|| get_env_opt_u64(ENV_DEFAULT_METRICS_INTERVAL))
-            .or_else(|| get_env_opt_u64(LEGACY_DEFAULT_INTERVAL))
-            .filter(|&v| v > 0)
-            .map(Duration::from_secs)
-            .unwrap_or(default_interval)
-    }
-
-    // Read intervals from environment or use defaults
-    let cluster_interval =
-        parse_metrics_interval(ENV_CLUSTER_METRICS_INTERVAL, LEGACY_CLUSTER_INTERVAL, DEFAULT_CLUSTER_METRICS_INTERVAL);
-
-    let bucket_interval =
-        parse_metrics_interval(ENV_BUCKET_METRICS_INTERVAL, LEGACY_BUCKET_INTERVAL, DEFAULT_BUCKET_METRICS_INTERVAL);
-
-    let bucket_replication_bandwidth_interval = parse_metrics_interval(
-        ENV_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL,
-        LEGACY_REPLICATION_BANDWIDTH_INTERVAL,
-        DEFAULT_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL,
-    );
-
-    let node_interval = parse_metrics_interval(ENV_NODE_METRICS_INTERVAL, LEGACY_NODE_INTERVAL, DEFAULT_NODE_METRICS_INTERVAL);
-
-    let resource_interval =
-        parse_metrics_interval(ENV_RESOURCE_METRICS_INTERVAL, LEGACY_RESOURCE_INTERVAL, DEFAULT_RESOURCE_METRICS_INTERVAL);
-    let audit_interval =
-        parse_metrics_interval(ENV_AUDIT_METRICS_INTERVAL, LEGACY_AUDIT_INTERVAL, DEFAULT_AUDIT_METRICS_INTERVAL);
-    let notification_interval = parse_metrics_interval(
-        ENV_NOTIFICATION_METRICS_INTERVAL,
-        LEGACY_NOTIFICATION_INTERVAL,
-        DEFAULT_NOTIFICATION_METRICS_INTERVAL,
-    );
+    let config = configured_metrics_runtime_config();
+    let cluster_interval = config.cluster_interval;
+    let bucket_interval = config.bucket_interval;
+    let bucket_replication_bandwidth_interval = config.bucket_replication_bandwidth_interval;
+    let node_interval = config.node_interval;
+    let resource_interval = config.resource_interval;
+    let audit_interval = config.audit_interval;
+    let notification_interval = config.notification_interval;
 
     // Spawn task for cluster metrics
     let token_clone = token.clone();
@@ -360,7 +588,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     let token_clone = token.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(bucket_replication_bandwidth_interval);
-        let repl_bw_zero_tombstone_cycles = parse_repl_bw_zero_tombstone_cycles();
+        let repl_bw_zero_tombstone_cycles = config.replication_bandwidth_zero_tombstone_cycles;
         let mut prev_live_keys: HashSet<ReplBwKey> = HashSet::new();
         let mut zero_tombstones: HashMap<ReplBwKey, u8> = HashMap::new();
         let mut has_seen_valid_snapshot = false;
@@ -498,18 +726,13 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     });
 
     // Spawn task for system monitoring metrics (migrated from rustfs-obs::system)
-    let system_interval = get_env_opt_u64(ENV_SYSTEM_METRICS_INTERVAL)
-        .or_else(|| get_env_opt_u64(LEGACY_SYSTEM_METRICS_INTERVAL).map(|ms| ms / 1000)) // Convert ms to seconds
-        .or_else(|| get_env_opt_u64(ENV_DEFAULT_METRICS_INTERVAL))
-        .filter(|&v| v > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_SYSTEM_METRICS_INTERVAL);
+    let system_interval = config.system_interval;
 
     let token_clone = token.clone();
     tokio::spawn(async move {
         let labels = current_process_metric_labels();
         let mut host_system = System::new_all();
-        let process_interval = resource_interval.min(system_interval);
+        let process_interval = config.process_interval;
         let mut interval = tokio::time::interval(process_interval);
         let now = Instant::now();
         let mut next_resource_run = now;
@@ -687,6 +910,21 @@ mod tests {
     use std::time::Duration;
     use tokio::time::Instant;
 
+    fn fixed_metrics_runtime_config() -> MetricsRuntimeConfig {
+        MetricsRuntimeConfig {
+            cluster_interval: Duration::from_secs(60),
+            bucket_interval: Duration::from_secs(300),
+            bucket_replication_bandwidth_interval: Duration::from_secs(30),
+            node_interval: Duration::from_secs(60),
+            resource_interval: Duration::from_secs(15),
+            audit_interval: Duration::from_secs(45),
+            notification_interval: Duration::from_secs(20),
+            system_interval: Duration::from_secs(10),
+            process_interval: Duration::from_secs(10),
+            replication_bandwidth_zero_tombstone_cycles: 3,
+        }
+    }
+
     fn repl_bw_key(bucket: &str, target_arn: &str) -> ReplBwKey {
         (bucket.to_string(), target_arn.to_string())
     }
@@ -695,6 +933,60 @@ mod tests {
         keys.iter()
             .map(|(bucket, target_arn)| repl_bw_key(bucket, target_arn))
             .collect()
+    }
+
+    #[test]
+    fn metrics_runtime_status_reports_disabled_state() {
+        let snapshot = build_metrics_runtime_status_snapshot(false, false, fixed_metrics_runtime_config());
+
+        assert_eq!(snapshot.service, METRICS_RUNTIME_SERVICE_NAME);
+        assert_eq!(snapshot.state, MetricsRuntimeServiceState::Disabled);
+        assert!(!snapshot.metrics_enabled);
+        assert_eq!(snapshot.collector_tasks, METRICS_RUNTIME_COLLECTOR_TASKS);
+        assert_eq!(snapshot.intervals.cluster_interval_secs, 60);
+        assert_eq!(snapshot.intervals.bucket_interval_secs, 300);
+        assert_eq!(snapshot.intervals.process_interval_secs, 10);
+        assert_eq!(snapshot.intervals.replication_bandwidth_zero_tombstone_cycles, 3);
+        assert_eq!(snapshot.cancellation_source, MetricsRuntimeCancellationSource::RuntimeToken);
+        assert_eq!(snapshot.shutdown_handle, MetricsRuntimeShutdownHandle::RuntimeTokenOnly);
+    }
+
+    #[test]
+    fn metrics_runtime_status_reports_running_and_stopping_states() {
+        let running = build_metrics_runtime_status_snapshot(true, false, fixed_metrics_runtime_config());
+        let stopping = build_metrics_runtime_status_snapshot(true, true, fixed_metrics_runtime_config());
+
+        assert_eq!(running.state, MetricsRuntimeServiceState::Running);
+        assert_eq!(stopping.state, MetricsRuntimeServiceState::Stopping);
+        assert!(running.metrics_enabled);
+        assert!(stopping.metrics_enabled);
+    }
+
+    #[test]
+    fn metrics_runtime_controller_reconcile_is_idempotent() {
+        let controller = MetricsRuntimeController;
+        let snapshot = build_metrics_runtime_controller_snapshot(true, false, fixed_metrics_runtime_config());
+
+        let first = controller.reconcile_snapshot(snapshot);
+        let second = controller.reconcile_snapshot(snapshot);
+
+        assert_eq!(first, second);
+        assert_eq!(first.service, METRICS_RUNTIME_SERVICE_NAME);
+        assert_eq!(first.desired.state, MetricsRuntimeDesiredState::Enabled);
+        assert_eq!(first.current_state, MetricsRuntimeServiceState::Running);
+        assert_eq!(first.worker_mutation, MetricsRuntimeWorkerMutation::None);
+    }
+
+    #[test]
+    fn metrics_runtime_controller_reports_disabled_without_worker_mutation() {
+        let controller = MetricsRuntimeController;
+        let snapshot = build_metrics_runtime_controller_snapshot(false, false, fixed_metrics_runtime_config());
+        let plan = controller.reconcile_snapshot(snapshot);
+
+        assert_eq!(snapshot.desired.state, MetricsRuntimeDesiredState::Disabled);
+        assert_eq!(snapshot.status.state, MetricsRuntimeServiceState::Disabled);
+        assert_eq!(plan.current_state, MetricsRuntimeServiceState::Disabled);
+        assert_eq!(plan.worker_mutation, MetricsRuntimeWorkerMutation::None);
     }
 
     #[test]
