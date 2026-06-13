@@ -41,6 +41,9 @@ use std::time::Duration;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
+const LOG_COMPONENT_TLS: &str = "tls";
+const LOG_SUBSYSTEM_TLS: &str = "tls_material";
+
 /// System CA certificate search paths (platform-specific).
 const SYSTEM_CA_PATHS: &[&str] = &[
     "/etc/ssl/certs/ca-certificates.crt",                  // Debian/Ubuntu/Alpine
@@ -98,7 +101,13 @@ pub(crate) async fn build_acceptor_from_loaded(
     match server {
         Some(RuntimeServerTlsMaterial::SingleCert { certs, key }) => {
             let config = build_server_config(ServerCertSource::SingleCert { certs, key }, mtls_verifier)?;
-            info!("Created TLS acceptor with root single certificate");
+            info!(
+                component = LOG_COMPONENT_TLS,
+                subsystem = LOG_SUBSYSTEM_TLS,
+                event = "tls_acceptor_created",
+                mode = "single_cert",
+                "TLS acceptor created"
+            );
             let acceptor = Arc::new(TlsAcceptor::from(Arc::new(config)));
             Ok(Some(Arc::new(TlsAcceptorHolder::new(acceptor))))
         }
@@ -106,7 +115,13 @@ pub(crate) async fn build_acceptor_from_loaded(
             let resolver = create_multi_cert_resolver(cert_key_pairs)
                 .map_err(|e| TlsMaterialError::Parse(format!("build multi-cert resolver: {e}")))?;
             let config = build_server_config(ServerCertSource::Resolver(Arc::new(resolver)), mtls_verifier)?;
-            info!("Created TLS acceptor with SNI resolver");
+            info!(
+                component = LOG_COMPONENT_TLS,
+                subsystem = LOG_SUBSYSTEM_TLS,
+                event = "tls_acceptor_created",
+                mode = "sni_resolver",
+                "TLS acceptor created"
+            );
             let acceptor = Arc::new(TlsAcceptor::from(Arc::new(config)));
             Ok(Some(Arc::new(TlsAcceptorHolder::new(acceptor))))
         }
@@ -126,7 +141,13 @@ async fn enrich_outbound(outbound: &mut rustfs_tls_runtime::OutboundTlsMaterial,
     if get_env_bool(ENV_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_LEAF_CERT_AS_CA)
         && load_cert_file_by_name(tls_dir, RUSTFS_TLS_CERT, &mut outbound.root_ca_pem).await
     {
-        info!("Loaded leaf certificate(s) as root CA as per RUSTFS_TRUST_LEAF_CERT_AS_CA");
+        info!(
+            component = LOG_COMPONENT_TLS,
+            subsystem = LOG_SUBSYSTEM_TLS,
+            event = "tls_root_ca_enriched",
+            source = "leaf_certificate",
+            "TLS root CA set enriched"
+        );
     }
 
     // 2. Optional: load system root CAs
@@ -135,15 +156,36 @@ async fn enrich_outbound(outbound: &mut rustfs_tls_runtime::OutboundTlsMaterial,
         for path in SYSTEM_CA_PATHS {
             if load_cert_file(Path::new(path), &mut outbound.root_ca_pem, "system root certificates").await {
                 system_loaded = true;
-                info!("Loaded system root certificates from {}", path);
+                info!(
+                    component = LOG_COMPONENT_TLS,
+                    subsystem = LOG_SUBSYSTEM_TLS,
+                    event = "tls_root_ca_enriched",
+                    source = "system_roots",
+                    path,
+                    "TLS root CA set enriched"
+                );
                 break;
             }
         }
         if !system_loaded {
-            debug!("Could not find system root certificates in common locations.");
+            debug!(
+                component = LOG_COMPONENT_TLS,
+                subsystem = LOG_SUBSYSTEM_TLS,
+                event = "tls_root_ca_enriched",
+                source = "system_roots",
+                state = "not_found",
+                "No system root certificates were loaded"
+            );
         }
     } else {
-        info!("Loading system root certificates disabled via RUSTFS_TRUST_SYSTEM_CA");
+        info!(
+            component = LOG_COMPONENT_TLS,
+            subsystem = LOG_SUBSYSTEM_TLS,
+            event = "tls_root_ca_enriched",
+            source = "system_roots",
+            state = "disabled",
+            "System root CA loading disabled"
+        );
     }
 
     // 3. Optional: override mTLS identity from env-var paths
@@ -177,8 +219,13 @@ async fn load_mtls_identity_from_overridden_paths(
 
     if !client_cert_path.exists() || !client_key_path.exists() {
         info!(
-            "mTLS client identity not configured (missing {:?} and/or {:?}); proceeding with server-only TLS",
-            client_cert_path, client_key_path
+            component = LOG_COMPONENT_TLS,
+            subsystem = LOG_SUBSYSTEM_TLS,
+            event = "mtls_identity_state",
+            state = "not_configured",
+            cert_path = ?client_cert_path,
+            key_path = ?client_key_path,
+            "mTLS client identity not configured"
         );
         return Ok(None);
     }
@@ -197,7 +244,15 @@ async fn load_mtls_identity_from_overridden_paths(
     let mut reader = std::io::Cursor::new(&key_pem);
     PrivateKeyDer::from_pem_reader(&mut reader).map_err(|e| TlsMaterialError::Parse(format!("invalid client key PEM: {e}")))?;
 
-    info!("Loaded mTLS client identity cert={:?} key={:?}", client_cert_path, client_key_path);
+    info!(
+        component = LOG_COMPONENT_TLS,
+        subsystem = LOG_SUBSYSTEM_TLS,
+        event = "mtls_identity_state",
+        state = "loaded",
+        cert_path = ?client_cert_path,
+        key_path = ?client_key_path,
+        "mTLS client identity loaded"
+    );
     Ok(Some(MtlsIdentityPem { cert_pem, key_pem }))
 }
 
@@ -216,18 +271,43 @@ fn map_runtime_tls_error(err: rustfs_tls_runtime::TlsRuntimeError) -> TlsMateria
 /// Returns true if the file was successfully loaded.
 async fn load_cert_file(path: &Path, pem_data: &mut Vec<u8>, desc: &str) -> bool {
     if tokio::fs::metadata(path).await.is_err() {
-        debug!("{} file not found at {:?}", desc, path);
+        debug!(
+            component = LOG_COMPONENT_TLS,
+            subsystem = LOG_SUBSYSTEM_TLS,
+            event = "tls_material_file_state",
+            description = desc,
+            path = ?path,
+            state = "missing",
+            "TLS material file state changed"
+        );
         return false;
     }
     match tokio::fs::read(path).await {
         Ok(data) => {
             pem_data.extend_from_slice(&data);
             pem_data.push(b'\n');
-            info!("Loaded {} from {:?}", desc, path);
+            info!(
+                component = LOG_COMPONENT_TLS,
+                subsystem = LOG_SUBSYSTEM_TLS,
+                event = "tls_material_file_state",
+                description = desc,
+                path = ?path,
+                state = "loaded",
+                "TLS material file state changed"
+            );
             true
         }
         Err(e) => {
-            debug!("Failed to read {} from {:?}: {}", desc, path, e);
+            debug!(
+                component = LOG_COMPONENT_TLS,
+                subsystem = LOG_SUBSYSTEM_TLS,
+                event = "tls_material_file_state",
+                description = desc,
+                path = ?path,
+                state = "read_failed",
+                error = %e,
+                "TLS material file state changed"
+            );
             false
         }
     }
@@ -238,7 +318,14 @@ async fn load_cert_file(path: &Path, pem_data: &mut Vec<u8>, desc: &str) -> bool
 /// Returns `true` if at least one matching file was loaded.
 async fn load_cert_file_by_name(dir: &Path, cert_name: &str, pem_data: &mut Vec<u8>) -> bool {
     let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
-        debug!("Certificate directory not found: {}", dir.display());
+        debug!(
+            component = LOG_COMPONENT_TLS,
+            subsystem = LOG_SUBSYSTEM_TLS,
+            event = "tls_material_directory_state",
+            path = %dir.display(),
+            state = "missing",
+            "TLS material directory state changed"
+        );
         return false;
     };
 
@@ -421,14 +508,28 @@ impl TlsAcceptorHolder {
 pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>) {
     let enabled = get_env_bool(ENV_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_ENABLE);
     if !enabled {
-        debug!("TLS certificate hot reload is disabled (set {}=1 to enable)", ENV_TLS_RELOAD_ENABLE);
+        debug!(
+            component = LOG_COMPONENT_TLS,
+            subsystem = LOG_SUBSYSTEM_TLS,
+            event = "tls_reload_state",
+            state = "disabled",
+            env_var = ENV_TLS_RELOAD_ENABLE,
+            "TLS reload state changed"
+        );
         return;
     }
 
     let interval_secs = rustfs_utils::get_env_u64(ENV_TLS_RELOAD_INTERVAL, DEFAULT_TLS_RELOAD_INTERVAL).max(5);
     let tls_source = TlsSource::from_directory(&tls_path);
 
-    info!("TLS certificate hot reload enabled, checking every {}s", interval_secs);
+    info!(
+        component = LOG_COMPONENT_TLS,
+        subsystem = LOG_SUBSYSTEM_TLS,
+        event = "tls_reload_state",
+        state = "enabled",
+        interval_secs,
+        "TLS reload state changed"
+    );
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
@@ -440,7 +541,14 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
                 Ok(mut snapshot) => {
                     if let Err(e) = enrich_outbound(&mut snapshot.outbound, &tls_dir).await {
                         record_tls_reload_result("rustfs_server_reload_loop", "enrich_err", None, None);
-                        warn!("TLS outbound enrichment failed (will retry): {}", e);
+                        warn!(
+                            component = LOG_COMPONENT_TLS,
+                            subsystem = LOG_SUBSYSTEM_TLS,
+                            event = "tls_reload_failed",
+                            stage = "enrich_outbound",
+                            error = %e,
+                            "TLS reload failed"
+                        );
                         continue;
                     }
 
@@ -448,28 +556,64 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
                     publish_global_outbound_tls_state(TlsGeneration(generation), &snapshot.outbound).await;
                     record_tls_generation("rustfs_server_reload_loop", generation);
                     if !snapshot.outbound.root_ca_pem.is_empty() {
-                        info!("Configured custom root certificates for inter-node communication");
+                        info!(
+                            component = LOG_COMPONENT_TLS,
+                            subsystem = LOG_SUBSYSTEM_TLS,
+                            event = "tls_root_ca_enriched",
+                            source = "reload_snapshot",
+                            generation,
+                            "TLS root CA set updated"
+                        );
                     }
 
                     match build_acceptor_from_loaded(snapshot.server, &tls_dir).await {
                         Ok(Some(new_holder)) => {
-                            info!("TLS certificates reloaded successfully");
+                            info!(
+                                component = LOG_COMPONENT_TLS,
+                                subsystem = LOG_SUBSYSTEM_TLS,
+                                event = "tls_reload_state",
+                                state = "reloaded",
+                                generation,
+                                "TLS reload state changed"
+                            );
                             holder.swap(&new_holder);
                             record_tls_reload_result("rustfs_server_reload_loop", "ok", None, Some(generation));
                         }
                         Ok(None) => {
                             record_tls_reload_skipped("rustfs_server_reload_loop", "no_acceptor");
-                            warn!("TLS reload returned no acceptor despite configured TLS path; keeping previous acceptor")
+                            warn!(
+                                component = LOG_COMPONENT_TLS,
+                                subsystem = LOG_SUBSYSTEM_TLS,
+                                event = "tls_reload_failed",
+                                stage = "build_acceptor",
+                                reason = "no_acceptor",
+                                "TLS reload returned no acceptor"
+                            )
                         }
                         Err(e) => {
                             record_tls_reload_result("rustfs_server_reload_loop", "acceptor_err", None, Some(generation));
-                            warn!("TLS certificate reload failed (will retry): {}", e)
+                            warn!(
+                                component = LOG_COMPONENT_TLS,
+                                subsystem = LOG_SUBSYSTEM_TLS,
+                                event = "tls_reload_failed",
+                                stage = "build_acceptor",
+                                error = %e,
+                                generation,
+                                "TLS reload failed"
+                            )
                         }
                     }
                 }
                 Err(e) => {
                     record_tls_reload_result("rustfs_server_reload_loop", "load_err", None, None);
-                    warn!("TLS material reload failed (will retry): {}", e);
+                    warn!(
+                        component = LOG_COMPONENT_TLS,
+                        subsystem = LOG_SUBSYSTEM_TLS,
+                        event = "tls_reload_failed",
+                        stage = "load_snapshot",
+                        error = %e,
+                        "TLS reload failed"
+                    );
                 }
             }
         }

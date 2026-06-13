@@ -85,6 +85,9 @@ use std::sync::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+const LOG_COMPONENT_EMBEDDED: &str = "embedded";
+const LOG_SUBSYSTEM_EMBEDDED: &str = "embedded";
+
 /// Tracks whether a server has been started in this process.
 static SERVER_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -299,7 +302,14 @@ impl RustFSServerBuilder {
 
         // Crypto provider.
         if let Err(err) = default_provider().install_default() {
-            debug!("Ignoring crypto provider installation error: {err:?}");
+            debug!(
+                component = LOG_COMPONENT_EMBEDDED,
+                subsystem = LOG_SUBSYSTEM_EMBEDDED,
+                event = "crypto_provider_state",
+                state = "already_installed",
+                error = ?err,
+                "Embedded crypto provider state changed"
+            );
         }
 
         // Trusted proxies.
@@ -370,7 +380,14 @@ impl RustFSServerBuilder {
         let store = match ECStore::new(server_addr, endpoint_pools.clone(), ctx.clone()).await {
             Ok(store) => store,
             Err(e) => {
-                error!("ECStore::new {:?}", e);
+                error!(
+                    component = LOG_COMPONENT_EMBEDDED,
+                    subsystem = LOG_SUBSYSTEM_EMBEDDED,
+                    event = "embedded_storage_init_failed",
+                    stage = "ecstore_new",
+                    error = ?e,
+                    "Embedded storage initialization failed"
+                );
                 shutdown_embedded_server();
                 return Err(ServerError::Init(format!("ECStore: {e}")));
             }
@@ -387,7 +404,15 @@ impl RustFSServerBuilder {
                 shutdown_embedded_server();
                 return Err(ServerError::Init(format!("init_global_config_sys failed after 15 retries: {e}")));
             }
-            debug!("init_global_config_sys retry {retry}: {e}");
+            debug!(
+                component = LOG_COMPONENT_EMBEDDED,
+                subsystem = LOG_SUBSYSTEM_EMBEDDED,
+                event = "embedded_storage_init_retry",
+                stage = "global_config_sys",
+                retry,
+                error = %e,
+                "Embedded storage initialization retry scheduled"
+            );
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
         readiness.mark_stage(SystemStage::StorageReady);
@@ -397,7 +422,14 @@ impl RustFSServerBuilder {
 
         // KMS (optional, non-fatal for embedded).
         if let Err(e) = init_kms_system(&config).await {
-            warn!("KMS initialization skipped: {e}");
+            warn!(
+                component = LOG_COMPONENT_EMBEDDED,
+                subsystem = LOG_SUBSYSTEM_EMBEDDED,
+                event = "embedded_optional_service_skipped",
+                service = "kms",
+                error = %e,
+                "Embedded optional service initialization skipped"
+            );
         }
 
         // Buffer profiles.
@@ -408,7 +440,14 @@ impl RustFSServerBuilder {
 
         // Audit (non-fatal).
         if let Err(e) = start_audit_system().await {
-            warn!("Audit system: {e}");
+            warn!(
+                component = LOG_COMPONENT_EMBEDDED,
+                subsystem = LOG_SUBSYSTEM_EMBEDDED,
+                event = "embedded_optional_service_skipped",
+                service = "audit",
+                error = %e,
+                "Embedded optional service initialization skipped"
+            );
         }
 
         // Bucket listing for metadata + notification init.
@@ -445,7 +484,14 @@ impl RustFSServerBuilder {
 
         // Notification system.
         if let Err(e) = new_global_notification_sys(endpoint_pools.clone()).await {
-            warn!("notification system: {e}");
+            warn!(
+                component = LOG_COMPONENT_EMBEDDED,
+                subsystem = LOG_SUBSYSTEM_EMBEDDED,
+                event = "embedded_optional_service_skipped",
+                service = "notification",
+                error = %e,
+                "Embedded optional service initialization skipped"
+            );
         }
 
         if iam_bootstrap == IamBootstrapDisposition::ReadyInline {
@@ -471,6 +517,10 @@ impl RustFSServerBuilder {
 
         info!(
             target: "rustfs::embedded",
+            component = LOG_COMPONENT_EMBEDDED,
+            subsystem = LOG_SUBSYSTEM_EMBEDDED,
+            event = "embedded_server_state",
+            state = "ready",
             "RustFS embedded server ready at http://{}",
             server.endpoint_address()
         );
@@ -541,7 +591,14 @@ impl RustFSServer {
     }
 
     async fn do_shutdown(&mut self) {
-        info!(target: "rustfs::embedded", "Shutting down embedded RustFS server...");
+        info!(
+            target: "rustfs::embedded",
+            component = LOG_COMPONENT_EMBEDDED,
+            subsystem = LOG_SUBSYSTEM_EMBEDDED,
+            event = "embedded_server_state",
+            state = "stopping",
+            "Embedded server state changed"
+        );
 
         // Cancel background services.
         self.cancel_token.cancel();
@@ -551,7 +608,14 @@ impl RustFSServer {
 
         // Stop the audit system.
         if let Err(e) = stop_audit_system().await {
-            warn!("Failed to stop audit system during shutdown: {e}");
+            warn!(
+                component = LOG_COMPONENT_EMBEDDED,
+                subsystem = LOG_SUBSYSTEM_EMBEDDED,
+                event = "embedded_shutdown_cleanup_failed",
+                service = "audit",
+                error = %e,
+                "Embedded shutdown cleanup failed"
+            );
         }
 
         // Signal HTTP server to stop.
@@ -563,10 +627,25 @@ impl RustFSServer {
         if let Some(ref dir) = self.temp_dir
             && let Err(e) = tokio::fs::remove_dir_all(dir).await
         {
-            warn!("Failed to clean up temp dir {}: {e}", dir.display());
+            warn!(
+                component = LOG_COMPONENT_EMBEDDED,
+                subsystem = LOG_SUBSYSTEM_EMBEDDED,
+                event = "embedded_shutdown_cleanup_failed",
+                service = "temp_dir",
+                path = %dir.display(),
+                error = %e,
+                "Embedded shutdown cleanup failed"
+            );
         }
 
-        info!(target: "rustfs::embedded", "Embedded RustFS server stopped.");
+        info!(
+            target: "rustfs::embedded",
+            component = LOG_COMPONENT_EMBEDDED,
+            subsystem = LOG_SUBSYSTEM_EMBEDDED,
+            event = "embedded_server_state",
+            state = "stopped",
+            "Embedded server state changed"
+        );
     }
 }
 

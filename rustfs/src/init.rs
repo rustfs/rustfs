@@ -28,15 +28,30 @@ use std::env;
 use std::io::Error;
 use tracing::{debug, error, info, instrument, warn};
 
+const LOG_COMPONENT_INIT: &str = "init";
+const LOG_SUBSYSTEM_STARTUP: &str = "startup";
+const LOG_SUBSYSTEM_UPDATE: &str = "update_check";
+const LOG_SUBSYSTEM_NOTIFICATION: &str = "notification";
+const LOG_SUBSYSTEM_KMS: &str = "kms";
+const LOG_SUBSYSTEM_BUFFER: &str = "buffer_profile";
+const LOG_SUBSYSTEM_AUTOTUNER: &str = "autotuner";
+const LOG_SUBSYSTEM_PROTOCOL: &str = "protocol";
+
 #[instrument]
 pub fn print_server_info() {
     let current_year = jiff::Zoned::now().year();
-    // Use custom macros to print server information
-    info!("RustFS Object Storage Server");
-    info!("Copyright: 2024-{} RustFS, Inc", current_year);
-    info!("License: Apache-2.0 https://www.apache.org/licenses/LICENSE-2.0");
-    info!("Version: {}", version::get_version());
-    info!("Docs: https://rustfs.com/docs/");
+    info!(
+        target: "rustfs::init",
+        event = "server_identity",
+        component = LOG_COMPONENT_INIT,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        product = "RustFS Object Storage Server",
+        version = %version::get_version(),
+        copyright_year = current_year,
+        license = "Apache-2.0",
+        docs_url = "https://rustfs.com/docs/",
+        "Server identity loaded"
+    );
 }
 
 /// Initialize the asynchronous update check system.
@@ -63,28 +78,62 @@ pub fn init_update_check() {
                 if result.update_available {
                     if let Some(latest) = &result.latest_version {
                         info!(
-                            "🚀 Version check: New version available: {} -> {} (current: {})",
-                            result.current_version, latest.version, result.current_version
+                            target: "rustfs::init",
+                            event = "update_check_result",
+                            component = LOG_COMPONENT_INIT,
+                            subsystem = LOG_SUBSYSTEM_UPDATE,
+                            result = "update_available",
+                            current_version = %result.current_version,
+                            latest_version = %latest.version,
+                            has_release_notes = latest.release_notes.is_some(),
+                            download_url = latest.download_url.as_deref().unwrap_or_default(),
+                            "Update check completed"
                         );
-                        if let Some(notes) = &latest.release_notes {
-                            info!("📝 Release notes: {}", notes);
-                        }
-                        if let Some(url) = &latest.download_url {
-                            info!("🔗 Download URL: {}", url);
-                        }
                     }
                 } else {
-                    debug!("✅ Version check: Current version is up to date: {}", result.current_version);
+                    debug!(
+                        target: "rustfs::init",
+                        event = "update_check_result",
+                        component = LOG_COMPONENT_INIT,
+                        subsystem = LOG_SUBSYSTEM_UPDATE,
+                        result = "up_to_date",
+                        current_version = %result.current_version,
+                        "Update check completed"
+                    );
                 }
             }
             Ok(Err(UpdateCheckError::HttpError(e))) => {
-                debug!("Version check: network error (this is normal): {}", e);
+                debug!(
+                    target: "rustfs::init",
+                    event = "update_check_result",
+                    component = LOG_COMPONENT_INIT,
+                    subsystem = LOG_SUBSYSTEM_UPDATE,
+                    result = "http_error",
+                    error = %e,
+                    "Update check skipped"
+                );
             }
             Ok(Err(e)) => {
-                debug!("Version check: failed (this is normal): {}", e);
+                debug!(
+                    target: "rustfs::init",
+                    event = "update_check_result",
+                    component = LOG_COMPONENT_INIT,
+                    subsystem = LOG_SUBSYSTEM_UPDATE,
+                    result = "failed",
+                    error = %e,
+                    "Update check failed"
+                );
             }
             Err(_) => {
-                debug!("Version check: timeout after 30 seconds (this is normal)");
+                debug!(
+                    target: "rustfs::init",
+                    event = "update_check_result",
+                    component = LOG_COMPONENT_INIT,
+                    subsystem = LOG_SUBSYSTEM_UPDATE,
+                    result = "timeout",
+                    timeout_secs = 30,
+                    "Update check timed out"
+                );
             }
         }
     });
@@ -113,51 +162,110 @@ pub async fn add_bucket_notification_configuration(buckets: Vec<String>) {
         .map(|r| r.as_str())
         .unwrap_or_else(|| {
             warn!(
-                "Global region is not set; attempting notification configuration for all buckets using default region '{}'.",
-                RUSTFS_REGION
+                target: "rustfs::init",
+                event = "notification_region_fallback",
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                fallback_region = RUSTFS_REGION,
+                "Notification configuration falling back to default region"
             );
             RUSTFS_REGION
         });
     for bucket in buckets.iter() {
         let has_notification_config = metadata_sys::get_notification_config(bucket).await.unwrap_or_else(|err| {
-            warn!("get_notification_config err {:?}", err);
+            warn!(
+                target: "rustfs::init",
+                event = "notification_config_load_failed",
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                bucket = %bucket,
+                error = ?err,
+                "Failed to load bucket notification configuration"
+            );
             None
         });
 
         match has_notification_config {
             Some(cfg) => {
                 info!(
-                    target: "rustfs::main::add_bucket_notification_configuration",
+                    target: "rustfs::init",
+                    event = "notification_config_loaded",
+                    component = LOG_COMPONENT_INIT,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
                     bucket = %bucket,
-                    "Bucket '{}' has existing notification configuration: {:?}", bucket, cfg);
+                    queue_configuration_count = cfg.queue_configurations.as_ref().map_or(0, Vec::len),
+                    topic_configuration_count = cfg.topic_configurations.as_ref().map_or(0, Vec::len),
+                    lambda_configuration_count = cfg.lambda_function_configurations.as_ref().map_or(0, Vec::len),
+                    "Loaded bucket notification configuration"
+                );
 
                 let mut event_rules = Vec::new();
                 if let Err(e) = process_queue_configurations(&mut event_rules, cfg.queue_configurations.clone(), arn_to_target_id)
                 {
-                    error!("Failed to parse queue notification config for bucket '{}': {:?}", bucket, e);
+                    error!(
+                        target: "rustfs::init",
+                        event = "notification_config_parse_failed",
+                        component = LOG_COMPONENT_INIT,
+                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                        bucket = %bucket,
+                        config_type = "queue",
+                        error = ?e,
+                        "Failed to parse bucket notification configuration"
+                    );
                 }
                 if let Err(e) = process_topic_configurations(&mut event_rules, cfg.topic_configurations.clone(), arn_to_target_id)
                 {
-                    error!("Failed to parse topic notification config for bucket '{}': {:?}", bucket, e);
+                    error!(
+                        target: "rustfs::init",
+                        event = "notification_config_parse_failed",
+                        component = LOG_COMPONENT_INIT,
+                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                        bucket = %bucket,
+                        config_type = "topic",
+                        error = ?e,
+                        "Failed to parse bucket notification configuration"
+                    );
                 }
                 if let Err(e) =
                     process_lambda_configurations(&mut event_rules, cfg.lambda_function_configurations.clone(), arn_to_target_id)
                 {
-                    error!("Failed to parse lambda notification config for bucket '{}': {:?}", bucket, e);
+                    error!(
+                        target: "rustfs::init",
+                        event = "notification_config_parse_failed",
+                        component = LOG_COMPONENT_INIT,
+                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                        bucket = %bucket,
+                        config_type = "lambda",
+                        error = ?e,
+                        "Failed to parse bucket notification configuration"
+                    );
                 }
 
                 if let Err(e) = notifier_global::add_event_specific_rules(bucket, region, &event_rules)
                     .await
                     .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))
                 {
-                    error!("Failed to add rules for bucket '{}': {:?}", bucket, e);
+                    error!(
+                        target: "rustfs::init",
+                        event = "notification_rules_registration_failed",
+                        component = LOG_COMPONENT_INIT,
+                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                        bucket = %bucket,
+                        region,
+                        error = ?e,
+                        "Failed to register bucket notification rules"
+                    );
                 }
             }
             None => {
                 info!(
-                    target: "rustfs::main::add_bucket_notification_configuration",
+                    target: "rustfs::init",
+                    event = "notification_config_missing",
+                    component = LOG_COMPONENT_INIT,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
                     bucket = %bucket,
-                    "Bucket '{}' has no existing notification configuration.", bucket);
+                    "Bucket notification configuration not found"
+                );
             }
         }
     }
@@ -266,7 +374,15 @@ async fn configure_and_start_kms(
         .await
         .map_err(|e| Error::other(format!("Failed to start KMS: {e}")))?;
 
-    info!("KMS service configured and started successfully from {}", config_source);
+    info!(
+        target: "rustfs::init",
+        event = "kms_service_state",
+        component = LOG_COMPONENT_INIT,
+        subsystem = LOG_SUBSYSTEM_KMS,
+        state = "started",
+        config_source,
+        "KMS service state changed"
+    );
     Ok(())
 }
 
@@ -287,7 +403,15 @@ pub async fn init_kms_system(config: &config::Config) -> std::io::Result<()> {
 
     // If KMS is enabled in configuration, configure and start the service
     if config.kms_enable {
-        info!("KMS is enabled via command line, configuring and starting service...");
+        info!(
+            target: "rustfs::init",
+            event = "kms_service_state",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_KMS,
+            state = "configuring",
+            config_source = "command_line",
+            "KMS service state changed"
+        );
 
         // Create KMS configuration from command line options
         let kms_config = match config.kms_backend.as_str() {
@@ -300,22 +424,49 @@ pub async fn init_kms_system(config: &config::Config) -> std::io::Result<()> {
         configure_and_start_kms(&service_manager, kms_config, "command line options").await?;
     } else {
         // Try to load persisted KMS configuration from cluster storage
-        info!("Attempting to load persisted KMS configuration from cluster storage...");
+        info!(
+            target: "rustfs::init",
+            event = "kms_persisted_config_lookup",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_KMS,
+            state = "loading",
+            "Loading persisted KMS configuration"
+        );
 
         if let Some(persisted_config) = admin::handlers::kms_dynamic::load_kms_config().await {
-            info!("Found persisted KMS configuration, attempting to configure and start service...");
+            info!(
+                target: "rustfs::init",
+                event = "kms_persisted_config_lookup",
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_KMS,
+                state = "found",
+                "Loaded persisted KMS configuration"
+            );
 
             // Configure the KMS service with persisted config
             match configure_and_start_kms(&service_manager, persisted_config, "persisted configuration").await {
-                Ok(()) => {
-                    info!("KMS service configured and started successfully from persisted configuration");
-                }
+                Ok(()) => {}
                 Err(e) => {
-                    warn!("Failed to configure KMS with persisted configuration: {}", e);
+                    warn!(
+                        target: "rustfs::init",
+                        event = "kms_service_state",
+                        component = LOG_COMPONENT_INIT,
+                        subsystem = LOG_SUBSYSTEM_KMS,
+                        state = "persisted_config_failed",
+                        error = %e,
+                        "KMS service state changed"
+                    );
                 }
             }
         } else {
-            info!("No persisted KMS configuration found. KMS is ready for dynamic configuration via API.");
+            info!(
+                target: "rustfs::init",
+                event = "kms_persisted_config_lookup",
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_KMS,
+                state = "not_found",
+                "No persisted KMS configuration found"
+            );
         }
     }
 
@@ -341,11 +492,28 @@ pub fn init_buffer_profile_system(config: &config::Config) {
     // Whether buffer profiling is disabled or not, it is enabled by default, unless the user explicitly sets '--buffer-profile-disable' or 'RUSTFS_BUFFER_PROFILE_DISABLE=true'
     if config.buffer_profile_disable {
         // User explicitly disabled buffer profiling - use GeneralPurpose profile in disabled mode
-        info!("Buffer profiling disabled via --buffer-profile-disable, using GeneralPurpose profile");
+        info!(
+            target: "rustfs::init",
+            event = "buffer_profile_state",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_BUFFER,
+            state = "disabled",
+            profile = "GeneralPurpose",
+            reason = "flag_override",
+            "Buffer profile state changed"
+        );
         set_buffer_profile_enabled(false);
     } else {
         // Enabled by default: use configured workload profile
-        info!("Buffer profiling enabled with profile: {}", config.buffer_profile);
+        info!(
+            target: "rustfs::init",
+            event = "buffer_profile_state",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_BUFFER,
+            state = "configuring",
+            profile = %config.buffer_profile,
+            "Buffer profile state changed"
+        );
 
         // Parse the workload profile from configuration string
         // Support a custom profile when buffer_profile is set to "custom";
@@ -358,8 +526,14 @@ pub fn init_buffer_profile_system(config: &config::Config) {
             let default_unknown = get_env_usize(ENV_RUSTFS_BUFFER_DEFAULT_SIZE, DEFAULT_BUFFER_UNKNOWN_SIZE);
 
             info!(
-                "Creating custom buffer profile: min={}, max={}, default={}",
-                min_size, max_size, default_unknown
+                target: "rustfs::init",
+                event = "buffer_profile_custom",
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_BUFFER,
+                min_size,
+                max_size,
+                default_size = default_unknown,
+                "Creating custom buffer profile"
             );
             WorkloadProfile::custom(
                 min_size,
@@ -376,20 +550,47 @@ pub fn init_buffer_profile_system(config: &config::Config) {
         };
 
         // Log the selected profile for operational visibility
-        info!("Active buffer profile: {:?}", profile);
+        info!(
+            target: "rustfs::init",
+            event = "buffer_profile_selected",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_BUFFER,
+            profile = ?profile,
+            "Selected buffer profile"
+        );
 
         // Create and validate buffer configuration
         let mut buffer_config = RustFSBufferConfig::new(profile);
         if let Err(e) = buffer_config.validate() {
-            warn!("Buffer configuration validation failed: {}. Falling back to GeneralPurpose profile.", e);
+            warn!(
+                target: "rustfs::init",
+                event = "buffer_profile_validation_failed",
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_BUFFER,
+                error = %e,
+                fallback_profile = DEFAULT_BUFFER_PROFILE,
+                "Buffer profile validation failed"
+            );
             // Fall back to a known-good profile to avoid installing an invalid configuration
             let fallback_profile = WorkloadProfile::from_name(DEFAULT_BUFFER_PROFILE);
-            info!("Using fallback buffer profile: {:?}", fallback_profile);
+            info!(
+                target: "rustfs::init",
+                event = "buffer_profile_fallback",
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_BUFFER,
+                profile = ?fallback_profile,
+                "Using fallback buffer profile"
+            );
             let fallback_config = RustFSBufferConfig::new(fallback_profile);
             if let Err(e2) = fallback_config.validate() {
                 error!(
-                    "Fallback buffer configuration validation failed: {}. Aborting buffer profiling initialization.",
-                    e2
+                    target: "rustfs::init",
+                    event = "buffer_profile_validation_failed",
+                    component = LOG_COMPONENT_INIT,
+                    subsystem = LOG_SUBSYSTEM_BUFFER,
+                    error = %e2,
+                    fallback_profile = DEFAULT_BUFFER_PROFILE,
+                    "Fallback buffer profile validation failed"
                 );
                 panic!("Failed to initialize a valid RustFS buffer configuration");
             }
@@ -397,7 +598,15 @@ pub fn init_buffer_profile_system(config: &config::Config) {
         }
 
         // Log the workload profile name
-        info!("Workload profile: {}", buffer_config.workload_name());
+        let workload_name = buffer_config.workload_name();
+        info!(
+            target: "rustfs::init",
+            event = "buffer_profile_workload",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_BUFFER,
+            workload = %workload_name,
+            "Buffer profile workload selected"
+        );
 
         // Initialize the global buffer configuration
         init_global_buffer_config(buffer_config);
@@ -405,7 +614,15 @@ pub fn init_buffer_profile_system(config: &config::Config) {
         // Enable buffer profiling globally
         set_buffer_profile_enabled(true);
 
-        info!("Buffer profiling system initialized successfully");
+        info!(
+            target: "rustfs::init",
+            event = "buffer_profile_state",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_BUFFER,
+            state = "initialized",
+            workload = %workload_name,
+            "Buffer profile state changed"
+        );
     }
 }
 
@@ -441,9 +658,26 @@ where
 
     tokio::spawn(async move {
         if let Err(e) = server.await {
-            error!("{} server error: {}", protocol_name, e);
+            error!(
+                target: "rustfs::init",
+                event = "protocol_server_state",
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                protocol = protocol_name,
+                state = "runtime_failed",
+                error = %e,
+                "Protocol server state changed"
+            );
         }
-        info!("{} server shutdown completed", protocol_name);
+        info!(
+            target: "rustfs::init",
+            event = "protocol_server_state",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_PROTOCOL,
+            protocol = protocol_name,
+            state = "stopped",
+            "Protocol server state changed"
+        );
     });
 
     shutdown_tx
@@ -463,7 +697,14 @@ pub async fn init_auto_tuner(ctx: tokio_util::sync::CancellationToken) {
     let autotuner_enabled = rustfs_utils::get_env_bool("RUSTFS_AUTOTUNER_ENABLED", false);
 
     if autotuner_enabled {
-        info!(target: "rustfs::main::run", "Starting auto-tuner for performance optimization");
+        info!(
+            target: "rustfs::init",
+            event = "autotuner_state",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_AUTOTUNER,
+            state = "starting",
+            "Auto-tuner state changed"
+        );
 
         let config = TunerConfig::default();
         let manager = get_concurrency_manager();
@@ -475,23 +716,59 @@ pub async fn init_auto_tuner(ctx: tokio_util::sync::CancellationToken) {
             loop {
                 tokio::select! {
                     _ = ctx.cancelled() => {
-                        info!(target: "rustfs::autotuner", "Auto-tuner shutting down");
+                        info!(
+                            target: "rustfs::init",
+                            event = "autotuner_state",
+                            component = LOG_COMPONENT_INIT,
+                            subsystem = LOG_SUBSYSTEM_AUTOTUNER,
+                            state = "stopping",
+                            "Auto-tuner state changed"
+                        );
                         break;
                     }
                     _ = tokio::time::sleep(tokio::time::Duration::from_secs(60)) => {
                         if let Err(e) = tuner.tune().await {
-                            error!(target: "rustfs::autotuner", "Auto-tuner iteration failed: {}", e);
+                            error!(
+                                target: "rustfs::init",
+                                event = "autotuner_iteration",
+                                component = LOG_COMPONENT_INIT,
+                                subsystem = LOG_SUBSYSTEM_AUTOTUNER,
+                                result = "failed",
+                                error = %e,
+                                "Auto-tuner iteration completed"
+                            );
                         } else {
-                            debug!(target: "rustfs::autotuner", "Auto-tuner iteration completed");
+                            debug!(
+                                target: "rustfs::init",
+                                event = "autotuner_iteration",
+                                component = LOG_COMPONENT_INIT,
+                                subsystem = LOG_SUBSYSTEM_AUTOTUNER,
+                                result = "ok",
+                                "Auto-tuner iteration completed"
+                            );
                         }
                     }
                 }
             }
         });
 
-        info!(target: "rustfs::main::run", "Auto-tuner started successfully");
+        info!(
+            target: "rustfs::init",
+            event = "autotuner_state",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_AUTOTUNER,
+            state = "started",
+            "Auto-tuner state changed"
+        );
     } else {
-        info!(target: "rustfs::main::run", "Auto-tuner disabled (set RUSTFS_AUTOTUNER_ENABLED=true to enable)");
+        info!(
+            target: "rustfs::init",
+            event = "autotuner_state",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_AUTOTUNER,
+            state = "disabled",
+            "Auto-tuner state changed"
+        );
     }
 }
 

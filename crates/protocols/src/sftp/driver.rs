@@ -52,7 +52,7 @@ use uuid::Uuid;
 /// Try-acquire returns immediately. If no permit is available the abort
 /// is skipped and the orphaned upload_id is reclaimed by the bucket
 /// AbortIncompleteMultipartUpload lifecycle rule documented in
-/// OperatorDeploymentNotes.md.
+/// docs/operations/sftp.md.
 const ABORT_PERMITS_FLOOR: usize = 8;
 const ABORT_PERMITS_CEILING: usize = 128;
 static ABORT_PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
@@ -68,8 +68,8 @@ pub struct SftpDriver<S: StorageBackend + Send + Sync + 'static> {
     pub(super) storage: Arc<S>,
     pub(super) session_context: SessionContext,
     /// When true, write operations (OPEN with any write flag, WRITE,
-    /// REMOVE, MKDIR, RMDIR, RENAME) are rejected with PermissionDenied
-    /// before any backend call runs.
+    /// SETSTAT, FSETSTAT, REMOVE, MKDIR, RMDIR, RENAME) are rejected with
+    /// PermissionDenied before any backend call runs.
     pub(super) read_only: bool,
     pub(super) handles: HashMap<String, HandleState>,
     /// S3 multipart part size in bytes. Bytes accumulate in the per-handle
