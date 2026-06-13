@@ -212,7 +212,9 @@ Follow the instructions in the [Helm Chart README](https://charts.rustfs.com/) t
 
 For scanner pacing, cycle budgets, bitrot cadence, lifecycle transition status,
 and single-node single-disk idle CPU tuning, see
-[Scanner Runtime Controls](docs/operations/scanner-runtime-controls.md).
+[Scanner Runtime Controls](docs/operations/scanner-runtime-controls.md). For
+repeatable scanner-pressure validation, see
+[Scanner Benchmark Runbook](docs/operations/scanner-benchmark-runbook.md).
 
 ### 5\. Nix Flake (Option 5)
 

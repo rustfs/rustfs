@@ -5,6 +5,9 @@ data scanner. It is written for operators who need to reduce scanner pressure,
 diagnose slow scan progress, or confirm that background lifecycle, replication,
 heal, bitrot, and usage work is still moving.
 
+For reproducible scanner-pressure validation and before/after evidence, see
+[Scanner Benchmark Runbook](scanner-benchmark-runbook.md).
+
 ## What the scanner does
 
 The scanner is the background maintenance loop that walks stored objects and
