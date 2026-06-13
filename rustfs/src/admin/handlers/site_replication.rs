@@ -3701,11 +3701,21 @@ impl Operation for SRStateEditHandler {
     }
 }
 
-/// Fix 5: when `site-replicator-0` is desynced between peers (e.g. after a failed `rm` left
-/// stale state), `peer/remove` and other admin calls return 403. This handler generates a fresh
-/// service-account secret, applies it locally, and pushes a `peer/join` to each peer using the
-/// same service-account credentials. A peer whose secret is already correct will accept the
-/// update idempotently; a peer whose secret was stale will be repaired.
+/// Repairs a split-brained `site-replicator-0` service account.
+///
+/// When the internal service account is desynced (e.g. after a failed `rm` left stale state on
+/// one peer), admin calls to that peer return 403. This handler recovers the cluster without a
+/// full teardown:
+///
+/// 1. Generates a fresh service-account secret locally.
+/// 2. Applies it to the local node and persists state.
+/// 3. Pushes `peer/join` with the new credentials to every remote peer.
+///    A peer whose secret is already correct accepts the update idempotently.
+///    A peer whose secret was stale is repaired.
+///
+/// **Partial failure**: if one or more peers are unreachable the local node is still updated and
+/// `status="Partial"` is returned with `err_detail` listing each failed endpoint and its error.
+/// The call is **idempotent** — re-run it until `status="Success"` to repair all peers.
 pub struct SRRotateServiceAccountHandler {}
 
 #[async_trait::async_trait]
