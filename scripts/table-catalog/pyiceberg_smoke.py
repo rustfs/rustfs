@@ -111,9 +111,10 @@ CLIENT_MATRIX: list[dict[str, str]] = [
 UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
     {
         "capability": "credential-vending",
-        "status": "unsupported-response-boundary",
+        "status": "scope-preview-no-temporary-credentials",
         "roadmap_area": "credential-boundary",
-        "expected_behavior": "load table advertises rustfs.credential-vending=unsupported and returns no long-lived credentials",
+        "catalog_endpoint": "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials",
+        "expected_behavior": "load table advertises the table credential scope; the credentials endpoint returns an empty storage-credentials list and no long-lived credentials",
     },
     {
         "capability": "background-maintenance-worker",

@@ -4,11 +4,17 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import pyiceberg_smoke
+
+
+INTERNAL_ROADMAP_LABEL_RE = re.compile(r"\b(?:PR|PG|P)[0-9]+\b")
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 class PyIcebergSmokeConfigTest(unittest.TestCase):
@@ -69,6 +75,12 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         for entry in inventory:
             self.assertIn("status", entry)
             self.assertIn("roadmap_area", entry)
+
+    def test_published_table_catalog_docs_do_not_use_internal_roadmap_labels(self) -> None:
+        readme = (SCRIPT_DIR / "README.md").read_text(encoding="utf-8")
+
+        self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(readme))
+        self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(str(pyiceberg_smoke.unsupported_inventory())))
 
 
 if __name__ == "__main__":
