@@ -18,7 +18,7 @@ use axum::http::HeaderMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::{
     CacheConfig, CacheStats, IpValidationCache, ProxyChainAnalyzer, ProxyError, ProxyMetrics, TrustedProxyConfig, ValidationMode,
@@ -81,14 +81,6 @@ impl ClientInfo {
             warnings,
         }
     }
-
-    /// Returns a string representation of the client info for logging.
-    pub fn to_log_string(&self) -> String {
-        format!(
-            "client_ip={}, proxy={:?}, hops={}, trusted={}, mode={:?}",
-            self.real_ip, self.proxy_ip, self.proxy_hops, self.is_from_trusted_proxy, self.validation_mode
-        )
-    }
 }
 
 /// Core validator that processes incoming requests to verify proxy chains.
@@ -149,13 +141,28 @@ impl ProxyValidator {
     /// Internal logic for request validation.
     fn validate_request_internal(&self, peer_addr: Option<SocketAddr>, headers: &HeaderMap) -> Result<ClientInfo, ProxyError> {
         let Some(peer_addr) = peer_addr else {
-            debug!("SocketAddr extension is missing; skipping trusted proxy evaluation");
+            debug!(
+                event = "proxy_validation.evaluate",
+                component = "trusted_proxies",
+                subsystem = "validator",
+                result = "direct",
+                reason = "missing_peer_addr",
+                "trusted proxy evaluation skipped"
+            );
             return Ok(ClientInfo::direct(SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0)));
         };
 
         let peer_ip = peer_addr.ip();
         if peer_ip.is_unspecified() {
-            debug!("Peer address is unspecified; skipping trusted proxy evaluation");
+            debug!(
+                event = "proxy_validation.evaluate",
+                component = "trusted_proxies",
+                subsystem = "validator",
+                result = "direct",
+                reason = "unspecified_peer_addr",
+                peer_ip = %peer_ip,
+                "trusted proxy evaluation skipped"
+            );
             return Ok(ClientInfo::direct(peer_addr));
         }
 
@@ -165,7 +172,15 @@ impl ProxyValidator {
 
         // Check if the direct peer is a trusted proxy.
         if is_trusted_proxy {
-            debug!("Request received from trusted proxy: {}", peer_ip);
+            trace!(
+                event = "proxy_validation.peer",
+                component = "trusted_proxies",
+                subsystem = "validator",
+                result = "trusted_proxy",
+                peer_ip = %peer_ip,
+                validation_mode = self.config.validation_mode.as_str(),
+                "trusted proxy peer accepted"
+            );
 
             // Parse and validate headers from the trusted proxy.
             self.validate_trusted_proxy_request(&peer_addr, headers)
@@ -173,8 +188,25 @@ impl ProxyValidator {
             // Log a warning if the request is from a private network but not trusted.
             if self.config.is_private_network(&peer_ip) {
                 warn!(
-                    "Request from private network but not trusted: {}. This might indicate a configuration issue.",
-                    peer_ip
+                    event = "proxy_validation.peer",
+                    component = "trusted_proxies",
+                    subsystem = "validator",
+                    result = "direct",
+                    fallback = "socket_peer",
+                    reason = "private_network_untrusted",
+                    peer_ip = %peer_ip,
+                    "trusted proxy validation downgraded to direct peer"
+                );
+            } else {
+                trace!(
+                    event = "proxy_validation.peer",
+                    component = "trusted_proxies",
+                    subsystem = "validator",
+                    result = "direct",
+                    fallback = "socket_peer",
+                    reason = "peer_not_trusted",
+                    peer_ip = %peer_ip,
+                    "trusted proxy validation resolved direct peer"
                 );
             }
 
@@ -194,7 +226,14 @@ impl ProxyValidator {
         }
 
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            tracing::debug!("No Tokio runtime available; trusted proxy cache maintenance is disabled");
+            tracing::debug!(
+                event = "proxy_validation.cache_maintenance",
+                component = "trusted_proxies",
+                subsystem = "validator",
+                state = "disabled",
+                reason = "missing_tokio_runtime",
+                "trusted proxy cache maintenance unavailable"
+            );
             return;
         };
 
@@ -234,6 +273,20 @@ impl ProxyValidator {
         if self.config.enable_chain_continuity_check && !chain_analysis.is_continuous {
             return Err(ProxyError::ChainNotContinuous);
         }
+
+        trace!(
+            event = "proxy_validation.chain",
+            component = "trusted_proxies",
+            subsystem = "validator",
+            result = "accepted",
+            proxy_ip = %proxy_ip,
+            client_ip = %chain_analysis.client_ip,
+            proxy_hops = chain_analysis.hops,
+            warning_count = chain_analysis.warnings.len(),
+            validation_mode = chain_analysis.validation_mode.as_str(),
+            trusted_proxy_count = chain_analysis.trusted_chain.len(),
+            "trusted proxy chain accepted"
+        );
 
         Ok(ClientInfo::from_trusted_proxy(
             chain_analysis.client_ip,

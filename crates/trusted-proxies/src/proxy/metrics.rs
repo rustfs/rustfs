@@ -219,21 +219,26 @@ impl ProxyMetrics {
     /// Prints a summary of enabled metrics to the log.
     pub fn print_summary(&self) {
         if !self.enabled {
-            info!("Metrics collection is disabled");
+            info!(
+                event = "trusted_proxies.metrics",
+                component = "trusted_proxies",
+                subsystem = "metrics",
+                state = "disabled",
+                app = %self.app_name,
+                "trusted proxies metrics state changed"
+            );
             return;
         }
 
-        info!("Proxy metrics enabled for application: {}", self.app_name);
-        info!("Available metrics:");
-        info!("  - rustfs_trusted_proxy_validation_attempts_total");
-        info!("  - rustfs_trusted_proxy_validation_success_total");
-        info!("  - rustfs_trusted_proxy_validation_failure_total");
-        info!("  - rustfs_trusted_proxy_validation_failure_by_type_total");
-        info!("  - rustfs_trusted_proxy_chain_length");
-        info!("  - rustfs_trusted_proxy_validation_duration_seconds");
-        info!("  - rustfs_trusted_proxy_cache_size");
-        info!("  - rustfs_trusted_proxy_cache_hits_total");
-        info!("  - rustfs_trusted_proxy_cache_misses_total");
+        info!(
+            event = "trusted_proxies.metrics",
+            component = "trusted_proxies",
+            subsystem = "metrics",
+            state = "enabled",
+            app = %self.app_name,
+            metric_count = 9,
+            "trusted proxies metrics state changed"
+        );
     }
 }
 

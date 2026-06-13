@@ -60,7 +60,16 @@ impl CloudflareIpRanges {
 
         match networks {
             Ok(networks) => {
-                info!("Loaded {} static Cloudflare IP ranges", networks.len());
+                info!(
+                    event = "trusted_proxies.cloud_ranges",
+                    component = "trusted_proxies",
+                    subsystem = "cloud_ranges",
+                    provider = "cloudflare",
+                    source = "static",
+                    result = "loaded",
+                    range_count = networks.len(),
+                    "trusted proxy cloud ranges loaded"
+                );
                 Ok(networks)
             }
             Err(e) => Err(AppError::cloud(format!("Failed to parse static Cloudflare IP ranges: {}", e))),
@@ -96,19 +105,55 @@ impl CloudflareIpRanges {
 
                         match ranges {
                             Ok(mut networks) => {
-                                debug!("Fetched {} IP ranges from {}", networks.len(), url);
+                                debug!(
+                                    event = "trusted_proxies.cloud_ranges",
+                                    component = "trusted_proxies",
+                                    subsystem = "cloud_ranges",
+                                    provider = "cloudflare",
+                                    source = %url,
+                                    result = "loaded",
+                                    range_count = networks.len(),
+                                    "trusted proxy cloud ranges fetched"
+                                );
                                 all_ranges.append(&mut networks);
                             }
                             Err(e) => {
-                                debug!("Failed to parse IP ranges from {}: {}", url, e);
+                                debug!(
+                                    event = "trusted_proxies.cloud_ranges",
+                                    component = "trusted_proxies",
+                                    subsystem = "cloud_ranges",
+                                    provider = "cloudflare",
+                                    source = %url,
+                                    result = "parse_failed",
+                                    error = %e,
+                                    "trusted proxy cloud ranges parse failed"
+                                );
                             }
                         }
                     } else {
-                        debug!("Failed to fetch IP ranges from {}: HTTP {}", url, response.status());
+                        debug!(
+                            event = "trusted_proxies.cloud_ranges",
+                            component = "trusted_proxies",
+                            subsystem = "cloud_ranges",
+                            provider = "cloudflare",
+                            source = %url,
+                            result = "http_error",
+                            status = %response.status(),
+                            "trusted proxy cloud ranges fetch failed"
+                        );
                     }
                 }
                 Err(e) => {
-                    debug!("Failed to fetch from {}: {}", url, e);
+                    debug!(
+                        event = "trusted_proxies.cloud_ranges",
+                        component = "trusted_proxies",
+                        subsystem = "cloud_ranges",
+                        provider = "cloudflare",
+                        source = %url,
+                        result = "request_failed",
+                        error = %e,
+                        "trusted proxy cloud ranges fetch failed"
+                    );
                 }
             }
         }
@@ -117,7 +162,16 @@ impl CloudflareIpRanges {
             // Fallback to static list if API requests fail.
             Self::fetch().await
         } else {
-            info!("Successfully fetched {} Cloudflare IP ranges from API", all_ranges.len());
+            info!(
+                event = "trusted_proxies.cloud_ranges",
+                component = "trusted_proxies",
+                subsystem = "cloud_ranges",
+                provider = "cloudflare",
+                source = "api",
+                result = "loaded",
+                range_count = all_ranges.len(),
+                "trusted proxy cloud ranges loaded"
+            );
             Ok(all_ranges)
         }
     }
@@ -151,7 +205,16 @@ impl DigitalOceanIpRanges {
 
         match networks {
             Ok(networks) => {
-                info!("Loaded {} static DigitalOcean IP ranges", networks.len());
+                info!(
+                    event = "trusted_proxies.cloud_ranges",
+                    component = "trusted_proxies",
+                    subsystem = "cloud_ranges",
+                    provider = "digitalocean",
+                    source = "static",
+                    result = "loaded",
+                    range_count = networks.len(),
+                    "trusted proxy cloud ranges loaded"
+                );
                 Ok(networks)
             }
             Err(e) => Err(AppError::cloud(format!("Failed to parse static DigitalOcean IP ranges: {}", e))),
@@ -200,15 +263,42 @@ impl GoogleCloudIpRanges {
                         }
                     }
 
-                    info!("Successfully fetched {} Google Cloud IP ranges from API", networks.len());
+                    info!(
+                        event = "trusted_proxies.cloud_ranges",
+                        component = "trusted_proxies",
+                        subsystem = "cloud_ranges",
+                        provider = "gcp",
+                        source = "api",
+                        result = "loaded",
+                        range_count = networks.len(),
+                        "trusted proxy cloud ranges loaded"
+                    );
                     Ok(networks)
                 } else {
-                    debug!("Failed to fetch Google IP ranges: HTTP {}", response.status());
+                    debug!(
+                        event = "trusted_proxies.cloud_ranges",
+                        component = "trusted_proxies",
+                        subsystem = "cloud_ranges",
+                        provider = "gcp",
+                        source = %url,
+                        result = "http_error",
+                        status = %response.status(),
+                        "trusted proxy cloud ranges fetch failed"
+                    );
                     Ok(Vec::new())
                 }
             }
             Err(e) => {
-                debug!("Failed to fetch Google IP ranges: {}", e);
+                debug!(
+                    event = "trusted_proxies.cloud_ranges",
+                    component = "trusted_proxies",
+                    subsystem = "cloud_ranges",
+                    provider = "gcp",
+                    source = %url,
+                    result = "request_failed",
+                    error = %e,
+                    "trusted proxy cloud ranges fetch failed"
+                );
                 Ok(Vec::new())
             }
         }
