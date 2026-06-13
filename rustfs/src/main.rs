@@ -1011,6 +1011,23 @@ struct ProtocolShutdownSenders {
     sftp: Option<ShutdownHandle>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundShutdownStep {
+    DataScanner,
+    Ahm,
+}
+
+fn background_shutdown_steps(enable_scanner: bool, enable_heal: bool) -> Vec<BackgroundShutdownStep> {
+    let mut steps = Vec::with_capacity(2);
+    if enable_scanner {
+        steps.push(BackgroundShutdownStep::DataScanner);
+    }
+    if enable_heal || enable_scanner {
+        steps.push(BackgroundShutdownStep::Ahm);
+    }
+    steps
+}
+
 /// Handles the shutdown process of the server
 async fn handle_shutdown(
     state_manager: &ServiceStateManager,
@@ -1044,33 +1061,37 @@ async fn handle_shutdown(
     let enable_heal = get_env_bool_with_aliases(ENV_HEAL_ENABLED, &[ENV_HEAL_ENABLED_DEPRECATED], true);
 
     // Stop background services based on what was enabled.
-    if enable_scanner {
-        info!(
-            target: "rustfs::main::handle_shutdown",
-            event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            service = "data_scanner",
-            state = "stopping",
-            "Background service shutdown started"
-        );
-        shutdown_background_services();
+    let background_steps = background_shutdown_steps(enable_scanner, enable_heal);
+    for step in &background_steps {
+        match step {
+            BackgroundShutdownStep::DataScanner => {
+                info!(
+                    target: "rustfs::main::handle_shutdown",
+                    event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+                    component = LOG_COMPONENT_MAIN,
+                    subsystem = LOG_SUBSYSTEM_STARTUP,
+                    service = "data_scanner",
+                    state = "stopping",
+                    "Background service shutdown started"
+                );
+                shutdown_background_services();
+            }
+            BackgroundShutdownStep::Ahm => {
+                info!(
+                    target: "rustfs::main::handle_shutdown",
+                    event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+                    component = LOG_COMPONENT_MAIN,
+                    subsystem = LOG_SUBSYSTEM_STARTUP,
+                    service = "ahm",
+                    state = "stopping",
+                    "Background service shutdown started"
+                );
+                shutdown_ahm_services();
+            }
+        }
     }
 
-    if enable_heal || enable_scanner {
-        info!(
-            target: "rustfs::main::handle_shutdown",
-            event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            service = "ahm",
-            state = "stopping",
-            "Background service shutdown started"
-        );
-        shutdown_ahm_services();
-    }
-
-    if !enable_scanner && !enable_heal {
+    if background_steps.is_empty() {
         info!(
             target: "rustfs::main::handle_shutdown",
             event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
@@ -1267,5 +1288,19 @@ mod tests {
         assert!(DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_config::ENV_RUSTFS_SECRET_KEY));
         assert!(!DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_credentials::DEFAULT_ACCESS_KEY));
         assert!(!DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_credentials::DEFAULT_SECRET_KEY));
+    }
+
+    #[test]
+    fn background_shutdown_plan_keeps_scanner_before_ahm() {
+        assert_eq!(
+            background_shutdown_steps(true, true),
+            vec![BackgroundShutdownStep::DataScanner, BackgroundShutdownStep::Ahm]
+        );
+        assert_eq!(
+            background_shutdown_steps(true, false),
+            vec![BackgroundShutdownStep::DataScanner, BackgroundShutdownStep::Ahm]
+        );
+        assert_eq!(background_shutdown_steps(false, true), vec![BackgroundShutdownStep::Ahm]);
+        assert!(background_shutdown_steps(false, false).is_empty());
     }
 }
