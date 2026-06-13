@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-metrics-runtime-controller-status`
-- Baseline: `origin/main` at `76b375c478a8c2f5c79e62e848156a55915ed769`
-- PR type for this branch: `behavior-change`
-- Runtime behavior changes: none; the metrics runtime controller/status surface
-  only returns read-only snapshot/reconcile data and never starts, stops,
-  resizes, or wakes collectors.
-- Rust code changes: add metrics runtime status/controller snapshots and
-  reconcile plans with explicit no-op worker mutation.
+- Branch: `overtrue/arch-config-reload-preservation`
+- Baseline: `origin/main` at `6b1e114b39a51166a872388ad64f86ee3d910864`
+- PR type for this branch: `test-only`
+- Runtime behavior changes: none; config reload and shutdown behavior are
+  preserved while their no-worker-mutation and shutdown-order assumptions are
+  made testable.
+- Rust code changes: add module-local config reload and background shutdown
+  plans plus focused tests for `TEST-BGC-002`.
 - CI/script changes: none.
-- Docs changes: record `BGC-006` metrics runtime controller/status scope.
+- Docs changes: record `TEST-BGC-002` config reload preservation coverage.
 
 ## Phase 0 Tasks
 
@@ -425,48 +425,57 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     cancellation, and startup call shape.
   - Verification: focused metrics runtime tests, compile checks, formatting,
     migration guards, Rust risk scan, and pre-commit quality gate.
+- [x] `TEST-BGC-002` Preserve config reload and shutdown assumptions.
+  - Acceptance: dynamic server-config reload reports no worker mutation for
+    scanner/heal runtime config, bucket lifecycle/replication config files are
+    not dynamic server-config reload targets, and background shutdown keeps
+    scanner before AHM while preserving the scanner-implies-AHM dependency.
+  - Must preserve: no scanner, heal, lifecycle, replication, audit, storage
+    class, peer-signal, readiness, or worker lifecycle behavior change.
+  - Verification: focused config reload and shutdown tests, compile checks,
+    formatting, diff hygiene, and Rust risk scan.
 
 ## Next PRs
 
-1. `test-only`: add config-reload preservation coverage for scanner/heal/
-   lifecycle/replication in `TEST-BGC-002`.
-2. `behavior-change`: add another low-risk read-only status surface only after
-   preserving config-reload and shutdown assumptions.
+1. `behavior-change`: add another low-risk read-only status surface now that
+   config-reload and shutdown assumptions have dedicated preservation tests.
+2. `test-only`: extend preservation coverage only if the next controller touches
+   additional startup/shutdown or config reload assumptions.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed metrics runtime follows the established typed desired/status/reconcile shape without adding a generic scheduler, registry, or admin route. |
-| Migration preservation | pass | Confirmed reconcile reports `worker_mutation: none`, preserving collector grouping, interval parsing, tombstone cycles, cancellation, and metrics emission behavior. |
-| Testing/verification | pass | Focused tests, compile checks, formatting, diff hygiene, migration guards, Rust risk scan, and `make pre-commit` passed. |
+| Quality/architecture | pass | Confirmed the new plans are module-local test seams only and do not add a generic scheduler, registry, route, or public API. |
+| Migration preservation | pass | Confirmed reload plans report `worker_mutation: none`, bucket lifecycle/replication remain outside dynamic server-config reload, and shutdown keeps scanner before AHM. |
+| Testing/verification | pass | Focused tests, formatting, diff hygiene, migration guards, Rust risk scan, and `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `76b375c478a8c2f5c79e62e848156a55915ed769`:
-- `cargo test -p rustfs-obs metrics_runtime --lib`; 4 passed.
-- `cargo check -p rustfs-obs`.
-- `cargo check -p rustfs --lib`.
+Passed on `6b1e114b39a51166a872388ad64f86ee3d910864`:
+- `cargo test -p rustfs --bin rustfs background_shutdown_plan_keeps_scanner_before_ahm`; 1 passed.
+- `cargo test -p rustfs background_config_reload_plan_never_mutates_workers`; 1 passed.
 - `cargo fmt --all`.
 - `cargo fmt --all --check`.
 - `git diff --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
-- `./scripts/check_metrics_migration_refs.sh`.
-- Rust risk scan for changed Rust files; only an existing doc-comment
-  `println!` example and an existing bounded scheduler numeric cast matched.
-- `make pre-commit`; all checks passed, including nextest 5880 passed and 111
+- Rust risk scan for changed Rust files; only pre-existing test `expect`,
+  startup `expect`, import alias `as`, and startup `eprintln!` matches remain;
+  added-line risky-pattern scan found no matches.
+- `make pre-commit`; all checks passed, including nextest 5882 passed and 111
   skipped.
 
 Notes:
-- This slice adds reconcile/status data only. It does not apply reconcile output
-  to the running metrics collectors.
-- There is no admin/API exposure in this PR; future controller harness work
-  should stay isolated from scanner, heal, lifecycle, and replication.
+- This slice does not make dynamic config reload start, stop, restart, resize,
+  or wake scanner/heal/lifecycle/replication workers.
+- The shutdown plan preserves the existing scanner before AHM order and keeps
+  scanner shutdown implying AHM shutdown.
 
 ## Handoff Notes
 
-- Next migration slice should start `TEST-BGC-002` config-reload preservation
-  coverage before broader controller surfaces.
-- Keep scanner, heal, lifecycle, replication, disk health, and config reload out
-  of broad controller movement until dedicated preservation tests exist.
+- Next migration slice can add another low-risk read-only background status
+  surface while keeping worker lifecycle mutations out of scope.
+- Keep scanner, heal, lifecycle, replication, disk health, and config reload
+  behavior changes out of broad controller movement until each has dedicated
+  status snapshots.
