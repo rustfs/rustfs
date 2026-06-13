@@ -245,7 +245,7 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
     let (rd, mut wd) = tokio::io::duplex(DEFAULT_READ_BUFFER_SIZE);
     tokio::spawn(async move {
         if let Err(e) = disk.walk_dir(args, &mut wd).await {
-            warn!("walk dir err {}", e);
+            warn!(error = %e, "walk_dir failed");
         }
     });
 

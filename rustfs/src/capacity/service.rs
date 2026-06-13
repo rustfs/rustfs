@@ -22,6 +22,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
+const LOG_COMPONENT_CAPACITY: &str = "capacity";
+const LOG_SUBSYSTEM_CAPACITY: &str = "capacity";
+
 pub fn capacity_disk_ref(endpoint: impl Into<String>, drive_path: impl Into<String>) -> CapacityDiskRef {
     CapacityDiskRef {
         endpoint: endpoint.into(),
@@ -50,7 +53,15 @@ async fn refresh_admin_disks_with_subset_fallback(
     match scan::refresh_capacity_with_scope(refresh_disks.clone(), dirty_subset).await {
         Ok(update) => Ok(update),
         Err(err) if dirty_subset => {
-            warn!("Dirty-subset capacity refresh failed: {}. Retrying full-disk refresh for recovery", err);
+            warn!(
+                component = LOG_COMPONENT_CAPACITY,
+                subsystem = LOG_SUBSYSTEM_CAPACITY,
+                event = "capacity_refresh_retry",
+                scope = "dirty_subset",
+                fallback_scope = "full_disk",
+                error = %err,
+                "Capacity refresh failed and will retry with full-disk scope"
+            );
             scan::refresh_capacity_with_scope(all_disks, false).await
         }
         Err(err) => Err(err),
@@ -133,13 +144,27 @@ pub async fn resolve_admin_used_capacity(disks: &[rustfs_madmin::Disk], fallback
                 Ok(update) => {
                     let elapsed = start.elapsed();
                     debug!(
-                        "Foreground capacity refresh completed in {:?} (files={}, estimated={})",
-                        elapsed, update.file_count, update.is_estimated
+                        component = LOG_COMPONENT_CAPACITY,
+                        subsystem = LOG_SUBSYSTEM_CAPACITY,
+                        event = "capacity_refresh_completed",
+                        mode = "foreground",
+                        duration_ms = elapsed.as_millis() as u64,
+                        file_count = update.file_count,
+                        is_estimated = update.is_estimated,
+                        "Capacity refresh completed"
                     );
                     update.total_used
                 }
                 Err(err) => {
-                    warn!("Foreground capacity refresh failed: {}, using cached value", err);
+                    warn!(
+                        component = LOG_COMPONENT_CAPACITY,
+                        subsystem = LOG_SUBSYSTEM_CAPACITY,
+                        event = "capacity_refresh_failed",
+                        mode = "foreground",
+                        fallback = "cached_value",
+                        error = %err,
+                        "Capacity refresh failed"
+                    );
                     record_capacity_cache_served("stale");
                     cached.total_used
                 }
@@ -148,17 +173,40 @@ pub async fn resolve_admin_used_capacity(disks: &[rustfs_madmin::Disk], fallback
 
         record_capacity_cache_served("stale");
         debug!(
-            "Using stale cached capacity: {} bytes (age: {:?}, source: {:?}, files={}, estimated={}, needs_update={}, blocking={})",
-            cached.total_used, cache_age, cached.source, cached.file_count, cached.is_estimated, needs_update, should_block
+            component = LOG_COMPONENT_CAPACITY,
+            subsystem = LOG_SUBSYSTEM_CAPACITY,
+            event = "capacity_cache_served",
+            cache_state = "stale",
+            total_used = cached.total_used,
+            age_ms = cache_age.as_millis() as u64,
+            source = ?cached.source,
+            file_count = cached.file_count,
+            is_estimated = cached.is_estimated,
+            needs_update,
+            blocking = should_block,
+            "Served cached capacity"
         );
 
         record_capacity_refresh_request("background", capacity_manager::DataSource::Scheduled.as_metric_label());
         if spawn_refresh_if_needed_admin_disks(capacity_manager.clone(), capacity_manager::DataSource::Scheduled, disks, true)
             .await
         {
-            debug!("Background capacity update started");
+            debug!(
+                component = LOG_COMPONENT_CAPACITY,
+                subsystem = LOG_SUBSYSTEM_CAPACITY,
+                event = "capacity_refresh_background",
+                state = "started",
+                "Background capacity refresh state changed"
+            );
         } else {
-            debug!("Background update already in progress, skipping spawn");
+            debug!(
+                component = LOG_COMPONENT_CAPACITY,
+                subsystem = LOG_SUBSYSTEM_CAPACITY,
+                event = "capacity_refresh_background",
+                state = "skipped",
+                reason = "already_running",
+                "Background capacity refresh state changed"
+            );
         }
 
         return cached.total_used;
@@ -171,15 +219,27 @@ pub async fn resolve_admin_used_capacity(disks: &[rustfs_madmin::Disk], fallback
         Ok(update) => {
             let elapsed = start.elapsed();
             info!(
-                "Initial capacity calculation completed: {} bytes in {:?} (files={}, estimated={})",
-                update.total_used, elapsed, update.file_count, update.is_estimated
+                component = LOG_COMPONENT_CAPACITY,
+                subsystem = LOG_SUBSYSTEM_CAPACITY,
+                event = "capacity_refresh_completed",
+                mode = "initial",
+                total_used = update.total_used,
+                duration_ms = elapsed.as_millis() as u64,
+                file_count = update.file_count,
+                is_estimated = update.is_estimated,
+                "Capacity refresh completed"
             );
             update.total_used
         }
         Err(err) => {
             warn!(
-                "Failed to calculate data directory used capacity: {}, falling back to disk used capacity",
-                err
+                component = LOG_COMPONENT_CAPACITY,
+                subsystem = LOG_SUBSYSTEM_CAPACITY,
+                event = "capacity_refresh_failed",
+                mode = "initial",
+                fallback = "disk_used_capacity",
+                error = %err,
+                "Capacity refresh failed"
             );
             record_capacity_cache_served("fallback");
             record_capacity_scan_mode("fallback");
@@ -195,25 +255,56 @@ pub async fn resolve_admin_used_capacity(disks: &[rustfs_madmin::Disk], fallback
 }
 
 pub async fn init_capacity_management_for_local_disks() {
-    info!("Initializing capacity management system...");
+    info!(
+        component = LOG_COMPONENT_CAPACITY,
+        subsystem = LOG_SUBSYSTEM_CAPACITY,
+        event = "capacity_manager_state",
+        state = "initializing",
+        "Capacity manager state changed"
+    );
 
     let disks = rustfs_ecstore::store::all_local_disk().await;
     if disks.is_empty() {
-        warn!("No local disks found, capacity management will not run");
+        warn!(
+            component = LOG_COMPONENT_CAPACITY,
+            subsystem = LOG_SUBSYSTEM_CAPACITY,
+            event = "capacity_manager_state",
+            state = "skipped",
+            reason = "no_local_disks",
+            "Capacity manager state changed"
+        );
         return;
     }
 
-    info!("Found {} local disk(s)", disks.len());
+    info!(
+        component = LOG_COMPONENT_CAPACITY,
+        subsystem = LOG_SUBSYSTEM_CAPACITY,
+        event = "capacity_manager_disks_detected",
+        disk_count = disks.len(),
+        "Detected local disks for capacity management"
+    );
 
     let disk_refs = disks
         .iter()
         .map(|ds| capacity_disk_ref(ds.endpoint().to_string(), ds.to_string()))
         .collect();
 
-    info!("Starting background capacity update task...");
+    info!(
+        component = LOG_COMPONENT_CAPACITY,
+        subsystem = LOG_SUBSYSTEM_CAPACITY,
+        event = "capacity_manager_state",
+        state = "starting_background_task",
+        "Capacity manager state changed"
+    );
     capacity_manager::start_background_task(disk_refs).await;
 
-    info!("Capacity management system initialized successfully");
+    info!(
+        component = LOG_COMPONENT_CAPACITY,
+        subsystem = LOG_SUBSYSTEM_CAPACITY,
+        event = "capacity_manager_state",
+        state = "initialized",
+        "Capacity manager state changed"
+    );
 }
 
 pub async fn get_cached_capacity_with_metrics() -> Option<(u64, &'static str)> {
