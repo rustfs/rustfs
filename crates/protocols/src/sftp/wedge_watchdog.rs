@@ -62,6 +62,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SFTP_WATCHDOG: &str = "sftp_watchdog";
+const EVENT_SFTP_WATCHDOG_STATE: &str = "sftp_watchdog_state";
+
 /// Reason a watchdog cancelled its session. Included in the warn log
 /// the watchdog writes at cancel time so operators can correlate the
 /// cancel with the upstream client behaviour.
@@ -140,12 +144,14 @@ pub(super) fn spawn_for_session(session_diag: Arc<SessionDiag>, socket: Socket, 
                         }
                         Decision::Cancel(reason) => {
                             tracing::warn!(
-                                target: "rustfs_protocols::sftp::watchdog",
+                                event = EVENT_SFTP_WATCHDOG_STATE,
+                                component = LOG_COMPONENT_PROTOCOLS,
+                                subsystem = LOG_SUBSYSTEM_SFTP_WATCHDOG,
                                 session_id,
                                 peer = %peer,
                                 silence_secs,
                                 reason = reason.as_str(),
-                                "wedge watchdog cancelling session: russh select! parked outside its arms",
+                                "sftp watchdog state changed",
                             );
                             cancel_token.cancel();
                             break;

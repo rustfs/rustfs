@@ -30,6 +30,10 @@ use russh_sftp::protocol::{File, Handle, Name, StatusCode};
 use rustfs_utils::path;
 use s3s::dto::{ListObjectsV2Input, PutObjectInput, StreamingBlob};
 
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SFTP_DIR: &str = "sftp_dir";
+const EVENT_SFTP_DIR_STATE: &str = "sftp_dir_state";
+
 /// Build the conventional "." and ".." directory entries that prefix
 /// the first READDIR response on every directory handle. SFTPv3 does
 /// not mandate these, but POSIX clients require them. Emitting both
@@ -260,10 +264,14 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         }
         if let Some(total) = truncated_at {
             tracing::warn!(
+                event = EVENT_SFTP_DIR_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SFTP_DIR,
                 returned = entries.len(),
                 total = total,
                 cap = ROOT_LISTING_MAX_ENTRIES,
-                "root READDIR truncated: principal has more buckets than the cap",
+                result = "root_readdir_truncated",
+                "sftp dir state changed",
             );
         }
         Ok(entries)

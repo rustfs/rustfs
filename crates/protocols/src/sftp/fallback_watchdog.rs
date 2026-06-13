@@ -29,6 +29,10 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SFTP_WATCHDOG: &str = "sftp_watchdog";
+const EVENT_SFTP_WATCHDOG_STATE: &str = "sftp_watchdog_state";
+
 /// Spawn a per-session silence backstop tick task.
 ///
 /// The task holds a clone of the per-session CancellationToken and an
@@ -51,12 +55,14 @@ pub(super) fn spawn_for_session(session_diag: Arc<SessionDiag>, cancel_token: Ca
                     let silence_secs = silence_secs(&session_diag);
                     if fallback_threshold_reached(silence_secs) {
                         tracing::warn!(
-                            target: "rustfs_protocols::sftp::watchdog",
+                            event = EVENT_SFTP_WATCHDOG_STATE,
+                            component = LOG_COMPONENT_PROTOCOLS,
+                            subsystem = LOG_SUBSYSTEM_SFTP_WATCHDOG,
                             session_id,
                             peer = %peer,
                             silence_secs,
                             reason = "fallback_silence",
-                            "fallback watchdog cancelling session: silence exceeded fallback threshold",
+                            "sftp watchdog state changed",
                         );
                         cancel_token.cancel();
                         break;
