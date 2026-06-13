@@ -1,5 +1,9 @@
 {{- $logDir := .Values.config.rustfs.obs_log_directory }}
 {{- $logDirEnabled := ne $logDir "" }}
+{{- $drivesPerNode := int (include "rustfs.drivesPerNode" .) -}}
+{{- if and .Values.mode.distributed.enabled (le (int .Values.replicaCount) 1) -}}
+{{- fail "Distributed mode requires replicaCount >= 2" -}}
+{{- end -}}
 
 {{- if .Values.mode.distributed.enabled }}
 ---
@@ -75,17 +79,17 @@ spec:
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           env:
-            - name: REPLICA_COUNT
-              value: {{ .Values.replicaCount | quote }}
+            - name: DRIVES_PER_NODE
+              value: {{ $drivesPerNode | quote }}
           command:
             - sh
             - -c
             - |
-              if [ "$REPLICA_COUNT" -eq 4 ]; then
-                for i in $(seq 0 $(($REPLICA_COUNT - 1))); do
+              if [ "$DRIVES_PER_NODE" -gt 1 ]; then
+                for i in $(seq 0 $(($DRIVES_PER_NODE - 1))); do
                   mkdir -p /data/rustfs$i
-                done;
-              elif [ "$REPLICA_COUNT" -eq 16 ]; then
+                done
+              else
                 mkdir -p /data
               fi
               {{- if $logDirEnabled }}
@@ -93,12 +97,12 @@ spec:
               chmod 755 /mnt/rustfs/logs
               {{- end }}
           volumeMounts:
-            {{- if eq (int .Values.replicaCount) 4 }}
-            {{- range $i := until (int .Values.replicaCount) }}
+            {{- if gt $drivesPerNode 1 }}
+            {{- range $i := until $drivesPerNode }}
             - name: data-rustfs-{{ $i }}
               mountPath: /data/rustfs{{ $i }}
             {{- end }}
-            {{- else if eq (int .Values.replicaCount) 16 }}
+            {{- else }}
             - name: data
               mountPath: /data
             {{- end }}
@@ -159,12 +163,12 @@ spec:
               mountPath: {{ $logDir }}
               subPath: logs
             {{- end }}
-            {{- if eq (int .Values.replicaCount) 4 }}
-            {{- range $i := until (int .Values.replicaCount) }}
+            {{- if gt $drivesPerNode 1 }}
+            {{- range $i := until $drivesPerNode }}
             - name: data-rustfs-{{ $i }}
               mountPath: /data/rustfs{{ $i }}
             {{- end }}
-            {{- else if eq (int .Values.replicaCount) 16 }}
+            {{- else }}
             - name: data
               mountPath: /data
             {{- end }}
@@ -204,8 +208,11 @@ spec:
         name: logs
         labels:
           {{- toYaml .Values.commonLabels | nindent 10 }}
+        {{- $logAnn := .Values.storageclass.pvcAnnotations.logs | default (dict) -}}
+        {{- if gt (len $logAnn) 0 }}
         annotations:
-          {{- toYaml .Values.storageclass.pvcAnnotations.logs | nindent 10 }}
+          {{- toYaml $logAnn | nindent 10 }}
+        {{- end }}
       spec:
         accessModes: ["ReadWriteOnce"]
         storageClassName: {{ .Values.storageclass.name }}
@@ -213,16 +220,19 @@ spec:
           requests:
             storage: {{ .Values.storageclass.logStorageSize }}
     {{- end }}
-    {{- if eq (int .Values.replicaCount) 4 }}
-    {{- range $i := until (int .Values.replicaCount) }}
+    {{- if gt $drivesPerNode 1 }}
+    {{- range $i := until $drivesPerNode }}
     - apiVersion: v1
       kind: PersistentVolumeClaim
       metadata:
         name: data-rustfs-{{ $i }}
         labels:
           {{- toYaml $.Values.commonLabels | nindent 10 }}
+        {{- $dataAnn := $.Values.storageclass.pvcAnnotations.data | default (dict) -}}
+        {{- if gt (len $dataAnn) 0 }}
         annotations:
-          {{- toYaml $.Values.storageclass.pvcAnnotations.data | nindent 10 }}
+          {{- toYaml $dataAnn | nindent 10 }}
+        {{- end }}
       spec:
         accessModes: ["ReadWriteOnce"]
         storageClassName: {{ $.Values.storageclass.name }}
@@ -230,15 +240,18 @@ spec:
           requests:
             storage: {{ $.Values.storageclass.dataStorageSize }}
     {{- end }}
-    {{- else if eq (int .Values.replicaCount) 16 }}
+    {{- else }}
     - apiVersion: v1
       kind: PersistentVolumeClaim
       metadata:
         name: data
         labels:
           {{- toYaml .Values.commonLabels | nindent 10 }}
+        {{- $dataAnn := .Values.storageclass.pvcAnnotations.data | default (dict) -}}
+        {{- if gt (len $dataAnn) 0 }}
         annotations:
-          {{- toYaml .Values.storageclass.pvcAnnotations.data | nindent 10 }}
+          {{- toYaml $dataAnn | nindent 10 }}
+        {{- end }}
       spec:
         accessModes: ["ReadWriteOnce"]
         storageClassName: {{ .Values.storageclass.name }}

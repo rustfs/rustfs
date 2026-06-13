@@ -2,8 +2,25 @@
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
 
-# This will set the replicaset count more information can be found here: https://kubernetes.io/docs/concepts/workloads/controllers/replicaset/
+# Number of StatefulSet pods (nodes in the distributed cluster).
+# In distributed mode this must be >= 2 (RustFS requires at least two nodes
+# for an erasure-coded cluster).
 replicaCount: 4
+
+# Number of data drives (PVCs) per pod. Combined with replicaCount this
+# determines the total drive count seen by rustfs.
+# - drivesPerNode > 1: each pod gets N volumes mounted at /data/rustfs0.../data/rustfsN-1
+# - drivesPerNode = 1: each pod gets a single volume mounted at /data
+#
+# When left unset (null) the chart infers a backward-compatible value:
+#   replicaCount = 4  -> drivesPerNode = 4  (legacy default)
+#   replicaCount != 4 -> drivesPerNode = 1  (legacy 16x1 and any other topology)
+#
+# WARNING: changing drivesPerNode on an existing StatefulSet is not allowed
+# because Kubernetes forbids updates to volumeClaimTemplates. To change the
+# drive count you must delete the StatefulSet (with --cascade=orphan to keep
+# pods/PVCs) and recreate it, or perform a full reinstall.
+drivesPerNode: null
 
 # This sets the container image more information can be found here: https://kubernetes.io/docs/concepts/containers/images/
 image:
@@ -65,23 +82,30 @@ config:
     # Examples
     # volumes: "/data/rustfs0,/data/rustfs1,/data/rustfs2,/data/rustfs3"
     # volumes: "http://rustfs-{0...3}.rustfs-headless:9000/data/rustfs{0...3}"
+    # NOTE: When overriding volumes manually, the mount paths and drive ranges
+    # must match the number of pods (replicaCount) and drives per pod
+    # (drivesPerNode). Mismatched values will cause broken volume discovery.
     volumes: ""
     address: ":9000"
     console_enable: "true"
     console_address: ":9001"
-    log_level: "info"
     region: "us-east-1"
-    obs_log_directory: "/logs" # Set to "" to disable log PVCs and mounts.
-    obs_environment: "development"
     # Optionally enable support for virtual-hosted-style requests.
     # See more information: https://docs.rustfs.com/integration/virtual.html
     domains: "" # e.g. "example.com"
     ec:
+      # Total drives = replicaCount * drivesPerNode.
+      # If you change replicaCount or drivesPerNode, adjust parity accordingly:
+      #
+      # | replicaCount | drivesPerNode | Total drives | Valid parity | Default |
+      # | ------------ | ------------- | ------------ | ------------ | ------- |
+      # | 1            | 1             | 1            | 0            | 0       |
+      # | 4            | 1             | 4            | 0–2          | 2       |
+      # | 4            | 2             | 8            | 0–4          | 4       |
+      # | 4            | 4             | 16           | 0–8          | *4*     |
+      # | 8            | 1             | 8            | 0–4          | 4       |
+      # | 16           | 1             | 16           | 0–8          | 4       |
       storage_class_standard: "EC:4" # Storage class for standard storage class in erasure coding mode, default is "STANDARD"
-    log_rotation: # Specify log rotation settings
-      # size: 100 # Default value: 100 MB
-      # time: hour # Default value: hour, eg: day,hour,minute,second
-      # keep_files: 30 # number of rotated log files to keep
     scanner:
       # Scanner speed preset: fastest|fast|default|slow|slowest
       speed: ""
@@ -121,10 +145,20 @@ config:
     # - default: keep current timeout defaults.
     # - high_latency: use higher timeout defaults for scanner-sensitive operations.
     timeout_profile: ""
+    log_level: "info"
+    log_rotation: # Specify log rotation settings
+      # size: 100 # Default value: 100 MB
+      # time: hour # Default value: hour, eg: day,hour,minute,second
+      # keep_files: 30 # number of rotated log files to keep
+    ## If obs_log_directory is not empty, a separate volume for logs will be created and the logs will NOT be sent to stdout. If not set, will default to default chart value "/logs"
+    obs_log_directory: "/logs"
+    ## Supported values include `production`, `development`, `test`, and `staging`;
+    ## refer to the RustFS configuration documentation/source for the authoritative list.
+    obs_environment: "development"
     obs_endpoint:
       enabled: false # If true, rustfs will export metrics, traces, logs and profiling data to the specified OTLP endpoints. If false, the individual settings for metrics, traces, logs and profiling endpoints will be ignored and all data will not be exported.
       base_endpoint: "" #Root OTLP/HTTP endpoint, e.g. http://otel-collector:4318
-      use_stdout: false # If true, rustfs will also export logs to stdout in addition to the OTLP logs endpoint.
+      use_stdout: true # If true, rustfs will also export logs to stdout in addition to the OTLP logs endpoint.
       metrics:
         enabled: false
         endpoint: "" # If specified, rustfs will export metrics to this OTLP endpoint. e.g. "http://localhost:4318/v1/metrics"
@@ -141,7 +175,7 @@ config:
       enabled: false
       type: "vault" # Only Support vault currently.
       vault:
-        vault_backend: "" # Only support vault kv2 and vault transit. 
+        vault_backend: "" # Only support vault kv2 and vault transit.
         vault_address: ""
         vault_token: ""
         vault_mount_path: ""
@@ -201,6 +235,7 @@ priorityClassName: ""
 
 service:
   annotations: {}
+  labels: {} # Additional labels
   headlessAnnotations: {} # Applied to the headless Service when mode.distributed.enabled=true
   traefikAnnotations: # Applied to the Service when mode.distributed.enabled=true and ingress.className=traefik
     traefik.ingress.kubernetes.io/service.sticky.cookie: "true"
@@ -213,6 +248,7 @@ service:
   loadBalancerIP: ""           # Request a specific IP from the load balancer (e.g. for Cilium LB-IPAM or MetalLB)
   loadBalancerClass: ""        # Specify a load balancer implementation (e.g. "io.cilium/bgp", "metallb")
   loadBalancerSourceRanges: [] # Restrict client IPs (e.g. ["10.0.0.0/8"])
+  externalIPs: []             # Expose service via specific external IPs (e.g. ["203.0.113.1"])
   endpoint:
     port: 9000
     nodePort: 32000
@@ -263,7 +299,7 @@ ingress:
 gatewayApi:
   enabled: false
   gatewayClass: traefik # Only support for traefik and contour gatewayClass at the moment.
-  listeners: # Specify which listeners to create on the Gateway. 
+  listeners: # Specify which listeners to create on the Gateway.
     http:
       name: web
       port: 8000
@@ -346,12 +382,9 @@ storageclass:
   name: local-path
   dataStorageSize: 256Mi
   logStorageSize: 256Mi
-  pvcAnnotations: {}
-    #pvcAnnotations:
-    #  data:
-    #    key: value
-    #  logs:
-    #    key: value
+  pvcAnnotations:
+    data: {}
+    logs: {}
 
 pdb:
   create: false

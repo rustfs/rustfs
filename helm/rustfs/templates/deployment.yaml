@@ -126,7 +126,7 @@ spec:
               subPath: ca.crt
             - name: client-cert
               mountPath: /opt/tls/client_cert.pem
-              subPath: client_cert.pem 
+              subPath: client_cert.pem
             - name: client-cert
               mountPath: /opt/tls/client_key.pem
               subPath: client_key.pem
