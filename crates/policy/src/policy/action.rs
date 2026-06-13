@@ -36,10 +36,12 @@ impl Serialize for ActionSet {
 
         // Always serialize as array, even for single action, to match S3 specification
         // and ensure compatibility with AWS SDK clients that expect array format
-        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
-        for action in &self.0 {
-            let action_str: &str = action.into();
-            seq.serialize_element(action_str)?;
+        let mut actions: Vec<&str> = self.0.iter().map(Into::into).collect();
+        actions.sort_unstable();
+
+        let mut seq = serializer.serialize_seq(Some(actions.len()))?;
+        for action in actions {
+            seq.serialize_element(action)?;
         }
         seq.end()
     }
