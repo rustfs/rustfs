@@ -125,6 +125,19 @@ calls must return the same plan for the same snapshot and must not request a
 worker start, stop, resize, wakeup, storage write, readiness signal, peer
 signal, or metrics emission.
 
+## BGC-005 Allocator Reclaim Status And Controller Surface
+
+The second low-risk controller/status surface is allocator reclaim. It reports
+the service name, desired enablement, configured force flag, backend-specific
+effective force, idle interval settings, runtime-token cancellation state, and
+the absence of a dedicated shutdown handle.
+
+The only allowed worker mutation for this surface is `none`. Reconcile output is
+read-only and must not start, stop, resize, wake, or otherwise drive the
+allocator reclaim loop. Existing backend-specific force handling, idle-streak
+logic, metrics emission, and runtime-token shutdown behavior remain owned by the
+current loop.
+
 ## Future Reconcile Rules
 
 Future reconcile work is allowed only after a read-only status snapshot exists.
