@@ -20,6 +20,7 @@ use crate::constants::{network::DEFAULT_SOURCE_IP, paths::ROOT_PATH};
 use libunftp::options::FtpsRequired;
 use rustfs_config::{DEFAULT_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_INTERVAL, ENV_TLS_RELOAD_ENABLE, ENV_TLS_RELOAD_INTERVAL};
 use rustfs_tls_runtime::{ReloadableServerCertResolver, TlsReloadOptions, spawn_server_cert_reload_loop};
+use rustfs_utils::MaskedAccessKey;
 use std::fmt::{Debug, Display, Formatter};
 use std::net::IpAddr;
 use std::path::Path;
@@ -31,6 +32,15 @@ use tracing::{debug, error, info, warn};
 use unftp_core::auth::{
     AuthenticationError, Authenticator, Credentials, Principal, UserDetail, UserDetailError, UserDetailProvider,
 };
+
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_FTPS_SERVER: &str = "ftps_server";
+const LOG_SUBSYSTEM_FTPS_AUTH: &str = "ftps_auth";
+const EVENT_FTPS_SERVER_STATE: &str = "ftps_server_state";
+const EVENT_FTPS_TLS_STATE: &str = "ftps_tls_state";
+const EVENT_FTPS_CONFIG_STATE: &str = "ftps_config_state";
+const EVENT_FTPS_RUNTIME_STATE: &str = "ftps_runtime_state";
+const EVENT_FTPS_AUTH_STATE: &str = "ftps_auth_state";
 
 /// FTPS user implementation
 #[derive(Debug, Clone)]
@@ -89,7 +99,16 @@ where
     /// This method binds the listener first to ensure the port is available,
     /// then spawns the server loop in a background task.
     pub async fn start(&self, mut shutdown_rx: broadcast::Receiver<()>) -> Result<(), FtpsInitError> {
-        info!("Initializing FTPS server on {}", self.config.bind_addr);
+        info!(
+            event = EVENT_FTPS_SERVER_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
+            state = "starting",
+            bind_addr = %self.config.bind_addr,
+            tls_enabled = self.config.tls_enabled,
+            ftps_required = self.config.ftps_required,
+            "ftps server state changed"
+        );
         let (reload_shutdown_tx, reload_shutdown_rx) = watch::channel(false);
 
         let storage_clone = self.storage.clone();
@@ -102,27 +121,62 @@ where
         // Configure passive ports for data connections
         if let Some(passive_ports) = &self.config.passive_ports {
             let range = self.config.parse_passive_ports()?;
-            info!("Configuring FTPS passive ports range: {:?} ({})", range, passive_ports);
+            info!(
+                event = EVENT_FTPS_CONFIG_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
+                state = "passive_ports_configured",
+                passive_ports = %passive_ports,
+                passive_port_range = ?range,
+                "ftps config state changed"
+            );
             server_builder = server_builder.passive_ports(range);
         } else {
-            warn!("No passive ports configured, using system-assigned ports");
+            warn!(
+                event = EVENT_FTPS_CONFIG_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
+                result = "system_assigned_passive_ports",
+                "ftps config state changed"
+            );
         }
 
         // Configure external IP address for passive mode
         if let Some(ref external_ip) = self.config.external_ip {
-            info!("Configuring FTPS external IP for passive mode: {}", external_ip);
+            info!(
+                event = EVENT_FTPS_CONFIG_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
+                state = "external_ip_configured",
+                external_ip = %external_ip,
+                "ftps config state changed"
+            );
             server_builder = server_builder.passive_host(external_ip.as_str());
         }
 
         // Configure both active and passive mode support
         use libunftp::options::ActivePassiveMode;
         server_builder = server_builder.active_passive_mode(ActivePassiveMode::ActiveAndPassive);
-        info!("FTPS server configured for both active and passive mode support");
+        info!(
+            event = EVENT_FTPS_CONFIG_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
+            state = "active_passive_mode_enabled",
+            mode = "active_and_passive",
+            "ftps config state changed"
+        );
 
         // Configure FTPS / TLS
         if self.config.tls_enabled {
             if let Some(cert_dir) = &self.config.cert_dir {
-                debug!("Enabling FTPS with multi-certificate support from directory: {}", cert_dir);
+                debug!(
+                    event = EVENT_FTPS_TLS_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
+                    state = "enabled",
+                    cert_dir = %cert_dir,
+                    "ftps tls state changed"
+                );
 
                 let resolver = ReloadableServerCertResolver::load_from_directory(cert_dir)
                     .map_err(|e| FtpsInitError::InvalidConfig(format!("Failed to create certificate resolver: {}", e)))?;
@@ -143,7 +197,13 @@ where
                 server_builder = server_builder.ftps_manual::<std::path::PathBuf>(Arc::new(server_config));
 
                 if self.config.ftps_required {
-                    info!("FTPS is explicitly required for all connections");
+                    info!(
+                        event = EVENT_FTPS_TLS_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
+                        state = "required",
+                        "ftps tls state changed"
+                    );
                     server_builder = server_builder.ftps_required(FtpsRequired::All, FtpsRequired::All);
                 }
             } else if self.config.ftps_required {
@@ -152,7 +212,14 @@ where
                 ));
             }
         } else {
-            info!("TLS disabled, running in plain FTP mode");
+            info!(
+                event = EVENT_FTPS_TLS_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
+                state = "disabled",
+                mode = "plain_ftp",
+                "ftps tls state changed"
+            );
         }
 
         // Build the server instance
@@ -162,7 +229,14 @@ where
         let bind_addr = self.config.bind_addr.to_string();
         let server_handle = tokio::spawn(async move {
             if let Err(e) = server.listen(bind_addr).await {
-                error!("FTPS server runtime error: {}", e);
+                error!(
+                    event = EVENT_FTPS_RUNTIME_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
+                    result = "runtime_error",
+                    error = %e,
+                    "ftps runtime state changed"
+                );
                 return Err(FtpsInitError::Server(e));
             }
             Ok(())
@@ -174,21 +248,48 @@ where
                 let _ = reload_shutdown_tx.send(true);
                 match result {
                     Ok(Ok(())) => {
-                        info!("FTPS server stopped normally");
+                        info!(
+                            event = EVENT_FTPS_SERVER_STATE,
+                            component = LOG_COMPONENT_PROTOCOLS,
+                            subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
+                            state = "stopped",
+                            result = "ok",
+                            "ftps server state changed"
+                        );
                         Ok(())
                     }
                     Ok(Err(e)) => {
-                        error!("FTPS server internal error: {}", e);
+                        error!(
+                            event = EVENT_FTPS_RUNTIME_STATE,
+                            component = LOG_COMPONENT_PROTOCOLS,
+                            subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
+                            result = "internal_error",
+                            error = %e,
+                            "ftps runtime state changed"
+                        );
                         Err(e)
                     }
                     Err(e) => {
-                        error!("FTPS server panic or task cancellation: {}", e);
+                        error!(
+                            event = EVENT_FTPS_RUNTIME_STATE,
+                            component = LOG_COMPONENT_PROTOCOLS,
+                            subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
+                            result = "task_failed",
+                            error = %e,
+                            "ftps runtime state changed"
+                        );
                         Err(FtpsInitError::Bind(std::io::Error::other(e.to_string())))
                     }
                 }
             }
             _ = shutdown_rx.recv() => {
-                info!("FTPS server received shutdown signal");
+                info!(
+                    event = EVENT_FTPS_SERVER_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
+                    state = "shutdown_requested",
+                    "ftps server state changed"
+                );
                 let _ = reload_shutdown_tx.send(true);
                 // libunftp listen() is not easily cancellable gracefully without dropping the future.
                 // The select! dropping server_handle will close the listener.
@@ -218,20 +319,46 @@ impl UserDetailProvider for FtpsUserDetailProvider {
 
     async fn provide_user_detail(&self, principal: &Principal) -> Result<Self::User, UserDetailError> {
         use rustfs_iam::get;
+        let masked_username = MaskedAccessKey(&principal.username);
 
         // Access IAM system
         let iam_sys = get().map_err(|e| {
-            error!("IAM system unavailable during FTPS user detail fetch: {}", e);
+            error!(
+                event = EVENT_FTPS_AUTH_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_FTPS_AUTH,
+                result = "iam_unavailable",
+                phase = "user_detail",
+                error = %e,
+                "ftps auth state changed"
+            );
             UserDetailError::ImplPropagated("Internal authentication service unavailable".to_string(), Some(Box::new(e)))
         })?;
 
         let (user_identity, _is_valid) = iam_sys.check_key(&principal.username).await.map_err(|e| {
-            error!("IAM check_key failed for {}: {}", principal.username, e);
+            error!(
+                event = EVENT_FTPS_AUTH_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_FTPS_AUTH,
+                result = "check_key_failed",
+                phase = "user_detail",
+                username = %masked_username,
+                error = %e,
+                "ftps auth state changed"
+            );
             UserDetailError::ImplPropagated("Authentication verification failed".to_string(), Some(Box::new(e)))
         })?;
 
         let identity = user_identity.ok_or_else(|| {
-            error!("User identity missing for {}", principal.username);
+            error!(
+                event = EVENT_FTPS_AUTH_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_FTPS_AUTH,
+                result = "identity_missing",
+                phase = "user_detail",
+                username = %masked_username,
+                "ftps auth state changed"
+            );
             UserDetailError::UserNotFound {
                 username: principal.username.clone(),
             }
@@ -268,10 +395,19 @@ impl Authenticator for FtpsAuthenticator {
     async fn authenticate(&self, username: &str, creds: &Credentials) -> Result<Principal, AuthenticationError> {
         use rustfs_credentials::Credentials as S3Credentials;
         use rustfs_iam::get;
+        let masked_username = MaskedAccessKey(username);
 
         // Access IAM system
         let iam_sys = get().map_err(|e| {
-            error!("IAM system unavailable during FTPS auth: {}", e);
+            error!(
+                event = EVENT_FTPS_AUTH_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_FTPS_AUTH,
+                result = "iam_unavailable",
+                phase = "authenticate",
+                error = %e,
+                "ftps auth state changed"
+            );
             AuthenticationError::ImplPropagated("Internal authentication service unavailable".to_string(), Some(Box::new(e)))
         })?;
 
@@ -289,26 +425,67 @@ impl Authenticator for FtpsAuthenticator {
         };
 
         let (user_identity, is_valid) = iam_sys.check_key(&s3_creds.access_key).await.map_err(|e| {
-            error!("IAM check_key failed for {}: {}", username, e);
+            error!(
+                event = EVENT_FTPS_AUTH_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_FTPS_AUTH,
+                result = "check_key_failed",
+                phase = "authenticate",
+                username = %masked_username,
+                error = %e,
+                "ftps auth state changed"
+            );
             AuthenticationError::ImplPropagated("Authentication verification failed".to_string(), Some(Box::new(e)))
         })?;
 
         if !is_valid {
-            warn!("FTPS login failed: Invalid access key '{}'", username);
+            warn!(
+                event = EVENT_FTPS_AUTH_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_FTPS_AUTH,
+                result = "invalid_access_key",
+                phase = "authenticate",
+                username = %masked_username,
+                "ftps auth state changed"
+            );
             return Err(AuthenticationError::BadUser);
         }
 
         let identity = user_identity.ok_or_else(|| {
-            error!("User identity missing despite valid key for {}", username);
+            error!(
+                event = EVENT_FTPS_AUTH_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_FTPS_AUTH,
+                result = "identity_missing",
+                phase = "authenticate",
+                username = %masked_username,
+                "ftps auth state changed"
+            );
             AuthenticationError::BadUser
         })?;
 
         if !identity.credentials.secret_key.eq(&s3_creds.secret_key) {
-            warn!("FTPS login failed: Invalid secret key for '{}'", username);
+            warn!(
+                event = EVENT_FTPS_AUTH_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_FTPS_AUTH,
+                result = "invalid_secret_key",
+                phase = "authenticate",
+                username = %masked_username,
+                "ftps auth state changed"
+            );
             return Err(AuthenticationError::BadPassword);
         }
 
-        info!("FTPS user '{}' authenticated successfully", username);
+        debug!(
+            event = EVENT_FTPS_AUTH_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_FTPS_AUTH,
+            result = "authenticated",
+            phase = "authenticate",
+            username = %masked_username,
+            "ftps auth state changed"
+        );
         Ok(Principal {
             username: username.to_string(),
         })

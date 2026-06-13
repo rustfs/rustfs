@@ -42,6 +42,7 @@ use rustfs_config::{
     DEFAULT_SFTP_HOST_KEY_RELOAD_ENABLE, DEFAULT_SFTP_HOST_KEY_RELOAD_INTERVAL, ENV_SFTP_HOST_KEY_RELOAD_ENABLE,
     ENV_SFTP_HOST_KEY_RELOAD_INTERVAL,
 };
+use rustfs_utils::MaskedAccessKey;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -56,8 +57,18 @@ use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 use tokio::time::{Duration, MissedTickBehavior, timeout};
 use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 
 use crate::sftp::constants::limits::SHUTDOWN_DRAIN_TIMEOUT_SECS;
+
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SFTP_SERVER: &str = "sftp_server";
+const LOG_SUBSYSTEM_SFTP_AUTH: &str = "sftp_auth";
+const EVENT_SFTP_SERVER_STATE: &str = "sftp_server_state";
+const EVENT_SFTP_HOST_KEY_RELOAD_STATE: &str = "sftp_host_key_reload_state";
+const EVENT_SFTP_SESSION_STATE: &str = "sftp_session_state";
+const EVENT_SFTP_AUTH_STATE: &str = "sftp_auth_state";
+const EVENT_SFTP_SUBSYSTEM_STATE: &str = "sftp_subsystem_state";
 
 // Cipher, KEX, MAC, and host-key algorithm lists. All four are compile-time
 // constants with no environment-variable override, so operators cannot
@@ -223,9 +234,13 @@ fn host_key_algorithm_rank(algorithm: keys::Algorithm) -> u8 {
 fn spawn_host_key_reload_loop(config: SftpConfig, holder: Arc<SshConfigHolder>, shutdown_token: CancellationToken) {
     let enabled = rustfs_utils::get_env_bool(ENV_SFTP_HOST_KEY_RELOAD_ENABLE, DEFAULT_SFTP_HOST_KEY_RELOAD_ENABLE);
     if !enabled {
-        tracing::debug!(
-            "SFTP host key hot reload is disabled (set {}=1 to enable)",
-            ENV_SFTP_HOST_KEY_RELOAD_ENABLE
+        debug!(
+            event = EVENT_SFTP_HOST_KEY_RELOAD_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+            state = "disabled",
+            env_var = ENV_SFTP_HOST_KEY_RELOAD_ENABLE,
+            "sftp host key reload state changed"
         );
         return;
     }
@@ -233,10 +248,14 @@ fn spawn_host_key_reload_loop(config: SftpConfig, holder: Arc<SshConfigHolder>, 
     let interval_secs =
         rustfs_utils::get_env_u64(ENV_SFTP_HOST_KEY_RELOAD_INTERVAL, DEFAULT_SFTP_HOST_KEY_RELOAD_INTERVAL).max(5);
 
-    tracing::info!(
+    info!(
+        event = EVENT_SFTP_HOST_KEY_RELOAD_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+        state = "enabled",
         host_key_dir = %config.host_key_dir.display(),
         interval_secs,
-        "SFTP host key hot reload enabled"
+        "sftp host key reload state changed"
     );
 
     tokio::spawn(async move {
@@ -246,7 +265,14 @@ fn spawn_host_key_reload_loop(config: SftpConfig, holder: Arc<SshConfigHolder>, 
         loop {
             tokio::select! {
                 _ = shutdown_token.cancelled() => {
-                    tracing::info!(host_key_dir = %config.host_key_dir.display(), "SFTP host key hot reload task stopped");
+                    info!(
+                        event = EVENT_SFTP_HOST_KEY_RELOAD_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+                        state = "stopped",
+                        host_key_dir = %config.host_key_dir.display(),
+                        "sftp host key reload state changed"
+                    );
                     break;
                 }
                 _ = interval.tick() => {}
@@ -254,23 +280,35 @@ fn spawn_host_key_reload_loop(config: SftpConfig, holder: Arc<SshConfigHolder>, 
 
             match holder.reload_from_config(&config).await {
                 Ok(Some(host_key_count)) => {
-                    tracing::info!(
+                    info!(
+                        event = EVENT_SFTP_HOST_KEY_RELOAD_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+                        result = "reloaded",
                         host_key_dir = %config.host_key_dir.display(),
                         host_key_count,
-                        "SFTP host keys reloaded successfully"
+                        "sftp host key reload state changed"
                     );
                 }
                 Ok(None) => {
-                    tracing::debug!(
+                    debug!(
+                        event = EVENT_SFTP_HOST_KEY_RELOAD_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+                        result = "unchanged",
                         host_key_dir = %config.host_key_dir.display(),
-                        "SFTP host key material unchanged; skipping reload"
+                        "sftp host key reload state changed"
                     );
                 }
                 Err(err) => {
-                    tracing::warn!(
+                    warn!(
+                        event = EVENT_SFTP_HOST_KEY_RELOAD_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+                        result = "reload_failed",
                         host_key_dir = %config.host_key_dir.display(),
                         err = %err,
-                        "SFTP host key reload failed; keeping previous keys"
+                        "sftp host key reload state changed"
                     );
                 }
             }
@@ -353,7 +391,15 @@ where
         let listener = TcpListener::bind(self.config.bind_addr)
             .await
             .map_err(|e| SftpInitError::Server(format!("failed to bind {}: {}", self.config.bind_addr, e)))?;
-        tracing::info!(bind_addr = %self.config.bind_addr, "SFTP server listening");
+        info!(
+            event = EVENT_SFTP_SERVER_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+            state = "listening",
+            bind_addr = %self.config.bind_addr,
+            read_only = self.config.read_only,
+            "sftp server state changed"
+        );
 
         let mut sessions: JoinSet<()> = JoinSet::new();
         // Parent cancellation token for the lifetime of this listener.
@@ -383,9 +429,13 @@ where
                     self.handle_accept(accept_result, &mut sessions, &server_shutdown_token);
                 }
                 _ = shutdown_rx.recv() => {
-                    tracing::info!(
+                    info!(
+                        event = EVENT_SFTP_SERVER_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+                        state = "shutdown_requested",
                         live_sessions = sessions.len(),
-                        "SFTP server received shutdown signal",
+                        "sftp server state changed",
                     );
                     // Cascade cancellation to every live session and
                     // its watchdog before the drain loop runs. Wedged
@@ -412,11 +462,34 @@ where
         while let Some(res) = sessions.try_join_next() {
             let live = sessions.len();
             match res {
-                Ok(()) => tracing::debug!(live_sessions = live, "SFTP session task finished"),
+                Ok(()) => debug!(
+                    event = EVENT_SFTP_SESSION_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+                    state = "finished",
+                    live_sessions = live,
+                    "sftp session state changed"
+                ),
                 Err(e) if e.is_panic() => {
-                    tracing::error!(err = %e, live_sessions = live, "SFTP session task panicked")
+                    error!(
+                        event = EVENT_SFTP_SESSION_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+                        result = "task_panicked",
+                        err = %e,
+                        live_sessions = live,
+                        "sftp session state changed"
+                    )
                 }
-                Err(e) => tracing::debug!(err = %e, live_sessions = live, "SFTP session task cancelled"),
+                Err(e) => debug!(
+                    event = EVENT_SFTP_SESSION_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+                    state = "cancelled",
+                    err = %e,
+                    live_sessions = live,
+                    "sftp session state changed"
+                ),
             }
         }
     }
@@ -434,7 +507,14 @@ where
         let (stream, peer_addr) = match accept_result {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(err = %e, "failed to accept connection");
+                warn!(
+                    event = EVENT_SFTP_SESSION_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+                    result = "accept_failed",
+                    err = %e,
+                    "sftp session state changed"
+                );
                 return;
             }
         };
@@ -454,7 +534,13 @@ where
             // is still consistent across panics, and the accept loop
             // must keep running.
             let mut reg = self.session_registry.lock().unwrap_or_else(|poisoned| {
-                tracing::warn!("session registry mutex poisoned, recovering");
+                warn!(
+                    event = EVENT_SFTP_SESSION_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+                    result = "registry_poisoned",
+                    "sftp session state changed"
+                );
                 poisoned.into_inner()
             });
             reg.push(Arc::downgrade(&session_diag));
@@ -472,10 +558,14 @@ where
         let watchdog_socket = {
             let socket = wedge_watchdog::dup_socket(&stream);
             if socket.is_none() {
-                tracing::warn!(
+                warn!(
+                    event = EVENT_SFTP_SESSION_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+                    result = "watchdog_socket_unavailable",
                     peer = %peer_addr,
                     session_id = session_diag.session_id,
-                    "wedge watchdog: dup_socket failed, session has no wedge protection (rare; usually fd exhaustion)",
+                    "sftp session state changed",
                 );
             }
             socket
@@ -500,13 +590,17 @@ where
             session_diag: handler_session_diag,
         };
 
-        tracing::debug!(
+        debug!(
+            event = EVENT_SFTP_SESSION_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+            state = "spawned",
             peer = %peer_addr,
             // sessions.len() reads pre-spawn, so add one to include
             // the session about to be inserted.
             live_sessions = sessions.len() + 1,
             session_id = session_diag.session_id,
-            "SFTP accept: spawning session task",
+            "sftp session state changed",
         );
         #[cfg(target_os = "linux")]
         sessions.spawn(run_session(
@@ -670,7 +764,14 @@ async fn run_session<S>(
 ) where
     S: StorageBackend + Send + Sync + 'static,
 {
-    tracing::debug!(peer = %peer_addr, "SFTP session task entered");
+    debug!(
+        event = EVENT_SFTP_SESSION_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+        state = "task_entered",
+        peer = %peer_addr,
+        "sftp session state changed"
+    );
     // run_stream covers SSH KEX and password auth. Cap with a
     // wallclock deadline so a peer that completes TCP but stalls
     // before KEXINIT (or that drives KEX or auth so slowly that no
@@ -681,19 +782,38 @@ async fn run_session<S>(
     let session = match timeout(handshake_deadline, russh::server::run_stream(ssh_config, stream, handler)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            tracing::debug!(peer = %peer_addr, err = %e, "SSH session setup failed");
+            debug!(
+                event = EVENT_SFTP_SESSION_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+                result = "setup_failed",
+                peer = %peer_addr,
+                err = %e,
+                "sftp session state changed"
+            );
             return;
         }
         Err(_elapsed) => {
-            tracing::warn!(
+            warn!(
+                event = EVENT_SFTP_SESSION_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+                result = "handshake_timeout",
                 peer = %peer_addr,
                 deadline_secs = HANDSHAKE_DEADLINE_SECS,
-                "SSH handshake exceeded deadline; dropping connection",
+                "sftp session state changed",
             );
             return;
         }
     };
-    tracing::debug!(peer = %peer_addr, "SFTP session run_stream returned; awaiting session loop");
+    debug!(
+        event = EVENT_SFTP_SESSION_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+        state = "handshake_completed",
+        peer = %peer_addr,
+        "sftp session state changed"
+    );
     // Spawn the per-session watchdog. On Linux the wedge watchdog
     // observes the SFTP-handler activity stamp and the kernel TCP
     // state. On wedge detection it shuts the duplicated socket down
@@ -722,16 +842,38 @@ async fn run_session<S>(
     let session_result = match session_result {
         Some(r) => r,
         None => {
-            tracing::warn!(peer = %peer_addr, "SFTP session cancelled (watchdog or server shutdown)");
+            warn!(
+                event = EVENT_SFTP_SESSION_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+                state = "cancelled",
+                peer = %peer_addr,
+                "sftp session state changed"
+            );
             return;
         }
     };
     match session_result {
         Ok(()) => {
-            tracing::debug!(peer = %peer_addr, "SFTP session ended cleanly");
+            debug!(
+                event = EVENT_SFTP_SESSION_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+                state = "ended_cleanly",
+                peer = %peer_addr,
+                "sftp session state changed"
+            );
         }
         Err(e) => {
-            tracing::debug!(peer = %peer_addr, err = %e, "SSH session ended with error");
+            debug!(
+                event = EVENT_SFTP_SESSION_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+                result = "ended_with_error",
+                peer = %peer_addr,
+                err = %e,
+                "sftp session state changed"
+            );
         }
     }
 }
@@ -757,16 +899,33 @@ async fn drain_sessions(mut sessions: JoinSet<()>) {
             if let Err(e) = res
                 && e.is_panic()
             {
-                tracing::error!(err = %e, "SFTP session task panicked during drain");
+                error!(
+                    event = EVENT_SFTP_SESSION_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+                    result = "drain_task_panicked",
+                    err = %e,
+                    "sftp session state changed"
+                );
             }
         }
     };
     match timeout(Duration::from_secs(SHUTDOWN_DRAIN_TIMEOUT_SECS), drain).await {
-        Ok(()) => tracing::info!("SFTP session drain complete"),
-        Err(_) => tracing::warn!(
+        Ok(()) => info!(
+            event = EVENT_SFTP_SERVER_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+            state = "drain_completed",
+            "sftp server state changed"
+        ),
+        Err(_) => warn!(
+            event = EVENT_SFTP_SERVER_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+            result = "drain_timeout",
             timeout_secs = SHUTDOWN_DRAIN_TIMEOUT_SECS,
             live = sessions.len(),
-            "SFTP session drain timed out, cancelling remaining sessions",
+            "sftp server state changed",
         ),
     }
 }
@@ -872,6 +1031,7 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
     ) -> impl std::future::Future<Output = Result<Auth, Self::Error>> + Send {
         let user = user.to_owned();
         let password = password.to_owned();
+        let masked_user = MaskedAccessKey(&user).to_string();
         let peer_addr = self.peer_addr;
         let session_diag = Arc::clone(&self.session_diag);
         session_diag.stamp();
@@ -880,7 +1040,15 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
             let iam_sys = match rustfs_iam::get() {
                 Ok(sys) => sys,
                 Err(e) => {
-                    tracing::error!(err = %e, "IAM system unavailable");
+                    error!(
+                        event = EVENT_SFTP_AUTH_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SFTP_AUTH,
+                        result = "iam_unavailable",
+                        peer = %peer_addr,
+                        err = %e,
+                        "sftp auth state changed"
+                    );
                     return Ok(Auth::reject());
                 }
             };
@@ -888,10 +1056,15 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
             let (identity_opt, is_valid) = match iam_sys.check_key(&user).await {
                 Ok(result) => result,
                 Err(e) => {
-                    tracing::error!(
-                        user = %user,
+                    error!(
+                        event = EVENT_SFTP_AUTH_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SFTP_AUTH,
+                        result = "check_key_failed",
+                        user = %masked_user,
+                        peer = %peer_addr,
                         err = %e,
-                        "IAM check_key error"
+                        "sftp auth state changed"
                     );
                     return Ok(Auth::reject());
                 }
@@ -900,10 +1073,14 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
             let identity = match identity_opt {
                 Some(id) => id,
                 None => {
-                    tracing::warn!(
-                        user = %user,
+                    warn!(
+                        event = EVENT_SFTP_AUTH_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SFTP_AUTH,
+                        result = "unknown_access_key",
+                        user = %masked_user,
                         peer = %peer_addr,
-                        "SFTP auth rejected: unknown access key"
+                        "sftp auth state changed"
                     );
                     return Ok(Auth::reject());
                 }
@@ -912,10 +1089,14 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
             // Reject disabled or expired accounts. FTPS checks this at
             // ftps/server.rs:286. SFTP must do the same.
             if !is_valid {
-                tracing::warn!(
-                    user = %user,
+                warn!(
+                    event = EVENT_SFTP_AUTH_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_AUTH,
+                    result = "account_inactive",
+                    user = %masked_user,
                     peer = %peer_addr,
-                    "SFTP auth rejected: account disabled or expired"
+                    "sftp auth state changed"
                 );
                 return Ok(Auth::reject());
             }
@@ -926,10 +1107,14 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
             let secret_matches: bool = identity.credentials.secret_key.as_bytes().ct_eq(password.as_bytes()).into();
 
             if !secret_matches {
-                tracing::warn!(
-                    user = %user,
+                warn!(
+                    event = EVENT_SFTP_AUTH_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_AUTH,
+                    result = "invalid_secret_key",
+                    user = %masked_user,
                     peer = %peer_addr,
-                    "SFTP auth rejected: invalid secret key"
+                    "sftp auth state changed"
                 );
                 return Ok(Auth::reject());
             }
@@ -937,10 +1122,14 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
             let principal = ProtocolPrincipal::new(Arc::new(identity));
             self.session_context = Some(SessionContext::new(principal, Protocol::Sftp, peer_addr.ip()));
 
-            tracing::info!(
-                user = %user,
+            debug!(
+                event = EVENT_SFTP_AUTH_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SFTP_AUTH,
+                result = "authenticated",
+                user = %masked_user,
                 peer = %peer_addr,
-                "SFTP auth accepted"
+                "sftp auth state changed"
             );
             Ok(Auth::Accept)
         }
@@ -992,10 +1181,14 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
 
         let inputs: Result<Option<RunInputs<S>>, Self::Error> = (|| {
             if name != SFTP_SUBSYSTEM_NAME {
-                tracing::warn!(
+                warn!(
+                    event = EVENT_SFTP_SUBSYSTEM_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+                    result = "unsupported_subsystem",
                     subsystem = %name,
                     peer = %self.peer_addr,
-                    "rejecting unsupported subsystem"
+                    "sftp subsystem state changed"
                 );
                 session.channel_failure(channel_id)?;
                 return Ok(None);
@@ -1004,9 +1197,14 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
             let channel = match self.channels.remove(&channel_id) {
                 Some(ch) => ch,
                 None => {
-                    tracing::error!(
+                    error!(
+                        event = EVENT_SFTP_SUBSYSTEM_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+                        result = "channel_missing",
                         channel = ?channel_id,
-                        "subsystem_request: no channel found"
+                        peer = %self.peer_addr,
+                        "sftp subsystem state changed"
                     );
                     session.channel_failure(channel_id)?;
                     return Ok(None);
@@ -1016,13 +1214,30 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
             let session_context = match self.session_context.clone() {
                 Some(ctx) => ctx,
                 None => {
-                    tracing::error!("subsystem_request before authentication");
+                    error!(
+                        event = EVENT_SFTP_SUBSYSTEM_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+                        result = "unauthenticated_request",
+                        channel = ?channel_id,
+                        peer = %self.peer_addr,
+                        "sftp subsystem state changed"
+                    );
                     session.channel_failure(channel_id)?;
                     return Ok(None);
                 }
             };
 
             session.channel_success(channel_id)?;
+            debug!(
+                event = EVENT_SFTP_SUBSYSTEM_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
+                state = "accepted",
+                channel = ?channel_id,
+                peer = %self.peer_addr,
+                "sftp subsystem state changed"
+            );
 
             Ok(Some(RunInputs {
                 stream: channel.into_stream(),

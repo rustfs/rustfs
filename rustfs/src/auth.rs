@@ -19,9 +19,9 @@ use rustfs_iam::error::Error as IamError;
 use rustfs_iam::sys::{
     SESSION_POLICY_NAME, get_claims_from_token_with_secret, get_claims_from_token_with_secret_allow_missing_exp,
 };
-use rustfs_obs::MaskedAccessKey;
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
 use rustfs_trusted_proxies::ClientInfo;
+use rustfs_utils::MaskedAccessKey;
 use rustfs_utils::http::{AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER};
 use s3s::S3Error;
 use s3s::S3ErrorCode;

@@ -32,6 +32,22 @@ use walkdir::WalkDir;
 
 const MAX_CAPACITY_SCAN_CONCURRENCY: usize = 4;
 const CAPACITY_PROGRESS_CHECK_STRIDE: usize = 512;
+const LOG_COMPONENT_CAPACITY: &str = "capacity";
+const LOG_SUBSYSTEM_SCAN: &str = "scan";
+const LOG_SUBSYSTEM_SAMPLING: &str = "sampling";
+const EVENT_CAPACITY_SCAN_DISK_COMPLETED: &str = "capacity_scan_disk_completed";
+const EVENT_CAPACITY_SCAN_DISK_FAILED: &str = "capacity_scan_disk_failed";
+const EVENT_CAPACITY_SCAN_SUMMARY: &str = "capacity_scan_summary";
+const EVENT_CAPACITY_SCAN_SYMLINK_SKIPPED: &str = "capacity_scan_symlink_skipped";
+const EVENT_CAPACITY_SCAN_SYMLINK_SUMMARY: &str = "capacity_scan_symlink_summary";
+const EVENT_CAPACITY_SCAN_DYNAMIC_TIMEOUT: &str = "capacity_scan_dynamic_timeout";
+const EVENT_CAPACITY_SCAN_TIMEOUT: &str = "capacity_scan_timeout";
+const EVENT_CAPACITY_SCAN_STALL_DETECTED: &str = "capacity_scan_stall_detected";
+const EVENT_CAPACITY_SCAN_SAMPLING_CLAMPED: &str = "capacity_scan_sampling_clamped";
+const EVENT_CAPACITY_SCAN_TRAVERSAL_FAILED: &str = "capacity_scan_traversal_failed";
+const EVENT_CAPACITY_SCAN_METADATA_FAILED: &str = "capacity_scan_metadata_failed";
+const EVENT_CAPACITY_SCAN_SAMPLING_APPLIED: &str = "capacity_scan_sampling_applied";
+const EVENT_CAPACITY_SCAN_EXACT_COMPLETED: &str = "capacity_scan_exact_completed";
 
 #[derive(Debug)]
 struct DiskScanOutcome {
@@ -138,8 +154,19 @@ async fn calculate_data_dir_used_capacity_report(
                     scan.had_partial_errors,
                 );
                 debug!(
-                    "Data directory {} size: {} bytes, files={}, sampled={}, estimated={}, duration={:?}",
-                    outcome.drive_path, scan.used_bytes, scan.file_count, scan.sampled_count, scan.is_estimated, outcome.duration
+                    event = EVENT_CAPACITY_SCAN_DISK_COMPLETED,
+                    component = LOG_COMPONENT_CAPACITY,
+                    subsystem = LOG_SUBSYSTEM_SCAN,
+                    result = "ok",
+                    disk_label = %outcome.disk_label,
+                    drive_path = %outcome.drive_path,
+                    used_bytes = scan.used_bytes,
+                    file_count = scan.file_count,
+                    sampled_count = scan.sampled_count,
+                    estimated = scan.is_estimated,
+                    partial_errors = scan.had_partial_errors,
+                    duration_ms = outcome.duration.as_millis() as u64,
+                    "capacity scan disk completed"
                 );
                 total_used += scan.used_bytes;
                 total_files += scan.file_count;
@@ -159,7 +186,17 @@ async fn calculate_data_dir_used_capacity_report(
             }
             Err(e) => {
                 record_capacity_scan_disk(outcome.disk_label.as_str(), outcome.duration, 0, 0, false, true);
-                warn!("Failed to get size for directory {}: {:?}", outcome.drive_path, e);
+                warn!(
+                    event = EVENT_CAPACITY_SCAN_DISK_FAILED,
+                    component = LOG_COMPONENT_CAPACITY,
+                    subsystem = LOG_SUBSYSTEM_SCAN,
+                    result = "error",
+                    disk_label = %outcome.disk_label,
+                    drive_path = %outcome.drive_path,
+                    duration_ms = outcome.duration.as_millis() as u64,
+                    error = ?e,
+                    "capacity scan disk failed"
+                );
                 has_failure = true;
             }
         }
@@ -170,7 +207,19 @@ async fn calculate_data_dir_used_capacity_report(
     }
 
     if has_failure {
-        warn!("Some directories failed to calculate size, result may be incomplete");
+        warn!(
+            event = EVENT_CAPACITY_SCAN_SUMMARY,
+            component = LOG_COMPONENT_CAPACITY,
+            subsystem = LOG_SUBSYSTEM_SCAN,
+            result = "partial",
+            disk_count = disks.len(),
+            used_bytes = total_used,
+            file_count = total_files,
+            sampled_count = total_sampled,
+            estimated = is_estimated,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "capacity scan completed with partial failures"
+        );
     }
 
     let mut summary = CapacityScanResult {
@@ -265,12 +314,30 @@ impl SymlinkTracker {
 
     fn should_follow(&self, path: &Path, depth: u8) -> bool {
         if depth >= self.max_depth {
-            debug!("Symlink depth limit reached: {} >= {}, not following {:?}", depth, self.max_depth, path);
+            debug!(
+                event = EVENT_CAPACITY_SCAN_SYMLINK_SKIPPED,
+                component = LOG_COMPONENT_CAPACITY,
+                subsystem = LOG_SUBSYSTEM_SCAN,
+                result = "skipped",
+                reason = "depth_limit",
+                depth,
+                max_depth = self.max_depth,
+                path = ?path,
+                "capacity scan symlink skipped"
+            );
             return false;
         }
 
         if self.visited.contains(path) {
-            warn!("Circular symlink reference detected: {:?}, skipping", path);
+            warn!(
+                event = EVENT_CAPACITY_SCAN_SYMLINK_SKIPPED,
+                component = LOG_COMPONENT_CAPACITY,
+                subsystem = LOG_SUBSYSTEM_SCAN,
+                result = "skipped",
+                reason = "cycle_detected",
+                path = ?path,
+                "capacity scan symlink skipped"
+            );
             return false;
         }
 
@@ -343,8 +410,17 @@ impl ProgressMonitor {
         let clamped_timeout = adjusted_timeout.max(self.min_timeout).min(self.max_timeout);
 
         debug!(
-            "Dynamic timeout calculation: files={}, avg_size={}, multiplier={:.2}, base_timeout={:?}, adjusted_timeout={:?}, clamped_timeout={:?}",
-            file_count, avg_file_size, multiplier, self.timeout, adjusted_timeout, clamped_timeout
+            event = EVENT_CAPACITY_SCAN_DYNAMIC_TIMEOUT,
+            component = LOG_COMPONENT_CAPACITY,
+            subsystem = LOG_SUBSYSTEM_SCAN,
+            state = "calculated",
+            file_count,
+            avg_file_size,
+            multiplier,
+            base_timeout_secs = self.timeout.as_secs(),
+            adjusted_timeout_secs = adjusted_timeout.as_secs(),
+            clamped_timeout_secs = clamped_timeout.as_secs(),
+            "capacity scan dynamic timeout calculated"
         );
 
         clamped_timeout
@@ -360,8 +436,15 @@ impl ProgressMonitor {
 
         if elapsed >= dynamic_timeout {
             warn!(
-                "Directory size calculation timeout after {} files, elapsed: {:?}, timeout: {:?}",
-                files_processed, elapsed, dynamic_timeout
+                event = EVENT_CAPACITY_SCAN_TIMEOUT,
+                component = LOG_COMPONENT_CAPACITY,
+                subsystem = LOG_SUBSYSTEM_SCAN,
+                result = "timeout",
+                file_count = files_processed,
+                elapsed_ms = elapsed.as_millis() as u64,
+                timeout_ms = dynamic_timeout.as_millis() as u64,
+                dynamic_timeout_enabled = self.enable_dynamic_timeout,
+                "capacity scan timed out"
             );
 
             if self.enable_dynamic_timeout {
@@ -380,8 +463,13 @@ impl ProgressMonitor {
 
             if files_per_checkpoint == 0 && files_processed > 0 {
                 warn!(
-                    "No progress detected for {:?}, possible stall at {} files",
-                    self.stall_timeout, files_processed
+                    event = EVENT_CAPACITY_SCAN_STALL_DETECTED,
+                    component = LOG_COMPONENT_CAPACITY,
+                    subsystem = LOG_SUBSYSTEM_SCAN,
+                    result = "stall",
+                    file_count = files_processed,
+                    stall_timeout_ms = self.stall_timeout.as_millis() as u64,
+                    "capacity scan stall detected"
                 );
 
                 record_capacity_stall_detected();
@@ -418,7 +506,16 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
     let max_symlink_depth = get_max_symlink_depth();
 
     let effective_sample_rate = if sample_rate == 0 {
-        warn!("Invalid sampling configuration: sample_rate=0. Clamping to 1 to avoid panic.");
+        warn!(
+            event = EVENT_CAPACITY_SCAN_SAMPLING_CLAMPED,
+            component = LOG_COMPONENT_CAPACITY,
+            subsystem = LOG_SUBSYSTEM_SAMPLING,
+            result = "clamped",
+            configured_sample_rate = 0,
+            effective_sample_rate = 1,
+            reason = "zero_sample_rate",
+            "capacity scan sampling configuration clamped"
+        );
         1
     } else {
         sample_rate
@@ -453,7 +550,15 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
             let entry = match entry_result {
                 Ok(entry) => entry,
                 Err(err) => {
-                    warn!("Failed to traverse directory entry under {:?}: {}", path, err);
+                    warn!(
+                        event = EVENT_CAPACITY_SCAN_TRAVERSAL_FAILED,
+                        component = LOG_COMPONENT_CAPACITY,
+                        subsystem = LOG_SUBSYSTEM_SCAN,
+                        result = "partial",
+                        root_path = ?path,
+                        error = %err,
+                        "capacity scan traversal failed"
+                    );
                     had_partial_errors = true;
                     continue;
                 }
@@ -479,7 +584,15 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
             let metadata = match entry.metadata() {
                 Ok(meta) => meta,
                 Err(err) => {
-                    warn!("Failed to get metadata for {:?}: {}", entry.path(), err);
+                    warn!(
+                        event = EVENT_CAPACITY_SCAN_METADATA_FAILED,
+                        component = LOG_COMPONENT_CAPACITY,
+                        subsystem = LOG_SUBSYSTEM_SCAN,
+                        result = "partial",
+                        entry_path = ?entry.path(),
+                        error = %err,
+                        "capacity scan metadata failed"
+                    );
                     had_partial_errors = true;
                     continue;
                 }
@@ -502,8 +615,17 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
                     let estimated_overflow = overflow_sampled_bytes.saturating_mul(overflow_count as u64) / sampled_count as u64;
                     let estimated_total = exact_prefix_bytes.saturating_add(estimated_overflow);
                     info!(
-                        "Timeout/stall at {} files, using sampled estimate: exact_prefix={} overflow_estimate={} sampled={}",
-                        file_count, exact_prefix_bytes, estimated_overflow, sampled_count
+                        event = EVENT_CAPACITY_SCAN_SAMPLING_APPLIED,
+                        component = LOG_COMPONENT_CAPACITY,
+                        subsystem = LOG_SUBSYSTEM_SAMPLING,
+                        result = "fallback_estimate",
+                        reason = "timeout_or_stall",
+                        file_count,
+                        exact_prefix_bytes,
+                        estimated_overflow_bytes = estimated_overflow,
+                        sampled_count,
+                        estimated_total_bytes = estimated_total,
+                        "capacity scan sampling applied"
                     );
                     progress_monitor.record_timeout_fallback();
                     record_capacity_scan_sampling(sampled_count, true);
@@ -534,8 +656,15 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
 
                 if file_count.is_multiple_of(100_000) {
                     debug!(
-                        "Processed {} files, exact_prefix_bytes={}, sampled_overflow={} files/{} bytes",
-                        file_count, exact_prefix_bytes, sampled_count, overflow_sampled_bytes
+                        event = EVENT_CAPACITY_SCAN_SAMPLING_APPLIED,
+                        component = LOG_COMPONENT_CAPACITY,
+                        subsystem = LOG_SUBSYSTEM_SAMPLING,
+                        state = "progress",
+                        file_count,
+                        exact_prefix_bytes,
+                        sampled_count,
+                        sampled_overflow_bytes = overflow_sampled_bytes,
+                        "capacity scan sampling progress"
                     );
                 }
             }
@@ -555,8 +684,17 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
                     let estimated_overflow = overflow_sampled_bytes.saturating_mul(overflow_count as u64) / sampled_count as u64;
                     let estimated_total = exact_prefix_bytes.saturating_add(estimated_overflow);
                     info!(
-                        "Timeout/stall at {} files during final check, using sampled estimate: exact_prefix={} overflow_estimate={} sampled={}",
-                        file_count, exact_prefix_bytes, estimated_overflow, sampled_count
+                        event = EVENT_CAPACITY_SCAN_SAMPLING_APPLIED,
+                        component = LOG_COMPONENT_CAPACITY,
+                        subsystem = LOG_SUBSYSTEM_SAMPLING,
+                        result = "fallback_estimate",
+                        reason = "final_timeout_or_stall",
+                        file_count,
+                        exact_prefix_bytes,
+                        estimated_overflow_bytes = estimated_overflow,
+                        sampled_count,
+                        estimated_total_bytes = estimated_total,
+                        "capacity scan sampling applied"
                     );
                     progress_monitor.record_timeout_fallback();
                     record_capacity_scan_sampling(sampled_count, true);
@@ -577,8 +715,13 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
         let (symlink_count, symlink_size) = symlink_tracker.get_stats();
         if symlink_count > 0 {
             info!(
-                "Symlink tracking: {} symlinks processed, total tracked size: {} bytes",
-                symlink_count, symlink_size
+                event = EVENT_CAPACITY_SCAN_SYMLINK_SUMMARY,
+                component = LOG_COMPONENT_CAPACITY,
+                subsystem = LOG_SUBSYSTEM_SCAN,
+                result = "observed",
+                symlink_count,
+                tracked_bytes = symlink_size,
+                "capacity scan symlink summary"
             );
         }
 
@@ -587,8 +730,19 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
             let estimated_overflow = overflow_sampled_bytes.saturating_mul(overflow_count as u64) / sampled_count as u64;
             let estimated_size = exact_prefix_bytes.saturating_add(estimated_overflow);
             info!(
-                "Large directory detected: {} files, estimated size: {} bytes (exact prefix: {}, sampled overflow {}/{})",
-                file_count, estimated_size, exact_prefix_bytes, sampled_count, overflow_count
+                event = EVENT_CAPACITY_SCAN_SAMPLING_APPLIED,
+                component = LOG_COMPONENT_CAPACITY,
+                subsystem = LOG_SUBSYSTEM_SAMPLING,
+                result = "estimated",
+                reason = "overflow_sampling",
+                file_count,
+                threshold = max_files_threshold,
+                exact_prefix_bytes,
+                overflow_count,
+                sampled_count,
+                estimated_overflow_bytes = estimated_overflow,
+                estimated_total_bytes = estimated_size,
+                "capacity scan sampling applied"
             );
             record_capacity_scan_sampling(sampled_count, true);
             record_capacity_scan_mode("estimated");
@@ -607,8 +761,20 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
             let estimated_overflow = avg_prefix_size.saturating_mul(overflow_count as u64);
             let estimated_size = exact_prefix_bytes.saturating_add(estimated_overflow);
             info!(
-                "Large directory detected: {} files, estimated size: {} bytes (no overflow samples, used prefix average {} bytes/file)",
-                file_count, estimated_size, avg_prefix_size
+                event = EVENT_CAPACITY_SCAN_SAMPLING_APPLIED,
+                component = LOG_COMPONENT_CAPACITY,
+                subsystem = LOG_SUBSYSTEM_SAMPLING,
+                result = "estimated",
+                reason = "prefix_average",
+                file_count,
+                threshold = max_files_threshold,
+                exact_prefix_bytes,
+                overflow_count,
+                sampled_count = 0,
+                avg_prefix_size,
+                estimated_overflow_bytes = estimated_overflow,
+                estimated_total_bytes = estimated_size,
+                "capacity scan sampling applied"
             );
             record_capacity_scan_sampling(0, true);
             record_capacity_scan_mode("estimated");
@@ -623,10 +789,14 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
         } else {
             record_capacity_scan_sampling(0, false);
             debug!(
-                "Directory size calculation completed: {} files, {} bytes, took {:?}",
+                event = EVENT_CAPACITY_SCAN_EXACT_COMPLETED,
+                component = LOG_COMPONENT_CAPACITY,
+                subsystem = LOG_SUBSYSTEM_SCAN,
+                result = "exact",
                 file_count,
-                exact_prefix_bytes,
-                start_time.elapsed()
+                used_bytes = exact_prefix_bytes,
+                duration_ms = start_time.elapsed().as_millis() as u64,
+                "capacity scan exact completed"
             );
             record_capacity_scan_mode("exact");
             Ok(CapacityScanResult {

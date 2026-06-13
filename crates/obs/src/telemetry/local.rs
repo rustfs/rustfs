@@ -60,6 +60,11 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
 };
 
+const LOG_COMPONENT_OBS: &str = "obs";
+const LOG_SUBSYSTEM_LOCAL_LOGGING: &str = "local_logging";
+const EVENT_LOCAL_LOGGING_STATE: &str = "local_logging_state";
+const EVENT_LOG_CLEANER_STATE: &str = "log_cleaner_state";
+
 pub(super) fn build_json_log_layer<S, W>(writer: W, enable_ansi: bool, span_events: FmtSpan) -> impl tracing_subscriber::Layer<S>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
@@ -161,12 +166,16 @@ fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: boo
     set_observability_metric_enabled(false);
     counter!("rustfs_start_total").increment(1);
     info!(
+        event = EVENT_LOCAL_LOGGING_STATE,
+        component = LOG_COMPONENT_OBS,
+        subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
+        state = "initialized",
         backend = "local",
         sink = "stdout",
         output_format = "json",
         logger_level,
         is_production,
-        "Initialized local logging"
+        "local logging state changed"
     );
 
     OtelGuard {
@@ -271,6 +280,10 @@ fn init_file_logging_internal(
     let cleanup_handle = spawn_cleanup_task(config, log_directory, log_filename, keep_files);
 
     info!(
+        event = EVENT_LOCAL_LOGGING_STATE,
+        component = LOG_COMPONENT_OBS,
+        subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
+        state = "initialized",
         backend = "local",
         sink = "file",
         output_format = "json",
@@ -280,7 +293,7 @@ fn init_file_logging_internal(
         stdout_mirror_enabled = stdout_guard.is_some(),
         is_production,
         logger_level,
-        "Initialized local logging"
+        "local logging state changed"
     );
 
     Ok(OtelGuard {
@@ -459,13 +472,17 @@ pub fn spawn_cleanup_task(
     );
 
     info!(
+        event = EVENT_LOG_CLEANER_STATE,
+        component = LOG_COMPONENT_OBS,
+        subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
+        state = "configured",
         compression_algorithm = %compression_algorithm,
         parallel_compress,
         parallel_workers,
         zstd_level,
         zstd_fallback_to_gzip,
         zstd_workers,
-        "log cleaner compression profile configured"
+        "log cleaner state changed"
     );
 
     tokio::spawn(async move {
@@ -483,11 +500,25 @@ pub fn spawn_cleanup_task(
                 }
                 Ok(Err(e)) => {
                     counter!(METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL).increment(1);
-                    tracing::warn!("Log cleanup failed: {}", e);
+                    tracing::warn!(
+                        event = EVENT_LOG_CLEANER_STATE,
+                        component = LOG_COMPONENT_OBS,
+                        subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
+                        result = "cleanup_failed",
+                        error = %e,
+                        "log cleaner state changed"
+                    );
                 }
                 Err(e) => {
                     counter!(METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL).increment(1);
-                    tracing::warn!("Log cleanup task panicked: {}", e);
+                    tracing::warn!(
+                        event = EVENT_LOG_CLEANER_STATE,
+                        component = LOG_COMPONENT_OBS,
+                        subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
+                        result = "cleanup_task_panicked",
+                        error = %e,
+                        "log cleaner state changed"
+                    );
                 }
             }
         }

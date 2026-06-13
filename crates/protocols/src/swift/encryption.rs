@@ -63,6 +63,10 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use std::collections::HashMap;
 use tracing::{debug, warn};
 
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SWIFT_ENCRYPTION: &str = "swift_encryption";
+const EVENT_SWIFT_ENCRYPTION_STATE: &str = "swift_encryption_state";
+
 /// Encryption algorithm identifier
 #[derive(Debug, Clone, PartialEq)]
 pub enum EncryptionAlgorithm {
@@ -270,7 +274,13 @@ pub fn should_encrypt(config: &EncryptionConfig, headers: &http::HeaderMap) -> b
     if let Some(disable) = headers.get("x-object-meta-crypto-disable")
         && disable.to_str().unwrap_or("") == "true"
     {
-        debug!("Client explicitly disabled encryption");
+        debug!(
+            event = EVENT_SWIFT_ENCRYPTION_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_ENCRYPTION,
+            state = "disabled_by_client",
+            "swift encryption state changed"
+        );
         return false;
     }
 
@@ -305,7 +315,15 @@ pub fn generate_iv(size: usize) -> Vec<u8> {
 /// In production, this would use a proper crypto library like `aes-gcm` or `ring`.
 /// This is a stub that demonstrates the API structure.
 pub fn encrypt_data(data: &[u8], config: &EncryptionConfig) -> SwiftResult<(Vec<u8>, EncryptionMetadata)> {
-    debug!("Encrypting {} bytes with {}", data.len(), config.algorithm.as_str());
+    debug!(
+        event = EVENT_SWIFT_ENCRYPTION_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SWIFT_ENCRYPTION,
+        state = "encrypting",
+        input_bytes = data.len(),
+        algorithm = config.algorithm.as_str(),
+        "swift encryption state changed"
+    );
 
     // Generate IV (12 bytes for GCM, 16 bytes for CBC)
     let iv_size = match config.algorithm {
@@ -327,7 +345,14 @@ pub fn encrypt_data(data: &[u8], config: &EncryptionConfig) -> SwiftResult<(Vec<
     // let ciphertext = cipher.encrypt(nonce, data)
     //     .map_err(|e| SwiftError::InternalServerError(format!("Encryption failed: {}", e)))?;
 
-    warn!("Encryption not yet implemented - returning plaintext with metadata");
+    warn!(
+        event = EVENT_SWIFT_ENCRYPTION_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SWIFT_ENCRYPTION,
+        result = "not_implemented",
+        mode = "encrypt",
+        "swift encryption state changed"
+    );
 
     let metadata = EncryptionMetadata::new(config.algorithm.clone(), config.key_id.clone(), iv);
 
@@ -340,7 +365,15 @@ pub fn encrypt_data(data: &[u8], config: &EncryptionConfig) -> SwiftResult<(Vec<
 /// In production, this would use a proper crypto library like `aes-gcm` or `ring`.
 /// This is a stub that demonstrates the API structure.
 pub fn decrypt_data(encrypted_data: &[u8], metadata: &EncryptionMetadata, config: &EncryptionConfig) -> SwiftResult<Vec<u8>> {
-    debug!("Decrypting {} bytes with {}", encrypted_data.len(), metadata.algorithm.as_str());
+    debug!(
+        event = EVENT_SWIFT_ENCRYPTION_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SWIFT_ENCRYPTION,
+        state = "decrypting",
+        input_bytes = encrypted_data.len(),
+        algorithm = metadata.algorithm.as_str(),
+        "swift encryption state changed"
+    );
 
     // Verify key ID matches
     if metadata.key_id != config.key_id {
@@ -361,7 +394,14 @@ pub fn decrypt_data(encrypted_data: &[u8], metadata: &EncryptionMetadata, config
     // let plaintext = cipher.decrypt(nonce, encrypted_data)
     //     .map_err(|e| SwiftError::InternalServerError(format!("Decryption failed: {}", e)))?;
 
-    warn!("Decryption not yet implemented - returning data as-is");
+    warn!(
+        event = EVENT_SWIFT_ENCRYPTION_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SWIFT_ENCRYPTION,
+        result = "not_implemented",
+        mode = "decrypt",
+        "swift encryption state changed"
+    );
 
     // In production, return plaintext
     Ok(encrypted_data.to_vec())

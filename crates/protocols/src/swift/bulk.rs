@@ -82,6 +82,11 @@ use s3s::Body;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error};
 
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SWIFT_BULK: &str = "swift_bulk";
+const EVENT_SWIFT_BULK_DELETE_STATE: &str = "swift_bulk_delete_state";
+const EVENT_SWIFT_BULK_EXTRACT_STATE: &str = "swift_bulk_extract_state";
+
 /// Result of a single delete operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteResult {
@@ -211,7 +216,14 @@ fn parse_object_path(path: &str) -> SwiftResult<(String, String)> {
 ///
 /// Deletes multiple objects specified in the request body
 pub async fn handle_bulk_delete(account: &str, body: String, credentials: &Credentials) -> SwiftResult<Response<Body>> {
-    debug!("Bulk delete request for account: {}", account);
+    debug!(
+        event = EVENT_SWIFT_BULK_DELETE_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SWIFT_BULK,
+        state = "started",
+        account = %account,
+        "swift bulk delete state changed"
+    );
 
     let mut response = BulkDeleteResponse::default();
     let mut delete_results = Vec::new();
@@ -223,7 +235,15 @@ pub async fn handle_bulk_delete(account: &str, body: String, credentials: &Crede
         return Err(SwiftError::BadRequest("No paths provided for bulk delete".to_string()));
     }
 
-    debug!("Processing {} delete requests", paths.len());
+    debug!(
+        event = EVENT_SWIFT_BULK_DELETE_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SWIFT_BULK,
+        state = "processing",
+        account = %account,
+        path_count = paths.len(),
+        "swift bulk delete state changed"
+    );
 
     // Process each path
     for path in paths {
@@ -248,7 +268,16 @@ pub async fn handle_bulk_delete(account: &str, body: String, credentials: &Crede
                         }
                     }
                     Err(e) => {
-                        error!("Error deleting {}: {}", path, e);
+                        error!(
+                            event = EVENT_SWIFT_BULK_DELETE_STATE,
+                            component = LOG_COMPONENT_PROTOCOLS,
+                            subsystem = LOG_SUBSYSTEM_SWIFT_BULK,
+                            result = "delete_failed",
+                            account = %account,
+                            path = %path,
+                            error = %e,
+                            "swift bulk delete state changed"
+                        );
                         response.errors.push(vec![path.to_string(), e.to_string()]);
                         DeleteResult {
                             path: path.to_string(),
@@ -259,7 +288,16 @@ pub async fn handle_bulk_delete(account: &str, body: String, credentials: &Crede
                 }
             }
             Err(e) => {
-                error!("Invalid path {}: {}", path, e);
+                error!(
+                    event = EVENT_SWIFT_BULK_DELETE_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SWIFT_BULK,
+                    result = "invalid_path",
+                    account = %account,
+                    path = %path,
+                    error = %e,
+                    "swift bulk delete state changed"
+                );
                 response.errors.push(vec![path.to_string(), e.to_string()]);
                 DeleteResult {
                     path: path.to_string(),
@@ -328,7 +366,16 @@ pub async fn handle_bulk_extract(
     body: Vec<u8>,
     credentials: &Credentials,
 ) -> SwiftResult<Response<Body>> {
-    debug!("Bulk extract request for container: {}, format: {:?}", container, format);
+    debug!(
+        event = EVENT_SWIFT_BULK_EXTRACT_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SWIFT_BULK,
+        state = "started",
+        account = %account,
+        container = %container,
+        format = ?format,
+        "swift bulk extract state changed"
+    );
 
     let mut response = BulkExtractResponse::default();
 
@@ -358,10 +405,27 @@ pub async fn handle_bulk_extract(
         {
             Ok(_) => {
                 response.number_files_created += 1;
-                debug!("Extracted: {}", path_str);
+                debug!(
+                    event = EVENT_SWIFT_BULK_EXTRACT_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SWIFT_BULK,
+                    state = "file_created",
+                    container = %container,
+                    object = %path_str,
+                    "swift bulk extract state changed"
+                );
             }
             Err(e) => {
-                error!("Failed to upload {}: {}", path_str, e);
+                error!(
+                    event = EVENT_SWIFT_BULK_EXTRACT_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SWIFT_BULK,
+                    result = "upload_failed",
+                    container = %container,
+                    object = %path_str,
+                    error = %e,
+                    "swift bulk extract state changed"
+                );
                 response.errors.push(vec![path_str.clone(), e.to_string()]);
             }
         }
@@ -430,14 +494,29 @@ async fn extract_tar_entries(format: ArchiveFormat, body: Vec<u8>) -> SwiftResul
 
         // Skip directories
         if entry.header().entry_type().is_dir() {
-            debug!("Skipping directory: {}", path_str);
+            debug!(
+                event = EVENT_SWIFT_BULK_EXTRACT_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SWIFT_BULK,
+                state = "skipped_directory",
+                path = %path_str,
+                "swift bulk extract state changed"
+            );
             continue;
         }
 
         // Read file contents
         let mut contents = Vec::new();
         if let Err(e) = tokio::io::AsyncReadExt::read_to_end(&mut entry, &mut contents).await {
-            error!("Failed to read tar entry {}: {}", path_str, e);
+            error!(
+                event = EVENT_SWIFT_BULK_EXTRACT_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SWIFT_BULK,
+                result = "tar_entry_read_failed",
+                path = %path_str,
+                error = %e,
+                "swift bulk extract state changed"
+            );
             continue;
         }
 

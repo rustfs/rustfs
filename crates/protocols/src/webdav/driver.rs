@@ -22,6 +22,7 @@ use dav_server::fs::{
 };
 use futures_util::{FutureExt, StreamExt, stream};
 use percent_encoding::percent_decode_str;
+use rustfs_utils::MaskedAccessKey;
 use rustfs_utils::path;
 use s3s::dto::*;
 use std::fmt::Debug;
@@ -30,6 +31,22 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::RwLock;
 use tracing::{debug, error};
+
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_WEBDAV_DRIVER: &str = "webdav_driver";
+const EVENT_WEBDAV_OBJECT_METADATA_FAILED: &str = "webdav_object_metadata_failed";
+const EVENT_WEBDAV_STREAM_READ_FAILED: &str = "webdav_stream_read_failed";
+const EVENT_WEBDAV_OBJECT_READ_FAILED: &str = "webdav_object_read_failed";
+const EVENT_WEBDAV_OBJECT_WRITE_STATE: &str = "webdav_object_write_state";
+const EVENT_WEBDAV_LIST_FAILED: &str = "webdav_list_failed";
+const EVENT_WEBDAV_COPY_FAILED: &str = "webdav_copy_failed";
+const EVENT_WEBDAV_DELETE_FAILED: &str = "webdav_delete_failed";
+const EVENT_WEBDAV_PROBE_FAILED: &str = "webdav_probe_failed";
+const EVENT_WEBDAV_BUCKET_LIST_FAILED: &str = "webdav_bucket_list_failed";
+const EVENT_WEBDAV_BUCKET_METADATA_STATE: &str = "webdav_bucket_metadata_state";
+const EVENT_WEBDAV_DIRECTORY_STATE: &str = "webdav_directory_state";
+const EVENT_WEBDAV_OBJECT_DELETE_STATE: &str = "webdav_object_delete_state";
+const EVENT_WEBDAV_RENAME_STATE: &str = "webdav_rename_state";
 
 /// Convert s3s ETag enum to string
 fn etag_to_string(etag: &ETag) -> String {
@@ -209,7 +226,15 @@ where
                     }) as Box<dyn DavMetaData>)
                 }
                 Err(e) => {
-                    error!("Failed to get file metadata for {}/{}: {}", bucket, key, e);
+                    error!(
+                        event = EVENT_WEBDAV_OBJECT_METADATA_FAILED,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        bucket = %bucket,
+                        object = %key,
+                        error = %e,
+                        "webdav object metadata failed"
+                    );
                     Err(FsError::NotFound)
                 }
             }
@@ -280,7 +305,15 @@ where
                             match chunk_result {
                                 Ok(bytes) => data.extend_from_slice(&bytes),
                                 Err(e) => {
-                                    error!("Error reading stream: {}", e);
+                                    error!(
+                                        event = EVENT_WEBDAV_STREAM_READ_FAILED,
+                                        component = LOG_COMPONENT_PROTOCOLS,
+                                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                                        bucket = %bucket,
+                                        object = %key,
+                                        error = %e,
+                                        "webdav stream read failed"
+                                    );
                                     return Err(FsError::GeneralFailure);
                                 }
                             }
@@ -294,7 +327,17 @@ where
                     }
                 }
                 Err(e) => {
-                    error!("Failed to read bytes from {}/{}: {}", bucket, key, e);
+                    error!(
+                        event = EVENT_WEBDAV_OBJECT_READ_FAILED,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        bucket = %bucket,
+                        object = %key,
+                        start_pos,
+                        read_len = count,
+                        error = %e,
+                        "webdav object read failed"
+                    );
                     Err(FsError::GeneralFailure)
                 }
             }
@@ -372,12 +415,31 @@ where
                 .await
             {
                 Ok(_) => {
-                    debug!("Successfully flushed {} bytes to {}/{}", file_size, bucket, key);
+                    debug!(
+                        event = EVENT_WEBDAV_OBJECT_WRITE_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        state = "flushed",
+                        bucket = %bucket,
+                        object = %key,
+                        file_size,
+                        "webdav object write state changed"
+                    );
                     // Buffer already cleared by std::mem::take above
                     Ok(())
                 }
                 Err(e) => {
-                    error!("Failed to flush to {}/{}: {}", bucket, key, e);
+                    error!(
+                        event = EVENT_WEBDAV_OBJECT_WRITE_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        state = "flush_failed",
+                        bucket = %bucket,
+                        object = %key,
+                        file_size,
+                        error = %e,
+                        "webdav object write state changed"
+                    );
                     Err(FsError::GeneralFailure)
                 }
             }
@@ -473,7 +535,15 @@ where
             .list_objects_v2(list_input, access_key, secret_key)
             .await
             .map_err(|e| {
-                error!("Failed to list objects in {} with prefix '{}': {}", bucket, prefix, e);
+                error!(
+                    event = EVENT_WEBDAV_LIST_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                    bucket = %bucket,
+                    prefix = %prefix,
+                    error = %e,
+                    "webdav list failed"
+                );
                 FsError::GeneralFailure
             })?;
 
@@ -488,7 +558,18 @@ where
             .get_object(src_bucket, src_key, access_key, secret_key, None)
             .await
             .map_err(|e| {
-                error!("Failed to get source object '{}' in '{}': {}", src_key, src_bucket, e);
+                error!(
+                    event = EVENT_WEBDAV_COPY_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                    state = "source_read_failed",
+                    src_bucket = %src_bucket,
+                    src_object = %src_key,
+                    dst_bucket = %dst_bucket,
+                    dst_object = %dst_key,
+                    error = %e,
+                    "webdav copy failed"
+                );
                 FsError::GeneralFailure
             })?;
 
@@ -499,7 +580,17 @@ where
             ..
         } = get_output;
         let body = body.ok_or_else(|| {
-            error!("GetObject for source object '{}/{}' returned no body stream", src_bucket, src_key);
+            error!(
+                event = EVENT_WEBDAV_COPY_FAILED,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                state = "source_body_missing",
+                src_bucket = %src_bucket,
+                src_object = %src_key,
+                dst_bucket = %dst_bucket,
+                dst_object = %dst_key,
+                "webdav copy failed"
+            );
             FsError::GeneralFailure
         })?;
 
@@ -523,8 +614,16 @@ where
             .await
             .map_err(|e| {
                 error!(
-                    "Failed to copy object from '{}/{}' to '{}/{}': {}",
-                    src_bucket, src_key, dst_bucket, dst_key, e
+                    event = EVENT_WEBDAV_COPY_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                    state = "destination_write_failed",
+                    src_bucket = %src_bucket,
+                    src_object = %src_key,
+                    dst_bucket = %dst_bucket,
+                    dst_object = %dst_key,
+                    error = %e,
+                    "webdav copy failed"
                 );
                 FsError::GeneralFailure
             })?;
@@ -550,7 +649,16 @@ where
                 .delete_object(src_bucket, src_obj_key, access_key, secret_key)
                 .await
                 .map_err(|e| {
-                    error!("Failed to delete source object '{}' after directory rename: {}", src_obj_key, e);
+                    error!(
+                        event = EVENT_WEBDAV_DELETE_FAILED,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        state = "rename_cleanup_failed",
+                        bucket = %src_bucket,
+                        object = %src_obj_key,
+                        error = %e,
+                        "webdav delete failed"
+                    );
                     FsError::GeneralFailure
                 })?;
         }
@@ -575,7 +683,15 @@ where
                 if Self::is_missing_head_object_error(&err_msg) {
                     Ok(HeadObjectProbe::Missing)
                 } else {
-                    error!("Failed to probe object '{}/{}': {}", bucket, key, err_msg);
+                    error!(
+                        event = EVENT_WEBDAV_PROBE_FAILED,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        bucket = %bucket,
+                        object = %key,
+                        error = %err_msg,
+                        "webdav probe failed"
+                    );
                     Err(FsError::GeneralFailure)
                 }
             }
@@ -718,7 +834,14 @@ where
                 Ok(entries)
             }
             Err(e) => {
-                error!("Failed to list buckets: {}", e);
+                error!(
+                    event = EVENT_WEBDAV_BUCKET_LIST_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                    error = %e,
+                    access_key = %MaskedAccessKey(&self.session_context.principal.user_identity.credentials.access_key),
+                    "webdav bucket list failed"
+                );
                 Err(FsError::GeneralFailure)
             }
         }
@@ -852,7 +975,15 @@ where
                 Ok(entries)
             }
             Err(e) => {
-                error!("Failed to list objects in {}: {}", bucket, e);
+                error!(
+                    event = EVENT_WEBDAV_LIST_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                    bucket = %bucket,
+                    prefix = %prefix_with_slash.unwrap_or_default(),
+                    error = %e,
+                    "webdav list failed"
+                );
                 Err(FsError::GeneralFailure)
             }
         }
@@ -920,7 +1051,15 @@ where
             Ok(_) => Ok(()),
             Err(e) if e.to_string().contains("NoSuchBucket") => Ok(()),
             Err(e) => {
-                error!("Failed to delete bucket '{}': {}", bucket, e);
+                error!(
+                    event = EVENT_WEBDAV_DELETE_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                    state = "bucket_delete_failed",
+                    bucket = %bucket,
+                    error = %e,
+                    "webdav delete failed"
+                );
                 Err(FsError::GeneralFailure)
             }
         }
@@ -1073,7 +1212,15 @@ where
                         content_type: None,
                     }) as Box<dyn DavMetaData>),
                     Err(e) => {
-                        debug!("Bucket not found: {}: {}", bucket, e);
+                        debug!(
+                            event = EVENT_WEBDAV_BUCKET_METADATA_STATE,
+                            component = LOG_COMPONENT_PROTOCOLS,
+                            subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                            result = "not_found",
+                            bucket = %bucket,
+                            error = %e,
+                            "webdav bucket metadata state changed"
+                        );
                         Err(FsError::NotFound)
                     }
                 }
@@ -1125,11 +1272,28 @@ where
                     .await
                 {
                     Ok(_) => {
-                        debug!("Successfully created directory '{}' in bucket '{}'", dir_key, bucket);
+                        debug!(
+                            event = EVENT_WEBDAV_DIRECTORY_STATE,
+                            component = LOG_COMPONENT_PROTOCOLS,
+                            subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                            state = "created",
+                            bucket = %bucket,
+                            object = %dir_key,
+                            "webdav directory state changed"
+                        );
                         return Ok(());
                     }
                     Err(e) => {
-                        error!("Failed to create directory '{}' in bucket '{}': {}", dir_key, bucket, e);
+                        error!(
+                            event = EVENT_WEBDAV_DIRECTORY_STATE,
+                            component = LOG_COMPONENT_PROTOCOLS,
+                            subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                            state = "create_failed",
+                            bucket = %bucket,
+                            object = %dir_key,
+                            error = %e,
+                            "webdav directory state changed"
+                        );
                         return Err(FsError::GeneralFailure);
                     }
                 }
@@ -1150,11 +1314,26 @@ where
                 .await
             {
                 Ok(_) => {
-                    debug!("Successfully created bucket '{}'", bucket);
+                    debug!(
+                        event = EVENT_WEBDAV_DIRECTORY_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        state = "bucket_created",
+                        bucket = %bucket,
+                        "webdav directory state changed"
+                    );
                     Ok(())
                 }
                 Err(e) => {
-                    error!("Failed to create bucket '{}': {}", bucket, e);
+                    error!(
+                        event = EVENT_WEBDAV_DIRECTORY_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        state = "bucket_create_failed",
+                        bucket = %bucket,
+                        error = %e,
+                        "webdav directory state changed"
+                    );
                     Err(FsError::GeneralFailure)
                 }
             }
@@ -1279,11 +1458,28 @@ where
                 .await
             {
                 Ok(_) => {
-                    debug!("Successfully deleted object '{}/{}'", bucket, key);
+                    debug!(
+                        event = EVENT_WEBDAV_OBJECT_DELETE_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        state = "deleted",
+                        bucket = %bucket,
+                        object = %key,
+                        "webdav object delete state changed"
+                    );
                     Ok(())
                 }
                 Err(e) => {
-                    error!("Failed to delete object '{}/{}': {}", bucket, key, e);
+                    error!(
+                        event = EVENT_WEBDAV_OBJECT_DELETE_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        state = "delete_failed",
+                        bucket = %bucket,
+                        object = %key,
+                        error = %e,
+                        "webdav object delete state changed"
+                    );
                     Err(FsError::GeneralFailure)
                 }
             }
@@ -1323,11 +1519,32 @@ where
                         .delete_object(&src_bucket, &src_key, access_key, secret_key)
                         .await
                         .map_err(|e| {
-                            error!("Failed to delete source object after rename: {}", e);
+                            error!(
+                                event = EVENT_WEBDAV_RENAME_STATE,
+                                component = LOG_COMPONENT_PROTOCOLS,
+                                subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                                state = "source_delete_failed",
+                                src_bucket = %src_bucket,
+                                src_object = %src_key,
+                                dst_bucket = %dst_bucket,
+                                dst_object = %dst_key,
+                                error = %e,
+                                "webdav rename state changed"
+                            );
                             FsError::GeneralFailure
                         })?;
 
-                    debug!("Successfully renamed file '{}/{}' to '{}/{}'", src_bucket, src_key, dst_bucket, dst_key);
+                    debug!(
+                        event = EVENT_WEBDAV_RENAME_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        state = "file_renamed",
+                        src_bucket = %src_bucket,
+                        src_object = %src_key,
+                        dst_bucket = %dst_bucket,
+                        dst_object = %dst_key,
+                        "webdav rename state changed"
+                    );
                     return Ok(());
                 }
                 ResolvedPath::Directory { prefix, .. } => {
@@ -1376,7 +1593,18 @@ where
                     .list_objects_v2(list_input, access_key, secret_key)
                     .await
                     .map_err(|e| {
-                        error!("Failed to list objects during directory rename: {}", e);
+                        error!(
+                            event = EVENT_WEBDAV_RENAME_STATE,
+                            component = LOG_COMPONENT_PROTOCOLS,
+                            subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                            state = "directory_list_failed",
+                            src_bucket = %src_bucket,
+                            src_prefix = %src_prefix,
+                            dst_bucket = %dst_bucket,
+                            dst_prefix = %dst_prefix,
+                            error = %e,
+                            "webdav rename state changed"
+                        );
                         FsError::GeneralFailure
                     })?;
 
@@ -1415,13 +1643,30 @@ where
             }
 
             if !renamed_any {
-                debug!("Source not found: {}/{}", src_bucket, src_key);
+                debug!(
+                    event = EVENT_WEBDAV_RENAME_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                    result = "source_not_found",
+                    src_bucket = %src_bucket,
+                    src_object = %src_key,
+                    dst_bucket = %dst_bucket,
+                    dst_object = %dst_key,
+                    "webdav rename state changed"
+                );
                 return Err(FsError::NotFound);
             }
 
             debug!(
-                "Successfully renamed directory '{}/{}' to '{}/{}'",
-                src_bucket, src_key, dst_bucket, dst_key
+                event = EVENT_WEBDAV_RENAME_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                state = "directory_renamed",
+                src_bucket = %src_bucket,
+                src_object = %src_key,
+                dst_bucket = %dst_bucket,
+                dst_object = %dst_key,
+                "webdav rename state changed"
             );
             Ok(())
         }

@@ -36,6 +36,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SFTP_CONFIG: &str = "sftp_config";
+const EVENT_SFTP_CONFIG_STATE: &str = "sftp_config_state";
+const EVENT_SFTP_HOST_KEY_STATE: &str = "sftp_host_key_state";
+
 /// Upper bound on file size accepted as a candidate host key (1 MiB).
 /// Guards against accidentally reading huge non-key files in the host
 /// key directory. Real keys are well under 10 KiB.
@@ -203,11 +208,15 @@ impl SftpConfig {
             Some(n) if (HANDLES_PER_SESSION_MIN..=HANDLES_PER_SESSION_MAX).contains(&n) => Some(n),
             Some(n) => {
                 tracing::warn!(
+                    event = EVENT_SFTP_CONFIG_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_CONFIG,
                     requested = n,
                     min = HANDLES_PER_SESSION_MIN,
                     max = HANDLES_PER_SESSION_MAX,
                     default = DEFAULT_HANDLES_PER_SESSION,
-                    "RUSTFS_SFTP_HANDLES_PER_SESSION out of range. Falling back to the default.",
+                    result = "handles_per_session_out_of_range",
+                    "sftp config state changed",
                 );
                 None
             }
@@ -227,11 +236,15 @@ impl SftpConfig {
             Some(n) if (BACKEND_OP_TIMEOUT_MIN_SECS..=BACKEND_OP_TIMEOUT_MAX_SECS).contains(&n) => Some(n),
             Some(n) => {
                 tracing::warn!(
+                    event = EVENT_SFTP_CONFIG_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_CONFIG,
                     requested = n,
                     min = BACKEND_OP_TIMEOUT_MIN_SECS,
                     max = BACKEND_OP_TIMEOUT_MAX_SECS,
                     default = DEFAULT_BACKEND_OP_TIMEOUT_SECS,
-                    "RUSTFS_SFTP_BACKEND_OP_TIMEOUT_SECS out of range. Falling back to the default.",
+                    result = "backend_timeout_out_of_range",
+                    "sftp config state changed",
                 );
                 None
             }
@@ -254,11 +267,15 @@ impl SftpConfig {
             Some(n) if (READ_CACHE_WINDOW_MIN..=READ_CACHE_WINDOW_MAX).contains(&n) => Some(n),
             Some(n) => {
                 tracing::warn!(
+                    event = EVENT_SFTP_CONFIG_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_CONFIG,
                     requested = n,
                     min = READ_CACHE_WINDOW_MIN,
                     max = READ_CACHE_WINDOW_MAX,
                     default = READ_CACHE_WINDOW_DEFAULT,
-                    "RUSTFS_SFTP_READ_CACHE_WINDOW_BYTES out of range. Set to 0 to disable the cache, or to a value between the named bounds. Falling back to the default.",
+                    result = "read_cache_window_out_of_range",
+                    "sftp config state changed",
                 );
                 None
             }
@@ -277,10 +294,14 @@ impl SftpConfig {
             Some(n) if n >= READ_CACHE_TOTAL_MEM_MIN => Some(n),
             Some(n) => {
                 tracing::warn!(
+                    event = EVENT_SFTP_CONFIG_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_CONFIG,
                     requested = n,
                     min = READ_CACHE_TOTAL_MEM_MIN,
                     default = READ_CACHE_TOTAL_MEM_DEFAULT,
-                    "RUSTFS_SFTP_READ_CACHE_TOTAL_MEM_BYTES below minimum. Falling back to the default.",
+                    result = "read_cache_total_mem_below_minimum",
+                    "sftp config state changed",
                 );
                 None
             }
@@ -337,9 +358,13 @@ impl SftpConfig {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::warn!(
+                        event = EVENT_SFTP_HOST_KEY_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SFTP_CONFIG,
                         path = %path.display(),
                         err = %e,
-                        "cannot stat file, skipping"
+                        result = "stat_failed",
+                        "sftp host key state changed"
                     );
                     continue;
                 }
@@ -353,9 +378,13 @@ impl SftpConfig {
             let file_size = metadata.len();
             if file_size == 0 || file_size > MAX_HOST_KEY_FILE_SIZE {
                 tracing::debug!(
+                    event = EVENT_SFTP_HOST_KEY_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_CONFIG,
                     path = %path.display(),
                     size = file_size,
-                    "skipping file: size outside valid key range"
+                    result = "size_out_of_range",
+                    "sftp host key state changed"
                 );
                 continue;
             }
@@ -369,9 +398,13 @@ impl SftpConfig {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::warn!(
+                        event = EVENT_SFTP_HOST_KEY_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SFTP_CONFIG,
                         path = %path.display(),
                         err = %e,
-                        "cannot read file, skipping"
+                        result = "read_failed",
+                        "sftp host key state changed"
                     );
                     continue;
                 }
@@ -380,9 +413,13 @@ impl SftpConfig {
             match russh::keys::decode_secret_key(&data, None) {
                 Ok(key) => {
                     tracing::info!(
+                        event = EVENT_SFTP_HOST_KEY_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SFTP_CONFIG,
                         path = %path.display(),
                         algorithm = ?key.algorithm(),
-                        "loaded host key"
+                        state = "loaded",
+                        "sftp host key state changed"
                     );
                     keys.push(key);
                 }
@@ -396,15 +433,23 @@ impl SftpConfig {
                     //    reason in the log.
                     if data.contains(PEM_BEGIN_MARKER) {
                         tracing::warn!(
+                            event = EVENT_SFTP_HOST_KEY_STATE,
+                            component = LOG_COMPONENT_PROTOCOLS,
+                            subsystem = LOG_SUBSYSTEM_SFTP_CONFIG,
                             path = %path.display(),
                             err = %e,
-                            "file looks like a private key but failed to decode (passphrase-protected keys are not supported)"
+                            result = "decode_failed",
+                            "sftp host key state changed"
                         );
                     } else {
                         tracing::debug!(
+                            event = EVENT_SFTP_HOST_KEY_STATE,
+                            component = LOG_COMPONENT_PROTOCOLS,
+                            subsystem = LOG_SUBSYSTEM_SFTP_CONFIG,
                             path = %path.display(),
                             err = %e,
-                            "not a valid private key, skipping"
+                            result = "not_a_private_key",
+                            "sftp host key state changed"
                         );
                     }
                 }
@@ -440,9 +485,13 @@ impl SftpConfig {
         });
 
         tracing::info!(
+            event = EVENT_SFTP_HOST_KEY_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SFTP_CONFIG,
             count = keys.len(),
             dir = %host_key_dir.display(),
-            "host key loading complete"
+            state = "load_complete",
+            "sftp host key state changed"
         );
 
         Ok(keys)
@@ -467,14 +516,12 @@ fn warn_once_windows(host_key_dir: &Path) {
     static WARN: Once = Once::new();
     WARN.call_once(|| {
         tracing::warn!(
-            target: "rustfs_protocols::sftp::host_key",
+            event = EVENT_SFTP_HOST_KEY_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SFTP_CONFIG,
             host_key_dir = %host_key_dir.display(),
-            "SFTP host key file permission enforcement is not active on \
-             Windows. rustfs trusts operator-managed NTFS ACLs on the \
-             host-key directory. Restrict read access to the running rustfs \
-             service account, NT AUTHORITY\\SYSTEM, and \
-             BUILTIN\\Administrators. Default ProgramData inheritance grants \
-             BUILTIN\\Users read access."
+            result = "windows_acl_operator_managed",
+            "sftp host key state changed"
         );
     });
 }

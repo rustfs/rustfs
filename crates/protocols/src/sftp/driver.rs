@@ -34,6 +34,7 @@ use crate::common::client::s3::StorageBackend;
 use crate::common::gateway::{AuthorizationError, S3Action, authorize_operation};
 use crate::common::session::SessionContext;
 use russh_sftp::protocol::{Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Packet, Status, StatusCode, Version};
+use rustfs_utils::MaskedAccessKey;
 use s3s::dto::{AbortMultipartUploadInput, CopyObjectInput, CopySource};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
@@ -62,6 +63,12 @@ static ABORT_PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
     let permits = (parallelism * 2).clamp(ABORT_PERMITS_FLOOR, ABORT_PERMITS_CEILING);
     Arc::new(Semaphore::new(permits))
 });
+
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SFTP_DRIVER: &str = "sftp_driver";
+const EVENT_SFTP_DRIVER_STATE: &str = "sftp_driver_state";
+const EVENT_SFTP_BACKEND_STATE: &str = "sftp_backend_state";
+const EVENT_SFTP_AUTHZ_STATE: &str = "sftp_authz_state";
 
 /// Per-session SFTP operation handler.
 pub struct SftpDriver<S: StorageBackend + Send + Sync + 'static> {
@@ -175,9 +182,13 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
     pub(super) fn enforce_server_readonly(&self) -> Result<(), SftpError> {
         if self.read_only {
             tracing::warn!(
+                event = EVENT_SFTP_DRIVER_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SFTP_DRIVER,
                 peer = %self.session_context.source_ip,
-                user = %self.session_context.principal.user_identity.credentials.access_key,
-                "SFTP write rejected: server is in read-only mode"
+                user = %MaskedAccessKey(&self.session_context.principal.user_identity.credentials.access_key),
+                result = "read_only_rejected",
+                "sftp driver state changed"
             );
             return Err(SftpError::code(StatusCode::PermissionDenied));
         }
@@ -232,7 +243,15 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(s3_error_to_sftp(op, e)),
             Err(_elapsed) => {
-                tracing::warn!(op = op, timeout_secs = self.backend_op_timeout_secs, "SFTP backend operation timed out");
+                tracing::warn!(
+                    event = EVENT_SFTP_BACKEND_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_DRIVER,
+                    op = op,
+                    timeout_secs = self.backend_op_timeout_secs,
+                    result = "timeout",
+                    "sftp backend state changed"
+                );
                 Err(SftpError::code(StatusCode::Failure))
             }
         }
@@ -251,7 +270,15 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         match tokio::time::timeout(std::time::Duration::from_secs(self.backend_op_timeout_secs), fut).await {
             Ok(inner) => Ok(inner),
             Err(_elapsed) => {
-                tracing::warn!(op = op, timeout_secs = self.backend_op_timeout_secs, "SFTP backend operation timed out");
+                tracing::warn!(
+                    event = EVENT_SFTP_BACKEND_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_DRIVER,
+                    op = op,
+                    timeout_secs = self.backend_op_timeout_secs,
+                    result = "timeout",
+                    "sftp backend state changed"
+                );
                 Err(SftpError::code(StatusCode::Failure))
             }
         }
@@ -274,13 +301,47 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         let outcome = match tokio::time::timeout(std::time::Duration::from_secs(self.backend_op_timeout_secs), auth_fut).await {
             Ok(inner) => inner,
             Err(_elapsed) => {
+                tracing::warn!(
+                    event = EVENT_SFTP_AUTHZ_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_DRIVER,
+                    action = action.as_str(),
+                    bucket = %bucket,
+                    key = %key.unwrap_or_default(),
+                    result = "timeout",
+                    "sftp authz state changed"
+                );
                 return Err(auth_err_unreachable(action.as_str(), bucket, key));
             }
         };
         match outcome {
             Ok(()) => Ok(()),
-            Err(AuthorizationError::AccessDenied) => Err(auth_err()),
-            Err(AuthorizationError::IamUnavailable) => Err(auth_err_unreachable(action.as_str(), bucket, key)),
+            Err(AuthorizationError::AccessDenied) => {
+                tracing::warn!(
+                    event = EVENT_SFTP_AUTHZ_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_DRIVER,
+                    action = action.as_str(),
+                    bucket = %bucket,
+                    key = %key.unwrap_or_default(),
+                    result = "access_denied",
+                    "sftp authz state changed"
+                );
+                Err(auth_err())
+            }
+            Err(AuthorizationError::IamUnavailable) => {
+                tracing::warn!(
+                    event = EVENT_SFTP_AUTHZ_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_DRIVER,
+                    action = action.as_str(),
+                    bucket = %bucket,
+                    key = %key.unwrap_or_default(),
+                    result = "iam_unavailable",
+                    "sftp authz state changed"
+                );
+                Err(auth_err_unreachable(action.as_str(), bucket, key))
+            }
         }
     }
 }

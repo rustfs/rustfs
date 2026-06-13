@@ -16,7 +16,7 @@ use crate::storage::ecfs::FS;
 use http::{HeaderMap, Method};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustfs_credentials;
-use rustfs_obs::MaskedAccessKey;
+use rustfs_utils::MaskedAccessKey;
 use s3s::dto::*;
 use s3s::{S3, S3Request, S3Result};
 use tokio_stream::Stream;

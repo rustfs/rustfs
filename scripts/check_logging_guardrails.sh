@@ -42,6 +42,45 @@ checked_files=(
   "crates/trusted-proxies/src/cloud/metadata/aws.rs"
   "crates/trusted-proxies/src/cloud/metadata/azure.rs"
   "crates/trusted-proxies/src/cloud/metadata/gcp.rs"
+  "crates/protocols/src/webdav/server.rs"
+  "crates/protocols/src/webdav/driver.rs"
+  "crates/protocols/src/ftps/server.rs"
+  "crates/protocols/src/ftps/driver.rs"
+  "crates/protocols/src/sftp/server.rs"
+  "crates/protocols/src/sftp/driver.rs"
+  "crates/protocols/src/sftp/write.rs"
+  "crates/protocols/src/sftp/config.rs"
+  "crates/protocols/src/sftp/errors.rs"
+  "crates/protocols/src/sftp/dir.rs"
+  "crates/protocols/src/sftp/fallback_watchdog.rs"
+  "crates/protocols/src/sftp/wedge_watchdog.rs"
+  "crates/protocols/src/swift/expiration_worker.rs"
+  "crates/protocols/src/swift/versioning.rs"
+  "crates/protocols/src/swift/bulk.rs"
+  "crates/protocols/src/swift/encryption.rs"
+  "crates/protocols/src/swift/handler.rs"
+  "crates/protocols/src/swift/staticweb.rs"
+  "crates/protocols/src/swift/acl.rs"
+  "crates/protocols/src/swift/sync.rs"
+  "crates/protocols/src/swift/container.rs"
+  "crates/protocols/src/swift/object.rs"
+  "crates/protocols/src/swift/formpost.rs"
+  "crates/protocols/src/swift/ratelimit.rs"
+  "crates/protocols/src/swift/expiration.rs"
+  "crates/protocols/src/swift/cors.rs"
+  "crates/protocols/src/swift/quota.rs"
+  "crates/protocols/src/swift/symlink.rs"
+  "crates/protocols/src/common/gateway.rs"
+  "crates/obs/src/telemetry/dial9.rs"
+  "crates/obs/src/telemetry/local.rs"
+  "crates/obs/src/metrics/scheduler.rs"
+  "crates/obs/src/cleaner/core.rs"
+  "crates/obs/src/cleaner/compress.rs"
+  "crates/obs/src/cleaner/scanner.rs"
+  "crates/obs/src/metrics/stats_collector.rs"
+  "crates/obs/src/global.rs"
+  "crates/obs/src/telemetry/recorder.rs"
+  "crates/obs/src/metrics/collectors/system_gpu.rs"
 )
 
 forbidden_patterns=(
@@ -249,6 +288,163 @@ forbidden_patterns=(
   'debug!("Failed to fetch GCP IP ranges: {}", e)'
   'debug!("Using default GCP public IP ranges")'
   'debug!("Using default GCP VPC network ranges")'
+  'info!("Initializing WebDAV server on {}"'
+  'info!("WebDAV server listening on {}"'
+  'debug!("Enabling WebDAV TLS with certificates from: {}"'
+  'warn!("Request body too large: {} > {}"'
+  'error!("IAM system unavailable during WebDAV auth: {}"'
+  'error!("IAM check_key failed for {}: {}"'
+  'warn!("WebDAV login failed: Invalid access key '\''{}'\''"'
+  'warn!("WebDAV login failed: Invalid secret key for '\''{}'\''"'
+  'info!("WebDAV user '\''{}'\'' authenticated successfully"'
+  'info!("Initializing FTPS server on {}"'
+  'info!("Configuring FTPS passive ports range: {:?} ({})"'
+  'warn!("No passive ports configured, using system-assigned ports"'
+  'info!("Configuring FTPS external IP for passive mode: {}"'
+  'info!("FTPS server configured for both active and passive mode support"'
+  'info!("FTPS is explicitly required for all connections"'
+  'info!("TLS disabled, running in plain FTP mode"'
+  'error!("IAM system unavailable during FTPS auth: {}"'
+  'error!("IAM check_key failed for {}: {}"'
+  'warn!("FTPS login failed: Invalid access key '\''{}'\''"'
+  'warn!("FTPS login failed: Invalid secret key for '\''{}'\''"'
+  'info!("FTPS user '\''{}'\'' authenticated successfully"'
+  'warn!("Expiration worker already running"'
+  'info!("Starting expiration worker (scan_interval={}s, worker_id={}/{})"'
+  'info!("Expiration worker stopped"'
+  'error!("Expiration cleanup iteration failed: {}"'
+  'info!("Stopping expiration worker"'
+  'debug!("Skipping object {} (handled by different worker)"'
+  'debug!("Tracking object {} for expiration at {}"'
+  'debug!("Untracking object {} from expiration"'
+  'info!("Starting expiration cleanup iteration (worker_id={})"'
+  'warn!("Invalid expiration entry path: {}"'
+  'info!("Deleted expired object: {}"'
+  'debug!("Object {} no longer exists or expiration removed"'
+  'error!("Failed to delete expired object {}: {}"'
+  'info!("Expiration cleanup iteration complete: scanned={}, deleted={}, duration={}ms, queue_size={}"'
+  'debug!("Would delete expired object: {}/{}/{} (expires_at={})"'
+  'info!("Starting full scan of objects with expiration (worker_id={})"'
+  'warn!("Full object scan not yet implemented - requires storage layer integration"'
+  'debug!("Bulk delete request for account: {}"'
+  'debug!("Processing {} delete requests"'
+  'error!("Error deleting {}: {}"'
+  'error!("Invalid path {}: {}"'
+  'debug!("Bulk extract request for container: {}, format: {:?}"'
+  'debug!("Extracted: {}"'
+  'error!("Failed to upload {}: {}"'
+  'debug!("Skipping directory: {}"'
+  'error!("Failed to read tar entry {}: {}"'
+  'debug!("Client explicitly disabled encryption"'
+  'debug!("Encrypting {} bytes with {}"'
+  'warn!("Encryption not yet implemented - returning plaintext with metadata"'
+  'debug!("Decrypting {} bytes with {}"'
+  'warn!("Decryption not yet implemented - returning data as-is"'
+  'debug!("Swift route matched: {:?}"'
+  'debug!("No Swift route matched, delegating to S3 service"'
+  'debug!("TempURL detected for {}/{}/{}"'
+  'debug!("TempURL validated successfully"'
+  'warn!("Failed to restore version after delete: {}"'
+  'debug!("Static web request: container={}, path={}, config={:?}"'
+  'debug!("Generating directory listing for path: {}"'
+  'debug!("Attempting to serve object: {}"'
+  'debug!("Serving error document: {}"'
+  'debug!("Error document not found, returning standard 404"'
+  'debug!("Read access granted: public read enabled"'
+  'debug!("Read access granted: referrer matches pattern {}"'
+  'debug!("Read access granted: account {} matches"'
+  'debug!("Read access granted: user {}:{} matches"'
+  'debug!("Read access denied: no matching ACL grant"'
+  'debug!("Write access granted: account {} matches"'
+  'debug!("Write access granted: user {}:{} matches"'
+  'debug!("Write access denied: no matching ACL grant"'
+  'warn!("Container sync using unencrypted HTTP - consider using HTTPS"'
+  'warn!("Container sync key is short (<16 chars) - recommend longer key"'
+  'debug!("Scheduled retry #{} for '\''{}'\'' at +{}s"'
+  'error!("Storage operation '\''{}'\'' failed: {}"'
+  'debug!("Creating symlink to target: {}"'
+  'debug!("FormPost signature mismatch: expected={}, got={}"'
+  'debug!("FormPost uploaded: {}/{}/{}"'
+  'debug!("Rate limit OK for {}: {} remaining"'
+  'debug!("Rate limit exceeded for {}: retry after {} seconds"'
+  'debug!("X-Delete-After: {} seconds -> X-Delete-At: {}"'
+  'debug!("X-Delete-At: {}"'
+  'debug!("X-Delete-At timestamp is more than 10 years in the future: {}"'
+  'debug!("Extracted symlink target: container={:?}, object={}"'
+  'warn!("Circular symlink reference detected"'
+  'debug!("CORS preflight request for container: {}"'
+  'debug!("Quota check passed: {}/{:?} bytes, {}/{:?} objects"'
+  'warn!("SFTP backend error"'
+  'warn!("SFTP authorisation rejected because the IAM system was unreachable"'
+  'warn!("fallback watchdog cancelling session: silence exceeded fallback threshold"'
+  'warn!("wedge watchdog cancelling session: russh select! parked outside its arms"'
+  'warn!("RUSTFS_SFTP_HANDLES_PER_SESSION out of range. Falling back to the default."'
+  'warn!("RUSTFS_SFTP_BACKEND_OP_TIMEOUT_SECS out of range. Falling back to the default."'
+  'warn!("RUSTFS_SFTP_READ_CACHE_WINDOW_BYTES out of range. Set to 0 to disable the cache, or to a value between the named bounds. Falling back to the default."'
+  'warn!("RUSTFS_SFTP_READ_CACHE_TOTAL_MEM_BYTES below minimum. Falling back to the default."'
+  'warn!("cannot stat file, skipping"'
+  'debug!("skipping file: size outside valid key range"'
+  'warn!("cannot read file, skipping"'
+  'info!("loaded host key"'
+  'warn!("file looks like a private key but failed to decode (passphrase-protected keys are not supported)"'
+  'debug!("not a valid private key, skipping"'
+  'info!("host key loading complete"'
+  'warn!("SFTP host key file permission enforcement is not active on Windows.' 
+  'info!("Dial9 telemetry disabled"'
+  'info!("Validating dial9 telemetry configuration"'
+  'warn!("Failed to create dial9 output directory '\''{}'\'': {}"'
+  'warn!("Continuing without dial9 telemetry"'
+  'info!("Dial9 telemetry configuration validated successfully"'
+  'info!("Dial9 telemetry data will be flushed on drop"'
+  'info!("Dial9 telemetry guard dropped, data flushed"'
+  'info!("Initialized local logging"'
+  'info!("log cleaner compression profile configured"'
+  'warn!("Log cleanup failed: {}"'
+  'warn!("Log cleanup task panicked: {}"'
+  'warn!("Metrics collection for cluster stats cancelled."'
+  'warn!("Metrics collection for supplementary cluster stats cancelled."'
+  'warn!("Metrics collection for bucket stats cancelled."'
+  'warn!("Metrics collection for node/disk stats cancelled."'
+  'warn!("Bucket monitor unavailable; skip replication bandwidth key-state transition this cycle."'
+  'warn!("Metrics collection for bucket replication bandwidth stats cancelled."'
+  'warn!("Metrics collection for audit target stats cancelled."'
+  'warn!("Metrics collection for notification stats cancelled."'
+  'warn!("Metrics collection for background workflow stats cancelled."'
+  'warn!("Failed to get current PID for system monitoring: {}"'
+  'warn!("GPU metrics collection failed: {}"'
+  'warn!("GPU collector initialization failed: {}"'
+  'warn!("Process metrics collection cancelled."'
+  'warn!("Metrics collection for internode network stats cancelled."'
+  'warn!("Failed to collect process attributes for metrics labels: {}"'
+  'debug!("Log directory does not exist: {:?}"'
+  'info!("Found {} regular log files, total size: {} bytes ({:.2} MB)"'
+  'info!("Cleanup completed: deleted {} files, freed {} bytes ({:.2} MB)"'
+  'warn!(file = ?file.path, error = %err, "parallel compression failed"' 
+  'warn!("parallel compression worker panicked, falling back to serial path"'
+  'info!("parallel cleanup finished"'
+  'warn!(file = ?file.path, error = %err, "serial compression failed, source kept"' 
+  'info!("[DRY RUN] Would delete: {:?} ({} bytes)"'
+  'debug!("Deleted: {:?}"'
+  'error!("Failed to delete {:?}: {}"'
+  'warn!("zstd compression failed, fallback to gzip"'
+  'debug!(file = ?archive_path, "compressed archive already exists, skipping"' 
+  'info!("[DRY RUN] Would compress file: {:?} -> {:?}"'
+  'debug!("compression finished"'
+  'debug!("Excluding file from cleanup: {:?}"'
+  'tracing::warn!("Failed to delete empty file {:?}: {}"' 
+  'debug!("Deleted empty file: {:?}"'
+  'tracing::info!("[DRY RUN] Would delete empty file: {:?}"' 
+  'warn!("Failed to load data usage from backend: {}"'
+  'warn!("Failed to list buckets for cluster metrics: {}"'
+  'warn!("Failed to load data usage for bucket metrics: {}"'
+  'warn!("Failed to list buckets for bucket metrics: {}"'
+  'warn!("Invalid bandwidth limit value for target {:?}: {}"'
+  'warn!("OBSERVABILITY_METRIC_ENABLED was already initialized; keeping original value"'
+  'info!("Initializing global guard"'
+  'error!("{} cache read lock poisoned: {}"'
+  'error!("{} cache write lock poisoned: {}"'
+  'error!("metrics_metadata lock poisoned: {}"'
+  'warn!("Could not get GPU stats, recording 0 for GPU memory usage"'
 )
 
 for pattern in "${forbidden_patterns[@]}"; do

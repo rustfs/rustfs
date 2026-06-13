@@ -30,6 +30,10 @@ use std::{
 };
 use tracing::error;
 
+const LOG_COMPONENT_OBS: &str = "obs";
+const LOG_SUBSYSTEM_RECORDER: &str = "recorder";
+const EVENT_RECORDER_STATE: &str = "recorder_state";
+
 macro_rules! configure_builder {
     ($builder:expr, $metadata:expr) => {{
         let mut builder = $builder;
@@ -151,7 +155,7 @@ impl Recorder {
         let cache = match lock.read() {
             Ok(g) => g,
             Err(e) => {
-                error!("{} cache read lock poisoned: {}", metric_type, e);
+                error!(event = EVENT_RECORDER_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_RECORDER, metric_type = %metric_type, result = "cache_read_lock_poisoned", error = %e, "recorder state changed");
                 e.into_inner()
             }
         };
@@ -162,7 +166,7 @@ impl Recorder {
         let mut cache = match lock.write() {
             Ok(g) => g,
             Err(e) => {
-                error!("{} cache write lock poisoned: {}", metric_type, e);
+                error!(event = EVENT_RECORDER_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_RECORDER, metric_type = %metric_type, result = "cache_write_lock_poisoned", error = %e, "recorder state changed");
                 e.into_inner()
             }
         };
@@ -179,7 +183,7 @@ impl Recorder {
         F: FnOnce(&mut HashMap<KeyName, MetricMetadata>) -> R,
     {
         let mut guard = self.metrics_metadata.lock().unwrap_or_else(|e| {
-            error!("metrics_metadata lock poisoned: {}", e);
+            error!(event = EVENT_RECORDER_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_RECORDER, result = "metrics_metadata_lock_poisoned", error = %e, "recorder state changed");
             e.into_inner()
         });
         f(&mut guard)

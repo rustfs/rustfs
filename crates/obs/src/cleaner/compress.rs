@@ -31,6 +31,10 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
+const LOG_COMPONENT_OBS: &str = "obs";
+const LOG_SUBSYSTEM_LOG_CLEANER: &str = "log_cleaner";
+const EVENT_LOG_CLEANER_COMPRESSION_STATE: &str = "log_cleaner_compression_state";
+
 /// Compression options shared by serial and parallel cleaner paths.
 ///
 /// The core cleaner prepares this immutable bundle once per cleanup pass and
@@ -78,9 +82,13 @@ pub(super) fn compress_file(path: &Path, options: &CompressionOptions) -> Result
             Ok(output) => Ok(output),
             Err(err) if options.zstd_fallback_to_gzip => {
                 warn!(
+                    event = EVENT_LOG_CLEANER_COMPRESSION_STATE,
+                    component = LOG_COMPONENT_OBS,
+                    subsystem = LOG_SUBSYSTEM_LOG_CLEANER,
                     file = ?path,
                     error = %err,
-                    "zstd compression failed, fallback to gzip"
+                    result = "zstd_failed_fallback_gzip",
+                    "log cleaner compression state changed"
                 );
                 compress_gzip(path, options.gzip_level, options.dry_run)
             }
@@ -127,7 +135,7 @@ where
     // Keep idempotent behavior: existing archive means this file has already
     // been handled in a previous cleanup pass.
     if archive_path.exists() {
-        debug!(file = ?archive_path, "compressed archive already exists, skipping");
+        debug!(event = EVENT_LOG_CLEANER_COMPRESSION_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, file = ?archive_path, state = "archive_exists", "log cleaner compression state changed");
         let input_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let output_bytes = std::fs::metadata(archive_path).map(|m| m.len()).unwrap_or(0);
         return Ok(CompressionOutput {
@@ -140,7 +148,7 @@ where
 
     let input_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     if dry_run {
-        info!("[DRY RUN] Would compress file: {:?} -> {:?}", path, archive_path);
+        info!(event = EVENT_LOG_CLEANER_COMPRESSION_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, state = "dry_run_compress", file = ?path, archive = ?archive_path, input_bytes, "log cleaner compression state changed");
         return Ok(CompressionOutput {
             archive_path: archive_path.to_path_buf(),
             algorithm_used,
@@ -185,12 +193,16 @@ where
 
     let output_bytes = std::fs::metadata(archive_path).map(|m| m.len()).unwrap_or(0);
     debug!(
+        event = EVENT_LOG_CLEANER_COMPRESSION_STATE,
+        component = LOG_COMPONENT_OBS,
+        subsystem = LOG_SUBSYSTEM_LOG_CLEANER,
         file = ?path,
         archive = ?archive_path,
         input_bytes,
         output_bytes,
         algorithm = %algorithm_used,
-        "compression finished"
+        state = "compression_finished",
+        "log cleaner compression state changed"
     );
 
     Ok(CompressionOutput {
