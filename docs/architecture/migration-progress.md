@@ -5,15 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-background-status-snapshot`
-- Baseline: `origin/main` at `f7bf4fd3e4b304c75c880f28d8c45329366571f6`
-- PR type for this branch: `contract`
-- Runtime behavior changes: none; memory observability startup, sampler loop,
-  cancellation, and metrics emission behavior are unchanged.
-- Rust code changes: add a typed read-only memory observability status snapshot
-  and reuse the existing sampler interval parsing helper.
+- Branch: `overtrue/arch-background-controller-pilot`
+- Baseline: `origin/main` at `bda0b1f3dd923f728e4d2ff2f17bde2755a6cb5e`
+- PR type for this branch: `behavior-change`
+- Runtime behavior changes: none; the memory observability controller pilot only
+  returns read-only snapshot/reconcile data and never starts, stops, resizes, or
+  wakes workers.
+- Rust code changes: add a memory observability controller snapshot and
+  reconcile plan with explicit no-op worker mutation.
 - CI/script changes: none.
-- Docs changes: record `BGC-003` status snapshot scope and update background
+- Docs changes: record `BGC-004` controller pilot scope and update background
   controller migration progress.
 
 ## Phase 0 Tasks
@@ -388,26 +389,35 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     behavior change.
   - Verification: focused memory observability tests, compile checks, migration
     guards, formatting, and pre-commit quality gate.
+- [x] `BGC-004` Pilot one controller.
+  - Acceptance: memory observability exposes a typed controller snapshot and
+    reconcile plan that compare desired state with current status.
+  - Must preserve: no admin route, scheduler, service registry, worker
+    lifecycle mutation, storage write, readiness signal, peer signal, or metrics
+    emission behavior change.
+  - Verification: focused controller tests prove repeated reconcile is
+    idempotent, cancellation state is preserved, and worker mutation remains
+    none.
 
 ## Next PRs
 
-1. `behavior-change`: pilot one low-risk controller behind status-first tests
-   in `BGC-004`.
-2. `test-only`: add controller harness coverage for cancellation and
+1. `test-only`: add controller harness coverage for cancellation and
    duplicate-worker prevention in `TEST-BGC-001`.
+2. `behavior-change`: add the next low-risk background status surface before
+   broader reconcile work.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed the snapshot is a typed read-only contract in `memory_observability` with no generic controller framework, service registry, or admin route. |
-| Migration preservation | pass | Confirmed memory observability startup, sampler loop, runtime token cancellation, interval defaulting, and metrics emission behavior remain unchanged. |
-| Testing/verification | pass | Confirmed focused tests, rustfs library check, formatting, diff hygiene, migration guards, Rust risk scan, and `make pre-commit` all passed. |
+| Quality/architecture | pass | Confirmed the controller pilot stays local to `memory_observability`, uses typed desired/status/reconcile structs, and does not add a generic scheduler or admin route. |
+| Migration preservation | pass | Confirmed reconcile reports `worker_mutation: none`, preserving sampler startup, cancellation, interval defaulting, and metrics emission behavior. |
+| Testing/verification | pass | Focused tests, compile checks, formatting, diff hygiene, migration guards, Rust risk scan, and `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `f7bf4fd3e1b3b48b3bec0702a6d8a840b45a5160`:
-- `cargo test -p rustfs memory_observability --lib`; 5 passed.
+Passed on `bda0b1f3dd923f728e4d2ff2f17bde2755a6cb5e`:
+- `cargo test -p rustfs memory_observability --lib`; 8 passed.
 - `cargo check -p rustfs --lib`.
 - `cargo fmt --all`.
 - `cargo fmt --all --check`.
@@ -416,20 +426,19 @@ Passed on `f7bf4fd3e1b3b48b3bec0702a6d8a840b45a5160`:
 - `./scripts/check_layer_dependencies.sh`.
 - `./scripts/check_metrics_migration_refs.sh`.
 - Rust risk scan for unwrap/expect/casts/string errors/debug output in
-  `rustfs/src/memory_observability.rs`; only pre-existing test `expect` calls
-  were matched.
-- `make pre-commit`; all checks passed, including nextest 5857 passed and 111
+  `rustfs/src/memory_observability.rs`; only test `expect` calls matched.
+- `make pre-commit`; all checks passed, including nextest 5865 passed and 111
   skipped.
 
 Notes:
-- This slice only exposes in-memory status from existing inputs. It does not
-  start, stop, resize, or wake memory observability workers.
-- There is no admin/API exposure in this PR; future `BGC-004` work must remain
-  status-first before adding reconcile behavior.
+- This slice adds reconcile data only. It does not apply reconcile output to the
+  running sampler.
+- There is no admin/API exposure in this PR; future controller harness work
+  should stay isolated from scanner, heal, lifecycle, and replication.
 
 ## Handoff Notes
 
-- Next migration slice can start `BGC-004` by choosing one low-risk controller
-  and proving idempotent reconcile without duplicate workers.
+- Next migration slice can start `TEST-BGC-001` with a fake-clock and
+  cancellation-token harness around the memory observability pilot.
 - Keep scanner, heal, lifecycle, replication, disk health, and config reload out
   of broad controller movement until dedicated preservation tests exist.
