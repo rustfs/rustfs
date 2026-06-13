@@ -112,37 +112,37 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
     {
         "capability": "credential-vending",
         "status": "unsupported-response-boundary",
-        "pg_owner": "PG2",
+        "roadmap_area": "credential-boundary",
         "expected_behavior": "load table advertises rustfs.credential-vending=unsupported and returns no long-lived credentials",
     },
     {
         "capability": "background-maintenance-worker",
         "status": "unsupported",
-        "pg_owner": "PG4",
+        "roadmap_area": "maintenance-worker",
         "expected_behavior": "manual maintenance APIs may exist, but background-enabled maintenance is rejected",
     },
     {
         "capability": "manifest-data-reachability-cleanup",
         "status": "unsupported",
-        "pg_owner": "PG4",
+        "roadmap_area": "reachability-cleanup",
         "expected_behavior": "metadata-only cleanup must not delete manifest, data, or delete files",
     },
     {
         "capability": "snapshot-expiration-and-compaction",
         "status": "unsupported",
-        "pg_owner": "PG5",
+        "roadmap_area": "snapshot-maintenance",
         "expected_behavior": "no automatic snapshot expiration or data rewrite is claimed",
     },
     {
         "capability": "iceberg-views",
         "status": "unsupported",
-        "pg_owner": "PG6",
+        "roadmap_area": "view-api",
         "expected_behavior": "view routes should return a stable unsupported response until implemented",
     },
     {
         "capability": "multi-table-transactions",
         "status": "not-planned-short-term",
-        "pg_owner": "PG6",
+        "roadmap_area": "transaction-scope",
         "expected_behavior": "RustFS S3 Tables only claims single-table commit atomicity",
     },
 ]
@@ -218,7 +218,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--insecure", action="store_true", help="Disable TLS verification for HTTPS endpoints.")
     parser.add_argument("--print-client-matrix", action="store_true", help="Print the current client conformance matrix as JSON and exit.")
     parser.add_argument("--print-vendor-profiles", action="store_true", help="Print vendor connection profile references as JSON and exit.")
-    parser.add_argument("--print-unsupported-inventory", action="store_true", help="Print PG1 unsupported capability inventory as JSON and exit.")
+    parser.add_argument("--print-unsupported-inventory", action="store_true", help="Print unsupported capability inventory as JSON and exit.")
     return apply_profile_defaults(parser.parse_args())
 
 

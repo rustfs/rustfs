@@ -59,7 +59,7 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         self.assertEqual(profiles["minio-aistor"]["rest_signing_name"], "s3tables")
         self.assertEqual(profiles["cloudflare-r2-data-catalog"]["credential_mode"], "catalog-vended")
 
-    def test_unsupported_inventory_names_stable_pg1_boundaries(self) -> None:
+    def test_unsupported_inventory_names_stable_boundaries(self) -> None:
         inventory = pyiceberg_smoke.unsupported_inventory()
         capabilities = {entry["capability"] for entry in inventory}
 
@@ -68,7 +68,7 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         self.assertIn("background-maintenance-worker", capabilities)
         for entry in inventory:
             self.assertIn("status", entry)
-            self.assertIn("pg_owner", entry)
+            self.assertIn("roadmap_area", entry)
 
 
 if __name__ == "__main__":

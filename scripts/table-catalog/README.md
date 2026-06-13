@@ -71,8 +71,8 @@ python3 scripts/table-catalog/pyiceberg_smoke.py \
 
 ## Machine-Readable Inventories
 
-The script can print the current PG1 inventories without importing PyIceberg,
-PyArrow, or boto3:
+The script can print the current conformance inventories without importing
+PyIceberg, PyArrow, or boto3:
 
 ```bash
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-client-matrix
@@ -109,14 +109,14 @@ added.
 
 ## Unsupported Inventory
 
-PG1 documents unsupported behavior instead of hiding it behind internal errors.
-The current unsupported inventory is:
+Unsupported behavior is documented instead of hidden behind internal errors. The
+current unsupported inventory is:
 
-- credential vending: response boundary exists; real temporary credentials are PG2
-- background maintenance worker: PG4
-- manifest/data reachability cleanup: PG4
-- snapshot expiration and compaction: PG5
-- Iceberg views: PG6
+- credential vending: unsupported response boundary exists; real temporary credentials are not issued
+- background maintenance worker: unsupported
+- manifest/data reachability cleanup: unsupported
+- snapshot expiration and compaction: unsupported
+- Iceberg views: unsupported
 - multi-table transactions: not a short-term production claim
 
 ## Spark Manual Baseline
