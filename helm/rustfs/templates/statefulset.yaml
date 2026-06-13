@@ -1,82 +1,119 @@
 {{- $logDir := .Values.config.rustfs.obs_log_directory }}
 {{- $logDirEnabled := ne $logDir "" }}
+{{- $poolsEnabled := and .Values.pools .Values.pools.enabled }}
 
 {{- if .Values.mode.distributed.enabled }}
+{{- range $pool := include "rustfs.pools" . | fromJsonArray }}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ include "rustfs.fullname" . }}
-  namespace: {{ .Release.Namespace }}
+  name: {{ $pool.fullname }}
+  namespace: {{ $.Release.Namespace }}
   labels:
-    {{- include "rustfs.labels" . | nindent 4 }}
-    {{- with .Values.commonLabels }}
+    {{- include "rustfs.labels" $ | nindent 4 }}
+    {{- if $poolsEnabled }}
+    rustfs.com/pool: {{ $pool.index | quote }}
+    {{- end }}
+    {{- with $.Values.commonLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
-  serviceName: {{ include "rustfs.fullname" . }}-headless
-  replicas: {{ .Values.replicaCount }}
+  serviceName: {{ include "rustfs.fullname" $ }}-headless
+  replicas: {{ $pool.replicaCount }}
   podManagementPolicy: Parallel
   selector:
     matchLabels:
-      {{- include "rustfs.selectorLabels" . | nindent 6 }}
+      {{- include "rustfs.selectorLabels" $ | nindent 6 }}
+      {{- if gt (int $pool.index) 0 }}
+      {{- /* Pool 0 keeps the legacy selector: it is immutable on existing
+             StatefulSets and must not change when pools are enabled. */}}
+      rustfs.com/pool: {{ $pool.index | quote }}
+      {{- end }}
   template:
     metadata:
       labels:
-        {{- include "rustfs.selectorLabels" . | nindent 8 }}
-        {{- with .Values.podLabels }}
+        {{- include "rustfs.selectorLabels" $ | nindent 8 }}
+        {{- if $poolsEnabled }}
+        rustfs.com/pool: {{ $pool.index | quote }}
+        {{- end }}
+        {{- with $.Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
-      enableServiceLinks: {{ .Values.enableServiceLinks }}
-      {{- with include "chart.imagePullSecrets" . }}
+      enableServiceLinks: {{ $.Values.enableServiceLinks }}
+      {{- with include "chart.imagePullSecrets" $ }}
       imagePullSecrets:
         {{- . | nindent 8 }}
       {{- end }}
-      {{- if and .Values.nodeSelector (not .Values.affinity.nodeAffinity) }}
+      {{- if and $.Values.nodeSelector (not $.Values.affinity.nodeAffinity) }}
       nodeSelector:
-        {{- toYaml .Values.nodeSelector | nindent 8 }}
+        {{- toYaml $.Values.nodeSelector | nindent 8 }}
       {{- end }}
-      {{- if .Values.affinity }}
+      {{- if $.Values.affinity }}
       affinity:
         nodeAffinity:
-        {{- if .Values.affinity.nodeAffinity }}
-          {{- toYaml .Values.affinity.nodeAffinity | nindent 10 }}
+        {{- if $.Values.affinity.nodeAffinity }}
+          {{- toYaml $.Values.affinity.nodeAffinity | nindent 10 }}
         {{- else }}
           {}
         {{- end }}
-        {{- if .Values.affinity.podAntiAffinity.enabled }}
+        {{- if $.Values.affinity.podAntiAffinity.enabled }}
         podAntiAffinity:
+          {{- if $poolsEnabled }}
+          {{- /* Pool-scoped and PREFERRED, not required: during in-place
+                 expansion the not-yet-rolled pods' required rules block new
+                 pods from their nodes, while the new pods' DNS must resolve
+                 before the roll can proceed - required rules deadlock
+                 expansion whenever the cluster has fewer nodes than total
+                 pods. Soft anti-affinity converges (the scheduler still
+                 spreads when capacity allows). */}}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app.kubernetes.io/name
+                      operator: In
+                      values:
+                        - {{ include "rustfs.name" $ }}
+                    - key: rustfs.com/pool
+                      operator: In
+                      values:
+                        - {{ $pool.index | quote }}
+                topologyKey: {{ $.Values.affinity.podAntiAffinity.topologyKey }}
+          {{- else }}
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
                 matchExpressions:
                   - key: app.kubernetes.io/name
                     operator: In
                     values:
-                      - {{ include "rustfs.name" . }}
-              topologyKey: {{ .Values.affinity.podAntiAffinity.topologyKey }}
+                      - {{ include "rustfs.name" $ }}
+              topologyKey: {{ $.Values.affinity.podAntiAffinity.topologyKey }}
+          {{- end }}
         {{- end }}
       {{- end }}
-      {{- if .Values.tolerations }}
+      {{- if $.Values.tolerations }}
       tolerations:
-        {{- toYaml .Values.tolerations | nindent 8 }}
+        {{- toYaml $.Values.tolerations | nindent 8 }}
       {{- end }}
-      {{- if and .Values.topologySpreadConstraints.enabled .Values.topologySpreadConstraints.constraints }}
+      {{- if and $.Values.topologySpreadConstraints.enabled $.Values.topologySpreadConstraints.constraints }}
       topologySpreadConstraints:
-        {{- toYaml .Values.topologySpreadConstraints.constraints | nindent 8 }}
+        {{- toYaml $.Values.topologySpreadConstraints.constraints | nindent 8 }}
       {{- end }}
-      priorityClassName: {{ .Values.priorityClassName }}
+      priorityClassName: {{ $.Values.priorityClassName }}
       securityContext:
-        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+        {{- toYaml $.Values.podSecurityContext | nindent 8 }}
       initContainers:
         - name: init-step
-          image: "{{ .Values.image.initImage.repository }}:{{ .Values.image.initImage.tag }}"
-          imagePullPolicy: {{ .Values.image.initImage.pullPolicy }}
+          image: "{{ $.Values.image.initImage.repository }}:{{ $.Values.image.initImage.tag }}"
+          imagePullPolicy: {{ $.Values.image.initImage.pullPolicy }}
           securityContext:
-            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+            {{- toYaml $.Values.containerSecurityContext | nindent 12 }}
           env:
             - name: REPLICA_COUNT
-              value: {{ .Values.replicaCount | quote }}
+              value: {{ $pool.replicaCount | quote }}
           command:
             - sh
             - -c
@@ -93,12 +130,12 @@ spec:
               chmod 755 /mnt/rustfs/logs
               {{- end }}
           volumeMounts:
-            {{- if eq (int .Values.replicaCount) 4 }}
-            {{- range $i := until (int .Values.replicaCount) }}
+            {{- if eq (int $pool.replicaCount) 4 }}
+            {{- range $i := until (int $pool.replicaCount) }}
             - name: data-rustfs-{{ $i }}
               mountPath: /data/rustfs{{ $i }}
             {{- end }}
-            {{- else if eq (int .Values.replicaCount) 16 }}
+            {{- else if eq (int $pool.replicaCount) 16 }}
             - name: data
               mountPath: /data
             {{- end }}
@@ -107,31 +144,31 @@ spec:
               mountPath: /mnt/rustfs
             {{- end }}
       containers:
-        - name: {{ .Chart.Name }}
-          image: "{{ .Values.image.rustfs.repository }}:{{ .Values.image.rustfs.tag | default .Chart.AppVersion }}"
+        - name: {{ $.Chart.Name }}
+          image: "{{ $.Values.image.rustfs.repository }}:{{ $.Values.image.rustfs.tag | default $.Chart.AppVersion }}"
           command: ["/usr/bin/rustfs"]
-          imagePullPolicy: {{ .Values.image.rustfs.pullPolicy }}
+          imagePullPolicy: {{ $.Values.image.rustfs.pullPolicy }}
           securityContext:
-            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+            {{- toYaml $.Values.containerSecurityContext | nindent 12 }}
           ports:
             - name: endpoint
-              containerPort: {{ .Values.service.endpoint.port }}
+              containerPort: {{ $.Values.service.endpoint.port }}
             - name: console
-              containerPort: {{ .Values.service.console.port }}
-          {{- with .Values.extraEnv }}
+              containerPort: {{ $.Values.service.console.port }}
+          {{- with $.Values.extraEnv }}
           env:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           envFrom:
             - configMapRef:
-                name: {{ include "rustfs.fullname" . }}-config
+                name: {{ include "rustfs.fullname" $ }}-config
             - secretRef:
-                name: {{ include "rustfs.secretName" . }}
+                name: {{ include "rustfs.secretName" $ }}
           resources:
-            {{- toYaml .Values.resources | nindent 12 }}
-          {{- include "rustfs.probes" . | nindent 10 }}
+            {{- toYaml $.Values.resources | nindent 12 }}
+          {{- include "rustfs.probes" $ | nindent 10 }}
           volumeMounts:
-            {{- if .Values.mtls.enabled }}
+            {{- if $.Values.mtls.enabled }}
             - name: client-cert
               mountPath: /opt/tls/client_cert.pem
               subPath: client_cert.pem
@@ -151,7 +188,7 @@ spec:
               mountPath: /opt/tls/ca.crt
               subPath: ca.crt
             {{- end }}
-            {{- with .Values.extraVolumeMounts }}
+            {{- with $.Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
             {{- if $logDirEnabled }}
@@ -159,18 +196,18 @@ spec:
               mountPath: {{ $logDir }}
               subPath: logs
             {{- end }}
-            {{- if eq (int .Values.replicaCount) 4 }}
-            {{- range $i := until (int .Values.replicaCount) }}
+            {{- if eq (int $pool.replicaCount) 4 }}
+            {{- range $i := until (int $pool.replicaCount) }}
             - name: data-rustfs-{{ $i }}
               mountPath: /data/rustfs{{ $i }}
             {{- end }}
-            {{- else if eq (int .Values.replicaCount) 16 }}
+            {{- else if eq (int $pool.replicaCount) 16 }}
             - name: data
               mountPath: /data
             {{- end }}
-      {{- if or .Values.mtls.enabled .Values.extraVolumes }}
+      {{- if or $.Values.mtls.enabled $.Values.extraVolumes }}
       volumes:
-        {{- if .Values.mtls.enabled }}
+        {{- if $.Values.mtls.enabled }}
         - name: server-cert
           secret:
             secretName: rustfs-server-tls
@@ -192,7 +229,7 @@ spec:
               - key: ca.crt
                 path: client_ca.crt
         {{- end }}
-        {{- with .Values.extraVolumes }}
+        {{- with $.Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- end }}
@@ -203,18 +240,18 @@ spec:
       metadata:
         name: logs
         labels:
-          {{- toYaml .Values.commonLabels | nindent 10 }}
+          {{- toYaml $.Values.commonLabels | nindent 10 }}
         annotations:
-          {{- toYaml .Values.storageclass.pvcAnnotations.logs | nindent 10 }}
+          {{- toYaml $pool.storageclass.pvcAnnotations.logs | nindent 10 }}
       spec:
         accessModes: ["ReadWriteOnce"]
-        storageClassName: {{ .Values.storageclass.name }}
+        storageClassName: {{ $pool.storageclass.name }}
         resources:
           requests:
-            storage: {{ .Values.storageclass.logStorageSize }}
+            storage: {{ $pool.storageclass.logStorageSize }}
     {{- end }}
-    {{- if eq (int .Values.replicaCount) 4 }}
-    {{- range $i := until (int .Values.replicaCount) }}
+    {{- if eq (int $pool.replicaCount) 4 }}
+    {{- range $i := until (int $pool.replicaCount) }}
     - apiVersion: v1
       kind: PersistentVolumeClaim
       metadata:
@@ -222,28 +259,29 @@ spec:
         labels:
           {{- toYaml $.Values.commonLabels | nindent 10 }}
         annotations:
-          {{- toYaml $.Values.storageclass.pvcAnnotations.data | nindent 10 }}
+          {{- toYaml $pool.storageclass.pvcAnnotations.data | nindent 10 }}
       spec:
         accessModes: ["ReadWriteOnce"]
-        storageClassName: {{ $.Values.storageclass.name }}
+        storageClassName: {{ $pool.storageclass.name }}
         resources:
           requests:
-            storage: {{ $.Values.storageclass.dataStorageSize }}
+            storage: {{ $pool.storageclass.dataStorageSize }}
     {{- end }}
-    {{- else if eq (int .Values.replicaCount) 16 }}
+    {{- else if eq (int $pool.replicaCount) 16 }}
     - apiVersion: v1
       kind: PersistentVolumeClaim
       metadata:
         name: data
         labels:
-          {{- toYaml .Values.commonLabels | nindent 10 }}
+          {{- toYaml $.Values.commonLabels | nindent 10 }}
         annotations:
-          {{- toYaml .Values.storageclass.pvcAnnotations.data | nindent 10 }}
+          {{- toYaml $pool.storageclass.pvcAnnotations.data | nindent 10 }}
       spec:
         accessModes: ["ReadWriteOnce"]
-        storageClassName: {{ .Values.storageclass.name }}
+        storageClassName: {{ $pool.storageclass.name }}
         resources:
           requests:
-            storage: {{ .Values.storageclass.dataStorageSize }}
+            storage: {{ $pool.storageclass.dataStorageSize }}
     {{- end }}
+{{- end }}
 {{- end }}

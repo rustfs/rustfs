@@ -46,6 +46,33 @@ mode:
   distributed:
     enabled: true
 
+# Server pools for horizontal capacity expansion (distributed mode only).
+# Disabled by default: the chart then behaves exactly like the classic
+# single-pool layout driven by the top-level replicaCount/storageclass.
+#
+# With pools.enabled=true, one StatefulSet is rendered per entry of
+# pools.list and RUSTFS_VOLUMES contains every pool's volume expression
+# (space separated), which is how the server discovers multiple pools.
+# Each entry may set replicaCount (4 or 16) and/or a storageclass block;
+# omitted fields inherit the top-level values.
+#
+# IMPORTANT:
+# - Pools are append-only. The list index determines the StatefulSet name
+#   (pool 0 keeps the legacy name so existing single-pool deployments can be
+#   expanded in place); never remove or reorder entries. To retire a pool,
+#   use `rc admin decommission` first.
+# - After adding a pool, run `rc admin rebalance start <alias>` to spread
+#   existing data across the new capacity.
+pools:
+  enabled: false
+  list: []
+  # Example: expand an existing 4-node deployment with a second, larger pool:
+  # list:
+  #   - {}                          # pool 0: inherits top-level values, keeps existing PVCs
+  #   - replicaCount: 4             # pool 1: new capacity
+  #     storageclass:
+  #       dataStorageSize: 10Gi
+
 secret:
   existingSecret: ""
   # SECURITY: rendering fails by default unless one of the following is true:
