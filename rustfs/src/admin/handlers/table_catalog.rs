@@ -2464,27 +2464,17 @@ async fn table_metadata_maintenance_response<B>(
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
-    let report = if request.delete {
-        store
-            .delete_table_metadata_maintenance_candidates(
-                bucket,
-                &namespace.public_name(),
-                table,
-                request.retain_recent_metadata_files,
-            )
-            .await
-            .map_err(catalog_store_error)
-    } else {
-        store
-            .plan_table_metadata_maintenance(bucket, &namespace.public_name(), table, request.retain_recent_metadata_files)
-            .await
-            .map_err(catalog_store_error)
-    }?;
     store
-        .put_table_metadata_maintenance_report(&report)
+        .run_table_metadata_maintenance_with_retention(
+            bucket,
+            &namespace.public_name(),
+            table,
+            request.delete,
+            Some("rustfs-admin".to_string()),
+            request.retain_recent_metadata_files,
+        )
         .await
-        .map_err(catalog_store_error)?;
-    Ok(report)
+        .map_err(catalog_store_error)
 }
 
 async fn catalog_import_response<B>(
