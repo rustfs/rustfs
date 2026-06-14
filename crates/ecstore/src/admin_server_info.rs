@@ -18,8 +18,8 @@ use crate::rpc::{TonicInterceptor, gen_tonic_signature_interceptor, node_service
 use crate::{
     disk::endpoint::Endpoint,
     global::{GLOBAL_BOOT_TIME, GLOBAL_Endpoints, get_global_deployment_id},
-    new_object_layer_fn,
     notification_sys::get_global_notification_sys,
+    resolve_object_store_handle,
 };
 
 use crate::data_usage::load_data_usage_cache;
@@ -185,7 +185,7 @@ pub async fn get_local_server_property() -> ServerProperties {
     // let mut sensitive = HashSet::new();
     // sensitive.insert(rustfs_config::ENV_RUSTFS_ACCESS_KEY.to_string());
     // sensitive.insert(rustfs_config::ENV_RUSTFS_SECRET_KEY.to_string());
-    if let Some(store) = new_object_layer_fn() {
+    if let Some(store) = resolve_object_store_handle() {
         let storage_info = StorageAdminApi::local_storage_info(store.as_ref()).await;
         props.state = ITEM_ONLINE.to_string();
         props.disks = storage_info.disks;
@@ -229,7 +229,7 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
     let mut backend = rustfs_madmin::ErasureBackend::default();
     let mut pools: HashMap<i32, HashMap<i32, ErasureSetInfo>> = HashMap::new();
 
-    if let Some(store) = new_object_layer_fn() {
+    if let Some(store) = resolve_object_store_handle() {
         mode = ITEM_ONLINE;
         match load_data_usage_from_backend(store.clone()).await {
             Ok(res) => {
@@ -347,7 +347,7 @@ fn get_online_offline_disks_stats(disks_info: &[Disk]) -> (BackendDisks, Backend
 }
 
 async fn get_pools_info(all_disks: &[Disk]) -> Result<HashMap<i32, HashMap<i32, ErasureSetInfo>>> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(Error::other("ServerNotInitialized"));
     };
 

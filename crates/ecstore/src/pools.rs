@@ -35,8 +35,8 @@ use crate::error::{
     StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_data_movement_overwrite, is_err_object_not_found,
     is_err_operation_canceled, is_err_version_not_found,
 };
-use crate::new_object_layer_fn;
 use crate::notification_sys::get_global_notification_sys;
+use crate::resolve_object_store_handle;
 use crate::set_disk::SetDisks;
 use crate::store_api::{
     BucketOperations, BucketOptions, GetObjectReader, HealOperations, MakeBucketOptions, ObjectIO, ObjectOperations,
@@ -1384,7 +1384,7 @@ impl ECStore {
 
         ensure_decommission_not_rebalancing(self.is_rebalance_conflicting_with_decommission().await)?;
 
-        let store = require_decommission_store(new_object_layer_fn(), "start decommission")?;
+        let store = require_decommission_store(resolve_object_store_handle(), "start decommission")?;
 
         self.start_decommission(indices.clone()).await?;
         if let Err(err) = self.spawn_decommission_routines(store, rx, indices.clone()).await {

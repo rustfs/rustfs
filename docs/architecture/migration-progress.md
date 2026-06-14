@@ -5,18 +5,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-server-storage-object-store-resolver`
-- Baseline: `upstream/main` at `9372ee70329d08ea7aafae8df84f6b1ecb5bd686`
+- Branch: `overtrue/arch-ecstore-internal-object-store-resolver`
+- Baseline: `upstream/main` at `8f6b1d47b5af689e0b3576ab4448cc4274786df1`
 - PR type for this branch: `consumer-migration`
-- Runtime behavior changes: no external behavior change expected; server and
-  storage infra object-store lookups prefer the AppContext-owned object store
-  through the ECStore-owned resolver and keep the existing global fallback.
-- Rust code changes: migrate server readiness/module-switch and storage access,
-  ecfs extension, and node RPC object-store lookups to the ECStore-owned
-  resolver without touching app compatibility fallbacks or ECStore internal
-  background consumers.
+- Runtime behavior changes: no external behavior change expected; ECStore
+  internal/background object-store lookups prefer the AppContext-owned object
+  store through the ECStore-owned resolver and keep the existing global
+  fallback.
+- Rust code changes: migrate ECStore internal metrics, notification, tier,
+  decommission, admin info, bucket metadata, replication, lifecycle, and data
+  usage object-store lookups to the ECStore-owned resolver without touching app
+  compatibility fallbacks or the global fallback definition.
 - CI/script changes: none.
-- Docs changes: record `CTX-009` consumer migration scope and verification.
+- Docs changes: record `CTX-010` consumer migration scope and verification.
 
 ## Phase 0 Tasks
 
@@ -215,6 +216,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     storage access authorization checks, ecfs extension validation, node RPC
     metadata/storage-info/rebalance/tier reload behavior, and existing storage
     error paths.
+  - Verification: formatting, compile checks, migration guards, diff hygiene,
+    Rust risk scan, and full `make pre-commit`.
+- [x] `CTX-010` Migrate ECStore internal object-store consumers.
+  - Do: migrate ECStore internal/background object-store lookups to the
+    ECStore-owned resolver.
+  - Acceptance: ECStore metrics realtime, notification, tier config save,
+    decommission, admin server info, bucket metadata, replication decision,
+    lifecycle compensation/expiry, and data-usage cache consumers prefer the
+    AppContext-owned object store after context initialization and preserve the
+    existing global object-layer fallback.
+  - Must preserve: metrics collection, notification rebalance stop behavior,
+    tier config persistence, decommission startup, admin server info reporting,
+    bucket metadata persistence, replication decisions, lifecycle queueing, data
+    usage cache persistence, and existing storage error paths.
   - Verification: formatting, compile checks, migration guards, diff hygiene,
     Rust risk scan, and full `make pre-commit`.
 
@@ -523,9 +538,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `consumer-migration`: review app compatibility fallback call sites and
-   ECStore internal background consumers before the final global-accessor
-   cleanup phase.
+1. `consumer-migration`: review app compatibility fallback call sites before
+   the final global-accessor cleanup phase.
 2. `pure-move`: start `R-009` boot wrapper with the IAM degraded readiness
    contract covered.
 
@@ -533,40 +547,42 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Single consumer-migration slice; server/storage infra consumers use the ECStore-owned resolver without widening application-layer dependencies or changing ECStore internals. |
-| Migration preservation | passed | Readiness, module-switch, storage access, ecfs extension, and node RPC call sites keep the same error paths while preferring the AppContext-owned store when installed. |
-| Testing/verification | passed | Formatting, compile check, diff hygiene, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Single consumer-migration slice; ECStore internal/background consumers use the ECStore-owned resolver without adding application-layer dependencies or changing the fallback definition. |
+| Migration preservation | passed | Metrics, notification, tier, decommission, admin info, bucket metadata, replication, lifecycle, and data-usage call sites keep the same missing-store/error behavior while preferring the AppContext-owned store when installed. |
+| Testing/verification | passed | Formatting, compile checks, diff hygiene, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `9372ee70329d08ea7aafae8df84f6b1ecb5bd686`:
+Passed on `8f6b1d47b5af689e0b3576ab4448cc4274786df1`:
 
 - `cargo fmt --all --check`.
+- `cargo check -p rustfs-ecstore`.
 - `cargo check -p rustfs --lib`.
 - `git diff --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
-- `git rev-list --left-right --count HEAD...origin/main` returned `0 0`.
+- `git rev-list --left-right --count HEAD...origin/main` returned `1 0`
+  after rebase.
 - Rust risk scan for changed Rust files; full-file matches were existing tests,
-  existing relaxed counters, existing numeric casts, and existing string error
-  signatures, and the added-line scan returned no `unwrap`/`expect`, numeric
-  cast, string error, boxed error, print macro, or relaxed-ordering match.
+  existing relaxed counters, existing numeric casts, existing print/debug
+  helpers, and existing unwrap/expect paths, and the added-line scan returned
+  no `unwrap`/`expect`, numeric cast, string error, boxed error, print macro, or
+  relaxed-ordering match.
 - `make pre-commit`; all checks passed, including nextest 5954 passed and 111
   skipped, plus doctests.
 
 Notes:
 
-- This slice migrates server readiness/module-switch and storage access, ecfs
-  extension, and node RPC object-store lookups to the ECStore-owned resolver.
+- This slice migrates ECStore internal/background object-store lookups to the
+  ECStore-owned resolver.
 - App compatibility fallback call sites remain on `new_object_layer_fn` as an
   explicit fallback path.
-- ECStore internal background consumers remain on the old global accessor for a
-  separate review.
+- The old global accessor remains as the resolver fallback and public
+  compatibility re-export for a later cleanup slice.
 
 ## Handoff Notes
 
-- CTX-009 is complete.
+- CTX-010 is complete.
 - App compatibility fallback call sites remain on `new_object_layer_fn` as an
   explicit fallback path.
-- ECStore internal background consumers should be reviewed separately before
-  changing their global accessor behavior.
+- The global fallback definition and re-export remain for a later cleanup slice.
