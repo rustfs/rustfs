@@ -134,10 +134,40 @@ impl tonic::service::Interceptor for TonicInterceptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry::global;
+    use opentelemetry::trace::{SpanContext, TraceContextExt, TraceFlags, TraceId, TraceState, TracerProvider as _};
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
     use tonic::service::Interceptor;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    use tracing_subscriber::{Registry, layer::SubscriberExt};
 
     fn ensure_test_rpc_secret() {
         let _ = rustfs_credentials::GLOBAL_RUSTFS_RPC_SECRET.set("test-rpc-secret".to_string());
+    }
+
+    fn with_trace_parent<F>(trace_id_hex: &str, f: F)
+    where
+        F: FnOnce(),
+    {
+        global::set_text_map_propagator(TraceContextPropagator::new());
+
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("rpc-client-tests");
+        let subscriber = Registry::default().with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("rpc-client-test-span");
+            let trace_id = TraceId::from_hex(trace_id_hex).expect("trace id should be valid hex");
+            let span_id = opentelemetry::trace::SpanId::from_hex("0102030405060708").expect("span id should be valid hex");
+            let parent = SpanContext::new(trace_id, span_id, TraceFlags::SAMPLED, true, TraceState::default());
+            span.set_parent(opentelemetry::Context::new().with_remote_span_context(parent))
+                .expect("failed to set parent context");
+            let _guard = span.enter();
+
+            f();
+        });
+        let _ = provider.shutdown();
     }
 
     #[test]
@@ -165,5 +195,22 @@ mod tests {
         if let Some(v) = req.metadata().get("x-request-id") {
             assert!(!v.as_encoded_bytes().is_empty());
         }
+    }
+
+    #[test]
+    fn test_signature_interceptor_injects_traceparent_metadata() {
+        ensure_test_rpc_secret();
+        let mut interceptor = TonicSignatureInterceptor;
+        let req = tonic::Request::new(());
+
+        with_trace_parent("4bf92f3577b34da6a3ce929d0e0e4736", || {
+            let req = interceptor.call(req).expect("interceptor call should succeed");
+            let traceparent = req
+                .metadata()
+                .get("traceparent")
+                .and_then(|v| v.to_str().ok())
+                .expect("traceparent metadata should be injected");
+            assert!(traceparent.starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-"));
+        });
     }
 }
