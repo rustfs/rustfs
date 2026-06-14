@@ -2431,10 +2431,7 @@ fn table_catalog_store_result_label<T>(result: &TableCatalogStoreResult<T>) -> &
 }
 
 fn duration_millis_u64(duration: StdDuration) -> u64 {
-    match u64::try_from(duration.as_millis()) {
-        Ok(duration_ms) => duration_ms,
-        Err(_) => u64::MAX,
-    }
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn record_table_commit_cas_result(operation: &str, started: Instant, result: &TableCatalogStoreResult<()>) {

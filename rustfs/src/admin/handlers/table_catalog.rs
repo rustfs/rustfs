@@ -649,10 +649,7 @@ fn empty_response(status: StatusCode) -> S3Response<(StatusCode, Body)> {
 }
 
 fn duration_millis_u64(duration: StdDuration) -> u64 {
-    match u64::try_from(duration.as_millis()) {
-        Ok(duration_ms) => duration_ms,
-        Err(_) => u64::MAX,
-    }
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn table_catalog_admin_operation_result_label<T, E>(result: &Result<T, E>) -> &'static str {
