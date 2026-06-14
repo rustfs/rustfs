@@ -71,7 +71,8 @@ const LOG_SUBSYSTEM_LOCAL_LOGGING: &str = "local_logging";
 const EVENT_LOCAL_LOGGING_STATE: &str = "local_logging_state";
 const EVENT_LOG_CLEANER_STATE: &str = "log_cleaner_state";
 const STDERR_WARNING_PREFIX: &str = "[WARN]";
-const REQUEST_ID: &str = "request-id";
+const REQUEST_ID_CANONICAL: &str = "request_id";
+const REQUEST_ID_COMPAT: &str = "request-id";
 
 #[derive(Clone, Debug)]
 struct RequestIdJsonFormat<T> {
@@ -106,9 +107,15 @@ where
         let trimmed = buffer.trim_end();
         let mut payload: JsonValue = serde_json::from_str(trimmed).map_err(|_| fmt::Error)?;
         if let Some(object) = payload.as_object_mut() {
+            let request_id = request_id.expect("checked is_some");
             object
-                .entry(REQUEST_ID.to_string())
-                .or_insert_with(|| JsonValue::String(request_id.expect("checked is_some")));
+                .entry(REQUEST_ID_CANONICAL.to_string())
+                .or_insert_with(|| JsonValue::String(request_id.clone()));
+            // Keep a top-level compatibility alias for operators or downstream
+            // queries that already rely on the earlier hyphenated field name.
+            object
+                .entry(REQUEST_ID_COMPAT.to_string())
+                .or_insert_with(|| JsonValue::String(request_id));
         }
 
         let serialized = serde_json::to_string(&payload).map_err(|_| fmt::Error)?;
@@ -131,7 +138,11 @@ where
         let extensions = span.extensions();
         let formatted_fields = extensions.get::<tracing_subscriber::fmt::FormattedFields<JsonFields>>()?;
         let fields: BTreeMap<String, JsonValue> = serde_json::from_str(&formatted_fields.fields).ok()?;
-        if let Some(value) = fields.get(REQUEST_ID).and_then(JsonValue::as_str) {
+        if let Some(value) = fields
+            .get(REQUEST_ID_CANONICAL)
+            .or_else(|| fields.get(REQUEST_ID_COMPAT))
+            .and_then(JsonValue::as_str)
+        {
             request_id = Some(value.to_string());
         }
     }
@@ -842,6 +853,7 @@ mod tests {
         let parsed = render_json_log_with_request_span();
 
         assert_eq!(parsed["request_id"], Value::String("req-123".to_string()));
+        assert_eq!(parsed["request-id"], Value::String("req-123".to_string()));
         assert_eq!(parsed["message"], Value::String("inside request span".to_string()));
         assert_eq!(parsed["span"]["request_id"], Value::String("req-123".to_string()));
     }
@@ -851,6 +863,7 @@ mod tests {
         let parsed = render_json_log_with_recovery_monitor_child_span();
 
         assert_eq!(parsed["request_id"], Value::String("req-parent".to_string()));
+        assert_eq!(parsed["request-id"], Value::String("req-parent".to_string()));
         assert_eq!(parsed["message"], Value::String("inside recovery monitor".to_string()));
         assert_eq!(parsed["span"]["name"], Value::String("recovery-monitor".to_string()));
         assert_eq!(parsed["span"]["kind"], Value::String("remote_disk".to_string()));
