@@ -31,6 +31,7 @@ pub mod kms_management;
 pub mod metrics;
 pub mod module_switch;
 mod notify_runtime_access;
+pub mod object_zip_download;
 pub mod oidc;
 pub mod plugins_catalog;
 pub mod plugins_instances;
@@ -75,6 +76,7 @@ mod tests {
         let _get_extension_catalog = extensions::GetExtensionCatalogHandler {};
         let _list_extension_instances = extensions::ListExtensionInstancesHandler {};
         let _get_plugin_catalog = plugins_catalog::GetPluginCatalogHandler {};
+        let _create_object_zip_download = object_zip_download::CreateObjectZipDownloadHandler {};
         let _list_plugin_instances = plugins_instances::ListPluginInstancesHandler {};
         let _get_plugin_instance = plugins_instances::GetPluginInstanceHandler {};
         let _put_plugin_instance = plugins_instances::PutPluginInstanceHandler {};
