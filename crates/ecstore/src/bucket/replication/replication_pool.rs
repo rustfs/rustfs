@@ -20,14 +20,15 @@ use crate::bucket::replication::ResyncStatusType;
 use crate::bucket::replication::replicate_delete;
 use crate::bucket::replication::replicate_object;
 use crate::bucket::replication::replication_resyncer::{
-    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, REPLICATION_DIR, RESYNC_FILE_NAME, ReplicationConfig,
-    ReplicationResyncer, TargetReplicationResyncStatus, decode_resync_file, get_heal_replicate_object_info, save_resync_status,
+    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, MRF_REPLICATION_FILE, REPLICATION_DIR, RESYNC_FILE_NAME,
+    ReplicationConfig, ReplicationResyncer, TargetReplicationResyncStatus, decode_mrf_file, decode_resync_file, encode_mrf_file,
+    get_heal_replicate_object_info, save_resync_status,
 };
 use crate::bucket::replication::replication_state::ReplicationStats;
-use crate::config::com::read_config;
+use crate::config::com::{read_config, save_config};
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::Error as EcstoreError;
-use crate::store_api::{NamespaceLocking, ObjectIO, ObjectInfo};
+use crate::store_api::{NamespaceLocking, ObjectIO, ObjectInfo, ObjectOptions};
 use lazy_static::lazy_static;
 use rustfs_filemeta::MrfReplicateEntry;
 use rustfs_filemeta::ReplicateDecision;
@@ -233,7 +234,8 @@ pub struct ReplicationPool<S: StorageAPI + NamespaceLocking> {
 
     // MRF (Most Recent Failures) channels
     mrf_replica_tx: Sender<ReplicationOperation>,
-    mrf_replica_rx: Mutex<Option<Receiver<ReplicationOperation>>>,
+    // Shared among N MRF workers; Arc allows spawning more than one worker.
+    mrf_replica_rx: Arc<Mutex<Receiver<ReplicationOperation>>>,
     mrf_save_tx: Sender<MrfReplicateEntry>,
     mrf_save_rx: Mutex<Option<Receiver<MrfReplicateEntry>>>,
 
@@ -285,7 +287,7 @@ impl<S: StorageAPI + NamespaceLocking> ReplicationPool<S> {
             workers: RwLock::new(Vec::new()),
             lrg_workers: RwLock::new(Vec::new()),
             mrf_replica_tx,
-            mrf_replica_rx: Mutex::new(Some(mrf_replica_rx)),
+            mrf_replica_rx: Arc::new(Mutex::new(mrf_replica_rx)),
             mrf_save_tx,
             mrf_save_rx: Mutex::new(Some(mrf_save_rx)),
             mrf_worker_kill_tx,
@@ -463,50 +465,48 @@ impl<S: StorageAPI + NamespaceLocking> ReplicationPool<S> {
 
     /// Resizes the failed workers pool
     pub async fn resize_failed_workers(&self, n: i32) {
-        // Add workers if needed
+        // Spawn workers up to n.  Each worker shares the receiver via Arc<Mutex<...>>.
+        // The mutex is held only while calling recv() — released before processing — so
+        // all workers process entries concurrently (the dequeue step is serialised but
+        // the replication I/O is not).
         while self.mrf_worker_size.load(Ordering::SeqCst) < n {
             self.mrf_worker_size.fetch_add(1, Ordering::SeqCst);
 
             let active_counter = self.active_mrf_workers.clone();
             let stats = self.stats.clone();
             let storage = self.storage.clone();
-            let mrf_rx = self.mrf_replica_rx.lock().await.take();
+            let mrf_rx = Arc::clone(&self.mrf_replica_rx);
 
-            if let Some(rx) = mrf_rx {
-                let handle = tokio::spawn(async move {
-                    let mut rx = rx;
-                    while let Some(operation) = rx.recv().await {
-                        active_counter.fetch_add(1, Ordering::SeqCst);
+            let handle = tokio::spawn(async move {
+                loop {
+                    let operation = { mrf_rx.lock().await.recv().await };
+                    let Some(operation) = operation else { break };
 
-                        match operation {
-                            ReplicationOperation::Object(obj_info) => {
-                                stats
-                                    .inc_q(&obj_info.bucket, obj_info.size, obj_info.delete_marker, obj_info.op_type)
-                                    .await;
-
-                                replicate_object(obj_info.as_ref().clone(), storage.clone()).await;
-
-                                stats
-                                    .dec_q(&obj_info.bucket, obj_info.size, obj_info.delete_marker, obj_info.op_type)
-                                    .await;
-                            }
-                            ReplicationOperation::Delete(del_info) => {
-                                replicate_delete(*del_info, storage.clone()).await;
-                            }
+                    active_counter.fetch_add(1, Ordering::SeqCst);
+                    match operation {
+                        ReplicationOperation::Object(obj_info) => {
+                            stats
+                                .inc_q(&obj_info.bucket, obj_info.size, obj_info.delete_marker, obj_info.op_type)
+                                .await;
+                            replicate_object(obj_info.as_ref().clone(), storage.clone()).await;
+                            stats
+                                .dec_q(&obj_info.bucket, obj_info.size, obj_info.delete_marker, obj_info.op_type)
+                                .await;
                         }
-
-                        active_counter.fetch_sub(1, Ordering::SeqCst);
+                        ReplicationOperation::Delete(del_info) => {
+                            replicate_delete(*del_info, storage.clone()).await;
+                        }
                     }
-                });
-                self.task_handles.lock().await.push(handle);
-                break; // Only one receiver can be taken
-            }
+                    active_counter.fetch_sub(1, Ordering::SeqCst);
+                }
+            });
+            self.task_handles.lock().await.push(handle);
         }
 
         // Remove workers if needed
         while self.mrf_worker_size.load(Ordering::SeqCst) > n {
             self.mrf_worker_size.fetch_sub(1, Ordering::SeqCst);
-            let _ = self.mrf_worker_kill_tx.try_send(()); // Signal worker to stop
+            let _ = self.mrf_worker_kill_tx.try_send(());
         }
     }
 
@@ -789,16 +789,143 @@ impl<S: StorageAPI + NamespaceLocking> ReplicationPool<S> {
         }
     }
 
-    /// Starts the MRF processor background task
+    /// Starts the MRF processor — one-shot at startup.
+    ///
+    /// Reads the on-disk MRF file, re-injects every entry into `mrf_replica_tx` as a
+    /// Heal operation, then clears the file.  The file is cleared AFTER all entries are
+    /// successfully queued so a crash mid-replay results in at-most-twice delivery
+    /// (safe — replication is idempotent) rather than entry loss.
     async fn start_mrf_processor(&self) {
-        // This would start a background task to process MRF entries
-        // Implementation depends on the actual MRF processing logic
+        let storage = self.storage.clone();
+
+        let handle = tokio::spawn(async move {
+            let data = match read_config(storage.clone(), MRF_REPLICATION_FILE).await {
+                Ok(d) => d,
+                Err(EcstoreError::ConfigNotFound) => return, // no file yet — normal on first start
+                Err(e) => {
+                    warn!(
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REPLICATION,
+                        error = %e,
+                        "Failed to load MRF recovery file"
+                    );
+                    return;
+                }
+            };
+
+            let entries = match decode_mrf_file(&data) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REPLICATION,
+                        error = %e,
+                        "Failed to decode MRF recovery file — discarding corrupt data"
+                    );
+                    // Overwrite the corrupt file so we don't fail again on next restart.
+                    let _ = save_config(storage, MRF_REPLICATION_FILE, encode_mrf_file(&[]).unwrap_or_default()).await;
+                    return;
+                }
+            };
+
+            let total = entries.len();
+            let mut queued_count = 0usize;
+
+            for entry in entries.iter() {
+                let opts = ObjectOptions {
+                    version_id: entry.version_id.map(|u| u.to_string()),
+                    ..Default::default()
+                };
+                let oi = match storage.get_object_info(&entry.bucket, &entry.object, &opts).await {
+                    Ok(oi) => oi,
+                    Err(e) => {
+                        debug!(
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_REPLICATION,
+                            bucket = %entry.bucket,
+                            object = %entry.object,
+                            error = %e,
+                            "MRF recovery: object not found, skipping"
+                        );
+                        continue;
+                    }
+                };
+                // Route through queue_replication_heal so the replication decision (dsc) is
+                // computed from the live replication config — this is required for
+                // replicate_object to actually send the object to its targets.
+                queue_replication_heal(&entry.bucket, oi, entry.retry_count as u32).await;
+                queued_count += 1;
+            }
+
+            // Clear AFTER all entries are processed so a crash mid-replay causes at-most-twice
+            // delivery (idempotent) rather than entry loss.
+            if let Err(e) = save_config(storage, MRF_REPLICATION_FILE, encode_mrf_file(&[]).unwrap_or_default()).await {
+                warn!(
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    error = %e,
+                    "Failed to clear MRF recovery file after replay — entries may be replayed again on next restart"
+                );
+            }
+
+            if queued_count > 0 {
+                info!(
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    recovered = queued_count,
+                    total,
+                    "Recovered MRF entries from disk and queued for retry"
+                );
+            }
+        });
+        self.task_handles.lock().await.push(handle);
     }
 
-    /// Starts the MRF persister background task  
+    /// Starts the MRF persister — ongoing background task.
+    ///
+    /// Drains `mrf_save_rx` (entries that overflowed the normal worker channels) and
+    /// writes them to the on-disk MRF file every 10 seconds or when 1 000 entries
+    /// accumulate.  The file is overwritten (not appended) on each flush so it always
+    /// reflects the current pending backlog.
     async fn start_mrf_persister(&self) {
-        // This would start a background task to persist MRF entries to disk
-        // Implementation depends on the actual persistence logic
+        let Some(mut rx) = self.mrf_save_rx.lock().await.take() else {
+            return;
+        };
+        let storage = self.storage.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut pending: Vec<MrfReplicateEntry> = Vec::new();
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    entry = rx.recv() => match entry {
+                        Some(e) => {
+                            pending.push(e);
+                            if pending.len() >= 1000 {
+                                flush_mrf_to_disk(&pending, &storage).await;
+                                pending.clear();
+                            }
+                        }
+                        None => {
+                            // Channel closed (pool shutting down) — final flush.
+                            if !pending.is_empty() {
+                                flush_mrf_to_disk(&pending, &storage).await;
+                            }
+                            break;
+                        }
+                    },
+                    _ = interval.tick() => {
+                        if !pending.is_empty() {
+                            flush_mrf_to_disk(&pending, &storage).await;
+                            pending.clear();
+                        }
+                    }
+                }
+            }
+        });
+        self.task_handles.lock().await.push(handle);
     }
 
     /// Worker function for handling regular replication operations
@@ -1096,6 +1223,34 @@ impl<S: StorageAPI + NamespaceLocking> ReplicationPool<S> {
         }
 
         Ok(())
+    }
+}
+
+/// Encodes `entries` and overwrites the MRF persistence file.
+/// Errors are logged but not propagated; entries remain in the caller's buffer
+/// and the next flush will retry.
+async fn flush_mrf_to_disk<S: ObjectIO>(entries: &[MrfReplicateEntry], storage: &Arc<S>) {
+    match encode_mrf_file(entries) {
+        Ok(data) => {
+            if let Err(e) = save_config(storage.clone(), MRF_REPLICATION_FILE, data).await {
+                warn!(
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    count = entries.len(),
+                    error = %e,
+                    "Failed to flush MRF entries to disk"
+                );
+            }
+        }
+        Err(e) => {
+            warn!(
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                count = entries.len(),
+                error = %e,
+                "Failed to encode MRF entries for disk flush"
+            );
+        }
     }
 }
 

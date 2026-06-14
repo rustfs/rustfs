@@ -542,13 +542,15 @@ pub struct MrfReplicateEntry {
     #[serde(rename = "object")]
     pub object: String,
 
-    #[serde(skip_serializing, skip_deserializing)]
+    // Persisted so recovery after restart can replay the exact version.
+    // Old serialized files lack this key; `default` fills in None safely.
+    #[serde(rename = "versionID", skip_serializing_if = "Option::is_none", default)]
     pub version_id: Option<Uuid>,
 
     #[serde(rename = "retryCount")]
     pub retry_count: i32,
 
-    #[serde(skip_serializing, skip_deserializing)]
+    #[serde(rename = "size", default)]
     pub size: i64,
 }
 
