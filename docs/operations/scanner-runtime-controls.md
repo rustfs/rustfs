@@ -148,26 +148,32 @@ or heal admission.
 
 ## Reading Distributed Metrics
 
-`/rustfs/admin/v3/scanner/status` reports the local node's detailed scanner
-state. In distributed deployments, use the admin metrics stream with scanner
-metrics enabled to compare nodes and aggregate pressure:
+`/rustfs/admin/v3/scanner/status` and `/rustfs/admin/v3/metrics` report the
+node that handles the HTTP request. The metrics endpoint does not fan out to
+peer nodes. In distributed deployments, query every node explicitly and keep
+`by-host=true` enabled so each response includes that node's host view:
 
 ```bash
-awscurl \
-  --service s3 \
-  --region us-east-1 \
-  --access_key "$RUSTFS_ACCESS_KEY" \
-  --secret_key "$RUSTFS_SECRET_KEY" \
-  --request GET \
-  'http://127.0.0.1:9000/rustfs/admin/v3/metrics?types=1&by-host=true&n=1'
+for endpoint in http://node-a:9000 http://node-b:9000 http://node-c:9000; do
+  node="${endpoint#http://}"
+  node="${node%%:*}"
+  awscurl \
+    --service s3 \
+    --region us-east-1 \
+    --access_key "$RUSTFS_ACCESS_KEY" \
+    --secret_key "$RUSTFS_SECRET_KEY" \
+    --request GET \
+    "${endpoint}/rustfs/admin/v3/metrics?types=1&by-host=true&n=1" \
+    > "artifacts/scanner-metrics.${node}.$(date -u +%Y%m%dT%H%M%SZ).ndjson"
+done
 ```
 
 The `aggregated.scanner` payload preserves the same scanner progress,
 checkpoint, pacing, source work, and lifecycle transition fields used by the
-local scanner status. The `by_host.*.scanner` payload keeps the per-node view.
-Use the aggregate for cluster-wide pressure and the host view to find the node
-that owns an old active path, a partial checkpoint, or a downstream queue
-admission problem.
+local scanner status, but only for the node that returned the response. The
+`by_host.*.scanner` payload keeps that node's host view. Compare the per-node
+artifacts externally to find old active paths, partial checkpoints, pacing
+pressure, or downstream queue admission problems across the deployment.
 
 ## Reading Lifecycle Transition Status
 
