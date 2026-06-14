@@ -5,18 +5,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-server-storage-object-store-resolver`
-- Baseline: `upstream/main` at `9372ee70329d08ea7aafae8df84f6b1ecb5bd686`
-- PR type for this branch: `consumer-migration`
-- Runtime behavior changes: no external behavior change expected; server and
-  storage infra object-store lookups prefer the AppContext-owned object store
-  through the ECStore-owned resolver and keep the existing global fallback.
-- Rust code changes: migrate server readiness/module-switch and storage access,
-  ecfs extension, and node RPC object-store lookups to the ECStore-owned
-  resolver without touching app compatibility fallbacks or ECStore internal
-  background consumers.
+- Branch: `overtrue/arch-startup-service-bootstrap`
+- Baseline: `origin/main` at `b49057c8e3e0b1a0ed828912806ee67b49e404c4`
+- PR type for this branch: `pure-move`
+- Runtime behavior changes: no external behavior change expected; binary startup
+  still treats notification initialization failure as fatal, while embedded
+  startup still treats audit and notification failures as non-fatal warnings.
+- Rust code changes: centralize event notifier, audit startup, and notification
+  system bootstrap in `startup_services` helpers with caller-owned
+  logging/error policy, then use those helpers from binary and embedded
+  startup.
 - CI/script changes: none.
-- Docs changes: record `CTX-009` consumer migration scope and verification.
+- Docs changes: record `R-010` startup service bootstrap wrapper progress and
+  verification.
 
 ## Phase 0 Tasks
 
@@ -215,6 +216,33 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     storage access authorization checks, ecfs extension validation, node RPC
     metadata/storage-info/rebalance/tier reload behavior, and existing storage
     error paths.
+  - Verification: formatting, compile checks, migration guards, diff hygiene,
+    Rust risk scan, and full `make pre-commit`.
+- [x] `CTX-010` Migrate ECStore internal object-store consumers.
+  - Do: migrate ECStore internal/background object-store lookups to the
+    ECStore-owned resolver.
+  - Acceptance: ECStore metrics realtime, notification, tier config save,
+    decommission, admin server info, bucket metadata, replication decision,
+    lifecycle compensation/expiry, and data-usage cache consumers prefer the
+    AppContext-owned object store after context initialization and preserve the
+    existing global object-layer fallback.
+  - Must preserve: metrics collection, notification rebalance stop behavior,
+    tier config persistence, decommission startup, admin server info reporting,
+    bucket metadata persistence, replication decisions, lifecycle queueing, data
+    usage cache persistence, and existing storage error paths.
+  - Verification: formatting, compile checks, migration guards, diff hygiene,
+    Rust risk scan, and full `make pre-commit`.
+- [x] `CTX-011` Consolidate app usecase object-store fallback.
+  - Do: migrate app admin, bucket, multipart, and object usecases away from
+    direct `new_object_layer_fn` calls and through an explicit-context resolver
+    helper.
+  - Acceptance: usecase lookups keep their injected AppContext precedence,
+    preserve `without_context()` legacy global object-layer fallback semantics,
+    and avoid consulting the global AppContext when a usecase intentionally has
+    no context.
+  - Must preserve: admin storage/data-usage reads, bucket create/delete/list
+    behavior, multipart object writes, object API reads/writes, lifecycle
+    transition tests, and existing "Not init" error paths.
   - Verification: formatting, compile checks, migration guards, diff hygiene,
     Rust risk scan, and full `make pre-commit`.
 
@@ -521,52 +549,77 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: focused config reload and shutdown tests, compile checks,
     formatting, diff hygiene, and Rust risk scan.
 
+## Phase 9 Startup Bootstrap Tasks
+
+- [x] `R-009` Centralize startup IAM readiness publication bootstrap.
+  - Do: move the ReadyInline/Deferred readiness publication decision behind
+    `startup_iam::publish_ready_for_iam_bootstrap` and use it from binary and
+    embedded startup.
+  - Acceptance: inline IAM bootstrap still waits for runtime readiness and
+    updates service state, deferred IAM bootstrap does not publish readiness
+    from main or embedded startup, and embedded runtime readiness failures still
+    trigger embedded shutdown error mapping.
+  - Must preserve: startup ordering, IAM degraded recovery ownership,
+    `IamReady`/`FullReady` publication semantics, and embedded shutdown
+    behavior.
+  - Verification: focused startup IAM tests, binary/lib compile checks,
+    formatting, migration guards, Rust risk scan, and pre-commit quality gate.
+
+- [x] `R-010` Centralize startup optional service bootstrap.
+  - Do: move event notifier, audit startup, and notification system startup
+    behind `startup_services` helpers with caller-owned logging/error policy.
+  - Acceptance: binary still initializes the event notifier before audit, logs
+    audit start/failure through the same startup target, and treats notification
+    init failure as fatal; embedded still treats audit and notification failures
+    as non-fatal warnings.
+  - Must preserve: startup order, audit non-fatal behavior, notification fatal
+    boundary in binary, embedded warn-and-continue behavior, and event notifier
+    initialization.
+  - Verification: focused startup service tests, binary/lib compile checks,
+    formatting, migration guards, Rust risk scan, and pre-commit quality gate.
+
 ## Next PRs
 
-1. `consumer-migration`: review app compatibility fallback call sites and
-   ECStore internal background consumers before the final global-accessor
-   cleanup phase.
-2. `pure-move`: start `R-009` boot wrapper with the IAM degraded readiness
-   contract covered.
+1. `pure-move`: continue extracting startup boot wrappers in larger slices while
+   preserving startup order and readiness ownership.
+2. `ci-gate`: finish `G-006` public re-export and storage trait coverage checks
+   before the remaining cleanup slices.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Single consumer-migration slice; server/storage infra consumers use the ECStore-owned resolver without widening application-layer dependencies or changing ECStore internals. |
-| Migration preservation | passed | Readiness, module-switch, storage access, ecfs extension, and node RPC call sites keep the same error paths while preferring the AppContext-owned store when installed. |
-| Testing/verification | passed | Formatting, compile check, diff hygiene, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Pure-move slice centralizes optional startup service bootstrap while keeping caller-specific logging and error policy at the binary and embedded boundaries. |
+| Migration preservation | passed | Binary keeps notification init fatal, embedded keeps audit and notification failures warn-and-continue, and event notifier still starts before audit. |
+| Testing/verification | passed | Focused startup service tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `9372ee70329d08ea7aafae8df84f6b1ecb5bd686`:
+Passed on `b49057c8e3e0b1a0ed828912806ee67b49e404c4`:
 
-- `cargo fmt --all --check`.
+- `cargo test -p rustfs startup_services --no-fail-fast`.
+- `cargo check -p rustfs --bin rustfs`.
 - `cargo check -p rustfs --lib`.
+- `cargo fmt --all --check`.
 - `git diff --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - `git rev-list --left-right --count HEAD...origin/main` returned `0 0`.
-- Rust risk scan for changed Rust files; full-file matches were existing tests,
-  existing relaxed counters, existing numeric casts, and existing string error
-  signatures, and the added-line scan returned no `unwrap`/`expect`, numeric
-  cast, string error, boxed error, print macro, or relaxed-ordering match.
-- `make pre-commit`; all checks passed, including nextest 5954 passed and 111
-  skipped, plus doctests.
+- Rust risk scan for changed Rust files: full-file matches were existing docs
+  examples, existing startup error output, and existing startup imports; added
+  lines introduced no unwrap/expect, numeric cast, string error, boxed error,
+  print macro, relaxed-ordering, or unsafe match.
+- `make pre-commit`: all checks passed, including nextest with 5969 passed and
+  111 skipped, plus doctests.
 
 Notes:
 
-- This slice migrates server readiness/module-switch and storage access, ecfs
-  extension, and node RPC object-store lookups to the ECStore-owned resolver.
-- App compatibility fallback call sites remain on `new_object_layer_fn` as an
-  explicit fallback path.
-- ECStore internal background consumers remain on the old global accessor for a
-  separate review.
+- This slice centralizes startup optional service bootstrap without moving
+  logging or error-policy ownership out of binary and embedded startup.
+- Binary and embedded keep their existing notification failure semantics.
 
 ## Handoff Notes
 
-- CTX-009 is complete.
-- App compatibility fallback call sites remain on `new_object_layer_fn` as an
-  explicit fallback path.
-- ECStore internal background consumers should be reviewed separately before
-  changing their global accessor behavior.
+- R-010 is complete.
+- Next startup slices can be larger pure moves, but must keep startup ordering,
+  fatal/non-fatal boundaries, and readiness ownership explicit in tests.

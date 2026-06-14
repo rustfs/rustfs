@@ -18,7 +18,7 @@ use crate::global::{GLOBAL_BOOT_TIME, get_global_endpoints};
 use crate::metrics_realtime::{CollectMetricsOpts, MetricType};
 use crate::rebalance::RebalSaveOpt;
 use crate::rpc::PeerRestClient;
-use crate::{endpoints::EndpointServerPools, new_object_layer_fn};
+use crate::{endpoints::EndpointServerPools, resolve_object_store_handle};
 use futures::future::join_all;
 use lazy_static::lazy_static;
 use rustfs_madmin::health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConfig, SysErrors, SysServices};
@@ -520,7 +520,7 @@ impl NotificationSys {
 
     pub async fn stop_rebalance(&self) -> Result<()> {
         warn!("notification stop_rebalance start");
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             error!("stop_rebalance: not init");
             return Err(Error::other("stop_rebalance: object layer not initialized"));
         };

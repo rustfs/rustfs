@@ -64,6 +64,7 @@ const LOG_COMPONENT_OBS: &str = "obs";
 const LOG_SUBSYSTEM_LOCAL_LOGGING: &str = "local_logging";
 const EVENT_LOCAL_LOGGING_STATE: &str = "local_logging_state";
 const EVENT_LOG_CLEANER_STATE: &str = "log_cleaner_state";
+const STDERR_WARNING_PREFIX: &str = "[WARN]";
 
 pub(super) fn build_json_log_layer<S, W>(writer: W, enable_ansi: bool, span_events: FmtSpan) -> impl tracing_subscriber::Layer<S>
 where
@@ -361,19 +362,29 @@ pub(super) fn should_fallback_to_stdout(error: &TelemetryError) -> bool {
     }
 }
 
+fn format_file_logging_fallback_warning(log_directory: &str, error: &TelemetryError) -> String {
+    format!(
+        "{STDERR_WARNING_PREFIX} local logging fallback to stdout: failed_sink=file sink=stdout log_directory={log_directory} error={error}"
+    )
+}
+
 pub(super) fn emit_file_logging_fallback_warning(log_directory: &str, error: &TelemetryError) {
-    warn!(
-        event = EVENT_LOCAL_LOGGING_STATE,
-        component = LOG_COMPONENT_OBS,
-        subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
-        state = "fallback_to_stdout",
-        backend = "local",
-        failed_sink = "file",
-        sink = "stdout",
-        log_directory,
-        error = %error,
-        "local logging state changed"
-    );
+    if tracing::dispatcher::has_been_set() {
+        warn!(
+            event = EVENT_LOCAL_LOGGING_STATE,
+            component = LOG_COMPONENT_OBS,
+            subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
+            state = "fallback_to_stdout",
+            backend = "local",
+            failed_sink = "file",
+            sink = "stdout",
+            log_directory,
+            error = %error,
+            "local logging state changed"
+        );
+    } else {
+        eprintln!("{}", format_file_logging_fallback_warning(log_directory, error));
+    }
 }
 
 // ─── Cleanup task ─────────────────────────────────────────────────────────────
@@ -629,6 +640,19 @@ mod tests {
         assert!(!should_fallback_to_stdout(&TelemetryError::Io(
             "No such file or directory (os error 2)".to_string()
         )));
+    }
+
+    #[test]
+    fn test_file_logging_fallback_warning_message_is_actionable() {
+        let message = format_file_logging_fallback_warning(
+            "/var/log/rustfs",
+            &TelemetryError::Io("Permission denied (os error 13)".to_string()),
+        );
+
+        assert!(message.starts_with(STDERR_WARNING_PREFIX));
+        assert!(message.contains("fallback to stdout"));
+        assert!(message.contains("log_directory=/var/log/rustfs"));
+        assert!(message.contains("Permission denied"));
     }
 
     #[test]

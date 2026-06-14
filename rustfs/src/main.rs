@@ -30,11 +30,11 @@ use futures_util::future::join_all;
 use rustfs::capacity::capacity_integration::init_capacity_management;
 use rustfs::license::{init_license, license_status};
 use rustfs::server::{
-    ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
-    start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
+    ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, shutdown_event_notifier, start_http_server,
+    stop_audit_system, wait_for_shutdown,
 };
 use rustfs::startup_fs_guard::enforce_unsupported_fs_policy;
-use rustfs::startup_iam::{IamBootstrapDisposition, bootstrap_or_defer_iam_init};
+use rustfs::startup_iam::{bootstrap_or_defer_iam_init, publish_ready_for_iam_bootstrap};
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
@@ -45,7 +45,6 @@ use rustfs_ecstore::{
     config as ecconfig,
     endpoints::EndpointServerPools,
     global::{set_global_rustfs_port, shutdown_background_services},
-    notification_sys::new_global_notification_sys,
     set_global_endpoints,
     store::ECStore,
     store::init_local_disks,
@@ -111,6 +110,7 @@ const EVENT_BACKGROUND_SERVICE_SHUTDOWN: &str = "background_service_shutdown";
 const EVENT_EVENT_NOTIFIER_SHUTDOWN: &str = "event_notifier_shutdown";
 const EVENT_PROFILING_SHUTDOWN: &str = "profiling_shutdown";
 const EVENT_SERVER_SHUTDOWN_STATE: &str = "server_shutdown_state";
+const OBSERVABILITY_INIT_FATAL_ALREADY_REPORTED: &str = "observability initialization failure already reported";
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -132,8 +132,10 @@ fn main() {
     let runtime = rustfs::server::build_tokio_runtime().expect("Failed to build Tokio runtime");
     let result = runtime.block_on(async_main());
     if let Err(ref e) = result {
-        // Tracing may not be initialized when startup fails this early.
-        emit_fatal_stderr("Server runtime failed", e);
+        if e.to_string() != OBSERVABILITY_INIT_FATAL_ALREADY_REPORTED {
+            // Tracing may not be initialized when startup fails this early.
+            emit_fatal_stderr("Server runtime failed", e);
+        }
         std::process::exit(1);
     }
 }
@@ -193,7 +195,7 @@ async fn async_main() -> Result<()> {
         Err(e) => {
             // Structured logging is unavailable until observability initializes.
             emit_fatal_stderr("Observability initialization failed", &e);
-            return Err(Error::other(e));
+            return Err(Error::other(OBSERVABILITY_INIT_FATAL_ALREADY_REPORTED));
         }
     };
 
@@ -775,12 +777,8 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     // Initialize buffer profiling system
     init_buffer_profile_system(&config);
 
-    // Initialize event notifier
-    init_event_notifier().await;
-
-    // Start the audit system
-    match start_audit_system().await {
-        Ok(_) => info!(
+    match rustfs::startup_services::init_event_notifier_and_audit().await {
+        Ok(()) => info!(
             target: "rustfs::main::run",
             event = EVENT_AUDIT_SYSTEM_STATE,
             component = LOG_COMPONENT_MAIN,
@@ -890,17 +888,18 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 
     add_bucket_notification_configuration(buckets.clone()).await;
 
-    // Initialize the global notification system
-    new_global_notification_sys(endpoint_pools.clone()).await.map_err(|err| {
-        error!(
-            event = EVENT_NOTIFICATION_SYSTEM_INITIALIZATION_FAILED,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            error = ?err,
-            "Failed to initialize notification system"
-        );
-        Error::other(err)
-    })?;
+    rustfs::startup_services::init_notification_system(endpoint_pools.clone())
+        .await
+        .map_err(|err| {
+            error!(
+                event = EVENT_NOTIFICATION_SYSTEM_INITIALIZATION_FAILED,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                error = ?err,
+                "Failed to initialize notification system"
+            );
+            Error::other(err)
+        })?;
 
     // Create a cancellation token for AHM services
     let _ = create_ahm_services_cancel_token();
@@ -965,9 +964,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
         iam_bootstrap = ?iam_bootstrap,
         "RustFS server ready"
     );
-    if iam_bootstrap == IamBootstrapDisposition::ReadyInline {
-        rustfs::server::publish_ready_when_runtime_ready(readiness.as_ref(), Some(state_manager.as_ref())).await?;
-    }
+    publish_ready_for_iam_bootstrap(iam_bootstrap, readiness.as_ref(), Some(state_manager.as_ref())).await?;
     // Set the global RustFS initialization time to now
     rustfs_common::set_global_init_time_now().await;
 

@@ -17,7 +17,9 @@
 use crate::admin::handlers::site_replication::{
     site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
 };
-use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
+use crate::app::context::{
+    AppContext, default_notify_interface, get_global_app_context, resolve_object_store_handle_for_context,
+};
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
@@ -53,7 +55,6 @@ use rustfs_ecstore::bucket::{
 };
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::notification_sys::get_global_notification_sys;
 use rustfs_ecstore::store::ECStore;
 use rustfs_ecstore::store_api::{BucketOperations, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations, ObjectInfo};
@@ -740,10 +741,7 @@ impl DefaultBucketUsecase {
     }
 
     fn object_store(&self) -> Option<Arc<ECStore>> {
-        self.context
-            .as_ref()
-            .map(|context| context.object_store())
-            .or_else(new_object_layer_fn)
+        resolve_object_store_handle_for_context(self.context.as_deref())
     }
 
     #[instrument(

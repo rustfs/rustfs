@@ -35,7 +35,7 @@ use crate::set_disk::get_lock_acquire_timeout;
 use crate::store_api::{
     DeletedObject, HTTPRangeSpec, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOptions, ObjectToDelete, WalkOptions,
 };
-use crate::{StorageAPI, new_object_layer_fn};
+use crate::{StorageAPI, resolve_object_store_handle};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
 use aws_sdk_s3::primitives::ByteStream;
@@ -1580,7 +1580,7 @@ impl ObjectInfoExt for ObjectInfo {
 }
 
 pub async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOptions) -> ReplicateDecision {
-    if new_object_layer_fn().is_none() {
+    if resolve_object_store_handle().is_none() {
         return ReplicateDecision::default();
     }
 

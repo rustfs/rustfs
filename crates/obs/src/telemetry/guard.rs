@@ -47,6 +47,11 @@ pub(crate) type MemoryProfilingAgent = ();
 const LOG_COMPONENT_OBS: &str = "obs";
 const LOG_SUBSYSTEM_GUARD: &str = "guard";
 const EVENT_OBS_GUARD_SHUTDOWN: &str = "obs_guard_shutdown";
+const STDERR_ERROR_PREFIX: &str = "[ERROR]";
+
+fn format_guard_shutdown_stderr_message(resource: &str, error: impl std::fmt::Display) -> String {
+    format!("{STDERR_ERROR_PREFIX} observability guard shutdown failed: resource={resource} error={error}")
+}
 
 /// RAII guard that owns all active OpenTelemetry providers and the
 /// `tracing_appender` worker guard.
@@ -96,43 +101,37 @@ impl Drop for OtelGuard {
         if let Some(provider) = self.tracer_provider.take()
             && let Err(err) = provider.shutdown()
         {
-            error!(
-                event = EVENT_OBS_GUARD_SHUTDOWN,
-                component = LOG_COMPONENT_OBS,
-                subsystem = LOG_SUBSYSTEM_GUARD,
-                resource = "tracer_provider",
-                result = "shutdown_failed",
-                error = ?err,
-                "observability guard shutdown failed"
-            );
+            if tracing::dispatcher::has_been_set() {
+                error!(
+                    event = EVENT_OBS_GUARD_SHUTDOWN,
+                    component = LOG_COMPONENT_OBS,
+                    subsystem = LOG_SUBSYSTEM_GUARD,
+                    resource = "tracer_provider",
+                    result = "shutdown_failed",
+                    error = %err,
+                    "observability guard shutdown failed"
+                );
+            } else {
+                eprintln!("{}", format_guard_shutdown_stderr_message("tracer_provider", err));
+            }
         }
 
         if let Some(provider) = self.meter_provider.take()
             && let Err(err) = provider.shutdown()
         {
-            error!(
-                event = EVENT_OBS_GUARD_SHUTDOWN,
-                component = LOG_COMPONENT_OBS,
-                subsystem = LOG_SUBSYSTEM_GUARD,
-                resource = "meter_provider",
-                result = "shutdown_failed",
-                error = ?err,
-                "observability guard shutdown failed"
-            );
-        }
-
-        if let Some(provider) = self.logger_provider.take()
-            && let Err(err) = provider.shutdown()
-        {
-            error!(
-                event = EVENT_OBS_GUARD_SHUTDOWN,
-                component = LOG_COMPONENT_OBS,
-                subsystem = LOG_SUBSYSTEM_GUARD,
-                resource = "logger_provider",
-                result = "shutdown_failed",
-                error = ?err,
-                "observability guard shutdown failed"
-            );
+            if tracing::dispatcher::has_been_set() {
+                error!(
+                    event = EVENT_OBS_GUARD_SHUTDOWN,
+                    component = LOG_COMPONENT_OBS,
+                    subsystem = LOG_SUBSYSTEM_GUARD,
+                    resource = "meter_provider",
+                    result = "shutdown_failed",
+                    error = %err,
+                    "observability guard shutdown failed"
+                );
+            } else {
+                eprintln!("{}", format_guard_shutdown_stderr_message("meter_provider", err));
+            }
         }
 
         #[cfg(all(
@@ -141,15 +140,21 @@ impl Drop for OtelGuard {
         ))]
         if let Some(agent) = self.profiling_agent.take() {
             match agent.stop() {
-                Err(err) => error!(
-                    event = EVENT_OBS_GUARD_SHUTDOWN,
-                    component = LOG_COMPONENT_OBS,
-                    subsystem = LOG_SUBSYSTEM_GUARD,
-                    resource = "profiling_agent",
-                    result = "shutdown_failed",
-                    error = ?err,
-                    "observability guard shutdown failed"
-                ),
+                Err(err) => {
+                    if tracing::dispatcher::has_been_set() {
+                        error!(
+                            event = EVENT_OBS_GUARD_SHUTDOWN,
+                            component = LOG_COMPONENT_OBS,
+                            subsystem = LOG_SUBSYSTEM_GUARD,
+                            resource = "profiling_agent",
+                            result = "shutdown_failed",
+                            error = %err,
+                            "observability guard shutdown failed"
+                        );
+                    } else {
+                        eprintln!("{}", format_guard_shutdown_stderr_message("profiling_agent", err));
+                    }
+                }
                 Ok(stopped) => {
                     stopped.shutdown();
                 }
@@ -159,15 +164,21 @@ impl Drop for OtelGuard {
         #[cfg(all(feature = "pyroscope", target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
         if let Some(agent) = self.memory_profiling_agent.take() {
             match agent.stop() {
-                Err(err) => error!(
-                    event = EVENT_OBS_GUARD_SHUTDOWN,
-                    component = LOG_COMPONENT_OBS,
-                    subsystem = LOG_SUBSYSTEM_GUARD,
-                    resource = "memory_profiling_agent",
-                    result = "shutdown_failed",
-                    error = ?err,
-                    "observability guard shutdown failed"
-                ),
+                Err(err) => {
+                    if tracing::dispatcher::has_been_set() {
+                        error!(
+                            event = EVENT_OBS_GUARD_SHUTDOWN,
+                            component = LOG_COMPONENT_OBS,
+                            subsystem = LOG_SUBSYSTEM_GUARD,
+                            resource = "memory_profiling_agent",
+                            result = "shutdown_failed",
+                            error = %err,
+                            "observability guard shutdown failed"
+                        );
+                    } else {
+                        eprintln!("{}", format_guard_shutdown_stderr_message("memory_profiling_agent", err));
+                    }
+                }
                 Ok(stopped) => {
                     stopped.shutdown();
                 }
@@ -184,6 +195,15 @@ impl Drop for OtelGuard {
                 "observability guard resource shutdown requested"
             );
             handle.abort();
+        }
+
+        if let Some(provider) = self.logger_provider.take()
+            && let Err(err) = provider.shutdown()
+        {
+            // After logger shutdown, the OTLP log bridge is no longer a reliable
+            // sink for its own failure path, so fall back to stderr.
+            // resource = "logger_provider"
+            eprintln!("{}", format_guard_shutdown_stderr_message("logger_provider", err));
         }
 
         if let Some(guard) = self.tracing_guard.take() {
@@ -209,5 +229,19 @@ impl Drop for OtelGuard {
             );
             drop(guard);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_guard_shutdown_stderr_message_is_actionable() {
+        let message = format_guard_shutdown_stderr_message("logger_provider", "flush failed");
+
+        assert!(message.starts_with(STDERR_ERROR_PREFIX));
+        assert!(message.contains("resource=logger_provider"));
+        assert!(message.contains("error=flush failed"));
     }
 }

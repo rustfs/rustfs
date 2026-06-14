@@ -14,7 +14,7 @@
 
 //! Admin application use-case contracts.
 
-use crate::app::context::{AppContext, get_global_app_context};
+use crate::app::context::{AppContext, get_global_app_context, resolve_object_store_handle_for_context};
 use crate::capacity::resolve_admin_used_capacity;
 use crate::error::ApiError;
 use crate::server::{DependencyReadiness, collect_dependency_readiness as collect_runtime_dependency_readiness};
@@ -22,7 +22,6 @@ use rustfs_data_usage::DataUsageInfo;
 use rustfs_ecstore::admin_server_info::get_server_info;
 use rustfs_ecstore::data_usage::{apply_bucket_usage_memory_overlay, load_data_usage_from_backend};
 use rustfs_ecstore::endpoints::EndpointServerPools;
-use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::pools::{PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free};
 use rustfs_ecstore::store::ECStore;
 use rustfs_madmin::{InfoMessage, StorageInfo};
@@ -104,10 +103,7 @@ impl DefaultAdminUsecase {
     }
 
     fn object_store(&self) -> Option<Arc<ECStore>> {
-        self.context
-            .as_ref()
-            .map(|context| context.object_store())
-            .or_else(new_object_layer_fn)
+        resolve_object_store_handle_for_context(self.context.as_deref())
     }
 
     fn app_error(code: S3ErrorCode, message: impl Into<String>) -> ApiError {
