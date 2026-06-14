@@ -56,7 +56,7 @@ use super::container::ContainerMapper;
 use super::object::{ObjectKeyMapper, head_object};
 use super::{SwiftError, SwiftResult};
 use rustfs_credentials::Credentials;
-use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::resolve_object_store_handle;
 use rustfs_ecstore::store_api::{ListOperations, ObjectOperations, ObjectOptions};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error};
@@ -197,7 +197,7 @@ pub async fn archive_current_version(
     let version_key = ObjectKeyMapper::swift_to_s3_key(&version_name)?;
 
     // Get storage layer
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -340,7 +340,7 @@ pub async fn restore_previous_version(
     let version_key = ObjectKeyMapper::swift_to_s3_key(newest_version)?;
 
     // Get storage layer
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -476,7 +476,7 @@ pub async fn list_object_versions(
     let archive_bucket = mapper.swift_to_s3_bucket(archive_container, &project_id);
 
     // Get storage layer
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 

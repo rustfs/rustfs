@@ -20,7 +20,7 @@ use super::account::validate_account_access;
 use super::types::Container;
 use super::{SwiftError, SwiftResult};
 use rustfs_credentials::Credentials;
-use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::resolve_object_store_handle;
 use rustfs_ecstore::store_api::{BucketOperations, ListOperations};
 use rustfs_storage_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
 use s3s::dto::{Tag, Tagging};
@@ -242,7 +242,7 @@ pub async fn list_containers(account: &str, credentials: &Credentials) -> SwiftR
     let mapper = ContainerMapper::default();
 
     // Get storage layer
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -300,7 +300,7 @@ pub async fn create_container(account: &str, container: &str, credentials: &Cred
     let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
 
     // Get storage layer
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -394,7 +394,7 @@ pub async fn get_container_metadata(account: &str, container: &str, credentials:
     let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
 
     // Get storage layer
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -471,7 +471,7 @@ pub async fn update_container_metadata(
     let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
 
     // Get storage layer
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -570,7 +570,7 @@ pub async fn delete_container(account: &str, container: &str, credentials: &Cred
     let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
 
     // Get storage layer
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -658,7 +658,7 @@ pub async fn list_objects(
     let bucket = mapper.swift_to_s3_bucket(container, &project_id);
 
     // Get storage layer
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -768,7 +768,7 @@ pub async fn enable_versioning(
     let archive_bucket_name = mapper.swift_to_s3_bucket(archive_container, &project_id);
 
     // Get storage layer
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -864,7 +864,7 @@ pub async fn disable_versioning(account: &str, container: &str, credentials: &Cr
     let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
 
     // Verify container exists
-    let Some(_store) = new_object_layer_fn() else {
+    let Some(_store) = resolve_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -1015,7 +1015,7 @@ pub async fn set_container_acl(
     let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
 
     // Get storage layer
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 

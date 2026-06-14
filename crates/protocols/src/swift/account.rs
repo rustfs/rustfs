@@ -16,7 +16,7 @@
 
 use super::{SwiftError, SwiftResult};
 use rustfs_credentials::Credentials;
-use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::resolve_object_store_handle;
 use rustfs_ecstore::store_api::BucketOperations;
 use rustfs_storage_api::MakeBucketOptions;
 use s3s::dto::{Tag, Tagging};
@@ -160,7 +160,7 @@ pub async fn update_account_metadata(
 ) -> SwiftResult<()> {
     let bucket_name = get_account_metadata_bucket_name(account);
 
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
