@@ -188,7 +188,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                 peer = %self.session_context.source_ip,
                 user = %MaskedAccessKey(&self.session_context.principal.user_identity.credentials.access_key),
                 result = "read_only_rejected",
-                "sftp driver state changed"
+                "SFTP write rejected by read-only mode"
             );
             return Err(SftpError::code(StatusCode::PermissionDenied));
         }
@@ -250,7 +250,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                     op = op,
                     timeout_secs = self.backend_op_timeout_secs,
                     result = "timeout",
-                    "sftp backend state changed"
+                    "SFTP backend operation timed out"
                 );
                 Err(SftpError::code(StatusCode::Failure))
             }

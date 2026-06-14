@@ -39,6 +39,10 @@ use time::OffsetDateTime;
 use tracing::{error, info, warn};
 use url::Url;
 
+const LOG_COMPONENT_ADMIN: &str = "admin";
+const LOG_SUBSYSTEM_OIDC: &str = "oidc";
+const EVENT_ADMIN_OIDC_STATE: &str = "admin_oidc_state";
+
 const OIDC_PUBLIC_PROVIDERS_SUFFIX: &str = "/v3/oidc/providers";
 const OIDC_AUTHORIZE_SUFFIX: &str = "/v3/oidc/authorize/";
 const OIDC_CALLBACK_SUFFIX: &str = "/v3/oidc/callback/";
@@ -448,7 +452,14 @@ impl Operation for OidcAuthorizeHandler {
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("authorize failed: {e}")))?;
 
-        info!("OIDC authorize redirect for provider '{}' to IdP", provider_id);
+        info!(
+            event = EVENT_ADMIN_OIDC_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_OIDC,
+            provider_id = %provider_id,
+            state = "authorize_redirect",
+            "admin oidc state"
+        );
 
         // Return 302 redirect
         let mut resp = S3Response::new((StatusCode::FOUND, Body::empty()));
@@ -486,7 +497,15 @@ impl Operation for OidcCallbackHandler {
         // Check for error response from IdP
         if let Some(error) = extract_query_param(&req.uri, "error") {
             let desc = extract_query_param(&req.uri, "error_description").unwrap_or_default();
-            warn!("OIDC callback received error from IdP: {} - {}", error, desc);
+            warn!(
+                event = EVENT_ADMIN_OIDC_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_OIDC,
+                result = "idp_callback_error",
+                error_code = %error,
+                error_description = %desc,
+                "admin oidc state"
+            );
             return Err(S3Error::with_message(
                 S3ErrorCode::AccessDenied,
                 format!("OIDC authentication failed: {error} - {desc}"),
@@ -500,21 +519,42 @@ impl Operation for OidcCallbackHandler {
         // Exchange authorization code for tokens and extract claims
         let (claims, actual_provider_id, session, id_token) =
             oidc_sys.exchange_code(&state, &code, &redirect_uri).await.map_err(|e| {
-                error!("OIDC code exchange failed: {}", e);
+                error!(
+                    event = EVENT_ADMIN_OIDC_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
+                    result = "code_exchange_failed",
+                    error = %e,
+                    "admin oidc state"
+                );
                 S3Error::with_message(S3ErrorCode::AccessDenied, format!("code exchange failed: {e}"))
             })?;
 
         info!(
-            "OIDC login successful: username='{}', email='{}', sub='{}' (provider: {})",
-            claims.username, claims.email, claims.sub, actual_provider_id
+            event = EVENT_ADMIN_OIDC_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_OIDC,
+            provider_id = %actual_provider_id,
+            username = %claims.username,
+            email = %claims.email,
+            subject = %claims.sub,
+            state = "authentication_succeeded",
+            "admin oidc state"
         );
 
         // Map claims to policies and groups
         let (policies, groups) = oidc_sys.map_claims_to_policies(&actual_provider_id, &claims);
 
         info!(
-            "OIDC claim mapping: user='{}', policies={:?}, groups={:?}",
-            claims.username, policies, groups
+            event = EVENT_ADMIN_OIDC_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_OIDC,
+            provider_id = %actual_provider_id,
+            username = %claims.username,
+            policy_count = policies.len(),
+            group_count = groups.len(),
+            state = "claims_mapped",
+            "admin oidc state"
         );
 
         // Generate STS credentials using the shared helper.
@@ -568,7 +608,14 @@ impl Operation for OidcLogoutHandler {
                 Ok(Some(url)) => url,
                 Ok(None) => fallback_location.clone(),
                 Err(err) => {
-                    warn!("OIDC logout fallback triggered: {}", err);
+                    warn!(
+                        event = EVENT_ADMIN_OIDC_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_OIDC,
+                        result = "logout_fallback_triggered",
+                        error = %err,
+                        "admin oidc state"
+                    );
                     fallback_location.clone()
                 }
             },

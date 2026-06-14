@@ -423,7 +423,7 @@ where
                         bucket = %bucket,
                         object = %key,
                         file_size,
-                        "webdav object write state changed"
+                        "WebDAV object flush completed"
                     );
                     // Buffer already cleared by std::mem::take above
                     Ok(())
@@ -438,7 +438,7 @@ where
                         object = %key,
                         file_size,
                         error = %e,
-                        "webdav object write state changed"
+                        "WebDAV object flush failed"
                     );
                     Err(FsError::GeneralFailure)
                 }
@@ -1219,7 +1219,7 @@ where
                             result = "not_found",
                             bucket = %bucket,
                             error = %e,
-                            "webdav bucket metadata state changed"
+                            "WebDAV bucket metadata listed"
                         );
                         Err(FsError::NotFound)
                     }
@@ -1279,7 +1279,7 @@ where
                             state = "created",
                             bucket = %bucket,
                             object = %dir_key,
-                            "webdav directory state changed"
+                            "WebDAV directory marker created"
                         );
                         return Ok(());
                     }
@@ -1292,7 +1292,7 @@ where
                             bucket = %bucket,
                             object = %dir_key,
                             error = %e,
-                            "webdav directory state changed"
+                            "WebDAV directory marker create failed"
                         );
                         return Err(FsError::GeneralFailure);
                     }
@@ -1320,7 +1320,7 @@ where
                         subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
                         state = "bucket_created",
                         bucket = %bucket,
-                        "webdav directory state changed"
+                        "WebDAV bucket created"
                     );
                     Ok(())
                 }
@@ -1332,7 +1332,7 @@ where
                         state = "bucket_create_failed",
                         bucket = %bucket,
                         error = %e,
-                        "webdav directory state changed"
+                        "WebDAV bucket create failed"
                     );
                     Err(FsError::GeneralFailure)
                 }
@@ -1465,7 +1465,7 @@ where
                         state = "deleted",
                         bucket = %bucket,
                         object = %key,
-                        "webdav object delete state changed"
+                        "WebDAV object deleted"
                     );
                     Ok(())
                 }
@@ -1478,7 +1478,7 @@ where
                         bucket = %bucket,
                         object = %key,
                         error = %e,
-                        "webdav object delete state changed"
+                        "WebDAV object delete failed"
                     );
                     Err(FsError::GeneralFailure)
                 }
@@ -1529,7 +1529,7 @@ where
                                 dst_bucket = %dst_bucket,
                                 dst_object = %dst_key,
                                 error = %e,
-                                "webdav rename state changed"
+                                "WebDAV rename source delete failed"
                             );
                             FsError::GeneralFailure
                         })?;
@@ -1543,7 +1543,7 @@ where
                         src_object = %src_key,
                         dst_bucket = %dst_bucket,
                         dst_object = %dst_key,
-                        "webdav rename state changed"
+                        "WebDAV file renamed"
                     );
                     return Ok(());
                 }
@@ -1603,7 +1603,7 @@ where
                             dst_bucket = %dst_bucket,
                             dst_prefix = %dst_prefix,
                             error = %e,
-                            "webdav rename state changed"
+                            "WebDAV rename directory listing failed"
                         );
                         FsError::GeneralFailure
                     })?;
@@ -1652,7 +1652,7 @@ where
                     src_object = %src_key,
                     dst_bucket = %dst_bucket,
                     dst_object = %dst_key,
-                    "webdav rename state changed"
+                    "WebDAV rename source not found"
                 );
                 return Err(FsError::NotFound);
             }
@@ -1666,7 +1666,7 @@ where
                 src_object = %src_key,
                 dst_bucket = %dst_bucket,
                 dst_object = %dst_key,
-                "webdav rename state changed"
+                "WebDAV directory renamed"
             );
             Ok(())
         }

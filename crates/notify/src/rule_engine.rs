@@ -69,7 +69,7 @@ impl NotifyRuleEngine {
             bucket = %bucket,
             state = "updated",
             event_count,
-            "Updated bucket notification rules"
+            "notify bucket rules state"
         );
     }
 
@@ -85,7 +85,7 @@ impl NotifyRuleEngine {
                 subsystem = LOG_SUBSYSTEM_RULE_ENGINE,
                 bucket = %bucket,
                 state = "removed",
-                "Removed bucket notification rules"
+                "notify bucket rules state"
             );
         }
     }

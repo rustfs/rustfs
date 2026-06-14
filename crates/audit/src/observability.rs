@@ -160,7 +160,7 @@ impl AuditMetrics {
             component = LOG_COMPONENT_AUDIT,
             subsystem = LOG_SUBSYSTEM_OBSERVABILITY,
             state = "config_reloaded",
-            "Audit observability state updated"
+            "audit observability state"
         );
     }
 
@@ -173,7 +173,7 @@ impl AuditMetrics {
             component = LOG_COMPONENT_AUDIT,
             subsystem = LOG_SUBSYSTEM_OBSERVABILITY,
             state = "system_started",
-            "Audit observability state updated"
+            "audit observability state"
         );
     }
 
@@ -249,7 +249,7 @@ impl AuditMetrics {
             component = LOG_COMPONENT_AUDIT,
             subsystem = LOG_SUBSYSTEM_OBSERVABILITY,
             state = "metrics_reset",
-            "Audit observability state updated"
+            "audit observability state"
         );
     }
 

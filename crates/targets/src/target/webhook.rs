@@ -45,6 +45,11 @@ use std::{
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, instrument, warn};
 
+const LOG_COMPONENT_TARGETS: &str = "targets";
+const LOG_SUBSYSTEM_WEBHOOK: &str = "webhook";
+const EVENT_WEBHOOK_TARGET_STATE: &str = "webhook_target_state";
+const EVENT_WEBHOOK_DELIVERY_STATE: &str = "webhook_delivery_state";
+
 /// Arguments for configuring a Webhook target
 #[derive(Clone)]
 pub struct WebhookArgs {
@@ -190,7 +195,14 @@ where
 
         // Create a cancel channel
         let (cancel_sender, _) = mpsc::channel(1);
-        info!(target_id = %target_id.id, "Webhook target created");
+        info!(
+            event = EVENT_WEBHOOK_TARGET_STATE,
+            component = LOG_COMPONENT_TARGETS,
+            subsystem = LOG_SUBSYSTEM_WEBHOOK,
+            target_id = %target_id.id,
+            state = "created",
+            "webhook target state"
+        );
         Ok(WebhookTarget::<E> {
             id: target_id,
             args,
@@ -220,8 +232,13 @@ where
             // DANGEROUS: For testing only, skip all certificate verification
             client_builder = client_builder.danger_accept_invalid_certs(true);
             warn!(
-                "Webhook target '{}' is configured to skip TLS verification. This is insecure and should not be used in production.",
-                args.endpoint
+                event = EVENT_WEBHOOK_TARGET_STATE,
+                component = LOG_COMPONENT_TARGETS,
+                subsystem = LOG_SUBSYSTEM_WEBHOOK,
+                endpoint = %args.endpoint,
+                state = "tls_verification_skipped",
+                fallback = "danger_accept_invalid_certs",
+                "webhook target state"
             );
         } else if !args.client_ca.is_empty() {
             // Use user-provided custom CA certificate
@@ -301,10 +318,14 @@ where
         match tokio::time::timeout(Duration::from_secs(5), client.head(health_check_url.as_str()).send()).await {
             Ok(Ok(resp)) => {
                 debug!(
-                    target = %self.id,
+                    event = EVENT_WEBHOOK_TARGET_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_WEBHOOK,
+                    target_id = %self.id,
                     status = %resp.status(),
                     health_check_url = %health_check_url,
-                    "Webhook health check request succeeded"
+                    state = "reachability_probe_succeeded",
+                    "webhook target state"
                 );
                 Ok(true)
             }
@@ -337,7 +358,15 @@ where
         // behavior matches real delivery while avoiding path-specific false negatives.
         match self.probe_reachability().await {
             Ok(true) => {
-                debug!("Webhook target {} reachability probe succeeded via {:?}", self.id, self.health_check_url);
+                debug!(
+                    event = EVENT_WEBHOOK_TARGET_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_WEBHOOK,
+                    target_id = %self.id,
+                    health_check_url = ?self.health_check_url,
+                    state = "reachable",
+                    "webhook target state"
+                );
             }
             Ok(false) => {
                 return Err(TargetError::NotConnected);
@@ -348,7 +377,14 @@ where
         }
 
         self.initialized.store(true, Ordering::SeqCst);
-        info!("Webhook target {} initialized", self.id);
+        info!(
+            event = EVENT_WEBHOOK_TARGET_STATE,
+            component = LOG_COMPONENT_TARGETS,
+            subsystem = LOG_SUBSYSTEM_WEBHOOK,
+            target_id = %self.id,
+            state = "initialized",
+            "webhook target state"
+        );
         Ok(())
     }
 
@@ -357,14 +393,17 @@ where
     }
 
     async fn send_body(&self, body: Vec<u8>, meta: &QueuedPayloadMeta) -> Result<(), TargetError> {
-        info!("Webhook sending queued payload to target: {}", self.id);
         debug!(
-            target = %self.id,
+            event = EVENT_WEBHOOK_DELIVERY_STATE,
+            component = LOG_COMPONENT_TARGETS,
+            subsystem = LOG_SUBSYSTEM_WEBHOOK,
+            target_id = %self.id,
             bucket = %meta.bucket_name,
             object = %meta.object_name,
             event = %meta.event_name,
             payload_len = body.len(),
-            "Sending webhook payload"
+            state = "sending",
+            "webhook delivery state"
         );
 
         // When a TLS reload adapter is attached, it drives client rebuilds in
@@ -406,7 +445,15 @@ where
 
         let status = resp.status();
         if status.is_success() {
-            debug!("Event sent to webhook target: {}", self.id);
+            debug!(
+                event = EVENT_WEBHOOK_DELIVERY_STATE,
+                component = LOG_COMPONENT_TARGETS,
+                subsystem = LOG_SUBSYSTEM_WEBHOOK,
+                target_id = %self.id,
+                status = %status,
+                state = "sent",
+                "webhook delivery state"
+            );
             self.delivery_counters.record_success();
             Ok(())
         } else if status == StatusCode::FORBIDDEN {
@@ -454,13 +501,28 @@ where
                 self.delivery_counters.record_final_failure();
                 return Err(e);
             }
-            debug!("Event saved to store for target: {}", self.id);
+            debug!(
+                event = EVENT_WEBHOOK_DELIVERY_STATE,
+                component = LOG_COMPONENT_TARGETS,
+                subsystem = LOG_SUBSYSTEM_WEBHOOK,
+                target_id = %self.id,
+                state = "store_enqueued",
+                "webhook delivery state"
+            );
             Ok(())
         } else {
             match self.init().await {
                 Ok(_) => (),
                 Err(e) => {
-                    error!("Failed to initialize Webhook target {}: {}", self.id.id, e);
+                    error!(
+                        event = EVENT_WEBHOOK_TARGET_STATE,
+                        component = LOG_COMPONENT_TARGETS,
+                        subsystem = LOG_SUBSYSTEM_WEBHOOK,
+                        target_id = %self.id.id,
+                        state = "init_failed",
+                        error = %e,
+                        "webhook target state"
+                    );
                     self.delivery_counters.record_final_failure();
                     return Err(TargetError::NotConnected);
                 }
@@ -474,13 +536,27 @@ where
     }
 
     async fn send_raw_from_store(&self, key: Key, body: Vec<u8>, meta: QueuedPayloadMeta) -> Result<(), TargetError> {
-        debug!("Sending queued payload from store for target: {}, key: {}", self.id, key);
+        debug!(
+            event = EVENT_WEBHOOK_DELIVERY_STATE,
+            component = LOG_COMPONENT_TARGETS,
+            subsystem = LOG_SUBSYSTEM_WEBHOOK,
+            target_id = %self.id,
+            key = %key,
+            state = "store_replay_started",
+            "webhook delivery state"
+        );
         match self.init().await {
-            Ok(_) => {
-                debug!("Event sent to store for target: {}", self.name());
-            }
+            Ok(_) => {}
             Err(e) => {
-                error!("Failed to initialize Webhook target {}: {}", self.id.id, e);
+                error!(
+                    event = EVENT_WEBHOOK_TARGET_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_WEBHOOK,
+                    target_id = %self.id.id,
+                    state = "init_failed",
+                    error = %e,
+                    "webhook target state"
+                );
                 return Err(TargetError::NotConnected);
             }
         }
@@ -492,7 +568,15 @@ where
             return Err(e);
         }
 
-        debug!("Event sent from store and deleted for target: {}", self.id);
+        debug!(
+            event = EVENT_WEBHOOK_DELIVERY_STATE,
+            component = LOG_COMPONENT_TARGETS,
+            subsystem = LOG_SUBSYSTEM_WEBHOOK,
+            target_id = %self.id,
+            key = %key,
+            state = "store_replay_sent",
+            "webhook delivery state"
+        );
         Ok(())
     }
 
@@ -500,7 +584,14 @@ where
         // Send cancel signal to background tasks
         let _ = self.cancel_sender.try_send(());
         // Adapter cleanup is done by the coordinator; no local state to reset.
-        info!("Webhook target closed: {}", self.id);
+        info!(
+            event = EVENT_WEBHOOK_TARGET_STATE,
+            component = LOG_COMPONENT_TARGETS,
+            subsystem = LOG_SUBSYSTEM_WEBHOOK,
+            target_id = %self.id,
+            state = "closed",
+            "webhook target state"
+        );
         Ok(())
     }
 
@@ -515,7 +606,14 @@ where
 
     async fn init(&self) -> Result<(), TargetError> {
         if !self.is_enabled() {
-            debug!("Webhook target {} is disabled, skipping initialization", self.id);
+            debug!(
+                event = EVENT_WEBHOOK_TARGET_STATE,
+                component = LOG_COMPONENT_TARGETS,
+                subsystem = LOG_SUBSYSTEM_WEBHOOK,
+                target_id = %self.id,
+                state = "disabled",
+                "webhook target state"
+            );
             return Ok(());
         }
         self.init_inner().await

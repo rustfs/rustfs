@@ -372,7 +372,7 @@ impl Drop for NotificationSystem {
             component = LOG_COMPONENT_NOTIFY,
             subsystem = LOG_SUBSYSTEM_INTEGRATION,
             state = "dropping",
-            "Notification system instance is being dropped"
+            "notify system integration state"
         );
 
         let snapshot = self.snapshot_metrics();
@@ -394,7 +394,7 @@ impl Drop for NotificationSystem {
                 metric_name = name,
                 metric_value = value,
                 metric_kind = if is_gauge { "gauge" } else { "counter" },
-                "Notification shutdown metric snapshot"
+                "notify system integration state"
             );
         }
 
@@ -406,7 +406,7 @@ impl Drop for NotificationSystem {
                 subsystem = LOG_SUBSYSTEM_INTEGRATION,
                 status_key = %key,
                 status_value = %value,
-                "Notification system status snapshot"
+                "notify system integration state"
             );
         }
     }

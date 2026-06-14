@@ -97,7 +97,7 @@ fn resolve_scanner_runtime_config() -> crate::runtime_config::ScannerRuntimeConf
                 subsystem = LOG_SUBSYSTEM_RUNTIME,
                 state = "resolve_failed",
                 error = %err,
-                "Scanner runtime config resolution failed; using last applied config"
+                "Scanner runtime config fallback applied"
             );
             current_scanner_runtime_config()
         }
@@ -179,7 +179,7 @@ async fn persisted_usage_cache_is_cold_for_startup(storeapi: &Arc<ECStore>) -> b
                 path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
                 state = "startup_inspect_failed",
                 error = %err,
-                "Scanner startup cache inspection failed; keeping configured startup delay"
+                "Scanner startup cache inspection failed"
             );
             return false;
         }
@@ -198,7 +198,7 @@ async fn persisted_usage_cache_is_cold_for_startup(storeapi: &Arc<ECStore>) -> b
                 path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
                 state = "startup_decode_failed",
                 error = %err,
-                "Scanner startup cache decode failed; skipping startup delay"
+                "Scanner startup cache decode failed"
             );
             true
         }
@@ -222,7 +222,7 @@ async fn initial_scanner_startup_usage_state(storeapi: &Arc<ECStore>) -> (bool, 
                 subsystem = LOG_SUBSYSTEM_RUNTIME,
                 state = "startup_bucket_inspect_failed",
                 error = %err,
-                "Scanner startup bucket inspection failed; keeping configured startup delay"
+                "Scanner startup bucket inspection failed"
             );
             false
         }
@@ -418,7 +418,7 @@ async fn configure_scanner_defaults(storeapi: &Arc<ECStore>) {
             replication_active = features.replication,
             feature_inspection_failed = features.inspection_failed,
             state = "single_disk_defaults_applied",
-            "Scanner defaults updated for single-disk deployment"
+            "Scanner defaults applied"
         );
     } else {
         set_scanner_default_speed(ScannerSpeed::Default);
@@ -562,7 +562,7 @@ pub async fn read_background_heal_info(storeapi: Arc<ECStore>) -> BackgroundHeal
                 path = %&*BACKGROUND_HEAL_INFO_PATH,
                 state = "decode_failed",
                 error = %e,
-                "Scanner background heal state decode failed"
+                "Scanner background heal decode failed"
             );
             BackgroundHealInfo::default()
         }),
@@ -577,7 +577,7 @@ pub async fn read_background_heal_info(storeapi: Arc<ECStore>) -> BackgroundHeal
                     path = %&*BACKGROUND_HEAL_INFO_PATH,
                     state = "read_failed",
                     error = %e,
-                    "Scanner background heal state read failed"
+                    "Scanner background heal read failed"
                 );
             }
             BackgroundHealInfo::default()
@@ -605,7 +605,7 @@ pub async fn save_background_heal_info(storeapi: Arc<ECStore>, info: BackgroundH
                 path = %&*BACKGROUND_HEAL_INFO_PATH,
                 state = "encode_failed",
                 error = %e,
-                "Scanner background heal state encode failed"
+                "Scanner background heal encode failed"
             );
             return;
         }
@@ -621,7 +621,7 @@ pub async fn save_background_heal_info(storeapi: Arc<ECStore>, info: BackgroundH
             path = %&*BACKGROUND_HEAL_INFO_PATH,
             state = "save_failed",
             error = %e,
-            "Scanner background heal state save failed"
+            "Scanner background heal save failed"
         );
     }
 }
@@ -650,7 +650,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
             subsystem = LOG_SUBSYSTEM_RUNTIME,
             state = "refresh_failed",
             error = %err,
-            "Scanner runtime config refresh failed; using last applied config"
+            "Scanner runtime config refresh failed"
         );
     }
     let configured_cycle_interval = scanner_cycle_interval();
@@ -685,7 +685,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
         cycle = cycle_info.current,
         scan_mode = ?scan_mode,
         state = "started",
-        "Scanner cycle state updated"
+        "Scanner cycle started"
     );
     let _scan_mode_guard = ScannerScanModeGuard::new(scan_mode);
     if let Some(new_heal_info) = background_heal_info_for_scan_start(
@@ -730,7 +730,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
                 max_objects = ?cycle_budget.max_objects(),
                 max_directories = ?cycle_budget.max_directories(),
                 state = "budget_reached",
-                "Scanner cycle stopped after reaching budget"
+                "Scanner cycle budget reached"
             );
             let budget_reason = cycle_budget.reason();
             emit_scan_cycle_partial_with_source(
@@ -751,7 +751,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
             state = "failed",
             duration = ?now.elapsed(),
             error = %e,
-            "Scanner cycle state updated"
+            "Scanner cycle failed"
         );
         emit_scan_cycle_complete(false, cycle_start.elapsed());
         if let Some(new_heal_info) = background_heal_info_for_scan_complete(background_heal_info.clone(), scan_mode) {
@@ -772,7 +772,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
             max_objects = ?cycle_budget.max_objects(),
             max_directories = ?cycle_budget.max_directories(),
             state = "budget_reached",
-            "Scanner cycle stopped after reaching budget"
+            "Scanner cycle budget reached"
         );
         global_metrics().finish_scan_cycle_work(cycle_work_start);
         let budget_reason = cycle_budget.reason();
@@ -806,7 +806,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
         state = "completed",
         duration = ?now.elapsed(),
         cycles_total = cycle_info.cycle_completed.len(),
-        "Scanner cycle state updated"
+        "Scanner cycle completed"
     );
 
     retain_recent_cycle_completions(&mut cycle_info.cycle_completed);
@@ -830,14 +830,14 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
             "Scanner state persistence failed"
         );
     } else {
-        info!(
+        debug!(
             target: "rustfs::scanner",
             event = EVENT_SCANNER_PERSIST_STATE,
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_RUNTIME,
             path = %&*DATA_USAGE_BLOOM_NAME_PATH,
             state = "saved",
-            "Scanner state persisted"
+            "Scanner state saved"
         );
     }
 }
@@ -854,7 +854,7 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
                     subsystem = LOG_SUBSYSTEM_RUNTIME,
                     lock_name = "leader.lock",
                     state = "acquired",
-                    "Scanner leader lock state updated"
+                    "Scanner leader lock acquired"
                 );
                 guard
             }
@@ -867,7 +867,7 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
                     lock_name = "leader.lock",
                     state = "contended",
                     error = ?e,
-                    "Scanner leader lock state updated"
+                    "Scanner leader lock contended"
                 );
                 return Ok(());
             }
@@ -881,7 +881,7 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
                 lock_name = "leader.lock",
                 state = "create_failed",
                 error = %e,
-                "Scanner leader lock state updated"
+                "Scanner leader lock creation failed"
             );
             return Ok(());
         }
@@ -977,7 +977,7 @@ pub async fn store_data_usage_in_backend(
             && let (Some(new_ts), Some(existing_ts)) = (data_usage_info.last_update, existing.last_update)
             && new_ts <= existing_ts
         {
-            info!(
+            debug!(
                 target: "rustfs::scanner",
                 event = EVENT_SCANNER_PERSIST_STATE,
                 component = LOG_COMPONENT_SCANNER,
@@ -986,7 +986,7 @@ pub async fn store_data_usage_in_backend(
                 incoming_last_update = ?new_ts,
                 existing_last_update = ?existing_ts,
                 state = "skip_stale_update",
-                "Scanner data usage persistence skipped stale update"
+                "Scanner stale data usage update skipped"
             );
             continue;
         }
@@ -1003,7 +1003,7 @@ pub async fn store_data_usage_in_backend(
                     path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
                     state = "encode_failed",
                     error = %e,
-                    "Scanner data usage persistence encode failed"
+                    "Scanner data usage encode failed"
                 );
                 continue;
             }
@@ -1040,7 +1040,7 @@ pub async fn store_data_usage_in_backend(
                 path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
                 state = "save_failed",
                 error = %e,
-                "Scanner data usage persistence failed"
+                "Scanner data usage save failed"
             );
         } else {
             rustfs_ecstore::data_usage::replace_bucket_usage_memory_from_info(&data_usage_info).await;

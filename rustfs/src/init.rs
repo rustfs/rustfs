@@ -36,6 +36,8 @@ const LOG_SUBSYSTEM_KMS: &str = "kms";
 const LOG_SUBSYSTEM_BUFFER: &str = "buffer_profile";
 const LOG_SUBSYSTEM_AUTOTUNER: &str = "autotuner";
 const LOG_SUBSYSTEM_PROTOCOL: &str = "protocol";
+const EVENT_PROTOCOL_RUNTIME_STATE: &str = "protocol_runtime_state";
+const EVENT_PROTOCOL_SERVER_STATE: &str = "protocol_server_state";
 
 #[instrument]
 pub fn print_server_info() {
@@ -666,7 +668,7 @@ where
                 protocol = protocol_name,
                 state = "runtime_failed",
                 error = %e,
-                "Protocol server state changed"
+                "Protocol server failed"
             );
         }
         info!(
@@ -676,7 +678,7 @@ where
             subsystem = LOG_SUBSYSTEM_PROTOCOL,
             protocol = protocol_name,
             state = "stopped",
-            "Protocol server state changed"
+            "Protocol server stopped"
         );
     });
 
@@ -786,7 +788,15 @@ pub async fn init_ftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::er
         // Check if FTP is enabled
         let ftp_enable = rustfs_utils::get_env_bool(ENV_FTP_ENABLE, false);
         if !ftp_enable {
-            debug!("FTP system is disabled");
+            debug!(
+                target: "rustfs::init",
+                event = EVENT_PROTOCOL_RUNTIME_STATE,
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                protocol = "ftp",
+                state = "disabled",
+                "Protocol runtime disabled"
+            );
             return Ok(None);
         }
 
@@ -817,12 +827,21 @@ pub async fn init_ftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::er
         let fs = crate::storage::ecfs::FS::new();
         let storage_client = ProtocolStorageClient::new(fs);
         let server: FtpsServer<ProtocolStorageClient> = FtpsServer::new(config, storage_client).await?;
+        let bind_addr = server.config().bind_addr;
+        let passive_ports = server.config().passive_ports.clone();
 
         // Log server configuration
-        info!(
-            "FTP server configured on {} with passive ports {:?}",
-            server.config().bind_addr,
-            server.config().passive_ports
+        debug!(
+            target: "rustfs::init",
+            event = EVENT_PROTOCOL_RUNTIME_STATE,
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_PROTOCOL,
+            protocol = "ftp",
+            state = "configured",
+            bind_addr = %bind_addr,
+            passive_ports = ?passive_ports,
+            tls_enabled = false,
+            "Protocol runtime configured"
         );
 
         // Start FTP server in background task with proper shutdown support
@@ -830,12 +849,39 @@ pub async fn init_ftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::er
 
         let task_handle = tokio::spawn(async move {
             if let Err(e) = server.start(shutdown_rx).await {
-                error!("FTP server error: {}", e);
+                error!(
+                    target: "rustfs::init",
+                    event = EVENT_PROTOCOL_SERVER_STATE,
+                    component = LOG_COMPONENT_INIT,
+                    subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                    protocol = "ftp",
+                    state = "runtime_failed",
+                    error = %e,
+                    "Protocol server failed"
+                );
             }
-            info!("FTP server shutdown completed");
+            info!(
+                target: "rustfs::init",
+                event = EVENT_PROTOCOL_SERVER_STATE,
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                protocol = "ftp",
+                state = "stopped",
+                "Protocol server stopped"
+            );
         });
 
-        info!("FTP system initialized successfully");
+        info!(
+            target: "rustfs::init",
+            event = EVENT_PROTOCOL_RUNTIME_STATE,
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_PROTOCOL,
+            protocol = "ftp",
+            state = "started",
+            bind_addr = %bind_addr,
+            tls_enabled = false,
+            "Protocol runtime started"
+        );
         Ok(Some(ShutdownHandle::new(shutdown_tx, task_handle)))
     }
 }
@@ -859,7 +905,15 @@ pub async fn init_ftps_system() -> Result<Option<ShutdownHandle>, Box<dyn std::e
         // Check if FTPS is enabled
         let ftps_enable = rustfs_utils::get_env_bool(ENV_FTPS_ENABLE, false);
         if !ftps_enable {
-            debug!("FTPS system is disabled");
+            debug!(
+                target: "rustfs::init",
+                event = EVENT_PROTOCOL_RUNTIME_STATE,
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                protocol = "ftps",
+                state = "disabled",
+                "Protocol runtime disabled"
+            );
             return Ok(None);
         }
 
@@ -893,12 +947,22 @@ pub async fn init_ftps_system() -> Result<Option<ShutdownHandle>, Box<dyn std::e
         let fs = crate::storage::ecfs::FS::new();
         let storage_client = ProtocolStorageClient::new(fs);
         let server: FtpsServer<ProtocolStorageClient> = FtpsServer::new(config, storage_client).await?;
+        let bind_addr = server.config().bind_addr;
+        let passive_ports = server.config().passive_ports.clone();
+        let tls_enabled = server.config().tls_enabled;
 
         // Log server configuration
-        info!(
-            "FTPS server configured on {} with passive ports {:?}",
-            server.config().bind_addr,
-            server.config().passive_ports
+        debug!(
+            target: "rustfs::init",
+            event = EVENT_PROTOCOL_RUNTIME_STATE,
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_PROTOCOL,
+            protocol = "ftps",
+            state = "configured",
+            bind_addr = %bind_addr,
+            passive_ports = ?passive_ports,
+            tls_enabled,
+            "Protocol runtime configured"
         );
 
         // Start FTPS server in background task with proper shutdown support
@@ -906,12 +970,39 @@ pub async fn init_ftps_system() -> Result<Option<ShutdownHandle>, Box<dyn std::e
 
         let task_handle = tokio::spawn(async move {
             if let Err(e) = server.start(shutdown_rx).await {
-                error!("FTPS server error: {}", e);
+                error!(
+                    target: "rustfs::init",
+                    event = EVENT_PROTOCOL_SERVER_STATE,
+                    component = LOG_COMPONENT_INIT,
+                    subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                    protocol = "ftps",
+                    state = "runtime_failed",
+                    error = %e,
+                    "Protocol server failed"
+                );
             }
-            info!("FTPS server shutdown completed");
+            info!(
+                target: "rustfs::init",
+                event = EVENT_PROTOCOL_SERVER_STATE,
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                protocol = "ftps",
+                state = "stopped",
+                "Protocol server stopped"
+            );
         });
 
-        info!("FTPS system initialized successfully");
+        info!(
+            target: "rustfs::init",
+            event = EVENT_PROTOCOL_RUNTIME_STATE,
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_PROTOCOL,
+            protocol = "ftps",
+            state = "started",
+            bind_addr = %bind_addr,
+            tls_enabled,
+            "Protocol runtime started"
+        );
         Ok(Some(ShutdownHandle::new(shutdown_tx, task_handle)))
     }
 }
@@ -935,7 +1026,15 @@ pub async fn init_webdav_system() -> Result<Option<ShutdownHandle>, Box<dyn std:
         // Check if WebDAV is enabled
         let webdav_enable = rustfs_utils::get_env_bool(ENV_WEBDAV_ENABLE, false);
         if !webdav_enable {
-            debug!("WebDAV system is disabled");
+            debug!(
+                target: "rustfs::init",
+                event = EVENT_PROTOCOL_RUNTIME_STATE,
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                protocol = "webdav",
+                state = "disabled",
+                "Protocol runtime disabled"
+            );
             return Ok(None);
         }
 
@@ -966,21 +1065,64 @@ pub async fn init_webdav_system() -> Result<Option<ShutdownHandle>, Box<dyn std:
         let fs = crate::storage::ecfs::FS::new();
         let storage_client = ProtocolStorageClient::new(fs);
         let server: WebDavServer<crate::protocols::ProtocolStorageClient> = WebDavServer::new(config, storage_client).await?;
+        let bind_addr = server.config().bind_addr;
+        let tls_enabled = server.config().tls_enabled;
+        let max_body_size = server.config().max_body_size;
+        let request_timeout_secs = server.config().request_timeout_secs;
 
         // Log server configuration
-        info!("WebDAV server configured on {}", server.config().bind_addr);
+        debug!(
+            target: "rustfs::init",
+            event = EVENT_PROTOCOL_RUNTIME_STATE,
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_PROTOCOL,
+            protocol = "webdav",
+            state = "configured",
+            bind_addr = %bind_addr,
+            tls_enabled,
+            max_body_size,
+            request_timeout_secs,
+            "Protocol runtime configured"
+        );
 
         // Start WebDAV server in background task with proper shutdown support
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
 
         let task_handle = tokio::spawn(async move {
             if let Err(e) = server.start(shutdown_rx).await {
-                error!("WebDAV server error: {}", e);
+                error!(
+                    target: "rustfs::init",
+                    event = EVENT_PROTOCOL_SERVER_STATE,
+                    component = LOG_COMPONENT_INIT,
+                    subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                    protocol = "webdav",
+                    state = "runtime_failed",
+                    error = %e,
+                    "Protocol server failed"
+                );
             }
-            info!("WebDAV server shutdown completed");
+            info!(
+                target: "rustfs::init",
+                event = EVENT_PROTOCOL_SERVER_STATE,
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                protocol = "webdav",
+                state = "stopped",
+                "Protocol server stopped"
+            );
         });
 
-        info!("WebDAV system initialized successfully");
+        info!(
+            target: "rustfs::init",
+            event = EVENT_PROTOCOL_RUNTIME_STATE,
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_PROTOCOL,
+            protocol = "webdav",
+            state = "started",
+            bind_addr = %bind_addr,
+            tls_enabled,
+            "Protocol runtime started"
+        );
         Ok(Some(ShutdownHandle::new(shutdown_tx, task_handle)))
     }
 }
@@ -1003,7 +1145,15 @@ pub async fn init_sftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::e
 
         let enabled = rustfs_utils::get_env_bool(ENV_SFTP_ENABLE, false);
         if !enabled {
-            debug!("SFTP system is disabled");
+            debug!(
+                target: "rustfs::init",
+                event = EVENT_PROTOCOL_RUNTIME_STATE,
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                protocol = "sftp",
+                state = "disabled",
+                "Protocol runtime disabled"
+            );
             return Ok(None);
         }
 
@@ -1051,7 +1201,18 @@ pub async fn init_sftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::e
 
         let server = SftpServer::new(config.clone(), storage_client, host_keys)?;
 
-        info!("SFTP server configured on {}", config.bind_addr);
+        debug!(
+            target: "rustfs::init",
+            event = EVENT_PROTOCOL_RUNTIME_STATE,
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_PROTOCOL,
+            protocol = "sftp",
+            state = "configured",
+            bind_addr = %config.bind_addr,
+            read_only = config.read_only,
+            host_key_dir = %config.host_key_dir.display(),
+            "Protocol runtime configured"
+        );
 
         // Hook into shutdown support
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
@@ -1059,12 +1220,39 @@ pub async fn init_sftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::e
         // Start SFTP server in background task
         let task_handle = tokio::spawn(async move {
             if let Err(e) = server.start(shutdown_rx).await {
-                error!("SFTP server error: {}", e);
+                error!(
+                    target: "rustfs::init",
+                    event = EVENT_PROTOCOL_SERVER_STATE,
+                    component = LOG_COMPONENT_INIT,
+                    subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                    protocol = "sftp",
+                    state = "runtime_failed",
+                    error = %e,
+                    "Protocol server failed"
+                );
             }
-            info!("SFTP server shutdown completed");
+            info!(
+                target: "rustfs::init",
+                event = EVENT_PROTOCOL_SERVER_STATE,
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                protocol = "sftp",
+                state = "stopped",
+                "Protocol server stopped"
+            );
         });
 
-        info!("SFTP system initialized successfully");
+        info!(
+            target: "rustfs::init",
+            event = EVENT_PROTOCOL_RUNTIME_STATE,
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_PROTOCOL,
+            protocol = "sftp",
+            state = "started",
+            bind_addr = %config.bind_addr,
+            read_only = config.read_only,
+            "Protocol runtime started"
+        );
         Ok(Some(ShutdownHandle::new(shutdown_tx, task_handle)))
     }
 }

@@ -126,7 +126,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::RwLock;
 use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
 const ACCEPT_RANGES_BYTES: &str = "bytes";
@@ -1119,15 +1119,18 @@ fn is_post_object_sse_kms_requested(input: &PutObjectInput, headers: &HeaderMap)
 
 async fn resolve_put_object_expiration(bucket: &str, obj_info: &ObjectInfo) -> Option<String> {
     let Ok((lifecycle_config, _)) = metadata_sys::get_lifecycle_config(bucket).await else {
-        debug!("resolve_put_object_expiration: lifecycle config not found for bucket {bucket}");
+        debug!(bucket, state = "config_missing", "PUT object expiration config missing");
         return None;
     };
 
     let obj_opts = lifecycle::ObjectOpts::from_object_info(obj_info);
     let event = lifecycle_config.predict_expiration(&obj_opts).await;
     debug!(
-        "resolve_put_object_expiration: bucket={bucket}, action={:?}, rule_id={}, due={:?}",
-        event.action, event.rule_id, event.due
+        bucket,
+        action = ?event.action,
+        rule_id = %event.rule_id,
+        due = ?event.due,
+        "PUT object expiration resolved"
     );
     build_put_object_expiration_header(&event)
 }
@@ -1176,7 +1179,7 @@ impl DefaultObjectUsecase {
                 ),
             )),
             Err(e) => {
-                warn!("Quota check failed for bucket {bucket}: {e}, allowing operation");
+                warn!(bucket, error = %e, state = "checker_failed", "Bucket quota check degraded to allow");
                 Ok(())
             }
             _ => Ok(()),
@@ -1419,7 +1422,7 @@ impl DefaultObjectUsecase {
             match ContentType::from_str(content_type) {
                 Ok(res) => Some(res),
                 Err(err) => {
-                    error!("parse content-type err {} {:?}", content_type, err);
+                    error!(content_type, error = ?err, "GET object content-type parse failed");
                     None
                 }
             }
@@ -1616,7 +1619,7 @@ impl DefaultObjectUsecase {
         {
             let (decrypted_checksums, _is_multipart) =
                 info.decrypt_checksums(part_number.unwrap_or(0), headers).map_err(|e| {
-                    error!("decrypt_checksums error: {}", e);
+                    error!(error = %e, "GetObject checksum decryption failed");
                     ApiError::from(e)
                 })?;
 
@@ -1659,25 +1662,22 @@ impl DefaultObjectUsecase {
             if should_buffer_encrypted_object {
                 let mut buf = Vec::with_capacity(response_content_length as usize);
                 if let Err(e) = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
-                    error!("Failed to read decrypted object into memory: {}", e);
+                    error!(error = %e, "GetObject decrypted object buffering failed");
                     return Err(ApiError::from(StorageError::other(format!("Failed to read decrypted object: {e}"))).into());
                 }
 
                 if buf.len() != response_content_length as usize {
                     warn!(
-                        "Encrypted object size mismatch during read: expected={} actual={}",
-                        response_content_length,
-                        buf.len()
+                        expected = response_content_length,
+                        actual = buf.len(),
+                        "Encrypted object size mismatch during read"
                     );
                 }
 
                 return Ok(Self::build_memory_blob(buf, response_content_length, optimal_buffer_size));
             }
 
-            info!(
-                "Encrypted object: Using unlimited stream for decryption with buffer size {}",
-                optimal_buffer_size
-            );
+            debug!(buffer_size = optimal_buffer_size, "Encrypted object uses streaming decrypt path");
             return Ok(Self::build_reader_blob(final_stream, response_content_length, optimal_buffer_size));
         }
 
@@ -1690,16 +1690,16 @@ impl DefaultObjectUsecase {
                 Ok(_) => {
                     if buf.len() != response_content_length as usize {
                         warn!(
-                            "Object size mismatch during seek support read: expected={} actual={}",
-                            response_content_length,
-                            buf.len()
+                            expected = response_content_length,
+                            actual = buf.len(),
+                            "Object size mismatch during seek-support read"
                         );
                     }
 
                     return Ok(Self::build_memory_blob(buf, response_content_length, optimal_buffer_size));
                 }
                 Err(e) => {
-                    error!("Failed to read object into memory for seek support: {}", e);
+                    error!(error = %e, "GetObject seek-support buffering failed");
                 }
             }
         }
@@ -2772,7 +2772,7 @@ impl DefaultObjectUsecase {
             && src_bucket == bucket
             && src_key == key
         {
-            error!("Rejected self-copy operation: bucket={}, key={}", bucket, key);
+            error!(bucket, key, "Rejected self-copy operation");
             return Err(s3_error!(
                 InvalidRequest,
                 "Cannot copy an object to itself. Source and destination must be different."
@@ -3671,7 +3671,7 @@ impl DefaultObjectUsecase {
                         let has_children = match probe_prefix_has_children(store, &bucket, &key, false).await {
                             Ok(has_children) => has_children,
                             Err(e) => {
-                                error!("Failed to probe children for prefix (bucket: {}, key: {}): {}", bucket, key, e);
+                                error!(bucket, key, error = %e, "Failed to probe children for prefix");
                                 false
                             }
                         };
@@ -3743,7 +3743,7 @@ impl DefaultObjectUsecase {
                 match ContentType::from_str(content_type) {
                     Ok(res) => Some(res),
                     Err(err) => {
-                        error!("parse content-type err {} {:?}", &content_type, err);
+                        error!(content_type = %content_type, error = ?err, "Archive content-type parse failed");
                         //
                         None
                     }
@@ -3757,7 +3757,7 @@ impl DefaultObjectUsecase {
         // TODO: range download
 
         let content_length = info.get_actual_size().map_err(|e| {
-            error!("get_actual_size error: {}", e);
+            error!(error = %e, "Failed to resolve actual object size");
             ApiError::from(e)
         })?;
 
@@ -3873,7 +3873,7 @@ impl DefaultObjectUsecase {
             if let Ok(header_value) = tag_count.to_string().parse::<HeaderValue>() {
                 response.headers.insert(header_name, header_value);
             } else {
-                warn!("Failed to parse x-amz-tagging-count header value, skipping");
+                warn!("Failed to parse x-amz-tagging-count header; skipping");
             }
         }
         if let Some(retain_date) = metadata_map
@@ -4119,7 +4119,7 @@ impl DefaultObjectUsecase {
                     err.to_string()
                 );
             } else {
-                info!("successfully restored transitioned object: {}/{}", bucket_clone, object_clone);
+                debug!(bucket = %bucket_clone, object = %object_clone, "Transitioned object restored");
             }
         });
 
@@ -4294,13 +4294,13 @@ impl DefaultObjectUsecase {
         let decoder = CompressionFormat::from_extension(&ext)
             .get_decoder(ExtractArchiveEtagReader::new(archive_reader, archive_etag.clone()))
             .map_err(|e| {
-                error!("get_decoder err {:?}", e);
+                error!(error = ?e, "Archive decoder creation failed");
                 s3_error!(InvalidArgument, "get_decoder err")
             })?;
 
         let mut ar = Archive::new(decoder);
         let mut entries = ar.entries().map_err(|e| {
-            error!("get entries err {:?}", e);
+            error!(error = ?e, "Archive entry listing failed");
             s3_error!(InvalidArgument, "get entries err")
         })?;
 
@@ -4329,10 +4329,10 @@ impl DefaultObjectUsecase {
                 Ok(f) => f,
                 Err(e) => {
                     if extract_options.ignore_errors {
-                        warn!("Skipping archive entry because read failed and ignore-errors is enabled: {e}");
+                        warn!(error = %e, "Archive entry read skipped due to ignore-errors");
                         continue;
                     }
-                    error!("Failed to read archive entry: {}", e);
+                    error!(error = %e, "Archive entry read failed");
                     return Err(s3_error!(InvalidArgument, "Failed to read archive entry: {:?}", e));
                 }
             };
@@ -4341,7 +4341,7 @@ impl DefaultObjectUsecase {
                 Ok(path) => path,
                 Err(e) => {
                     if extract_options.ignore_errors {
-                        warn!("Skipping archive entry because path decode failed and ignore-errors is enabled: {e}");
+                        warn!(error = %e, "Archive path decode skipped due to ignore-errors");
                         continue;
                     }
                     return Err(s3_error!(InvalidArgument, "Failed to decode archive entry path"));
@@ -4353,7 +4353,7 @@ impl DefaultObjectUsecase {
                 Ok(fpath) => fpath,
                 Err(err) => {
                     if extract_options.ignore_errors {
-                        warn!("Skipping archive entry because path is unsafe and ignore-errors is enabled: {err}");
+                        warn!(error = %err, "Unsafe archive path skipped due to ignore-errors");
                         continue;
                     }
                     return Err(err);
@@ -4483,7 +4483,7 @@ impl DefaultObjectUsecase {
                 Ok(info) => info,
                 Err(e) => {
                     if extract_options.ignore_errors {
-                        warn!("Skipping archive entry because object write failed and ignore-errors is enabled: {e}");
+                        warn!(error = %e, "Archive object write skipped due to ignore-errors");
                         continue;
                     }
                     return Err(ApiError::from(e).into());

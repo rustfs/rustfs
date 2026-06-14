@@ -33,6 +33,10 @@ use std::collections::HashMap;
 use tracing::{error, info};
 use urlencoding;
 
+const LOG_COMPONENT_ADMIN: &str = "admin";
+const LOG_SUBSYSTEM_KMS_KEYS: &str = "kms_keys";
+const EVENT_ADMIN_KMS_KEYS_STATE: &str = "admin_kms_keys_state";
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateKmsKeyRequest {
@@ -227,7 +231,7 @@ impl Operation for CreateKeyHandler {
         };
 
         let Some(service) = kms_encryption_service_from_context().await else {
-            return Err(s3_error!(InternalError, "KMS service not initialized"));
+            return Err(s3_error!(InternalError, "kms service is not initialized"));
         };
 
         // Extract key name from tags if provided
@@ -259,7 +263,15 @@ impl Operation for CreateKeyHandler {
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
             Err(e) => {
-                error!("Failed to create KMS key: {}", e);
+                error!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "create_key",
+                    result = "failed",
+                    error = %e,
+                    "admin kms keys state"
+                );
                 Err(s3_error!(InternalError, "failed to create key: {}", e))
             }
         }
@@ -290,11 +302,11 @@ impl Operation for DescribeKeyHandler {
         .await?;
 
         let Some(key_id) = extract_key_id(&req.uri) else {
-            return Err(s3_error!(InvalidRequest, "missing keyId parameter"));
+            return Err(s3_error!(InvalidRequest, "missing required parameter: 'keyId'"));
         };
 
         let Some(service) = kms_encryption_service_from_context().await else {
-            return Err(s3_error!(InternalError, "KMS service not initialized"));
+            return Err(s3_error!(InternalError, "kms service is not initialized"));
         };
 
         let request = DescribeKeyRequest { key_id: key_id.clone() };
@@ -314,7 +326,16 @@ impl Operation for DescribeKeyHandler {
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
             Err(e) => {
-                error!("Failed to describe KMS key {}: {}", key_id, e);
+                error!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "describe_key",
+                    key_id = %key_id,
+                    result = "failed",
+                    error = %e,
+                    "admin kms keys state"
+                );
                 Err(s3_error!(InternalError, "failed to describe key: {}", e))
             }
         }
@@ -451,7 +472,7 @@ impl Operation for ListKeysHandler {
         let marker = query_params.get("marker").cloned();
 
         let Some(service) = kms_encryption_service_from_context().await else {
-            return Err(s3_error!(InternalError, "KMS service not initialized"));
+            return Err(s3_error!(InternalError, "kms service is not initialized"));
         };
 
         let request = ListKeysRequest {
@@ -478,7 +499,15 @@ impl Operation for ListKeysHandler {
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
             Err(e) => {
-                error!("Failed to list KMS keys: {}", e);
+                error!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "list_keys",
+                    result = "failed",
+                    error = %e,
+                    "admin kms keys state"
+                );
                 Err(s3_error!(InternalError, "failed to list keys: {}", e))
             }
         }
@@ -544,7 +573,15 @@ impl Operation for GenerateDataKeyHandler {
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
             Err(e) => {
-                error!("Failed to generate data key: {}", e);
+                error!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "generate_data_key",
+                    result = "failed",
+                    error = %e,
+                    "admin kms keys state"
+                );
                 Err(s3_error!(InternalError, "failed to generate data key: {}", e))
             }
         }
@@ -593,7 +630,7 @@ impl Operation for CreateKmsKeyHandler {
         let Some(service_manager) = kms_service_manager_from_context() else {
             let response = CreateKmsKeyResponse {
                 success: false,
-                message: "KMS service manager not initialized".to_string(),
+                message: "kms service manager is not initialized".to_string(),
                 key_id: "".to_string(),
                 key_metadata: None,
             };
@@ -607,7 +644,7 @@ impl Operation for CreateKmsKeyHandler {
         let Some(manager) = service_manager.get_manager().await else {
             let response = CreateKmsKeyResponse {
                 success: false,
-                message: "KMS service not running".to_string(),
+                message: "kms service is not running".to_string(),
                 key_id: "".to_string(),
                 key_metadata: None,
             };
@@ -633,10 +670,18 @@ impl Operation for CreateKmsKeyHandler {
 
         match manager.create_key(kms_request).await {
             Ok(kms_response) => {
-                info!("Created KMS key: {}", kms_response.key_id);
+                info!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "create_key",
+                    key_id = %kms_response.key_id,
+                    state = "completed",
+                    "admin kms keys state"
+                );
                 let response = CreateKmsKeyResponse {
                     success: true,
-                    message: "Key created successfully".to_string(),
+                    message: "key created successfully".to_string(),
                     key_id: kms_response.key_id,
                     key_metadata: Some(kms_response.key_metadata),
                 };
@@ -650,10 +695,18 @@ impl Operation for CreateKmsKeyHandler {
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
             Err(e) => {
-                error!("Failed to create KMS key: {}", e);
+                error!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "create_key",
+                    result = "failed",
+                    error = %e,
+                    "admin kms keys state"
+                );
                 let response = CreateKmsKeyResponse {
                     success: false,
-                    message: format!("Failed to create key: {e}"),
+                    message: format!("failed to create key: {e}"),
                     key_id: "".to_string(),
                     key_metadata: None,
                 };
@@ -720,7 +773,7 @@ impl Operation for DeleteKmsKeyHandler {
             let Some(key_id) = query_params.get("keyId") else {
                 let response = DeleteKmsKeyResponse {
                     success: false,
-                    message: "missing keyId parameter".to_string(),
+                    message: "missing required parameter: 'keyId'".to_string(),
                     key_id: "".to_string(),
                     deletion_date: None,
                 };
@@ -747,7 +800,7 @@ impl Operation for DeleteKmsKeyHandler {
         let Some(service_manager) = kms_service_manager_from_context() else {
             let response = DeleteKmsKeyResponse {
                 success: false,
-                message: "KMS service manager not initialized".to_string(),
+                message: "kms service manager is not initialized".to_string(),
                 key_id: request.key_id,
                 deletion_date: None,
             };
@@ -761,7 +814,7 @@ impl Operation for DeleteKmsKeyHandler {
         let Some(manager) = service_manager.get_manager().await else {
             let response = DeleteKmsKeyResponse {
                 success: false,
-                message: "KMS service not running".to_string(),
+                message: "kms service is not running".to_string(),
                 key_id: request.key_id,
                 deletion_date: None,
             };
@@ -780,10 +833,18 @@ impl Operation for DeleteKmsKeyHandler {
 
         match manager.delete_key(kms_request).await {
             Ok(kms_response) => {
-                info!("Successfully deleted KMS key: {}", kms_response.key_id);
+                info!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "delete_key",
+                    key_id = %kms_response.key_id,
+                    state = "completed",
+                    "admin kms keys state"
+                );
                 let response = DeleteKmsKeyResponse {
                     success: true,
-                    message: "Key deleted successfully".to_string(),
+                    message: "key deleted successfully".to_string(),
                     key_id: kms_response.key_id,
                     deletion_date: kms_response.deletion_date,
                 };
@@ -797,7 +858,16 @@ impl Operation for DeleteKmsKeyHandler {
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
             Err(e) => {
-                error!("Failed to delete KMS key {}: {}", request.key_id, e);
+                error!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "delete_key",
+                    key_id = %request.key_id,
+                    result = "failed",
+                    error = %e,
+                    "admin kms keys state"
+                );
                 let status = match &e {
                     KmsError::KeyNotFound { .. } => StatusCode::NOT_FOUND,
                     KmsError::InvalidOperation { .. } | KmsError::ValidationError { .. } => StatusCode::BAD_REQUEST,
@@ -870,7 +940,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
             let Some(key_id) = query_params.get("keyId") else {
                 let response = CancelKmsKeyDeletionResponse {
                     success: false,
-                    message: "missing keyId parameter".to_string(),
+                    message: "missing required parameter: 'keyId'".to_string(),
                     key_id: "".to_string(),
                     key_metadata: None,
                 };
@@ -888,7 +958,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
         let Some(service_manager) = kms_service_manager_from_context() else {
             let response = CancelKmsKeyDeletionResponse {
                 success: false,
-                message: "KMS service manager not initialized".to_string(),
+                message: "kms service manager is not initialized".to_string(),
                 key_id: request.key_id,
                 key_metadata: None,
             };
@@ -902,7 +972,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
         let Some(manager) = service_manager.get_manager().await else {
             let response = CancelKmsKeyDeletionResponse {
                 success: false,
-                message: "KMS service not running".to_string(),
+                message: "kms service is not running".to_string(),
                 key_id: request.key_id,
                 key_metadata: None,
             };
@@ -919,10 +989,18 @@ impl Operation for CancelKmsKeyDeletionHandler {
 
         match manager.cancel_key_deletion(kms_request).await {
             Ok(kms_response) => {
-                info!("Cancelled deletion for KMS key: {}", kms_response.key_id);
+                info!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "cancel_delete_key",
+                    key_id = %kms_response.key_id,
+                    state = "completed",
+                    "admin kms keys state"
+                );
                 let response = CancelKmsKeyDeletionResponse {
                     success: true,
-                    message: "Key deletion cancelled successfully".to_string(),
+                    message: "key deletion cancelled successfully".to_string(),
                     key_id: kms_response.key_id,
                     key_metadata: Some(kms_response.key_metadata),
                 };
@@ -936,7 +1014,16 @@ impl Operation for CancelKmsKeyDeletionHandler {
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
             Err(e) => {
-                error!("Failed to cancel deletion for KMS key {}: {}", request.key_id, e);
+                error!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "cancel_delete_key",
+                    key_id = %request.key_id,
+                    result = "failed",
+                    error = %e,
+                    "admin kms keys state"
+                );
                 let response = CancelKmsKeyDeletionResponse {
                     success: false,
                     message: format!("Failed to cancel key deletion: {e}"),
@@ -995,7 +1082,7 @@ impl Operation for ListKmsKeysHandler {
         let Some(service_manager) = kms_service_manager_from_context() else {
             let response = ListKmsKeysResponse {
                 success: false,
-                message: "KMS service manager not initialized".to_string(),
+                message: "kms service manager is not initialized".to_string(),
                 keys: vec![],
                 truncated: false,
                 next_marker: None,
@@ -1010,7 +1097,7 @@ impl Operation for ListKmsKeysHandler {
         let Some(manager) = service_manager.get_manager().await else {
             let response = ListKmsKeysResponse {
                 success: false,
-                message: "KMS service not running".to_string(),
+                message: "kms service is not running".to_string(),
                 keys: vec![],
                 truncated: false,
                 next_marker: None,
@@ -1031,10 +1118,18 @@ impl Operation for ListKmsKeysHandler {
 
         match manager.list_keys(kms_request).await {
             Ok(kms_response) => {
-                info!("Listed {} KMS keys", kms_response.keys.len());
+                info!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "list_keys",
+                    state = "completed",
+                    key_count = kms_response.keys.len(),
+                    "admin kms keys state"
+                );
                 let response = ListKmsKeysResponse {
                     success: true,
-                    message: "Keys listed successfully".to_string(),
+                    message: "keys listed successfully".to_string(),
                     keys: kms_response.keys,
                     truncated: kms_response.truncated,
                     next_marker: kms_response.next_marker,
@@ -1049,10 +1144,18 @@ impl Operation for ListKmsKeysHandler {
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
             Err(e) => {
-                error!("Failed to list KMS keys: {}", e);
+                error!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "list_keys",
+                    result = "failed",
+                    error = %e,
+                    "admin kms keys state"
+                );
                 let response = ListKmsKeysResponse {
                     success: false,
-                    message: format!("Failed to list keys: {e}"),
+                    message: format!("failed to list keys: {e}"),
                     keys: vec![],
                     truncated: false,
                     next_marker: None,
@@ -1103,7 +1206,7 @@ impl Operation for DescribeKmsKeyHandler {
         let Some(key_id) = params.get("key_id") else {
             let response = DescribeKmsKeyResponse {
                 success: false,
-                message: "missing keyId parameter".to_string(),
+                message: "missing required parameter: 'keyId'".to_string(),
                 key_metadata: None,
             };
             let data =
@@ -1116,7 +1219,7 @@ impl Operation for DescribeKmsKeyHandler {
         let Some(service_manager) = kms_service_manager_from_context() else {
             let response = DescribeKmsKeyResponse {
                 success: false,
-                message: "KMS service manager not initialized".to_string(),
+                message: "kms service manager is not initialized".to_string(),
                 key_metadata: None,
             };
             let data =
@@ -1129,7 +1232,7 @@ impl Operation for DescribeKmsKeyHandler {
         let Some(manager) = service_manager.get_manager().await else {
             let response = DescribeKmsKeyResponse {
                 success: false,
-                message: "KMS service not running".to_string(),
+                message: "kms service is not running".to_string(),
                 key_metadata: None,
             };
             let data =
@@ -1145,7 +1248,15 @@ impl Operation for DescribeKmsKeyHandler {
 
         match manager.describe_key(kms_request).await {
             Ok(kms_response) => {
-                info!("Described KMS key: {}", key_id);
+                info!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "describe_key",
+                    key_id = %key_id,
+                    state = "completed",
+                    "admin kms keys state"
+                );
                 let response = DescribeKmsKeyResponse {
                     success: true,
                     message: "Key described successfully".to_string(),
@@ -1161,7 +1272,16 @@ impl Operation for DescribeKmsKeyHandler {
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
             Err(e) => {
-                error!("Failed to describe KMS key {}: {}", key_id, e);
+                error!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "describe_key",
+                    key_id = %key_id,
+                    result = "failed",
+                    error = %e,
+                    "admin kms keys state"
+                );
                 let status = match &e {
                     KmsError::KeyNotFound { .. } => StatusCode::NOT_FOUND,
                     KmsError::InvalidOperation { .. } => StatusCode::BAD_REQUEST,

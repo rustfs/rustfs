@@ -655,7 +655,7 @@ where
             state = "requested",
             username = %masked_username,
             path = %path_str,
-            "ftps object delete state changed"
+            "FTPS delete requested"
         );
 
         let (bucket, key) = self
@@ -749,7 +749,7 @@ where
                     username = %masked_username,
                     path = %path_str,
                     bucket = %bucket,
-                    "ftps directory state changed"
+                    "FTPS directory created"
                 );
                 Ok(())
             }
@@ -793,7 +793,7 @@ where
                     state = "removed",
                     path = %path_str,
                     bucket = %bucket,
-                    "ftps directory state changed"
+                    "FTPS directory removed"
                 );
                 Ok(())
             }
@@ -807,7 +807,7 @@ where
                         subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
                         state = "already_removed",
                         bucket = %bucket,
-                        "ftps directory state changed"
+                        "FTPS directory already removed"
                     );
                     Ok(())
                 } else {
@@ -877,7 +877,7 @@ where
             username = %MaskedAccessKey(&user.username),
             from = %from_str,
             to = %to_str,
-            "ftps rename state changed"
+            "FTPS rename unsupported"
         );
 
         Err(Error::new(
