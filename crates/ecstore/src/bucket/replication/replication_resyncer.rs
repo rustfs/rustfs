@@ -2593,6 +2593,10 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
         name: object.clone(),
         user_tags: roi.user_tags.clone(),
         ssec: roi.ssec,
+        op_type: roi.op_type,
+        // ExistingObject ops must respect per-rule ExistingObjectReplicationStatus.
+        // Heal ops intentionally bypass it (repairing a past failure is not an initial sync).
+        existing_object: roi.op_type == ReplicationType::ExistingObject,
         ..Default::default()
     });
 

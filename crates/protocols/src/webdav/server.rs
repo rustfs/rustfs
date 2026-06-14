@@ -26,6 +26,7 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use rustfs_config::{DEFAULT_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_INTERVAL, ENV_TLS_RELOAD_ENABLE, ENV_TLS_RELOAD_INTERVAL};
 use rustfs_tls_runtime::{ReloadableServerCertResolver, TlsReloadOptions, spawn_server_cert_reload_loop};
+use rustfs_utils::MaskedAccessKey;
 use rustls::ServerConfig;
 use std::convert::Infallible;
 use std::net::IpAddr;
@@ -35,6 +36,16 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
+
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_WEBDAV_SERVER: &str = "webdav_server";
+const LOG_SUBSYSTEM_WEBDAV_AUTH: &str = "webdav_auth";
+const EVENT_WEBDAV_SERVER_STATE: &str = "webdav_server_state";
+const EVENT_WEBDAV_TLS_STATE: &str = "webdav_tls_state";
+const EVENT_WEBDAV_CONNECTION_STATE: &str = "webdav_connection_state";
+const EVENT_WEBDAV_REQUEST_VALIDATION_FAILED: &str = "webdav_request_validation_failed";
+const EVENT_WEBDAV_REQUEST_BODY_FAILED: &str = "webdav_request_body_failed";
+const EVENT_WEBDAV_AUTH_STATE: &str = "webdav_auth_state";
 
 /// WebDAV server implementation
 pub struct WebDavServer<S>
@@ -67,16 +78,39 @@ where
 
     /// Start the WebDAV server
     pub async fn start(&self, mut shutdown_rx: broadcast::Receiver<()>) -> Result<(), WebDavInitError> {
-        info!("Initializing WebDAV server on {}", self.config.bind_addr);
+        info!(
+            event = EVENT_WEBDAV_SERVER_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
+            state = "starting",
+            bind_addr = %self.config.bind_addr,
+            tls_enabled = self.config.tls_enabled,
+            max_body_size = self.config.max_body_size,
+            "webdav server state changed"
+        );
 
         let listener = TcpListener::bind(self.config.bind_addr).await?;
-        info!("WebDAV server listening on {}", self.config.bind_addr);
+        info!(
+            event = EVENT_WEBDAV_SERVER_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
+            state = "listening",
+            bind_addr = %self.config.bind_addr,
+            "webdav server state changed"
+        );
         let (reload_shutdown_tx, reload_shutdown_rx) = watch::channel(false);
 
         // Setup TLS if enabled
         let tls_acceptor = if self.config.tls_enabled {
             if let Some(cert_dir) = &self.config.cert_dir {
-                debug!("Enabling WebDAV TLS with certificates from: {}", cert_dir);
+                debug!(
+                    event = EVENT_WEBDAV_TLS_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
+                    state = "enabled",
+                    cert_dir = %cert_dir,
+                    "webdav tls state changed"
+                );
 
                 let resolver = ReloadableServerCertResolver::load_from_directory(cert_dir)
                     .map_err(|e| WebDavInitError::Tls(format!("Failed to create certificate resolver: {}", e)))?;
@@ -118,28 +152,67 @@ where
                                         Ok(tls_stream) => {
                                             let io = TokioIo::new(tls_stream);
                                             if let Err(e) = Self::handle_connection_impl(io, storage, source_ip, max_body_size).await {
-                                                debug!("Connection error: {}", e);
+                                                debug!(
+                                                    event = EVENT_WEBDAV_CONNECTION_STATE,
+                                                    component = LOG_COMPONENT_PROTOCOLS,
+                                                    subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
+                                                    result = "error",
+                                                    peer = %source_ip,
+                                                    transport = "tls",
+                                                    error = %e,
+                                                    "webdav connection ended with error"
+                                                );
                                             }
                                         }
                                         Err(e) => {
-                                            debug!("TLS handshake failed: {}", e);
+                                            debug!(
+                                                event = EVENT_WEBDAV_CONNECTION_STATE,
+                                                component = LOG_COMPONENT_PROTOCOLS,
+                                                subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
+                                                result = "tls_handshake_failed",
+                                                peer = %source_ip,
+                                                error = %e,
+                                                "webdav connection ended with error"
+                                            );
                                         }
                                     }
                                 } else {
                                     let io = TokioIo::new(stream);
                                     if let Err(e) = Self::handle_connection_impl(io, storage, source_ip, max_body_size).await {
-                                        debug!("Connection error: {}", e);
+                                        debug!(
+                                            event = EVENT_WEBDAV_CONNECTION_STATE,
+                                            component = LOG_COMPONENT_PROTOCOLS,
+                                            subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
+                                            result = "error",
+                                            peer = %source_ip,
+                                            transport = "tcp",
+                                            error = %e,
+                                            "webdav connection ended with error"
+                                        );
                                     }
                                 }
                             });
                         }
                         Err(e) => {
-                            error!("Failed to accept connection: {}", e);
+                            error!(
+                                event = EVENT_WEBDAV_CONNECTION_STATE,
+                                component = LOG_COMPONENT_PROTOCOLS,
+                                subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
+                                result = "accept_failed",
+                                error = %e,
+                                "webdav connection accept failed"
+                            );
                         }
                     }
                 }
                 _ = shutdown_rx.recv() => {
-                    info!("WebDAV server received shutdown signal");
+                    info!(
+                        event = EVENT_WEBDAV_SERVER_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
+                        state = "shutdown_requested",
+                        "webdav server state changed"
+                    );
                     let _ = reload_shutdown_tx.send(true);
                     break;
                 }
@@ -147,7 +220,13 @@ where
         }
 
         let _ = reload_shutdown_tx.send(true);
-        info!("WebDAV server stopped");
+        info!(
+            event = EVENT_WEBDAV_SERVER_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
+            state = "stopped",
+            "webdav server state changed"
+        );
         Ok(())
     }
 
@@ -184,7 +263,16 @@ where
             && let Ok(length) = length_str.parse::<u64>()
             && length > max_body_size
         {
-            warn!("Request body too large: {} > {}", length, max_body_size);
+            warn!(
+                event = EVENT_WEBDAV_REQUEST_VALIDATION_FAILED,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
+                result = "payload_too_large",
+                content_length = length,
+                max_body_size,
+                source_ip = %source_ip,
+                "webdav request validation failed"
+            );
             return Ok(error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 &format!("Request body too large. Maximum size is {} bytes", max_body_size),
@@ -233,7 +321,15 @@ where
         let body_bytes = match body.collect().await {
             Ok(collected) => collected.to_bytes(),
             Err(e) => {
-                error!("Failed to read request body: {}", e);
+                error!(
+                    event = EVENT_WEBDAV_REQUEST_BODY_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
+                    result = "request_body_read_failed",
+                    source_ip = %source_ip,
+                    error = %e,
+                    "webdav request body failed"
+                );
                 return Ok(error_response(StatusCode::BAD_REQUEST, "Failed to read request body"));
             }
         };
@@ -249,7 +345,15 @@ where
         let body_bytes = match body.collect().await {
             Ok(collected) => collected.to_bytes(),
             Err(e) => {
-                error!("Failed to read response body: {}", e);
+                error!(
+                    event = EVENT_WEBDAV_REQUEST_BODY_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
+                    result = "response_body_read_failed",
+                    source_ip = %source_ip,
+                    error = %e,
+                    "webdav request body failed"
+                );
                 return Ok(error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"));
             }
         };
@@ -261,10 +365,19 @@ where
     async fn authenticate(access_key: &str, secret_key: &str, source_ip: IpAddr) -> Result<SessionContext, WebDavInitError> {
         use rustfs_credentials::Credentials as S3Credentials;
         use rustfs_iam::get;
+        let masked_access_key = MaskedAccessKey(access_key);
 
         // Access IAM system
         let iam_sys = get().map_err(|e| {
-            error!("IAM system unavailable during WebDAV auth: {}", e);
+            error!(
+                event = EVENT_WEBDAV_AUTH_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_WEBDAV_AUTH,
+                result = "iam_unavailable",
+                source_ip = %source_ip,
+                error = %e,
+                "webdav auth state changed"
+            );
             WebDavInitError::Server("Internal authentication service unavailable".to_string())
         })?;
 
@@ -282,26 +395,67 @@ where
         };
 
         let (user_identity, is_valid) = iam_sys.check_key(&s3_creds.access_key).await.map_err(|e| {
-            error!("IAM check_key failed for {}: {}", access_key, e);
+            error!(
+                event = EVENT_WEBDAV_AUTH_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_WEBDAV_AUTH,
+                result = "check_key_failed",
+                source_ip = %source_ip,
+                access_key = %masked_access_key,
+                error = %e,
+                "webdav auth state changed"
+            );
             WebDavInitError::Server("Authentication verification failed".to_string())
         })?;
 
         if !is_valid {
-            warn!("WebDAV login failed: Invalid access key '{}'", access_key);
+            warn!(
+                event = EVENT_WEBDAV_AUTH_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_WEBDAV_AUTH,
+                result = "invalid_access_key",
+                source_ip = %source_ip,
+                access_key = %masked_access_key,
+                "webdav auth state changed"
+            );
             return Err(WebDavInitError::Server("Invalid credentials".to_string()));
         }
 
         let identity = user_identity.ok_or_else(|| {
-            error!("User identity missing despite valid key for {}", access_key);
+            error!(
+                event = EVENT_WEBDAV_AUTH_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_WEBDAV_AUTH,
+                result = "identity_missing",
+                source_ip = %source_ip,
+                access_key = %masked_access_key,
+                "webdav auth state changed"
+            );
             WebDavInitError::Server("User not found".to_string())
         })?;
 
         if !identity.credentials.secret_key.eq(&s3_creds.secret_key) {
-            warn!("WebDAV login failed: Invalid secret key for '{}'", access_key);
+            warn!(
+                event = EVENT_WEBDAV_AUTH_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_WEBDAV_AUTH,
+                result = "invalid_secret_key",
+                source_ip = %source_ip,
+                access_key = %masked_access_key,
+                "webdav auth state changed"
+            );
             return Err(WebDavInitError::Server("Invalid credentials".to_string()));
         }
 
-        info!("WebDAV user '{}' authenticated successfully", access_key);
+        debug!(
+            event = EVENT_WEBDAV_AUTH_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_WEBDAV_AUTH,
+            result = "authenticated",
+            source_ip = %source_ip,
+            access_key = %masked_access_key,
+            "webdav auth state changed"
+        );
 
         Ok(SessionContext::new(
             ProtocolPrincipal::new(Arc::new(identity)),

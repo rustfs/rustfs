@@ -53,6 +53,11 @@ use super::{SwiftError, SwiftResult};
 use std::collections::HashMap;
 use tracing::{debug, warn};
 
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SWIFT_SYNC: &str = "swift_sync";
+const EVENT_SWIFT_SYNC_CONFIG_STATE: &str = "swift_sync_config_state";
+const EVENT_SWIFT_SYNC_RETRY_STATE: &str = "swift_sync_retry_state";
+
 /// Container sync configuration
 #[derive(Debug, Clone, PartialEq)]
 pub struct SyncConfig {
@@ -109,12 +114,19 @@ impl SyncConfig {
 
         // Warn if using HTTP instead of HTTPS
         if self.sync_to.starts_with("http://") {
-            warn!("Container sync using unencrypted HTTP - consider using HTTPS");
+            warn!(event = EVENT_SWIFT_SYNC_CONFIG_STATE, component = LOG_COMPONENT_PROTOCOLS, subsystem = LOG_SUBSYSTEM_SWIFT_SYNC, result = "unencrypted_http", sync_to = %self.sync_to, "swift sync config state changed");
         }
 
         // Validate key length (recommend at least 16 characters)
         if self.sync_key.len() < 16 {
-            warn!("Container sync key is short (<16 chars) - recommend longer key");
+            warn!(
+                event = EVENT_SWIFT_SYNC_CONFIG_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SWIFT_SYNC,
+                result = "short_key",
+                key_length = self.sync_key.len(),
+                "swift sync config state changed"
+            );
         }
 
         Ok(())
@@ -211,7 +223,7 @@ impl SyncQueueEntry {
         let backoff_seconds = std::cmp::min(60 * (1 << (self.retry_count - 1)), 3600);
         self.next_retry = current_time + backoff_seconds;
 
-        debug!("Scheduled retry #{} for '{}' at +{}s", self.retry_count, self.object, backoff_seconds);
+        debug!(event = EVENT_SWIFT_SYNC_RETRY_STATE, component = LOG_COMPONENT_PROTOCOLS, subsystem = LOG_SUBSYSTEM_SWIFT_SYNC, state = "scheduled", retry_count = self.retry_count, object = %self.object, backoff_seconds, "swift sync retry state changed");
     }
 
     /// Check if ready for retry

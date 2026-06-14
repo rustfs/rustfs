@@ -318,4 +318,77 @@ mod tests {
 
         assert_eq!(arns, vec!["arn:legacy:target".to_string()]);
     }
+
+    fn replication_rule_existing_object_disabled(id: &str, arn: &str) -> ReplicationRule {
+        ReplicationRule {
+            delete_marker_replication: Some(DeleteMarkerReplication::default()),
+            delete_replication: None,
+            destination: Destination {
+                bucket: arn.to_string(),
+                ..Default::default()
+            },
+            existing_object_replication: Some(ExistingObjectReplication {
+                status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::DISABLED),
+            }),
+            filter: None,
+            id: Some(id.to_string()),
+            prefix: Some(String::new()),
+            priority: Some(1),
+            source_selection_criteria: None,
+            status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+        }
+    }
+
+    // Regression test for BUG-3: replicate_object was calling filter_target_arns with
+    // existing_object:false regardless of op_type, letting ExistingObject resync operations
+    // fan out to targets whose rule has ExistingObjectReplicationStatus::DISABLED.
+    #[test]
+    fn filter_target_arns_excludes_disabled_existing_object_target_for_existing_object_op() {
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                replication_rule("rule-enabled", "arn:target:enabled"),
+                replication_rule_existing_object_disabled("rule-disabled", "arn:target:disabled"),
+            ],
+        };
+
+        let arns = config.filter_target_arns(&ObjectOpts {
+            name: "object".to_string(),
+            op_type: ReplicationType::ExistingObject,
+            existing_object: true,
+            ..Default::default()
+        });
+
+        assert_eq!(arns.len(), 1, "only the ENABLED target should be returned for ExistingObject ops");
+        assert!(arns.contains(&"arn:target:enabled".to_string()));
+        assert!(!arns.contains(&"arn:target:disabled".to_string()));
+    }
+
+    // Heal operations intentionally bypass ExistingObjectReplicationStatus — healing a past
+    // failure is not subject to the existing-object opt-out.
+    #[test]
+    fn filter_target_arns_includes_disabled_existing_object_target_for_heal_op() {
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                replication_rule("rule-enabled", "arn:target:enabled"),
+                replication_rule_existing_object_disabled("rule-disabled", "arn:target:disabled"),
+            ],
+        };
+
+        let arns = config.filter_target_arns(&ObjectOpts {
+            name: "object".to_string(),
+            op_type: ReplicationType::Heal,
+            existing_object: false,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            arns.len(),
+            2,
+            "Heal ops must reach all targets regardless of existing_object_replication setting"
+        );
+        assert!(arns.contains(&"arn:target:enabled".to_string()));
+        assert!(arns.contains(&"arn:target:disabled".to_string()));
+    }
 }

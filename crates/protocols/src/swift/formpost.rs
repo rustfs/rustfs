@@ -85,6 +85,10 @@ use sha1::Sha1;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SWIFT_FORMPOST: &str = "swift_formpost";
+const EVENT_SWIFT_FORMPOST_STATE: &str = "swift_formpost_state";
+
 type HmacSha1 = Hmac<Sha1>;
 
 /// FormPost request parameters
@@ -206,7 +210,13 @@ pub fn validate_formpost(path: &str, request: &FormPostRequest, key: &str) -> Sw
     )?;
 
     if request.signature != expected_sig {
-        debug!("FormPost signature mismatch: expected={}, got={}", expected_sig, request.signature);
+        debug!(
+            event = EVENT_SWIFT_FORMPOST_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_FORMPOST,
+            result = "signature_mismatch",
+            "swift formpost state changed"
+        );
         return Err(SwiftError::Unauthorized("Invalid FormPost signature".to_string()));
     }
 
@@ -433,7 +443,16 @@ pub async fn handle_formpost(
 
         match super::object::put_object(account, container, object_name, credentials, reader, &upload_headers).await {
             Ok(_) => {
-                debug!("FormPost uploaded: {}/{}/{}", account, container, object_name);
+                debug!(
+                    event = EVENT_SWIFT_FORMPOST_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SWIFT_FORMPOST,
+                    state = "uploaded",
+                    account = %account,
+                    container = %container,
+                    object = %object_name,
+                    "swift formpost state changed"
+                );
             }
             Err(e) => {
                 upload_errors.push(format!("{}: {}", file.filename, e));

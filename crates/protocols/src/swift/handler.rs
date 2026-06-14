@@ -35,6 +35,11 @@ use tokio_util::io::StreamReader;
 use tower::Service;
 use tracing::{debug, instrument};
 
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SWIFT_HANDLER: &str = "swift_handler";
+const EVENT_SWIFT_ROUTE_STATE: &str = "swift_route_state";
+const EVENT_SWIFT_TEMPURL_STATE: &str = "swift_tempurl_state";
+
 /// Swift-aware service that routes to Swift handlers or S3 service
 #[derive(Clone)]
 pub struct SwiftService<S> {
@@ -75,7 +80,14 @@ where
         let uri = req.uri();
 
         if let Some(route) = self.router.route(uri, method.clone()) {
-            debug!("Swift route matched: {:?}", route);
+            debug!(
+                event = EVENT_SWIFT_ROUTE_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SWIFT_HANDLER,
+                state = "matched",
+                route = ?route,
+                "swift route state changed"
+            );
 
             // Extract credentials from Keystone task-local storage (if available)
             // This is consistent with how S3 auth handler retrieves Keystone credentials
@@ -98,7 +110,13 @@ where
         }
 
         // Not a Swift request, delegate to S3 service
-        debug!("No Swift route matched, delegating to S3 service");
+        debug!(
+            event = EVENT_SWIFT_ROUTE_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_HANDLER,
+            state = "delegated_to_s3",
+            "swift route state changed"
+        );
         let mut s3_service = self.s3_service.clone();
         Box::pin(async move { s3_service.call(req).await.map_err(Into::into) })
     }
@@ -127,7 +145,16 @@ async fn handle_swift_request(
         && let Some(tempurl_params) = tempurl::TempURLParams::from_query(query)
     {
         // TempURL detected - validate it
-        debug!("TempURL detected for {}/{}/{}", account, container, object);
+        debug!(
+            event = EVENT_SWIFT_TEMPURL_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_HANDLER,
+            state = "detected",
+            account = %account,
+            container = %container,
+            object = %object,
+            "swift tempurl state changed"
+        );
 
         // Get account TempURL key
         let tempurl_key = super::account::get_tempurl_key(account, &credentials).await?;
@@ -140,7 +167,16 @@ async fn handle_swift_request(
             tempurl.validate_request(method.as_str(), path, &tempurl_params)?;
 
             // TempURL is valid - proceed with request (no credentials needed)
-            debug!("TempURL validated successfully");
+            debug!(
+                event = EVENT_SWIFT_TEMPURL_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SWIFT_HANDLER,
+                result = "validated",
+                account = %account,
+                container = %container,
+                object = %object,
+                "swift tempurl state changed"
+            );
 
             // Reconstruct request for object operation
             let req = Request::from_parts(parts, body);
@@ -904,7 +940,14 @@ async fn handle_authenticated_request(
                         .await
                         .unwrap_or_else(|e| {
                             // Log restore error but don't fail the DELETE
-                            tracing::warn!("Failed to restore version after delete: {}", e);
+                            tracing::warn!(
+                                event = EVENT_SWIFT_TEMPURL_STATE,
+                                component = LOG_COMPONENT_PROTOCOLS,
+                                subsystem = LOG_SUBSYSTEM_SWIFT_HANDLER,
+                                result = "restore_after_delete_failed",
+                                error = %e,
+                                "swift tempurl state changed"
+                            );
                             false
                         });
 

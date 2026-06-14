@@ -30,6 +30,10 @@ use std::path::Path;
 use std::time::SystemTime;
 use tracing::debug;
 
+const LOG_COMPONENT_OBS: &str = "obs";
+const LOG_SUBSYSTEM_LOG_CLEANER: &str = "log_cleaner";
+const EVENT_LOG_CLEANER_SCAN_STATE: &str = "log_cleaner_scan_state";
+
 /// Result of a single pass directory scan.
 ///
 /// Separating regular logs from compressed archives keeps the selection logic
@@ -125,7 +129,7 @@ pub(super) fn scan_log_directory(
 
         // 2. Check exclusion patterns early.
         if is_excluded(filename, exclude_patterns) {
-            debug!("Excluding file from cleanup: {:?}", filename);
+            debug!(event = EVENT_LOG_CLEANER_SCAN_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, state = "excluded", filename = %filename, "log cleaner scan state changed");
             continue;
         }
 
@@ -171,12 +175,12 @@ pub(super) fn scan_log_directory(
         if !is_compressed && file_size == 0 && delete_empty_files {
             if !dry_run {
                 if let Err(e) = fs::remove_file(&path) {
-                    tracing::warn!("Failed to delete empty file {:?}: {}", path, e);
+                    tracing::warn!(event = EVENT_LOG_CLEANER_SCAN_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, result = "empty_file_delete_failed", path = ?path, error = %e, "log cleaner scan state changed");
                 } else {
-                    debug!("Deleted empty file: {:?}", path);
+                    debug!(event = EVENT_LOG_CLEANER_SCAN_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, state = "empty_file_deleted", path = ?path, "log cleaner scan state changed");
                 }
             } else {
-                tracing::info!("[DRY RUN] Would delete empty file: {:?}", path);
+                tracing::info!(event = EVENT_LOG_CLEANER_SCAN_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, state = "dry_run_empty_file_delete", path = ?path, "log cleaner scan state changed");
             }
             continue;
         }

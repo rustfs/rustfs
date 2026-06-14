@@ -56,7 +56,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_REPLICATION: &str = "replication";
@@ -65,6 +65,7 @@ const EVENT_REPLICATION_WORKER_RESIZED: &str = "replication_worker_resized";
 const EVENT_REPLICATION_BACKPRESSURE: &str = "replication_backpressure";
 const EVENT_REPLICATION_RESYNC_LOAD_SKIPPED: &str = "replication_resync_load_skipped";
 const EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED: &str = "replication_config_lookup_skipped";
+const EVENT_REPLICATION_MRF_QUEUE_OVERFLOW: &str = "replication_mrf_queue_overflow";
 
 // Worker limits
 pub const WORKER_MAX_LIMIT: usize = 500;
@@ -588,6 +589,14 @@ impl<S: StorageAPI + NamespaceLocking> ReplicationPool<S> {
                     let admission = if self.mrf_save_tx.try_send(ri.to_mrf_entry()).is_ok() {
                         ReplicationQueueAdmission::Queued
                     } else {
+                        warn!(
+                            event = EVENT_REPLICATION_MRF_QUEUE_OVERFLOW,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_REPLICATION,
+                            bucket = %ri.bucket,
+                            object = %ri.name,
+                            "MRF queue full — large-worker replication failure entry dropped and will not be retried"
+                        );
                         ReplicationQueueAdmission::Missed
                     };
 
@@ -627,6 +636,14 @@ impl<S: StorageAPI + NamespaceLocking> ReplicationPool<S> {
         let admission = if self.mrf_save_tx.try_send(ri.to_mrf_entry()).is_ok() {
             ReplicationQueueAdmission::Queued
         } else {
+            warn!(
+                event = EVENT_REPLICATION_MRF_QUEUE_OVERFLOW,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                bucket = %ri.bucket,
+                object = %ri.name,
+                "MRF queue full — replication failure entry dropped and will not be retried"
+            );
             ReplicationQueueAdmission::Missed
         };
 
@@ -703,6 +720,14 @@ impl<S: StorageAPI + NamespaceLocking> ReplicationPool<S> {
         let admission = if self.mrf_save_tx.try_send(doi.to_mrf_entry()).is_ok() {
             ReplicationQueueAdmission::Queued
         } else {
+            warn!(
+                event = EVENT_REPLICATION_MRF_QUEUE_OVERFLOW,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                bucket = %doi.bucket,
+                object = %doi.delete_object.object_name,
+                "MRF queue full — delete replication failure entry dropped and will not be retried"
+            );
             ReplicationQueueAdmission::Missed
         };
 
@@ -749,7 +774,14 @@ impl<S: StorageAPI + NamespaceLocking> ReplicationPool<S> {
 
     /// Queues an MRF save operation
     async fn queue_mrf_save(&self, entry: MrfReplicateEntry) {
-        let _ = self.mrf_save_tx.try_send(entry);
+        if self.mrf_save_tx.try_send(entry).is_err() {
+            warn!(
+                event = EVENT_REPLICATION_MRF_QUEUE_OVERFLOW,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                "MRF queue full — replication failure entry dropped and will not be retried"
+            );
+        }
     }
 
     /// Starts the MRF processor background task

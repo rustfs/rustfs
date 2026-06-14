@@ -64,6 +64,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SWIFT_RATELIMIT: &str = "swift_ratelimit";
+const EVENT_SWIFT_RATELIMIT_STATE: &str = "swift_ratelimit_state";
+
 /// Rate limit configuration
 #[derive(Debug, Clone, PartialEq)]
 pub struct RateLimit {
@@ -221,11 +225,11 @@ impl RateLimiter {
 
         match bucket.try_consume() {
             Ok(remaining) => {
-                debug!("Rate limit OK for {}: {} remaining", key, remaining);
+                debug!(event = EVENT_SWIFT_RATELIMIT_STATE, component = LOG_COMPONENT_PROTOCOLS, subsystem = LOG_SUBSYSTEM_SWIFT_RATELIMIT, key = %key, remaining, result = "allowed", "swift ratelimit state changed");
                 Ok((remaining, reset))
             }
             Err(retry_after) => {
-                debug!("Rate limit exceeded for {}: retry after {} seconds", key, retry_after);
+                debug!(event = EVENT_SWIFT_RATELIMIT_STATE, component = LOG_COMPONENT_PROTOCOLS, subsystem = LOG_SUBSYSTEM_SWIFT_RATELIMIT, key = %key, retry_after, result = "limited", "swift ratelimit state changed");
                 Err(SwiftError::TooManyRequests {
                     retry_after,
                     limit: rate_limit.limit,

@@ -17,7 +17,7 @@
 use http::HeaderMap;
 use rustfs_credentials::Credentials;
 use rustfs_keystone::{KeystoneAuthProvider, KeystoneClient, KeystoneConfig, KeystoneIdentityMapper};
-use rustfs_obs::MaskedAccessKey;
+use rustfs_utils::MaskedAccessKey;
 use s3s::{S3Result, s3_error};
 use std::sync::{Arc, OnceLock};
 use tracing::{error, info};

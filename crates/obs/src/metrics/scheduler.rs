@@ -94,6 +94,10 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+const LOG_COMPONENT_OBS: &str = "obs";
+const LOG_SUBSYSTEM_METRICS_RUNTIME: &str = "metrics_runtime";
+const EVENT_METRICS_RUNTIME_STATE: &str = "metrics_runtime_state";
+
 /// Default interval for system monitoring metrics (15 seconds)
 const DEFAULT_SYSTEM_METRICS_INTERVAL: Duration = Duration::from_secs(15);
 /// Environment variable for system monitoring interval
@@ -497,7 +501,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                     report_metrics(&metrics);
                 }
                 _ = token_clone.cancelled() => {
-                    warn!("Metrics collection for cluster stats cancelled.");
+                    warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "cluster_stats", state = "cancelled", "metrics runtime state changed");
                     return;
                 }
             }
@@ -537,7 +541,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                     }
                 }
                 _ = token_clone.cancelled() => {
-                    warn!("Metrics collection for supplementary cluster stats cancelled.");
+                    warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "supplementary_cluster_stats", state = "cancelled", "metrics runtime state changed");
                     return;
                 }
             }
@@ -556,7 +560,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                     report_metrics(&metrics);
                 }
                 _ = token_clone.cancelled() => {
-                    warn!("Metrics collection for bucket stats cancelled.");
+                    warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "bucket_stats", state = "cancelled", "metrics runtime state changed");
                     return;
                 }
             }
@@ -577,7 +581,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                     report_metrics(&metrics);
                 }
                 _ = token_clone.cancelled() => {
-                    warn!("Metrics collection for node/disk stats cancelled.");
+                    warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "node_disk_stats", state = "cancelled", "metrics runtime state changed");
                     return;
                 }
             }
@@ -601,7 +605,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                     let current_live_keys = repl_bw_live_keys(&stats);
 
                     if !monitor_available {
-                        warn!("Bucket monitor unavailable; skip replication bandwidth key-state transition this cycle.");
+                        warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "bucket_replication_bandwidth", result = "bucket_monitor_unavailable", "metrics runtime state changed");
                     }
                     update_repl_bw_zero_tombstones(
                         monitor_available,
@@ -626,7 +630,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                     expire_repl_bw_zero_tombstones(monitor_available, &mut zero_tombstones);
                 }
                 _ = token_clone.cancelled() => {
-                    warn!("Metrics collection for bucket replication bandwidth stats cancelled.");
+                    warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "bucket_replication_bandwidth", state = "cancelled", "metrics runtime state changed");
                     return;
                 }
             }
@@ -653,7 +657,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                     report_metrics(&metrics);
                 }
                 _ = token_clone.cancelled() => {
-                    warn!("Metrics collection for audit target stats cancelled.");
+                    warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "audit_target_stats", state = "cancelled", "metrics runtime state changed");
                     return;
                 }
             }
@@ -689,7 +693,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                     report_metrics(&metrics);
                 }
                 _ = token_clone.cancelled() => {
-                    warn!("Metrics collection for notification stats cancelled.");
+                    warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "notification_stats", state = "cancelled", "metrics runtime state changed");
                     return;
                 }
             }
@@ -718,7 +722,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                     }
                 }
                 _ = token_clone.cancelled() => {
-                    warn!("Metrics collection for background workflow stats cancelled.");
+                    warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "background_workflow_stats", state = "cancelled", "metrics runtime state changed");
                     return;
                 }
             }
@@ -742,7 +746,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         let current_pid = match sysinfo::get_current_pid() {
             Ok(pid) => Some(pid),
             Err(e) => {
-                warn!("Failed to get current PID for system monitoring: {}", e);
+                warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "system_monitoring", result = "current_pid_unavailable", error = %e, "metrics runtime state changed");
                 None
             }
         };
@@ -776,11 +780,11 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                                         metrics.extend(collect_gpu_metrics(&gpu_stats, &labels));
                                     }
                                     Err(e) => {
-                                        warn!("GPU metrics collection failed: {}", e);
+                                        warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "gpu_metrics", result = "collect_failed", error = %e, "metrics runtime state changed");
                                     }
                                 },
                                 Err(e) => {
-                                    warn!("GPU collector initialization failed: {}", e);
+                                    warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "gpu_metrics", result = "collector_init_failed", error = %e, "metrics runtime state changed");
                                 }
                             }
                         }
@@ -790,7 +794,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                     }
                 }
                 _ = token_clone.cancelled() => {
-                    warn!("Process metrics collection cancelled.");
+                    warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "process_metrics", state = "cancelled", "metrics runtime state changed");
                     return;
                 }
             }
@@ -812,7 +816,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                     }
                 }
                 _ = token_clone.cancelled() => {
-                    warn!("Metrics collection for internode network stats cancelled.");
+                    warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "internode_network_stats", state = "cancelled", "metrics runtime state changed");
                     return;
                 }
             }
@@ -865,7 +869,7 @@ fn current_process_metric_labels() -> Vec<(&'static str, Cow<'static, str>)> {
 }
 
 fn fallback_process_metric_labels(err: ProcessAttributeError) -> Vec<(&'static str, Cow<'static, str>)> {
-    warn!("Failed to collect process attributes for metrics labels: {}", err);
+    warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "process_metric_labels", result = "collect_failed", error = %err, "metrics runtime state changed");
     vec![
         ("process_pid", Cow::Owned(std::process::id().to_string())),
         ("process_executable_name", Cow::Borrowed("unknown")),
