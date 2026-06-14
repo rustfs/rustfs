@@ -472,7 +472,7 @@ where
         if !allowed_keys.contains(key) {
             return Err(s3_error!(
                 InvalidArgument,
-                "key '{}' not allowed for {} type '{}'",
+                "key '{}' is not allowed for {} type '{}'",
                 key,
                 target_label,
                 target_type
@@ -492,7 +492,7 @@ where
 pub(crate) async fn validate_queue_dir(queue_dir: &str) -> S3Result<()> {
     if !queue_dir.is_empty() {
         if !Path::new(queue_dir).is_absolute() {
-            return Err(s3_error!(InvalidArgument, "queue_dir must be absolute path"));
+            return Err(s3_error!(InvalidArgument, "queue_dir must be an absolute path"));
         }
         retry_with_backoff(
             || async { tokio::fs::metadata(queue_dir).await.map(|_| ()) },
@@ -502,7 +502,7 @@ pub(crate) async fn validate_queue_dir(queue_dir: &str) -> S3Result<()> {
         .await
         .map_err(|e| match e.kind() {
             ErrorKind::NotFound => s3_error!(InvalidArgument, "queue_dir does not exist"),
-            ErrorKind::PermissionDenied => s3_error!(InvalidArgument, "queue_dir exists but permission denied"),
+            ErrorKind::PermissionDenied => s3_error!(InvalidArgument, "queue_dir exists but permission is denied"),
             _ => s3_error!(InvalidArgument, "failed to access queue_dir: {}", e),
         })?;
     }
@@ -533,7 +533,7 @@ where
         .ok_or_else(|| s3_error!(InvalidArgument, "unsupported target type: '{}'", target_type))?;
     timeout(Duration::from_secs(10), validate_target_request(spec, &kv_map, default_queue_dir))
         .await
-        .map_err(|_| s3_error!(InvalidArgument, "target validation timed out"))??;
+        .map_err(|_| s3_error!(InvalidArgument, "target validation timed out after 10s"))??;
 
     let mut kvs = KVS::new();
     for (key, value) in kv_map {
@@ -652,13 +652,13 @@ async fn validate_webhook_request(kv_map: &HashMap<String, String>) -> S3Result<
         .get("endpoint")
         .map(String::as_str)
         .ok_or_else(|| s3_error!(InvalidArgument, "endpoint is required"))?;
-    let parsed_endpoint = Url::parse(endpoint).map_err(|e| s3_error!(InvalidArgument, "invalid endpoint url: {}", e))?;
+    let parsed_endpoint = Url::parse(endpoint).map_err(|e| s3_error!(InvalidArgument, "invalid endpoint URL: {}", e))?;
     match parsed_endpoint.scheme() {
         "http" | "https" => {}
         other => {
             return Err(s3_error!(
                 InvalidArgument,
-                "unsupported endpoint scheme: {} (only http and https are allowed)",
+                "unsupported endpoint scheme '{}'; only http and https are allowed",
                 other
             ));
         }
@@ -683,7 +683,7 @@ async fn validate_mqtt_request(kv_map: &HashMap<String, String>) -> S3Result<()>
     let endpoint = kv_map
         .get(MQTT_BROKER)
         .map(String::as_str)
-        .ok_or_else(|| s3_error!(InvalidArgument, "broker endpoint is required"))?;
+        .ok_or_else(|| s3_error!(InvalidArgument, "broker URL is required"))?;
     let topic = kv_map
         .get(MQTT_TOPIC)
         .map(String::as_str)
@@ -701,12 +701,12 @@ async fn validate_mqtt_request(kv_map: &HashMap<String, String>) -> S3Result<()>
     .map_err(|e| s3_error!(InvalidArgument, "invalid MQTT TLS settings: {}", e))?;
     let parsed_broker = Url::parse(endpoint).map_err(|e| s3_error!(InvalidArgument, "invalid broker URL: {}", e))?;
     rustfs_targets::target::mqtt::validate_mqtt_broker_url(&parsed_broker, &tls)
-        .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+        .map_err(|e| s3_error!(InvalidArgument, "invalid broker URL: {}", e))?;
     check_mqtt_broker_available_with_tls(parsed_broker.as_str(), topic, username, password, &tls)
         .await
         .map_err(|e| match e {
-            TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
-            _ => s3_error!(InvalidArgument, "MQTT broker check failed: {}", e),
+            TargetError::Configuration(_) => s3_error!(InvalidArgument, "invalid MQTT configuration: {}", e),
+            _ => s3_error!(InvalidArgument, "mqtt connectivity check failed: {}", e),
         })?;
 
     if let Some(queue_dir) = kv_map.get("queue_dir") {
@@ -755,10 +755,10 @@ async fn validate_nats_request_impl(
         validate_queue_dir(queue_dir.as_str()).await?;
     }
     let args = build_nats_args(&to_kvs(kv_map), default_queue_dir, domain.runtime_target_type())
-        .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+        .map_err(|e| s3_error!(InvalidArgument, "invalid NATS configuration: {}", e))?;
     check_nats_server_available(&args).await.map_err(|e| match e {
-        TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
-        _ => s3_error!(InvalidArgument, "NATS server check failed: {}", e),
+        TargetError::Configuration(_) => s3_error!(InvalidArgument, "invalid NATS configuration: {}", e),
+        _ => s3_error!(InvalidArgument, "nats connectivity check failed: {}", e),
     })
 }
 
@@ -780,17 +780,17 @@ async fn validate_kafka_request_impl(
     }
 
     if !kv_map.contains_key(KAFKA_BROKERS) {
-        return Err(s3_error!(InvalidArgument, "Kafka brokers are required"));
+        return Err(s3_error!(InvalidArgument, "kafka brokers are required"));
     }
     if !kv_map.contains_key(KAFKA_TOPIC) {
-        return Err(s3_error!(InvalidArgument, "Kafka topic is required"));
+        return Err(s3_error!(InvalidArgument, "kafka topic is required"));
     }
 
     let args = build_kafka_args(&to_kvs(kv_map), default_queue_dir, domain.runtime_target_type())
-        .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+        .map_err(|e| s3_error!(InvalidArgument, "invalid Kafka configuration: {}", e))?;
     check_kafka_broker_available(&args).await.map_err(|e| match e {
-        TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
-        _ => s3_error!(InvalidArgument, "Kafka broker check failed: {}", e),
+        TargetError::Configuration(_) => s3_error!(InvalidArgument, "invalid Kafka configuration: {}", e),
+        _ => s3_error!(InvalidArgument, "kafka connectivity check failed: {}", e),
     })
 }
 
@@ -811,10 +811,10 @@ async fn validate_amqp_request_impl(
         validate_queue_dir(queue_dir.as_str()).await?;
     }
     let args = build_amqp_args(&to_kvs(kv_map), default_queue_dir, domain.runtime_target_type())
-        .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+        .map_err(|e| s3_error!(InvalidArgument, "invalid AMQP configuration: {}", e))?;
     check_amqp_broker_available(&args).await.map_err(|e| match e {
-        TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
-        _ => s3_error!(InvalidArgument, "AMQP broker check failed: {}", e),
+        TargetError::Configuration(_) => s3_error!(InvalidArgument, "invalid AMQP configuration: {}", e),
+        _ => s3_error!(InvalidArgument, "amqp connectivity check failed: {}", e),
     })
 }
 
@@ -835,10 +835,10 @@ async fn validate_pulsar_request_impl(
         validate_queue_dir(queue_dir.as_str()).await?;
     }
     let args = build_pulsar_args(&to_kvs(kv_map), default_queue_dir, domain.runtime_target_type())
-        .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+        .map_err(|e| s3_error!(InvalidArgument, "invalid Pulsar configuration: {}", e))?;
     check_pulsar_broker_available(&args).await.map_err(|e| match e {
-        TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
-        _ => s3_error!(InvalidArgument, "Pulsar broker check failed: {}", e),
+        TargetError::Configuration(_) => s3_error!(InvalidArgument, "invalid Pulsar configuration: {}", e),
+        _ => s3_error!(InvalidArgument, "pulsar connectivity check failed: {}", e),
     })
 }
 
@@ -851,11 +851,11 @@ async fn validate_mysql_request(
         validate_queue_dir(queue_dir.as_str()).await?;
     }
 
-    let args =
-        build_mysql_args(&to_kvs(kv_map), default_queue_dir, target_type).map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+    let args = build_mysql_args(&to_kvs(kv_map), default_queue_dir, target_type)
+        .map_err(|e| s3_error!(InvalidArgument, "invalid MySQL configuration: {}", e))?;
     check_mysql_server_available(&args).await.map_err(|e| match e {
-        TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
-        _ => s3_error!(InvalidArgument, "MySQL server check failed: {}", e),
+        TargetError::Configuration(_) => s3_error!(InvalidArgument, "invalid MySQL configuration: {}", e),
+        _ => s3_error!(InvalidArgument, "mysql connectivity check failed: {}", e),
     })
 }
 
@@ -876,10 +876,10 @@ async fn validate_postgres_request_impl(
         validate_queue_dir(queue_dir.as_str()).await?;
     }
     let args = build_postgres_args(&to_kvs(kv_map), default_queue_dir, domain.runtime_target_type())
-        .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+        .map_err(|e| s3_error!(InvalidArgument, "invalid PostgreSQL configuration: {}", e))?;
     check_postgres_server_available(&args).await.map_err(|e| match e {
-        TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
-        _ => s3_error!(InvalidArgument, "PostgreSQL server check failed: {}", e),
+        TargetError::Configuration(_) => s3_error!(InvalidArgument, "invalid PostgreSQL configuration: {}", e),
+        _ => s3_error!(InvalidArgument, "postgres connectivity check failed: {}", e),
     })
 }
 
@@ -894,13 +894,13 @@ async fn validate_redis_request(
     }
 
     validate_redis_config(&to_kvs(kv_map), default_queue_dir, default_channel)
-        .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+        .map_err(|e| s3_error!(InvalidArgument, "invalid Redis configuration: {}", e))?;
 
     let args = build_redis_args(&to_kvs(kv_map), default_queue_dir, default_channel, domain.runtime_target_type())
-        .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+        .map_err(|e| s3_error!(InvalidArgument, "invalid Redis configuration: {}", e))?;
     check_redis_server_available(&args).await.map_err(|e| match e {
-        TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
-        _ => s3_error!(InvalidArgument, "Redis server check failed: {}", e),
+        TargetError::Configuration(_) => s3_error!(InvalidArgument, "invalid Redis configuration: {}", e),
+        _ => s3_error!(InvalidArgument, "redis connectivity check failed: {}", e),
     })
 }
 

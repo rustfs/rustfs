@@ -66,7 +66,7 @@ use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 const LOG_COMPONENT_SCANNER: &str = "scanner";
 const LOG_SUBSYSTEM_FOLDER: &str = "folder";
@@ -639,7 +639,7 @@ impl ScannerItem {
             subsystem = LOG_SUBSYSTEM_LIFECYCLE,
             object_path = %self.object_path(),
             state = "started",
-            "Scanner lifecycle action evaluation started"
+            "Scanner lifecycle evaluation started"
         );
 
         let versioning_config = match BucketVersioningSys::get(&self.bucket).await {
@@ -990,7 +990,7 @@ impl ScannerItem {
                 let age = now - mod_time;
                 age.whole_seconds().max(0)
             });
-            info!(
+            debug!(
                 target: "rustfs::scanner::folder",
                 event = EVENT_SCANNER_HEAL_ADMISSION,
                 component = LOG_COMPONENT_SCANNER,
@@ -1003,7 +1003,7 @@ impl ScannerItem {
                 original_scan_mode = %HealScanMode::Deep.as_str(),
                 effective_scan_mode = %scan_mode.as_str(),
                 state = "downgraded_to_normal",
-                "Scanner heal admission downgraded deep scan during cooldown"
+                "Scanner heal deep scan downgraded"
             );
         }
 
@@ -1688,14 +1688,14 @@ impl FolderScanner {
 
             if found_objects && is_erasure().await {
                 // If we found an object in erasure mode, we skip subdirs (only datadirs)...
-                info!(
+                debug!(
                     target: "rustfs::scanner::folder",
                     event = EVENT_SCANNER_FOLDER_STATE,
                     component = LOG_COMPONENT_SCANNER,
                     subsystem = LOG_SUBSYSTEM_FOLDER,
                     folder = %folder.name,
                     state = "erasure_object_found",
-                    "Scanner folder stopped descending after finding erasure object"
+                    "Scanner folder descent stopped after erasure object"
                 );
                 break;
             }

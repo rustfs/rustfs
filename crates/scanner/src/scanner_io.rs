@@ -900,7 +900,7 @@ impl ScannerIOCache for SetDisks {
                         subsystem = LOG_SUBSYSTEM_IO,
                         bucket = %bucket.name,
                         state = "scan_started",
-                        "Scanner disk bucket state updated"
+                        "Scanner disk bucket scan started"
                     );
 
                     let cache_name = path_join_buf(&[&bucket.name, DATA_USAGE_CACHE_NAME]);
@@ -910,13 +910,13 @@ impl ScannerIOCache for SetDisks {
                         error!(
                             target: "rustfs::scanner::io",
                             event = EVENT_SCANNER_DISK_BUCKET_STATE,
-                            component = LOG_COMPONENT_SCANNER,
-                            subsystem = LOG_SUBSYSTEM_IO,
-                            bucket = %bucket.name,
-                            cache_name = %cache_name,
-                            state = "cache_load_failed",
-                            error = %e,
-                            "Scanner disk bucket state updated"
+                                component = LOG_COMPONENT_SCANNER,
+                                subsystem = LOG_SUBSYSTEM_IO,
+                                bucket = %bucket.name,
+                                cache_name = %cache_name,
+                                state = "cache_load_failed",
+                                error = %e,
+                                "Scanner disk bucket cache load failed"
                         );
                     }
 
@@ -942,7 +942,7 @@ impl ScannerIOCache for SetDisks {
                         bucket = %bucket.name,
                         cache_name = ?cache.info.name,
                         state = "cache_ready",
-                        "Scanner disk bucket state updated"
+                        "Scanner disk bucket cache ready"
                     );
 
                     let (updates_tx, mut updates_rx) = mpsc::channel::<DataUsageEntry>(1);
@@ -997,7 +997,7 @@ impl ScannerIOCache for SetDisks {
                                     bucket = %bucket.name,
                                     state = "cancelled",
                                     error = %e,
-                                    "Scanner disk bucket state updated"
+                                    "Scanner disk bucket scan cancelled"
                                 );
                             } else {
                                 error!(
@@ -1008,7 +1008,7 @@ impl ScannerIOCache for SetDisks {
                                     bucket = %bucket.name,
                                     state = "scan_failed",
                                     error = %e,
-                                    "Scanner disk bucket state updated"
+                                    "Scanner disk bucket scan failed"
                                 );
                             }
 
@@ -1104,7 +1104,7 @@ impl ScannerIOCache for SetDisks {
                         bucket = %bucket.name,
                         cache_name = %cache.info.name,
                         state = "scan_completed",
-                        "Scanner disk bucket state updated"
+                        "Scanner disk bucket scan completed"
                     );
 
                     if let Err(e) = update_fut.await {
@@ -1132,7 +1132,7 @@ impl ScannerIOCache for SetDisks {
                         bucket = %bucket.name,
                         cache_name = %cache.info.name,
                         state = "send_root_entry",
-                        "Scanner data usage stream progress updated"
+                        "Scanner root entry publish started"
                     );
 
                     if let Err(e) = send_cache_root_entry_info(&bucket_result_tx_clone_clone, &cache).await {
@@ -1182,7 +1182,7 @@ impl ScannerIOCache for SetDisks {
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_IO,
             state = "set_scan_completed",
-            "Scanner set-level disk scan completed"
+            "Scanner set scan completed"
         );
 
         Ok(())

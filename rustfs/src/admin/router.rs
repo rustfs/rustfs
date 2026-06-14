@@ -102,6 +102,7 @@ use uuid::Uuid;
 const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_OBJECT_LAMBDA: &str = "object_lambda";
 const LOG_SUBSYSTEM_LIVE_EVENTS: &str = "live_events";
+const EVENT_ADMIN_ROUTER_STATE: &str = "admin_router_state";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplicationExtRoute {
@@ -632,11 +633,12 @@ async fn load_current_server_config() -> S3Result<Config> {
             Ok(config) => return Ok(config),
             Err(err) => {
                 warn!(
+                    event = EVENT_ADMIN_ROUTER_STATE,
                     component = LOG_COMPONENT_ADMIN,
                     subsystem = LOG_SUBSYSTEM_OBJECT_LAMBDA,
-                    event = "object_lambda_config_reload_failed",
+                    result = "config_reload_failed",
                     error = %err,
-                    "Failed to reload current server config for object lambda request"
+                    "admin router state"
                 );
             }
         }
@@ -661,11 +663,12 @@ fn build_object_lambda_http_client(config: &ObjectLambdaWebhookConfig) -> S3Resu
 
     if config.skip_tls_verify {
         warn!(
+            event = EVENT_ADMIN_ROUTER_STATE,
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_OBJECT_LAMBDA,
-            event = "object_lambda_tls_verification_disabled",
+            result = "tls_verification_disabled",
             endpoint = %config.endpoint,
-            "Object Lambda target is configured to skip TLS certificate verification"
+            "admin router state"
         );
         builder = builder.danger_accept_invalid_certs(true);
     } else if !config.client_ca.is_empty() {
@@ -1218,23 +1221,25 @@ async fn fan_in_remote_live_events(
                 Ok(Ok(batch)) => batch,
                 Ok(Err(err)) => {
                     warn!(
+                        event = EVENT_ADMIN_ROUTER_STATE,
                         component = LOG_COMPONENT_ADMIN,
                         subsystem = LOG_SUBSYSTEM_LIVE_EVENTS,
-                        event = "peer_live_events_fetch_failed",
                         peer = %peer.client.host,
+                        result = "peer_fetch_failed",
                         error = %err,
-                        "Failed to fetch live events from peer"
+                        "admin router state"
                     );
                     break;
                 }
                 Err(_) => {
                     warn!(
+                        event = EVENT_ADMIN_ROUTER_STATE,
                         component = LOG_COMPONENT_ADMIN,
                         subsystem = LOG_SUBSYSTEM_LIVE_EVENTS,
-                        event = "peer_live_events_fetch_failed",
                         peer = %peer.client.host,
+                        result = "peer_fetch_timeout",
                         error = "timeout",
-                        "Failed to fetch live events from peer"
+                        "admin router state"
                     );
                     break;
                 }
@@ -1257,13 +1262,14 @@ async fn fan_in_remote_live_events(
                                 }
                                 Err(err) => {
                                     warn!(
+                                        event = EVENT_ADMIN_ROUTER_STATE,
                                         component = LOG_COMPONENT_ADMIN,
                                         subsystem = LOG_SUBSYSTEM_LIVE_EVENTS,
-                                        event = "live_event_serialize_failed",
                                         source = "remote_peer",
                                         peer = %peer.client.host,
+                                        result = "event_serialize_failed",
                                         error = %err,
-                                        "Failed to serialize live event"
+                                        "admin router state"
                                     );
                                 }
                             }
@@ -1271,12 +1277,13 @@ async fn fan_in_remote_live_events(
                     }
                     Err(err) => {
                         warn!(
+                            event = EVENT_ADMIN_ROUTER_STATE,
                             component = LOG_COMPONENT_ADMIN,
                             subsystem = LOG_SUBSYSTEM_LIVE_EVENTS,
-                            event = "peer_live_events_decode_failed",
                             peer = %peer.client.host,
+                            result = "peer_decode_failed",
                             error = %err,
-                            "Failed to decode live events from peer"
+                            "admin router state"
                         );
                     }
                 }
@@ -1331,23 +1338,25 @@ fn build_listen_notification_response(uri: &Uri, bucket: Option<&str>) -> S3Resu
                                     }
                                     Err(err) => {
                                         warn!(
+                                            event = EVENT_ADMIN_ROUTER_STATE,
                                             component = LOG_COMPONENT_ADMIN,
                                             subsystem = LOG_SUBSYSTEM_LIVE_EVENTS,
-                                            event = "live_event_serialize_failed",
                                             source = "local_stream",
+                                            result = "event_serialize_failed",
                                             error = %err,
-                                            "Failed to serialize live event"
+                                            "admin router state"
                                         );
                                     }
                                 }
                             }
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                                 warn!(
+                                    event = EVENT_ADMIN_ROUTER_STATE,
                                     component = LOG_COMPONENT_ADMIN,
                                     subsystem = LOG_SUBSYSTEM_LIVE_EVENTS,
-                                    event = "live_event_stream_lagged",
+                                    result = "stream_lagged",
                                     skipped,
-                                    "Live event stream lagged"
+                                    "admin router state"
                                 );
                             }
                             Err(broadcast::error::RecvError::Closed) => break,
@@ -1507,7 +1516,14 @@ async fn authorize_replication_extension_request(req: &mut S3Request<Body>, ext_
     license_check().map_err(|er| match er.kind() {
         std::io::ErrorKind::PermissionDenied => s3_error!(AccessDenied, "{er}"),
         _ => {
-            error!("license check failed due to unexpected error: {er}");
+            error!(
+                event = EVENT_ADMIN_ROUTER_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_OBJECT_LAMBDA,
+                result = "license_check_failed",
+                error = %er,
+                "admin router state"
+            );
             s3_error!(InternalError, "License validation failed")
         }
     })?;
@@ -2229,7 +2245,14 @@ async fn authorize_misc_extension_request(req: &mut S3Request<Body>, route: &Mis
     license_check().map_err(|er| match er.kind() {
         std::io::ErrorKind::PermissionDenied => s3_error!(AccessDenied, "{er}"),
         _ => {
-            error!("license check failed due to unexpected error: {er}");
+            error!(
+                event = EVENT_ADMIN_ROUTER_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_OBJECT_LAMBDA,
+                result = "license_check_failed",
+                error = %er,
+                "admin router state"
+            );
             s3_error!(InternalError, "License validation failed")
         }
     })?;

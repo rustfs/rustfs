@@ -207,7 +207,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             bucket,
             object = %key,
             start_pos = ?start_pos,
-            "Protocol storage client request details"
+            "Protocol storage client request"
         );
 
         let mut builder = GetObjectInput::builder().bucket(bucket.to_string()).key(key.to_string());
@@ -513,7 +513,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             object = %key,
             range_start = start_pos,
             range_length = length,
-            "Protocol storage client request details"
+            "Protocol storage client request"
         );
 
         let range = s3s::dto::Range::Int {

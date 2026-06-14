@@ -89,6 +89,7 @@ const EVENT_DEFAULT_CREDENTIALS_DETECTED: &str = "default_credentials_detected";
 const EVENT_SERVER_CONFIG_SANITIZED: &str = "server_config_sanitized";
 const EVENT_SERVER_STARTING: &str = "server_starting";
 const EVENT_SERVER_RUNTIME_FAILED: &str = "server_runtime_failed";
+const EVENT_ACTION_CREDENTIALS_INITIALIZED: &str = "action_credentials_initialized";
 const EVENT_ACTION_CREDENTIALS_INITIALIZATION_FAILED: &str = "action_credentials_initialization_failed";
 const EVENT_OBSERVABILITY_GUARD_SET: &str = "observability_guard_set";
 const EVENT_CRYPTO_PROVIDER_STATE: &str = "crypto_provider_state";
@@ -384,7 +385,14 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     // Set up AK and SK
     match init_global_action_credentials(Some(config.access_key.clone()), Some(config.secret_key.clone())) {
         Ok(_) => {
-            debug!(target: "rustfs::main::run", "Global action credentials initialized successfully.");
+            debug!(
+                target: "rustfs::main::run",
+                event = EVENT_ACTION_CREDENTIALS_INITIALIZED,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_AUTH,
+                result = "ok",
+                "Initialized global action credentials"
+            );
         }
         Err(e) => {
             let msg = format!("init global action credentials failed: {e:?}");
@@ -419,9 +427,13 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
         .inspect_err(|err| {
             error!(
                 target: "rustfs::main::run",
+                event = EVENT_STARTUP_STORAGE_STAGE,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STORAGE,
                 stage = "endpoint_parsing",
+                state = "failed",
                 error = ?err,
-                "startup storage stage failed"
+                "Endpoint parsing failed"
             );
         })
         .map_err(Error::other)?;
@@ -445,9 +457,13 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
         .inspect_err(|err| {
             error!(
                 target: "rustfs::main::run",
+                event = EVENT_STARTUP_STORAGE_STAGE,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STORAGE,
                 stage = "local_disk_initialization",
+                state = "failed",
                 error = ?err,
-                "startup storage stage failed"
+                "Local disk initialization failed"
             );
         })
         .map_err(Error::other)?;
@@ -540,9 +556,13 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
         .inspect_err(|err| {
             error!(
                 target: "rustfs::main::run",
+                event = EVENT_STARTUP_STORAGE_STAGE,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STORAGE,
                 stage = "ecstore_initialization",
+                state = "failed",
                 error = ?err,
-                "startup storage stage failed"
+                "ECStore initialization failed"
             );
         })?;
 
@@ -561,7 +581,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
             state = "retrying",
             retry_count = retry_count + 1,
             error = ?e,
-            "Startup storage stage failed"
+            "Global config initialization retry failed"
         );
         // TODO: check error type
         retry_count += 1;
@@ -580,13 +600,13 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     #[cfg(feature = "ftps")]
     let ftp_shutdown_tx = match init_ftp_system().await {
         Ok(Some(tx)) => {
-            info!(
+            debug!(
                 event = EVENT_PROTOCOL_SYSTEM_STATE,
                 component = LOG_COMPONENT_MAIN,
                 subsystem = LOG_SUBSYSTEM_STARTUP,
                 protocol = "ftp",
-                state = "initialized",
-                "Protocol system state changed"
+                state = "started",
+                "Protocol runtime started"
             );
             Some(tx)
         }
@@ -597,7 +617,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
                 subsystem = LOG_SUBSYSTEM_STARTUP,
                 protocol = "ftp",
                 state = "disabled",
-                "Protocol system state changed"
+                "Protocol runtime disabled"
             );
             None
         }
@@ -609,7 +629,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
                 protocol = "ftp",
                 state = "initialization_failed",
                 error = %e,
-                "Protocol system state changed"
+                "Protocol runtime initialization failed"
             );
             return Err(Error::other(e));
         }
@@ -622,13 +642,13 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     #[cfg(feature = "ftps")]
     let ftps_shutdown_tx = match init_ftps_system().await {
         Ok(Some(tx)) => {
-            info!(
+            debug!(
                 event = EVENT_PROTOCOL_SYSTEM_STATE,
                 component = LOG_COMPONENT_MAIN,
                 subsystem = LOG_SUBSYSTEM_STARTUP,
                 protocol = "ftps",
-                state = "initialized",
-                "Protocol system state changed"
+                state = "started",
+                "Protocol runtime started"
             );
             Some(tx)
         }
@@ -639,7 +659,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
                 subsystem = LOG_SUBSYSTEM_STARTUP,
                 protocol = "ftps",
                 state = "disabled",
-                "Protocol system state changed"
+                "Protocol runtime disabled"
             );
             None
         }
@@ -651,7 +671,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
                 protocol = "ftps",
                 state = "initialization_failed",
                 error = %e,
-                "Protocol system state changed"
+                "Protocol runtime initialization failed"
             );
             return Err(Error::other(e));
         }
@@ -664,13 +684,13 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     #[cfg(feature = "webdav")]
     let webdav_shutdown_tx = match init_webdav_system().await {
         Ok(Some(tx)) => {
-            info!(
+            debug!(
                 event = EVENT_PROTOCOL_SYSTEM_STATE,
                 component = LOG_COMPONENT_MAIN,
                 subsystem = LOG_SUBSYSTEM_STARTUP,
                 protocol = "webdav",
-                state = "initialized",
-                "Protocol system state changed"
+                state = "started",
+                "Protocol runtime started"
             );
             Some(tx)
         }
@@ -681,7 +701,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
                 subsystem = LOG_SUBSYSTEM_STARTUP,
                 protocol = "webdav",
                 state = "disabled",
-                "Protocol system state changed"
+                "Protocol runtime disabled"
             );
             None
         }
@@ -693,7 +713,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
                 protocol = "webdav",
                 state = "initialization_failed",
                 error = %e,
-                "Protocol system state changed"
+                "Protocol runtime initialization failed"
             );
             return Err(Error::other(e));
         }
@@ -706,13 +726,13 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     #[cfg(feature = "sftp")]
     let sftp_shutdown_tx = match init_sftp_system().await {
         Ok(Some(tx)) => {
-            info!(
+            debug!(
                 event = EVENT_PROTOCOL_SYSTEM_STATE,
                 component = LOG_COMPONENT_MAIN,
                 subsystem = LOG_SUBSYSTEM_STARTUP,
                 protocol = "sftp",
-                state = "initialized",
-                "Protocol system state changed"
+                state = "started",
+                "Protocol runtime started"
             );
             Some(tx)
         }
@@ -723,7 +743,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
                 subsystem = LOG_SUBSYSTEM_STARTUP,
                 protocol = "sftp",
                 state = "disabled",
-                "Protocol system state changed"
+                "Protocol runtime disabled"
             );
             None
         }
@@ -735,7 +755,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
                 protocol = "sftp",
                 state = "initialization_failed",
                 error = %e,
-                "Protocol system state changed"
+                "Protocol runtime initialization failed"
             );
             return Err(Error::other(e));
         }
@@ -758,7 +778,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
             component = LOG_COMPONENT_MAIN,
             subsystem = LOG_SUBSYSTEM_STARTUP,
             state = "started",
-            "Audit system state changed"
+            "Audit runtime started"
         ),
         Err(e) => error!(
             target: "rustfs::main::run",
@@ -767,7 +787,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
             subsystem = LOG_SUBSYSTEM_STARTUP,
             state = "start_failed",
             error = %e,
-            "Audit system state changed"
+            "Audit runtime failed to start"
         ),
     }
 
@@ -781,7 +801,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
             component = LOG_COMPONENT_MAIN,
             subsystem = LOG_SUBSYSTEM_STARTUP,
             state = "started",
-            "Deadlock detector state changed"
+            "Deadlock detector started"
         );
     } else {
         info!(
@@ -790,7 +810,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
             component = LOG_COMPONENT_MAIN,
             subsystem = LOG_SUBSYSTEM_STARTUP,
             state = "disabled",
-            "Deadlock detector state changed"
+            "Deadlock detector disabled"
         );
     }
 
@@ -888,7 +908,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
         subsystem = LOG_SUBSYSTEM_STARTUP,
         enable_scanner = enable_scanner,
         enable_heal = enable_heal,
-        "Configured background services"
+        "Background services configured"
     );
 
     // Scanner depends on the heal channel/manager, so scanner implies heal.
@@ -907,7 +927,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
             enable_heal = false,
             ahm_state = "skipped",
             reason = "disabled",
-            "Background services configured"
+            "Background services disabled"
         );
     }
 
@@ -935,7 +955,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
         server_address = %server_address,
         started_at = %jiff::Zoned::now(),
         iam_bootstrap = ?iam_bootstrap,
-        "RustFS server started successfully"
+        "RustFS server ready"
     );
     if iam_bootstrap == IamBootstrapDisposition::ReadyInline {
         rustfs::server::publish_ready_when_runtime_ready(readiness.as_ref(), Some(state_manager.as_ref())).await?;
@@ -971,7 +991,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
         subsystem = LOG_SUBSYSTEM_STARTUP,
         state = ?state_manager.current_state(),
         result = "stopped",
-        "Server shutdown state changed"
+        "RustFS server stopped"
     );
     Ok(())
 }
@@ -1051,7 +1071,7 @@ async fn handle_shutdown(
         component = LOG_COMPONENT_MAIN,
         subsystem = LOG_SUBSYSTEM_STARTUP,
         signal = shutdown_signal.log_label(),
-        "Shutdown signal received in main thread"
+        "Shutdown signal received"
     );
     // update the status to stopping first
     state_manager.update(ServiceState::Stopping);
@@ -1114,7 +1134,7 @@ async fn handle_shutdown(
             subsystem = LOG_SUBSYSTEM_STARTUP,
             protocol = "ftp",
             state = "stopping",
-            "Protocol system state changed"
+            "Protocol runtime stopping"
         );
         protocol_shutdowns.push(ftp_shutdown_tx.shutdown());
     }
@@ -1127,7 +1147,7 @@ async fn handle_shutdown(
             subsystem = LOG_SUBSYSTEM_STARTUP,
             protocol = "ftps",
             state = "stopping",
-            "Protocol system state changed"
+            "Protocol runtime stopping"
         );
         protocol_shutdowns.push(ftps_shutdown_tx.shutdown());
     }
@@ -1141,7 +1161,7 @@ async fn handle_shutdown(
             subsystem = LOG_SUBSYSTEM_STARTUP,
             protocol = "webdav",
             state = "stopping",
-            "Protocol system state changed"
+            "Protocol runtime stopping"
         );
         protocol_shutdowns.push(webdav_shutdown_tx.shutdown());
     }
@@ -1155,7 +1175,7 @@ async fn handle_shutdown(
             subsystem = LOG_SUBSYSTEM_STARTUP,
             protocol = "sftp",
             state = "stopping",
-            "Protocol system state changed"
+            "Protocol runtime stopping"
         );
         protocol_shutdowns.push(sftp_shutdown_tx.shutdown());
     }
@@ -1178,7 +1198,7 @@ async fn handle_shutdown(
         component = LOG_COMPONENT_MAIN,
         subsystem = LOG_SUBSYSTEM_STARTUP,
         state = "stopping",
-        "Audit system state changed"
+        "Audit runtime stopping"
     );
     match stop_audit_system().await {
         Ok(_) => info!(
@@ -1187,7 +1207,7 @@ async fn handle_shutdown(
             component = LOG_COMPONENT_MAIN,
             subsystem = LOG_SUBSYSTEM_STARTUP,
             state = "stopped",
-            "Audit system state changed"
+            "Audit runtime stopped"
         ),
         Err(e) => error!(
             target: "rustfs::main::handle_shutdown",
@@ -1196,7 +1216,7 @@ async fn handle_shutdown(
             subsystem = LOG_SUBSYSTEM_STARTUP,
             state = "stop_failed",
             error = %e,
-            "Audit system state changed"
+            "Audit runtime failed to stop"
         ),
     }
 
@@ -1217,7 +1237,7 @@ async fn handle_shutdown(
         component = LOG_COMPONENT_MAIN,
         subsystem = LOG_SUBSYSTEM_STARTUP,
         state = "stopping",
-        "Server shutdown state changed"
+        "RustFS server stopping"
     );
     if let Some(s3_shutdown_handle) = s3_shutdown_handle {
         s3_shutdown_handle.shutdown().await;
@@ -1235,7 +1255,7 @@ async fn handle_shutdown(
         component = LOG_COMPONENT_MAIN,
         subsystem = LOG_SUBSYSTEM_STARTUP,
         state = "stopped",
-        "Server shutdown state changed"
+        "RustFS server stopped"
     );
 }
 

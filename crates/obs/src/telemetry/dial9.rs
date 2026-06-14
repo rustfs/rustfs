@@ -203,7 +203,7 @@ impl Dial9SessionGuard {
                 component = LOG_COMPONENT_OBS,
                 subsystem = LOG_SUBSYSTEM_DIAL9,
                 state = "shutdown_requested",
-                "dial9 state changed"
+                "dial9 state"
             );
             // TelemetryGuard handles flushing automatically when dropped
         }
@@ -219,7 +219,7 @@ impl Drop for Dial9SessionGuard {
                 component = LOG_COMPONENT_OBS,
                 subsystem = LOG_SUBSYSTEM_DIAL9,
                 state = "flushed",
-                "dial9 state changed"
+                "dial9 state"
             );
         }
     }

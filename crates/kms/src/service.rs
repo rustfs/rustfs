@@ -24,7 +24,7 @@ use rand::random;
 use std::collections::HashMap;
 use std::io::Cursor;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tracing::{debug, info};
+use tracing::debug;
 use zeroize::Zeroize;
 
 /// Data key for object encryption
@@ -209,7 +209,7 @@ impl ObjectEncryptionService {
         // Generate a unique random nonce for this data key
         // This ensures each object/part gets a unique base nonce for streaming encryption
         let nonce: [u8; 12] = random();
-        tracing::info!("Generated random nonce for data key: {:02x?}", nonce);
+        tracing::debug!("Generated random nonce for data key");
 
         let data_key = DataKey {
             plaintext_key: data_key_response
@@ -302,7 +302,7 @@ impl ObjectEncryptionService {
                 key_id: actual_key_id.to_string(),
             };
             if let Err(KmsError::KeyNotFound { .. }) = self.kms_manager.describe_key(describe_req).await {
-                info!("Auto-creating SSE-S3 key: {}", actual_key_id);
+                debug!(key_id = %actual_key_id, "Auto-creating SSE-S3 key");
                 let create_req = CreateKeyRequest {
                     key_name: Some(actual_key_id.to_string()),
                     key_usage: KeyUsage::EncryptDecrypt,
@@ -364,7 +364,13 @@ impl ObjectEncryptionService {
             encrypted_data_key: data_key.ciphertext_blob,
         };
 
-        info!("Successfully encrypted object {}/{} ({} bytes)", bucket, object_key, original_size);
+        debug!(
+            bucket,
+            object = object_key,
+            original_size,
+            algorithm = %algorithm.as_str(),
+            "Object encrypted"
+        );
 
         Ok(EncryptionResult { ciphertext, metadata })
     }
@@ -429,7 +435,13 @@ impl ObjectEncryptionService {
         // Decrypt the data
         let plaintext = cipher.decrypt(&ciphertext, &metadata.iv, tag, &aad)?;
 
-        info!("Successfully decrypted object {}/{} ({} bytes)", bucket, object_key, plaintext.len());
+        debug!(
+            bucket,
+            object = object_key,
+            plaintext_len = plaintext.len(),
+            algorithm = %metadata.algorithm,
+            "Object decrypted"
+        );
 
         Ok(Box::new(Cursor::new(plaintext)))
     }
@@ -507,7 +519,7 @@ impl ObjectEncryptionService {
             encrypted_data_key: Vec::new(), // Empty for SSE-C
         };
 
-        info!(
+        debug!(
             "Successfully encrypted object {}/{} with SSE-C ({} bytes)",
             bucket, object_key, original_size
         );
@@ -568,7 +580,7 @@ impl ObjectEncryptionService {
         // Decrypt the data
         let plaintext = cipher.decrypt(&ciphertext, &metadata.iv, tag, &aad)?;
 
-        info!(
+        debug!(
             "Successfully decrypted SSE-C object {}/{} ({} bytes)",
             bucket,
             object_key,

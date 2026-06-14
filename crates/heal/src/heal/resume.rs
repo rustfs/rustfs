@@ -20,7 +20,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 const LOG_COMPONENT_HEAL: &str = "heal";
@@ -299,7 +299,7 @@ impl ResumeManager {
             let _ = self.disk.delete(RUSTFS_META_BUCKET, path_str, Default::default()).await;
         }
 
-        info!(
+        debug!(
             target: "rustfs::heal::resume",
             event = EVENT_HEAL_RESUME_STATE,
             component = LOG_COMPONENT_HEAL,
@@ -524,7 +524,7 @@ impl CheckpointManager {
             let _ = self.disk.delete(RUSTFS_META_BUCKET, path_str, Default::default()).await;
         }
 
-        info!(
+        debug!(
             target: "rustfs::heal::resume",
             event = EVENT_HEAL_CHECKPOINT_STATE,
             component = LOG_COMPONENT_HEAL,
@@ -649,7 +649,7 @@ impl ResumeUtils {
                 let age_hours = (current_time - state.last_update) / 3600;
 
                 if age_hours > max_age_hours {
-                    info!(
+                    debug!(
                         target: "rustfs::heal::resume",
                         event = EVENT_HEAL_RESUME_STATE,
                         component = LOG_COMPONENT_HEAL,
@@ -657,7 +657,7 @@ impl ResumeUtils {
                         task_id,
                         age_hours,
                         state = "expired_cleanup_started",
-                        "Heal resume state cleanup started"
+                        "Heal resume cleanup started"
                     );
                     if let Err(e) = resume_manager.cleanup().await {
                         warn!(

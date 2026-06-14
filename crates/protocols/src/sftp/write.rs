@@ -75,7 +75,7 @@ pub(super) fn write_dispatch_byte_count(phase: &WritePhase, part_size: u64, satu
                         component = LOG_COMPONENT_PROTOCOLS,
                         subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
                         result = "byte_count_overflow",
-                        "sftp write state changed"
+                        "SFTP write byte-count overflow"
                     );
                     Err(SftpError::code(StatusCode::Failure))
                 }
@@ -90,7 +90,7 @@ pub(super) fn write_dispatch_byte_count(phase: &WritePhase, part_size: u64, satu
                     component = LOG_COMPONENT_PROTOCOLS,
                     subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
                     result = "handle_poisoned",
-                    "sftp write state changed"
+                    "SFTP write handle poisoned"
                 );
                 Err(SftpError::code(StatusCode::Failure))
             }
@@ -115,7 +115,7 @@ pub(super) fn write_dispatch_append_bytes(phase: &mut WritePhase, data: &[u8]) -
                 component = LOG_COMPONENT_PROTOCOLS,
                 subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
                 result = "append_on_failed_handle",
-                "sftp write state changed"
+                "SFTP write append rejected on failed handle"
             );
             Err(SftpError::code(StatusCode::Failure))
         }
@@ -368,7 +368,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                     key = %sanitise_control_bytes(key),
                     attempt = attempt,
                     state = "retrying_put_object",
-                    "sftp write state changed",
+                    "SFTP put_object retry scheduled",
                 );
             }
 
@@ -414,7 +414,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             bucket = %sanitise_control_bytes(bucket),
             key = %sanitise_control_bytes(key),
             result = "retry_loop_fell_through",
-            "sftp write state changed",
+            "SFTP put_object retry loop fell through",
         );
         Err(SftpError::code(StatusCode::Failure))
     }
@@ -459,7 +459,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                 upload_id = %upload_id,
                 part_number = part_number,
                 result = "etag_missing",
-                "sftp multipart state changed"
+                "SFTP multipart part missing etag"
             );
             SftpError::code(StatusCode::Failure)
         })?;
@@ -543,7 +543,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                 bucket = %sanitise_control_bytes(bucket),
                 key = %sanitise_control_bytes(key),
                 result = "upload_id_missing",
-                "sftp multipart state changed"
+                "SFTP multipart upload missing upload_id"
             );
             SftpError::code(StatusCode::Failure)
         })?;
@@ -708,7 +708,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                     component = LOG_COMPONENT_PROTOCOLS,
                     subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
                     result = "buffering_phase_lost",
-                    "sftp multipart state changed"
+                    "SFTP multipart buffering phase lost"
                 );
                 return Err(SftpError::code(StatusCode::Failure));
             }
@@ -772,7 +772,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                         key = %key,
                         limit = S3_MAX_MULTIPART_PARTS,
                         result = "parts_limit_exceeded",
-                        "sftp multipart state changed",
+                        "SFTP multipart parts limit exceeded",
                     );
                     let upload_id_for_fail = upload_id.clone();
                     let abort_authorized_for_fail = *abort_authorized;
@@ -791,7 +791,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                     component = LOG_COMPONENT_PROTOCOLS,
                     subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
                     result = "flush_without_streaming",
-                    "sftp multipart state changed"
+                    "SFTP multipart flush requested without streaming state"
                 );
                 return Err(SftpError::code(StatusCode::Failure));
             }
@@ -817,7 +817,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                         component = LOG_COMPONENT_PROTOCOLS,
                         subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
                         result = "post_upload_phase_missing",
-                        "sftp multipart state changed"
+                        "SFTP multipart post-upload phase missing"
                     );
                     Err(SftpError::code(StatusCode::Failure))
                 }
@@ -887,7 +887,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                     err = ?abort_err,
                     context = context,
                     result = "abort_failed",
-                    "sftp abort state changed",
+                    "SFTP multipart abort failed",
                 );
             }
         } else {
@@ -901,7 +901,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                 access_key = %MaskedAccessKey(self.access_key()),
                 context = context,
                 result = "abort_skipped_unauthorized",
-                "sftp abort state changed",
+                "SFTP multipart abort skipped by policy",
             );
         }
     }
@@ -959,7 +959,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                     upload_id = %upload_id,
                     limit = S3_MAX_MULTIPART_PARTS,
                     result = "final_part_limit_exceeded",
-                    "sftp multipart state changed",
+                    "SFTP multipart final-part limit exceeded",
                 );
                 self.close_abort_or_skip(bucket, key, &upload_id, abort_authorized, "parts-limit breach")
                     .await;
@@ -1080,7 +1080,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                         upload_id = %mp.upload_id,
                         part_number = part_number,
                         result = "etag_missing",
-                        "sftp multipart copy state changed"
+                        "SFTP multipart copy part missing etag"
                     );
                     SftpError::code(StatusCode::Failure)
                 })?;
