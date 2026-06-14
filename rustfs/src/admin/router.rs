@@ -23,6 +23,7 @@ use crate::server::{
     ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, is_admin_path,
 };
 use crate::storage::access::{ReqInfo, authorize_request};
+use crate::storage::request_context::spawn_traced;
 use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -1310,7 +1311,7 @@ fn build_listen_notification_response(uri: &Uri, bucket: Option<&str>) -> S3Resu
         inner: ReceiverStream::new(rx),
     });
 
-    tokio::spawn(async move {
+    spawn_traced(async move {
         let mut ticker = tokio::time::interval(interval_duration);
         let mut peer_ticker = tokio::time::interval(LISTEN_NOTIFICATION_PEER_POLL_INTERVAL);
         // Skip the immediate first tick so behavior starts after interval duration.
