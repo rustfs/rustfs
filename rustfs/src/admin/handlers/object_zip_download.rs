@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::admin::router::{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH, AdminOperation, Operation, S3Router};
+use crate::app::context::resolve_object_store_handle;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
@@ -32,7 +33,6 @@ use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::get_global_action_cred;
 use rustfs_ecstore::{
     global::get_global_region,
-    new_object_layer_fn,
     store_api::{BucketOperations, ListOperations, ObjectIO, ObjectOperations, ObjectOptions},
 };
 use rustfs_policy::policy::action::{Action, S3Action};
@@ -640,7 +640,7 @@ fn validate_zip_entry_name(entry_name: &str) -> S3Result<()> {
 }
 
 async fn preflight_zip_items(request: &CreateObjectZipDownloadRequest, items: &[ZipDownloadItem]) -> S3Result<()> {
-    let store = new_object_layer_fn().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
+    let store = resolve_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
     for item in items {
         store
             .get_object_info(&request.bucket, &item.key, &ObjectOptions::default())
@@ -655,7 +655,7 @@ fn storage_error_to_s3(err: rustfs_ecstore::error::Error) -> s3s::S3Error {
 }
 
 async fn validate_zip_download_request(record: &ObjectZipDownloadToken) -> S3Result<()> {
-    let store = new_object_layer_fn().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
+    let store = resolve_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
     store
         .get_bucket_info(&record.request.bucket, &BucketOptions::default())
         .await
@@ -780,7 +780,7 @@ async fn prepare_zip_download_archive(record: &ObjectZipDownloadToken) -> S3Resu
 
 async fn generate_zip_archive(record: &ObjectZipDownloadToken, file: &mut File) -> io::Result<()> {
     let mut zip = ZipFileWriter::with_tokio(file).force_zip64();
-    let store = new_object_layer_fn().ok_or_else(|| io::Error::other("object store not initialized"))?;
+    let store = resolve_object_store_handle().ok_or_else(|| io::Error::other("object store not initialized"))?;
 
     let explicit_items = collect_explicit_zip_items(&record.request)
         .map_err(|err| io::Error::other(format!("failed to prepare explicit ZIP items: {err}")))?;
@@ -867,7 +867,7 @@ async fn write_zip_item<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let store = new_object_layer_fn().ok_or_else(|| io::Error::other("object store not initialized"))?;
+    let store = resolve_object_store_handle().ok_or_else(|| io::Error::other("object store not initialized"))?;
     let mut reader = store
         .get_object_reader(bucket, &item.key, None, HeaderMap::new(), &ObjectOptions::default())
         .await

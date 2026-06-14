@@ -5,16 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-ecfs-object-store-context`
-- Baseline: `upstream/main` at `046d5386ba9ffe6a0df39ffd78322c62e9f358d2`
+- Branch: `overtrue/arch-admin-zip-object-store-context`
+- Baseline: `upstream/main` at `5e68cf8a296f0453fd050d137830032329685d12`
 - PR type for this branch: `consumer-migration`
-- Runtime behavior changes: no external behavior change expected; S3 ECFS
-  object-store lookups prefer the AppContext-owned object store and keep the
-  existing global fallback.
-- Rust code changes: migrate `rustfs/src/storage/ecfs.rs` object-store lookups
-  to the shared resolver without touching lower-layer storage infra modules.
+- Runtime behavior changes: no external behavior change expected; admin object
+  ZIP download object-store lookups prefer the AppContext-owned object store
+  and keep the existing global fallback.
+- Rust code changes: migrate rustfs/src/admin/handlers/object_zip_download.rs
+  object-store lookups to the shared resolver without touching infra-layer
+  server/storage modules or standalone crates.
 - CI/script changes: none.
-- Docs changes: record `CTX-006` consumer migration scope and verification.
+- Docs changes: record `CTX-007` consumer migration scope and verification.
 
 ## Phase 0 Tasks
 
@@ -180,6 +181,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     preserve the existing global object-layer fallback when absent.
   - Must preserve: S3 object/bucket API behavior, object-lock/tagging/metadata
     semantics, and existing storage error paths.
+  - Verification: formatting, compile check, migration guards, diff hygiene,
+    Rust risk scan, and full `make pre-commit`.
+- [x] `CTX-007` Migrate admin ZIP object-store consumers.
+  - Do: migrate admin object ZIP download object-store lookups to the shared
+    object-store resolver.
+  - Acceptance: admin ZIP object-store lookups use AppContext when present and
+    preserve the existing global object-layer fallback when absent.
+  - Must preserve: admin download authorization/preflight behavior, ZIP listing
+    and streaming behavior, and existing storage error paths.
   - Verification: formatting, compile check, migration guards, diff hygiene,
     Rust risk scan, and full `make pre-commit`.
 
@@ -488,8 +498,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `consumer-migration`: migrate the next low-risk non-admin AppContext
-   consumer group that does not introduce a new reverse layer dependency.
+1. `consumer-migration`: design the crate-local object-store resolver path for
+   crates/protocols, crates/obs, crates/scanner, and crates/notify without
+   introducing reverse dependencies on rustfs.
 2. `pure-move`: start `R-009` boot wrapper with the IAM degraded readiness
    contract covered.
 
@@ -497,13 +508,13 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Single `consumer-migration` slice; `ecfs.rs` is an interface-layer module already using app usecases, and the layer guard reports no new reverse dependencies. |
-| Migration preservation | pass | AppContext object-store resolution is preferred when present, existing global object-layer fallback and S3 storage error paths are preserved, and ECFS method bodies keep their behavior. |
+| Quality/architecture | pass | Single `consumer-migration` slice; admin ZIP code may depend on app context, and the layer guard reports no new reverse dependencies. |
+| Migration preservation | pass | AppContext object-store resolution is preferred when present, while existing global object-layer fallback and ZIP error paths are preserved. |
 | Testing/verification | pass | Formatting, compile check, diff hygiene, migration/layer guards, added-line Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `046d5386ba9ffe6a0df39ffd78322c62e9f358d2`:
+Passed on `5e68cf8a296f0453fd050d137830032329685d12`:
 - `cargo fmt --all`.
 - `cargo fmt --all --check`.
 - `cargo check -p rustfs --lib`.
@@ -511,18 +522,23 @@ Passed on `046d5386ba9ffe6a0df39ffd78322c62e9f358d2`:
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - Rust risk scan for changed Rust files; full-file matches were existing
-  code/tests, and the added-line scan returned no `unwrap`/`expect`, numeric
-  cast, string error, boxed error, print macro, or relaxed-ordering match.
-- `make pre-commit`; all checks passed, including nextest 5905 passed and
+  tests and S3 result signatures, and the added-line scan returned no
+  `unwrap`/`expect`, numeric cast, string error, boxed error, print macro, or
+  relaxed-ordering match.
+- `make pre-commit`; all checks passed, including nextest 5939 passed and
   111 skipped, plus doctests.
 
 Notes:
-- This slice migrates one coherent ECFS object-store consumer group.
+- This slice migrates the admin object ZIP download object-store consumer
+  group.
+- Server/storage infra consumers still need a crate-local resolver path before
+  migration.
 - Global object-layer fallback remains available until the planned cleanup
   phase.
 
 ## Handoff Notes
 
-- CTX-006 is complete.
-- Keep the next consumer or boot wrapper PR scoped to one PR type and preserve
-  global fallback until the planned cleanup phase.
+- CTX-007 is complete.
+- Keep infra-layer server/storage consumers on the global accessor until a
+  crate-local resolver path is designed; preserve global fallback until the
+  planned cleanup phase.
