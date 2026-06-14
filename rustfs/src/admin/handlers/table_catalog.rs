@@ -4257,6 +4257,21 @@ mod tests {
                 })
                 .await
         );
+        assert!(
+            !policy
+                .is_allowed(&rustfs_policy::policy::Args {
+                    account: "temporary-access-key",
+                    groups: &groups,
+                    action: Action::AdminAction(rustfs_policy::policy::action::AdminAction::CreateTableAction),
+                    bucket: "warehouse",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "namespaces/analytics/tables/events",
+                    claims: &claims,
+                    deny_only: false,
+                })
+                .await
+        );
     }
 
     #[test]

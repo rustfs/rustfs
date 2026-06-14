@@ -2942,6 +2942,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn table_data_plane_resource_prefers_longest_registered_warehouse_prefix() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let parent_table = IdentifierSegment::parse("orders").unwrap();
+        let child_table = IdentifierSegment::parse("orders_child").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &parent_table, "00001.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &parent_table, current.clone()).await;
+        let mut child_entry = test_table_entry(bucket, &namespace, &child_table, current);
+        child_entry.table_id = "table-id-child".to_string();
+        child_entry.warehouse_location = format!("s3://{bucket}/tables/table-id/child");
+        store.create_table(child_entry).await.unwrap();
+
+        let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/child/data/part-00001.parquet")
+            .await
+            .expect("data-plane resource lookup should succeed")
+            .expect("object should resolve to the child table");
+
+        assert_eq!(resource.table, "orders_child");
+        assert_eq!(resource.table_id, "table-id-child");
+        assert_eq!(resource.warehouse_object_prefix, "tables/table-id/child/");
+        assert_eq!(resource.catalog_resource_object(), "namespaces/sales/tables/orders_child");
+    }
+
+    #[tokio::test]
     async fn maintenance_dry_run_reports_job_context_and_deletable_candidates() {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend.clone());
