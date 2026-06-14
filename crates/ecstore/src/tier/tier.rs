@@ -994,7 +994,6 @@ impl TierConfigMgr {
     }
 
     pub async fn reload(&mut self, api: Arc<ECStore>) -> std::result::Result<(), std::io::Error> {
-        //let Some(api) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
         let new_config = load_tier_config(api).await;
 
         match &new_config {

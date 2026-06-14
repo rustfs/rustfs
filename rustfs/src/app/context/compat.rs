@@ -41,7 +41,13 @@ pub fn resolve_bucket_metadata_handle() -> Option<Arc<RwLock<BucketMetadataSys>>
 
 /// Resolve object store handle using AppContext-first precedence.
 pub fn resolve_object_store_handle() -> Option<Arc<ECStore>> {
-    resolve_object_store_handle_with(get_global_app_context(), new_object_layer_fn)
+    let context = get_global_app_context();
+    resolve_object_store_handle_for_context(context.as_deref())
+}
+
+/// Resolve object store handle using an explicit AppContext, falling back to the legacy global object layer.
+pub fn resolve_object_store_handle_for_context(context: Option<&AppContext>) -> Option<Arc<ECStore>> {
+    context.map(|context| context.object_store()).or_else(new_object_layer_fn)
 }
 
 /// Resolve endpoints using AppContext-first precedence.
@@ -77,6 +83,7 @@ fn resolve_bucket_metadata_handle_with(
         .or_else(fallback)
 }
 
+#[cfg(test)]
 fn resolve_object_store_handle_with(
     context: Option<Arc<AppContext>>,
     fallback: impl FnOnce() -> Option<Arc<ECStore>>,

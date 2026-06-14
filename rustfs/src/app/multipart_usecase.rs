@@ -14,7 +14,7 @@
 
 //! Multipart application use-case contracts.
 
-use crate::app::context::{AppContext, get_global_app_context};
+use crate::app::context::{AppContext, get_global_app_context, resolve_object_store_handle_for_context};
 use crate::app::object_usecase::{build_put_like_object_lock_metadata, validate_existing_object_lock_for_write};
 use crate::capacity::record_capacity_write;
 use crate::error::ApiError;
@@ -48,7 +48,6 @@ use rustfs_ecstore::bucket::{
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::compress::is_disk_compressible;
 use rustfs_ecstore::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
-use rustfs_ecstore::new_object_layer_fn;
 #[cfg(test)]
 use rustfs_ecstore::rio::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
 use rustfs_ecstore::rio::{HashReader, WritePlan};
@@ -230,10 +229,7 @@ impl DefaultMultipartUsecase {
     }
 
     fn object_store(&self) -> Option<Arc<ECStore>> {
-        self.context
-            .as_ref()
-            .map(|context| context.object_store())
-            .or_else(new_object_layer_fn)
+        resolve_object_store_handle_for_context(self.context.as_deref())
     }
 
     #[instrument(level = "debug", skip(self))]
