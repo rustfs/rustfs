@@ -5,18 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-startup-readiness-bootstrap`
-- Baseline: `origin/main` at `8d23ce06c6dba11f50f656af4c30b63036cef92f`
+- Branch: `overtrue/arch-startup-service-bootstrap`
+- Baseline: `origin/main` at `b49057c8e3e0b1a0ed828912806ee67b49e404c4`
 - PR type for this branch: `pure-move`
-- Runtime behavior changes: no external behavior change expected; inline IAM
-  bootstrap still publishes runtime readiness after runtime dependencies are
-  ready, and deferred IAM bootstrap still leaves readiness publication to the
-  recovery loop.
-- Rust code changes: centralize the IAM bootstrap readiness publication decision
-  in `startup_iam`, use it from binary and embedded startup, and add
-  wrapper-level coverage for inline, deferred, and failure paths.
+- Runtime behavior changes: no external behavior change expected; binary startup
+  still treats notification initialization failure as fatal, while embedded
+  startup still treats audit and notification failures as non-fatal warnings.
+- Rust code changes: centralize event notifier, audit startup, and notification
+  system bootstrap in `startup_services` helpers with caller-owned
+  logging/error policy, then use those helpers from binary and embedded
+  startup.
 - CI/script changes: none.
-- Docs changes: record `R-009` startup readiness bootstrap wrapper progress and
+- Docs changes: record `R-010` startup service bootstrap wrapper progress and
   verification.
 
 ## Phase 0 Tasks
@@ -565,6 +565,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: focused startup IAM tests, binary/lib compile checks,
     formatting, migration guards, Rust risk scan, and pre-commit quality gate.
 
+- [x] `R-010` Centralize startup optional service bootstrap.
+  - Do: move event notifier, audit startup, and notification system startup
+    behind `startup_services` helpers with caller-owned logging/error policy.
+  - Acceptance: binary still initializes the event notifier before audit, logs
+    audit start/failure through the same startup target, and treats notification
+    init failure as fatal; embedded still treats audit and notification failures
+    as non-fatal warnings.
+  - Must preserve: startup order, audit non-fatal behavior, notification fatal
+    boundary in binary, embedded warn-and-continue behavior, and event notifier
+    initialization.
+  - Verification: focused startup service tests, binary/lib compile checks,
+    formatting, migration guards, Rust risk scan, and pre-commit quality gate.
+
 ## Next PRs
 
 1. `pure-move`: continue extracting startup boot wrappers in larger slices while
@@ -576,38 +589,37 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Pure-move slice centralizes IAM bootstrap readiness publication without moving runtime readiness collection or startup dependency checks. |
-| Migration preservation | passed | Main and embedded keep ReadyInline publication behavior, Deferred remains recovery-loop owned, and embedded readiness errors still map through shutdown. |
-| Testing/verification | passed | Focused startup IAM tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Pure-move slice centralizes optional startup service bootstrap while keeping caller-specific logging and error policy at the binary and embedded boundaries. |
+| Migration preservation | passed | Binary keeps notification init fatal, embedded keeps audit and notification failures warn-and-continue, and event notifier still starts before audit. |
+| Testing/verification | passed | Focused startup service tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `8d23ce06c6dba11f50f656af4c30b63036cef92f`:
+Passed on `b49057c8e3e0b1a0ed828912806ee67b49e404c4`:
 
-- `cargo fmt --all --check`.
-- `cargo test -p rustfs startup_iam --no-fail-fast`.
+- `cargo test -p rustfs startup_services --no-fail-fast`.
 - `cargo check -p rustfs --bin rustfs`.
 - `cargo check -p rustfs --lib`.
+- `cargo fmt --all --check`.
 - `git diff --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - `git rev-list --left-right --count HEAD...origin/main` returned `0 0`.
 - Rust risk scan for changed Rust files: full-file matches were existing docs
-  examples, existing startup error output, existing test expectations, and the
-  existing boxed recovery future; added-line scan returned no unwrap/expect,
-  numeric cast, string error, boxed error, print macro, relaxed-ordering, or
-  unsafe match.
-- `make pre-commit`: all checks passed, including nextest with 5966 passed and
+  examples, existing startup error output, and existing startup imports; added
+  lines introduced no unwrap/expect, numeric cast, string error, boxed error,
+  print macro, relaxed-ordering, or unsafe match.
+- `make pre-commit`: all checks passed, including nextest with 5969 passed and
   111 skipped, plus doctests.
 
 Notes:
 
-- This slice centralizes startup IAM readiness publication without changing the
-  runtime readiness checks themselves.
-- Deferred IAM bootstrap readiness remains owned by the recovery loop.
+- This slice centralizes startup optional service bootstrap without moving
+  logging or error-policy ownership out of binary and embedded startup.
+- Binary and embedded keep their existing notification failure semantics.
 
 ## Handoff Notes
 
-- R-009 is complete.
-- Next startup slices can be larger pure moves, but must keep startup ordering
-  and readiness ownership explicit in tests.
+- R-010 is complete.
+- Next startup slices can be larger pure moves, but must keep startup ordering,
+  fatal/non-fatal boundaries, and readiness ownership explicit in tests.

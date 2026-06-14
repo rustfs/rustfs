@@ -30,8 +30,8 @@ use futures_util::future::join_all;
 use rustfs::capacity::capacity_integration::init_capacity_management;
 use rustfs::license::{init_license, license_status};
 use rustfs::server::{
-    ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
-    start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
+    ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, shutdown_event_notifier, start_http_server,
+    stop_audit_system, wait_for_shutdown,
 };
 use rustfs::startup_fs_guard::enforce_unsupported_fs_policy;
 use rustfs::startup_iam::{bootstrap_or_defer_iam_init, publish_ready_for_iam_bootstrap};
@@ -45,7 +45,6 @@ use rustfs_ecstore::{
     config as ecconfig,
     endpoints::EndpointServerPools,
     global::{set_global_rustfs_port, shutdown_background_services},
-    notification_sys::new_global_notification_sys,
     set_global_endpoints,
     store::ECStore,
     store::init_local_disks,
@@ -778,12 +777,8 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     // Initialize buffer profiling system
     init_buffer_profile_system(&config);
 
-    // Initialize event notifier
-    init_event_notifier().await;
-
-    // Start the audit system
-    match start_audit_system().await {
-        Ok(_) => info!(
+    match rustfs::startup_services::init_event_notifier_and_audit().await {
+        Ok(()) => info!(
             target: "rustfs::main::run",
             event = EVENT_AUDIT_SYSTEM_STATE,
             component = LOG_COMPONENT_MAIN,
@@ -893,17 +888,18 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 
     add_bucket_notification_configuration(buckets.clone()).await;
 
-    // Initialize the global notification system
-    new_global_notification_sys(endpoint_pools.clone()).await.map_err(|err| {
-        error!(
-            event = EVENT_NOTIFICATION_SYSTEM_INITIALIZATION_FAILED,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            error = ?err,
-            "Failed to initialize notification system"
-        );
-        Error::other(err)
-    })?;
+    rustfs::startup_services::init_notification_system(endpoint_pools.clone())
+        .await
+        .map_err(|err| {
+            error!(
+                event = EVENT_NOTIFICATION_SYSTEM_INITIALIZATION_FAILED,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                error = ?err,
+                "Failed to initialize notification system"
+            );
+            Error::other(err)
+        })?;
 
     // Create a cancellation token for AHM services
     let _ = create_ahm_services_cancel_token();

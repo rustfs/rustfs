@@ -48,9 +48,7 @@
 
 use crate::config::Config;
 use crate::init::{add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system};
-use crate::server::{
-    ShutdownHandle, init_event_notifier, shutdown_event_notifier, start_audit_system, start_http_server, stop_audit_system,
-};
+use crate::server::{ShutdownHandle, shutdown_event_notifier, start_http_server, stop_audit_system};
 use crate::startup_fs_guard::enforce_unsupported_fs_policy;
 use crate::startup_iam::{bootstrap_or_defer_iam_init, publish_ready_for_iam_bootstrap};
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
@@ -65,7 +63,6 @@ use rustfs_ecstore::{
     config as ecconfig,
     endpoints::EndpointServerPools,
     global::set_global_rustfs_port,
-    notification_sys::new_global_notification_sys,
     set_global_endpoints,
     store::ECStore,
     store::init_local_disks,
@@ -435,11 +432,7 @@ impl RustFSServerBuilder {
         // Buffer profiles.
         init_buffer_profile_system(&config);
 
-        // Event notifier.
-        init_event_notifier().await;
-
-        // Audit (non-fatal).
-        if let Err(e) = start_audit_system().await {
+        if let Err(e) = crate::startup_services::init_event_notifier_and_audit().await {
             warn!(
                 component = LOG_COMPONENT_EMBEDDED,
                 subsystem = LOG_SUBSYSTEM_EMBEDDED,
@@ -482,8 +475,7 @@ impl RustFSServerBuilder {
         // Bucket notifications.
         add_bucket_notification_configuration(buckets.clone()).await;
 
-        // Notification system.
-        if let Err(e) = new_global_notification_sys(endpoint_pools.clone()).await {
+        if let Err(e) = crate::startup_services::init_notification_system(endpoint_pools.clone()).await {
             warn!(
                 component = LOG_COMPONENT_EMBEDDED,
                 subsystem = LOG_SUBSYSTEM_EMBEDDED,
