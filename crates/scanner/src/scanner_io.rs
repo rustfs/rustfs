@@ -39,7 +39,7 @@ use rustfs_ecstore::disk::error::DiskError;
 use rustfs_ecstore::disk::{Disk, DiskAPI};
 use rustfs_ecstore::error::{Error, StorageError};
 use rustfs_ecstore::global::GLOBAL_TierConfigMgr;
-use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::resolve_object_store_handle;
 use rustfs_ecstore::set_disk::SetDisks;
 use rustfs_ecstore::store_api::{BucketOperations, ObjectIO, ObjectInfo};
 use rustfs_ecstore::{error::Result, store::ECStore};
@@ -1333,7 +1333,7 @@ impl ScannerIODisk for Disk {
 
         // TODO: object lock
 
-        let Some(ecstore) = new_object_layer_fn() else {
+        let Some(ecstore) = resolve_object_store_handle() else {
             error!(
                 target: "rustfs::scanner::io",
                 event = EVENT_SCANNER_DISK_BUCKET_STATE,

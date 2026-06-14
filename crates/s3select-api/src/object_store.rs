@@ -26,7 +26,7 @@ use object_store::{
 use pin_project_lite::pin_project;
 use rustfs_common::DEFAULT_DELIMITER;
 use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
-use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::resolve_object_store_handle;
 use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use rustfs_ecstore::store::ECStore;
 use rustfs_ecstore::store_api::{GetObjectReader, HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectOptions};
@@ -107,7 +107,7 @@ pub struct InvalidScanRange;
 
 impl EcObjectStore {
     pub fn new(input: Arc<SelectObjectContentInput>) -> S3Result<Self> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(s3_error!(InternalError, "ec store not inited"));
         };
 

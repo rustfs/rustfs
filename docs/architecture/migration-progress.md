@@ -5,17 +5,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-admin-zip-object-store-context`
-- Baseline: `upstream/main` at `5e68cf8a296f0453fd050d137830032329685d12`
+- Branch: `overtrue/arch-object-store-resolver-crates`
+- Baseline: `upstream/main` at `59f99a30e2dee0794658cb1a2793cf48ed62e5ef`
 - PR type for this branch: `consumer-migration`
-- Runtime behavior changes: no external behavior change expected; admin object
-  ZIP download object-store lookups prefer the AppContext-owned object store
-  and keep the existing global fallback.
-- Rust code changes: migrate rustfs/src/admin/handlers/object_zip_download.rs
-  object-store lookups to the shared resolver without touching infra-layer
-  server/storage modules or standalone crates.
+- Runtime behavior changes: no external behavior change expected; standalone
+  protocol, observability, scanner, notify, and S3 Select object-store lookups
+  prefer the AppContext-owned object store when the application context is
+  installed and keep the existing global fallback.
+- Rust code changes: add an ECStore-owned object-store resolver hook, install
+  it from AppContext initialization, and migrate the standalone crate consumer
+  group without touching server/storage infra modules or ECStore internal
+  background consumers.
 - CI/script changes: none.
-- Docs changes: record `CTX-007` consumer migration scope and verification.
+- Docs changes: record `CTX-008` consumer migration scope and verification.
 
 ## Phase 0 Tasks
 
@@ -191,6 +193,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Must preserve: admin download authorization/preflight behavior, ZIP listing
     and streaming behavior, and existing storage error paths.
   - Verification: formatting, compile check, migration guards, diff hygiene,
+    Rust risk scan, and full `make pre-commit`.
+- [x] `CTX-008` Migrate standalone crate object-store consumers.
+  - Do: add an ECStore-owned resolver hook for AppContext-first object-store
+    lookup and migrate Swift, S3 Select, scanner, notify, and observability
+    object-store consumers to that resolver.
+  - Acceptance: standalone crates can prefer the AppContext-owned object store
+    without depending on the `rustfs` application crate and preserve the
+    existing global object-layer fallback.
+  - Must preserve: Swift protocol behavior, S3 Select object reads, scanner
+    cache/scan behavior, notification config persistence, observability stats
+    collection, and existing storage error paths.
+  - Verification: formatting, compile checks, migration guards, diff hygiene,
     Rust risk scan, and full `make pre-commit`.
 
 ## Phase 1 Security Governance Tasks
@@ -498,9 +512,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `consumer-migration`: design the crate-local object-store resolver path for
-   crates/protocols, crates/obs, crates/scanner, and crates/notify without
-   introducing reverse dependencies on rustfs.
+1. `consumer-migration`: migrate the remaining server/storage infra object-store
+   consumers after confirming the ECStore-owned resolver is the right boundary.
 2. `pure-move`: start `R-009` boot wrapper with the IAM degraded readiness
    contract covered.
 
@@ -508,37 +521,44 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Single `consumer-migration` slice; admin ZIP code may depend on app context, and the layer guard reports no new reverse dependencies. |
-| Migration preservation | pass | AppContext object-store resolution is preferred when present, while existing global object-layer fallback and ZIP error paths are preserved. |
-| Testing/verification | pass | Formatting, compile check, diff hygiene, migration/layer guards, added-line Rust risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Single consumer-migration slice; ECStore owns the resolver hook, standalone crates do not depend on `rustfs`, and the layer guard reports no new reverse dependencies. |
+| Migration preservation | passed | AppContext object-store resolution is preferred after context initialization, while the old global object-layer fallback and existing storage error paths are preserved. |
+| Testing/verification | passed | Formatting, compile checks, Swift feature check, diff hygiene, migration/layer guards, added-line Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `5e68cf8a296f0453fd050d137830032329685d12`:
+Passed on `59f99a30e2dee0794658cb1a2793cf48ed62e5ef`:
+
 - `cargo fmt --all`.
 - `cargo fmt --all --check`.
+- `cargo check -p rustfs-ecstore -p rustfs-s3select-api -p rustfs-scanner -p rustfs-notify -p rustfs-obs`.
+- `cargo check -p rustfs-protocols --features swift`.
 - `cargo check -p rustfs --lib`.
 - `git diff --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
-- Rust risk scan for changed Rust files; full-file matches were existing
-  tests and S3 result signatures, and the added-line scan returned no
+- Rust risk scan for changed Rust files; full-file matches were existing tests,
+  numeric casts, and relaxed counters, and the added-line scan returned no
   `unwrap`/`expect`, numeric cast, string error, boxed error, print macro, or
   relaxed-ordering match.
-- `make pre-commit`; all checks passed, including nextest 5939 passed and
-  111 skipped, plus doctests.
+- `make pre-commit`; all checks passed, including nextest 5941 passed and 111
+  skipped, plus doctests.
 
 Notes:
-- This slice migrates the admin object ZIP download object-store consumer
-  group.
-- Server/storage infra consumers still need a crate-local resolver path before
-  migration.
+
+- This slice adds an ECStore-owned object-store resolver hook for standalone
+  crates.
+- Swift, S3 Select, scanner, notify, and observability consumers now use the
+  resolver without depending on the `rustfs` application crate.
+- Server/storage infra consumers and ECStore internal background consumers
+  remain on the old global accessor for a follow-up slice.
 - Global object-layer fallback remains available until the planned cleanup
   phase.
 
 ## Handoff Notes
 
-- CTX-007 is complete.
-- Keep infra-layer server/storage consumers on the global accessor until a
-  crate-local resolver path is designed; preserve global fallback until the
-  planned cleanup phase.
+- CTX-008 is complete.
+- Remaining server/storage infra consumers can migrate to the ECStore-owned
+  resolver in the next consumer-migration slice if the layer guard still passes.
+- ECStore internal background consumers should be reviewed separately before
+  changing their global accessor behavior.

@@ -34,8 +34,8 @@ use rustfs_ecstore::bucket::metadata_sys::get_quota_config;
 use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
 use rustfs_ecstore::data_usage::load_data_usage_from_backend;
 use rustfs_ecstore::global::get_global_bucket_monitor;
-use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
+use rustfs_ecstore::resolve_object_store_handle;
 use rustfs_ecstore::store_api::BucketOperations;
 use rustfs_iam::{get_global_iam_sys, oidc::oidc_plugin_authn_metrics_snapshot};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
@@ -152,7 +152,7 @@ pub struct ProcessMetricBundle {
 
 /// Collect cluster and cluster-health statistics from a single storage snapshot.
 pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthStats) {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return (ClusterStats::default(), ClusterHealthStats::default());
     };
 
@@ -242,7 +242,7 @@ pub async fn collect_cluster_health_stats() -> ClusterHealthStats {
 
 /// Collect bucket statistics from the storage layer.
 pub async fn collect_bucket_stats() -> Vec<BucketStats> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Vec::new();
     };
 
@@ -523,7 +523,7 @@ pub fn collect_system_memory_stats() -> MemoryStats {
 
 /// Collect node disk stats and drive stats from a single storage snapshot.
 pub async fn collect_disk_and_system_drive_stats() -> (Vec<DiskStats>, Vec<DriveDetailedStats>, DriveCountStats) {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return (Vec::new(), Vec::new(), DriveCountStats::default());
     };
 
@@ -711,7 +711,7 @@ pub fn collect_internode_network_stats() -> Option<NetworkStats> {
 
 /// Collect cluster config metrics from backend parity configuration.
 pub async fn collect_cluster_config_stats() -> Option<ClusterConfigStats> {
-    let store = new_object_layer_fn()?;
+    let store = resolve_object_store_handle()?;
     let backend = StorageAdminApi::backend_info(store.as_ref()).await;
 
     Some(ClusterConfigStats {
@@ -722,7 +722,7 @@ pub async fn collect_cluster_config_stats() -> Option<ClusterConfigStats> {
 
 /// Collect cluster erasure set metrics from storage and backend topology info.
 pub async fn collect_erasure_set_stats() -> Vec<ErasureSetStats> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Vec::new();
     };
 
@@ -801,7 +801,7 @@ pub async fn collect_iam_stats() -> Option<IamStats> {
 /// builds cluster totals plus per-bucket distributions from the returned
 /// histograms. It does not trigger an inline object-data rescan.
 pub async fn collect_cluster_usage_metric_stats() -> Option<(ClusterUsageStats, Vec<BucketUsageStats>)> {
-    let store = new_object_layer_fn()?;
+    let store = resolve_object_store_handle()?;
     let data_usage = load_data_usage_from_backend(store.clone()).await.ok()?;
     let mut buckets = Vec::with_capacity(data_usage.buckets_usage.len());
 

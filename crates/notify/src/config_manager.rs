@@ -316,7 +316,7 @@ impl NotifyConfigManager {
     where
         F: FnMut(&mut Config) -> bool,
     {
-        let Some(store) = rustfs_ecstore::global::new_object_layer_fn() else {
+        let Some(store) = rustfs_ecstore::global::resolve_object_store_handle() else {
             return Err(NotificationError::StorageNotAvailable(
                 "Failed to save target configuration: server storage not initialized".to_string(),
             ));

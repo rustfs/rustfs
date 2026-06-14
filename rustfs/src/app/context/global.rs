@@ -21,7 +21,7 @@ use super::interfaces::{
     BucketMetadataInterface, BufferConfigInterface, EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface,
     NotifyInterface, RegionInterface, ServerConfigInterface, TierConfigInterface,
 };
-use rustfs_ecstore::store::ECStore;
+use rustfs_ecstore::{set_object_store_resolver, store::ECStore};
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
 use std::sync::{Arc, OnceLock};
@@ -151,7 +151,10 @@ static APP_CONTEXT_SINGLETON: OnceLock<Arc<AppContext>> = OnceLock::new();
 
 /// Initialize global application context once and return the canonical instance.
 pub fn init_global_app_context(context: AppContext) -> Arc<AppContext> {
-    APP_CONTEXT_SINGLETON.get_or_init(|| Arc::new(context)).clone()
+    let context = APP_CONTEXT_SINGLETON.get_or_init(|| Arc::new(context)).clone();
+    let resolver_context = context.clone();
+    let _ = set_object_store_resolver(Arc::new(move || Some(resolver_context.object_store())));
+    context
 }
 
 /// Get global application context if it has been initialized.
