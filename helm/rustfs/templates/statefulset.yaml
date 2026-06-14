@@ -2,6 +2,10 @@
 {{- $logDirEnabled := ne $logDir "" }}
 
 {{- if .Values.mode.distributed.enabled }}
+{{- $replicas := int .Values.replicaCount }}
+{{- if and (ne $replicas 4) (ne $replicas 16) }}
+{{- fail (printf "replicaCount must be 4 or 16 in distributed mode (got %d). See helm/README.md for supported topologies." $replicas) }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: StatefulSet

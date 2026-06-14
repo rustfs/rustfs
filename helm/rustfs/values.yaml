@@ -2,7 +2,9 @@
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
 
-# This will set the replicaset count more information can be found here: https://kubernetes.io/docs/concepts/workloads/controllers/replicaset/
+# Number of cluster nodes in distributed mode. Only 4 (each pod gets 4 data PVCs)
+# or 16 (each pod gets 1 data PVC) are supported; any other value fails rendering.
+# Ignored in standalone mode (capped to 1). See https://kubernetes.io/docs/concepts/workloads/controllers/replicaset/
 replicaCount: 4
 
 # This sets the container image more information can be found here: https://kubernetes.io/docs/concepts/containers/images/

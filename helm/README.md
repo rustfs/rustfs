@@ -143,7 +143,7 @@ uer. `ClusterIssuer` or `Issuer`. |
 | readinessProbe.periodSeconds | int | `5` |  |
 | readinessProbe.successThreshold | int | `1` |  |
 | readinessProbe.timeoutSeconds | int | `3` |  |
-| replicaCount | int | `4` | Number of cluster nodes. |
+| replicaCount | int | `4` | Number of cluster nodes in distributed mode. Only `4` or `16` are supported; other values fail rendering. Ignored in standalone mode. |
 | resources.limits.cpu | string | `"200m"` |  |
 | resources.limits.memory | string | `"512Mi"` |  |
 | resources.requests.cpu | string | `"100m"` |  |
