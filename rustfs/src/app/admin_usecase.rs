@@ -24,6 +24,7 @@ use rustfs_ecstore::data_usage::{apply_bucket_usage_memory_overlay, load_data_us
 use rustfs_ecstore::endpoints::EndpointServerPools;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::pools::{PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free};
+use rustfs_ecstore::store::ECStore;
 use rustfs_madmin::{InfoMessage, StorageInfo};
 use rustfs_storage_api::StorageAdminApi;
 use s3s::S3ErrorCode;
@@ -102,6 +103,13 @@ impl DefaultAdminUsecase {
         self.context.as_ref().and_then(|context| context.endpoints().handle())
     }
 
+    fn object_store(&self) -> Option<Arc<ECStore>> {
+        self.context
+            .as_ref()
+            .map(|context| context.object_store())
+            .or_else(new_object_layer_fn)
+    }
+
     fn app_error(code: S3ErrorCode, message: impl Into<String>) -> ApiError {
         ApiError {
             code,
@@ -121,7 +129,7 @@ impl DefaultAdminUsecase {
     }
 
     pub async fn execute_query_storage_info(&self) -> AdminUsecaseResult<StorageInfo> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
 
@@ -129,7 +137,7 @@ impl DefaultAdminUsecase {
     }
 
     pub async fn execute_query_data_usage_info(&self) -> AdminUsecaseResult<DataUsageInfo> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
 
@@ -208,7 +216,7 @@ impl DefaultAdminUsecase {
     }
 
     pub async fn execute_list_pool_statuses(&self) -> AdminUsecaseResult<Vec<PoolStatus>> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
 
@@ -255,7 +263,7 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error_default(S3ErrorCode::InvalidArgument));
         };
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
 
