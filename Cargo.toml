@@ -194,7 +194,7 @@ zeroize = { version = "1.9.0", features = ["derive"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 humantime = "2.3.0"
 jiff = { version = "0.2.28", features = ["serde"] }
-time = { version = "=0.3.47", features = ["std", "parsing", "formatting", "macros", "serde"] }
+time = { version = "0.3.49", features = ["std", "parsing", "formatting", "macros", "serde"] }
 
 # Database
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
@@ -264,7 +264,7 @@ reed-solomon-erasure = { version = "6.0", default-features = false, features = [
 reed-solomon-simd = "3.1.0"
 regex = { version = "1.12.4" }
 rumqttc = { package = "rumqttc-next", version = "0.33.2", features = ["websocket"] }
-redis = { version = "1.2.2", features = ["connection-manager", "tokio-rustls-comp", "tls-rustls-insecure"] }
+redis = { version = "1.2.3", features = ["connection-manager", "tokio-rustls-comp", "tls-rustls-insecure"] }
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.2" }
