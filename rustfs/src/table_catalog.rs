@@ -385,20 +385,37 @@ fn normalize_warehouse_object_prefix(object_prefix: &str) -> TableCatalogStoreRe
     Ok(normalized)
 }
 
-fn table_warehouse_object_prefix(entry: &TableEntry) -> TableCatalogStoreResult<String> {
-    let location = entry
-        .warehouse_location
+fn table_warehouse_object_prefix_from_location(table_bucket: &str, warehouse_location: &str) -> TableCatalogStoreResult<String> {
+    let location = warehouse_location
         .strip_prefix("s3://")
         .ok_or_else(|| TableCatalogStoreError::Invalid("table warehouse location must be an s3 URI".to_string()))?;
     let (bucket, object_prefix) = location
         .split_once('/')
         .ok_or_else(|| TableCatalogStoreError::Invalid("table warehouse location must include an object prefix".to_string()))?;
-    if bucket != entry.table_bucket {
+    if bucket != table_bucket {
         return Err(TableCatalogStoreError::Invalid(
             "table warehouse location must be inside the table bucket".to_string(),
         ));
     }
     normalize_warehouse_object_prefix(object_prefix)
+}
+
+fn table_warehouse_object_prefix(entry: &TableEntry) -> TableCatalogStoreResult<String> {
+    table_warehouse_object_prefix_from_location(&entry.table_bucket, &entry.warehouse_location)
+}
+
+fn metadata_warehouse_location(
+    table_bucket: &str,
+    metadata_location: &str,
+    metadata_object: &TableCatalogObject,
+) -> TableCatalogStoreResult<Option<String>> {
+    let metadata: serde_json::Value = serde_json::from_slice(&metadata_object.data)
+        .map_err(|err| TableCatalogStoreError::Invalid(format!("failed to parse new metadata {metadata_location}: {err}")))?;
+    let Some(location) = metadata.get("location").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    table_warehouse_object_prefix_from_location(table_bucket, location)?;
+    Ok(Some(location.to_string()))
 }
 
 pub(crate) async fn table_data_plane_resource_for_object<S>(
@@ -1464,16 +1481,18 @@ where
                 "new metadata location must be inside the table metadata directory".to_string(),
             ));
         }
-        if !self
+        let Some(new_metadata_object) = self
             .backend
-            .object_exists(&request.table_bucket, &request.new_metadata_location)
+            .read_object(&request.table_bucket, &request.new_metadata_location)
             .await?
-        {
+        else {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "new metadata object {}",
                 request.new_metadata_location
             )));
-        }
+        };
+        let next_warehouse_location =
+            metadata_warehouse_location(&request.table_bucket, &request.new_metadata_location, &new_metadata_object)?;
 
         let has_existing_commit = existing_commit.is_some();
         let mut staged_commit_log = existing_commit.unwrap_or_else(|| CommitLogEntry {
@@ -1496,6 +1515,9 @@ where
 
         let mut next = current.clone();
         next.metadata_location = staged_commit_log.new_metadata_location.clone();
+        if let Some(warehouse_location) = next_warehouse_location {
+            next.warehouse_location = warehouse_location;
+        }
         next.version_token = staged_commit_log.new_version_token.clone();
         next.generation = current.generation.saturating_add(1);
 
@@ -3565,6 +3587,63 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn object_table_catalog_store_syncs_warehouse_location_from_committed_metadata() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+        store
+            .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
+            .await
+            .unwrap();
+        backend
+            .seed_object(
+                bucket,
+                &new_metadata,
+                serde_json::to_vec(&serde_json::json!({
+                    "location": "s3://analytics/tables/relocated-table-id",
+                    "table-uuid": "table-uuid"
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let result = store
+            .commit_table(TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                commit_id: "commit-1".to_string(),
+                idempotency_key: None,
+                operation: "set-location".to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current_metadata,
+                new_metadata_location: new_metadata,
+                requirements: vec![serde_json::json!({"type": "assert-table-uuid", "uuid": "table-uuid"})],
+                writer: Some("pyiceberg/test".to_string()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.table.warehouse_location, "s3://analytics/tables/relocated-table-id");
+        let resource = table_data_plane_resource_for_object(&store, bucket, "tables/relocated-table-id/data/part-00001.parquet")
+            .await
+            .expect("data-plane resource lookup should succeed")
+            .expect("relocated table warehouse object should resolve to the table");
+        assert_eq!(resource.table, "orders");
+        assert_eq!(resource.warehouse_object_prefix, "tables/relocated-table-id/");
     }
 
     #[tokio::test]

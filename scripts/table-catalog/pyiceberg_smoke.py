@@ -543,13 +543,24 @@ def verify_vended_credential_data_plane_scope(
             print(f"warning: failed to clean unexpected denied-scope probe object {denied_key}: {cleanup_error}", file=sys.stderr)
         raise RuntimeError("vended table credentials unexpectedly wrote outside the table warehouse prefix")
 
+    admin_client = configured_s3_client(args, deps)
+    seeded_denied_key = False
     try:
-        client.get_object(Bucket=bucket, Key=denied_key)
-    except deps.botocore_client_error as error:
-        if is_access_denied_error(error):
-            return
-        raise RuntimeError(f"scope-denied read probe failed with unexpected S3 error: {error}") from error
-    raise RuntimeError("vended table credentials unexpectedly read outside the table warehouse prefix")
+        admin_client.put_object(Bucket=bucket, Key=denied_key, Body=b"rustfs denied read table credential scope probe\n")
+        seeded_denied_key = True
+        try:
+            client.get_object(Bucket=bucket, Key=denied_key)
+        except deps.botocore_client_error as error:
+            if is_access_denied_error(error):
+                return
+            raise RuntimeError(f"scope-denied read probe failed with unexpected S3 error: {error}") from error
+        raise RuntimeError("vended table credentials unexpectedly read outside the table warehouse prefix")
+    finally:
+        if seeded_denied_key:
+            try:
+                admin_client.delete_object(Bucket=bucket, Key=denied_key)
+            except Exception as cleanup_error:
+                print(f"warning: failed to clean denied-scope read probe object {denied_key}: {cleanup_error}", file=sys.stderr)
 
 
 def catalog_properties(args: argparse.Namespace, storage_credential: StorageCredential | None = None) -> dict[str, str]:

@@ -238,6 +238,16 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             def delete_object(self, *, Bucket: str, Key: str) -> None:
                 self.calls.append(("delete", Key))
 
+        class FakeAdminS3Client:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+
+            def put_object(self, *, Bucket: str, Key: str, Body: bytes) -> None:
+                self.calls.append(("put", Key))
+
+            def delete_object(self, *, Bucket: str, Key: str) -> None:
+                self.calls.append(("delete", Key))
+
         args = self.parse_with_args(["--bucket", "lake"])
         credential = pyiceberg_smoke.StorageCredential(
             prefix="s3://lake/tables/table-id/",
@@ -248,11 +258,13 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             },
         )
         fake_client = FakeS3Client()
+        fake_admin_client = FakeAdminS3Client()
         deps = mock.Mock(botocore_client_error=FakeClientError)
 
         with mock.patch.object(pyiceberg_smoke, "vended_s3_client", return_value=fake_client):
-            with mock.patch.object(pyiceberg_smoke, "scope_probe_keys", return_value=("tables/table-id/probe", "outside/probe")):
-                pyiceberg_smoke.verify_vended_credential_data_plane_scope(args, deps, credential, "s3://lake/tables/table-id")
+            with mock.patch.object(pyiceberg_smoke, "configured_s3_client", return_value=fake_admin_client):
+                with mock.patch.object(pyiceberg_smoke, "scope_probe_keys", return_value=("tables/table-id/probe", "outside/probe")):
+                    pyiceberg_smoke.verify_vended_credential_data_plane_scope(args, deps, credential, "s3://lake/tables/table-id")
 
         self.assertEqual(
             fake_client.calls,
@@ -263,6 +275,13 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
                 ("delete", "tables/table-id/probe"),
                 ("put", "outside/probe"),
                 ("get", "outside/probe"),
+            ],
+        )
+        self.assertEqual(
+            fake_admin_client.calls,
+            [
+                ("put", "outside/probe"),
+                ("delete", "outside/probe"),
             ],
         )
 
