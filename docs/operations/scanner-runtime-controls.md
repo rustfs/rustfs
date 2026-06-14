@@ -146,6 +146,29 @@ Use these counters to decide whether scan progress is limited by scanner pacing
 or by a downstream subsystem such as lifecycle transition, replication repair,
 or heal admission.
 
+## Reading Distributed Metrics
+
+`/rustfs/admin/v3/scanner/status` reports the local node's detailed scanner
+state. In distributed deployments, use the admin metrics stream with scanner
+metrics enabled to compare nodes and aggregate pressure:
+
+```bash
+awscurl \
+  --service s3 \
+  --region us-east-1 \
+  --access_key "$RUSTFS_ACCESS_KEY" \
+  --secret_key "$RUSTFS_SECRET_KEY" \
+  --request GET \
+  'http://127.0.0.1:9000/rustfs/admin/v3/metrics?types=1&by-host=true&n=1'
+```
+
+The `aggregated.scanner` payload preserves the same scanner progress,
+checkpoint, pacing, source work, and lifecycle transition fields used by the
+local scanner status. The `by_host.*.scanner` payload keeps the per-node view.
+Use the aggregate for cluster-wide pressure and the host view to find the node
+that owns an old active path, a partial checkpoint, or a downstream queue
+admission problem.
+
 ## Reading Lifecycle Transition Status
 
 `metrics.lifecycle_transition` focuses on scanner-driven lifecycle transition
