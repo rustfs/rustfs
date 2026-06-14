@@ -22,7 +22,7 @@ use metrics::counter;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::policy_sys::PolicySys;
 use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found};
-use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::resolve_object_store_handle;
 use rustfs_ecstore::store::ECStore;
 use rustfs_ecstore::store_api::BucketOperations;
 use rustfs_iam::error::Error as IamError;
@@ -784,7 +784,7 @@ fn table_data_plane_admin_action(action: Action) -> Option<AdminAction> {
 }
 
 fn table_catalog_store_for_data_plane() -> S3Result<crate::table_catalog::EcStoreTableCatalogStore<ECStore>> {
-    let store = new_object_layer_fn().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
+    let store = resolve_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
     let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new(store);
     Ok(crate::table_catalog::ObjectTableCatalogStore::new(backend))
 }
@@ -1183,7 +1183,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_object(&self, req: &mut S3Request<DeleteObjectInput>) -> S3Result<()> {
-        if let Some(store) = new_object_layer_fn()
+        if let Some(store) = resolve_object_store_handle()
             && let Err(err) = store.get_bucket_info(&req.input.bucket, &Default::default()).await
             && is_err_bucket_not_found(&err)
         {

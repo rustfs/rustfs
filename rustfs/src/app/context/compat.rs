@@ -122,6 +122,7 @@ mod tests {
     use crate::config::{RustFSBufferConfig, WorkloadProfile};
     use rustfs_ecstore::disk::endpoint::Endpoint;
     use rustfs_ecstore::endpoints::{Endpoints, PoolEndpoints};
+    use rustfs_ecstore::new_object_layer_fn;
     use rustfs_ecstore::store::init_local_disks;
     use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
     use std::path::PathBuf;
@@ -211,6 +212,11 @@ mod tests {
     }
 
     async fn test_store() -> (TempDir, Arc<ECStore>, EndpointServerPools) {
+        if let Some(store) = new_object_layer_fn() {
+            let endpoints = EndpointServerPools(store.pools.iter().map(|pool| pool.endpoints.clone()).collect());
+            return (tempfile::tempdir().expect("compat test temp dir"), store, endpoints);
+        }
+
         let temp_dir = tempfile::tempdir().expect("test temp dir");
         let disk_paths = (0..4)
             .map(|index| temp_dir.path().join(format!("disk{index}")))
@@ -238,6 +244,10 @@ mod tests {
             platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
         };
         let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
+
+        if let Some(store) = new_object_layer_fn() {
+            return (temp_dir, store, endpoint_pools);
+        }
 
         init_local_disks(endpoint_pools.clone()).await.expect("test local disks");
         let store = ECStore::new(

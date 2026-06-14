@@ -24,11 +24,10 @@ use crate::{
 use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
 use matchit::Params;
-use rustfs_ecstore::rebalance::RebalanceMeta;
 use rustfs_ecstore::{
     error::StorageError,
     notification_sys::get_global_notification_sys,
-    rebalance::{DiskStat, RebalSaveOpt},
+    rebalance::{DiskStat, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta},
     store_api::BucketOperations,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
@@ -104,6 +103,8 @@ pub struct RebalancePoolStatus {
     pub used: f64, // Fraction of used space in range 0.0..=1.0
     #[serde(rename = "lastError")]
     pub last_error: Option<String>, // Last rebalance error message for this pool
+    #[serde(rename = "cleanupWarnings")]
+    pub cleanup_warnings: RebalanceCleanupWarnings,
     #[serde(rename = "progress")]
     pub progress: Option<RebalPoolProgress>, // None when rebalance is not running
 }
@@ -205,6 +206,7 @@ fn build_rebalance_pool_statuses(
                 status: ps.info.status.to_string(),
                 used: rebalance_pool_used(disk_stats, i),
                 last_error: ps.info.last_error.clone(),
+                cleanup_warnings: ps.cleanup_warnings.clone(),
                 progress: None,
             };
 
@@ -562,7 +564,7 @@ mod rebalance_handler_tests {
         RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, build_rebalance_pool_statuses, rebalance_pool_used,
         rebalance_remaining_buckets, rebalance_used_pct,
     };
-    use rustfs_ecstore::rebalance::{DiskStat, RebalStatus, RebalanceInfo, RebalanceStats};
+    use rustfs_ecstore::rebalance::{DiskStat, RebalStatus, RebalanceCleanupWarnings, RebalanceInfo, RebalanceStats};
     use time::OffsetDateTime;
 
     #[test]
@@ -668,6 +670,7 @@ mod rebalance_handler_tests {
                 start_time: Some(OffsetDateTime::from_unix_timestamp(1_000).unwrap()),
                 ..Default::default()
             },
+            ..Default::default()
         };
 
         let progress = build_rebalance_pool_progress(OffsetDateTime::from_unix_timestamp(1_050).unwrap(), None, 0.3, &ps)
@@ -772,6 +775,7 @@ mod rebalance_handler_tests {
                     start_time: Some(OffsetDateTime::from_unix_timestamp(1_000).unwrap()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
             RebalanceStats {
                 participating: false,
@@ -847,6 +851,7 @@ mod rebalance_handler_tests {
                     start_time: Some(OffsetDateTime::from_unix_timestamp(2_000).unwrap()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         ];
 
@@ -883,6 +888,13 @@ mod rebalance_handler_tests {
                 status: "Started".to_string(),
                 used: 0.5,
                 last_error: Some("temporary error".to_string()),
+                cleanup_warnings: RebalanceCleanupWarnings {
+                    count: 1,
+                    last_message: Some("cleanup warning".to_string()),
+                    last_bucket: Some("bucket-a".to_string()),
+                    last_object: Some("obj".to_string()),
+                    last_at: Some(OffsetDateTime::from_unix_timestamp(1_001).unwrap()),
+                },
                 progress: Some(RebalPoolProgress {
                     num_objects: 3,
                     num_versions: 5,
@@ -899,6 +911,8 @@ mod rebalance_handler_tests {
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"remainingBuckets\""));
         assert!(json.contains("\"lastError\""));
+        assert!(json.contains("\"cleanupWarnings\""));
+        assert!(json.contains("\"lastMsg\":\"cleanup warning\""));
         assert!(json.contains("\"stoppedAt\":null"));
     }
 
@@ -913,6 +927,7 @@ mod rebalance_handler_tests {
                 status: "Stopped".to_string(),
                 used: 0.3,
                 last_error: None,
+                cleanup_warnings: RebalanceCleanupWarnings::default(),
                 progress: None,
             }],
         };

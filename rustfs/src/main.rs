@@ -119,13 +119,21 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+fn format_fatal_stderr_message(context: &str, error: impl std::fmt::Display) -> String {
+    format!("[FATAL] {context}: {error}")
+}
+
+fn emit_fatal_stderr(context: &str, error: impl std::fmt::Display) {
+    eprintln!("{}", format_fatal_stderr_message(context, error));
+}
+
 fn main() {
     // Build Tokio runtime with optional dial9 telemetry support
     let runtime = rustfs::server::build_tokio_runtime().expect("Failed to build Tokio runtime");
     let result = runtime.block_on(async_main());
     if let Err(ref e) = result {
-        // Use eprintln as tracing may not be initialized at this point
-        eprintln!("[FATAL] Server encountered an error and is shutting down: {e}");
+        // Tracing may not be initialized when startup fails this early.
+        emit_fatal_stderr("Server runtime failed", e);
         std::process::exit(1);
     }
 }
@@ -158,7 +166,7 @@ async fn async_main() -> Result<()> {
     let command_result = match rustfs::config::Opt::parse_command(args) {
         Ok(result) => result,
         Err(e) => {
-            eprintln!("Command parse failed, error: {}", e);
+            emit_fatal_stderr("Command parse failed", e);
             std::process::exit(1);
         }
     };
@@ -183,8 +191,8 @@ async fn async_main() -> Result<()> {
     let guard = match init_obs(Some(config.clone().obs_endpoint)).await {
         Ok(g) => g,
         Err(e) => {
-            // Use eprintln as tracing is not yet initialized
-            eprintln!("[FATAL] Failed to initialize observability: {e}");
+            // Structured logging is unavailable until observability initializes.
+            emit_fatal_stderr("Observability initialization failed", &e);
             return Err(Error::other(e));
         }
     };
@@ -1281,6 +1289,14 @@ mod tests {
         assert_eq!(
             formatted,
             "MINIO_ROOT_USER->RUSTFS_ROOT_USER, MINIO_NOTIFY_WEBHOOK_ENABLE_PRIMARY->RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY"
+        );
+    }
+
+    #[test]
+    fn fatal_stderr_message_uses_consistent_prefix_and_context() {
+        assert_eq!(
+            format_fatal_stderr_message("Observability initialization failed", "collector unavailable"),
+            "[FATAL] Observability initialization failed: collector unavailable"
         );
     }
 
