@@ -31,7 +31,7 @@ use rustfs_ecstore::{
     get_global_lock_client,
     global::GLOBAL_TierConfigMgr,
     metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics},
-    new_object_layer_fn,
+    resolve_object_store_handle,
     rpc::{
         LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG,
         SERVICE_SIGNAL_RELOAD_DYNAMIC,
@@ -813,7 +813,7 @@ impl Node for NodeService {
         &self,
         _request: Request<ReloadSiteReplicationConfigRequest>,
     ) -> Result<Response<ReloadSiteReplicationConfigResponse>, Status> {
-        let Some(_store) = new_object_layer_fn() else {
+        let Some(_store) = resolve_object_store_handle() else {
             return Ok(Response::new(ReloadSiteReplicationConfigResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -902,7 +902,7 @@ impl Node for NodeService {
         &self,
         _request: Request<ReloadPoolMetaRequest>,
     ) -> Result<Response<ReloadPoolMetaResponse>, Status> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Ok(Response::new(ReloadPoolMetaResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -921,7 +921,7 @@ impl Node for NodeService {
     }
 
     async fn stop_rebalance(&self, _request: Request<StopRebalanceRequest>) -> Result<Response<StopRebalanceResponse>, Status> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Ok(Response::new(StopRebalanceResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -940,7 +940,7 @@ impl Node for NodeService {
         &self,
         request: Request<LoadRebalanceMetaRequest>,
     ) -> Result<Response<LoadRebalanceMetaResponse>, Status> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Ok(Response::new(LoadRebalanceMetaResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -978,7 +978,7 @@ impl Node for NodeService {
         &self,
         _request: Request<LoadTransitionTierConfigRequest>,
     ) -> Result<Response<LoadTransitionTierConfigResponse>, Status> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Ok(Response::new(LoadTransitionTierConfigResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),

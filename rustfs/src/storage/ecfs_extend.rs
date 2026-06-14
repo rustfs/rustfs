@@ -24,7 +24,7 @@ use rustfs_ecstore::bucket::metadata_sys::get_replication_config;
 use rustfs_ecstore::bucket::object_lock::objectlock_sys;
 use rustfs_ecstore::bucket::replication::ReplicationConfigurationExt;
 use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::resolve_object_store_handle;
 use rustfs_ecstore::store_api::{BucketOperations, ObjectInfo, ObjectToDelete};
 use rustfs_storage_api::BucketOptions;
 use rustfs_targets::EventName;
@@ -739,7 +739,7 @@ pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelet
 
 /// Helper function to get store and validate bucket exists
 pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<rustfs_ecstore::store::ECStore>> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
