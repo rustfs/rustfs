@@ -446,7 +446,9 @@ where
             if table.state != TableCatalogEntryState::Active {
                 continue;
             }
-            let warehouse_object_prefix = table_warehouse_object_prefix(&table)?;
+            let Ok(warehouse_object_prefix) = table_warehouse_object_prefix(&table) else {
+                continue;
+            };
             if !object.starts_with(&warehouse_object_prefix) {
                 continue;
             }
@@ -2988,6 +2990,45 @@ mod tests {
         assert_eq!(resource.table_id, "table-id-child");
         assert_eq!(resource.warehouse_object_prefix, "tables/table-id/child/");
         assert_eq!(resource.catalog_resource_object(), "namespaces/sales/tables/orders_child");
+    }
+
+    #[tokio::test]
+    async fn table_data_plane_resource_skips_invalid_warehouse_locations() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let invalid_table = IdentifierSegment::parse("bad_orders").unwrap();
+        let valid_table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &valid_table, "00001.metadata.json");
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+
+        let mut invalid_entry = test_table_entry(bucket, &namespace, &invalid_table, current.clone());
+        invalid_entry.table_id = "bad-table-id".to_string();
+        invalid_entry.warehouse_location = format!("s3://{bucket}/");
+        store.create_table(invalid_entry).await.unwrap();
+        store
+            .create_table(test_table_entry(bucket, &namespace, &valid_table, current))
+            .await
+            .unwrap();
+
+        let unrelated = table_data_plane_resource_for_object(&store, bucket, "ordinary/object.parquet")
+            .await
+            .expect("invalid table warehouse location should not deny unrelated object lookup");
+        assert!(unrelated.is_none());
+
+        let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/part-00001.parquet")
+            .await
+            .expect("invalid table warehouse location should not block a later valid match")
+            .expect("valid table warehouse object should resolve to the table");
+        assert_eq!(resource.table, "orders");
+        assert_eq!(resource.table_id, "table-id");
+        assert_eq!(resource.warehouse_object_prefix, "tables/table-id/");
     }
 
     #[tokio::test]
