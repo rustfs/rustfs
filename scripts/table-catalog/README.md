@@ -94,12 +94,15 @@ table-scoped S3 access key, secret key, and session token before append, reload,
 and scan operations.
 
 Before the PyIceberg append, the profile also checks that the returned
-credential prefix exactly matches the created table warehouse location, then
-runs a direct S3 data-plane scope probe with the returned temporary credentials:
+credential prefix exactly matches the created table warehouse location after
+canonical S3 URI normalization, including percent-decoding equivalent path
+encodings. It then runs a direct S3 data-plane scope probe with the returned
+temporary credentials:
 
-- `PutObject`, `HeadObject`, and `DeleteObject` must work inside the returned
-  table warehouse prefix.
-- `PutObject` to the same bucket outside that prefix must be rejected.
+- `PutObject`, `HeadObject`, `GetObject`, and `DeleteObject` must work inside
+  the returned table warehouse prefix.
+- `PutObject` and `GetObject` to the same bucket outside that prefix must be
+  rejected.
 
 ## Machine-Readable Inventories
 

@@ -389,7 +389,7 @@ impl TableCredentialIssuer for IamTableCredentialIssuer {
             ));
         }
 
-        let policy = table_credential_session_policy(&request.entry.table_bucket, &request.object_prefix)?;
+        let policy = table_credential_session_policy(request.entry, &request.object_prefix)?;
         let policy_buf = serde_json::to_vec(&policy)
             .map_err(|err| s3_error!(InternalError, "failed to serialize table credential session policy: {}", err))?;
         let expiration = OffsetDateTime::now_utc().saturating_add(Duration::seconds(self.ttl_seconds));
@@ -990,8 +990,18 @@ fn normalize_table_credential_object_prefix(object_prefix: &str) -> S3Result<Str
     Ok(normalized)
 }
 
-fn table_credential_session_policy(bucket: &str, object_prefix: &str) -> S3Result<Policy> {
+fn table_credential_catalog_resource(entry: &crate::table_catalog::TableEntry) -> S3Result<String> {
+    let namespace = crate::table_catalog::Namespace::parse(&entry.namespace)
+        .map_err(|err| s3_error!(InvalidRequest, "invalid table credential namespace: {}", err))?;
+    let table = crate::table_catalog::IdentifierSegment::parse(&entry.table)
+        .map_err(|err| s3_error!(InvalidRequest, "invalid table credential table name: {}", err))?;
+    Ok(format!("namespaces/{}/tables/{}", namespace.storage_id(), table.as_str()))
+}
+
+fn table_credential_session_policy(entry: &crate::table_catalog::TableEntry, object_prefix: &str) -> S3Result<Policy> {
+    let bucket = &entry.table_bucket;
     let object_prefix = normalize_table_credential_object_prefix(object_prefix)?;
+    let catalog_resource = table_credential_catalog_resource(entry)?;
     let policy = serde_json::json!({
         "Version": "2012-10-17",
         "Statement": [
@@ -1015,6 +1025,16 @@ fn table_credential_session_policy(bucket: &str, object_prefix: &str) -> S3Resul
                 ],
                 "Resource": [
                     format!("arn:aws:s3:::{bucket}")
+                ]
+            },
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "admin:GetTableMetadata",
+                    "admin:SetTableMetadata"
+                ],
+                "Resource": [
+                    format!("arn:aws:s3:::{bucket}/{catalog_resource}")
                 ]
             }
         ]
@@ -4313,8 +4333,8 @@ mod tests {
 
     #[tokio::test]
     async fn table_credential_session_policy_is_limited_to_table_prefix() {
-        let policy =
-            table_credential_session_policy("warehouse", "tables/table-id/").expect("table credential policy should build");
+        let policy = table_credential_session_policy(&table_entry_for_credentials(), "tables/table-id/")
+            .expect("table credential policy should build");
         let groups = None;
         let conditions = std::collections::HashMap::new();
         let claims = std::collections::HashMap::new();
@@ -4350,6 +4370,21 @@ mod tests {
                 .await
         );
         assert!(
+            policy
+                .is_allowed(&rustfs_policy::policy::Args {
+                    account: "temporary-access-key",
+                    groups: &groups,
+                    action: Action::AdminAction(rustfs_policy::policy::action::AdminAction::SetTableMetadataAction),
+                    bucket: "warehouse",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "namespaces/analytics/tables/events",
+                    claims: &claims,
+                    deny_only: false,
+                })
+                .await
+        );
+        assert!(
             !policy
                 .is_allowed(&rustfs_policy::policy::Args {
                     account: "temporary-access-key",
@@ -4374,6 +4409,61 @@ mod tests {
                     conditions: &conditions,
                     is_owner: false,
                     object: "tables/table-id/data/file.parquet",
+                    claims: &claims,
+                    deny_only: false,
+                })
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn table_credential_session_policy_includes_table_resource_actions() {
+        let policy = table_credential_session_policy(&table_entry_for_credentials(), "tables/table-id/")
+            .expect("table credential policy should build");
+        let groups = None;
+        let conditions = std::collections::HashMap::new();
+        let claims = std::collections::HashMap::new();
+
+        assert!(
+            policy
+                .is_allowed(&rustfs_policy::policy::Args {
+                    account: "temporary-access-key",
+                    groups: &groups,
+                    action: Action::AdminAction(rustfs_policy::policy::action::AdminAction::GetTableMetadataAction),
+                    bucket: "warehouse",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "namespaces/analytics/tables/events",
+                    claims: &claims,
+                    deny_only: false,
+                })
+                .await
+        );
+        assert!(
+            !policy
+                .is_allowed(&rustfs_policy::policy::Args {
+                    account: "temporary-access-key",
+                    groups: &groups,
+                    action: Action::AdminAction(rustfs_policy::policy::action::AdminAction::SetTableMetadataAction),
+                    bucket: "warehouse",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "namespaces/analytics/tables/orders",
+                    claims: &claims,
+                    deny_only: false,
+                })
+                .await
+        );
+        assert!(
+            !policy
+                .is_allowed(&rustfs_policy::policy::Args {
+                    account: "temporary-access-key",
+                    groups: &groups,
+                    action: Action::AdminAction(rustfs_policy::policy::action::AdminAction::CreateTableAction),
+                    bucket: "warehouse",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "namespaces/analytics/tables/events",
                     claims: &claims,
                     deny_only: false,
                 })

@@ -149,6 +149,15 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         self.assertEqual(bucket, "lake")
         self.assertEqual(key_prefix, "tables/table-id/")
 
+    def test_s3_scope_from_uri_decodes_equivalent_prefix_encoding(self) -> None:
+        bucket, key_prefix = pyiceberg_smoke.s3_scope_from_uri(
+            "s3://lake/tables/table%2Did/",
+            "storage credential prefix",
+        )
+
+        self.assertEqual(bucket, "lake")
+        self.assertEqual(key_prefix, "tables/table-id/")
+
     def test_storage_credential_prefix_rejects_bucket_scope(self) -> None:
         credential = pyiceberg_smoke.StorageCredential(
             prefix="s3://lake",
@@ -220,6 +229,22 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             def head_object(self, *, Bucket: str, Key: str) -> None:
                 self.calls.append(("head", Key))
 
+            def get_object(self, *, Bucket: str, Key: str) -> dict[str, bytes]:
+                self.calls.append(("get", Key))
+                if Key == "outside/probe":
+                    raise FakeClientError(403, "AccessDenied")
+                return {"Body": b"rustfs table credential scope probe\n"}
+
+            def delete_object(self, *, Bucket: str, Key: str) -> None:
+                self.calls.append(("delete", Key))
+
+        class FakeAdminS3Client:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+
+            def put_object(self, *, Bucket: str, Key: str, Body: bytes) -> None:
+                self.calls.append(("put", Key))
+
             def delete_object(self, *, Bucket: str, Key: str) -> None:
                 self.calls.append(("delete", Key))
 
@@ -233,19 +258,30 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             },
         )
         fake_client = FakeS3Client()
+        fake_admin_client = FakeAdminS3Client()
         deps = mock.Mock(botocore_client_error=FakeClientError)
 
         with mock.patch.object(pyiceberg_smoke, "vended_s3_client", return_value=fake_client):
-            with mock.patch.object(pyiceberg_smoke, "scope_probe_keys", return_value=("tables/table-id/probe", "outside/probe")):
-                pyiceberg_smoke.verify_vended_credential_data_plane_scope(args, deps, credential, "s3://lake/tables/table-id")
+            with mock.patch.object(pyiceberg_smoke, "configured_s3_client", return_value=fake_admin_client):
+                with mock.patch.object(pyiceberg_smoke, "scope_probe_keys", return_value=("tables/table-id/probe", "outside/probe")):
+                    pyiceberg_smoke.verify_vended_credential_data_plane_scope(args, deps, credential, "s3://lake/tables/table-id")
 
         self.assertEqual(
             fake_client.calls,
             [
                 ("put", "tables/table-id/probe"),
                 ("head", "tables/table-id/probe"),
+                ("get", "tables/table-id/probe"),
                 ("delete", "tables/table-id/probe"),
                 ("put", "outside/probe"),
+                ("get", "outside/probe"),
+            ],
+        )
+        self.assertEqual(
+            fake_admin_client.calls,
+            [
+                ("put", "outside/probe"),
+                ("delete", "outside/probe"),
             ],
         )
 

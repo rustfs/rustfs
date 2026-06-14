@@ -431,12 +431,15 @@ def s3_scope_from_uri(s3_uri: str, description: str) -> tuple[str, str]:
     parsed = urllib.parse.urlparse(s3_uri)
     if parsed.scheme != "s3" or not parsed.netloc:
         raise RuntimeError(f"{description} must be an s3 URI")
-    object_prefix = parsed.path.lstrip("/")
+    bucket = urllib.parse.unquote(parsed.netloc)
+    object_prefix = urllib.parse.unquote(parsed.path.lstrip("/")).rstrip("/")
     if not object_prefix:
         raise RuntimeError(f"{description} must include an object prefix")
-    if not object_prefix.endswith("/"):
-        object_prefix = f"{object_prefix}/"
-    return parsed.netloc, object_prefix
+    if "\\" in object_prefix:
+        raise RuntimeError(f"{description} contains an invalid path separator")
+    if any(segment in {"", ".", ".."} for segment in object_prefix.split("/")):
+        raise RuntimeError(f"{description} contains an invalid path segment")
+    return bucket, f"{object_prefix}/"
 
 
 def s3_scope_from_credential(storage_credential: StorageCredential) -> tuple[str, str]:
@@ -520,22 +523,44 @@ def verify_vended_credential_data_plane_scope(
         client.put_object(Bucket=bucket, Key=inside_key, Body=b"rustfs table credential scope probe\n")
         put_inside = True
         client.head_object(Bucket=bucket, Key=inside_key)
+        client.get_object(Bucket=bucket, Key=inside_key)
     finally:
         if put_inside:
             client.delete_object(Bucket=bucket, Key=inside_key)
 
+    put_denied = False
     try:
         client.put_object(Bucket=bucket, Key=denied_key, Body=b"rustfs denied table credential scope probe\n")
     except deps.botocore_client_error as error:
         if is_access_denied_error(error):
-            return
-        raise RuntimeError(f"scope-denied data-plane probe failed with unexpected S3 error: {error}") from error
+            put_denied = True
+        else:
+            raise RuntimeError(f"scope-denied write probe failed with unexpected S3 error: {error}") from error
+    if not put_denied:
+        try:
+            configured_s3_client(args, deps).delete_object(Bucket=bucket, Key=denied_key)
+        except Exception as cleanup_error:
+            print(f"warning: failed to clean unexpected denied-scope probe object {denied_key}: {cleanup_error}", file=sys.stderr)
+        raise RuntimeError("vended table credentials unexpectedly wrote outside the table warehouse prefix")
 
+    admin_client = configured_s3_client(args, deps)
+    seeded_denied_key = False
     try:
-        configured_s3_client(args, deps).delete_object(Bucket=bucket, Key=denied_key)
-    except Exception as cleanup_error:
-        print(f"warning: failed to clean unexpected denied-scope probe object {denied_key}: {cleanup_error}", file=sys.stderr)
-    raise RuntimeError("vended table credentials unexpectedly wrote outside the table warehouse prefix")
+        admin_client.put_object(Bucket=bucket, Key=denied_key, Body=b"rustfs denied read table credential scope probe\n")
+        seeded_denied_key = True
+        try:
+            client.get_object(Bucket=bucket, Key=denied_key)
+        except deps.botocore_client_error as error:
+            if is_access_denied_error(error):
+                return
+            raise RuntimeError(f"scope-denied read probe failed with unexpected S3 error: {error}") from error
+        raise RuntimeError("vended table credentials unexpectedly read outside the table warehouse prefix")
+    finally:
+        if seeded_denied_key:
+            try:
+                admin_client.delete_object(Bucket=bucket, Key=denied_key)
+            except Exception as cleanup_error:
+                print(f"warning: failed to clean denied-scope read probe object {denied_key}: {cleanup_error}", file=sys.stderr)
 
 
 def catalog_properties(args: argparse.Namespace, storage_credential: StorageCredential | None = None) -> dict[str, str]:

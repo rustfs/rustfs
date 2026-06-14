@@ -302,6 +302,24 @@ pub(crate) struct TableCatalogExport {
     pub table: TableEntry,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableDataPlaneResource {
+    pub table_bucket: String,
+    pub namespace: String,
+    pub table: String,
+    pub table_id: String,
+    pub warehouse_object_prefix: String,
+}
+
+impl TableDataPlaneResource {
+    pub(crate) fn catalog_resource_object(&self) -> String {
+        let namespace = Namespace::parse(&self.namespace)
+            .map(|namespace| namespace.storage_id())
+            .unwrap_or_else(|_| self.namespace.clone());
+        format!("{NAMESPACE_ROOT}/{namespace}/{TABLE_ROOT}/{}", self.table)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableMetadataPointerStatus {
@@ -340,6 +358,118 @@ impl fmt::Display for TableCatalogStoreError {
 impl std::error::Error for TableCatalogStoreError {}
 
 pub(crate) type TableCatalogStoreResult<T> = Result<T, TableCatalogStoreError>;
+
+fn normalize_warehouse_object_prefix(object_prefix: &str) -> TableCatalogStoreResult<String> {
+    let object_prefix = object_prefix.strip_suffix('/').unwrap_or(object_prefix);
+    if object_prefix.is_empty() {
+        return Err(TableCatalogStoreError::Invalid(
+            "table warehouse location must include an object prefix".to_string(),
+        ));
+    }
+    if object_prefix.contains('\\') {
+        return Err(TableCatalogStoreError::Invalid(
+            "table warehouse location contains an invalid path separator".to_string(),
+        ));
+    }
+    if object_prefix
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(TableCatalogStoreError::Invalid(
+            "table warehouse location contains an invalid path segment".to_string(),
+        ));
+    }
+
+    let mut normalized = object_prefix.to_string();
+    normalized.push('/');
+    Ok(normalized)
+}
+
+fn table_warehouse_object_prefix_from_location(table_bucket: &str, warehouse_location: &str) -> TableCatalogStoreResult<String> {
+    let location = warehouse_location
+        .strip_prefix("s3://")
+        .ok_or_else(|| TableCatalogStoreError::Invalid("table warehouse location must be an s3 URI".to_string()))?;
+    let (bucket, object_prefix) = location
+        .split_once('/')
+        .ok_or_else(|| TableCatalogStoreError::Invalid("table warehouse location must include an object prefix".to_string()))?;
+    if bucket != table_bucket {
+        return Err(TableCatalogStoreError::Invalid(
+            "table warehouse location must be inside the table bucket".to_string(),
+        ));
+    }
+    normalize_warehouse_object_prefix(object_prefix)
+}
+
+fn table_warehouse_object_prefix(entry: &TableEntry) -> TableCatalogStoreResult<String> {
+    table_warehouse_object_prefix_from_location(&entry.table_bucket, &entry.warehouse_location)
+}
+
+fn metadata_warehouse_location(
+    table_bucket: &str,
+    metadata_location: &str,
+    metadata_object: &TableCatalogObject,
+) -> TableCatalogStoreResult<Option<String>> {
+    let metadata: serde_json::Value = serde_json::from_slice(&metadata_object.data)
+        .map_err(|err| TableCatalogStoreError::Invalid(format!("failed to parse new metadata {metadata_location}: {err}")))?;
+    let Some(location) = metadata.get("location").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    table_warehouse_object_prefix_from_location(table_bucket, location)?;
+    Ok(Some(location.to_string()))
+}
+
+pub(crate) async fn table_data_plane_resource_for_object<S>(
+    store: &S,
+    bucket: &str,
+    object: &str,
+) -> TableCatalogStoreResult<Option<TableDataPlaneResource>>
+where
+    S: TableCatalogStore + ?Sized,
+{
+    if bucket.is_empty() || object.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(table_bucket) = store.get_table_bucket(bucket).await? else {
+        return Ok(None);
+    };
+    if table_bucket.state != TableCatalogEntryState::Active {
+        return Ok(None);
+    }
+
+    let mut matched: Option<TableDataPlaneResource> = None;
+    for namespace in store.list_namespaces(bucket).await? {
+        if namespace.state != TableCatalogEntryState::Active {
+            continue;
+        }
+        for table in store.list_tables(bucket, &namespace.namespace).await? {
+            if table.state != TableCatalogEntryState::Active {
+                continue;
+            }
+            let Ok(warehouse_object_prefix) = table_warehouse_object_prefix(&table) else {
+                continue;
+            };
+            if !object.starts_with(&warehouse_object_prefix) {
+                continue;
+            }
+            if matched
+                .as_ref()
+                .is_some_and(|current| current.warehouse_object_prefix.len() >= warehouse_object_prefix.len())
+            {
+                continue;
+            }
+            matched = Some(TableDataPlaneResource {
+                table_bucket: table.table_bucket,
+                namespace: table.namespace,
+                table: table.table,
+                table_id: table.table_id,
+                warehouse_object_prefix,
+            });
+        }
+    }
+
+    Ok(matched)
+}
 
 #[async_trait::async_trait]
 pub(crate) trait TableCatalogStore: Send + Sync {
@@ -1353,16 +1483,18 @@ where
                 "new metadata location must be inside the table metadata directory".to_string(),
             ));
         }
-        if !self
+        let Some(new_metadata_object) = self
             .backend
-            .object_exists(&request.table_bucket, &request.new_metadata_location)
+            .read_object(&request.table_bucket, &request.new_metadata_location)
             .await?
-        {
+        else {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "new metadata object {}",
                 request.new_metadata_location
             )));
-        }
+        };
+        let next_warehouse_location =
+            metadata_warehouse_location(&request.table_bucket, &request.new_metadata_location, &new_metadata_object)?;
 
         let has_existing_commit = existing_commit.is_some();
         let mut staged_commit_log = existing_commit.unwrap_or_else(|| CommitLogEntry {
@@ -1385,6 +1517,9 @@ where
 
         let mut next = current.clone();
         next.metadata_location = staged_commit_log.new_metadata_location.clone();
+        if let Some(warehouse_location) = next_warehouse_location {
+            next.warehouse_location = warehouse_location;
+        }
         next.version_token = staged_commit_log.new_version_token.clone();
         next.generation = current.generation.saturating_add(1);
 
@@ -2789,6 +2924,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn table_data_plane_resource_resolves_registered_warehouse_prefix() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+
+        let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/part-00001.parquet")
+            .await
+            .expect("data-plane resource lookup should succeed")
+            .expect("object should resolve to the registered table");
+
+        assert_eq!(resource.table_bucket, bucket);
+        assert_eq!(resource.namespace, "sales");
+        assert_eq!(resource.table, "orders");
+        assert_eq!(resource.table_id, "table-id");
+        assert_eq!(resource.warehouse_object_prefix, "tables/table-id/");
+        assert_eq!(resource.catalog_resource_object(), "namespaces/sales/tables/orders");
+    }
+
+    #[tokio::test]
+    async fn table_data_plane_resource_does_not_match_sibling_prefix() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+
+        let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id-other/data/part-00001.parquet")
+            .await
+            .expect("data-plane resource lookup should succeed");
+
+        assert!(resource.is_none());
+    }
+
+    #[tokio::test]
+    async fn table_data_plane_resource_prefers_longest_registered_warehouse_prefix() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let parent_table = IdentifierSegment::parse("orders").unwrap();
+        let child_table = IdentifierSegment::parse("orders_child").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &parent_table, "00001.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &parent_table, current.clone()).await;
+        let mut child_entry = test_table_entry(bucket, &namespace, &child_table, current);
+        child_entry.table_id = "table-id-child".to_string();
+        child_entry.warehouse_location = format!("s3://{bucket}/tables/table-id/child");
+        store.create_table(child_entry).await.unwrap();
+
+        let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/child/data/part-00001.parquet")
+            .await
+            .expect("data-plane resource lookup should succeed")
+            .expect("object should resolve to the child table");
+
+        assert_eq!(resource.table, "orders_child");
+        assert_eq!(resource.table_id, "table-id-child");
+        assert_eq!(resource.warehouse_object_prefix, "tables/table-id/child/");
+        assert_eq!(resource.catalog_resource_object(), "namespaces/sales/tables/orders_child");
+    }
+
+    #[tokio::test]
+    async fn table_data_plane_resource_skips_invalid_warehouse_locations() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let invalid_table = IdentifierSegment::parse("bad_orders").unwrap();
+        let valid_table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &valid_table, "00001.metadata.json");
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+
+        let mut invalid_entry = test_table_entry(bucket, &namespace, &invalid_table, current.clone());
+        invalid_entry.table_id = "bad-table-id".to_string();
+        invalid_entry.warehouse_location = format!("s3://{bucket}/");
+        store.create_table(invalid_entry).await.unwrap();
+        store
+            .create_table(test_table_entry(bucket, &namespace, &valid_table, current))
+            .await
+            .unwrap();
+
+        let unrelated = table_data_plane_resource_for_object(&store, bucket, "ordinary/object.parquet")
+            .await
+            .expect("invalid table warehouse location should not deny unrelated object lookup");
+        assert!(unrelated.is_none());
+
+        let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/part-00001.parquet")
+            .await
+            .expect("invalid table warehouse location should not block a later valid match")
+            .expect("valid table warehouse object should resolve to the table");
+        assert_eq!(resource.table, "orders");
+        assert_eq!(resource.table_id, "table-id");
+        assert_eq!(resource.warehouse_object_prefix, "tables/table-id/");
+    }
+
+    #[tokio::test]
     async fn maintenance_dry_run_reports_job_context_and_deletable_candidates() {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend.clone());
@@ -3385,6 +3628,63 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn object_table_catalog_store_syncs_warehouse_location_from_committed_metadata() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+        store
+            .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
+            .await
+            .unwrap();
+        backend
+            .seed_object(
+                bucket,
+                &new_metadata,
+                serde_json::to_vec(&serde_json::json!({
+                    "location": "s3://analytics/tables/relocated-table-id",
+                    "table-uuid": "table-uuid"
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let result = store
+            .commit_table(TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                commit_id: "commit-1".to_string(),
+                idempotency_key: None,
+                operation: "set-location".to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current_metadata,
+                new_metadata_location: new_metadata,
+                requirements: vec![serde_json::json!({"type": "assert-table-uuid", "uuid": "table-uuid"})],
+                writer: Some("pyiceberg/test".to_string()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.table.warehouse_location, "s3://analytics/tables/relocated-table-id");
+        let resource = table_data_plane_resource_for_object(&store, bucket, "tables/relocated-table-id/data/part-00001.parquet")
+            .await
+            .expect("data-plane resource lookup should succeed")
+            .expect("relocated table warehouse object should resolve to the table");
+        assert_eq!(resource.table, "orders");
+        assert_eq!(resource.warehouse_object_prefix, "tables/relocated-table-id/");
     }
 
     #[tokio::test]
