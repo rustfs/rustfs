@@ -127,7 +127,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::error;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 use uuid::Uuid;
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -1491,55 +1491,58 @@ impl SetDisks {
         if !pending.is_empty() {
             let cleanup_requests = requests.clone();
             let lockers = self.lockers.clone();
-            let handle = tokio::spawn(async move {
-                let mut late_lock_ids_by_client = vec![Vec::new(); lockers.len()];
-                let mut pending = pending;
-                while let Some(join_result) = pending.join_next().await {
-                    match join_result {
-                        Ok((client_idx, Ok(responses))) => {
-                            for (req_idx, request) in cleanup_requests.iter().enumerate() {
-                                if let Some(response) = responses.get(req_idx)
-                                    && response.success
-                                {
-                                    let lock_id = response
-                                        .lock_info
-                                        .as_ref()
-                                        .map(|lock_info| lock_info.id.clone())
-                                        .unwrap_or_else(|| request.lock_id.clone());
-                                    if let Some(client_locks) = late_lock_ids_by_client.get_mut(client_idx) {
-                                        client_locks.push(lock_id);
+            let handle = tokio::spawn(
+                async move {
+                    let mut late_lock_ids_by_client = vec![Vec::new(); lockers.len()];
+                    let mut pending = pending;
+                    while let Some(join_result) = pending.join_next().await {
+                        match join_result {
+                            Ok((client_idx, Ok(responses))) => {
+                                for (req_idx, request) in cleanup_requests.iter().enumerate() {
+                                    if let Some(response) = responses.get(req_idx)
+                                        && response.success
+                                    {
+                                        let lock_id = response
+                                            .lock_info
+                                            .as_ref()
+                                            .map(|lock_info| lock_info.id.clone())
+                                            .unwrap_or_else(|| request.lock_id.clone());
+                                        if let Some(client_locks) = late_lock_ids_by_client.get_mut(client_idx) {
+                                            client_locks.push(lock_id);
+                                        }
                                     }
                                 }
                             }
-                        }
-                        Ok((_client_idx, Err(err))) => {
-                            tracing::warn!("late distributed delete lock batch request failed: {}", err);
-                        }
-                        Err(err) => {
-                            tracing::warn!("late distributed delete lock batch task join failed: {}", err);
-                        }
-                    }
-                }
-
-                join_all(lockers.iter().cloned().enumerate().filter_map(|(client_idx, client)| {
-                    let lock_ids = late_lock_ids_by_client.get(client_idx).cloned().unwrap_or_default();
-                    if lock_ids.is_empty() {
-                        None
-                    } else {
-                        Some(async move {
-                            if let Err(err) = client.release_locks_batch(&lock_ids).await {
-                                tracing::warn!(
-                                    client_idx,
-                                    lock_count = lock_ids.len(),
-                                    "failed to cleanup late distributed delete locks in batch: {}",
-                                    err
-                                );
+                            Ok((_client_idx, Err(err))) => {
+                                tracing::warn!("late distributed delete lock batch request failed: {}", err);
                             }
-                        })
+                            Err(err) => {
+                                tracing::warn!("late distributed delete lock batch task join failed: {}", err);
+                            }
+                        }
                     }
-                }))
-                .await;
-            });
+
+                    join_all(lockers.iter().cloned().enumerate().filter_map(|(client_idx, client)| {
+                        let lock_ids = late_lock_ids_by_client.get(client_idx).cloned().unwrap_or_default();
+                        if lock_ids.is_empty() {
+                            None
+                        } else {
+                            Some(async move {
+                                if let Err(err) = client.release_locks_batch(&lock_ids).await {
+                                    tracing::warn!(
+                                        client_idx,
+                                        lock_count = lock_ids.len(),
+                                        "failed to cleanup late distributed delete locks in batch: {}",
+                                        err
+                                    );
+                                }
+                            })
+                        }
+                    }))
+                    .await;
+                }
+                .instrument(tracing::Span::current()),
+            );
             drop(handle);
         }
 

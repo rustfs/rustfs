@@ -34,6 +34,7 @@ use std::{
 };
 use time::OffsetDateTime;
 use tokio::sync::mpsc::{self, Receiver, Sender};
+use tracing::Instrument;
 
 use crate::client::utils::base64_encode;
 use crate::client::{
@@ -221,11 +222,14 @@ impl TransitionClient {
         let self_clone = Arc::clone(&self);
         let bucket_name_owned = bucket_name.to_string();
 
-        tokio::spawn(async move {
-            self_clone
-                .remove_objects_inner(&bucket_name_owned, objects_rx, &result_tx, opts)
-                .await;
-        });
+        tokio::spawn(
+            async move {
+                self_clone
+                    .remove_objects_inner(&bucket_name_owned, objects_rx, &result_tx, opts)
+                    .await;
+            }
+            .instrument(tracing::Span::current()),
+        );
         result_rx
     }
 
@@ -241,26 +245,32 @@ impl TransitionClient {
         let bucket_name_owned = bucket_name.to_string();
 
         let (result_tx, mut result_rx) = mpsc::channel(1);
-        tokio::spawn(async move {
-            self_clone
-                .remove_objects_inner(&bucket_name_owned, objects_rx, &result_tx, opts)
-                .await;
-        });
-        tokio::spawn(async move {
-            while let Some(res) = result_rx.recv().await {
-                if res.err.is_none() {
-                    continue;
-                }
-                error_tx
-                    .send(RemoveObjectError {
-                        object_name: res.object_name,
-                        version_id: res.object_version_id,
-                        err: res.err,
-                        ..Default::default()
-                    })
+        tokio::spawn(
+            async move {
+                self_clone
+                    .remove_objects_inner(&bucket_name_owned, objects_rx, &result_tx, opts)
                     .await;
             }
-        });
+            .instrument(tracing::Span::current()),
+        );
+        tokio::spawn(
+            async move {
+                while let Some(res) = result_rx.recv().await {
+                    if res.err.is_none() {
+                        continue;
+                    }
+                    error_tx
+                        .send(RemoveObjectError {
+                            object_name: res.object_name,
+                            version_id: res.object_version_id,
+                            err: res.err,
+                            ..Default::default()
+                        })
+                        .await;
+                }
+            }
+            .instrument(tracing::Span::current()),
+        );
 
         error_rx
     }

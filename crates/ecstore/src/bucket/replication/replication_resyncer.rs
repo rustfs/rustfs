@@ -87,7 +87,7 @@ use tokio::task::JoinSet;
 use tokio::time::Duration as TokioDuration;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, instrument, warn};
+use tracing::{debug, error, instrument, trace, warn};
 use uuid::Uuid;
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -920,18 +920,32 @@ impl ReplicationResyncer {
                         (roi.size, None)
                     };
 
-                    debug!(
-                        event = EVENT_RESYNC_OBJECT_PROCESSED,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                        reset_id = %reset_id,
-                        bucket = %bucket_name,
-                        object = %roi.name,
-                        version_id = %roi.version_id.unwrap_or_default(),
-                        size,
-                        error = ?err,
-                        "Processed resync object"
-                    );
+                    if err.is_some() {
+                        debug!(
+                            event = EVENT_RESYNC_OBJECT_PROCESSED,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                            reset_id = %reset_id,
+                            bucket = %bucket_name,
+                            object = %roi.name,
+                            version_id = %roi.version_id.unwrap_or_default(),
+                            size,
+                            error = ?err,
+                            "Processed resync object with verification error"
+                        );
+                    } else {
+                        trace!(
+                            event = EVENT_RESYNC_OBJECT_PROCESSED,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                            reset_id = %reset_id,
+                            bucket = %bucket_name,
+                            object = %roi.name,
+                            version_id = %roi.version_id.unwrap_or_default(),
+                            size,
+                            "Processed resync object"
+                        );
+                    }
 
                     if cancel_token.is_cancelled() {
                         return;
