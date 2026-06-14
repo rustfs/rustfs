@@ -51,7 +51,7 @@ use rustfs_config::{APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME,
 use std::sync::Arc;
 use std::{fs, io::IsTerminal, time::Duration};
 use tracing::Subscriber;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{
     fmt::{format::FmtSpan, time::LocalTime},
@@ -126,8 +126,9 @@ pub(super) fn init_local_logging(
         match init_file_logging_internal(config, log_directory, logger_level, is_production) {
             Ok(guard) => Ok(guard),
             Err(error) if should_fallback_to_stdout(&error) => {
+                let guard = init_stdout_only(config, logger_level, is_production);
                 emit_file_logging_fallback_warning(log_directory, &error);
-                Ok(init_stdout_only(config, logger_level, is_production))
+                Ok(guard)
             }
             Err(error) => Err(error),
         }
@@ -361,9 +362,17 @@ pub(super) fn should_fallback_to_stdout(error: &TelemetryError) -> bool {
 }
 
 pub(super) fn emit_file_logging_fallback_warning(log_directory: &str, error: &TelemetryError) {
-    eprintln!(
-        "[WARN] Failed to initialize file observability logging at '{}': {}. Falling back to stdout logging.",
-        log_directory, error
+    warn!(
+        event = EVENT_LOCAL_LOGGING_STATE,
+        component = LOG_COMPONENT_OBS,
+        subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
+        state = "fallback_to_stdout",
+        backend = "local",
+        failed_sink = "file",
+        sink = "stdout",
+        log_directory,
+        error = %error,
+        "local logging state changed"
     );
 }
 

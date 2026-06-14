@@ -83,6 +83,19 @@ mod tests {
         }
     }
 
+    fn assert_source_contains(rel_path: &str, required_patterns: &[&str]) {
+        let path = workspace_root().join(rel_path);
+        let source = fs::read_to_string(&path).unwrap_or_else(|err| panic!("failed to read {}: {}", path.display(), err));
+        for pattern in required_patterns {
+            assert!(
+                source.contains(pattern),
+                "missing required logging governance pattern `{}` in {}",
+                pattern,
+                path.display()
+            );
+        }
+    }
+
     #[test]
     fn logging_redaction_rules_are_valid() {
         assert!(validate_logging_redaction_rules().is_ok());
@@ -153,6 +166,75 @@ mod tests {
             !source.contains("debug!(\"config: {:?}\", &config)"),
             "found forbidden full config debug output in {}",
             path.display()
+        );
+    }
+
+    #[test]
+    fn startup_fatal_stderr_uses_single_formatter_for_pre_observability_failures() {
+        assert_source_contains(
+            "rustfs/src/main.rs",
+            &[
+                "fn format_fatal_stderr_message(context: &str, error: impl std::fmt::Display) -> String",
+                "fn emit_fatal_stderr(context: &str, error: impl std::fmt::Display)",
+                "emit_fatal_stderr(\"Server runtime failed\", e)",
+                "emit_fatal_stderr(\"Command parse failed\", e)",
+                "emit_fatal_stderr(\"Observability initialization failed\", &e)",
+            ],
+        );
+    }
+
+    #[test]
+    fn observability_runtime_logging_uses_tracing_for_fallback_and_guard_shutdown() {
+        assert_no_unmasked_access_key_logging(
+            "crates/obs/src/telemetry/local.rs",
+            &[
+                "[WARN] Failed to initialize file observability logging",
+                "Falling back to stdout logging.",
+            ],
+        );
+        assert_source_contains(
+            "crates/obs/src/telemetry/local.rs",
+            &[
+                "warn!(",
+                "state = \"fallback_to_stdout\"",
+                "failed_sink = \"file\"",
+                "sink = \"stdout\"",
+            ],
+        );
+        assert_no_unmasked_access_key_logging(
+            "crates/obs/src/telemetry/guard.rs",
+            &[
+                "eprintln!(\"Tracer shutdown error: {err:?}\")",
+                "eprintln!(\"Meter shutdown error: {err:?}\")",
+                "eprintln!(\"Logger shutdown error: {err:?}\")",
+                "eprintln!(\"Log cleanup task stopped\")",
+                "eprintln!(\"Tracing guard dropped, flushing logs.\")",
+                "eprintln!(\"Stdout guard dropped, flushing logs.\")",
+            ],
+        );
+        assert_source_contains(
+            "crates/obs/src/telemetry/guard.rs",
+            &[
+                "EVENT_OBS_GUARD_SHUTDOWN",
+                "resource = \"tracer_provider\"",
+                "resource = \"meter_provider\"",
+                "resource = \"logger_provider\"",
+                "resource = \"log_cleaner\"",
+                "resource = \"tracing_guard\"",
+                "resource = \"stdout_guard\"",
+            ],
+        );
+    }
+
+    #[test]
+    fn low_level_logging_sink_stderr_exceptions_remain_explicit() {
+        assert_source_contains(
+            "crates/obs/src/telemetry/rolling.rs",
+            &[
+                "Failed to flush log file before rotation",
+                "RollingAppender: Failed to rotate log file after",
+                "RollingAppender: failed to rotate log file",
+            ],
         );
     }
 
