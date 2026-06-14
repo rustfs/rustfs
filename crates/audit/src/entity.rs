@@ -160,6 +160,8 @@ pub struct AuditEntry {
     pub api: ApiDetails,
     #[serde(rename = "remotehost", skip_serializing_if = "Option::is_none")]
     pub remote_host: Option<String>,
+    // Historical external audit contract: keep `requestID` instead of normalizing
+    // this field to `request_id` or `request-id`.
     #[serde(rename = "requestID", skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     #[serde(rename = "userAgent", skip_serializing_if = "Option::is_none")]
@@ -313,5 +315,31 @@ impl AuditEntryBuilder {
     /// Construct the final `AuditEntry`.
     pub fn build(self) -> AuditEntry {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[test]
+    fn audit_entry_serializes_historical_request_id_field_name() {
+        let entry = AuditEntryBuilder::new(
+            "1",
+            EventName::ObjectCreatedPut,
+            "s3",
+            ApiDetailsBuilder::new()
+                .name("PutObject")
+                .status("OK")
+                .status_code(200)
+                .build(),
+        )
+        .request_id("req-audit-123")
+        .build();
+
+        let value = serde_json::to_value(entry).expect("audit entry should serialize");
+        assert_eq!(value["requestID"], Value::String("req-audit-123".to_string()));
+        assert!(value.get("request_id").is_none(), "historical audit contract must not expose request_id");
     }
 }
