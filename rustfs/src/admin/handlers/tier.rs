@@ -21,6 +21,7 @@ use crate::{
     app::context::{resolve_object_store_handle, resolve_tier_config_handle},
     auth::{check_key_valid, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},
+    storage::request_context::spawn_traced,
 };
 use http::Uri;
 use http::{HeaderMap, StatusCode};
@@ -54,7 +55,6 @@ use s3s::{
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
 use time::OffsetDateTime;
-use tokio::spawn;
 use tracing::{debug, warn};
 
 const LOG_COMPONENT_ADMIN: &str = "admin";
@@ -91,7 +91,7 @@ pub struct AddTier {}
 
 fn spawn_transition_tier_config_propagation(action: &'static str) {
     if let Some(notification_sys) = get_global_notification_sys() {
-        spawn(async move {
+        spawn_traced(async move {
             for peer_result in notification_sys.load_transition_tier_config().await {
                 if let Some(err) = peer_result.err {
                     warn!(

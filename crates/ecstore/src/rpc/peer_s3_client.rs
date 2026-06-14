@@ -45,7 +45,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 type Client = Arc<Box<dyn PeerS3Client>>;
 
@@ -596,6 +596,16 @@ pub struct RemotePeerS3Client {
 }
 
 impl RemotePeerS3Client {
+    fn recovery_monitor_span(addr: &str) -> tracing::Span {
+        tracing::info_span!(
+            "recovery-monitor",
+            component = "ecstore",
+            subsystem = "peer_s3_client",
+            kind = "peer_s3",
+            addr = %addr
+        )
+    }
+
     pub fn new(node: Option<Node>, pools: Option<Vec<usize>>) -> Self {
         let addr = node.as_ref().map(|v| v.url.to_string()).unwrap_or_default();
         let client = Self {
@@ -661,10 +671,14 @@ impl RemotePeerS3Client {
                         let health_clone = Arc::clone(&health);
                         let addr_clone = addr.clone();
                         let cancel_clone = cancel_token.clone();
+                        let span = Self::recovery_monitor_span(&addr_clone);
 
-                        tokio::spawn(async move {
-                            Self::monitor_remote_peer_recovery(addr_clone, health_clone, cancel_clone).await;
-                        });
+                        tokio::spawn(
+                            async move {
+                                Self::monitor_remote_peer_recovery(addr_clone, health_clone, cancel_clone).await;
+                            }
+                            .instrument(span),
+                        );
                     }
                 }
             }
@@ -767,9 +781,13 @@ impl RemotePeerS3Client {
             let health = Arc::clone(&self.health);
             let cancel_token = self.cancel_token.clone();
             let addr = self.addr.clone();
-            tokio::spawn(async move {
-                Self::monitor_remote_peer_recovery(addr, health, cancel_token).await;
-            });
+            let span = Self::recovery_monitor_span(&addr);
+            tokio::spawn(
+                async move {
+                    Self::monitor_remote_peer_recovery(addr, health, cancel_token).await;
+                }
+                .instrument(span),
+            );
         }
     }
 }
