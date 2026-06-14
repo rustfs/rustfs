@@ -111,6 +111,7 @@ const EVENT_BACKGROUND_SERVICE_SHUTDOWN: &str = "background_service_shutdown";
 const EVENT_EVENT_NOTIFIER_SHUTDOWN: &str = "event_notifier_shutdown";
 const EVENT_PROFILING_SHUTDOWN: &str = "profiling_shutdown";
 const EVENT_SERVER_SHUTDOWN_STATE: &str = "server_shutdown_state";
+const OBSERVABILITY_INIT_FATAL_ALREADY_REPORTED: &str = "observability initialization failure already reported";
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -132,8 +133,10 @@ fn main() {
     let runtime = rustfs::server::build_tokio_runtime().expect("Failed to build Tokio runtime");
     let result = runtime.block_on(async_main());
     if let Err(ref e) = result {
-        // Tracing may not be initialized when startup fails this early.
-        emit_fatal_stderr("Server runtime failed", e);
+        if e.to_string() != OBSERVABILITY_INIT_FATAL_ALREADY_REPORTED {
+            // Tracing may not be initialized when startup fails this early.
+            emit_fatal_stderr("Server runtime failed", e);
+        }
         std::process::exit(1);
     }
 }
@@ -193,7 +196,7 @@ async fn async_main() -> Result<()> {
         Err(e) => {
             // Structured logging is unavailable until observability initializes.
             emit_fatal_stderr("Observability initialization failed", &e);
-            return Err(Error::other(e));
+            return Err(Error::other(OBSERVABILITY_INIT_FATAL_ALREADY_REPORTED));
         }
     };
 
