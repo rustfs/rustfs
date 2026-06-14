@@ -24,7 +24,7 @@ use crate::server::{
     layer::{
         BodylessStatusFixLayer, ConditionalCorsLayer, EmptyBodyContentLengthCompatLayer, HeadRequestBodyFixLayer,
         ObjectAttributesEtagFixLayer, PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer, RequestLoggingLayer,
-        S3ErrorMessageCompatLayer, redact_sensitive_uri_query,
+        S3ErrorMessageCompatLayer, VirtualHostStyleHintLayer, redact_sensitive_uri_query,
     },
     tls_material::{
         TlsAcceptorHolder, TlsHandshakeFailureKind, build_acceptor_from_loaded, load_tls_material, spawn_reload_loop,
@@ -506,6 +506,7 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
     }
 
     let is_console = config.console_enable;
+    let server_domains_configured = !config.server_domains.is_empty();
     let task_handle = tokio::spawn(async move {
         // Note: CORS layer is removed from global middleware stack
         // - S3 API CORS is handled by bucket-level CORS configuration in apply_cors_headers()
@@ -690,6 +691,7 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
                 s3_service: s3_service.clone(),
                 compression_config: compression_config.clone(),
                 is_console,
+                server_domains_configured,
                 readiness: readiness.clone(),
                 keystone_auth: auth_keystone::get_keystone_auth(),
                 trusted_proxy_layer: rustfs_trusted_proxies::is_enabled().then(|| rustfs_trusted_proxies::layer().clone()),
@@ -742,6 +744,8 @@ struct ConnectionContext {
     s3_service: S3Service,
     compression_config: HttpCompressionConfig,
     is_console: bool,
+    /// Whether `RUSTFS_SERVER_DOMAINS` is configured (i.e. s3s virtual-hosted-style routing is active).
+    server_domains_configured: bool,
     readiness: Arc<GlobalReadiness>,
     /// Pre-computed Keystone auth provider (avoids per-connection OnceLock read).
     keystone_auth: Option<Arc<rustfs_keystone::KeystoneAuthProvider>>,
@@ -843,6 +847,7 @@ fn process_connection(
             s3_service,
             compression_config,
             is_console,
+            server_domains_configured,
             readiness,
             keystone_auth,
             trusted_proxy_layer,
@@ -900,6 +905,7 @@ fn process_connection(
         // 19. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
         // 20. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
         // 21. PublicHealthEndpointLayer              — handles public health before s3s host parsing
+        // 22. VirtualHostStyleHintLayer              — actionable error for unroutable virtual-hosted-style (conditional)
         // ─────────────────────────────────────────────────────────────
         let hybrid_service = ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
@@ -1106,6 +1112,11 @@ fn process_connection(
             // buckets before custom routes. Handle them here so SERVER_DOMAINS
             // cannot turn /health into an S3 bucket request.
             .layer(PublicHealthEndpointLayer)
+            // Virtual-hosted-style S3 requests (the AWS SDK / Terraform default) cannot be
+            // routed when no server domain is configured: s3s parses them path-style and
+            // returns an opaque 501. When RUSTFS_SERVER_DOMAINS is unset, return an actionable
+            // error pointing at the fix. Inert (not installed) once domains are configured.
+            .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
             .service(service);
 
         let hybrid_service = TowerToHyperService::new(hybrid_service);
