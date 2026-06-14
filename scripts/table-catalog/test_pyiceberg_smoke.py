@@ -134,6 +134,112 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no storage credentials"):
             pyiceberg_smoke.storage_credential_from_response({"storage-credentials": []})
 
+    def test_storage_credential_prefix_parses_bucket_and_key_prefix(self) -> None:
+        bucket, key_prefix = pyiceberg_smoke.s3_scope_from_credential(
+            pyiceberg_smoke.StorageCredential(
+                prefix="s3://lake/tables/table-id/",
+                config={
+                    "s3.access-key-id": "temp-access",
+                    "s3.secret-access-key": "temp-secret",
+                    "s3.session-token": "temp-token",
+                },
+            )
+        )
+
+        self.assertEqual(bucket, "lake")
+        self.assertEqual(key_prefix, "tables/table-id/")
+
+    def test_storage_credential_prefix_rejects_bucket_scope(self) -> None:
+        credential = pyiceberg_smoke.StorageCredential(
+            prefix="s3://lake",
+            config={
+                "s3.access-key-id": "temp-access",
+                "s3.secret-access-key": "temp-secret",
+                "s3.session-token": "temp-token",
+            },
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "object prefix"):
+            pyiceberg_smoke.s3_scope_from_credential(credential)
+
+    def test_scope_probe_keys_are_inside_and_outside_the_vended_prefix(self) -> None:
+        inside_key, denied_key = pyiceberg_smoke.scope_probe_keys("tables/table-id/", "namespace", "table")
+
+        self.assertTrue(inside_key.startswith("tables/table-id/"))
+        self.assertFalse(denied_key.startswith("tables/table-id/"))
+        self.assertIn("namespace-table", inside_key)
+        self.assertIn("namespace-table", denied_key)
+
+    def test_vended_s3_client_uses_session_token(self) -> None:
+        args = self.parse_with_args(["--endpoint", "http://rustfs.local:9000"])
+        credential = pyiceberg_smoke.StorageCredential(
+            prefix="s3://lake/tables/table-id/",
+            config={
+                "s3.access-key-id": "temp-access",
+                "s3.secret-access-key": "temp-secret",
+                "s3.session-token": "temp-token",
+            },
+        )
+        boto3 = mock.Mock()
+        deps = mock.Mock(boto3=boto3, botocore_config=mock.Mock())
+
+        pyiceberg_smoke.vended_s3_client(args, deps, credential)
+
+        boto3.client.assert_called_once()
+        call_kwargs = boto3.client.call_args.kwargs
+        self.assertEqual(call_kwargs["aws_access_key_id"], "temp-access")
+        self.assertEqual(call_kwargs["aws_secret_access_key"], "temp-secret")
+        self.assertEqual(call_kwargs["aws_session_token"], "temp-token")
+
+    def test_data_plane_scope_probe_requires_inside_access_and_outside_denial(self) -> None:
+        class FakeClientError(Exception):
+            def __init__(self, status_code: int, code: str) -> None:
+                self.response = {
+                    "ResponseMetadata": {"HTTPStatusCode": status_code},
+                    "Error": {"Code": code},
+                }
+
+        class FakeS3Client:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+
+            def put_object(self, *, Bucket: str, Key: str, Body: bytes) -> None:
+                self.calls.append(("put", Key))
+                if Key == "outside/probe":
+                    raise FakeClientError(403, "AccessDenied")
+
+            def head_object(self, *, Bucket: str, Key: str) -> None:
+                self.calls.append(("head", Key))
+
+            def delete_object(self, *, Bucket: str, Key: str) -> None:
+                self.calls.append(("delete", Key))
+
+        args = self.parse_with_args(["--bucket", "lake"])
+        credential = pyiceberg_smoke.StorageCredential(
+            prefix="s3://lake/tables/table-id/",
+            config={
+                "s3.access-key-id": "temp-access",
+                "s3.secret-access-key": "temp-secret",
+                "s3.session-token": "temp-token",
+            },
+        )
+        fake_client = FakeS3Client()
+        deps = mock.Mock(botocore_client_error=FakeClientError)
+
+        with mock.patch.object(pyiceberg_smoke, "vended_s3_client", return_value=fake_client):
+            with mock.patch.object(pyiceberg_smoke, "scope_probe_keys", return_value=("tables/table-id/probe", "outside/probe")):
+                pyiceberg_smoke.verify_vended_credential_data_plane_scope(args, deps, credential)
+
+        self.assertEqual(
+            fake_client.calls,
+            [
+                ("put", "tables/table-id/probe"),
+                ("head", "tables/table-id/probe"),
+                ("delete", "tables/table-id/probe"),
+                ("put", "outside/probe"),
+            ],
+        )
+
     def test_unsupported_inventory_names_stable_boundaries(self) -> None:
         inventory = pyiceberg_smoke.unsupported_inventory()
         capabilities = {entry["capability"] for entry in inventory}

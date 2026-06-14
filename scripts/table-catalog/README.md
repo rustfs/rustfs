@@ -93,6 +93,13 @@ credentials endpoint and reloads the PyIceberg catalog with the returned
 table-scoped S3 access key, secret key, and session token before append, reload,
 and scan operations.
 
+Before the PyIceberg append, the profile also runs a direct S3 data-plane scope
+probe with the returned temporary credentials:
+
+- `PutObject`, `HeadObject`, and `DeleteObject` must work inside the returned
+  table warehouse prefix.
+- `PutObject` to the same bucket outside that prefix must be rejected.
+
 ## Machine-Readable Inventories
 
 The script can print the current conformance inventories without importing
@@ -113,7 +120,7 @@ added.
 
 | Client | Current status | Claim |
 |---|---|---|
-| PyIceberg | Automated smoke target | create namespace, create table, append, reload, scan, optional catalog-vended table credentials |
+| PyIceberg | Automated smoke target | create namespace, create table, append, reload, scan, optional catalog-vended table credentials with data-plane scope probe |
 | Spark Iceberg REST catalog | Manual-ready | create/load/append/reload should be verified against a running RustFS endpoint |
 | Trino Iceberg REST catalog | Documented, not automated | no write compatibility claim yet |
 | DuckDB Iceberg | Documented, not automated | read-path reference only |
@@ -137,7 +144,7 @@ added.
 Unsupported behavior is documented instead of hidden behind internal errors. The
 current unsupported inventory is:
 
-- credential vending: automated after table bootstrap; full no-long-term-data-credential bootstrap is not claimed
+- credential vending: automated after table bootstrap with a data-plane scope probe; full no-long-term-data-credential bootstrap is not claimed
 - background maintenance worker: unsupported
 - manifest/data reachability cleanup: unsupported
 - snapshot expiration and compaction: unsupported
@@ -163,7 +170,8 @@ expiration.
 The `rustfs-vended-credentials` profile verifies the client handoff from the
 catalog principal to the table-scoped temporary credentials. It still uses the
 configured principal for setup and REST request signing; the vended credentials
-are applied to PyIceberg S3 data-plane access after the table has been created.
+are first checked with a direct S3 scope probe and then applied to PyIceberg S3
+data-plane access after the table has been created.
 
 Enablement is server-side and fail-closed:
 
