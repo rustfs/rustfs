@@ -40,7 +40,7 @@ use std::pin::Pin;
 use std::sync::{LazyLock, Mutex, MutexGuard, RwLock};
 use std::time::{Duration as StdDuration, Instant};
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, warn};
 use url::Url;
 
 const OIDC_JWKS_REFRESH_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
@@ -76,7 +76,7 @@ fn lock_oidc_plugin_authn_metrics<'a, T>(mutex: &'a Mutex<T>, metric: &'static s
     match mutex.lock() {
         Ok(guard) => guard,
         Err(err) => {
-            warn!("recovering poisoned OIDC plugin authn metrics lock: {}", metric);
+            warn!(metric, "Recovering poisoned OIDC authn metrics lock");
             err.into_inner()
         }
     }
@@ -417,18 +417,18 @@ impl OidcSys {
         for sourced_config in parsed_configs {
             let config = sourced_config.config;
             if !config.enabled {
-                info!("OIDC provider '{}' is disabled, skipping", config.id);
+                debug!(provider = %config.id, "OIDC provider disabled");
                 continue;
             }
 
             match Self::discover_provider(&config, &http_client).await {
                 Ok(state) => {
-                    info!("OIDC provider '{}' discovered successfully", config.id);
+                    debug!(provider = %config.id, "OIDC provider discovered");
                     provider_states.insert(config.id.clone(), state);
                     configs.insert(config.id.clone(), config);
                 }
                 Err(e) => {
-                    error!("Failed to discover OIDC provider '{}': {}", config.id, e);
+                    error!(provider = %config.id, error = %e, "OIDC provider discovery failed");
                 }
             }
         }

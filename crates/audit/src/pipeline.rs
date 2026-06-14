@@ -266,7 +266,7 @@ impl AuditRuntimeView {
                 subsystem = LOG_SUBSYSTEM_PIPELINE,
                 target_id = %target_id,
                 state = "enabled",
-                "Changed audit target state"
+                "audit target state"
             );
             Ok(())
         } else {
@@ -283,7 +283,7 @@ impl AuditRuntimeView {
                 subsystem = LOG_SUBSYSTEM_PIPELINE,
                 target_id = %target_id,
                 state = "disabled",
-                "Changed audit target state"
+                "audit target state"
             );
             Ok(())
         } else {
@@ -300,7 +300,7 @@ impl AuditRuntimeView {
                 subsystem = LOG_SUBSYSTEM_PIPELINE,
                 target_id = %target_id,
                 state = "removed",
-                "Changed audit target state"
+                "audit target state"
             );
             Ok(())
         } else {
@@ -323,7 +323,7 @@ impl AuditRuntimeView {
             subsystem = LOG_SUBSYSTEM_PIPELINE,
             target_id = %target_id,
             state = "upserted",
-            "Changed audit target state"
+            "audit target state"
         );
         Ok(())
     }
@@ -349,7 +349,7 @@ impl AuditRuntimeFacade {
                                 subsystem = LOG_SUBSYSTEM_PIPELINE,
                                 target_id = %target.id(),
                                 replay_key = %key,
-                                "Delivered queued audit event"
+                                "audit replay delivery"
                             );
                             observability::record_target_success();
                         }
@@ -361,7 +361,7 @@ impl AuditRuntimeFacade {
                                     subsystem = LOG_SUBSYSTEM_PIPELINE,
                                     target_id = %target.id(),
                                     reason = "not_connected",
-                                    "Retrying queued audit event delivery"
+                                    "audit replay delivery"
                                 );
                             }
                             rustfs_targets::TargetError::Timeout(_) => {
@@ -371,7 +371,7 @@ impl AuditRuntimeFacade {
                                     subsystem = LOG_SUBSYSTEM_PIPELINE,
                                     target_id = %target.id(),
                                     reason = "timeout",
-                                    "Retrying queued audit event delivery"
+                                    "audit replay delivery"
                                 );
                             }
                             _ => {}
@@ -383,7 +383,7 @@ impl AuditRuntimeFacade {
                                 subsystem = LOG_SUBSYSTEM_PIPELINE,
                                 target_id = %target.id(),
                                 reason = %reason,
-                                "Dropped queued audit payload"
+                                "audit replay delivery"
                             );
                             observability::record_target_failure();
                         }
@@ -395,7 +395,7 @@ impl AuditRuntimeFacade {
                                 target_id = %target.id(),
                                 error = %error,
                                 reason = "permanent_failure",
-                                "Queued audit payload failed permanently"
+                                "audit replay delivery"
                             );
                             target.record_final_failure();
                             observability::record_target_failure();
@@ -408,7 +408,7 @@ impl AuditRuntimeFacade {
                                 target_id = %target.id(),
                                 replay_key = %key,
                                 reason = "retry_exhausted",
-                                "Dropped queued audit payload after retry exhaustion"
+                                "audit replay delivery"
                             );
                             target.record_final_failure();
                             observability::record_target_failure();
@@ -422,7 +422,7 @@ impl AuditRuntimeFacade {
                                 replay_key = %key,
                                 error = %error,
                                 reason = "unreadable_entry",
-                                "Skipped unreadable audit store entry"
+                                "audit replay delivery"
                             );
                         }
                     }
@@ -436,7 +436,7 @@ impl AuditRuntimeFacade {
                         subsystem = LOG_SUBSYSTEM_PIPELINE,
                         target_id = %target_id,
                         replay_enabled = true,
-                        "Audit replay stream started"
+                        "audit replay stream"
                     );
                 } else {
                     debug!(
@@ -446,7 +446,7 @@ impl AuditRuntimeFacade {
                         target_id = %target_id,
                         replay_enabled = false,
                         reason = "no_store_configured",
-                        "Audit replay stream skipped"
+                        "audit replay stream"
                     );
                 }
             }),

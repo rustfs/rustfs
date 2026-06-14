@@ -86,7 +86,7 @@ where
             bind_addr = %self.config.bind_addr,
             tls_enabled = self.config.tls_enabled,
             max_body_size = self.config.max_body_size,
-            "webdav server state changed"
+            "WebDAV server starting"
         );
 
         let listener = TcpListener::bind(self.config.bind_addr).await?;
@@ -96,7 +96,7 @@ where
             subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
             state = "listening",
             bind_addr = %self.config.bind_addr,
-            "webdav server state changed"
+            "WebDAV server listening"
         );
         let (reload_shutdown_tx, reload_shutdown_rx) = watch::channel(false);
 
@@ -109,7 +109,7 @@ where
                     subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
                     state = "enabled",
                     cert_dir = %cert_dir,
-                    "webdav tls state changed"
+                    "WebDAV TLS enabled"
                 );
 
                 let resolver = ReloadableServerCertResolver::load_from_directory(cert_dir)
@@ -211,7 +211,7 @@ where
                         component = LOG_COMPONENT_PROTOCOLS,
                         subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
                         state = "shutdown_requested",
-                        "webdav server state changed"
+                        "WebDAV shutdown requested"
                     );
                     let _ = reload_shutdown_tx.send(true);
                     break;
@@ -225,7 +225,7 @@ where
             component = LOG_COMPONENT_PROTOCOLS,
             subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
             state = "stopped",
-            "webdav server state changed"
+            "WebDAV server stopped"
         );
         Ok(())
     }
@@ -376,7 +376,7 @@ where
                 result = "iam_unavailable",
                 source_ip = %source_ip,
                 error = %e,
-                "webdav auth state changed"
+                "WebDAV auth IAM unavailable"
             );
             WebDavInitError::Server("Internal authentication service unavailable".to_string())
         })?;
@@ -403,7 +403,7 @@ where
                 source_ip = %source_ip,
                 access_key = %masked_access_key,
                 error = %e,
-                "webdav auth state changed"
+                "WebDAV auth key check failed"
             );
             WebDavInitError::Server("Authentication verification failed".to_string())
         })?;
@@ -416,7 +416,7 @@ where
                 result = "invalid_access_key",
                 source_ip = %source_ip,
                 access_key = %masked_access_key,
-                "webdav auth state changed"
+                "WebDAV auth rejected access key"
             );
             return Err(WebDavInitError::Server("Invalid credentials".to_string()));
         }
@@ -429,7 +429,7 @@ where
                 result = "identity_missing",
                 source_ip = %source_ip,
                 access_key = %masked_access_key,
-                "webdav auth state changed"
+                "WebDAV auth identity missing"
             );
             WebDavInitError::Server("User not found".to_string())
         })?;
@@ -442,7 +442,7 @@ where
                 result = "invalid_secret_key",
                 source_ip = %source_ip,
                 access_key = %masked_access_key,
-                "webdav auth state changed"
+                "WebDAV auth rejected secret key"
             );
             return Err(WebDavInitError::Server("Invalid credentials".to_string()));
         }
@@ -454,7 +454,7 @@ where
             result = "authenticated",
             source_ip = %source_ip,
             access_key = %masked_access_key,
-            "webdav auth state changed"
+            "WebDAV auth accepted"
         );
 
         Ok(SessionContext::new(

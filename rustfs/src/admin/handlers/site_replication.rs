@@ -93,6 +93,10 @@ use tracing::warn;
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
+const LOG_COMPONENT_ADMIN: &str = "admin";
+const LOG_SUBSYSTEM_SITE_REPLICATION: &str = "site_replication";
+const EVENT_ADMIN_SITE_REPLICATION_STATE: &str = "admin_site_replication_state";
+
 const SITE_REPLICATION_STATE_PATH: &str = "config/site-replication/state.json";
 const SITE_REPL_ADD_SUCCESS: &str = "Requested sites were configured for replication successfully.";
 const SITE_REPL_EDIT_SUCCESS: &str = "Requested site was updated successfully.";
@@ -2000,7 +2004,15 @@ async fn build_status_info(state: &SiteReplicationState, local_peer: &PeerInfo, 
                 reachable_peers.insert(deployment_id.clone());
             }
             Err(err) => {
-                warn!(peer = %peer.endpoint, error = ?err, "site replication peer metainfo fetch failed");
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    peer = %peer.endpoint,
+                    result = "peer_metainfo_fetch_failed",
+                    error = ?err,
+                    "admin site replication state"
+                );
                 site_infos.insert(deployment_id.clone(), SRInfo::default());
             }
         }
@@ -2536,7 +2548,14 @@ async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local
     let buckets = match store.list_bucket(&BucketOptions::default()).await {
         Ok(b) => b,
         Err(err) => {
-            warn!(error = ?err, "site replication backfill: failed to list buckets");
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                result = "backfill_list_buckets_failed",
+                error = ?err,
+                "admin site replication state"
+            );
             return;
         }
     };
@@ -2546,14 +2565,38 @@ async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local
         let name = &bucket.name;
 
         if let Err(err) = ensure_site_replication_bucket_versioning(name).await {
-            warn!(bucket = %name, error = ?err, "site replication backfill: versioning setup failed");
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                bucket = %name,
+                result = "backfill_versioning_setup_failed",
+                error = ?err,
+                "admin site replication state"
+            );
             continue;
         }
         if let Err(err) = ensure_site_replication_bucket_targets(name, state, local_peer, None).await {
-            warn!(bucket = %name, error = ?err, "site replication backfill: targets setup failed");
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                bucket = %name,
+                result = "backfill_targets_setup_failed",
+                error = ?err,
+                "admin site replication state"
+            );
         }
         if let Err(err) = ensure_site_replication_bucket_replication_config(name, state, local_peer).await {
-            warn!(bucket = %name, error = ?err, "site replication backfill: replication config setup failed");
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                bucket = %name,
+                result = "backfill_replication_config_setup_failed",
+                error = ?err,
+                "admin site replication state"
+            );
         }
         // Broadcast the bucket to peers so they create it too (idempotent on the peer side).
         // Read the real lock_enabled flag so peers recreate the bucket with the same object-lock
@@ -2561,12 +2604,29 @@ async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local
         let lock_enabled = match metadata_sys::get(name).await {
             Ok(bm) => bm.lock_enabled,
             Err(err) => {
-                warn!(bucket = %name, error = ?err, "site replication backfill: failed to read bucket metadata, assuming lock_enabled=false");
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    bucket = %name,
+                    result = "backfill_bucket_metadata_read_failed",
+                    fallback = "lock_enabled=false",
+                    error = ?err,
+                    "admin site replication state"
+                );
                 false
             }
         };
         if let Err(err) = site_replication_make_bucket_hook(name, lock_enabled).await {
-            warn!(bucket = %name, error = ?err, "site replication backfill: make-bucket broadcast failed");
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                bucket = %name,
+                result = "backfill_make_bucket_broadcast_failed",
+                error = ?err,
+                "admin site replication state"
+            );
         }
         // Kick a resync toward every remote peer so existing objects travel across.
         for peer in state.peers.values() {
@@ -2575,8 +2635,16 @@ async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local
             }
             let result = start_site_bucket_resync(name, peer, &resync_id).await;
             if result.status == "failed" {
-                warn!(bucket = %name, peer = %peer.endpoint, detail = %result.err_detail,
-                      "site replication backfill: resync kick failed");
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    bucket = %name,
+                    peer = %peer.endpoint,
+                    result = "backfill_resync_kick_failed",
+                    detail = %result.err_detail,
+                    "admin site replication state"
+                );
             }
         }
     }
@@ -3173,7 +3241,15 @@ impl Operation for SiteReplicationRemoveHandler {
                 .await
                 {
                     let err_detail = summarize_peer_error_detail(&format!("{}: {err}", peer.endpoint));
-                    warn!(peer = %peer.endpoint, error = %err_detail, "site replication peer remove notification failed");
+                    warn!(
+                        event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                        peer = %peer.endpoint,
+                        result = "peer_remove_notification_failed",
+                        error = %err_detail,
+                        "admin site replication state"
+                    );
                     peer_errors.push(err_detail);
                 }
             }
@@ -3767,7 +3843,15 @@ impl Operation for SRRotateServiceAccountHandler {
                 send_peer_admin_request(&peer.endpoint, SITE_REPLICATION_PEER_JOIN_PATH, &svc_ak, &new_sk, &join_req).await
             {
                 let detail = summarize_peer_error_detail(&format!("{}: {err}", peer.endpoint));
-                warn!(peer = %peer.endpoint, error = %detail, "site replication service account rotation failed for peer");
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    peer = %peer.endpoint,
+                    result = "service_account_rotation_failed",
+                    error = %detail,
+                    "admin site replication state"
+                );
                 peer_errors.push(detail);
             }
         }

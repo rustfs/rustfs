@@ -25,7 +25,11 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use tokio::sync::{Mutex, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+
+const LOG_COMPONENT_KMS: &str = "kms";
+const LOG_SUBSYSTEM_SERVICE: &str = "service";
+const EVENT_KMS_SERVICE_STATE: &str = "kms_service_state";
 
 /// KMS service status
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -106,7 +110,13 @@ impl KmsServiceManager {
             *status = KmsServiceStatus::Configured;
         }
 
-        info!("KMS configuration updated successfully");
+        debug!(
+            event = EVENT_KMS_SERVICE_STATE,
+            component = LOG_COMPONENT_KMS,
+            subsystem = LOG_SUBSYSTEM_SERVICE,
+            state = "configured",
+            "KMS service configured"
+        );
         Ok(())
     }
 
@@ -132,7 +142,14 @@ impl KmsServiceManager {
             }
         };
 
-        info!("Starting KMS service with backend: {:?}", config.backend);
+        info!(
+            event = EVENT_KMS_SERVICE_STATE,
+            component = LOG_COMPONENT_KMS,
+            subsystem = LOG_SUBSYSTEM_SERVICE,
+            backend = ?config.backend,
+            state = "starting",
+            "KMS service starting"
+        );
 
         match self.create_service_version(&config).await {
             Ok(service_version) => {
@@ -146,7 +163,13 @@ impl KmsServiceManager {
                     *status = KmsServiceStatus::Running;
                 }
 
-                info!("KMS service started successfully");
+                debug!(
+                    event = EVENT_KMS_SERVICE_STATE,
+                    component = LOG_COMPONENT_KMS,
+                    subsystem = LOG_SUBSYSTEM_SERVICE,
+                    state = "running",
+                    "KMS service running"
+                );
                 Ok(())
             }
             Err(e) => {
@@ -170,7 +193,13 @@ impl KmsServiceManager {
 
     /// Internal stop implementation (called within lifecycle mutex)
     async fn stop_internal(&self) -> Result<()> {
-        info!("Stopping KMS service");
+        debug!(
+            event = EVENT_KMS_SERVICE_STATE,
+            component = LOG_COMPONENT_KMS,
+            subsystem = LOG_SUBSYSTEM_SERVICE,
+            state = "stopping",
+            "KMS service stopping"
+        );
 
         // Atomically clear current service version (lock-free, instant)
         // Note: Existing Arc references will keep the service alive until operations complete
@@ -184,7 +213,13 @@ impl KmsServiceManager {
             }
         }
 
-        info!("KMS service stopped successfully (existing operations may continue)");
+        debug!(
+            event = EVENT_KMS_SERVICE_STATE,
+            component = LOG_COMPONENT_KMS,
+            subsystem = LOG_SUBSYSTEM_SERVICE,
+            state = "configured",
+            "KMS service stopped"
+        );
         Ok(())
     }
 
@@ -201,7 +236,13 @@ impl KmsServiceManager {
     pub async fn reconfigure(&self, new_config: KmsConfig) -> Result<()> {
         let _guard = self.lifecycle_mutex.lock().await;
 
-        info!("Reconfiguring KMS service (zero-downtime)");
+        debug!(
+            event = EVENT_KMS_SERVICE_STATE,
+            component = LOG_COMPONENT_KMS,
+            subsystem = LOG_SUBSYSTEM_SERVICE,
+            state = "reconfiguring",
+            "KMS service reconfiguring"
+        );
         new_config.validate()?;
 
         // Configure with new config
@@ -230,13 +271,22 @@ impl KmsServiceManager {
 
                 if let Some(old_ver) = old_version {
                     info!(
-                        "KMS service reconfigured successfully: version {} -> {} (old service will be cleaned up when operations complete)",
-                        old_ver, new_service_version.version
+                        event = EVENT_KMS_SERVICE_STATE,
+                        component = LOG_COMPONENT_KMS,
+                        subsystem = LOG_SUBSYSTEM_SERVICE,
+                        old_version = old_ver,
+                        new_version = new_service_version.version,
+                        state = "running",
+                        "KMS service reconfigured"
                     );
                 } else {
                     info!(
-                        "KMS service reconfigured successfully: version {} (service started)",
-                        new_service_version.version
+                        event = EVENT_KMS_SERVICE_STATE,
+                        component = LOG_COMPONENT_KMS,
+                        subsystem = LOG_SUBSYSTEM_SERVICE,
+                        new_version = new_service_version.version,
+                        state = "running",
+                        "KMS service started from reconfigure"
                     );
                 }
                 Ok(())

@@ -27,7 +27,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use tokio::sync::{RwLock, Semaphore};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const LOG_COMPONENT_HEAL: &str = "heal";
 const LOG_SUBSYSTEM_ERASURE_HEALER: &str = "erasure_healer";
@@ -99,7 +99,7 @@ impl ErasureSetHealer {
     /// execute erasure set heal with resume
     #[tracing::instrument(skip(self, buckets), fields(set_disk_id = %set_disk_id, bucket_count = buckets.len()))]
     pub async fn heal_erasure_set(&self, buckets: &[String], set_disk_id: &str) -> Result<()> {
-        info!(
+        debug!(
             target: "rustfs::heal::erasure_healer",
             event = EVENT_HEAL_ERASURE_RESUME_STATE,
             component = LOG_COMPONENT_HEAL,
@@ -162,7 +162,7 @@ impl ErasureSetHealer {
                 Ok(manager) => {
                     let state = manager.get_state().await;
                     if state.set_disk_id == set_disk_id && ResumeUtils::can_resume_task(&self.disk, &task_id).await {
-                        info!(
+                        debug!(
                             target: "rustfs::heal::erasure_healer",
                             event = EVENT_HEAL_ERASURE_RESUME_STATE,
                             component = LOG_COMPONENT_HEAL,
@@ -170,7 +170,7 @@ impl ErasureSetHealer {
                             task_id,
                             set_disk_id,
                             state = "resume_found",
-                            "Erasure set resume state selected"
+                            "Erasure set resume selected"
                         );
                         return Ok(task_id);
                     }
@@ -193,7 +193,7 @@ impl ErasureSetHealer {
 
         // create new task id
         let task_id = format!("{}_{}", set_disk_id, ResumeUtils::generate_task_id());
-        info!(
+        debug!(
             target: "rustfs::heal::erasure_healer",
             event = EVENT_HEAL_ERASURE_RESUME_STATE,
             component = LOG_COMPONENT_HEAL,
@@ -215,7 +215,7 @@ impl ErasureSetHealer {
     ) -> Result<(ResumeManager, CheckpointManager)> {
         // check if resume state exists
         if ResumeManager::has_resume_state(&self.disk, task_id).await {
-            info!(
+            debug!(
                 target: "rustfs::heal::erasure_healer",
                 event = EVENT_HEAL_ERASURE_RESUME_STATE,
                 component = LOG_COMPONENT_HEAL,
@@ -235,7 +235,7 @@ impl ErasureSetHealer {
 
             Ok((resume_manager, checkpoint_manager))
         } else {
-            info!(
+            debug!(
                 target: "rustfs::heal::erasure_healer",
                 event = EVENT_HEAL_ERASURE_RESUME_STATE,
                 component = LOG_COMPONENT_HEAL,
@@ -243,7 +243,7 @@ impl ErasureSetHealer {
                 task_id,
                 set_disk_id,
                 state = "creating_new",
-                "Erasure set resume state creating"
+                "Erasure set resume created"
             );
 
             let resume_manager = ResumeManager::new(
@@ -273,7 +273,7 @@ impl ErasureSetHealer {
         let state = resume_manager.get_state().await;
         let checkpoint = checkpoint_manager.get_checkpoint().await;
 
-        info!(
+        debug!(
             target: "rustfs::heal::erasure_healer",
             event = EVENT_HEAL_ERASURE_RESUME_STATE,
             component = LOG_COMPONENT_HEAL,
@@ -282,7 +282,7 @@ impl ErasureSetHealer {
             current_bucket_index = checkpoint.current_bucket_index,
             current_object_index = checkpoint.current_object_index,
             state = "resuming",
-            "Erasure set heal resumed from checkpoint"
+            "Erasure set resumed"
         );
 
         // 2. initialize progress
@@ -349,7 +349,7 @@ impl ErasureSetHealer {
             match bucket_result {
                 Ok(_) => {
                     resume_manager.complete_bucket(bucket).await?;
-                    info!(
+                    debug!(
                         target: "rustfs::heal::erasure_healer",
                         event = EVENT_HEAL_ERASURE_BUCKET_STATE,
                         component = LOG_COMPONENT_HEAL,
@@ -357,7 +357,7 @@ impl ErasureSetHealer {
                         set_disk_id,
                         bucket,
                         state = "completed",
-                        "Erasure set bucket heal completed"
+                        "Erasure set bucket completed"
                     );
                 }
                 Err(e) => {
@@ -383,14 +383,14 @@ impl ErasureSetHealer {
         // 5. mark task completed
         resume_manager.mark_completed().await?;
 
-        info!(
+        debug!(
             target: "rustfs::heal::erasure_healer",
             event = EVENT_HEAL_ERASURE_RESUME_STATE,
             component = LOG_COMPONENT_HEAL,
             subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
             set_disk_id,
             state = "completed",
-            "Erasure set heal completed"
+            "Erasure set completed"
         );
         Ok(())
     }
@@ -411,7 +411,7 @@ impl ErasureSetHealer {
         resume_manager: &ResumeManager,
         checkpoint_manager: &CheckpointManager,
     ) -> Result<()> {
-        info!(
+        debug!(
             target: "rustfs::heal::erasure_healer",
             event = EVENT_HEAL_ERASURE_BUCKET_STATE,
             component = LOG_COMPONENT_HEAL,
@@ -421,7 +421,7 @@ impl ErasureSetHealer {
             bucket_index,
             current_object_index = *current_object_index,
             state = "started",
-            "Erasure set bucket heal started"
+            "Erasure set bucket started"
         );
 
         // 1. get bucket info
@@ -584,7 +584,7 @@ impl ErasureSetHealer {
                     Ok(true) => {
                         *successful_objects += 1;
                         checkpoint_manager.add_processed_object(object.clone()).await?;
-                        info!(
+                        debug!(
                             target: "rustfs::heal::erasure_healer",
                             event = EVENT_HEAL_ERASURE_OBJECT_STATE,
                             component = LOG_COMPONENT_HEAL,
@@ -593,13 +593,13 @@ impl ErasureSetHealer {
                             bucket,
                             object = %object,
                             state = "healed",
-                            "Erasure set object heal completed"
+                            "Erasure set object healed"
                         );
                     }
                     Ok(false) => {
                         checkpoint_manager.add_processed_object(object.clone()).await?;
                         *successful_objects += 1;
-                        info!(
+                        debug!(
                             target: "rustfs::heal::erasure_healer",
                             event = EVENT_HEAL_ERASURE_OBJECT_STATE,
                             component = LOG_COMPONENT_HEAL,
@@ -608,7 +608,7 @@ impl ErasureSetHealer {
                             bucket,
                             object = %object,
                             state = "missing_treated_as_ok",
-                            "Erasure set object heal skipped because object disappeared"
+                            "Erasure set missing object treated as ok"
                         );
                     }
                     Err(Error::TaskCancelled) => {
@@ -743,14 +743,14 @@ impl ErasureSetHealer {
         bucket: &str,
         progress: &Arc<RwLock<HealProgress>>,
     ) -> Result<()> {
-        info!(
+        debug!(
             target: "rustfs::heal::erasure_healer",
             event = EVENT_HEAL_ERASURE_BUCKET_STATE,
             component = LOG_COMPONENT_HEAL,
             subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
             bucket,
             state = "started",
-            "Erasure set bucket heal started"
+            "Erasure set bucket started"
         );
 
         // 1. get bucket info
@@ -847,7 +847,7 @@ impl ErasureSetHealer {
             p.set_current_object(Some(format!("completed bucket: {bucket}")));
         }
 
-        info!(
+        debug!(
             target: "rustfs::heal::erasure_healer",
             event = EVENT_HEAL_ERASURE_BUCKET_STATE,
             component = LOG_COMPONENT_HEAL,
@@ -857,7 +857,7 @@ impl ErasureSetHealer {
             total_failed,
             total_scanned,
             state = "completed",
-            "Erasure set bucket heal completed"
+            "Erasure set bucket completed"
         );
 
         Ok(())
@@ -890,7 +890,7 @@ impl ErasureSetHealer {
 
                 match storage.heal_object(&bucket, &object, None, &heal_opts).await {
                     Ok((_result, None)) => {
-                        info!(
+                        debug!(
                             target: "rustfs::heal::erasure_healer",
                             event = EVENT_HEAL_ERASURE_OBJECT_STATE,
                             component = LOG_COMPONENT_HEAL,
@@ -898,7 +898,7 @@ impl ErasureSetHealer {
                             bucket,
                             object = %object,
                             state = "healed",
-                            "Erasure set object heal completed"
+                            "Erasure set object healed"
                         );
                         Ok(())
                     }
@@ -956,7 +956,7 @@ impl ErasureSetHealer {
             success_count,
             total,
             state = "summary",
-            "Erasure set heal summary recorded"
+            "Erasure set summary recorded"
         );
 
         if failure_count > 0 {
