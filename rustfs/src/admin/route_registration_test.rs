@@ -384,6 +384,11 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         ),
         table_route_sample(
             Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery",
+            "/analytics/namespaces/sales/tables/orders/catalog/recovery",
+        ),
+        table_route_sample(
+            Method::POST,
             "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
             "/analytics/namespaces/sales/tables/orders/catalog/rollback",
         ),
@@ -479,6 +484,11 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             Method::GET,
             "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/diagnostics",
             "/analytics/namespaces/sales/tables/orders/catalog/diagnostics",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery",
+            "/analytics/namespaces/sales/tables/orders/catalog/recovery",
         ),
         compat_table_route_sample(
             Method::POST,
@@ -660,6 +670,11 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(
         &router,
         Method::POST,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/recovery"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
         &table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/rollback"),
     );
     assert_route(&router, Method::GET, &compat_table_catalog_path("/config"));
@@ -736,6 +751,11 @@ fn test_register_routes_cover_representative_admin_paths() {
         &router,
         Method::GET,
         &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/diagnostics"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/recovery"),
     );
     assert_route(
         &router,

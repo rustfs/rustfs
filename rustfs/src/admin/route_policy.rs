@@ -756,6 +756,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery",
+        COMMIT_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
         COMMIT_TABLE,
         RouteRiskLevel::High,
@@ -904,6 +910,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/diagnostics",
         GET_TABLE_METADATA,
         RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery",
+        COMMIT_TABLE,
+        RouteRiskLevel::High,
     ),
     admin(
         HttpMethod::Post,
@@ -1182,6 +1194,16 @@ mod tests {
             HttpMethod::Post,
             "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
             REGISTER_TABLE,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery",
+            COMMIT_TABLE,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery",
+            COMMIT_TABLE,
         );
         assert_action(
             HttpMethod::Post,
