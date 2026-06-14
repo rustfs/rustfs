@@ -400,7 +400,7 @@ where
             target_id = %self.id,
             bucket = %meta.bucket_name,
             object = %meta.object_name,
-            event = %meta.event_name,
+            payload_event = %meta.event_name,
             payload_len = body.len(),
             state = "sending",
             "webhook delivery state"

@@ -535,9 +535,6 @@ impl Operation for OidcCallbackHandler {
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_OIDC,
             provider_id = %actual_provider_id,
-            username = %claims.username,
-            email = %claims.email,
-            subject = %claims.sub,
             state = "authentication_succeeded",
             "admin oidc state"
         );
@@ -550,7 +547,6 @@ impl Operation for OidcCallbackHandler {
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_OIDC,
             provider_id = %actual_provider_id,
-            username = %claims.username,
             policy_count = policies.len(),
             group_count = groups.len(),
             state = "claims_mapped",
