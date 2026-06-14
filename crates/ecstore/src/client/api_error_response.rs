@@ -36,6 +36,8 @@ pub struct ErrorResponse {
     pub bucket_name: String,
     pub key: String,
     pub resource: String,
+    // External S3-style error response contract: keep `RequestId`.
+    #[serde(rename = "RequestId")]
     pub request_id: String,
     pub host_id: String,
     pub region: String,
@@ -300,5 +302,31 @@ pub fn err_api_not_supported(message: &str) -> ErrorResponse {
         message: message.to_string(),
         request_id: "rustfs".to_string(),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[test]
+    fn error_response_serializes_request_id_as_pascal_case_contract() {
+        let response = ErrorResponse {
+            code: S3ErrorCode::InvalidArgument,
+            message: "bad request".to_string(),
+            bucket_name: "bucket".to_string(),
+            key: "key".to_string(),
+            resource: "/bucket/key".to_string(),
+            request_id: "req-xml-123".to_string(),
+            host_id: "host-1".to_string(),
+            region: "us-east-1".to_string(),
+            server: "rustfs".to_string(),
+            status_code: StatusCode::BAD_REQUEST,
+        };
+
+        let value = serde_json::to_value(response).expect("error response should serialize");
+        assert_eq!(value["RequestId"], Value::String("req-xml-123".to_string()));
+        assert!(value.get("request_id").is_none(), "external error contract must not expose request_id");
     }
 }

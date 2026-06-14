@@ -124,6 +124,7 @@ pub struct QuotaErrorResponse {
     pub message: String,
     #[serde(rename = "Resource")]
     pub resource: String,
+    // External quota error contract follows the existing PascalCase error schema.
     #[serde(rename = "RequestId")]
     pub request_id: String,
     #[serde(rename = "HostId")]
@@ -168,6 +169,7 @@ impl QuotaErrorResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     /// Legacy format: quota, created_at, updated_at (no quota_type)
     #[test]
@@ -216,5 +218,20 @@ mod tests {
         let q = BucketQuota::unmarshal(json.as_bytes()).expect("should parse");
         assert_eq!(q.quota, Some(1073741824));
         assert_eq!(q.quota_type, QuotaType::Hard);
+    }
+
+    #[test]
+    fn quota_error_response_serializes_request_id_as_pascal_case_contract() {
+        let response = QuotaErrorResponse::new(
+            &QuotaError::InvalidConfig {
+                reason: "bad quota".to_string(),
+            },
+            "req-quota-123",
+            "host-quota-1",
+        );
+
+        let value = serde_json::to_value(response).expect("quota error response should serialize");
+        assert_eq!(value["RequestId"], Value::String("req-quota-123".to_string()));
+        assert!(value.get("request_id").is_none(), "quota error contract must not expose request_id");
     }
 }

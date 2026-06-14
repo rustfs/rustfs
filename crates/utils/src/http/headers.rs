@@ -151,7 +151,8 @@ pub const AMZ_ENCRYPTION_KMS: &str = "aws:kms";
 pub const AMZ_SIGNATURE_V2: &str = "Signature";
 pub const AMZ_ACCESS_KEY_ID: &str = "AWSAccessKeyId";
 
-// Response request id.
+// Request id headers.
+pub const REQUEST_ID_HEADER: &str = "x-request-id";
 pub const AMZ_REQUEST_ID: &str = "x-amz-request-id";
 pub const AMZ_REQUEST_HOST_ID: &str = "x-amz-id-2";
 

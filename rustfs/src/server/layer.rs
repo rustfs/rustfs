@@ -24,14 +24,12 @@ use crate::server::{
     has_path_prefix, is_admin_path, is_table_catalog_path,
 };
 use crate::storage::apply_cors_headers;
-use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
+use crate::storage::request_context::{RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode, Uri};
 use http_body::Body;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
-use opentelemetry::global;
-use opentelemetry::trace::TraceContextExt;
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::get_env_opt_str;
 use rustfs_utils::http::headers::AMZ_REQUEST_ID;
@@ -51,30 +49,6 @@ const LOG_COMPONENT_SERVER: &str = "server";
 const LOG_SUBSYSTEM_HTTP: &str = "http";
 const REDACTED_QUERY_VALUE: &str = "redacted";
 const OBJECT_ZIP_DOWNLOADS_PATH: &str = "/v3/object-zip-downloads/";
-
-/// A carrier that adapts [`HeaderMap`] for OpenTelemetry trace context propagation.
-struct HeaderMapCarrier<'a>(&'a HeaderMap);
-
-impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrier<'a> {
-    fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(key).and_then(|v| v.to_str().ok())
-    }
-
-    fn keys(&self) -> Vec<&str> {
-        self.0.keys().map(|k| k.as_str()).collect()
-    }
-
-    fn get_all(&self, key: &str) -> Option<Vec<&str>> {
-        let headers = self
-            .0
-            .get_all(key)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .collect::<Vec<_>>();
-
-        if headers.is_empty() { None } else { Some(headers) }
-    }
-}
 
 pub(crate) fn redact_sensitive_uri_query(uri: &http::Uri) -> String {
     let path = uri.path();
@@ -131,8 +105,8 @@ fn is_object_zip_download_path(path: &str) -> bool {
 /// This layer must be placed after `SetRequestIdLayer` in the middleware stack,
 /// as it reads the `x-request-id` header that `SetRequestIdLayer` generates.
 ///
-/// Additionally, it stores the S3-compatible request ID alias in the request context
-/// without mutating signed request headers.
+/// Additionally, it preserves any upstream `x-amz-request-id` in the separate
+/// `RequestContext.x_amz_request_id` field without mutating signed request headers.
 #[derive(Clone, Default)]
 pub struct RequestContextLayer;
 
@@ -165,23 +139,12 @@ where
     fn call(&mut self, mut req: HttpRequest<B>) -> Self::Future {
         let request_id = extract_request_id_from_headers(req.headers());
 
-        // Extract OpenTelemetry trace/span context from incoming headers
-        let parent_cx = global::get_text_map_propagator(|propagator| propagator.extract(&HeaderMapCarrier(req.headers())));
-        let span_ref = parent_cx.span();
-        let span_context = span_ref.span_context();
-        let trace_id = if span_context.is_valid() {
-            Some(span_context.trace_id().to_string())
-        } else {
-            None
-        };
-        let span_id = if span_context.is_valid() {
-            Some(span_context.span_id().to_string())
-        } else {
-            None
-        };
+        let (trace_id, span_id) = extract_trace_context_ids_from_headers(req.headers())
+            .map(|(trace_id, span_id)| (Some(trace_id), Some(span_id)))
+            .unwrap_or((None, None));
 
-        // Preserve the upstream x-amz-request-id if present (S3 client forwarding),
-        // otherwise fall back to the canonical request_id.
+        // Preserve the upstream x-amz-request-id if present as the S3 compatibility alias;
+        // otherwise mirror the canonical internal request_id.
         let x_amz_request_id = req
             .headers()
             .get(AMZ_REQUEST_ID)
@@ -1529,6 +1492,8 @@ mod tests {
     use http::Request;
     use http_body_util::BodyExt;
     use http_body_util::Full;
+    use opentelemetry::global;
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
     use serial_test::serial;
     use std::convert::Infallible;
     use std::io::{self, Write};
@@ -2630,6 +2595,29 @@ mod tests {
         assert_eq!(context.request_id, "req-123");
         assert_eq!(context.x_amz_request_id, "amz-456");
         assert_eq!(request.headers().get(AMZ_REQUEST_ID).unwrap(), "amz-456");
+    }
+
+    #[test]
+    fn request_context_layer_extracts_trace_context_from_traceparent_header() {
+        global::set_text_map_propagator(TraceContextPropagator::new());
+
+        let mut service = RequestContextLayer.layer(CaptureService);
+        let request = Request::builder()
+            .uri("/bucket/object")
+            .header("x-request-id", "req-trace-123")
+            .header("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+            .body(())
+            .expect("request");
+
+        let request = service.call(request).into_inner().expect("service call should succeed");
+        let context = request
+            .extensions()
+            .get::<RequestContext>()
+            .expect("request context should be present");
+
+        assert_eq!(context.request_id, "req-trace-123");
+        assert_eq!(context.trace_id.as_deref(), Some("4bf92f3577b34da6a3ce929d0e0e4736"));
+        assert_eq!(context.span_id.as_deref(), Some("00f067aa0ba902b7"));
     }
 
     #[tokio::test]
