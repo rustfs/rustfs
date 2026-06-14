@@ -198,7 +198,7 @@ impl AuditRegistry {
             target_type = %target_type,
             target_id = %target_id,
             registry_key = %key,
-            "Created audit target registry key"
+            "audit target registry state"
         );
         key.to_string()
     }
@@ -221,7 +221,7 @@ impl AuditRegistry {
                 target_type = %target_type,
                 target_id = %target_id,
                 state = "enabled",
-                "Audit target registry state changed"
+                "audit target registry state"
             );
             Ok(())
         } else {
@@ -250,7 +250,7 @@ impl AuditRegistry {
                 target_type = %target_type,
                 target_id = %target_id,
                 state = "disabled",
-                "Audit target registry state changed"
+                "audit target registry state"
             );
             Ok(())
         } else {

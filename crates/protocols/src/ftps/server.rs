@@ -107,7 +107,7 @@ where
             bind_addr = %self.config.bind_addr,
             tls_enabled = self.config.tls_enabled,
             ftps_required = self.config.ftps_required,
-            "ftps server state changed"
+            "FTPS server starting"
         );
         let (reload_shutdown_tx, reload_shutdown_rx) = watch::channel(false);
 
@@ -121,14 +121,14 @@ where
         // Configure passive ports for data connections
         if let Some(passive_ports) = &self.config.passive_ports {
             let range = self.config.parse_passive_ports()?;
-            info!(
+            debug!(
                 event = EVENT_FTPS_CONFIG_STATE,
                 component = LOG_COMPONENT_PROTOCOLS,
                 subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
                 state = "passive_ports_configured",
                 passive_ports = %passive_ports,
                 passive_port_range = ?range,
-                "ftps config state changed"
+                "FTPS passive ports configured"
             );
             server_builder = server_builder.passive_ports(range);
         } else {
@@ -137,19 +137,19 @@ where
                 component = LOG_COMPONENT_PROTOCOLS,
                 subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
                 result = "system_assigned_passive_ports",
-                "ftps config state changed"
+                "FTPS passive ports defaulted"
             );
         }
 
         // Configure external IP address for passive mode
         if let Some(ref external_ip) = self.config.external_ip {
-            info!(
+            debug!(
                 event = EVENT_FTPS_CONFIG_STATE,
                 component = LOG_COMPONENT_PROTOCOLS,
                 subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
                 state = "external_ip_configured",
                 external_ip = %external_ip,
-                "ftps config state changed"
+                "FTPS external IP configured"
             );
             server_builder = server_builder.passive_host(external_ip.as_str());
         }
@@ -157,13 +157,13 @@ where
         // Configure both active and passive mode support
         use libunftp::options::ActivePassiveMode;
         server_builder = server_builder.active_passive_mode(ActivePassiveMode::ActiveAndPassive);
-        info!(
+        debug!(
             event = EVENT_FTPS_CONFIG_STATE,
             component = LOG_COMPONENT_PROTOCOLS,
             subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
             state = "active_passive_mode_enabled",
             mode = "active_and_passive",
-            "ftps config state changed"
+            "FTPS active/passive mode configured"
         );
 
         // Configure FTPS / TLS
@@ -175,7 +175,7 @@ where
                     subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
                     state = "enabled",
                     cert_dir = %cert_dir,
-                    "ftps tls state changed"
+                    "FTPS TLS enabled"
                 );
 
                 let resolver = ReloadableServerCertResolver::load_from_directory(cert_dir)
@@ -197,12 +197,12 @@ where
                 server_builder = server_builder.ftps_manual::<std::path::PathBuf>(Arc::new(server_config));
 
                 if self.config.ftps_required {
-                    info!(
+                    debug!(
                         event = EVENT_FTPS_TLS_STATE,
                         component = LOG_COMPONENT_PROTOCOLS,
                         subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
                         state = "required",
-                        "ftps tls state changed"
+                        "FTPS TLS required"
                     );
                     server_builder = server_builder.ftps_required(FtpsRequired::All, FtpsRequired::All);
                 }
@@ -218,7 +218,7 @@ where
                 subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
                 state = "disabled",
                 mode = "plain_ftp",
-                "ftps tls state changed"
+                "FTPS TLS disabled"
             );
         }
 
@@ -248,13 +248,13 @@ where
                 let _ = reload_shutdown_tx.send(true);
                 match result {
                     Ok(Ok(())) => {
-                        info!(
+                        debug!(
                             event = EVENT_FTPS_SERVER_STATE,
                             component = LOG_COMPONENT_PROTOCOLS,
                             subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
                             state = "stopped",
                             result = "ok",
-                            "ftps server state changed"
+                            "FTPS server stopped"
                         );
                         Ok(())
                     }
@@ -288,7 +288,7 @@ where
                     component = LOG_COMPONENT_PROTOCOLS,
                     subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
                     state = "shutdown_requested",
-                    "ftps server state changed"
+                    "FTPS shutdown requested"
                 );
                 let _ = reload_shutdown_tx.send(true);
                 // libunftp listen() is not easily cancellable gracefully without dropping the future.
@@ -330,7 +330,7 @@ impl UserDetailProvider for FtpsUserDetailProvider {
                 result = "iam_unavailable",
                 phase = "user_detail",
                 error = %e,
-                "ftps auth state changed"
+                "FTPS user-detail IAM unavailable"
             );
             UserDetailError::ImplPropagated("Internal authentication service unavailable".to_string(), Some(Box::new(e)))
         })?;
@@ -344,7 +344,7 @@ impl UserDetailProvider for FtpsUserDetailProvider {
                 phase = "user_detail",
                 username = %masked_username,
                 error = %e,
-                "ftps auth state changed"
+                "FTPS user-detail key check failed"
             );
             UserDetailError::ImplPropagated("Authentication verification failed".to_string(), Some(Box::new(e)))
         })?;
@@ -357,7 +357,7 @@ impl UserDetailProvider for FtpsUserDetailProvider {
                 result = "identity_missing",
                 phase = "user_detail",
                 username = %masked_username,
-                "ftps auth state changed"
+                "FTPS user-detail identity missing"
             );
             UserDetailError::UserNotFound {
                 username: principal.username.clone(),
@@ -406,7 +406,7 @@ impl Authenticator for FtpsAuthenticator {
                 result = "iam_unavailable",
                 phase = "authenticate",
                 error = %e,
-                "ftps auth state changed"
+                "FTPS auth IAM unavailable"
             );
             AuthenticationError::ImplPropagated("Internal authentication service unavailable".to_string(), Some(Box::new(e)))
         })?;
@@ -433,7 +433,7 @@ impl Authenticator for FtpsAuthenticator {
                 phase = "authenticate",
                 username = %masked_username,
                 error = %e,
-                "ftps auth state changed"
+                "FTPS auth key check failed"
             );
             AuthenticationError::ImplPropagated("Authentication verification failed".to_string(), Some(Box::new(e)))
         })?;
@@ -446,7 +446,7 @@ impl Authenticator for FtpsAuthenticator {
                 result = "invalid_access_key",
                 phase = "authenticate",
                 username = %masked_username,
-                "ftps auth state changed"
+                "FTPS auth rejected access key"
             );
             return Err(AuthenticationError::BadUser);
         }
@@ -459,7 +459,7 @@ impl Authenticator for FtpsAuthenticator {
                 result = "identity_missing",
                 phase = "authenticate",
                 username = %masked_username,
-                "ftps auth state changed"
+                "FTPS auth identity missing"
             );
             AuthenticationError::BadUser
         })?;
@@ -472,7 +472,7 @@ impl Authenticator for FtpsAuthenticator {
                 result = "invalid_secret_key",
                 phase = "authenticate",
                 username = %masked_username,
-                "ftps auth state changed"
+                "FTPS auth rejected secret key"
             );
             return Err(AuthenticationError::BadPassword);
         }
@@ -484,7 +484,7 @@ impl Authenticator for FtpsAuthenticator {
             result = "authenticated",
             phase = "authenticate",
             username = %masked_username,
-            "ftps auth state changed"
+            "FTPS auth accepted"
         );
         Ok(Principal {
             username: username.to_string(),

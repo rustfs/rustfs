@@ -30,6 +30,10 @@ use std::{
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+const LOG_COMPONENT_TARGETS: &str = "targets";
+const LOG_SUBSYSTEM_STORE: &str = "store";
+const EVENT_TARGET_STORE_STATE: &str = "target_store_state";
+
 fn resolve_queue_store_compression_from_env_value(value: Option<&str>) -> bool {
     value
         .and_then(|value| value.parse::<EnableState>().ok().map(|state| state.is_enabled()))
@@ -83,7 +87,14 @@ impl std::fmt::Display for Key {
 
 /// Parses a string into a Key
 pub fn parse_key(s: &str) -> Key {
-    debug!("Parsing key: {}", s);
+    debug!(
+        event = EVENT_TARGET_STORE_STATE,
+        component = LOG_COMPONENT_TARGETS,
+        subsystem = LOG_SUBSYSTEM_STORE,
+        action = "parse_key",
+        key = %s,
+        "target store state"
+    );
 
     let mut name = s.to_string();
     let mut extension = String::new();
@@ -111,8 +122,16 @@ pub fn parse_key(s: &str) -> Key {
     }
 
     debug!(
-        "Parsed key - name: {}, extension: {}, item_count: {}, compress: {}",
-        name, extension, item_count, compress
+        event = EVENT_TARGET_STORE_STATE,
+        component = LOG_COMPONENT_TARGETS,
+        subsystem = LOG_SUBSYSTEM_STORE,
+        action = "parse_key",
+        result = "parsed",
+        key_name = %name,
+        extension = %extension,
+        item_count,
+        compressed = compress,
+        "target store state"
     );
 
     Key {
@@ -276,7 +295,15 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
             .read()
             .map_err(|_| StoreError::Internal("Failed to acquire read lock on store filesystem".to_string()))?;
         let path = self.file_path(key);
-        debug!("Reading file for key: {},path: {}", key, path.display());
+        debug!(
+            event = EVENT_TARGET_STORE_STATE,
+            component = LOG_COMPONENT_TARGETS,
+            subsystem = LOG_SUBSYSTEM_STORE,
+            action = "read_file",
+            key = %key,
+            path = %path.display(),
+            "target store state"
+        );
         let data = std::fs::read(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 StoreError::NotFound
@@ -342,7 +369,14 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
             std::fs::write(&path, data).map_err(StoreError::Io)?;
         }
         let modified = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i64;
-        debug!("Wrote event to store: {}", key);
+        debug!(
+            event = EVENT_TARGET_STORE_STATE,
+            component = LOG_COMPONENT_TARGETS,
+            subsystem = LOG_SUBSYSTEM_STORE,
+            action = "write_file",
+            key = %key,
+            "target store state"
+        );
         Ok(modified)
     }
 
@@ -409,7 +443,15 @@ where
             }
         }
 
-        debug!("Opened store at: {:?}", self.directory);
+        debug!(
+            event = EVENT_TARGET_STORE_STATE,
+            component = LOG_COMPONENT_TARGETS,
+            subsystem = LOG_SUBSYSTEM_STORE,
+            state = "opened",
+            store_dir = ?self.directory,
+            entry_count = entries_map.len(),
+            "target store state"
+        );
         Ok(())
     }
 
@@ -471,7 +513,14 @@ where
     }
 
     fn get_multiple(&self, key: &Self::Key) -> Result<Vec<T>, Self::Error> {
-        debug!("Reading items from store for key: {}", key);
+        debug!(
+            event = EVENT_TARGET_STORE_STATE,
+            component = LOG_COMPONENT_TARGETS,
+            subsystem = LOG_SUBSYSTEM_STORE,
+            action = "read_batch",
+            key = %key,
+            "target store state"
+        );
         let data = self.get_raw(key)?;
         if data.is_empty() {
             return Err(StoreError::Deserialization("Cannot deserialize empty data".to_string()));
@@ -500,10 +549,15 @@ where
                     if items.len() < key.item_count && !items.is_empty() {
                         // Partial read
                         warn!(
-                            "Expected {} items for key {}, but only found {}. Possible data corruption or incorrect item_count.",
-                            key.item_count,
-                            key,
-                            items.len()
+                            event = EVENT_TARGET_STORE_STATE,
+                            component = LOG_COMPONENT_TARGETS,
+                            subsystem = LOG_SUBSYSTEM_STORE,
+                            action = "read_batch",
+                            key = %key,
+                            expected_items = key.item_count,
+                            actual_items = items.len(),
+                            reason = "partial_batch_read",
+                            "target store state"
                         );
                         // Depending on strictness, this could be an error.
                     } else if items.is_empty() {
@@ -538,7 +592,15 @@ where
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // File already gone — still clean up the entries map to avoid stale keys.
-                warn!("File not found for key {} during del, cleaning up entries map.", key);
+                warn!(
+                    event = EVENT_TARGET_STORE_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_STORE,
+                    action = "delete",
+                    key = %key,
+                    result = "file_missing",
+                    "target store state"
+                );
             }
             Err(e) => return Err(StoreError::Io(e)),
         }
@@ -550,9 +612,25 @@ where
             .map_err(|_| StoreError::Internal("Failed to acquire write lock on entries".to_string()))?;
 
         if entries.remove(&key.to_key_string()).is_none() {
-            debug!("Key {} not found in entries map during del, might have been already removed.", key);
+            debug!(
+                event = EVENT_TARGET_STORE_STATE,
+                component = LOG_COMPONENT_TARGETS,
+                subsystem = LOG_SUBSYSTEM_STORE,
+                action = "delete",
+                key = %key,
+                result = "entry_missing",
+                "target store state"
+            );
         }
-        debug!("Deleted event from store: {}", key.to_string());
+        debug!(
+            event = EVENT_TARGET_STORE_STATE,
+            component = LOG_COMPONENT_TARGETS,
+            subsystem = LOG_SUBSYSTEM_STORE,
+            action = "delete",
+            key = %key,
+            result = "deleted",
+            "target store state"
+        );
         Ok(())
     }
 
@@ -580,7 +658,14 @@ where
         let entries = match self.entries.read() {
             Ok(entries) => entries,
             Err(_) => {
-                debug!("Failed to acquire read lock on entries for listing");
+                debug!(
+                    event = EVENT_TARGET_STORE_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_STORE,
+                    action = "list",
+                    result = "lock_unavailable",
+                    "target store state"
+                );
                 return Vec::new();
             }
         };
@@ -597,7 +682,14 @@ where
         match self.entries.read() {
             Ok(entries) => entries.len(),
             Err(_) => {
-                debug!("Failed to acquire read lock on entries for len");
+                debug!(
+                    event = EVENT_TARGET_STORE_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_STORE,
+                    action = "len",
+                    result = "lock_unavailable",
+                    "target store state"
+                );
                 0
             }
         }

@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::{self, Sender};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 pub static IAM_CONFIG_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam"));
 pub static IAM_CONFIG_USERS_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam/users/"));
@@ -307,11 +307,11 @@ impl ObjectStore {
                 }
                 Err(StorageError::PreconditionFailed) => {
                     Self::complete_lazy_rewrite(path.as_str(), false);
-                    debug!("iam lazy rewrite skipped due to stale etag, path: {}", path);
+                    debug!(path = %path, state = "stale_etag", "IAM lazy rewrite skipped");
                 }
                 Err(err) => {
                     Self::complete_lazy_rewrite(path.as_str(), false);
-                    warn!("iam lazy rewrite failed, path: {}, err: {}", path, err);
+                    warn!(path = %path, error = %err, state = "rewrite_failed", "IAM lazy rewrite failed");
                 }
             }
         });
@@ -377,7 +377,7 @@ impl ObjectStore {
                     bucket = Self::BUCKET_NAME,
                     prefix = %path,
                     error = %err,
-                    "system path walk failed"
+                    "IAM config walk failed"
                 );
                 let _ = sender_on_error
                     .send(StringOrErr {
@@ -643,7 +643,7 @@ impl Store for ObjectStore {
         let outcome = match Self::decrypt_data_with_source(&data) {
             Ok(v) => v,
             Err(err) => {
-                warn!("config decrypt failed, keeping file: {}, path: {}", err, path_ref);
+                warn!(path = %path_ref, error = %err, "IAM config decrypt failed; keeping file");
                 // keep the config file when decrypt failed - do not delete
                 return Err(Error::ConfigNotFound);
             }
@@ -692,7 +692,7 @@ impl Store for ObjectStore {
                     tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
                 }
                 Err(e) => {
-                    error!("Final failure saving IAM config to {}: {:?}", path_ref, e);
+                    error!(path = %path_ref, error = ?e, "IAM config save failed");
                     return Err(e.into());
                 }
             }
@@ -717,7 +717,7 @@ impl Store for ObjectStore {
         debug!("Saving IAM identity to path: {}", path);
 
         self.save_iam_config(user_identity, path).await.map_err(|e| {
-            error!("ObjectStore save failure for {}: {:?}", name, e);
+            error!(name, error = ?e, "IAM identity save failed");
             e
         })
     }
@@ -739,10 +739,10 @@ impl Store for ObjectStore {
             .await
             .map_err(|err| {
                 if is_err_config_not_found(&err) {
-                    warn!("load_user_identity failed: no such user, name: {name}, user_type: {user_type:?}");
+                    warn!(name, user_type = ?user_type, "IAM user identity missing");
                     Error::NoSuchUser(name.to_owned())
                 } else {
-                    warn!("load_user_identity failed: {err:?}, name: {name}, user_type: {user_type:?}");
+                    warn!(name, user_type = ?user_type, error = ?err, "IAM user identity load failed");
                     err
                 }
             })?;
@@ -750,9 +750,7 @@ impl Store for ObjectStore {
         if u.credentials.is_expired() {
             let _ = self.delete_iam_config(get_user_identity_path(name, user_type)).await;
             let _ = self.delete_iam_config(get_mapped_policy_path(name, user_type, false)).await;
-            warn!(
-                "load_user_identity failed: user is expired, delete the user and mapped policy, name: {name}, user_type: {user_type:?}"
-            );
+            warn!(name, user_type = ?user_type, "IAM user identity expired and was removed");
             return Err(Error::NoSuchUser(name.to_owned()));
         }
 
@@ -776,7 +774,7 @@ impl Store for ObjectStore {
                         let _ = self.delete_iam_config(get_user_identity_path(name, user_type)).await;
                         let _ = self.delete_iam_config(get_mapped_policy_path(name, user_type, false)).await;
                     }
-                    warn!("extract_jwt_claims failed: {err:?}, name: {name}, user_type: {user_type:?}");
+                    warn!(name, user_type = ?user_type, error = ?err, "IAM JWT claim extraction failed");
                     return Err(Error::NoSuchUser(name.to_owned()));
                 }
             }
@@ -804,7 +802,7 @@ impl Store for ObjectStore {
 
         while let Some(v) = rx.recv().await {
             if let Some(err) = v.err {
-                warn!("list_iam_config_items {:?}", err);
+                warn!(error = ?err, "IAM config item listing failed");
                 let _ = ctx.cancel();
 
                 return Err(err);
@@ -866,7 +864,7 @@ impl Store for ObjectStore {
 
         while let Some(v) = rx.recv().await {
             if let Some(err) = v.err {
-                warn!("list_iam_config_items {:?}", err);
+                warn!(error = ?err, "IAM config item listing failed");
                 let _ = ctx.cancel();
 
                 return Err(err);
@@ -934,7 +932,7 @@ impl Store for ObjectStore {
 
         while let Some(v) = rx.recv().await {
             if let Some(err) = v.err {
-                warn!("list_iam_config_items {:?}", err);
+                warn!(error = ?err, "IAM config item listing failed");
                 let _ = ctx.cancel();
 
                 return Err(err);
@@ -1009,7 +1007,7 @@ impl Store for ObjectStore {
 
         while let Some(v) = rx.recv().await {
             if let Some(err) = v.err {
-                warn!("list_iam_config_items {:?}", err);
+                warn!(error = ?err, "IAM config item listing failed");
                 let _ = ctx.cancel();
 
                 return Err(err);
@@ -1044,7 +1042,7 @@ impl Store for ObjectStore {
 
                         let policy_name = rustfs_utils::path::dir(&policies_list[idx]);
 
-                        info!("load policy: {}", policy_name);
+                        debug!(policy = %policy_name, "IAM policy loaded");
 
                         policy_docs_cache.insert(policy_name, p);
                     }
@@ -1059,7 +1057,7 @@ impl Store for ObjectStore {
                     }
 
                     let policy_name = rustfs_utils::path::dir(&policies_list[idx]);
-                    info!("load policy: {}", policy_name);
+                    debug!(policy = %policy_name, "IAM policy loaded");
                     policy_docs_cache.insert(policy_name, p);
                 }
 
@@ -1083,7 +1081,7 @@ impl Store for ObjectStore {
                         }
 
                         let name = rustfs_utils::path::dir(&item_name_list[idx]);
-                        info!("load reg user: {}", name);
+                        debug!(user = %name, "IAM regular user loaded");
                         user_items_cache.insert(name, p);
                     }
                     break;
@@ -1097,7 +1095,7 @@ impl Store for ObjectStore {
                     }
 
                     let name = rustfs_utils::path::dir(&item_name_list[idx]);
-                    info!("load reg user: {}", name);
+                    debug!(user = %name, "IAM regular user loaded");
                     user_items_cache.insert(name, p);
                 }
 
@@ -1112,7 +1110,7 @@ impl Store for ObjectStore {
 
             for item in item_name_list.iter() {
                 let name = rustfs_utils::path::dir(item);
-                info!("load group: {}", name);
+                debug!(group = %name, "IAM group loaded");
                 if let Err(err) = self.load_group(&name, &mut items_cache).await {
                     return Err(Error::other(format!("load group failed: {err}")));
                 };
@@ -1140,7 +1138,7 @@ impl Store for ObjectStore {
                         }
 
                         let name = item_name_list[idx].trim_end_matches(".json").to_owned();
-                        info!("load user policy: {}", name);
+                        debug!(user = %name, "IAM user policy loaded");
                         items_cache.insert(name, p);
                     }
                     break;
@@ -1156,7 +1154,7 @@ impl Store for ObjectStore {
                     }
 
                     let name = item_name_list[idx].trim_end_matches(".json").to_owned();
-                    info!("load user policy: {}", name);
+                    debug!(user = %name, "IAM user policy loaded");
                     items_cache.insert(name, p);
                 }
 
@@ -1174,7 +1172,7 @@ impl Store for ObjectStore {
             for item in item_name_list.iter() {
                 let name = item.trim_end_matches(".json");
 
-                info!("load group policy: {}", name);
+                debug!(group = %name, "IAM group policy loaded");
                 if let Err(err) = self.load_mapped_policy(name, UserType::Reg, true, &mut items_cache).await
                     && !is_err_no_such_policy(&err)
                 {
@@ -1193,7 +1191,7 @@ impl Store for ObjectStore {
 
             for item in item_name_list.iter() {
                 let name = rustfs_utils::path::dir(item);
-                info!("load svc user: {}", name);
+                debug!(user = %name, "IAM service user loaded");
                 if let Err(err) = self.load_user(&name, UserType::Svc, &mut items_cache).await
                     && !is_err_no_such_user(&err)
                 {
@@ -1204,7 +1202,7 @@ impl Store for ObjectStore {
             for (_, v) in items_cache.iter() {
                 let parent = v.credentials.parent_user.clone();
                 if !user_items_cache.contains_key(&parent) {
-                    info!("load sts user policy: {}", parent);
+                    debug!(user = %parent, "IAM STS parent policy loaded");
                     if let Err(err) = self
                         .load_mapped_policy(&parent, UserType::Sts, false, &mut sts_policies_cache)
                         .await
@@ -1223,12 +1221,12 @@ impl Store for ObjectStore {
         // sts users
         if let Some(item_name_list) = listed_config_items.get(STS_LIST_KEY) {
             for item in item_name_list.iter() {
-                info!("load sts user path: {}", item);
+                debug!(path = %item, "IAM STS user path discovered");
 
                 let name = rustfs_utils::path::dir(item);
-                info!("load sts user: {}", name);
+                debug!(user = %name, "IAM STS user loaded");
                 if let Err(err) = self.load_user(&name, UserType::Sts, &mut sts_items_cache).await {
-                    info!("load sts user failed: {}", err);
+                    debug!(user = %name, error = %err, "IAM STS user load failed");
                 };
             }
         }
@@ -1237,12 +1235,12 @@ impl Store for ObjectStore {
         if let Some(item_name_list) = listed_config_items.get(POLICY_DB_STS_USERS_LIST_KEY) {
             for item in item_name_list.iter() {
                 let name = item.trim_end_matches(".json");
-                info!("load sts user policy: {}", name);
+                debug!(user = %name, "IAM STS user policy loaded");
                 if let Err(err) = self
                     .load_mapped_policy(name, UserType::Sts, false, &mut sts_policies_cache)
                     .await
                 {
-                    info!("load sts user policy failed: {}", err);
+                    debug!(user = %name, error = %err, "IAM STS user policy load failed");
                 };
             }
         }
@@ -1264,7 +1262,7 @@ impl Store for ObjectStore {
                 cache.replace_sts_policies(sts_policies_cache);
                 cache.build_user_group_memberships();
             } else {
-                warn!("skip IAM full reload cache commit because one or more IAM caches changed during reload");
+                warn!("IAM full reload cache commit skipped due to concurrent cache changes");
             }
         });
 

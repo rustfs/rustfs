@@ -175,7 +175,7 @@ fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: boo
         output_format = "json",
         logger_level,
         is_production,
-        "local logging state changed"
+        "local logging state"
     );
 
     OtelGuard {
@@ -293,7 +293,7 @@ fn init_file_logging_internal(
         stdout_mirror_enabled = stdout_guard.is_some(),
         is_production,
         logger_level,
-        "local logging state changed"
+        "local logging state"
     );
 
     Ok(OtelGuard {
@@ -482,7 +482,7 @@ pub fn spawn_cleanup_task(
         zstd_level,
         zstd_fallback_to_gzip,
         zstd_workers,
-        "log cleaner state changed"
+        "log cleaner state"
     );
 
     tokio::spawn(async move {

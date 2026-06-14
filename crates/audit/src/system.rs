@@ -120,7 +120,7 @@ impl AuditSystem {
             subsystem = LOG_SUBSYSTEM_SYSTEM,
             state = "targets_created",
             target_count = targets.len(),
-            "Created audit targets"
+            "audit system state"
         );
 
         let activation = self.runtime_facade().activate_targets_with_replay(targets).await;
@@ -159,7 +159,7 @@ impl AuditSystem {
             component = LOG_COMPONENT_AUDIT,
             subsystem = LOG_SUBSYSTEM_SYSTEM,
             state = "starting",
-            "Starting audit system"
+            "audit system state"
         );
 
         // Record system start
@@ -268,7 +268,7 @@ impl AuditSystem {
             component = LOG_COMPONENT_AUDIT,
             subsystem = LOG_SUBSYSTEM_SYSTEM,
             state = "stopping",
-            "Stopping audit system"
+            "audit system state"
         );
 
         // Stop all stream tasks first
@@ -441,7 +441,7 @@ impl AuditSystem {
             component = LOG_COMPONENT_AUDIT,
             subsystem = LOG_SUBSYSTEM_SYSTEM,
             state = "reloading",
-            "Reloading audit configuration"
+            "audit config reload"
         );
 
         observability::record_config_reload();
@@ -465,7 +465,7 @@ impl AuditSystem {
                     component = LOG_COMPONENT_AUDIT,
                     subsystem = LOG_SUBSYSTEM_SYSTEM,
                     state = "reloaded",
-                    "Reloaded audit configuration"
+                    "audit config reload"
                 );
                 Ok(())
             }
@@ -513,7 +513,7 @@ fn info_audit_state(state: &str, reason: Option<&str>, target_count: Option<usiz
         state,
         reason = reason.unwrap_or_default(),
         target_count = target_count.unwrap_or_default(),
-        "Changed audit system state"
+        "audit system state"
     );
 }
 
@@ -526,7 +526,7 @@ fn debug_audit_state(state: &str, reason: Option<&str>, error: Option<&str>, tar
         reason = reason.unwrap_or_default(),
         error = error.unwrap_or_default(),
         target_count,
-        "Observed audit system state"
+        "audit system state"
     );
 }
 
@@ -537,7 +537,7 @@ fn warn_audit_state(state: &str, reason: Option<&str>) {
         subsystem = LOG_SUBSYSTEM_SYSTEM,
         state,
         reason = reason.unwrap_or_default(),
-        "Audit system state transition skipped"
+        "audit system state"
     );
 }
 

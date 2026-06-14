@@ -60,6 +60,10 @@ const DEFAULT_MQTT_TLS_PORT: u16 = 8883;
 const DEFAULT_MQTT_WSS_PORT: u16 = 443;
 const MAX_MQTT_PACKET_SIZE_BYTES: u32 = 100 * 1024 * 1024;
 const DEFAULT_MQTT_WS_PATH_ALLOWLIST: &[&str] = &["/", "/mqtt"];
+const LOG_COMPONENT_TARGETS: &str = "targets";
+const LOG_SUBSYSTEM_MQTT: &str = "mqtt";
+const EVENT_MQTT_TARGET_STATE: &str = "mqtt_target_state";
+const EVENT_MQTT_DELIVERY_STATE: &str = "mqtt_delivery_state";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MQTTTlsPolicy {
@@ -574,7 +578,14 @@ where
             Some(MAX_MQTT_PACKET_SIZE_BYTES),
         )?;
 
-        info!(target_id = %target_id, "MQTT target created");
+        info!(
+            event = EVENT_MQTT_TARGET_STATE,
+            component = LOG_COMPONENT_TARGETS,
+            subsystem = LOG_SUBSYSTEM_MQTT,
+            target_id = %target_id,
+            state = "created",
+            "mqtt target state"
+        );
         Ok(MQTTTarget::<E> {
             id: target_id,
             args,
@@ -593,7 +604,14 @@ where
     #[instrument(skip(self), fields(target_id = %self.id))]
     async fn init(&self) -> Result<(), TargetError> {
         if self.connected.load(Ordering::SeqCst) {
-            debug!(target_id = %self.id, "Already connected.");
+            debug!(
+                event = EVENT_MQTT_TARGET_STATE,
+                component = LOG_COMPONENT_TARGETS,
+                subsystem = LOG_SUBSYSTEM_MQTT,
+                target_id = %self.id,
+                state = "already_connected",
+                "mqtt target state"
+            );
             return Ok(());
         }
 
@@ -607,7 +625,14 @@ where
         let _ = bg_task_manager
             .init_cell
             .get_or_try_init(|| async {
-                debug!(target_id = %target_id_clone, "Initializing MQTT background task.");
+                debug!(
+                    event = EVENT_MQTT_TARGET_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_MQTT,
+                    target_id = %target_id_clone,
+                    state = "background_task_initializing",
+                    "mqtt target state"
+                );
 
                 // Use the latest MqttOptions (may have been updated by TLS reload coordinator).
                 let mqtt_options: MqttOptions = (**pending_mqtt_options.load()).clone();
@@ -615,30 +640,67 @@ where
                 let (new_client, eventloop) = AsyncClient::builder(mqtt_options).capacity(10).build();
 
                 if let Err(e) = new_client.subscribe(&args_clone.topic, args_clone.qos).await {
-                    error!(target_id = %target_id_clone, error = %e, "Failed to subscribe to MQTT topic during init");
+                    error!(
+                        event = EVENT_MQTT_TARGET_STATE,
+                        component = LOG_COMPONENT_TARGETS,
+                        subsystem = LOG_SUBSYSTEM_MQTT,
+                        target_id = %target_id_clone,
+                        state = "subscribe_failed",
+                        error = %e,
+                        "mqtt target state"
+                    );
                     return Err(TargetError::Network(format!("MQTT subscribe failed: {e}")));
                 }
 
                 let mut rx_guard = bg_task_manager.initial_cancel_rx.lock().await;
                 let cancel_rx = rx_guard.take().ok_or_else(|| {
-                    error!(target_id = %target_id_clone, "MQTT cancel receiver already taken for task.");
+                    error!(
+                        event = EVENT_MQTT_TARGET_STATE,
+                        component = LOG_COMPONENT_TARGETS,
+                        subsystem = LOG_SUBSYSTEM_MQTT,
+                        target_id = %target_id_clone,
+                        state = "cancel_receiver_unavailable",
+                        "mqtt target state"
+                    );
                     TargetError::Configuration("MQTT cancel receiver already taken for task".to_string())
                 })?;
                 drop(rx_guard);
 
                 *client_arc.lock().await = Some(new_client.clone());
 
-                info!(target_id = %target_id_clone, "Spawning MQTT event loop task.");
+                info!(
+                    event = EVENT_MQTT_TARGET_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_MQTT,
+                    target_id = %target_id_clone,
+                    state = "event_loop_spawning",
+                    "mqtt target state"
+                );
                 let task_handle =
                     tokio::spawn(run_mqtt_event_loop(eventloop, connected_arc.clone(), target_id_clone.clone(), cancel_rx));
                 Ok(task_handle)
             })
             .await
             .map_err(|e: TargetError| {
-                error!(target_id = %self.id, error = %e, "Failed to initialize MQTT background task");
+                error!(
+                    event = EVENT_MQTT_TARGET_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_MQTT,
+                    target_id = %self.id,
+                    state = "background_task_init_failed",
+                    error = %e,
+                    "mqtt target state"
+                );
                 e
             })?;
-        debug!(target_id = %self.id, "MQTT background task initialized successfully.");
+        debug!(
+            event = EVENT_MQTT_TARGET_STATE,
+            component = LOG_COMPONENT_TARGETS,
+            subsystem = LOG_SUBSYSTEM_MQTT,
+            target_id = %self.id,
+            state = "background_task_initialized",
+            "mqtt target state"
+        );
 
         match tokio::time::timeout(DEFAULT_CONNECTION_TIMEOUT, async {
             while !self.connected.load(Ordering::SeqCst) {
@@ -646,23 +708,51 @@ where
                     && handle.is_finished()
                     && !self.connected.load(Ordering::SeqCst)
                 {
-                    error!(target_id = %self.id, "MQTT background task exited prematurely before connection was established.");
+                    error!(
+                        event = EVENT_MQTT_TARGET_STATE,
+                        component = LOG_COMPONENT_TARGETS,
+                        subsystem = LOG_SUBSYSTEM_MQTT,
+                        target_id = %self.id,
+                        state = "background_task_exited_before_connect",
+                        "mqtt target state"
+                    );
                     return Err(TargetError::Network("MQTT background task exited prematurely".to_string()));
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            debug!(target_id = %self.id, "MQTT target connected successfully.");
+            debug!(
+                event = EVENT_MQTT_TARGET_STATE,
+                component = LOG_COMPONENT_TARGETS,
+                subsystem = LOG_SUBSYSTEM_MQTT,
+                target_id = %self.id,
+                state = "connected",
+                "mqtt target state"
+            );
             Ok(())
         })
         .await
         {
             Ok(Ok(_)) => {
-                info!(target_id = %self.id, "MQTT target initialized and connected.");
+                info!(
+                    event = EVENT_MQTT_TARGET_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_MQTT,
+                    target_id = %self.id,
+                    state = "ready",
+                    "mqtt target state"
+                );
                 Ok(())
             }
             Ok(Err(e)) => Err(e),
             Err(_) => {
-                error!(target_id = %self.id, "Timeout waiting for MQTT connection after task spawn.");
+                error!(
+                    event = EVENT_MQTT_TARGET_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_MQTT,
+                    target_id = %self.id,
+                    state = "connect_timeout",
+                    "mqtt target state"
+                );
                 Err(TargetError::Network("Timeout waiting for MQTT connection".to_string()))
             }
         }
@@ -680,12 +770,16 @@ where
             .ok_or_else(|| TargetError::Configuration("MQTT client not initialized".to_string()))?;
 
         debug!(
-            target = %self.id,
+            event = EVENT_MQTT_DELIVERY_STATE,
+            component = LOG_COMPONENT_TARGETS,
+            subsystem = LOG_SUBSYSTEM_MQTT,
+            target_id = %self.id,
             bucket = %meta.bucket_name,
             object = %meta.object_name,
             event = %meta.event_name,
             payload_len = body.len(),
-            "Sending MQTT payload"
+            state = "publishing",
+            "mqtt delivery state"
         );
 
         client
@@ -693,7 +787,16 @@ where
             .await
             .map_err(|e| {
                 if e.to_string().contains("Connection") || e.to_string().contains("Timeout") {
-                    warn!(target_id = %self.id, error = %e, "Publish failed due to connection issue, marking as not connected.");
+                    warn!(
+                        event = EVENT_MQTT_DELIVERY_STATE,
+                        component = LOG_COMPONENT_TARGETS,
+                        subsystem = LOG_SUBSYSTEM_MQTT,
+                        target_id = %self.id,
+                        state = "publish_failed",
+                        reason = "connectivity_error",
+                        error = %e,
+                        "mqtt delivery state"
+                    );
                     let err = TargetError::NotConnected;
                     mark_target_disconnected_on_connectivity_error(&self.connected, &err);
                     err
@@ -702,7 +805,15 @@ where
                 }
             })?;
 
-        debug!(target_id = %self.id, topic = %self.args.topic, "Event published to MQTT topic");
+        debug!(
+            event = EVENT_MQTT_DELIVERY_STATE,
+            component = LOG_COMPONENT_TARGETS,
+            subsystem = LOG_SUBSYSTEM_MQTT,
+            target_id = %self.id,
+            topic = %self.args.topic,
+            state = "published",
+            "mqtt delivery state"
+        );
         self.delivery_counters.record_success();
         Ok(())
     }
@@ -781,14 +892,28 @@ async fn run_mqtt_event_loop(
     target_id: TargetID,
     mut cancel_rx: mpsc::Receiver<()>,
 ) {
-    info!(target_id = %target_id, "MQTT event loop task started.");
+    info!(
+        event = EVENT_MQTT_TARGET_STATE,
+        component = LOG_COMPONENT_TARGETS,
+        subsystem = LOG_SUBSYSTEM_MQTT,
+        target_id = %target_id,
+        state = "event_loop_started",
+        "mqtt target state"
+    );
     let mut initial_connection_established = false;
 
     loop {
         tokio::select! {
             biased;
             _ = cancel_rx.recv() => {
-                info!(target_id = %target_id, "MQTT event loop task received cancellation signal. Shutting down.");
+                info!(
+                    event = EVENT_MQTT_TARGET_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_MQTT,
+                    target_id = %target_id,
+                    state = "cancellation_received",
+                    "mqtt target state"
+                );
                 break;
             }
             polled_event_result = async {
@@ -796,7 +921,14 @@ async fn run_mqtt_event_loop(
                     match tokio::time::timeout(EVENT_LOOP_POLL_TIMEOUT, eventloop.poll()).await {
                         Ok(result) => Some(result),
                         Err(_) => {
-                            debug!(target_id = %target_id, "MQTT poll timed out (EVENT_LOOP_POLL_TIMEOUT) while not connected or status pending.");
+                            debug!(
+                                event = EVENT_MQTT_TARGET_STATE,
+                                component = LOG_COMPONENT_TARGETS,
+                                subsystem = LOG_SUBSYSTEM_MQTT,
+                                target_id = %target_id,
+                                state = "poll_timeout",
+                                "mqtt target state"
+                            );
                             connected_status.store(false, Ordering::SeqCst);
                             None
                         }
@@ -810,15 +942,38 @@ async fn run_mqtt_event_loop(
                         trace!(target_id = %target_id, event = ?notification, "Received MQTT event");
                         match notification {
                             rumqttc::Event::Incoming(Incoming::ConnAck(_conn_ack)) => {
-                                info!(target_id = %target_id, "MQTT connected (ConnAck).");
+                                info!(
+                                    event = EVENT_MQTT_TARGET_STATE,
+                                    component = LOG_COMPONENT_TARGETS,
+                                    subsystem = LOG_SUBSYSTEM_MQTT,
+                                    target_id = %target_id,
+                                    state = "connack_received",
+                                    "mqtt target state"
+                                );
                                 connected_status.store(true, Ordering::SeqCst);
                                 initial_connection_established = true;
                             }
                             rumqttc::Event::Incoming(Incoming::Publish(publish)) => {
-                                debug!(target_id = %target_id, topic = ?publish.topic, payload_len = publish.payload.len(), "Received message on subscribed topic.");
+                                debug!(
+                                    event = EVENT_MQTT_TARGET_STATE,
+                                    component = LOG_COMPONENT_TARGETS,
+                                    subsystem = LOG_SUBSYSTEM_MQTT,
+                                    target_id = %target_id,
+                                    state = "publish_received",
+                                    topic = ?publish.topic,
+                                    payload_len = publish.payload.len(),
+                                    "mqtt target state"
+                                );
                             }
                             rumqttc::Event::Incoming(Incoming::Disconnect(_)) => {
-                                info!(target_id = %target_id, "Received Disconnect packet from broker. MQTT connection lost.");
+                                info!(
+                                    event = EVENT_MQTT_TARGET_STATE,
+                                    component = LOG_COMPONENT_TARGETS,
+                                    subsystem = LOG_SUBSYSTEM_MQTT,
+                                    target_id = %target_id,
+                                    state = "broker_disconnected",
+                                    "mqtt target state"
+                                );
                                 connected_status.store(false, Ordering::SeqCst);
                             }
                             rumqttc::Event::Incoming(Incoming::PingResp(_)) => {
@@ -832,7 +987,14 @@ async fn run_mqtt_event_loop(
                             }
                             // Process other incoming packet types as needed (PubRec, PubRel, PubComp, UnsubAck)
                             rumqttc::Event::Outgoing(Outgoing::Disconnect) => {
-                                info!(target_id = %target_id, "MQTT outgoing disconnect initiated by client.");
+                                info!(
+                                    event = EVENT_MQTT_TARGET_STATE,
+                                    component = LOG_COMPONENT_TARGETS,
+                                    subsystem = LOG_SUBSYSTEM_MQTT,
+                                    target_id = %target_id,
+                                    state = "client_disconnect_requested",
+                                    "mqtt target state"
+                                );
                                 connected_status.store(false, Ordering::SeqCst);
                             }
                             rumqttc::Event::Outgoing(Outgoing::PingReq) => {
@@ -848,7 +1010,15 @@ async fn run_mqtt_event_loop(
                     }
                     Some(Err(e)) => {
                         connected_status.store(false, Ordering::SeqCst);
-                        error!(target_id = %target_id, error = %e, "Error from MQTT event loop poll");
+                        error!(
+                            event = EVENT_MQTT_TARGET_STATE,
+                            component = LOG_COMPONENT_TARGETS,
+                            subsystem = LOG_SUBSYSTEM_MQTT,
+                            target_id = %target_id,
+                            state = "poll_failed",
+                            error = %e,
+                            "mqtt target state"
+                        );
 
                         if matches!(e,
                             ConnectionError::Io(_) |
@@ -856,12 +1026,28 @@ async fn run_mqtt_event_loop(
                             ConnectionError::ConnectionRefused(_) |
                             ConnectionError::Tls(_)
                         ) {
-                           warn!(target_id = %target_id, error = %e, "MQTT connection error. Relying on rumqttc for reconnection if applicable.");
+                           warn!(
+                               event = EVENT_MQTT_TARGET_STATE,
+                               component = LOG_COMPONENT_TARGETS,
+                               subsystem = LOG_SUBSYSTEM_MQTT,
+                               target_id = %target_id,
+                               state = "reconnect_pending",
+                               error = %e,
+                               "mqtt target state"
+                           );
                         }
                         // Here you can decide whether to break loops based on the error type.
                         // For example, for some unrecoverable errors.
                         if is_fatal_mqtt_error(&e) {
-                            error!(target_id = %target_id, error = %e, "Fatal MQTT error, terminating event loop.");
+                            error!(
+                                event = EVENT_MQTT_TARGET_STATE,
+                                component = LOG_COMPONENT_TARGETS,
+                                subsystem = LOG_SUBSYSTEM_MQTT,
+                                target_id = %target_id,
+                                state = "fatal_error",
+                                error = %e,
+                                "mqtt target state"
+                            );
                             break;
                         }
                         // rumqttc's eventloop.poll() may return Err and terminate after some errors,
@@ -871,7 +1057,14 @@ async fn run_mqtt_event_loop(
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                     None => {
-                        warn!(target_id = %target_id, "Timeout during initial poll or pending state, will retry.");
+                        warn!(
+                            event = EVENT_MQTT_TARGET_STATE,
+                            component = LOG_COMPONENT_TARGETS,
+                            subsystem = LOG_SUBSYSTEM_MQTT,
+                            target_id = %target_id,
+                            state = "poll_retry_scheduled",
+                            "mqtt target state"
+                        );
                         continue;
                     }
                 }
@@ -879,7 +1072,14 @@ async fn run_mqtt_event_loop(
         }
     }
     connected_status.store(false, Ordering::SeqCst);
-    info!(target_id = %target_id, "MQTT event loop task finished.");
+    info!(
+        event = EVENT_MQTT_TARGET_STATE,
+        component = LOG_COMPONENT_TARGETS,
+        subsystem = LOG_SUBSYSTEM_MQTT,
+        target_id = %target_id,
+        state = "event_loop_finished",
+        "mqtt target state"
+    );
 }
 
 /// Check whether the given MQTT connection error should be considered a fatal error,
@@ -938,26 +1138,61 @@ where
 
     #[instrument(skip(self), fields(target_id = %self.id))]
     async fn is_active(&self) -> Result<bool, TargetError> {
-        debug!(target_id = %self.id, "Checking if MQTT target is active.");
+        debug!(
+            event = EVENT_MQTT_TARGET_STATE,
+            component = LOG_COMPONENT_TARGETS,
+            subsystem = LOG_SUBSYSTEM_MQTT,
+            target_id = %self.id,
+            state = "activity_check",
+            "mqtt target state"
+        );
         if self.client.lock().await.is_none() && !self.connected.load(Ordering::SeqCst) {
             // Check if the background task is running and has not panicked
             if let Some(handle) = self.bg_task_manager.init_cell.get()
                 && handle.is_finished()
             {
-                error!(target_id = %self.id, "MQTT background task has finished, possibly due to an error. Target is not active.");
+                error!(
+                    event = EVENT_MQTT_TARGET_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_MQTT,
+                    target_id = %self.id,
+                    state = "inactive_background_task_finished",
+                    "mqtt target state"
+                );
                 return Err(TargetError::Network("MQTT background task terminated".to_string()));
             }
-            debug!(target_id = %self.id, "MQTT client not yet initialized or task not running/connected.");
+            debug!(
+                event = EVENT_MQTT_TARGET_STATE,
+                component = LOG_COMPONENT_TARGETS,
+                subsystem = LOG_SUBSYSTEM_MQTT,
+                target_id = %self.id,
+                state = "inactive_client_unavailable",
+                "mqtt target state"
+            );
             return Err(TargetError::Configuration(
                 "MQTT client not available or not initialized/connected".to_string(),
             ));
         }
 
         if self.connected.load(Ordering::SeqCst) {
-            debug!(target_id = %self.id, "MQTT target is active (connected flag is true).");
+            debug!(
+                event = EVENT_MQTT_TARGET_STATE,
+                component = LOG_COMPONENT_TARGETS,
+                subsystem = LOG_SUBSYSTEM_MQTT,
+                target_id = %self.id,
+                state = "active",
+                "mqtt target state"
+            );
             Ok(true)
         } else {
-            debug!(target_id = %self.id, "MQTT target is not connected (connected flag is false).");
+            debug!(
+                event = EVENT_MQTT_TARGET_STATE,
+                component = LOG_COMPONENT_TARGETS,
+                subsystem = LOG_SUBSYSTEM_MQTT,
+                target_id = %self.id,
+                state = "inactive_not_connected",
+                "mqtt target state"
+            );
             Err(TargetError::NotConnected)
         }
     }
@@ -973,14 +1208,36 @@ where
         };
 
         if let Some(store) = &self.store {
-            debug!(target_id = %self.id, "Event saved to store start");
+            debug!(
+                event = EVENT_MQTT_DELIVERY_STATE,
+                component = LOG_COMPONENT_TARGETS,
+                subsystem = LOG_SUBSYSTEM_MQTT,
+                target_id = %self.id,
+                state = "store_enqueue_started",
+                "mqtt delivery state"
+            );
             match persist_queued_payload_to_store(store.as_ref(), &queued) {
                 Ok(_) => {
-                    debug!(target_id = %self.id, "Event saved to store for MQTT target successfully.");
+                    debug!(
+                        event = EVENT_MQTT_DELIVERY_STATE,
+                        component = LOG_COMPONENT_TARGETS,
+                        subsystem = LOG_SUBSYSTEM_MQTT,
+                        target_id = %self.id,
+                        state = "store_enqueued",
+                        "mqtt delivery state"
+                    );
                     Ok(())
                 }
                 Err(e) => {
-                    error!(target_id = %self.id, error = %e, "Failed to save event to store");
+                    error!(
+                        event = EVENT_MQTT_DELIVERY_STATE,
+                        component = LOG_COMPONENT_TARGETS,
+                        subsystem = LOG_SUBSYSTEM_MQTT,
+                        target_id = %self.id,
+                        state = "store_enqueue_failed",
+                        error = %e,
+                        "mqtt delivery state"
+                    );
                     self.delivery_counters.record_final_failure();
                     Err(e)
                 }
@@ -991,18 +1248,47 @@ where
             }
 
             if !self.connected.load(Ordering::SeqCst) {
-                warn!(target_id = %self.id, "Attempting to send directly but not connected; trying to init.");
+                warn!(
+                    event = EVENT_MQTT_TARGET_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_MQTT,
+                    target_id = %self.id,
+                    state = "direct_send_requires_init",
+                    "mqtt target state"
+                );
                 // Call the struct's init method, not the trait's default
                 match MQTTTarget::<E>::init(self).await {
-                    Ok(_) => debug!(target_id = %self.id, "MQTT target initialized successfully."),
+                    Ok(_) => debug!(
+                        event = EVENT_MQTT_TARGET_STATE,
+                        component = LOG_COMPONENT_TARGETS,
+                        subsystem = LOG_SUBSYSTEM_MQTT,
+                        target_id = %self.id,
+                        state = "init_completed",
+                        "mqtt target state"
+                    ),
                     Err(e) => {
-                        error!(target_id = %self.id, error = %e, "Failed to initialize MQTT target.");
+                        error!(
+                            event = EVENT_MQTT_TARGET_STATE,
+                            component = LOG_COMPONENT_TARGETS,
+                            subsystem = LOG_SUBSYSTEM_MQTT,
+                            target_id = %self.id,
+                            state = "init_failed",
+                            error = %e,
+                            "mqtt target state"
+                        );
                         self.delivery_counters.record_final_failure();
                         return Err(TargetError::NotConnected);
                     }
                 }
                 if !self.connected.load(Ordering::SeqCst) {
-                    error!(target_id = %self.id, "Cannot save (send directly) as target is not active after init attempt.");
+                    error!(
+                        event = EVENT_MQTT_TARGET_STATE,
+                        component = LOG_COMPONENT_TARGETS,
+                        subsystem = LOG_SUBSYSTEM_MQTT,
+                        target_id = %self.id,
+                        state = "init_completed_not_connected",
+                        "mqtt target state"
+                    );
                     self.delivery_counters.record_final_failure();
                     return Err(TargetError::NotConnected);
                 }
@@ -1017,50 +1303,143 @@ where
 
     #[instrument(skip(self, body, meta), fields(target_id = %self.id))]
     async fn send_raw_from_store(&self, key: Key, body: Vec<u8>, meta: QueuedPayloadMeta) -> Result<(), TargetError> {
-        debug!(target_id = %self.id, ?key, "Attempting to send queued payload from store.");
+        debug!(
+            event = EVENT_MQTT_DELIVERY_STATE,
+            component = LOG_COMPONENT_TARGETS,
+            subsystem = LOG_SUBSYSTEM_MQTT,
+            target_id = %self.id,
+            ?key,
+            state = "store_replay_started",
+            "mqtt delivery state"
+        );
 
         if !self.is_enabled() {
             return Err(TargetError::Disabled);
         }
 
         if !self.connected.load(Ordering::SeqCst) {
-            warn!(target_id = %self.id, "Not connected; trying to init before sending from store.");
+            warn!(
+                event = EVENT_MQTT_TARGET_STATE,
+                component = LOG_COMPONENT_TARGETS,
+                subsystem = LOG_SUBSYSTEM_MQTT,
+                target_id = %self.id,
+                state = "store_replay_requires_init",
+                "mqtt target state"
+            );
             match MQTTTarget::<E>::init(self).await {
-                Ok(_) => debug!(target_id = %self.id, "MQTT target initialized successfully."),
+                Ok(_) => debug!(
+                    event = EVENT_MQTT_TARGET_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_MQTT,
+                    target_id = %self.id,
+                    state = "init_completed",
+                    "mqtt target state"
+                ),
                 Err(e) => {
-                    error!(target_id = %self.id, error = %e, "Failed to initialize MQTT target.");
+                    error!(
+                        event = EVENT_MQTT_TARGET_STATE,
+                        component = LOG_COMPONENT_TARGETS,
+                        subsystem = LOG_SUBSYSTEM_MQTT,
+                        target_id = %self.id,
+                        state = "init_failed",
+                        error = %e,
+                        "mqtt target state"
+                    );
                     return Err(TargetError::NotConnected);
                 }
             }
             if !self.connected.load(Ordering::SeqCst) {
-                error!(target_id = %self.id, "Cannot send from store as target is not active after init attempt.");
+                error!(
+                    event = EVENT_MQTT_TARGET_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_MQTT,
+                    target_id = %self.id,
+                    state = "init_completed_not_connected",
+                    "mqtt target state"
+                );
                 return Err(TargetError::NotConnected);
             }
         }
 
-        debug!(target_id = %self.id, ?key, "Sending event from store.");
+        debug!(
+            event = EVENT_MQTT_DELIVERY_STATE,
+            component = LOG_COMPONENT_TARGETS,
+            subsystem = LOG_SUBSYSTEM_MQTT,
+            target_id = %self.id,
+            ?key,
+            state = "store_replay_publishing",
+            "mqtt delivery state"
+        );
         if let Err(e) = self.send_body(body, &meta).await {
             if matches!(e, TargetError::NotConnected) {
-                warn!(target_id = %self.id, "Failed to send event from store: Not connected. Event remains in store.");
+                warn!(
+                    event = EVENT_MQTT_DELIVERY_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_MQTT,
+                    target_id = %self.id,
+                    ?key,
+                    state = "store_replay_deferred",
+                    reason = "not_connected",
+                    "mqtt delivery state"
+                );
                 return Err(TargetError::NotConnected);
             }
-            error!(target_id = %self.id, error = %e, "Failed to send event from store with an unexpected error.");
+            error!(
+                event = EVENT_MQTT_DELIVERY_STATE,
+                component = LOG_COMPONENT_TARGETS,
+                subsystem = LOG_SUBSYSTEM_MQTT,
+                target_id = %self.id,
+                ?key,
+                state = "store_replay_failed",
+                error = %e,
+                "mqtt delivery state"
+            );
             return Err(e);
         }
-        debug!(target_id = %self.id, ?key, "Event sent from store successfully.");
+        debug!(
+            event = EVENT_MQTT_DELIVERY_STATE,
+            component = LOG_COMPONENT_TARGETS,
+            subsystem = LOG_SUBSYSTEM_MQTT,
+            target_id = %self.id,
+            ?key,
+            state = "store_replay_published",
+            "mqtt delivery state"
+        );
         Ok(())
     }
 
     async fn close(&self) -> Result<(), TargetError> {
-        info!(target_id = %self.id, "Attempting to close MQTT target.");
+        info!(
+            event = EVENT_MQTT_TARGET_STATE,
+            component = LOG_COMPONENT_TARGETS,
+            subsystem = LOG_SUBSYSTEM_MQTT,
+            target_id = %self.id,
+            state = "closing",
+            "mqtt target state"
+        );
 
         if let Err(e) = self.bg_task_manager.cancel_tx.send(()).await {
-            warn!(target_id = %self.id, error = %e, "Failed to send cancel signal to MQTT background task. It might have already exited.");
+            warn!(
+                event = EVENT_MQTT_TARGET_STATE,
+                component = LOG_COMPONENT_TARGETS,
+                subsystem = LOG_SUBSYSTEM_MQTT,
+                target_id = %self.id,
+                state = "cancel_signal_failed",
+                error = %e,
+                "mqtt target state"
+            );
         }
 
         // Wait for the task to finish if it was initialized
         if let Some(_task_handle) = self.bg_task_manager.init_cell.get() {
-            debug!(target_id = %self.id, "Waiting for MQTT background task to complete...");
+            debug!(
+                event = EVENT_MQTT_TARGET_STATE,
+                component = LOG_COMPONENT_TARGETS,
+                subsystem = LOG_SUBSYSTEM_MQTT,
+                target_id = %self.id,
+                state = "waiting_for_event_loop",
+                "mqtt target state"
+            );
             // It's tricky to await here if close is called from a sync context or Drop
             // For async close, this is fine. Consider a timeout.
             // let _ = tokio::time::timeout(Duration::from_secs(5), task_handle.await).await;
@@ -1069,9 +1448,24 @@ where
         }
 
         if let Some(client_instance) = self.client.lock().await.take() {
-            info!(target_id = %self.id, "Disconnecting MQTT client.");
+            info!(
+                event = EVENT_MQTT_TARGET_STATE,
+                component = LOG_COMPONENT_TARGETS,
+                subsystem = LOG_SUBSYSTEM_MQTT,
+                target_id = %self.id,
+                state = "disconnecting_client",
+                "mqtt target state"
+            );
             if let Err(e) = client_instance.disconnect().await {
-                warn!(target_id = %self.id, error = %e, "Error during MQTT client disconnect.");
+                warn!(
+                    event = EVENT_MQTT_TARGET_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_MQTT,
+                    target_id = %self.id,
+                    state = "disconnect_failed",
+                    error = %e,
+                    "mqtt target state"
+                );
             }
         }
 
@@ -1083,7 +1477,14 @@ where
         }
 
         self.connected.store(false, Ordering::SeqCst);
-        info!(target_id = %self.id, "MQTT target close method finished.");
+        info!(
+            event = EVENT_MQTT_TARGET_STATE,
+            component = LOG_COMPONENT_TARGETS,
+            subsystem = LOG_SUBSYSTEM_MQTT,
+            target_id = %self.id,
+            state = "closed",
+            "mqtt target state"
+        );
         Ok(())
     }
 
@@ -1097,7 +1498,14 @@ where
 
     async fn init(&self) -> Result<(), TargetError> {
         if !self.is_enabled() {
-            debug!(target_id = %self.id, "Target is disabled, skipping init.");
+            debug!(
+                event = EVENT_MQTT_TARGET_STATE,
+                component = LOG_COMPONENT_TARGETS,
+                subsystem = LOG_SUBSYSTEM_MQTT,
+                target_id = %self.id,
+                state = "disabled",
+                "mqtt target state"
+            );
             return Ok(());
         }
         // Call the internal init logic

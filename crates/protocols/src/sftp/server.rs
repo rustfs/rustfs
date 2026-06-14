@@ -255,7 +255,7 @@ fn spawn_host_key_reload_loop(config: SftpConfig, holder: Arc<SshConfigHolder>, 
         state = "enabled",
         host_key_dir = %config.host_key_dir.display(),
         interval_secs,
-        "sftp host key reload state changed"
+        "SFTP host-key reload enabled"
     );
 
     tokio::spawn(async move {
@@ -265,13 +265,13 @@ fn spawn_host_key_reload_loop(config: SftpConfig, holder: Arc<SshConfigHolder>, 
         loop {
             tokio::select! {
                 _ = shutdown_token.cancelled() => {
-                    info!(
+                    debug!(
                         event = EVENT_SFTP_HOST_KEY_RELOAD_STATE,
                         component = LOG_COMPONENT_PROTOCOLS,
                         subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
                         state = "stopped",
                         host_key_dir = %config.host_key_dir.display(),
-                        "sftp host key reload state changed"
+                        "SFTP host-key reload stopped"
                     );
                     break;
                 }
@@ -280,14 +280,14 @@ fn spawn_host_key_reload_loop(config: SftpConfig, holder: Arc<SshConfigHolder>, 
 
             match holder.reload_from_config(&config).await {
                 Ok(Some(host_key_count)) => {
-                    info!(
+                    debug!(
                         event = EVENT_SFTP_HOST_KEY_RELOAD_STATE,
                         component = LOG_COMPONENT_PROTOCOLS,
                         subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
                         result = "reloaded",
                         host_key_dir = %config.host_key_dir.display(),
                         host_key_count,
-                        "sftp host key reload state changed"
+                        "SFTP host keys reloaded"
                     );
                 }
                 Ok(None) => {
@@ -297,7 +297,7 @@ fn spawn_host_key_reload_loop(config: SftpConfig, holder: Arc<SshConfigHolder>, 
                         subsystem = LOG_SUBSYSTEM_SFTP_SERVER,
                         result = "unchanged",
                         host_key_dir = %config.host_key_dir.display(),
-                        "sftp host key reload state changed"
+                        "SFTP host keys unchanged"
                     );
                 }
                 Err(err) => {
@@ -308,7 +308,7 @@ fn spawn_host_key_reload_loop(config: SftpConfig, holder: Arc<SshConfigHolder>, 
                         result = "reload_failed",
                         host_key_dir = %config.host_key_dir.display(),
                         err = %err,
-                        "sftp host key reload state changed"
+                        "SFTP host-key reload failed"
                     );
                 }
             }
@@ -398,7 +398,7 @@ where
             state = "listening",
             bind_addr = %self.config.bind_addr,
             read_only = self.config.read_only,
-            "sftp server state changed"
+            "SFTP server listening"
         );
 
         let mut sessions: JoinSet<()> = JoinSet::new();

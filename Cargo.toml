@@ -159,7 +159,7 @@ tower-http = { version = "0.6.11", features = ["cors"] }
 
 # Serialization and Data Formats
 bytes = { version = "1.11.1", features = ["serde"] }
-bytesize = "2.3.1"
+bytesize = "2.4.0"
 byteorder = "1.5.0"
 flatbuffers = "25.12.19"
 form_urlencoded = "1.2.2"
@@ -188,13 +188,13 @@ rustls-pki-types = "1.14.1"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 subtle = "2.6"
-zeroize = { version = "1.8.2", features = ["derive"] }
+zeroize = { version = "1.9.0", features = ["derive"] }
 
 # Time and Date
 chrono = { version = "0.4.45", features = ["serde"] }
 humantime = "2.3.0"
 jiff = { version = "0.2.28", features = ["serde"] }
-time = { version = "=0.3.47", features = ["std", "parsing", "formatting", "macros", "serde"] }
+time = { version = "0.3.49", features = ["std", "parsing", "formatting", "macros", "serde"] }
 
 # Database
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
@@ -209,7 +209,7 @@ atoi = "3.0.0"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.8.18" }
 aws-credential-types = { version = "1.2.14" }
-aws-sdk-s3 = { version = "1.135.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "1.136.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-smithy-http-client = { version = "1.1.13", default-features = false, features = ["default-client", "rustls-aws-lc"] }
 aws-smithy-types = { version = "1.5.0" }
 base64 = "0.22.1"
@@ -264,7 +264,7 @@ reed-solomon-erasure = { version = "6.0", default-features = false, features = [
 reed-solomon-simd = "3.1.0"
 regex = { version = "1.12.4" }
 rumqttc = { package = "rumqttc-next", version = "0.33.2", features = ["websocket"] }
-redis = { version = "1.2.2", features = ["connection-manager", "tokio-rustls-comp", "tls-rustls-insecure"] }
+redis = { version = "1.2.3", features = ["connection-manager", "tokio-rustls-comp", "tls-rustls-insecure"] }
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.2" }
@@ -276,7 +276,7 @@ smallvec = { version = "1.15.2", features = ["serde"] }
 smartstring = "1.0.1"
 snafu = "0.9.1"
 snap = "1.1.1"
-starshard = { version = "2.2.0", features = ["rayon", "async", "serde"] }
+starshard = { version = "2.2.1", features = ["rayon", "async", "serde"] }
 strum = { version = "0.28.0", features = ["derive"] }
 sysinfo = "0.39.3"
 temp-env = "0.3.6"

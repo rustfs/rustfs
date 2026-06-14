@@ -69,7 +69,7 @@ impl HealChannelProcessor {
             component = LOG_COMPONENT_HEAL,
             subsystem = LOG_SUBSYSTEM_CHANNEL,
             state = "started",
-            "Heal channel processor state updated"
+            "Heal channel started"
         );
 
         loop {
@@ -85,7 +85,7 @@ impl HealChannelProcessor {
                                     subsystem = LOG_SUBSYSTEM_CHANNEL,
                                     state = "process_failed",
                                     error = %e,
-                                    "Heal channel request processing failed"
+                                    "Heal channel processing failed"
                                 );
                             }
                         }
@@ -96,7 +96,7 @@ impl HealChannelProcessor {
                                 component = LOG_COMPONENT_HEAL,
                                 subsystem = LOG_SUBSYSTEM_CHANNEL,
                                 state = "receiver_closed",
-                                "Heal channel processor state updated"
+                                "Heal channel receiver closed"
                             );
                             break;
                         }
@@ -105,7 +105,7 @@ impl HealChannelProcessor {
                 response = self.response_receiver.recv() => {
                     if let Some(response) = response {
                         // Handle response if needed
-                        info!(
+                        debug!(
                             target: "rustfs::heal::channel",
                             event = EVENT_HEAL_CHANNEL_RESPONSE,
                             component = LOG_COMPONENT_HEAL,
@@ -113,7 +113,7 @@ impl HealChannelProcessor {
                             request_id = %response.request_id,
                             success = response.success,
                             state = "received_local",
-                            "Heal channel response observed"
+                            "Heal response observed"
                         );
                     }
                 }
@@ -126,7 +126,7 @@ impl HealChannelProcessor {
             component = LOG_COMPONENT_HEAL,
             subsystem = LOG_SUBSYSTEM_CHANNEL,
             state = "stopped",
-            "Heal channel processor state updated"
+            "Heal channel stopped"
         );
         Ok(())
     }
@@ -154,7 +154,7 @@ impl HealChannelProcessor {
         request: HealChannelRequest,
         response_tx: oneshot::Sender<std::result::Result<HealAdmissionResult, String>>,
     ) -> Result<()> {
-        info!(
+        debug!(
             target: "rustfs::heal::channel",
             event = EVENT_HEAL_CHANNEL_REQUEST,
             component = LOG_COMPONENT_HEAL,
@@ -163,7 +163,7 @@ impl HealChannelProcessor {
             bucket = %request.bucket,
             object_prefix = %request.object_prefix.as_deref().unwrap_or(""),
             state = "start_received",
-            "Heal channel start request received"
+            "Heal start received"
         );
 
         // Convert channel request to heal request
@@ -185,7 +185,7 @@ impl HealChannelProcessor {
         // Submit to heal manager
         match self.heal_manager.submit_heal_request(heal_request).await {
             Ok(admission) => {
-                info!(
+                debug!(
                     target: "rustfs::heal::channel",
                     event = EVENT_HEAL_CHANNEL_REQUEST,
                     component = LOG_COMPONENT_HEAL,
@@ -193,7 +193,7 @@ impl HealChannelProcessor {
                     request_id = %request.id,
                     admission = admission.result_label(),
                     state = "admission_decided",
-                    "Heal channel admission decision completed"
+                    "Heal admission decided"
                 );
 
                 let _ = response_tx.send(Ok(admission));
@@ -225,7 +225,7 @@ impl HealChannelProcessor {
                     request_id = %request.id,
                     state = "submit_failed",
                     error = %error_text,
-                    "Heal channel start request failed"
+                    "Heal start submission failed"
                 );
                 let _ = response_tx.send(Err(error_text.clone()));
 
@@ -251,7 +251,7 @@ impl HealChannelProcessor {
         client_token: String,
         response_tx: oneshot::Sender<std::result::Result<HealChannelResponse, String>>,
     ) -> Result<()> {
-        info!(
+        debug!(
             target: "rustfs::heal::channel",
             event = EVENT_HEAL_CHANNEL_REQUEST,
             component = LOG_COMPONENT_HEAL,
@@ -259,7 +259,7 @@ impl HealChannelProcessor {
             request_id = %client_token,
             heal_path = %heal_path,
             state = "query_received",
-            "Heal channel query request received"
+            "Heal query received"
         );
 
         let (summary, detail, items) = match self.heal_manager.get_task_report_for_path(&heal_path, &client_token).await {
@@ -332,7 +332,7 @@ impl HealChannelProcessor {
         client_token: String,
         response_tx: oneshot::Sender<std::result::Result<HealChannelResponse, String>>,
     ) -> Result<()> {
-        info!(
+        debug!(
             target: "rustfs::heal::channel",
             event = EVENT_HEAL_CHANNEL_REQUEST,
             component = LOG_COMPONENT_HEAL,
@@ -340,7 +340,7 @@ impl HealChannelProcessor {
             request_id = %client_token,
             heal_path = %heal_path,
             state = "cancel_received",
-            "Heal channel cancel request received"
+            "Heal cancel received"
         );
 
         let request_id = if client_token.is_empty() {
@@ -451,7 +451,7 @@ impl HealChannelProcessor {
                 request_id = %response.request_id,
                 state = "enqueue_local_failed",
                 error = %e,
-                "Heal channel response enqueue failed"
+                "Heal response local enqueue failed"
             );
         }
         // Always attempt to broadcast, even if local send failed
@@ -464,7 +464,7 @@ impl HealChannelProcessor {
                 subsystem = LOG_SUBSYSTEM_CHANNEL,
                 state = "broadcast_failed",
                 error = %e,
-                "Heal channel response broadcast failed"
+                "Heal response broadcast failed"
             );
         }
     }

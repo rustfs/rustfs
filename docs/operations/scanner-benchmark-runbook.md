@@ -137,6 +137,25 @@ same command with new buckets or prefixes and record the final object count.
 Capture scanner status before the workload, after the workload finishes, and
 throughout the idle observation window.
 
+The repository includes a scanner validation harness for repeatable collection:
+
+```bash
+export RUSTFS_ACCESS_KEY="<admin-access-key>"
+export RUSTFS_SECRET_KEY="<admin-secret-key>"
+
+scripts/run_scanner_validation_harness.sh \
+  --alias ALIAS \
+  --endpoint http://127.0.0.1:9000 \
+  --deployment single-disk \
+  --workload-label small-object-idle \
+  --samples 30 \
+  --interval-secs 60 \
+  --out-dir artifacts/scanner-validation
+```
+
+The harness writes scanner/heal config snapshots, scanner status samples, host
+telemetry when available, run metadata, and `scanner-summary.csv`.
+
 Example status request:
 
 ```bash
