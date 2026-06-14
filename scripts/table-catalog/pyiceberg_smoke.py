@@ -88,7 +88,7 @@ CLIENT_MATRIX: list[dict[str, str]] = [
     {
         "client": "PyIceberg",
         "status": "automated",
-        "coverage": "create namespace, create table, append, reload, scan, optional catalog-vended table credentials with data-plane scope probe",
+        "coverage": "create namespace, create table, append, reload, scan, optional catalog-vended table credentials with exact-prefix data-plane scope probe",
         "entrypoint": "scripts/table-catalog/pyiceberg_smoke.py",
     },
     {
@@ -129,7 +129,7 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
         "status": "automated-after-table-bootstrap",
         "roadmap_area": "credential-vending",
         "catalog_endpoint": "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials",
-        "expected_behavior": "the rustfs-vended-credentials profile requires server-side temporary credential vending, verifies scoped data-plane access, and switches append, reload, and scan operations to the returned table-scoped credentials after table creation",
+        "expected_behavior": "the rustfs-vended-credentials profile requires server-side temporary credential vending, verifies the returned prefix exactly matches the table warehouse location, verifies scoped data-plane access, and switches append, reload, and scan operations to the returned table-scoped credentials after table creation",
     },
     {
         "capability": "background-maintenance-worker",
@@ -427,16 +427,43 @@ def load_table_storage_credential(args: argparse.Namespace, deps: RuntimeDeps) -
     return storage_credential_from_response(response)
 
 
-def s3_scope_from_credential(storage_credential: StorageCredential) -> tuple[str, str]:
-    parsed = urllib.parse.urlparse(storage_credential.prefix)
+def s3_scope_from_uri(s3_uri: str, description: str) -> tuple[str, str]:
+    parsed = urllib.parse.urlparse(s3_uri)
     if parsed.scheme != "s3" or not parsed.netloc:
-        raise RuntimeError("storage credential prefix must be an s3 URI")
+        raise RuntimeError(f"{description} must be an s3 URI")
     object_prefix = parsed.path.lstrip("/")
     if not object_prefix:
-        raise RuntimeError("storage credential prefix must include an object prefix")
+        raise RuntimeError(f"{description} must include an object prefix")
     if not object_prefix.endswith("/"):
         object_prefix = f"{object_prefix}/"
     return parsed.netloc, object_prefix
+
+
+def s3_scope_from_credential(storage_credential: StorageCredential) -> tuple[str, str]:
+    return s3_scope_from_uri(storage_credential.prefix, "storage credential prefix")
+
+
+def string_value(value: Any) -> str | None:
+    if callable(value):
+        value = value()
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def table_warehouse_location(table: Any) -> str:
+    for source in (getattr(table, "metadata", None), table):
+        if callable(source):
+            source = source()
+        if source is None:
+            continue
+        if isinstance(source, dict):
+            location = string_value(source.get("location"))
+        else:
+            location = string_value(getattr(source, "location", None))
+        if location is not None:
+            return location
+    raise RuntimeError("created table did not expose a warehouse location")
 
 
 def safe_probe_segment(namespace: str, table: str) -> str:
@@ -477,10 +504,14 @@ def verify_vended_credential_data_plane_scope(
     args: argparse.Namespace,
     deps: RuntimeDeps,
     storage_credential: StorageCredential,
+    table_location: str,
 ) -> None:
     bucket, object_prefix = s3_scope_from_credential(storage_credential)
-    if bucket != args.bucket:
-        raise RuntimeError(f"storage credential bucket {bucket} does not match expected table bucket {args.bucket}")
+    table_bucket, table_object_prefix = s3_scope_from_uri(table_location, "table warehouse location")
+    if bucket != table_bucket or object_prefix != table_object_prefix:
+        raise RuntimeError("storage credential prefix does not match table warehouse location")
+    if table_bucket != args.bucket:
+        raise RuntimeError(f"table warehouse bucket {table_bucket} does not match expected table bucket {args.bucket}")
 
     inside_key, denied_key = scope_probe_keys(object_prefix, args.namespace, args.table)
     client = vended_s3_client(args, deps, storage_credential)
@@ -659,7 +690,7 @@ def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> None:
             deps.pyarrow.field("payload", deps.pyarrow.string(), nullable=False),
         ]
     )
-    catalog.create_table(identifier, schema=arrow_schema)
+    created_table = catalog.create_table(identifier, schema=arrow_schema)
 
     storage_credential = None
     if args.require_vended_credentials:
@@ -667,7 +698,11 @@ def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> None:
         storage_credential = load_table_storage_credential(args, deps)
         print(f"credential scope: {storage_credential.prefix or 'not reported'}")
         print(f"[7/9] verifying table-scoped data-plane access")
-        verify_vended_credential_data_plane_scope(args, deps, storage_credential)
+        try:
+            expected_table_location = table_warehouse_location(created_table)
+        except RuntimeError:
+            expected_table_location = table_warehouse_location(catalog.load_table(identifier))
+        verify_vended_credential_data_plane_scope(args, deps, storage_credential, expected_table_location)
         catalog = deps.load_catalog(args.catalog_name, **catalog_properties(args, storage_credential=storage_credential))
         install_rustfs_rest_sigv4_adapter(catalog, args, deps)
     else:

@@ -162,6 +162,15 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "object prefix"):
             pyiceberg_smoke.s3_scope_from_credential(credential)
 
+    def test_table_warehouse_location_is_read_from_table_metadata(self) -> None:
+        class FakeMetadata:
+            location = "s3://lake/tables/table-id"
+
+        class FakeTable:
+            metadata = FakeMetadata()
+
+        self.assertEqual(pyiceberg_smoke.table_warehouse_location(FakeTable()), "s3://lake/tables/table-id")
+
     def test_scope_probe_keys_are_inside_and_outside_the_vended_prefix(self) -> None:
         inside_key, denied_key = pyiceberg_smoke.scope_probe_keys("tables/table-id/", "namespace", "table")
 
@@ -228,7 +237,7 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
 
         with mock.patch.object(pyiceberg_smoke, "vended_s3_client", return_value=fake_client):
             with mock.patch.object(pyiceberg_smoke, "scope_probe_keys", return_value=("tables/table-id/probe", "outside/probe")):
-                pyiceberg_smoke.verify_vended_credential_data_plane_scope(args, deps, credential)
+                pyiceberg_smoke.verify_vended_credential_data_plane_scope(args, deps, credential, "s3://lake/tables/table-id")
 
         self.assertEqual(
             fake_client.calls,
@@ -239,6 +248,29 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
                 ("put", "outside/probe"),
             ],
         )
+
+    def test_data_plane_scope_probe_rejects_parent_prefix_before_s3_calls(self) -> None:
+        args = self.parse_with_args(["--bucket", "lake"])
+        credential = pyiceberg_smoke.StorageCredential(
+            prefix="s3://lake/tables/",
+            config={
+                "s3.access-key-id": "temp-access",
+                "s3.secret-access-key": "temp-secret",
+                "s3.session-token": "temp-token",
+            },
+        )
+        deps = mock.Mock()
+
+        with mock.patch.object(pyiceberg_smoke, "vended_s3_client") as client_factory:
+            with self.assertRaisesRegex(RuntimeError, "does not match table warehouse location"):
+                pyiceberg_smoke.verify_vended_credential_data_plane_scope(
+                    args,
+                    deps,
+                    credential,
+                    "s3://lake/tables/table-id/",
+                )
+
+        client_factory.assert_not_called()
 
     def test_unsupported_inventory_names_stable_boundaries(self) -> None:
         inventory = pyiceberg_smoke.unsupported_inventory()
