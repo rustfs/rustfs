@@ -14,6 +14,7 @@
 
 use crate::admin::router::{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH, AdminOperation, Operation, S3Router};
 use crate::auth::{check_key_valid, get_session_token};
+use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use crate::storage::access::{ReqInfo, authorize_request};
@@ -578,10 +579,8 @@ impl Operation for DownloadObjectZipHandler {
         let record = validate_download_token(id, &token, OffsetDateTime::now_utc())?;
         let _token_id = &record.id;
         let _principal = &record.principal;
-        let items = collect_zip_items(&record.request).await?;
-        authorize_zip_items_for_download(&record, &items).await?;
-        preflight_zip_items(&record.request, &items).await?;
-        let body = build_zip_stream_body(record.request.clone(), items);
+        validate_zip_download_request(&record).await?;
+        let body = build_zip_stream_body(record.request.clone());
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/zip"));
@@ -641,28 +640,33 @@ async fn preflight_zip_items(request: &CreateObjectZipDownloadRequest, items: &[
         store
             .get_object_info(&request.bucket, &item.key, &ObjectOptions::default())
             .await
-            .map_err(|e| s3_error!(InternalError, "failed to prepare object `{}` for ZIP download: {}", item.key, e))?;
+            .map_err(storage_error_to_s3)?;
     }
     Ok(())
 }
 
-async fn collect_zip_items(request: &CreateObjectZipDownloadRequest) -> S3Result<Vec<ZipDownloadItem>> {
+fn storage_error_to_s3(err: rustfs_ecstore::error::Error) -> s3s::S3Error {
+    ApiError::from(err).into()
+}
+
+async fn validate_zip_download_request(record: &ObjectZipDownloadToken) -> S3Result<()> {
     let store = new_object_layer_fn().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
     store
-        .get_bucket_info(&request.bucket, &BucketOptions::default())
+        .get_bucket_info(&record.request.bucket, &BucketOptions::default())
         .await
-        .map_err(|e| s3_error!(InternalError, "failed to validate bucket `{}`: {}", request.bucket, e))?;
+        .map_err(storage_error_to_s3)?;
 
     let mut seen = HashSet::new();
-    let mut items = collect_explicit_zip_items(request, &mut seen)?;
+    let explicit_items = collect_explicit_zip_items(&record.request, &mut seen)?;
+    validate_zip_download_items(record, &explicit_items).await?;
 
-    for prefix in listing_prefixes(request) {
+    for prefix in listing_prefixes(&record.request) {
         let mut continuation_token = None;
         loop {
             let listed = store
                 .clone()
                 .list_objects_v2(
-                    &request.bucket,
+                    &record.request.bucket,
                     prefix,
                     continuation_token.clone(),
                     None,
@@ -672,14 +676,17 @@ async fn collect_zip_items(request: &CreateObjectZipDownloadRequest) -> S3Result
                     false,
                 )
                 .await
-                .map_err(|e| s3_error!(InternalError, "failed to list prefix `{}`: {}", prefix, e))?;
+                .map_err(storage_error_to_s3)?;
+
+            let mut page_items = Vec::new();
 
             for object in listed.objects {
                 if object.name == *prefix && object.size == 0 {
                     continue;
                 }
-                push_zip_item(request, &mut seen, &mut items, object.name)?;
+                push_zip_item(&record.request, &mut seen, &mut page_items, object.name)?;
             }
+            validate_zip_download_items(record, &page_items).await?;
 
             if !listed.is_truncated {
                 break;
@@ -691,7 +698,12 @@ async fn collect_zip_items(request: &CreateObjectZipDownloadRequest) -> S3Result
         }
     }
 
-    Ok(items)
+    Ok(())
+}
+
+async fn validate_zip_download_items(record: &ObjectZipDownloadToken, items: &[ZipDownloadItem]) -> S3Result<()> {
+    authorize_zip_items_for_download(record, items).await?;
+    preflight_zip_items(&record.request, items).await
 }
 
 fn listing_prefixes(request: &CreateObjectZipDownloadRequest) -> Vec<&str> {
@@ -763,10 +775,10 @@ fn push_zip_item(
     Ok(())
 }
 
-fn build_zip_stream_body(request: CreateObjectZipDownloadRequest, items: Vec<ZipDownloadItem>) -> Body {
+fn build_zip_stream_body(request: CreateObjectZipDownloadRequest) -> Body {
     let (reader, writer) = duplex(ZIP_STREAM_BUFFER_SIZE);
     tokio::spawn(async move {
-        if let Err(err) = stream_zip_archive(request, items, writer).await {
+        if let Err(err) = stream_zip_archive(request, writer).await {
             tracing::error!("object ZIP download stream failed: {}", err);
         }
     });
@@ -774,24 +786,71 @@ fn build_zip_stream_body(request: CreateObjectZipDownloadRequest, items: Vec<Zip
     Body::from(StreamingBlob::wrap(stream))
 }
 
-async fn stream_zip_archive(
-    request: CreateObjectZipDownloadRequest,
-    items: Vec<ZipDownloadItem>,
-    writer: tokio::io::DuplexStream,
-) -> io::Result<()> {
+async fn stream_zip_archive(request: CreateObjectZipDownloadRequest, writer: tokio::io::DuplexStream) -> io::Result<()> {
     let mut zip = ZipFileWriter::with_tokio(writer).force_zip64();
-    for item in items {
-        write_zip_item(&mut zip, &request.bucket, &item).await.map_err(|err| {
-            io::Error::other(format!(
-                "failed to write bucket `{}` object `{}` into ZIP entry `{}`: {}",
-                request.bucket, item.key, item.entry_name, err
-            ))
-        })?;
+    let store = new_object_layer_fn().ok_or_else(|| io::Error::other("object store not initialized"))?;
+    let mut seen = HashSet::new();
+    let explicit_items = collect_explicit_zip_items(&request, &mut seen)
+        .map_err(|err| io::Error::other(format!("failed to prepare explicit ZIP items: {err}")))?;
+    write_zip_items(&mut zip, &request.bucket, &explicit_items).await?;
+
+    for prefix in listing_prefixes(&request) {
+        let mut continuation_token = None;
+        loop {
+            let listed = store
+                .clone()
+                .list_objects_v2(
+                    &request.bucket,
+                    prefix,
+                    continuation_token.clone(),
+                    None,
+                    ZIP_LIST_MAX_KEYS,
+                    false,
+                    None,
+                    false,
+                )
+                .await
+                .map_err(|err| io::Error::other(format!("failed to list prefix `{prefix}` for ZIP stream: {err}")))?;
+
+            let mut page_items = Vec::new();
+            for object in listed.objects {
+                if object.name == *prefix && object.size == 0 {
+                    continue;
+                }
+                push_zip_item(&request, &mut seen, &mut page_items, object.name)
+                    .map_err(|err| io::Error::other(format!("failed to prepare ZIP entry name: {err}")))?;
+            }
+            write_zip_items(&mut zip, &request.bucket, &page_items).await?;
+
+            if !listed.is_truncated {
+                break;
+            }
+            continuation_token = listed.next_continuation_token;
+            if continuation_token.is_none() {
+                break;
+            }
+        }
     }
     zip.close()
         .await
         .map(|_| ())
         .map_err(|err| io::Error::other(format!("failed to finish ZIP archive: {err}")))
+}
+
+async fn write_zip_items(
+    zip: &mut async_zip::tokio::write::ZipFileWriter<tokio::io::DuplexStream>,
+    bucket: &str,
+    items: &[ZipDownloadItem],
+) -> io::Result<()> {
+    for item in items {
+        write_zip_item(zip, bucket, item).await.map_err(|err| {
+            io::Error::other(format!(
+                "failed to write bucket `{}` object `{}` into ZIP entry `{}`: {}",
+                bucket, item.key, item.entry_name, err
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 async fn write_zip_item(
@@ -1182,6 +1241,58 @@ mod tests {
         mixed.prefixes = vec!["2026/nested/".to_string()];
 
         assert_eq!(listing_prefixes(&mixed), vec!["2026/nested/"]);
+    }
+
+    #[test]
+    fn download_handler_validates_and_streams_without_collecting_full_listing() {
+        let src = include_str!("object_zip_download.rs");
+        let handler_block = extract_block_between_markers(
+            src,
+            "impl Operation for DownloadObjectZipHandler",
+            "fn sanitize_content_disposition_filename",
+        );
+
+        assert!(
+            handler_block.contains("validate_zip_download_request(&record).await?;"),
+            "download handler should validate access and object existence before returning the ZIP response"
+        );
+        assert!(
+            handler_block.contains("build_zip_stream_body(record.request.clone())"),
+            "download handler should stream from the request scope instead of materializing a full item list first"
+        );
+        assert!(
+            !handler_block.contains("collect_zip_items(&record.request).await?"),
+            "download handler must not collect every ZIP entry into memory before streaming"
+        );
+    }
+
+    #[test]
+    fn zip_download_preflight_preserves_storage_error_semantics() {
+        let src = include_str!("object_zip_download.rs");
+        let preflight_block = extract_block_between_markers(src, "async fn preflight_zip_items", "fn storage_error_to_s3");
+        let validation_block =
+            extract_block_between_markers(src, "async fn validate_zip_download_request", "async fn validate_zip_download_items");
+
+        assert!(
+            preflight_block.contains(".map_err(storage_error_to_s3)?;"),
+            "preflight object checks should preserve storage-layer S3 semantics"
+        );
+        assert!(
+            validation_block.contains(".map_err(storage_error_to_s3)?;"),
+            "bucket and listing checks should preserve storage-layer S3 semantics"
+        );
+        assert!(
+            preflight_block.contains(".get_object_info(&request.bucket, &item.key, &ObjectOptions::default())")
+                && !preflight_block.contains("failed to prepare object"),
+            "preflight object checks must not wrap expected missing object errors with a custom InternalError message"
+        );
+        assert!(
+            validation_block.contains(".get_bucket_info(&record.request.bucket, &BucketOptions::default())")
+                && validation_block.contains(".list_objects_v2(")
+                && !validation_block.contains("failed to validate bucket")
+                && !validation_block.contains("failed to list prefix"),
+            "bucket and listing checks must not wrap expected user-facing errors with custom InternalError messages"
+        );
     }
 
     #[test]
