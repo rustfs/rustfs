@@ -5,18 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-startup-service-bootstrap`
-- Baseline: `origin/main` at `b49057c8e3e0b1a0ed828912806ee67b49e404c4`
+- Branch: `overtrue/arch-startup-subsystems-bootstrap`
+- Baseline: `origin/main` at `949939137066435e590c8bd0f029ed1500e0e1cd`
 - PR type for this branch: `pure-move`
-- Runtime behavior changes: no external behavior change expected; binary startup
-  still treats notification initialization failure as fatal, while embedded
-  startup still treats audit and notification failures as non-fatal warnings.
-- Rust code changes: centralize event notifier, audit startup, and notification
-  system bootstrap in `startup_services` helpers with caller-owned
-  logging/error policy, then use those helpers from binary and embedded
+- Runtime behavior changes: no external behavior change expected; FTP, FTPS,
+  WebDAV, and SFTP startup still honors compile features and env-driven
+  enable/disable behavior, startup failure mapping, and shutdown handle flow.
+- Rust code changes: centralize protocol sidecar bootstrap in
+  `startup_protocols::init_protocol_shutdown_senders` and use it from binary
   startup.
 - CI/script changes: none.
-- Docs changes: record `R-010` startup service bootstrap wrapper progress and
+- Docs changes: record `R-011` startup protocol bootstrap wrapper progress and
   verification.
 
 ## Phase 0 Tasks
@@ -578,6 +577,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: focused startup service tests, binary/lib compile checks,
     formatting, migration guards, Rust risk scan, and pre-commit quality gate.
 
+- [x] `R-011` Centralize startup protocol sidecar bootstrap.
+  - Do: move FTP, FTPS, WebDAV, and SFTP startup orchestration behind
+    `startup_protocols::init_protocol_shutdown_senders`.
+  - Acceptance: feature-gated protocols still return `None` when not compiled
+    or enabled, started/disabled/failure logging preserves protocol and state
+    fields, and startup failures still abort binary startup with the same
+    `Error::other` mapping.
+  - Must preserve: protocol feature gates, env-driven enable/disable behavior,
+    startup log event/state/protocol values, shutdown handle ownership, and
+    existing shutdown ordering.
+  - Verification: focused startup protocol tests, binary/lib compile checks,
+    formatting, migration guards, Rust risk scan, and pre-commit quality gate.
+
 ## Next PRs
 
 1. `pure-move`: continue extracting startup boot wrappers in larger slices while
@@ -589,37 +601,39 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Pure-move slice centralizes optional startup service bootstrap while keeping caller-specific logging and error policy at the binary and embedded boundaries. |
-| Migration preservation | passed | Binary keeps notification init fatal, embedded keeps audit and notification failures warn-and-continue, and event notifier still starts before audit. |
-| Testing/verification | passed | Focused startup service tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Pure-move slice centralizes protocol sidecar startup while keeping the binary boundary in charge of shutdown wiring. |
+| Migration preservation | passed | Protocol feature gates, env-driven disabled handling, startup log event/state/protocol fields, and `Error::other` failure mapping are preserved. |
+| Testing/verification | passed | Focused startup protocol tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `b49057c8e3e0b1a0ed828912806ee67b49e404c4`:
+Passed on `949939137066435e590c8bd0f029ed1500e0e1cd`:
 
-- `cargo test -p rustfs startup_services --no-fail-fast`.
-- `cargo check -p rustfs --bin rustfs`.
 - `cargo check -p rustfs --lib`.
+- `cargo check -p rustfs --bin rustfs`.
+- `cargo test -p rustfs startup_protocols --no-fail-fast`.
 - `cargo fmt --all --check`.
 - `git diff --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - `git rev-list --left-right --count HEAD...origin/main` returned `0 0`.
-- Rust risk scan for changed Rust files: full-file matches were existing docs
-  examples, existing startup error output, and existing startup imports; added
-  lines introduced no unwrap/expect, numeric cast, string error, boxed error,
-  print macro, relaxed-ordering, or unsafe match.
-- `make pre-commit`: all checks passed, including nextest with 5969 passed and
+- Rust risk scan for changed Rust files: the only added-line match is the
+  `Box<dyn Error + Send + Sync>` type required by existing protocol init
+  signatures; full-file matches were existing docs examples and existing binary
+  startup error output.
+- `make pre-commit`: all checks passed, including nextest with 5971 passed and
   111 skipped, plus doctests.
 
 Notes:
 
-- This slice centralizes startup optional service bootstrap without moving
-  logging or error-policy ownership out of binary and embedded startup.
-- Binary and embedded keep their existing notification failure semantics.
+- This slice centralizes startup protocol sidecar bootstrap without changing
+  startup ordering or shutdown handle ownership.
+- Protocol logging keeps the existing event, subsystem, protocol, and state
+  values.
 
 ## Handoff Notes
 
-- R-010 is complete.
+- R-011 is complete.
 - Next startup slices can be larger pure moves, but must keep startup ordering,
-  fatal/non-fatal boundaries, and readiness ownership explicit in tests.
+  fatal/non-fatal boundaries, shutdown ownership, and readiness ownership
+  explicit in tests.
