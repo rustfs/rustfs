@@ -52,7 +52,7 @@ use crate::server::{
     ShutdownHandle, init_event_notifier, shutdown_event_notifier, start_audit_system, start_http_server, stop_audit_system,
 };
 use crate::startup_fs_guard::enforce_unsupported_fs_policy;
-use crate::startup_iam::{IamBootstrapDisposition, bootstrap_or_defer_iam_init};
+use crate::startup_iam::{bootstrap_or_defer_iam_init, publish_ready_for_iam_bootstrap};
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
@@ -494,14 +494,12 @@ impl RustFSServerBuilder {
             );
         }
 
-        if iam_bootstrap == IamBootstrapDisposition::ReadyInline {
-            crate::server::publish_ready_when_runtime_ready(readiness.as_ref(), None)
-                .await
-                .map_err(|e| {
-                    shutdown_embedded_server();
-                    ServerError::Init(format!("runtime readiness: {e}"))
-                })?;
-        }
+        publish_ready_for_iam_bootstrap(iam_bootstrap, readiness.as_ref(), None)
+            .await
+            .map_err(|e| {
+                shutdown_embedded_server();
+                ServerError::Init(format!("runtime readiness: {e}"))
+            })?;
 
         rustfs_common::set_global_init_time_now().await;
 

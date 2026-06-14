@@ -34,7 +34,7 @@ use rustfs::server::{
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
 use rustfs::startup_fs_guard::enforce_unsupported_fs_policy;
-use rustfs::startup_iam::{IamBootstrapDisposition, bootstrap_or_defer_iam_init};
+use rustfs::startup_iam::{bootstrap_or_defer_iam_init, publish_ready_for_iam_bootstrap};
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
@@ -968,9 +968,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
         iam_bootstrap = ?iam_bootstrap,
         "RustFS server ready"
     );
-    if iam_bootstrap == IamBootstrapDisposition::ReadyInline {
-        rustfs::server::publish_ready_when_runtime_ready(readiness.as_ref(), Some(state_manager.as_ref())).await?;
-    }
+    publish_ready_for_iam_bootstrap(iam_bootstrap, readiness.as_ref(), Some(state_manager.as_ref())).await?;
     // Set the global RustFS initialization time to now
     rustfs_common::set_global_init_time_now().await;
 

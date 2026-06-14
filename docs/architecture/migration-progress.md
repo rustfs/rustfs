@@ -5,17 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-app-usecase-object-store-fallback-cleanup`
-- Baseline: `origin/main` at `fc894c9b569229101f859a6c4097eb64d3f86f5c`
-- PR type for this branch: `consumer-migration`
-- Runtime behavior changes: no external behavior change expected; app usecase
-  object-store lookups share the same explicit-context resolver and keep the
-  existing legacy global object-layer fallback when no usecase context exists.
-- Rust code changes: add an explicit AppContext object-store resolver helper,
-  migrate admin, bucket, multipart, and object usecases to it, and remove a
-  stale ECStore tier comment that referenced the old direct accessor.
+- Branch: `overtrue/arch-startup-readiness-bootstrap`
+- Baseline: `origin/main` at `8d23ce06c6dba11f50f656af4c30b63036cef92f`
+- PR type for this branch: `pure-move`
+- Runtime behavior changes: no external behavior change expected; inline IAM
+  bootstrap still publishes runtime readiness after runtime dependencies are
+  ready, and deferred IAM bootstrap still leaves readiness publication to the
+  recovery loop.
+- Rust code changes: centralize the IAM bootstrap readiness publication decision
+  in `startup_iam`, use it from binary and embedded startup, and add
+  wrapper-level coverage for inline, deferred, and failure paths.
 - CI/script changes: none.
-- Docs changes: record `CTX-011` compatibility fallback cleanup scope and
+- Docs changes: record `R-009` startup readiness bootstrap wrapper progress and
   verification.
 
 ## Phase 0 Tasks
@@ -548,48 +549,65 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: focused config reload and shutdown tests, compile checks,
     formatting, diff hygiene, and Rust risk scan.
 
+## Phase 9 Startup Bootstrap Tasks
+
+- [x] `R-009` Centralize startup IAM readiness publication bootstrap.
+  - Do: move the ReadyInline/Deferred readiness publication decision behind
+    `startup_iam::publish_ready_for_iam_bootstrap` and use it from binary and
+    embedded startup.
+  - Acceptance: inline IAM bootstrap still waits for runtime readiness and
+    updates service state, deferred IAM bootstrap does not publish readiness
+    from main or embedded startup, and embedded runtime readiness failures still
+    trigger embedded shutdown error mapping.
+  - Must preserve: startup ordering, IAM degraded recovery ownership,
+    `IamReady`/`FullReady` publication semantics, and embedded shutdown
+    behavior.
+  - Verification: focused startup IAM tests, binary/lib compile checks,
+    formatting, migration guards, Rust risk scan, and pre-commit quality gate.
+
 ## Next PRs
 
-1. `consumer-migration`: remove the final old global object-layer accessor
-   compatibility path once downstream/public API cleanup is accepted.
-2. `pure-move`: start `R-009` boot wrapper with the IAM degraded readiness
-   contract covered.
+1. `pure-move`: continue extracting startup boot wrappers in larger slices while
+   preserving startup order and readiness ownership.
+2. `ci-gate`: finish `G-006` public re-export and storage trait coverage checks
+   before the remaining cleanup slices.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Single consumer-migration slice; app usecases delegate object-store fallback to the AppContext compatibility helper instead of duplicating direct global accessor calls. |
-| Migration preservation | passed | Admin, bucket, multipart, and object usecases keep injected context precedence and explicit no-context legacy global fallback behavior. |
-| Testing/verification | passed | Formatting, compile checks, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Pure-move slice centralizes IAM bootstrap readiness publication without moving runtime readiness collection or startup dependency checks. |
+| Migration preservation | passed | Main and embedded keep ReadyInline publication behavior, Deferred remains recovery-loop owned, and embedded readiness errors still map through shutdown. |
+| Testing/verification | passed | Focused startup IAM tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `fc894c9b569229101f859a6c4097eb64d3f86f5c`:
+Passed on `8d23ce06c6dba11f50f656af4c30b63036cef92f`:
 
 - `cargo fmt --all --check`.
-- `cargo check -p rustfs-ecstore`.
+- `cargo test -p rustfs startup_iam --no-fail-fast`.
+- `cargo check -p rustfs --bin rustfs`.
 - `cargo check -p rustfs --lib`.
 - `git diff --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
-- `git rev-list --left-right --count HEAD...origin/main` returned `1 0`
-  after rebase.
-- Rust risk scan for changed Rust files: full-file matches were existing tests,
-  existing numeric casts, existing string error signatures, and existing relaxed
-  counters; added-line scan returned no unwrap/expect, numeric cast, string
-  error, boxed error, print macro, or relaxed-ordering match.
-- `make pre-commit`: all checks passed, including nextest with 5961 passed
-  and 111 skipped, plus doctests.
+- `git rev-list --left-right --count HEAD...origin/main` returned `0 0`.
+- Rust risk scan for changed Rust files: full-file matches were existing docs
+  examples, existing startup error output, existing test expectations, and the
+  existing boxed recovery future; added-line scan returned no unwrap/expect,
+  numeric cast, string error, boxed error, print macro, relaxed-ordering, or
+  unsafe match.
+- `make pre-commit`: all checks passed, including nextest with 5966 passed and
+  111 skipped, plus doctests.
 
 Notes:
 
-- This slice consolidates app usecase object-store fallback without changing
-  request behavior.
-- The old global accessor remains as the resolver fallback and public
-  compatibility re-export for a later cleanup slice.
+- This slice centralizes startup IAM readiness publication without changing the
+  runtime readiness checks themselves.
+- Deferred IAM bootstrap readiness remains owned by the recovery loop.
 
 ## Handoff Notes
 
-- CTX-011 is complete.
-- The global fallback definition and re-export remain for a later cleanup slice.
+- R-009 is complete.
+- Next startup slices can be larger pure moves, but must keep startup ordering
+  and readiness ownership explicit in tests.
