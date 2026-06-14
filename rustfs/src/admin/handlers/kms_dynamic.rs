@@ -16,14 +16,13 @@
 
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::context::resolve_kms_runtime_service_manager;
+use crate::app::context::{resolve_kms_runtime_service_manager, resolve_object_store_handle};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::config::com::{read_config, save_config};
-use rustfs_ecstore::new_object_layer_fn;
 use rustfs_kms::{
     ConfigureKmsRequest, ConfigureKmsResponse, KmsConfig, KmsConfigSummary, KmsServiceStatus, KmsStatusResponse, StartKmsRequest,
     StartKmsResponse, StopKmsResponse,
@@ -104,7 +103,7 @@ fn normalize_configure_request_auth(
 /// Save KMS configuration to cluster storage
 #[instrument(skip(config))]
 async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err("Storage layer not initialized".to_string());
     };
 
@@ -128,7 +127,7 @@ async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
 /// Load KMS configuration from cluster storage
 #[instrument]
 pub async fn load_kms_config() -> Option<KmsConfig> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         warn!(
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_KMS,

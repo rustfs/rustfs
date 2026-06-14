@@ -19,6 +19,7 @@ use crate::admin::service::config::{
     validate_server_config,
 };
 use crate::admin::utils::{encode_compatible_admin_payload, is_compat_admin_request, read_compatible_admin_body};
+use crate::app::context::resolve_object_store_handle;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
@@ -72,7 +73,6 @@ use rustfs_ecstore::config::com::STORAGE_CLASS_SUB_SYS;
 use rustfs_ecstore::config::com::{delete_config, read_config, read_config_without_migrate, save_config, save_server_config};
 use rustfs_ecstore::config::storageclass::{INLINE_BLOCK_ENV, OPTIMIZE_ENV, RRS_ENV, STANDARD_ENV};
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
-use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::ListOperations;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
@@ -710,7 +710,7 @@ fn success_response(config_applied: bool) -> S3Result<S3Response<(StatusCode, Bo
 }
 
 fn object_store() -> S3Result<std::sync::Arc<rustfs_ecstore::store::ECStore>> {
-    new_object_layer_fn().ok_or_else(|| s3_error!(InternalError, "server storage not initialized"))
+    resolve_object_store_handle().ok_or_else(|| s3_error!(InternalError, "server storage not initialized"))
 }
 
 async fn load_server_config_from_store() -> S3Result<ServerConfig> {
