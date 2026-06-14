@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-admin-object-store-context`
-- Baseline: `upstream/main` at `6fcd62ba5648f90f6a78a0819f54e4a881cc2a87`
+- Branch: `overtrue/arch-storage-ecfs-object-store-context`
+- Baseline: `upstream/main` at `046d5386ba9ffe6a0df39ffd78322c62e9f358d2`
 - PR type for this branch: `consumer-migration`
-- Runtime behavior changes: no external behavior change expected; admin
+- Runtime behavior changes: no external behavior change expected; S3 ECFS
   object-store lookups prefer the AppContext-owned object store and keep the
   existing global fallback.
-- Rust code changes: add global fallback to the shared object-store resolver and
-  migrate admin handlers, services, and router helpers to that resolver.
+- Rust code changes: migrate `rustfs/src/storage/ecfs.rs` object-store lookups
+  to the shared resolver without touching lower-layer storage infra modules.
 - CI/script changes: none.
-- Docs changes: record `CTX-005` consumer migration scope and verification.
+- Docs changes: record `CTX-006` consumer migration scope and verification.
 
 ## Phase 0 Tasks
 
@@ -174,6 +174,14 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     preserve the existing global object-layer fallback when absent.
   - Verification: focused resolver test, formatting, compile check, migration
     guards, diff hygiene, Rust risk scan, and full `make pre-commit`.
+- [x] `CTX-006` Migrate ECFS object-store consumers.
+  - Do: migrate S3 ECFS object operations to the shared object-store resolver.
+  - Acceptance: ECFS object-store lookups use AppContext when present and
+    preserve the existing global object-layer fallback when absent.
+  - Must preserve: S3 object/bucket API behavior, object-lock/tagging/metadata
+    semantics, and existing storage error paths.
+  - Verification: formatting, compile check, migration guards, diff hygiene,
+    Rust risk scan, and full `make pre-commit`.
 
 ## Phase 1 Security Governance Tasks
 
@@ -481,7 +489,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Next PRs
 
 1. `consumer-migration`: migrate the next low-risk non-admin AppContext
-   consumer group while preserving global fallback.
+   consumer group that does not introduce a new reverse layer dependency.
 2. `pure-move`: start `R-009` boot wrapper with the IAM degraded readiness
    contract covered.
 
@@ -489,17 +497,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Single `consumer-migration` slice; the shared object-store resolver owns fallback behavior and admin callers do not add service containers, registries, or cross-layer dependencies. |
-| Migration preservation | pass | AppContext object-store resolution is preferred when present, existing global object-layer fallback and admin error paths are preserved, and method bodies keep their storage behavior. |
-| Testing/verification | pass | Focused resolver test, formatting, compile check, diff hygiene, migration guards, added-line Rust risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | pass | Single `consumer-migration` slice; `ecfs.rs` is an interface-layer module already using app usecases, and the layer guard reports no new reverse dependencies. |
+| Migration preservation | pass | AppContext object-store resolution is preferred when present, existing global object-layer fallback and S3 storage error paths are preserved, and ECFS method bodies keep their behavior. |
+| Testing/verification | pass | Formatting, compile check, diff hygiene, migration/layer guards, added-line Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `6fcd62ba5648f90f6a78a0819f54e4a881cc2a87`:
+Passed on `046d5386ba9ffe6a0df39ffd78322c62e9f358d2`:
 - `cargo fmt --all`.
 - `cargo fmt --all --check`.
 - `cargo check -p rustfs --lib`.
-- `cargo test -p rustfs app::context::compat::tests::resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`.
 - `git diff --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
@@ -510,12 +517,12 @@ Passed on `6fcd62ba5648f90f6a78a0819f54e4a881cc2a87`:
   111 skipped, plus doctests.
 
 Notes:
-- This slice migrates one coherent admin object-store consumer group.
+- This slice migrates one coherent ECFS object-store consumer group.
 - Global object-layer fallback remains available until the planned cleanup
   phase.
 
 ## Handoff Notes
 
-- CTX-005 is complete.
+- CTX-006 is complete.
 - Keep the next consumer or boot wrapper PR scoped to one PR type and preserve
   global fallback until the planned cleanup phase.
