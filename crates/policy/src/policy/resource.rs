@@ -17,12 +17,7 @@ use serde::{
     Deserialize, Deserializer, Serialize,
     de::{self, Error as DeError, Visitor},
 };
-use std::{
-    collections::{HashMap, HashSet},
-    fmt,
-    hash::Hash,
-    ops::Deref,
-};
+use std::{collections::HashMap, fmt, ops::Deref};
 
 use super::{
     Error as IamError, Validator,
@@ -32,7 +27,7 @@ use super::{
 };
 
 #[derive(Clone, Default, Debug)]
-pub struct ResourceSet(pub HashSet<Resource>);
+pub struct ResourceSet(pub Vec<Resource>);
 
 impl Serialize for ResourceSet {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -41,19 +36,13 @@ impl Serialize for ResourceSet {
     {
         use serde::ser::SerializeSeq;
 
-        let mut resources: Vec<String> = self
-            .0
-            .iter()
-            .map(|resource| match resource {
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for resource in &self.0 {
+            let resource_str = match resource {
                 Resource::S3(value) => format!("{}{}", Resource::S3_PREFIX, value),
                 Resource::Kms(value) => value.clone(),
-            })
-            .collect();
-        resources.sort_unstable();
-
-        let mut seq = serializer.serialize_seq(Some(resources.len()))?;
-        for resource in resources {
-            seq.serialize_element(&resource)?;
+            };
+            seq.serialize_element(&resource_str)?;
         }
         seq.end()
     }
@@ -63,6 +52,12 @@ impl ResourceSet {
     /// Returns true if the resource set is empty.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    fn push_unique(&mut self, resource: Resource) {
+        if !self.0.contains(&resource) {
+            self.0.push(resource);
+        }
     }
 
     pub async fn is_match(&self, resource: &str, conditions: &HashMap<String, Vec<String>>) -> bool {
@@ -96,7 +91,7 @@ impl ResourceSet {
 }
 
 impl Deref for ResourceSet {
-    type Target = HashSet<Resource>;
+    type Target = [Resource];
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -116,7 +111,7 @@ impl Validator for ResourceSet {
 
 impl PartialEq for ResourceSet {
     fn eq(&self, other: &Self) -> bool {
-        self.len() == other.len() && self.0.iter().all(|x| other.0.contains(x))
+        self.0.iter().all(|x| other.0.contains(x)) && other.0.iter().all(|x| self.0.contains(x))
     }
 }
 
@@ -139,9 +134,9 @@ impl<'de> Deserialize<'de> for ResourceSet {
                 E: de::Error,
             {
                 let resource = Resource::try_from(value).map_err(|e| E::custom(format!("invalid resource: {}", e)))?;
-                let mut set = HashSet::new();
-                set.insert(resource);
-                Ok(ResourceSet(set))
+                let mut resources = ResourceSet::default();
+                resources.push_unique(resource);
+                Ok(resources)
             }
 
             fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
@@ -149,18 +144,18 @@ impl<'de> Deserialize<'de> for ResourceSet {
                 A: de::SeqAccess<'de>,
                 A::Error: DeError,
             {
-                let mut set = HashSet::with_capacity(seq.size_hint().unwrap_or(0));
+                let mut resources = ResourceSet(Vec::with_capacity(seq.size_hint().unwrap_or(0)));
                 while let Some(value) = seq.next_element::<String>()? {
                     match Resource::try_from(value.as_str()) {
                         Ok(resource) => {
-                            set.insert(resource);
+                            resources.push_unique(resource);
                         }
                         Err(e) => {
                             return Err(A::Error::custom(format!("invalid resource: {}", e)));
                         }
                     }
                 }
-                Ok(ResourceSet(set))
+                Ok(resources)
             }
         }
 
