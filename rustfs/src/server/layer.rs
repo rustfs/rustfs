@@ -1018,19 +1018,21 @@ fn unroutable_virtual_host_target(method: &Method, uri: &Uri, headers: &HeaderMa
     }
 
     // `Host` is set for HTTP/1.1; HTTP/2 carries the host in the URI authority.
-    let host = match headers.get(http::header::HOST).and_then(|value| value.to_str().ok()) {
-        Some(host) => host,
+    let raw_authority = match headers.get(http::header::HOST).and_then(|value| value.to_str().ok()) {
+        Some(value) => value,
         None => uri.authority().map(|authority| authority.as_str())?,
     };
-    if host.is_empty() {
+    if raw_authority.is_empty() {
         return None;
     }
     // IP / socket-address hosts always use path-style addressing in s3s.
-    if rustfs_utils::is_socket_addr(host) {
+    if rustfs_utils::is_socket_addr(raw_authority) {
         return None;
     }
-    // Drop an optional `:port`; DNS hosts have no other `:`.
-    let host = host.rsplit_once(':').map_or(host, |(name, _)| name);
+    // Parse as an Authority to split host/port robustly (e.g. bracketed IPv6) rather
+    // than slicing on `:`.
+    let authority = raw_authority.parse::<http::uri::Authority>().ok()?;
+    let host = authority.host();
     // Require a dotted DNS name (the shape of a virtual-hosted bucket subdomain).
     if !host.contains('.') || host.starts_with('.') || host.ends_with('.') {
         return None;
@@ -1054,18 +1056,20 @@ fn xml_escape(value: &str) -> String {
     escaped
 }
 
-fn build_virtual_host_hint_response<RestBody, GrpcBody>(host: &str, resource: &str) -> Response<HybridBody<RestBody, GrpcBody>>
+fn build_virtual_host_hint_response<RestBody, GrpcBody>(
+    version: http::Version,
+    host: &str,
+    resource: &str,
+) -> Response<HybridBody<RestBody, GrpcBody>>
 where
     RestBody: From<Bytes>,
 {
-    // The leftmost label is the bucket; the remainder is the server domain the
-    // operator most likely needs to configure.
-    let suggested_domain = host.split_once('.').map_or(host, |(_, rest)| rest);
     let message = format!(
-        "Virtual-hosted-style request for host '{host}' could not be routed because no server domain is configured. \
-         Set RUSTFS_SERVER_DOMAINS to your S3 endpoint domain (for example, if '{host}' addresses a bucket as \
-         <bucket>.<domain>, set RUSTFS_SERVER_DOMAINS={suggested_domain}), or configure your S3 client to use \
-         path-style addressing (AWS SDK: force_path_style=true; Terraform aws provider: s3_use_path_style = true)."
+        "Virtual-hosted-style request for host '{host}' could not be routed because no server domain is \
+         configured. Set RUSTFS_SERVER_DOMAINS to the S3 endpoint domain your buckets are addressed under \
+         (for example RUSTFS_SERVER_DOMAINS=s3.example.com, so that bucket.s3.example.com routes to bucket \
+         'bucket'), or configure your S3 client to use path-style addressing (AWS SDK: force_path_style=true; \
+         Terraform aws provider: s3_use_path_style = true)."
     );
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -1074,9 +1078,16 @@ where
         resource = xml_escape(resource),
     );
 
-    Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::NOT_IMPLEMENTED)
-        .header(http::header::CONTENT_TYPE, "application/xml")
+        .header(http::header::CONTENT_TYPE, "application/xml");
+    // This short-circuit path does not drain the request body. For HTTP/1.x, signal
+    // connection close so an undrained body cannot disrupt keep-alive reuse. `Connection`
+    // is a forbidden header in HTTP/2+, so it is only set for HTTP/1.x.
+    if !matches!(version, http::Version::HTTP_2 | http::Version::HTTP_3) {
+        builder = builder.header(http::header::CONNECTION, "close");
+    }
+    builder
         .body(HybridBody::Rest {
             rest_body: RestBody::from(Bytes::from(body)),
         })
@@ -1122,6 +1133,7 @@ where
     fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
         if let Some(host) = unroutable_virtual_host_target(req.method(), req.uri(), req.headers()) {
             let resource = req.uri().path().to_owned();
+            let version = req.version();
             debug!(
                 event = VIRTUAL_HOST_STYLE_UNROUTABLE_EVENT,
                 component = LOG_COMPONENT_SERVER,
@@ -1130,7 +1142,7 @@ where
                 method = %req.method(),
                 "Rejected virtual-hosted-style request: no server domain configured (set RUSTFS_SERVER_DOMAINS or use path-style)"
             );
-            return Box::pin(async move { Ok(build_virtual_host_hint_response(&host, &resource)) });
+            return Box::pin(async move { Ok(build_virtual_host_hint_response(version, &host, &resource)) });
         }
 
         let mut inner = self.inner.clone();
@@ -1683,6 +1695,11 @@ mod tests {
         ip.insert(http::header::HOST, HeaderValue::from_static("127.0.0.1:9000"));
         assert_eq!(unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/"), &ip), None);
 
+        // Bracketed IPv6 authority (with port) is a socket address, not a bucket subdomain.
+        let mut ipv6 = HeaderMap::new();
+        ipv6.insert(http::header::HOST, HeaderValue::from_static("[::1]:9000"));
+        assert_eq!(unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/"), &ipv6), None);
+
         // Bare single-label hosts are not virtual-hosted bucket subdomains.
         let mut bare = HeaderMap::new();
         bare.insert(http::header::HOST, HeaderValue::from_static("localhost:9000"));
@@ -1703,7 +1720,7 @@ mod tests {
     #[test]
     fn build_virtual_host_hint_response_is_actionable() {
         let response: Response<HybridBody<Full<Bytes>, Full<Bytes>>> =
-            build_virtual_host_hint_response("my-bucket.s3.example.com", "/");
+            build_virtual_host_hint_response(http::Version::HTTP_11, "my-bucket.s3.example.com", "/");
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
         assert_eq!(
             response
@@ -1712,6 +1729,19 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("application/xml")
         );
+        // HTTP/1.x error responses close the connection (the request body is not drained).
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONNECTION)
+                .and_then(|value| value.to_str().ok()),
+            Some("close")
+        );
+
+        // `Connection` is forbidden in HTTP/2, so it must not be set there.
+        let h2_response: Response<HybridBody<Full<Bytes>, Full<Bytes>>> =
+            build_virtual_host_hint_response(http::Version::HTTP_2, "my-bucket.s3.example.com", "/");
+        assert!(h2_response.headers().get(http::header::CONNECTION).is_none());
     }
 
     #[tokio::test]
@@ -1734,6 +1764,13 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONNECTION)
+                .and_then(|value| value.to_str().ok()),
+            Some("close")
+        );
 
         let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
         let body = String::from_utf8(body.to_vec()).expect("utf8 body");
