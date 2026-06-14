@@ -35,7 +35,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
 const LOG_SUBSYSTEM_WEBDAV_SERVER: &str = "webdav_server";
@@ -144,54 +144,61 @@ where
                             let tls_acceptor = tls_acceptor.clone();
 
                             let max_body_size = self.config.max_body_size;
-                            tokio::spawn(async move {
-                                let source_ip: IpAddr = addr.ip();
-
-                                if let Some(acceptor) = tls_acceptor {
-                                    match acceptor.accept(stream).await {
-                                        Ok(tls_stream) => {
-                                            let io = TokioIo::new(tls_stream);
-                                            if let Err(e) = Self::handle_connection_impl(io, storage, source_ip, max_body_size).await {
+                            let source_ip: IpAddr = addr.ip();
+                            let span = info_span!(
+                                "webdav-connection",
+                                peer = %source_ip,
+                                transport = if tls_acceptor.is_some() { "tls" } else { "tcp" },
+                            );
+                            tokio::spawn(
+                                async move {
+                                    if let Some(acceptor) = tls_acceptor {
+                                        match acceptor.accept(stream).await {
+                                            Ok(tls_stream) => {
+                                                let io = TokioIo::new(tls_stream);
+                                                if let Err(e) = Self::handle_connection_impl(io, storage, source_ip, max_body_size).await {
+                                                    debug!(
+                                                        event = EVENT_WEBDAV_CONNECTION_STATE,
+                                                        component = LOG_COMPONENT_PROTOCOLS,
+                                                        subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
+                                                        result = "error",
+                                                        peer = %source_ip,
+                                                        transport = "tls",
+                                                        error = %e,
+                                                        "webdav connection ended with error"
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
                                                 debug!(
                                                     event = EVENT_WEBDAV_CONNECTION_STATE,
                                                     component = LOG_COMPONENT_PROTOCOLS,
                                                     subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
-                                                    result = "error",
+                                                    result = "tls_handshake_failed",
                                                     peer = %source_ip,
-                                                    transport = "tls",
                                                     error = %e,
                                                     "webdav connection ended with error"
                                                 );
                                             }
                                         }
-                                        Err(e) => {
+                                    } else {
+                                        let io = TokioIo::new(stream);
+                                        if let Err(e) = Self::handle_connection_impl(io, storage, source_ip, max_body_size).await {
                                             debug!(
                                                 event = EVENT_WEBDAV_CONNECTION_STATE,
                                                 component = LOG_COMPONENT_PROTOCOLS,
                                                 subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
-                                                result = "tls_handshake_failed",
+                                                result = "error",
                                                 peer = %source_ip,
+                                                transport = "tcp",
                                                 error = %e,
                                                 "webdav connection ended with error"
                                             );
                                         }
                                     }
-                                } else {
-                                    let io = TokioIo::new(stream);
-                                    if let Err(e) = Self::handle_connection_impl(io, storage, source_ip, max_body_size).await {
-                                        debug!(
-                                            event = EVENT_WEBDAV_CONNECTION_STATE,
-                                            component = LOG_COMPONENT_PROTOCOLS,
-                                            subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
-                                            result = "error",
-                                            peer = %source_ip,
-                                            transport = "tcp",
-                                            error = %e,
-                                            "webdav connection ended with error"
-                                        );
-                                    }
                                 }
-                            });
+                                .instrument(span),
+                            );
                         }
                         Err(e) => {
                             error!(

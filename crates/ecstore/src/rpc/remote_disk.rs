@@ -65,7 +65,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, service::interceptor::InterceptedService, transport::Channel};
-use tracing::{debug, warn};
+use tracing::{Instrument, debug, warn};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,6 +117,17 @@ pub struct RemoteDisk {
 }
 
 impl RemoteDisk {
+    fn recovery_monitor_span(addr: &str, endpoint: &Endpoint) -> tracing::Span {
+        tracing::info_span!(
+            "recovery-monitor",
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+            kind = "remote_disk",
+            endpoint = %endpoint,
+            addr = %addr
+        )
+    }
+
     fn is_retryable_walk_dir_error(err: &DiskError) -> bool {
         if is_network_like_disk_error(err) {
             return true;
@@ -239,9 +250,37 @@ impl RemoteDisk {
         let endpoint = self.endpoint.clone();
         let health = Arc::clone(&self.health);
         let cancel_token = self.cancel_token.clone();
-        tokio::spawn(async move {
-            Self::monitor_remote_disk_recovery(addr, endpoint, health, cancel_token).await;
-        });
+        let span = Self::recovery_monitor_span(&addr, &endpoint);
+        tokio::spawn(
+            async move {
+                Self::monitor_remote_disk_recovery(addr, endpoint, health, cancel_token).await;
+            }
+            .instrument(span),
+        );
+    }
+
+    #[cfg(test)]
+    fn spawn_recovery_monitor_log_probe_for_test(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let endpoint = self.endpoint.clone();
+        let addr = self.addr.clone();
+        let span = Self::recovery_monitor_span(&addr, &endpoint);
+        tokio::spawn(
+            async move {
+                warn!(
+                    event = EVENT_REMOTE_DISK_HEALTH,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+                    endpoint = %endpoint,
+                    addr,
+                    state = "probe",
+                    "remote disk recovery monitor log probe"
+                );
+                let _ = tx.send(());
+            }
+            .instrument(span),
+        );
+        rx
     }
 
     fn mark_suspect_or_offline(&self, reason: &'static str) -> bool {
@@ -295,10 +334,14 @@ impl RemoteDisk {
             let addr_clone = addr.clone();
             let endpoint_clone = endpoint.clone();
             let cancel_clone = cancel_token.clone();
+            let span = Self::recovery_monitor_span(&addr_clone, &endpoint_clone);
 
-            tokio::spawn(async move {
-                Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, cancel_clone).await;
-            });
+            tokio::spawn(
+                async move {
+                    Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, cancel_clone).await;
+                }
+                .instrument(span),
+            );
         }
 
         loop {
@@ -357,10 +400,14 @@ impl RemoteDisk {
                         let addr_clone = addr.clone();
                         let endpoint_clone = endpoint.clone();
                         let cancel_clone = cancel_token.clone();
+                        let span = Self::recovery_monitor_span(&addr_clone, &endpoint_clone);
 
-                        tokio::spawn(async move {
-                            Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, cancel_clone).await;
-                        });
+                        tokio::spawn(
+                            async move {
+                                Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, cancel_clone).await;
+                            }
+                            .instrument(span),
+                        );
                     }
                 }
             }
@@ -375,10 +422,28 @@ impl RemoteDisk {
         cancel_token: CancellationToken,
     ) {
         let mut interval = time::interval(get_drive_returning_probe_interval());
+        debug!(
+            event = EVENT_REMOTE_DISK_HEALTH,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+            endpoint = %endpoint,
+            addr,
+            state = "recovery_monitor_started",
+            "Remote disk recovery monitor started"
+        );
 
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => {
+                    debug!(
+                        event = EVENT_REMOTE_DISK_HEALTH,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+                        endpoint = %endpoint,
+                        addr,
+                        state = "recovery_monitor_cancelled",
+                        "Remote disk recovery monitor cancelled"
+                    );
                     return;
                 }
                 _ = interval.tick() => {
@@ -2200,16 +2265,67 @@ mod tests {
     use super::*;
     use crate::rpc::{InternodeDataTransportCapabilities, TcpHttpInternodeDataTransport};
     use rustfs_common::GLOBAL_CONN_MAP;
+    use serde_json::Value;
+    use std::io::{self as std_io, Write};
     use std::pin::Pin;
-    use std::sync::{Mutex as StdMutex, Once};
+    use std::sync::{Arc, Mutex, Mutex as StdMutex, Once};
     use std::task::{Context, Poll};
     use tokio::io::{ReadBuf, duplex};
     use tokio::net::TcpListener;
     use tonic::transport::Endpoint as TonicEndpoint;
     use tracing::Level;
+    use tracing_subscriber::{Registry, fmt::MakeWriter, layer::SubscriberExt};
     use uuid::Uuid;
 
     static INIT: Once = Once::new();
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct CapturedLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CapturedLogs {
+        fn lines(&self) -> Vec<Value> {
+            let buffer = self
+                .buffer
+                .lock()
+                .expect("captured logs mutex should not be poisoned")
+                .clone();
+            String::from_utf8(buffer)
+                .expect("captured logs should be valid UTF-8")
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).expect("captured log line should be valid JSON"))
+                .collect()
+        }
+    }
+
+    impl Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std_io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("captured logs mutex should not be poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std_io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
 
     #[derive(Debug, Clone)]
     enum RecordedTransportCall {
@@ -3499,5 +3615,156 @@ mod tests {
         assert_eq!(endpoint.pool_idx, 1);
         assert_eq!(endpoint.set_idx, 2);
         assert_eq!(endpoint.disk_idx, 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_disk_recovery_probe_logs_keep_request_id_span_context() {
+        let logs = CapturedLogs::default();
+        let subscriber = Registry::default().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .without_time()
+                .json()
+                .flatten_event(true)
+                .with_current_span(true)
+                .with_span_list(true),
+        );
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let endpoint = Endpoint {
+            url: url::Url::parse("http://127.0.0.1:59996/data").expect("endpoint URL should parse"),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+        let remote_disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: true,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .expect("remote disk should construct");
+
+        let span = tracing::info_span!("request-span", request_id = "req-remote-disk");
+        let _entered = span.enter();
+        let done = remote_disk.spawn_recovery_monitor_log_probe_for_test();
+        done.await
+            .expect("remote disk recovery monitor probe should signal completion");
+
+        let log = logs
+            .lines()
+            .into_iter()
+            .find(|value| value.get("message").and_then(Value::as_str) == Some("remote disk recovery monitor log probe"))
+            .expect("expected remote disk recovery monitor probe log");
+
+        assert_eq!(log["span"]["name"], Value::String("recovery-monitor".to_string()));
+        assert_eq!(log["span"]["kind"], Value::String("remote_disk".to_string()));
+        let spans = log["spans"].as_array().expect("spans should be present");
+        assert!(spans.iter().any(|span| {
+            span.get("name").and_then(Value::as_str) == Some("request-span")
+                && span.get("request_id").and_then(Value::as_str) == Some("req-remote-disk")
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_disk_network_error_starts_recovery_monitor_with_request_context() {
+        let logs = CapturedLogs::default();
+        let subscriber = Registry::default().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .without_time()
+                .json()
+                .flatten_event(true)
+                .with_current_span(true)
+                .with_span_list(true),
+        );
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let addr = "http://127.0.0.1:59997".to_string();
+        let endpoint = Endpoint {
+            url: url::Url::parse(&format!("{addr}/data")).expect("endpoint URL should parse"),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let remote_disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: true,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .expect("remote disk should construct");
+
+        let span = tracing::info_span!("request-span", request_id = "req-remote-disk-e2e");
+        let _entered = span.enter();
+
+        let err = remote_disk
+            .execute_with_timeout(
+                || async {
+                    Err::<(), Error>(DiskError::Io(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "connection refused",
+                    )))
+                },
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("network-like operation error should fail");
+        assert_eq!(
+            match &err {
+                DiskError::Io(io_err) => io_err.kind(),
+                other => panic!("expected io network error, got {other:?}"),
+            },
+            std::io::ErrorKind::ConnectionRefused
+        );
+
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        remote_disk.cancel_token.cancel();
+        tokio::task::yield_now().await;
+
+        let lines = logs.lines();
+        let marked_suspect = lines
+            .iter()
+            .find(|value| value.get("state").and_then(Value::as_str) == Some("marked_suspect"))
+            .expect("expected marked_suspect log");
+        assert!(
+            marked_suspect["spans"]
+                .as_array()
+                .expect("spans should be present")
+                .iter()
+                .any(|span| {
+                    span.get("name").and_then(Value::as_str) == Some("request-span")
+                        && span.get("request_id").and_then(Value::as_str) == Some("req-remote-disk-e2e")
+                })
+        );
+
+        let recovery_started = lines
+            .iter()
+            .find(|value| value.get("state").and_then(Value::as_str) == Some("recovery_monitor_started"))
+            .expect("expected recovery_monitor_started log");
+        assert_eq!(recovery_started["span"]["name"], Value::String("recovery-monitor".to_string()));
+        assert_eq!(recovery_started["span"]["kind"], Value::String("remote_disk".to_string()));
+        assert!(
+            recovery_started["spans"]
+                .as_array()
+                .expect("spans should be present")
+                .iter()
+                .any(|span| {
+                    span.get("name").and_then(Value::as_str) == Some("request-span")
+                        && span.get("request_id").and_then(Value::as_str) == Some("req-remote-disk-e2e")
+                })
+        );
     }
 }

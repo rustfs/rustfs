@@ -40,7 +40,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast::{self};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{Instrument, error, info, warn};
 use uuid::Uuid;
 
 const MAX_OBJECT_LIST: i32 = 1000;
@@ -710,31 +710,37 @@ impl ECStore {
         let cancel_rx1 = cancel.clone();
         let cancel_rx1_for_err = cancel_rx1.clone();
         let err_tx1 = err_tx.clone();
-        let job1 = tokio::spawn(async move {
-            let mut opts = opts;
-            opts.stop_disk_at_limit = true;
-            if let Err(err) = store.list_merged(cancel_rx1, opts, sender).await
-                && !cancel_rx1_for_err.is_cancelled()
-            {
-                error!("list_merged err {:?}", err);
-                let _ = err_tx1.send(Arc::new(err));
+        let job1 = tokio::spawn(
+            async move {
+                let mut opts = opts;
+                opts.stop_disk_at_limit = true;
+                if let Err(err) = store.list_merged(cancel_rx1, opts, sender).await
+                    && !cancel_rx1_for_err.is_cancelled()
+                {
+                    error!("list_merged err {:?}", err);
+                    let _ = err_tx1.send(Arc::new(err));
+                }
             }
-        });
+            .instrument(tracing::Span::current()),
+        );
 
         let cancel_rx2 = cancel.clone();
 
         let (result_tx, mut result_rx) = mpsc::channel(1);
         let err_tx2 = err_tx.clone();
         let opts = o.clone();
-        let job2 = tokio::spawn(async move {
-            if let Err(err) = gather_results(cancel_rx2, opts, recv, result_tx).await {
-                error!("gather_results err {:?}", err);
-                let _ = err_tx2.send(Arc::new(err));
-            }
+        let job2 = tokio::spawn(
+            async move {
+                if let Err(err) = gather_results(cancel_rx2, opts, recv, result_tx).await {
+                    error!("gather_results err {:?}", err);
+                    let _ = err_tx2.send(Arc::new(err));
+                }
 
-            // cancel call exit spawns
-            cancel.cancel();
-        });
+                // cancel call exit spawns
+                cancel.cancel();
+            }
+            .instrument(tracing::Span::current()),
+        );
 
         let mut result = {
             // receiver result
@@ -815,11 +821,14 @@ impl ECStore {
             }
         }
 
-        tokio::spawn(async move {
-            if let Err(err) = merge_entry_channels(rx, inputs, sender.clone(), 1).await {
-                error!("merge_entry_channels err {:?}", err)
+        tokio::spawn(
+            async move {
+                if let Err(err) = merge_entry_channels(rx, inputs, sender.clone(), 1).await {
+                    error!("merge_entry_channels err {:?}", err)
+                }
             }
-        });
+            .instrument(tracing::Span::current()),
+        );
 
         // let merge_res = merge_entry_channels(rx, inputs, sender.clone(), 1).await;
 
@@ -1007,34 +1016,47 @@ impl ECStore {
             Err(_) => None,
         };
 
-        tokio::spawn(async move {
-            let mut sent_err = false;
-            while let Some(entry) = merge_rx.recv().await {
-                if opts.latest_only {
-                    let fi = match entry.to_fileinfo(&bucket_clone) {
-                        Ok(res) => res,
-                        Err(err) => {
-                            if !sent_err {
+        tokio::spawn(
+            async move {
+                let mut sent_err = false;
+                while let Some(entry) = merge_rx.recv().await {
+                    if opts.latest_only {
+                        let fi = match entry.to_fileinfo(&bucket_clone) {
+                            Ok(res) => res,
+                            Err(err) => {
+                                if !sent_err {
+                                    let item = ObjectInfoOrErr {
+                                        item: None,
+                                        err: Some(err.into()),
+                                    };
+
+                                    if let Err(err) = result.send(item).await {
+                                        error!("walk result send err {:?}", err);
+                                    }
+
+                                    sent_err = true;
+
+                                    return;
+                                }
+
+                                continue;
+                            }
+                        };
+
+                        if let Some(filter) = opts.filter {
+                            if filter(&fi) {
                                 let item = ObjectInfoOrErr {
-                                    item: None,
-                                    err: Some(err.into()),
+                                    item: Some(ObjectInfo::from_file_info(&fi, &bucket_clone, &fi.name, {
+                                        if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
+                                    })),
+                                    err: None,
                                 };
 
                                 if let Err(err) = result.send(item).await {
                                     error!("walk result send err {:?}", err);
                                 }
-
-                                sent_err = true;
-
-                                return;
                             }
-
-                            continue;
-                        }
-                    };
-
-                    if let Some(filter) = opts.filter {
-                        if filter(&fi) {
+                        } else {
                             let item = ObjectInfoOrErr {
                                 item: Some(ObjectInfo::from_file_info(&fi, &bucket_clone, &fi.name, {
                                     if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
@@ -1046,43 +1068,43 @@ impl ECStore {
                                 error!("walk result send err {:?}", err);
                             }
                         }
-                    } else {
-                        let item = ObjectInfoOrErr {
-                            item: Some(ObjectInfo::from_file_info(&fi, &bucket_clone, &fi.name, {
-                                if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                            })),
-                            err: None,
-                        };
-
-                        if let Err(err) = result.send(item).await {
-                            error!("walk result send err {:?}", err);
-                        }
+                        continue;
                     }
-                    continue;
-                }
 
-                let fvs = match entry.file_info_versions(&bucket_clone) {
-                    Ok(res) => res,
-                    Err(err) => {
-                        let item = ObjectInfoOrErr {
-                            item: None,
-                            err: Some(err.into()),
-                        };
+                    let fvs = match entry.file_info_versions(&bucket_clone) {
+                        Ok(res) => res,
+                        Err(err) => {
+                            let item = ObjectInfoOrErr {
+                                item: None,
+                                err: Some(err.into()),
+                            };
 
-                        if let Err(err) = result.send(item).await {
-                            error!("walk result send err {:?}", err);
+                            if let Err(err) = result.send(item).await {
+                                error!("walk result send err {:?}", err);
+                            }
+                            return;
                         }
-                        return;
+                    };
+
+                    if opts.versions_sort == WalkVersionsSortOrder::Ascending {
+                        //TODO: SORT
                     }
-                };
 
-                if opts.versions_sort == WalkVersionsSortOrder::Ascending {
-                    //TODO: SORT
-                }
+                    for fi in fvs.versions.iter() {
+                        if let Some(filter) = opts.filter {
+                            if filter(fi) {
+                                let item = ObjectInfoOrErr {
+                                    item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
+                                        if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
+                                    })),
+                                    err: None,
+                                };
 
-                for fi in fvs.versions.iter() {
-                    if let Some(filter) = opts.filter {
-                        if filter(fi) {
+                                if let Err(err) = result.send(item).await {
+                                    error!("walk result send err {:?}", err);
+                                }
+                            }
+                        } else {
                             let item = ObjectInfoOrErr {
                                 item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
                                     if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
@@ -1094,23 +1116,13 @@ impl ECStore {
                                 error!("walk result send err {:?}", err);
                             }
                         }
-                    } else {
-                        let item = ObjectInfoOrErr {
-                            item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
-                                if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                            })),
-                            err: None,
-                        };
-
-                        if let Err(err) = result.send(item).await {
-                            error!("walk result send err {:?}", err);
-                        }
                     }
                 }
             }
-        });
+            .instrument(tracing::Span::current()),
+        );
 
-        tokio::spawn(async move { merge_entry_channels(rx, inputs, merge_tx, 1).await });
+        tokio::spawn(async move { merge_entry_channels(rx, inputs, merge_tx, 1).await }.instrument(tracing::Span::current()));
 
         let walk_results = join_all(futures).await;
         let mut errs = Vec::new();
