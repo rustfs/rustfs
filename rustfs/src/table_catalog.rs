@@ -302,6 +302,24 @@ pub(crate) struct TableCatalogExport {
     pub table: TableEntry,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableDataPlaneResource {
+    pub table_bucket: String,
+    pub namespace: String,
+    pub table: String,
+    pub table_id: String,
+    pub warehouse_object_prefix: String,
+}
+
+impl TableDataPlaneResource {
+    pub(crate) fn catalog_resource_object(&self) -> String {
+        let namespace = Namespace::parse(&self.namespace)
+            .map(|namespace| namespace.storage_id())
+            .unwrap_or_else(|_| self.namespace.clone());
+        format!("{NAMESPACE_ROOT}/{namespace}/{TABLE_ROOT}/{}", self.table)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableMetadataPointerStatus {
@@ -340,6 +358,99 @@ impl fmt::Display for TableCatalogStoreError {
 impl std::error::Error for TableCatalogStoreError {}
 
 pub(crate) type TableCatalogStoreResult<T> = Result<T, TableCatalogStoreError>;
+
+fn normalize_warehouse_object_prefix(object_prefix: &str) -> TableCatalogStoreResult<String> {
+    let object_prefix = object_prefix.strip_suffix('/').unwrap_or(object_prefix);
+    if object_prefix.is_empty() {
+        return Err(TableCatalogStoreError::Invalid(
+            "table warehouse location must include an object prefix".to_string(),
+        ));
+    }
+    if object_prefix.contains('\\') {
+        return Err(TableCatalogStoreError::Invalid(
+            "table warehouse location contains an invalid path separator".to_string(),
+        ));
+    }
+    if object_prefix
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(TableCatalogStoreError::Invalid(
+            "table warehouse location contains an invalid path segment".to_string(),
+        ));
+    }
+
+    let mut normalized = object_prefix.to_string();
+    normalized.push('/');
+    Ok(normalized)
+}
+
+fn table_warehouse_object_prefix(entry: &TableEntry) -> TableCatalogStoreResult<String> {
+    let location = entry
+        .warehouse_location
+        .strip_prefix("s3://")
+        .ok_or_else(|| TableCatalogStoreError::Invalid("table warehouse location must be an s3 URI".to_string()))?;
+    let (bucket, object_prefix) = location
+        .split_once('/')
+        .ok_or_else(|| TableCatalogStoreError::Invalid("table warehouse location must include an object prefix".to_string()))?;
+    if bucket != entry.table_bucket {
+        return Err(TableCatalogStoreError::Invalid(
+            "table warehouse location must be inside the table bucket".to_string(),
+        ));
+    }
+    normalize_warehouse_object_prefix(object_prefix)
+}
+
+pub(crate) async fn table_data_plane_resource_for_object<S>(
+    store: &S,
+    bucket: &str,
+    object: &str,
+) -> TableCatalogStoreResult<Option<TableDataPlaneResource>>
+where
+    S: TableCatalogStore + ?Sized,
+{
+    if bucket.is_empty() || object.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(table_bucket) = store.get_table_bucket(bucket).await? else {
+        return Ok(None);
+    };
+    if table_bucket.state != TableCatalogEntryState::Active {
+        return Ok(None);
+    }
+
+    let mut matched: Option<TableDataPlaneResource> = None;
+    for namespace in store.list_namespaces(bucket).await? {
+        if namespace.state != TableCatalogEntryState::Active {
+            continue;
+        }
+        for table in store.list_tables(bucket, &namespace.namespace).await? {
+            if table.state != TableCatalogEntryState::Active {
+                continue;
+            }
+            let warehouse_object_prefix = table_warehouse_object_prefix(&table)?;
+            if !object.starts_with(&warehouse_object_prefix) {
+                continue;
+            }
+            if matched
+                .as_ref()
+                .is_some_and(|current| current.warehouse_object_prefix.len() >= warehouse_object_prefix.len())
+            {
+                continue;
+            }
+            matched = Some(TableDataPlaneResource {
+                table_bucket: table.table_bucket,
+                namespace: table.namespace,
+                table: table.table,
+                table_id: table.table_id,
+                warehouse_object_prefix,
+            });
+        }
+    }
+
+    Ok(matched)
+}
 
 #[async_trait::async_trait]
 pub(crate) trait TableCatalogStore: Send + Sync {
@@ -2786,6 +2897,48 @@ mod tests {
         assert!(report.retained_metadata_locations.contains(&report.current_metadata_location));
         assert!(!report.cleanup_candidate_locations.contains(&report.current_metadata_location));
         assert_eq!(report.cleanup_candidate_locations, vec![v1, v2]);
+    }
+
+    #[tokio::test]
+    async fn table_data_plane_resource_resolves_registered_warehouse_prefix() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+
+        let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/part-00001.parquet")
+            .await
+            .expect("data-plane resource lookup should succeed")
+            .expect("object should resolve to the registered table");
+
+        assert_eq!(resource.table_bucket, bucket);
+        assert_eq!(resource.namespace, "sales");
+        assert_eq!(resource.table, "orders");
+        assert_eq!(resource.table_id, "table-id");
+        assert_eq!(resource.warehouse_object_prefix, "tables/table-id/");
+        assert_eq!(resource.catalog_resource_object(), "namespaces/sales/tables/orders");
+    }
+
+    #[tokio::test]
+    async fn table_data_plane_resource_does_not_match_sibling_prefix() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+
+        let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id-other/data/part-00001.parquet")
+            .await
+            .expect("data-plane resource lookup should succeed");
+
+        assert!(resource.is_none());
     }
 
     #[tokio::test]
