@@ -19,6 +19,7 @@ use crate::admin::site_replication_identity::{
     site_identity_key,
 };
 use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
+use crate::app::context::resolve_object_store_handle;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::config::get_config_snapshot;
 use crate::error::ApiError;
@@ -49,7 +50,6 @@ use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::config::com::{delete_config, read_config, save_config};
 use rustfs_ecstore::error::Error as StorageError;
 use rustfs_ecstore::global::{get_global_deployment_id, get_global_endpoints_opt, get_global_region, global_rustfs_port};
-use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::BucketOperations;
 use rustfs_iam::error::is_err_no_such_service_account;
 use rustfs_iam::store::{MappedPolicy, UserType};
@@ -478,7 +478,7 @@ async fn read_site_replication_json<T: DeserializeOwned>(
 }
 
 async fn load_site_replication_state() -> S3Result<SiteReplicationState> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
@@ -507,7 +507,7 @@ async fn load_site_replication_state() -> S3Result<SiteReplicationState> {
 }
 
 async fn save_site_replication_state(state: &SiteReplicationState) -> S3Result<()> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
@@ -523,7 +523,7 @@ async fn save_site_replication_state(state: &SiteReplicationState) -> S3Result<(
 }
 
 async fn clear_site_replication_state() -> S3Result<()> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
@@ -1240,7 +1240,7 @@ pub async fn site_replication_make_bucket_hook(bucket: &str, lock_enabled: bool)
     ensure_site_replication_bucket_targets(bucket, &state, &local_peer, None).await?;
     ensure_site_replication_bucket_replication_config(bucket, &state, &local_peer).await?;
 
-    let created_at = new_object_layer_fn()
+    let created_at = resolve_object_store_handle()
         .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?
         .get_bucket_info(bucket, &BucketOptions::default())
         .await
@@ -1308,7 +1308,7 @@ fn maybe_time(value: OffsetDateTime) -> Option<OffsetDateTime> {
 }
 
 async fn build_sr_info(state: &SiteReplicationState, local_peer: &PeerInfo) -> S3Result<SRInfo> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
@@ -2530,7 +2530,7 @@ pub async fn site_replication_peer_deployment_id_for_endpoint(endpoint: &str) ->
 /// kick a resync toward every remote peer so pre-existing objects back-fill. Errors are logged
 /// but never abort the caller — the admin can run a manual resync if needed.
 async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local_peer: &PeerInfo) {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return;
     };
     let buckets = match store.list_bucket(&BucketOptions::default()).await {
@@ -2779,7 +2779,7 @@ async fn ensure_site_replication_bucket_versioning(bucket: &str) -> S3Result<()>
 }
 
 async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
@@ -3371,7 +3371,7 @@ impl Operation for SRPeerBucketOpsHandler {
             .cloned()
             .ok_or_else(|| s3_error!(InvalidRequest, "operation is required"))?;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -3628,7 +3628,7 @@ impl Operation for SiteReplicationResyncOpHandler {
         if !state.peers.contains_key(&peer.deployment_id) {
             return Err(s3_error!(InvalidRequest, "site replication peer not found"));
         }
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
         let buckets = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;

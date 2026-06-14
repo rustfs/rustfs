@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-app-usecase-object-store-context`
-- Baseline: `origin/main` at `bed875d3e0d114398da8b2f94d4473293cbc45a8`
+- Branch: `overtrue/arch-admin-object-store-context`
+- Baseline: `upstream/main` at `6fcd62ba5648f90f6a78a0819f54e4a881cc2a87`
 - PR type for this branch: `consumer-migration`
-- Runtime behavior changes: no external behavior change expected; app usecases
-  prefer the AppContext-owned object store and keep the existing global
-  fallback.
-- Rust code changes: migrate admin, bucket, multipart, and object usecase
-  object-store lookups to AppContext-first resolution.
+- Runtime behavior changes: no external behavior change expected; admin
+  object-store lookups prefer the AppContext-owned object store and keep the
+  existing global fallback.
+- Rust code changes: add global fallback to the shared object-store resolver and
+  migrate admin handlers, services, and router helpers to that resolver.
 - CI/script changes: none.
-- Docs changes: record `CTX-004` consumer migration scope and verification.
+- Docs changes: record `CTX-005` consumer migration scope and verification.
 
 ## Phase 0 Tasks
 
@@ -167,6 +167,13 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     preserve the existing global object-layer fallback when absent.
   - Verification: formatting, compile check, migration guards, diff hygiene,
     Rust risk scan, and full `make pre-commit`.
+- [x] `CTX-005` Migrate admin object-store consumers.
+  - Do: migrate admin handlers, admin services, and admin router helpers to the
+    shared object-store resolver.
+  - Acceptance: admin object-store lookups use AppContext when present and
+    preserve the existing global object-layer fallback when absent.
+  - Verification: focused resolver test, formatting, compile check, migration
+    guards, diff hygiene, Rust risk scan, and full `make pre-commit`.
 
 ## Phase 1 Security Governance Tasks
 
@@ -473,25 +480,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `pure-move`: start `R-009` boot wrapper with the IAM degraded readiness
+1. `consumer-migration`: migrate the next low-risk non-admin AppContext
+   consumer group while preserving global fallback.
+2. `pure-move`: start `R-009` boot wrapper with the IAM degraded readiness
    contract covered.
-2. `consumer-migration`: migrate the next low-risk AppContext consumer group
-   while preserving global fallback.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Single `consumer-migration` slice; helpers stay private to each usecase and no service container, registry, or cross-layer dependency is added. |
-| Migration preservation | pass | AppContext object-store resolution is preferred when present, existing `new_object_layer_fn` fallback and `Not init` error paths are preserved, and method bodies keep their storage behavior. |
-| Testing/verification | pass | Formatting, compile check, diff hygiene, migration guards, added-line Rust risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | pass | Single `consumer-migration` slice; the shared object-store resolver owns fallback behavior and admin callers do not add service containers, registries, or cross-layer dependencies. |
+| Migration preservation | pass | AppContext object-store resolution is preferred when present, existing global object-layer fallback and admin error paths are preserved, and method bodies keep their storage behavior. |
+| Testing/verification | pass | Focused resolver test, formatting, compile check, diff hygiene, migration guards, added-line Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `bed875d3e0d114398da8b2f94d4473293cbc45a8`:
+Passed on `6fcd62ba5648f90f6a78a0819f54e4a881cc2a87`:
 - `cargo fmt --all`.
 - `cargo fmt --all --check`.
 - `cargo check -p rustfs --lib`.
+- `cargo test -p rustfs app::context::compat::tests::resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`.
 - `git diff --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
@@ -502,12 +510,12 @@ Passed on `bed875d3e0d114398da8b2f94d4473293cbc45a8`:
   111 skipped, plus doctests.
 
 Notes:
-- This slice migrates one coherent app usecase consumer group.
+- This slice migrates one coherent admin object-store consumer group.
 - Global object-layer fallback remains available until the planned cleanup
   phase.
 
 ## Handoff Notes
 
-- CTX-004 is complete.
+- CTX-005 is complete.
 - Keep the next consumer or boot wrapper PR scoped to one PR type and preserve
   global fallback until the planned cleanup phase.

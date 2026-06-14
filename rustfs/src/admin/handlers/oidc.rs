@@ -15,6 +15,7 @@
 use super::sts::create_oidc_sts_credentials;
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::app::context::resolve_object_store_handle;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, MINIO_ADMIN_PREFIX, RemoteAddr};
 use http::StatusCode;
@@ -30,7 +31,6 @@ use rustfs_config::server_config::Config as ServerConfig;
 use rustfs_config::server_config::get_global_server_config;
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::com::{read_config_without_migrate, save_server_config};
-use rustfs_ecstore::new_object_layer_fn;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::de::DeserializeOwned;
@@ -749,7 +749,7 @@ fn json_response<T: Serialize>(status: StatusCode, payload: &T) -> S3Result<S3Re
 }
 
 async fn load_server_config_from_store() -> S3Result<ServerConfig> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(s3_error!(InternalError, "storage layer not initialized"));
     };
 
@@ -759,7 +759,7 @@ async fn load_server_config_from_store() -> S3Result<ServerConfig> {
 }
 
 async fn save_server_config_to_store(config: &ServerConfig) -> S3Result<()> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(s3_error!(InternalError, "storage layer not initialized"));
     };
 

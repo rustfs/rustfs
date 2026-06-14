@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::admin::site_replication_identity::{deployment_id_for_endpoint, normalize_peer_map_by_identity_with};
+use crate::app::context::resolve_object_store_handle;
 use rustfs_ecstore::config::com::{read_config, save_config};
 use rustfs_ecstore::error::Error as StorageError;
-use rustfs_ecstore::new_object_layer_fn;
 use rustfs_madmin::PeerInfo;
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use serde_json::{Map, Value};
@@ -91,7 +91,7 @@ fn normalize_site_replication_state_json(data: &[u8]) -> Result<Option<Vec<u8>>,
 /// RustFS does not currently keep a separate in-memory cache for this state,
 /// so "reload" means validating that the persisted JSON is readable.
 pub async fn reload_site_replication_runtime_state() -> S3Result<()> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 

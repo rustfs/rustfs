@@ -22,6 +22,7 @@ use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
 use rustfs_ecstore::bucket::metadata_sys::BucketMetadataSys;
 use rustfs_ecstore::endpoints::EndpointServerPools;
+use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store::ECStore;
 use rustfs_ecstore::tier::tier::TierConfigMgr;
 use rustfs_kms::KmsServiceManager;
@@ -38,9 +39,9 @@ pub fn resolve_bucket_metadata_handle() -> Option<Arc<RwLock<BucketMetadataSys>>
     resolve_bucket_metadata_handle_with(get_global_app_context(), || default_bucket_metadata_interface().handle())
 }
 
-/// Resolve object store handle from AppContext.
+/// Resolve object store handle using AppContext-first precedence.
 pub fn resolve_object_store_handle() -> Option<Arc<ECStore>> {
-    resolve_object_store_handle_with(get_global_app_context())
+    resolve_object_store_handle_with(get_global_app_context(), new_object_layer_fn)
 }
 
 /// Resolve endpoints using AppContext-first precedence.
@@ -76,8 +77,11 @@ fn resolve_bucket_metadata_handle_with(
         .or_else(fallback)
 }
 
-fn resolve_object_store_handle_with(context: Option<Arc<AppContext>>) -> Option<Arc<ECStore>> {
-    context.map(|context| context.object_store())
+fn resolve_object_store_handle_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> Option<Arc<ECStore>>,
+) -> Option<Arc<ECStore>> {
+    context.map(|context| context.object_store()).or_else(fallback)
 }
 
 fn resolve_endpoints_handle_with(
@@ -295,7 +299,7 @@ mod tests {
             &bucket_metadata
         ));
         assert!(Arc::ptr_eq(
-            &resolve_object_store_handle_with(Some(context.clone())).expect("context object store"),
+            &resolve_object_store_handle_with(Some(context.clone()), || None).expect("context object store"),
             &object_store
         ));
         assert_eq!(
@@ -326,7 +330,10 @@ mod tests {
             &resolve_bucket_metadata_handle_with(None, || Some(bucket_metadata.clone())).expect("fallback bucket metadata"),
             &bucket_metadata
         ));
-        assert!(resolve_object_store_handle_with(None).is_none());
+        assert!(Arc::ptr_eq(
+            &resolve_object_store_handle_with(None, || Some(object_store.clone())).expect("fallback object store"),
+            &object_store
+        ));
         assert_eq!(
             resolve_endpoints_handle_with(None, || Some(endpoints.clone()))
                 .expect("fallback endpoints")

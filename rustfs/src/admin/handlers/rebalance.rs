@@ -17,6 +17,7 @@ use crate::{
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
     },
+    app::context::resolve_object_store_handle,
     auth::{check_key_valid, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},
 };
@@ -26,7 +27,6 @@ use matchit::Params;
 use rustfs_ecstore::rebalance::RebalanceMeta;
 use rustfs_ecstore::{
     error::StorageError,
-    new_object_layer_fn,
     notification_sys::get_global_notification_sys,
     rebalance::{DiskStat, RebalSaveOpt},
     store_api::BucketOperations,
@@ -238,7 +238,7 @@ impl Operation for RebalanceStart {
         )
         .await?;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(s3_error!(InternalError, "Failed to start rebalance: object layer not initialized"));
         };
 
@@ -322,7 +322,7 @@ impl Operation for RebalanceStatus {
         )
         .await?;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(s3_error!(InternalError, "Failed to load rebalance status: object layer not initialized"));
         };
 
@@ -400,7 +400,7 @@ impl Operation for RebalanceStop {
         )
         .await?;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(s3_error!(InternalError, "Failed to stop rebalance: object layer not initialized"));
         };
 
