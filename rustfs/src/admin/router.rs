@@ -14,6 +14,7 @@
 
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
+use crate::app::context::resolve_object_store_handle;
 use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
@@ -57,13 +58,10 @@ use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::config::com::read_config_without_migrate;
 use rustfs_ecstore::global::GLOBAL_BOOT_TIME;
+use rustfs_ecstore::global::{get_global_bucket_monitor, get_global_deployment_id, get_global_region};
 use rustfs_ecstore::notification_sys::get_global_notification_sys;
 use rustfs_ecstore::rpc::PeerRestClient;
 use rustfs_ecstore::store_api::BucketOperations;
-use rustfs_ecstore::{
-    global::{get_global_bucket_monitor, get_global_deployment_id, get_global_region},
-    new_object_layer_fn,
-};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_madmin::utils::parse_duration;
 use rustfs_notify::{Event as NotificationEvent, notification_system};
@@ -101,6 +99,7 @@ use tracing::{error, warn};
 use url::form_urlencoded;
 use uuid::Uuid;
 
+pub const ADMIN_OBJECT_ZIP_DOWNLOADS_PATH: &str = "/v3/object-zip-downloads";
 const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_OBJECT_LAMBDA: &str = "object_lambda";
 const LOG_SUBSYSTEM_LIVE_EVENTS: &str = "live_events";
@@ -630,7 +629,7 @@ async fn load_current_server_config() -> S3Result<Config> {
         return Ok(system.config.read().await.clone());
     }
 
-    if let Some(store) = new_object_layer_fn() {
+    if let Some(store) = resolve_object_store_handle() {
         match read_config_without_migrate(store).await {
             Ok(config) => return Ok(config),
             Err(err) => {
@@ -1398,7 +1397,7 @@ fn build_listen_notification_response(uri: &Uri, bucket: Option<&str>) -> S3Resu
 }
 
 async fn ensure_replication_bucket_exists(bucket: &str) -> S3Result<()> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
     };
 
@@ -2275,7 +2274,7 @@ async fn handle_misc_extension_request(req: &mut S3Request<Body>, route: &MiscEx
         }
         MiscExtRoute::ListenNotification { bucket } => {
             if let Some(bucket_name) = bucket {
-                let Some(store) = new_object_layer_fn() else {
+                let Some(store) = resolve_object_store_handle() else {
                     return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
                 };
                 store
@@ -2298,6 +2297,17 @@ pub struct S3Router<T> {
 
 fn is_public_health_path(path: &str) -> bool {
     path == HEALTH_PREFIX || path == HEALTH_READY_PATH
+}
+
+fn is_object_zip_download_token_path(method: &Method, uri: &Uri) -> bool {
+    if method != Method::GET {
+        return false;
+    }
+
+    let path = canonicalize_admin_path(uri.path());
+    path.starts_with(&format!("{ADMIN_PREFIX}{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH}/"))
+        && path.ends_with(".zip")
+        && query_value_exact(uri, "token").is_some_and(|token| !token.is_empty())
 }
 
 fn canonicalize_admin_path(path: &str) -> std::borrow::Cow<'_, str> {
@@ -2440,6 +2450,12 @@ where
 
         // Allow unauthenticated access to OIDC endpoints (user not yet authenticated)
         if is_oidc_path(path) {
+            return Ok(());
+        }
+
+        // Object ZIP downloads are browser-navigated with a short-lived token;
+        // the handler validates the token before returning any bytes.
+        if is_object_zip_download_token_path(&req.method, &req.uri) {
             return Ok(());
         }
 
@@ -3870,6 +3886,77 @@ mod tests {
             .check_access(&mut req)
             .await
             .expect_err("anonymous profile request must be denied");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[tokio::test]
+    async fn check_access_allows_object_zip_download_token_navigation() {
+        let router: S3Router<AdminOperation> = S3Router::new(false);
+        let mut req = S3Request {
+            input: Body::from(String::new()),
+            method: Method::GET,
+            uri: "/rustfs/admin/v3/object-zip-downloads/example.zip?token=abc"
+                .parse()
+                .expect("uri should parse"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        router
+            .check_access(&mut req)
+            .await
+            .expect("token download navigation should reach the handler");
+    }
+
+    #[tokio::test]
+    async fn check_access_rejects_object_zip_download_without_token() {
+        let router: S3Router<AdminOperation> = S3Router::new(false);
+        let mut req = S3Request {
+            input: Body::from(String::new()),
+            method: Method::GET,
+            uri: "/rustfs/admin/v3/object-zip-downloads/example.zip"
+                .parse()
+                .expect("uri should parse"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = router
+            .check_access(&mut req)
+            .await
+            .expect_err("token download without token must be denied before handler");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[tokio::test]
+    async fn check_access_rejects_anonymous_object_zip_download_post() {
+        let router: S3Router<AdminOperation> = S3Router::new(false);
+        let mut req = S3Request {
+            input: Body::from(String::new()),
+            method: Method::POST,
+            uri: "/rustfs/admin/v3/object-zip-downloads?token=abc"
+                .parse()
+                .expect("uri should parse"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = router
+            .check_access(&mut req)
+            .await
+            .expect_err("token exception must not apply to POST");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 

@@ -981,6 +981,16 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
         "/rustfs/admin/v3/datausageinfo",
         DeferredRoutePolicyReason::MultipleActions,
     ),
+    deferred(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/object-zip-downloads",
+        DeferredRoutePolicyReason::S3Action,
+    ),
+    deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/object-zip-downloads/{id}.zip",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
     deferred(HttpMethod::Get, "/rustfs/admin/v3/metrics", DeferredRoutePolicyReason::CredentialOnly),
     deferred(HttpMethod::Get, "/rustfs/admin/v3/pools/list", DeferredRoutePolicyReason::MultipleActions),
     deferred(
@@ -1220,6 +1230,16 @@ mod tests {
             DeferredRoutePolicyReason::MultipleActions,
         );
         assert_deferred(HttpMethod::Get, "/rustfs/admin/v3/accountinfo", DeferredRoutePolicyReason::S3Action);
+        assert_deferred(
+            HttpMethod::Post,
+            "/rustfs/admin/v3/object-zip-downloads",
+            DeferredRoutePolicyReason::S3Action,
+        );
+        assert_deferred(
+            HttpMethod::Get,
+            "/rustfs/admin/v3/object-zip-downloads/{id}.zip",
+            DeferredRoutePolicyReason::CredentialOnly,
+        );
     }
 
     fn route_policy_inventory_keys() -> BTreeSet<String> {

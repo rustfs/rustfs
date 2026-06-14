@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::app::context::resolve_object_store_handle;
 use rustfs_audit::reload_audit_config;
 use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_WEBHOOK_SUB_SYS};
 use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_REDIS_DEFAULT_CHANNEL, NOTIFY_WEBHOOK_SUB_SYS};
@@ -23,7 +24,6 @@ use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
 use rustfs_ecstore::config::com::{STORAGE_CLASS_SUB_SYS, read_config_without_migrate};
 use rustfs_ecstore::config::set_global_storage_class;
 use rustfs_ecstore::config::storageclass;
-use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::notification_sys::get_global_notification_sys;
 use rustfs_iam::oidc::load_oidc_provider_configs_from_server_config;
 use rustfs_storage_api::StorageAdminApi;
@@ -67,7 +67,7 @@ fn invalid_request(message: impl Into<String>) -> S3Error {
 }
 
 async fn apply_storage_class_runtime_config(config: &ServerConfig) -> S3Result<()> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(internal_error("storage layer not initialized"));
     };
 
@@ -92,7 +92,7 @@ fn validate_storage_class_kvs(kvs: &KVS, set_drive_counts: &[usize]) -> S3Result
 }
 
 async fn validate_storage_class_config(config: &ServerConfig) -> S3Result<()> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(internal_error("storage layer not initialized"));
     };
 
@@ -297,7 +297,7 @@ pub async fn reload_dynamic_config_runtime_state(sub_system: &str) -> S3Result<(
         return Err(internal_error(format!("unsupported dynamic config subsystem: {sub_system}")));
     }
 
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(internal_error("storage layer not initialized"));
     };
 
@@ -313,7 +313,7 @@ pub async fn reload_dynamic_config_runtime_state(sub_system: &str) -> S3Result<(
 }
 
 pub async fn reload_runtime_config_snapshot() -> S3Result<()> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(internal_error("storage layer not initialized"));
     };
 
