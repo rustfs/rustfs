@@ -17,15 +17,6 @@ use rustfs::init::{
     add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system, init_update_check, print_server_info,
 };
 
-#[cfg(feature = "ftps")]
-use rustfs::init::{init_ftp_system, init_ftps_system};
-
-#[cfg(feature = "webdav")]
-use rustfs::init::init_webdav_system;
-
-#[cfg(feature = "sftp")]
-use rustfs::init::init_sftp_system;
-
 use futures_util::future::join_all;
 use rustfs::capacity::capacity_integration::init_capacity_management;
 use rustfs::license::{init_license, license_status};
@@ -35,6 +26,7 @@ use rustfs::server::{
 };
 use rustfs::startup_fs_guard::enforce_unsupported_fs_policy;
 use rustfs::startup_iam::{bootstrap_or_defer_iam_init, publish_ready_for_iam_bootstrap};
+use rustfs::startup_protocols::{ProtocolShutdownSenders, init_protocol_shutdown_senders};
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
@@ -606,173 +598,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     // Initialize KMS system if enabled
     init_kms_system(&config).await?;
 
-    // Initialize FTP system if enabled
-    #[cfg(feature = "ftps")]
-    let ftp_shutdown_tx = match init_ftp_system().await {
-        Ok(Some(tx)) => {
-            debug!(
-                event = EVENT_PROTOCOL_SYSTEM_STATE,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STARTUP,
-                protocol = "ftp",
-                state = "started",
-                "Protocol runtime started"
-            );
-            Some(tx)
-        }
-        Ok(None) => {
-            info!(
-                event = EVENT_PROTOCOL_SYSTEM_STATE,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STARTUP,
-                protocol = "ftp",
-                state = "disabled",
-                "Protocol runtime disabled"
-            );
-            None
-        }
-        Err(e) => {
-            error!(
-                event = EVENT_PROTOCOL_SYSTEM_STATE,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STARTUP,
-                protocol = "ftp",
-                state = "initialization_failed",
-                error = %e,
-                "Protocol runtime initialization failed"
-            );
-            return Err(Error::other(e));
-        }
-    };
-
-    #[cfg(not(feature = "ftps"))]
-    let ftp_shutdown_tx: Option<ShutdownHandle> = None;
-
-    // Initialize FTPS system if enabled
-    #[cfg(feature = "ftps")]
-    let ftps_shutdown_tx = match init_ftps_system().await {
-        Ok(Some(tx)) => {
-            debug!(
-                event = EVENT_PROTOCOL_SYSTEM_STATE,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STARTUP,
-                protocol = "ftps",
-                state = "started",
-                "Protocol runtime started"
-            );
-            Some(tx)
-        }
-        Ok(None) => {
-            info!(
-                event = EVENT_PROTOCOL_SYSTEM_STATE,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STARTUP,
-                protocol = "ftps",
-                state = "disabled",
-                "Protocol runtime disabled"
-            );
-            None
-        }
-        Err(e) => {
-            error!(
-                event = EVENT_PROTOCOL_SYSTEM_STATE,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STARTUP,
-                protocol = "ftps",
-                state = "initialization_failed",
-                error = %e,
-                "Protocol runtime initialization failed"
-            );
-            return Err(Error::other(e));
-        }
-    };
-
-    #[cfg(not(feature = "ftps"))]
-    let ftps_shutdown_tx: Option<ShutdownHandle> = None;
-
-    // Initialize WebDAV system if enabled
-    #[cfg(feature = "webdav")]
-    let webdav_shutdown_tx = match init_webdav_system().await {
-        Ok(Some(tx)) => {
-            debug!(
-                event = EVENT_PROTOCOL_SYSTEM_STATE,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STARTUP,
-                protocol = "webdav",
-                state = "started",
-                "Protocol runtime started"
-            );
-            Some(tx)
-        }
-        Ok(None) => {
-            info!(
-                event = EVENT_PROTOCOL_SYSTEM_STATE,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STARTUP,
-                protocol = "webdav",
-                state = "disabled",
-                "Protocol runtime disabled"
-            );
-            None
-        }
-        Err(e) => {
-            error!(
-                event = EVENT_PROTOCOL_SYSTEM_STATE,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STARTUP,
-                protocol = "webdav",
-                state = "initialization_failed",
-                error = %e,
-                "Protocol runtime initialization failed"
-            );
-            return Err(Error::other(e));
-        }
-    };
-
-    #[cfg(not(feature = "webdav"))]
-    let webdav_shutdown_tx: Option<ShutdownHandle> = None;
-
-    // Initialize SFTP system if enabled
-    #[cfg(feature = "sftp")]
-    let sftp_shutdown_tx = match init_sftp_system().await {
-        Ok(Some(tx)) => {
-            debug!(
-                event = EVENT_PROTOCOL_SYSTEM_STATE,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STARTUP,
-                protocol = "sftp",
-                state = "started",
-                "Protocol runtime started"
-            );
-            Some(tx)
-        }
-        Ok(None) => {
-            info!(
-                event = EVENT_PROTOCOL_SYSTEM_STATE,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STARTUP,
-                protocol = "sftp",
-                state = "disabled",
-                "Protocol runtime disabled"
-            );
-            None
-        }
-        Err(e) => {
-            error!(
-                event = EVENT_PROTOCOL_SYSTEM_STATE,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STARTUP,
-                protocol = "sftp",
-                state = "initialization_failed",
-                error = %e,
-                "Protocol runtime initialization failed"
-            );
-            return Err(Error::other(e));
-        }
-    };
-
-    #[cfg(not(feature = "sftp"))]
-    let sftp_shutdown_tx: Option<ShutdownHandle> = None;
+    let protocol_shutdowns = init_protocol_shutdown_senders().await?;
 
     // Initialize buffer profiling system
     init_buffer_profile_system(&config);
@@ -979,12 +805,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
         shutdown_signal,
         s3_shutdown_tx,
         console_shutdown_tx,
-        ProtocolShutdownSenders {
-            ftp: ftp_shutdown_tx,
-            ftps: ftps_shutdown_tx,
-            webdav: webdav_shutdown_tx,
-            sftp: sftp_shutdown_tx,
-        },
+        protocol_shutdowns,
         ctx.clone(),
     )
     .await;
@@ -1025,15 +846,6 @@ fn log_external_prefix_compat_report(report: &ExternalEnvCompatReport) {
             "Applied external-prefix compatibility mappings"
         );
     }
-}
-
-/// Shutdown channels for every protocol server. None means the protocol was
-/// disabled at startup.
-struct ProtocolShutdownSenders {
-    ftp: Option<ShutdownHandle>,
-    ftps: Option<ShutdownHandle>,
-    webdav: Option<ShutdownHandle>,
-    sftp: Option<ShutdownHandle>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
