@@ -15,7 +15,11 @@
 use crate::admin::handlers::health::{HealthProbe, build_health_response_parts, collect_dependency_readiness};
 use crate::license::has_valid_license;
 use crate::server::has_path_prefix;
-use crate::server::{CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, LICENSE, RUSTFS_ADMIN_PREFIX, VERSION};
+use crate::server::{
+    CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HeaderMapCarrier, LICENSE, RUSTFS_ADMIN_PREFIX,
+    RequestContextLayer, VERSION,
+};
+use crate::storage::request_context::RequestContext;
 use crate::version::build;
 use axum::{
     Json, Router,
@@ -27,6 +31,7 @@ use axum::{
 };
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use mime_guess::from_path;
+use opentelemetry::global;
 use rust_embed::RustEmbed;
 use serde::Serialize;
 use std::{
@@ -41,7 +46,8 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{Span, debug, error, info, instrument, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[derive(RustEmbed)]
 #[folder = "$CARGO_MANIFEST_DIR/static"]
@@ -491,9 +497,45 @@ fn setup_console_middleware_stack(
     // Add comprehensive middleware layers using tower-http features
     app = app
         .layer(CatchPanicLayer::new())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &Request| {
+                    let request_context = request.extensions().get::<RequestContext>();
+                    let request_id = request_context.map(|ctx| ctx.request_id.as_str()).unwrap_or("unknown");
+                    let trace_id = request_context.and_then(|ctx| ctx.trace_id.as_deref()).unwrap_or("unknown");
+                    let span_id = request_context.and_then(|ctx| ctx.span_id.as_deref()).unwrap_or("unknown");
+
+                    let parent_context = global::get_text_map_propagator(|propagator| {
+                        propagator.extract(&HeaderMapCarrier::new(request.headers()))
+                    });
+
+                    let span = tracing::info_span!(
+                        "console-request",
+                        request_id = %request_id,
+                        trace_id = %trace_id,
+                        span_id = %span_id,
+                        method = %request.method(),
+                        uri = %request.uri(),
+                        status_code = tracing::field::Empty,
+                    );
+
+                    if span.is_disabled() {
+                        return span;
+                    }
+
+                    if let Err(err) = span.set_parent(parent_context) {
+                        debug!(error = ?err, "Failed to propagate tracing context for console request");
+                    }
+
+                    span
+                })
+                .on_response(|response: &Response, _latency: Duration, span: &Span| {
+                    span.record("status_code", tracing::field::display(response.status()));
+                }),
+        )
         .layer(PropagateRequestIdLayer::x_request_id())
+        .layer(RequestContextLayer)
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-        .layer(TraceLayer::new_for_http())
         // Compress responses
         .layer(CompressionLayer::new())
         .layer(middleware::from_fn(console_logging_middleware))
@@ -684,12 +726,47 @@ pub(crate) fn make_console_server() -> Router {
 mod tests {
     use super::*;
     use axum::body::Body;
+    use axum::routing::get;
     use http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use serial_test::serial;
+    use std::io;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::{Arc, Mutex};
     use temp_env::async_with_vars;
     use tower::ServiceExt;
+    use tracing_subscriber::{Registry, layer::SubscriberExt};
+
+    #[derive(Clone, Default)]
+    struct SharedWriter {
+        inner: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct SharedWriterGuard {
+        inner: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for SharedWriter {
+        type Writer = SharedWriterGuard;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            SharedWriterGuard {
+                inner: Arc::clone(&self.inner),
+            }
+        }
+    }
+
+    impl io::Write for SharedWriterGuard {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut inner = self.inner.lock().expect("shared writer lock should not be poisoned");
+            inner.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn console_api_base_url_keeps_rustfs_admin_prefix() {
@@ -736,6 +813,112 @@ mod tests {
         assert!(
             response.headers().contains_key("x-request-id"),
             "console response should include propagated x-request-id header"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn console_trace_layer_records_request_id_on_current_span() {
+        let writer = SharedWriter::default();
+        let subscriber = Registry::default().with(
+            tracing_subscriber::fmt::layer()
+                .without_time()
+                .with_target(false)
+                .with_level(false)
+                .with_ansi(false)
+                .json()
+                .flatten_event(true)
+                .with_current_span(true)
+                .with_span_list(true)
+                .with_writer(writer.clone()),
+        );
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let app = Router::new()
+            .route(
+                "/trace-test",
+                get(|| async {
+                    tracing::info!("console handler log");
+                    StatusCode::OK
+                }),
+            )
+            .layer(
+                TraceLayer::new_for_http()
+                    .make_span_with(|request: &http::Request<_>| {
+                        let request_context = request.extensions().get::<RequestContext>();
+                        let request_id = request_context.map(|ctx| ctx.request_id.as_str()).unwrap_or("unknown");
+                        let trace_id = request_context.and_then(|ctx| ctx.trace_id.as_deref()).unwrap_or("unknown");
+                        let span_id = request_context.and_then(|ctx| ctx.span_id.as_deref()).unwrap_or("unknown");
+
+                        let parent_context = global::get_text_map_propagator(|propagator| {
+                            propagator.extract(&HeaderMapCarrier::new(request.headers()))
+                        });
+
+                        let span = tracing::info_span!(
+                            "console-request",
+                            request_id = %request_id,
+                            trace_id = %trace_id,
+                            span_id = %span_id,
+                            method = %request.method(),
+                            uri = %request.uri(),
+                            status_code = tracing::field::Empty,
+                        );
+
+                        if span.is_disabled() {
+                            return span;
+                        }
+
+                        if let Err(err) = span.set_parent(parent_context) {
+                            debug!(error = ?err, "Failed to propagate tracing context for console request");
+                        }
+
+                        span
+                    })
+                    .on_response(|response: &Response, _latency: Duration, span: &Span| {
+                        span.record("status_code", tracing::field::display(response.status()));
+                    }),
+            )
+            .layer(RequestContextLayer)
+            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
+
+        app.oneshot(
+            Request::builder()
+                .uri("/trace-test")
+                .body(Body::empty())
+                .expect("failed to build trace test request"),
+        )
+        .await
+        .expect("trace test request should complete");
+
+        let output = String::from_utf8(
+            writer
+                .inner
+                .lock()
+                .expect("shared writer lock should not be poisoned")
+                .clone(),
+        )
+        .expect("console trace log output should be valid UTF-8");
+
+        let log = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("console log line should be valid JSON"))
+            .find(|value| value.get("message").and_then(serde_json::Value::as_str) == Some("console handler log"))
+            .expect("expected console handler log entry");
+
+        assert_eq!(log["span"]["method"], serde_json::Value::String("GET".to_string()));
+        assert_eq!(log["span"]["name"], serde_json::Value::String("console-request".to_string()));
+        assert!(
+            log.get("span")
+                .and_then(|span| span.get("request_id"))
+                .and_then(serde_json::Value::as_str)
+                .is_some(),
+            "{output}"
+        );
+        assert_ne!(
+            log.get("span")
+                .and_then(|span| span.get("request_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("unknown"),
+            "{output}"
         );
     }
 

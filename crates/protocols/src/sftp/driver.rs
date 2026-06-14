@@ -40,6 +40,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Semaphore;
+use tracing::Instrument;
 use uuid::Uuid;
 
 /// Permits available to the fire-and-forget AbortMultipartUpload tasks
@@ -1086,88 +1087,91 @@ impl<S: StorageBackend + Send + Sync + 'static> Drop for SftpDriver<S> {
                 }
             };
 
-            tokio::spawn(async move {
-                let _permit = permit;
-                tracing::warn!(
-                    bucket = %bucket,
-                    key = %key,
-                    upload_id = %upload_id,
-                    peer = %peer,
-                    "aborting orphaned multipart upload on session drop"
-                );
-                // Build AbortMultipartUploadInput inside the spawned
-                // task so the builder Result is handled in async
-                // context. The builder only fails on missing required
-                // fields. bucket, key, and upload_id are all set, so
-                // log and return on any unexpected failure.
-                let input = match AbortMultipartUploadInput::builder()
-                    .bucket(bucket.clone())
-                    .key(key.clone())
-                    .upload_id(upload_id.clone())
-                    .build()
-                {
-                    Ok(input) => input,
-                    Err(e) => {
-                        tracing::error!(
-                            bucket = %bucket,
-                            key = %key,
-                            upload_id = %upload_id,
-                            err = %e,
-                            "failed to build AbortMultipartUploadInput on session drop"
-                        );
-                        return;
-                    }
-                };
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(backend_op_timeout_secs),
-                    storage.abort_multipart_upload(input, &access_key, &secret_key),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => {
-                        // close() removes the tombstone only on Ok, so Drop
-                        // retries any abort whose inline attempt caused an
-                        // error. A retried abort can race a concurrent
-                        // successful CompleteMultipartUpload, returning
-                        // NoSuchUpload. Log at debug to keep error-level
-                        // logs reserved for genuine abort failures.
-                        if is_no_such_upload_error(&e) {
-                            tracing::debug!(
-                                bucket = %bucket,
-                                key = %key,
-                                upload_id = %upload_id,
-                                "Drop abort returned NoSuchUpload: upload already completed or aborted",
-                            );
-                        } else {
+            tokio::spawn(
+                async move {
+                    let _permit = permit;
+                    tracing::warn!(
+                        bucket = %bucket,
+                        key = %key,
+                        upload_id = %upload_id,
+                        peer = %peer,
+                        "aborting orphaned multipart upload on session drop"
+                    );
+                    // Build AbortMultipartUploadInput inside the spawned
+                    // task so the builder Result is handled in async
+                    // context. The builder only fails on missing required
+                    // fields. bucket, key, and upload_id are all set, so
+                    // log and return on any unexpected failure.
+                    let input = match AbortMultipartUploadInput::builder()
+                        .bucket(bucket.clone())
+                        .key(key.clone())
+                        .upload_id(upload_id.clone())
+                        .build()
+                    {
+                        Ok(input) => input,
+                        Err(e) => {
                             tracing::error!(
                                 bucket = %bucket,
                                 key = %key,
                                 upload_id = %upload_id,
                                 err = %e,
-                                "failed to abort orphaned multipart upload"
+                                "failed to build AbortMultipartUploadInput on session drop"
+                            );
+                            return;
+                        }
+                    };
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(backend_op_timeout_secs),
+                        storage.abort_multipart_upload(input, &access_key, &secret_key),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => {
+                            // close() removes the tombstone only on Ok, so Drop
+                            // retries any abort whose inline attempt caused an
+                            // error. A retried abort can race a concurrent
+                            // successful CompleteMultipartUpload, returning
+                            // NoSuchUpload. Log at debug to keep error-level
+                            // logs reserved for genuine abort failures.
+                            if is_no_such_upload_error(&e) {
+                                tracing::debug!(
+                                    bucket = %bucket,
+                                    key = %key,
+                                    upload_id = %upload_id,
+                                    "Drop abort returned NoSuchUpload: upload already completed or aborted",
+                                );
+                            } else {
+                                tracing::error!(
+                                    bucket = %bucket,
+                                    key = %key,
+                                    upload_id = %upload_id,
+                                    err = %e,
+                                    "failed to abort orphaned multipart upload"
+                                );
+                            }
+                        }
+                        Err(_elapsed) => {
+                            // Drop's abort task is bounded by the same
+                            // per-call deadline as inline backend calls.
+                            // A timeout here is rare (the runtime drains
+                            // session tasks for SHUTDOWN_DRAIN_TIMEOUT_SECS
+                            // and Drop runs after that), so log at warn so
+                            // operators can correlate the orphaned upload
+                            // with the bucket AbortIncompleteMultipartUpload
+                            // lifecycle rule that will reclaim it.
+                            tracing::warn!(
+                                bucket = %bucket,
+                                key = %key,
+                                upload_id = %upload_id,
+                                timeout_secs = backend_op_timeout_secs,
+                                "Drop abort of orphaned multipart upload timed out; bucket lifecycle rule must reclaim parts",
                             );
                         }
                     }
-                    Err(_elapsed) => {
-                        // Drop's abort task is bounded by the same
-                        // per-call deadline as inline backend calls.
-                        // A timeout here is rare (the runtime drains
-                        // session tasks for SHUTDOWN_DRAIN_TIMEOUT_SECS
-                        // and Drop runs after that), so log at warn so
-                        // operators can correlate the orphaned upload
-                        // with the bucket AbortIncompleteMultipartUpload
-                        // lifecycle rule that will reclaim it.
-                        tracing::warn!(
-                            bucket = %bucket,
-                            key = %key,
-                            upload_id = %upload_id,
-                            timeout_secs = backend_op_timeout_secs,
-                            "Drop abort of orphaned multipart upload timed out; bucket lifecycle rule must reclaim parts",
-                        );
-                    }
                 }
-            });
+                .instrument(tracing::Span::current()),
+            );
         }
     }
 }
