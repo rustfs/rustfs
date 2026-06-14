@@ -214,7 +214,7 @@ impl NodeService {
         &self,
         _request: Request<LocalStorageInfoRequest>,
     ) -> Result<Response<LocalStorageInfoResponse>, Status> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Ok(Response::new(LocalStorageInfoResponse {
                 success: false,
                 storage_info: Bytes::new(),
