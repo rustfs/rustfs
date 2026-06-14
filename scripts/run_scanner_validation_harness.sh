@@ -3,8 +3,9 @@ set -euo pipefail
 
 ALIAS=""
 ENDPOINT=""
-ACCESS_KEY=""
+ACCESS_KEY="${RUSTFS_ACCESS_KEY:-}"
 SECRET_KEY=""
+SECRET_KEY_ENV="RUSTFS_SECRET_KEY"
 REGION="us-east-1"
 DEPLOYMENT="single-disk"
 WORKLOAD_LABEL="unspecified"
@@ -22,15 +23,18 @@ usage() {
   cat <<'USAGE'
 Usage:
   scripts/run_scanner_validation_harness.sh --alias <admin-alias> \
-    --endpoint <url> --access-key <ak> --secret-key <sk> [options]
+    --endpoint <url> [options]
 
 Required:
   --alias                 Admin client alias used for config snapshots.
   --endpoint              RustFS endpoint, for example http://127.0.0.1:9000.
-  --access-key            Admin access key for scanner status requests.
-  --secret-key            Admin secret key for scanner status requests.
+  RUSTFS_ACCESS_KEY       Admin access key for scanner status requests.
+  RUSTFS_SECRET_KEY       Admin secret key for scanner status requests.
 
 Optional:
+  --access-key            Override RUSTFS_ACCESS_KEY for scanner status requests.
+  --secret-key-env        Environment variable that stores the admin secret key
+                          (default: RUSTFS_SECRET_KEY).
   --region                SigV4 region (default: us-east-1).
   --deployment            single-disk | multi-disk | distributed (default: single-disk).
   --workload-label        Free-form workload label written to metadata.
@@ -83,7 +87,7 @@ parse_args() {
       --alias) ALIAS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --endpoint) ENDPOINT="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --access-key) ACCESS_KEY="$(arg_value "$1" "${2:-}")"; shift 2 ;;
-      --secret-key) SECRET_KEY="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --secret-key-env) SECRET_KEY_ENV="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --region) REGION="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --deployment) DEPLOYMENT="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --workload-label) WORKLOAD_LABEL="$(arg_value "$1" "${2:-}")"; shift 2 ;;
@@ -106,8 +110,19 @@ parse_args() {
 }
 
 validate_args() {
-  if [[ -z "$ALIAS" || -z "$ENDPOINT" || -z "$ACCESS_KEY" || -z "$SECRET_KEY" ]]; then
-    echo "ERROR: --alias, --endpoint, --access-key, and --secret-key are required" >&2
+  if [[ -z "$ALIAS" || -z "$ENDPOINT" || -z "$ACCESS_KEY" ]]; then
+    echo "ERROR: --alias, --endpoint, and RUSTFS_ACCESS_KEY (or --access-key) are required" >&2
+    exit 1
+  fi
+
+  if ! [[ "$SECRET_KEY_ENV" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    echo "ERROR: --secret-key-env must be a valid environment variable name" >&2
+    exit 1
+  fi
+
+  SECRET_KEY="${!SECRET_KEY_ENV:-}"
+  if [[ -z "$SECRET_KEY" ]]; then
+    echo "ERROR: $SECRET_KEY_ENV is required for scanner status requests" >&2
     exit 1
   fi
 
@@ -172,7 +187,7 @@ first_rustfs_pid() {
     return
   fi
 
-  pidof rustfs 2>/dev/null | awk '{ print $1 }'
+  pidof rustfs 2>/dev/null | awk '{ print $1 }' || true
 }
 
 start_host_telemetry() {
@@ -222,11 +237,12 @@ capture_status_sample() {
   local ts="$2"
   local status_file="$OUT_DIR/status/scanner-status.${index}.${ts}.json"
 
+  AWS_ACCESS_KEY_ID="$ACCESS_KEY" \
+  AWS_SECRET_ACCESS_KEY="$SECRET_KEY" \
+  AWS_DEFAULT_REGION="$REGION" \
   "$AWSCURL_BIN" \
     --service s3 \
     --region "$REGION" \
-    --access_key "$ACCESS_KEY" \
-    --secret_key "$SECRET_KEY" \
     --request GET \
     "$(scanner_status_url)" \
     | "$JQ_BIN" . >"$status_file"

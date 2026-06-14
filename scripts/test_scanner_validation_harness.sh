@@ -30,6 +30,8 @@ cat >"$BIN_DIR/awscurl" <<'STUB'
 set -euo pipefail
 
 printf '%s\n' "$*" >>"${AWSCURL_LOG:?}"
+printf 'access-env-present=%s\n' "${AWS_ACCESS_KEY_ID:+yes}" >>"${AWSCURL_LOG:?}"
+printf 'secret-env-present=%s\n' "${AWS_SECRET_ACCESS_KEY:+yes}" >>"${AWSCURL_LOG:?}"
 cat <<'JSON'
 {
   "runtime_config": {
@@ -56,6 +58,21 @@ cat <<'JSON'
 JSON
 STUB
 
+cat >"$BIN_DIR/pidof" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+
+cat >"$BIN_DIR/iostat" <<'STUB'
+#!/usr/bin/env bash
+printf 'iostat sample\n'
+STUB
+
+cat >"$BIN_DIR/mpstat" <<'STUB'
+#!/usr/bin/env bash
+printf 'mpstat sample\n'
+STUB
+
 cat >"$BIN_DIR/jq" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -79,15 +96,14 @@ printf 'unexpected jq args: %s\n' "$*" >&2
 exit 1
 STUB
 
-chmod +x "$BIN_DIR/mc" "$BIN_DIR/awscurl" "$BIN_DIR/jq"
+chmod +x "$BIN_DIR/mc" "$BIN_DIR/awscurl" "$BIN_DIR/pidof" "$BIN_DIR/iostat" "$BIN_DIR/mpstat" "$BIN_DIR/jq"
 
 mc_log="$TMP_DIR/mc.log"
 awscurl_log="$TMP_DIR/awscurl.log"
-MC_LOG="$mc_log" AWSCURL_LOG="$awscurl_log" PATH="$BIN_DIR:$PATH" "$SCRIPT" \
+RUSTFS_SECRET_KEY=rustfsadmin MC_LOG="$mc_log" AWSCURL_LOG="$awscurl_log" PATH="$BIN_DIR:$PATH" "$SCRIPT" \
   --alias rustfs-local \
   --endpoint http://127.0.0.1:9000 \
   --access-key rustfsadmin \
-  --secret-key rustfsadmin \
   --deployment single-disk \
   --workload-label small-object-idle \
   --samples 2 \
@@ -117,7 +133,28 @@ grep -q '^workload_label=small-object-idle$' "$OUT_DIR/run-metadata.env"
 grep -q 'admin config get rustfs-local scanner' "$mc_log"
 grep -q 'admin config get rustfs-local heal' "$mc_log"
 grep -q -- '--request GET' "$awscurl_log"
+grep -q -- 'access-env-present=yes' "$awscurl_log"
+grep -q -- 'secret-env-present=yes' "$awscurl_log"
+if grep -q -- '--secret_key' "$awscurl_log"; then
+  echo "Expected awscurl to receive the secret through the environment, not argv" >&2
+  exit 1
+fi
 grep -q -- 'http://127.0.0.1:9000/rustfs/admin/v3/scanner/status' "$awscurl_log"
+
+missing_pid_out="$TMP_DIR/out-missing-pid"
+RUSTFS_SECRET_KEY=rustfsadmin MC_LOG="$mc_log" AWSCURL_LOG="$awscurl_log" PATH="$BIN_DIR:$PATH" "$SCRIPT" \
+  --alias rustfs-local \
+  --endpoint http://127.0.0.1:9000 \
+  --access-key rustfsadmin \
+  --deployment single-disk \
+  --workload-label missing-pid \
+  --samples 1 \
+  --interval-secs 1 \
+  --out-dir "$missing_pid_out"
+
+test -s "$missing_pid_out/status/scanner-status.1."*.json
+test -s "$missing_pid_out/iostat.txt"
+test -s "$missing_pid_out/mpstat.txt"
 
 missing_args_log="$TMP_DIR/missing-args.log"
 if PATH="$BIN_DIR:$PATH" "$SCRIPT" --alias rustfs-local >"$missing_args_log" 2>&1; then
@@ -125,7 +162,30 @@ if PATH="$BIN_DIR:$PATH" "$SCRIPT" --alias rustfs-local >"$missing_args_log" 2>&
   exit 1
 fi
 
-grep -q -- '--endpoint, --access-key, and --secret-key are required' "$missing_args_log"
+grep -q -- '--alias, --endpoint, and RUSTFS_ACCESS_KEY (or --access-key) are required' "$missing_args_log"
+
+missing_secret_log="$TMP_DIR/missing-secret.log"
+if PATH="$BIN_DIR:$PATH" "$SCRIPT" \
+  --alias rustfs-local \
+  --endpoint http://127.0.0.1:9000 \
+  --access-key rustfsadmin >"$missing_secret_log" 2>&1; then
+  echo "Expected missing RUSTFS_SECRET_KEY to fail" >&2
+  exit 1
+fi
+
+grep -q -- 'RUSTFS_SECRET_KEY is required for scanner status requests' "$missing_secret_log"
+
+invalid_secret_env_log="$TMP_DIR/invalid-secret-env.log"
+if PATH="$BIN_DIR:$PATH" "$SCRIPT" \
+  --alias rustfs-local \
+  --endpoint http://127.0.0.1:9000 \
+  --access-key rustfsadmin \
+  --secret-key-env 'not-valid!' >"$invalid_secret_env_log" 2>&1; then
+  echo "Expected invalid --secret-key-env to fail" >&2
+  exit 1
+fi
+
+grep -q -- '--secret-key-env must be a valid environment variable name' "$invalid_secret_env_log"
 
 missing_value_log="$TMP_DIR/missing-value.log"
 if PATH="$BIN_DIR:$PATH" "$SCRIPT" --alias >"$missing_value_log" 2>&1; then
@@ -134,3 +194,11 @@ if PATH="$BIN_DIR:$PATH" "$SCRIPT" --alias >"$missing_value_log" 2>&1; then
 fi
 
 grep -q -- 'missing value for --alias' "$missing_value_log"
+
+secret_arg_log="$TMP_DIR/secret-arg.log"
+if PATH="$BIN_DIR:$PATH" "$SCRIPT" --secret-key rustfsadmin >"$secret_arg_log" 2>&1; then
+  echo "Expected --secret-key argv to be rejected" >&2
+  exit 1
+fi
+
+grep -q -- 'unknown arg: --secret-key' "$secret_arg_log"

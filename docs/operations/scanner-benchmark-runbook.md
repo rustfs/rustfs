@@ -140,11 +140,12 @@ throughout the idle observation window.
 The repository includes a scanner validation harness for repeatable collection:
 
 ```bash
+export RUSTFS_ACCESS_KEY="<admin-access-key>"
+export RUSTFS_SECRET_KEY="<admin-secret-key>"
+
 scripts/run_scanner_validation_harness.sh \
   --alias ALIAS \
   --endpoint http://127.0.0.1:9000 \
-  --access-key "$RUSTFS_ACCESS_KEY" \
-  --secret-key "$RUSTFS_SECRET_KEY" \
   --deployment single-disk \
   --workload-label small-object-idle \
   --samples 30 \
