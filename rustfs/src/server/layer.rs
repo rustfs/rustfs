@@ -26,7 +26,7 @@ use crate::server::{
 use crate::storage::apply_cors_headers;
 use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
 use bytes::Bytes;
-use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode};
+use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode, Uri};
 use http_body::Body;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
@@ -992,6 +992,152 @@ where
     }
 }
 
+/// Structured-log event emitted when a virtual-hosted-style request cannot be
+/// routed because no server domain is configured.
+const VIRTUAL_HOST_STYLE_UNROUTABLE_EVENT: &str = "virtual_host_style_unroutable";
+
+/// Detects S3 requests that can only be virtual-hosted-style yet cannot be routed
+/// because no server domain is configured (`RUSTFS_SERVER_DOMAINS` unset).
+///
+/// Without a configured domain, s3s parses every request as path-style, so a
+/// virtual-hosted-style `PUT /` (the AWS SDK / Terraform default for `CreateBucket`)
+/// arrives with an empty bucket and fails with an opaque `501 NotImplemented`.
+///
+/// Only the service root (`/`) with a method that has no path-style equivalent
+/// (`PUT`/`DELETE`) and a DNS-style host (not an IP/socket address, and dotted like
+/// `bucket.example.com`) is matched. The host is read from the `Host` header
+/// (HTTP/1.1) or the request URI authority (HTTP/2 `:authority`). Such requests
+/// already fail today, so returning a clearer error never changes the outcome of a
+/// routable request. Returns the request host (without port) when matched.
+fn unroutable_virtual_host_target(method: &Method, uri: &Uri, headers: &HeaderMap) -> Option<String> {
+    if *method != Method::PUT && *method != Method::DELETE {
+        return None;
+    }
+    if uri.path() != "/" {
+        return None;
+    }
+
+    // `Host` is set for HTTP/1.1; HTTP/2 carries the host in the URI authority.
+    let host = match headers.get(http::header::HOST).and_then(|value| value.to_str().ok()) {
+        Some(host) => host,
+        None => uri.authority().map(|authority| authority.as_str())?,
+    };
+    if host.is_empty() {
+        return None;
+    }
+    // IP / socket-address hosts always use path-style addressing in s3s.
+    if rustfs_utils::is_socket_addr(host) {
+        return None;
+    }
+    // Drop an optional `:port`; DNS hosts have no other `:`.
+    let host = host.rsplit_once(':').map_or(host, |(name, _)| name);
+    // Require a dotted DNS name (the shape of a virtual-hosted bucket subdomain).
+    if !host.contains('.') || host.starts_with('.') || host.ends_with('.') {
+        return None;
+    }
+
+    Some(host.to_owned())
+}
+
+fn xml_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn build_virtual_host_hint_response<RestBody, GrpcBody>(host: &str, resource: &str) -> Response<HybridBody<RestBody, GrpcBody>>
+where
+    RestBody: From<Bytes>,
+{
+    // The leftmost label is the bucket; the remainder is the server domain the
+    // operator most likely needs to configure.
+    let suggested_domain = host.split_once('.').map_or(host, |(_, rest)| rest);
+    let message = format!(
+        "Virtual-hosted-style request for host '{host}' could not be routed because no server domain is configured. \
+         Set RUSTFS_SERVER_DOMAINS to your S3 endpoint domain (for example, if '{host}' addresses a bucket as \
+         <bucket>.<domain>, set RUSTFS_SERVER_DOMAINS={suggested_domain}), or configure your S3 client to use \
+         path-style addressing (AWS SDK: force_path_style=true; Terraform aws provider: s3_use_path_style = true)."
+    );
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <Error><Code>NotImplemented</Code><Message>{message}</Message><Resource>{resource}</Resource></Error>",
+        message = xml_escape(&message),
+        resource = xml_escape(resource),
+    );
+
+    Response::builder()
+        .status(StatusCode::NOT_IMPLEMENTED)
+        .header(http::header::CONTENT_TYPE, "application/xml")
+        .body(HybridBody::Rest {
+            rest_body: RestBody::from(Bytes::from(body)),
+        })
+        .expect("failed to build virtual-host hint response")
+}
+
+/// Returns an actionable error for virtual-hosted-style S3 requests that cannot be
+/// routed because `RUSTFS_SERVER_DOMAINS` is not configured. See
+/// [`unroutable_virtual_host_target`]. The layer is only installed when no server
+/// domain is configured, so it is a pure pass-through for every routable request.
+#[derive(Clone)]
+pub struct VirtualHostStyleHintLayer;
+
+impl<S> Layer<S> for VirtualHostStyleHintLayer {
+    type Service = VirtualHostStyleHintService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        VirtualHostStyleHintService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct VirtualHostStyleHintService<S> {
+    inner: S,
+}
+
+impl<S, ReqBody, RestBody, GrpcBody> Service<HttpRequest<ReqBody>> for VirtualHostStyleHintService<S>
+where
+    S: Service<HttpRequest<ReqBody>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    ReqBody: Send + 'static,
+    RestBody: From<Bytes> + Send + 'static,
+    GrpcBody: Send + 'static,
+{
+    type Response = Response<HybridBody<RestBody, GrpcBody>>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
+        if let Some(host) = unroutable_virtual_host_target(req.method(), req.uri(), req.headers()) {
+            let resource = req.uri().path().to_owned();
+            debug!(
+                event = VIRTUAL_HOST_STYLE_UNROUTABLE_EVENT,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_HTTP,
+                host = %host,
+                method = %req.method(),
+                "Rejected virtual-hosted-style request: no server domain configured (set RUSTFS_SERVER_DOMAINS or use path-style)"
+            );
+            return Box::pin(async move { Ok(build_virtual_host_hint_response(&host, &resource)) });
+        }
+
+        let mut inner = self.inner.clone();
+        Box::pin(async move { inner.call(req).await })
+    }
+}
+
 fn is_bodyless_status(status: StatusCode) -> bool {
     status.is_informational()
         || status == StatusCode::NO_CONTENT
@@ -1487,6 +1633,135 @@ mod tests {
             assert!(body.windows(br#""status":"#.len()).any(|window| window == br#""status":"#));
         })
         .await;
+    }
+
+    #[test]
+    fn unroutable_virtual_host_target_matches_service_root_writes() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::HOST, HeaderValue::from_static("my-bucket.s3.example.com"));
+        assert_eq!(
+            unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/"), &headers),
+            Some("my-bucket.s3.example.com".to_owned())
+        );
+        assert_eq!(
+            unroutable_virtual_host_target(&Method::DELETE, &Uri::from_static("/"), &headers),
+            Some("my-bucket.s3.example.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn unroutable_virtual_host_target_strips_port() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::HOST, HeaderValue::from_static("bucket.localhost:9000"));
+        assert_eq!(
+            unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/"), &headers),
+            Some("bucket.localhost".to_owned())
+        );
+    }
+
+    #[test]
+    fn unroutable_virtual_host_target_uses_uri_authority_when_host_header_absent() {
+        // HTTP/2 clients carry the host in the URI authority (`:authority`) rather than a Host header.
+        let uri = Uri::from_static("https://my-bucket.s3.example.com/");
+        assert_eq!(
+            unroutable_virtual_host_target(&Method::PUT, &uri, &HeaderMap::new()),
+            Some("my-bucket.s3.example.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn unroutable_virtual_host_target_ignores_non_matching_requests() {
+        let mut vhost = HeaderMap::new();
+        vhost.insert(http::header::HOST, HeaderValue::from_static("bucket.s3.example.com"));
+        // Path-style request carries the bucket in the path.
+        assert_eq!(unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/bucket"), &vhost), None);
+        // GET / is ListBuckets, a valid path-style service call.
+        assert_eq!(unroutable_virtual_host_target(&Method::GET, &Uri::from_static("/"), &vhost), None);
+
+        // IP / socket-address hosts always use path-style addressing.
+        let mut ip = HeaderMap::new();
+        ip.insert(http::header::HOST, HeaderValue::from_static("127.0.0.1:9000"));
+        assert_eq!(unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/"), &ip), None);
+
+        // Bare single-label hosts are not virtual-hosted bucket subdomains.
+        let mut bare = HeaderMap::new();
+        bare.insert(http::header::HOST, HeaderValue::from_static("localhost:9000"));
+        assert_eq!(unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/"), &bare), None);
+
+        // Trailing-dot FQDN is not matched (avoids suggesting a domain with a trailing dot).
+        let mut fqdn = HeaderMap::new();
+        fqdn.insert(http::header::HOST, HeaderValue::from_static("bucket.example.com."));
+        assert_eq!(unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/"), &fqdn), None);
+
+        // Missing Host header and no URI authority.
+        assert_eq!(
+            unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/"), &HeaderMap::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn build_virtual_host_hint_response_is_actionable() {
+        let response: Response<HybridBody<Full<Bytes>, Full<Bytes>>> =
+            build_virtual_host_hint_response("my-bucket.s3.example.com", "/");
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/xml")
+        );
+    }
+
+    #[tokio::test]
+    async fn virtual_host_style_hint_layer_short_circuits_unroutable_put() {
+        let inner = CountingHybridService::default();
+        let calls = inner.calls();
+        let mut service = VirtualHostStyleHintLayer.layer(inner);
+
+        let response = service
+            .call(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/")
+                    .header(http::header::HOST, "my-bucket.s3.example.com")
+                    .body(Full::<Bytes>::from(Bytes::new()))
+                    .expect("request"),
+            )
+            .await
+            .expect("hint response");
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
+        let body = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(body.contains("RUSTFS_SERVER_DOMAINS=s3.example.com"));
+        assert!(body.contains("s3_use_path_style"));
+    }
+
+    #[tokio::test]
+    async fn virtual_host_style_hint_layer_passes_through_path_style() {
+        let inner = CountingHybridService::default();
+        let calls = inner.calls();
+        let mut service = VirtualHostStyleHintLayer.layer(inner);
+
+        let response = service
+            .call(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/my-bucket")
+                    .header(http::header::HOST, "s3.example.com")
+                    .body(Full::<Bytes>::from(Bytes::new()))
+                    .expect("request"),
+            )
+            .await
+            .expect("inner response");
+
+        // Path-style request reaches the inner service unchanged.
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

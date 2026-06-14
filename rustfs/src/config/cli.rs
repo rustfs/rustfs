@@ -189,7 +189,13 @@ pub struct ServerOpts {
     )]
     pub address: String,
 
-    /// Domain name used for virtual-hosted-style requests.
+    /// Domain name(s) for virtual-hosted-style S3 requests (comma-separated).
+    ///
+    /// Required for clients that default to virtual-hosted-style addressing
+    /// (AWS SDK, Terraform/Pulumi, etc.), e.g. `RUSTFS_SERVER_DOMAINS=s3.example.com`
+    /// so that `bucket.s3.example.com` is routed to bucket `bucket`. When unset, only
+    /// path-style addressing is supported (configure clients with
+    /// `s3_use_path_style = true` / `force_path_style=true`).
     #[arg(
         long,
         env = "RUSTFS_SERVER_DOMAINS",
