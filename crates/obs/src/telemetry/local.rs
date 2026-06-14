@@ -71,6 +71,7 @@ const LOG_SUBSYSTEM_LOCAL_LOGGING: &str = "local_logging";
 const EVENT_LOCAL_LOGGING_STATE: &str = "local_logging_state";
 const EVENT_LOG_CLEANER_STATE: &str = "log_cleaner_state";
 const STDERR_WARNING_PREFIX: &str = "[WARN]";
+const REQUEST_ID: &str = "request-id";
 
 #[derive(Clone, Debug)]
 struct RequestIdJsonFormat<T> {
@@ -106,7 +107,7 @@ where
         let mut payload: JsonValue = serde_json::from_str(trimmed).map_err(|_| fmt::Error)?;
         if let Some(object) = payload.as_object_mut() {
             object
-                .entry("request_id".to_string())
+                .entry(REQUEST_ID.to_string())
                 .or_insert_with(|| JsonValue::String(request_id.expect("checked is_some")));
         }
 
@@ -130,7 +131,7 @@ where
         let extensions = span.extensions();
         let formatted_fields = extensions.get::<tracing_subscriber::fmt::FormattedFields<JsonFields>>()?;
         let fields: BTreeMap<String, JsonValue> = serde_json::from_str(&formatted_fields.fields).ok()?;
-        if let Some(value) = fields.get("request_id").and_then(JsonValue::as_str) {
+        if let Some(value) = fields.get(REQUEST_ID).and_then(JsonValue::as_str) {
             request_id = Some(value.to_string());
         }
     }
@@ -594,7 +595,7 @@ pub fn spawn_cleanup_task(
                 }
                 Ok(Err(e)) => {
                     counter!(METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL).increment(1);
-                    tracing::warn!(
+                    warn!(
                         event = EVENT_LOG_CLEANER_STATE,
                         component = LOG_COMPONENT_OBS,
                         subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
@@ -605,7 +606,7 @@ pub fn spawn_cleanup_task(
                 }
                 Err(e) => {
                     counter!(METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL).increment(1);
-                    tracing::warn!(
+                    warn!(
                         event = EVENT_LOG_CLEANER_STATE,
                         component = LOG_COMPONENT_OBS,
                         subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
@@ -667,7 +668,7 @@ mod tests {
         let subscriber = Registry::default().with(layer);
 
         tracing::subscriber::with_default(subscriber, || {
-            tracing::info!(component = "obs_contract_test", sink = "stdout", "hello world");
+            info!(component = "obs_contract_test", sink = "stdout", "hello world");
         });
 
         let raw = String::from_utf8(
@@ -691,7 +692,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let span = tracing::info_span!("http-request", request_id = "req-123", method = "GET");
             let _guard = span.enter();
-            tracing::info!(component = "obs_contract_test", message = "inside request span");
+            info!(component = "obs_contract_test", message = "inside request span");
         });
 
         let raw = String::from_utf8(
@@ -717,7 +718,7 @@ mod tests {
             let recovery_span =
                 tracing::info_span!("recovery-monitor", kind = "remote_disk", endpoint = "http://127.0.0.1:9000/data");
             let _recovery_guard = recovery_span.enter();
-            tracing::warn!(component = "obs_contract_test", message = "inside recovery monitor");
+            warn!(component = "obs_contract_test", message = "inside recovery monitor");
         });
 
         let raw = String::from_utf8(
