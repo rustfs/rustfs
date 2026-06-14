@@ -53,6 +53,7 @@ use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::rio::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
 use rustfs_ecstore::rio::{HashReader, WritePlan};
 use rustfs_ecstore::set_disk::is_valid_storage_class;
+use rustfs_ecstore::store::ECStore;
 use rustfs_ecstore::store_api::{CompletePart, HTTPRangeSpec, MultipartUploadResult, ObjectIO, ObjectOptions, PutObjReader};
 use rustfs_ecstore::store_api::{MultipartOperations, ObjectOperations};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
@@ -228,6 +229,13 @@ impl DefaultMultipartUsecase {
         self.context.as_ref().and_then(|context| context.bucket_metadata().handle())
     }
 
+    fn object_store(&self) -> Option<Arc<ECStore>> {
+        self.context
+            .as_ref()
+            .map(|context| context.object_store())
+            .or_else(new_object_layer_fn)
+    }
+
     #[instrument(level = "debug", skip(self))]
     pub async fn execute_abort_multipart_upload(
         &self,
@@ -237,7 +245,7 @@ impl DefaultMultipartUsecase {
             bucket, key, upload_id, ..
         } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -288,7 +296,7 @@ impl DefaultMultipartUsecase {
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         if if_match.is_some() || if_none_match.is_some() {
-            let Some(store) = new_object_layer_fn() else {
+            let Some(store) = self.object_store() else {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
             };
 
@@ -349,7 +357,7 @@ impl DefaultMultipartUsecase {
             ));
         }
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -548,7 +556,7 @@ impl DefaultMultipartUsecase {
 
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -731,7 +739,7 @@ impl DefaultMultipartUsecase {
         }
 
         // Get multipart info early to check if managed encryption will be applied
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -949,7 +957,7 @@ impl DefaultMultipartUsecase {
             max_uploads,
         } = parse_list_multipart_uploads_params(prefix, key_marker, max_uploads)?;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -973,7 +981,7 @@ impl DefaultMultipartUsecase {
 
         let params = parse_list_parts_params(part_number_marker, max_parts)?;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1035,7 +1043,7 @@ impl DefaultMultipartUsecase {
 
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
