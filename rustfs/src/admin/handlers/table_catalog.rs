@@ -24,7 +24,10 @@ use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_ecstore::{bucket::metadata_sys, store::ECStore};
+use rustfs_ecstore::{
+    bucket::{metadata::table_catalog_path_hash, metadata_sys},
+    store::ECStore,
+};
 use rustfs_iam::{manager::get_token_signing_key, sys::SESSION_POLICY_NAME};
 use rustfs_policy::{
     auth::get_new_credentials_with_metadata,
@@ -1443,8 +1446,27 @@ fn max_partition_field_id(value: &serde_json::Value) -> i64 {
     max_id
 }
 
-fn next_metadata_file_name(generation: u64) -> String {
-    format!("{generation:05}.metadata.json")
+fn standard_commit_ids(commit_id: Option<String>) -> (String, String) {
+    match commit_id {
+        Some(commit_id) => match Uuid::parse_str(&commit_id) {
+            Ok(uuid) => {
+                let commit_id = uuid.to_string();
+                (commit_id.clone(), commit_id)
+            }
+            Err(_) => {
+                let metadata_file_token = table_catalog_path_hash(&commit_id);
+                (commit_id, metadata_file_token)
+            }
+        },
+        None => {
+            let commit_id = Uuid::new_v4().to_string();
+            (commit_id.clone(), commit_id)
+        }
+    }
+}
+
+fn next_metadata_file_name(generation: u64, metadata_file_token: &str) -> String {
+    format!("{generation:05}-{metadata_file_token}.metadata.json")
 }
 
 fn validate_table_commit_requirements(metadata: &serde_json::Value, requirements: &[serde_json::Value]) -> S3Result<()> {
@@ -2303,9 +2325,13 @@ where
     validate_metadata_matches_current_metadata(&expected_metadata, &next_metadata)?;
     let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
         .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
+    let (commit_id, metadata_file_token) = standard_commit_ids(request.commit_id);
     let next_generation = current.generation.saturating_add(1);
-    let next_metadata_location =
-        crate::table_catalog::default_table_metadata_file_path(namespace, &table_name, &next_metadata_file_name(next_generation));
+    let next_metadata_location = crate::table_catalog::default_table_metadata_file_path(
+        namespace,
+        &table_name,
+        &next_metadata_file_name(next_generation, &metadata_file_token),
+    );
     let next_metadata_data = serde_json::to_vec(&next_metadata)
         .map_err(|err| s3_error!(InternalError, "failed to serialize table metadata update: {}", err))?;
     metadata_backend
@@ -2322,7 +2348,7 @@ where
         table_bucket: bucket.to_string(),
         namespace: namespace.public_name(),
         table: table.to_string(),
-        commit_id: request.commit_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        commit_id,
         idempotency_key: request.idempotency_key,
         operation: request.operation.unwrap_or_else(|| table_commit_operation(&next_metadata)),
         expected_version_token: current.version_token,
@@ -3485,6 +3511,24 @@ mod tests {
         assert_eq!(request.requirements.len(), 1);
     }
 
+    #[test]
+    fn standard_commit_ids_use_uuid_for_metadata_file_when_provided() {
+        let commit_id = "11111111-1111-4111-8111-111111111111";
+        assert_eq!(
+            standard_commit_ids(Some(commit_id.to_string())),
+            (commit_id.to_string(), commit_id.to_string())
+        );
+    }
+
+    #[test]
+    fn standard_commit_ids_generate_metadata_hash_for_non_uuid_client_id() {
+        let (commit_id, metadata_file_token) = standard_commit_ids(Some("commit-1".to_string()));
+
+        assert_eq!(commit_id, "commit-1");
+        assert_ne!(metadata_file_token, commit_id);
+        assert_eq!(metadata_file_token, table_catalog_path_hash("commit-1"));
+    }
+
     #[tokio::test]
     async fn create_table_response_writes_initial_metadata_for_standard_request() {
         let store = TestTableCatalogStore::default();
@@ -3560,39 +3604,7 @@ mod tests {
         let store = TestTableCatalogStore::default();
         let metadata_backend = TestTableCatalogObjectBackend::default();
         let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
-        ensure_table_bucket_entry(&store, "warehouse", true)
-            .await
-            .expect("table bucket entry should be seeded");
-        create_namespace_response(
-            &store,
-            "warehouse",
-            CreateNamespaceRequest {
-                namespace: vec!["analytics".to_string()],
-                properties: BTreeMap::new(),
-            },
-            true,
-        )
-        .await
-        .expect("namespace should be created");
-        let create_request: CreateTableRequest = serde_json::from_value(serde_json::json!({
-            "name": "events",
-            "schema": {
-                "type": "struct",
-                "schema-id": 0,
-                "fields": [
-                    {
-                        "id": 1,
-                        "name": "id",
-                        "required": true,
-                        "type": "long"
-                    }
-                ]
-            }
-        }))
-        .expect("standard create table request should parse");
-        let created = create_table_response(&store, &metadata_backend, "warehouse", &namespace, create_request, true)
-            .await
-            .expect("table should be created");
+        let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
         let table_uuid = created.metadata["table-uuid"]
             .as_str()
             .expect("created metadata should have table uuid")
@@ -3642,10 +3654,15 @@ mod tests {
             .await
             .expect("standard commit should succeed");
 
-        assert_eq!(
-            commit.metadata_location,
-            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002.metadata.json"
-        );
+        let metadata_file_prefix = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-";
+        let metadata_file_suffix = ".metadata.json";
+        let generated_commit_id = commit
+            .metadata_location
+            .strip_prefix(metadata_file_prefix)
+            .and_then(|file| file.strip_suffix(metadata_file_suffix))
+            .expect("standard commit metadata file should include a UUID suffix");
+        Uuid::parse_str(generated_commit_id).expect("metadata file suffix should be a UUID");
+        assert_eq!(commit.commit_id, generated_commit_id);
         assert_eq!(commit.metadata["properties"]["owner"], serde_json::Value::String("lakehouse".to_string()));
         assert_eq!(commit.metadata["current-snapshot-id"], 10);
         assert_eq!(commit.metadata["last-sequence-number"], 1);
@@ -3665,6 +3682,186 @@ mod tests {
                 .object_exists("warehouse", &commit.metadata_location)
                 .await
                 .expect("committed metadata lookup should succeed")
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_commit_uses_client_uuid_commit_id_in_metadata_file_name() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        create_standard_events_table(&store, &metadata_backend, &namespace).await;
+
+        let commit_id = "11111111-1111-4111-8111-111111111111";
+        let commit_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "commit-id": commit_id,
+            "updates": [
+                {
+                    "action": "set-properties",
+                    "updates": {
+                        "owner": "lakehouse"
+                    }
+                }
+            ]
+        }))
+        .expect("standard commit table request should parse");
+        let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", commit_request)
+            .await
+            .expect("standard commit should succeed");
+
+        assert_eq!(commit.commit_id, commit_id);
+        assert_eq!(
+            commit.metadata_location,
+            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-11111111-1111-4111-8111-111111111111.metadata.json"
+        );
+        assert!(
+            metadata_backend
+                .object_exists("warehouse", &commit.metadata_location)
+                .await
+                .expect("committed metadata lookup should succeed")
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_commit_accepts_non_uuid_client_commit_id_without_using_it_in_metadata_file_name() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        create_standard_events_table(&store, &metadata_backend, &namespace).await;
+
+        let commit_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "commit-id": "commit-1",
+            "updates": [
+                {
+                    "action": "set-properties",
+                    "updates": {
+                        "owner": "lakehouse"
+                    }
+                }
+            ]
+        }))
+        .expect("standard commit table request should parse");
+        let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", commit_request)
+            .await
+            .expect("standard commit should succeed");
+
+        let metadata_file_prefix = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-";
+        let metadata_file_suffix = ".metadata.json";
+        let metadata_file_token = commit
+            .metadata_location
+            .strip_prefix(metadata_file_prefix)
+            .and_then(|file| file.strip_suffix(metadata_file_suffix))
+            .expect("standard commit metadata file should include a safe token suffix");
+        assert_eq!(commit.commit_id, "commit-1");
+        assert_ne!(metadata_file_token, commit.commit_id);
+        assert_eq!(metadata_file_token, table_catalog_path_hash("commit-1"));
+    }
+
+    #[tokio::test]
+    async fn standard_commit_ignores_generation_only_orphan_metadata_file() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        create_standard_events_table(&store, &metadata_backend, &namespace).await;
+        metadata_backend
+            .put_json(
+                "warehouse",
+                ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002.metadata.json",
+                serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "orphan",
+                    "location": "s3://warehouse/tables/table-id"
+                }),
+            )
+            .await;
+
+        let commit_id = "22222222-2222-4222-8222-222222222222";
+        let commit_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "commit-id": commit_id,
+            "updates": [
+                {
+                    "action": "set-properties",
+                    "updates": {
+                        "owner": "lakehouse"
+                    }
+                }
+            ]
+        }))
+        .expect("standard commit table request should parse");
+        let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", commit_request)
+            .await
+            .expect("standard commit should not collide with generation-only orphan");
+
+        assert_eq!(
+            commit.metadata_location,
+            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-22222222-2222-4222-8222-222222222222.metadata.json"
+        );
+        assert_eq!(commit.metadata["properties"]["owner"], "lakehouse");
+    }
+
+    #[tokio::test]
+    async fn concurrent_standard_commits_write_distinct_metadata_files_before_pointer_conflict() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        create_standard_events_table(&store, &metadata_backend, &namespace).await;
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let metadata_backend = TestTableCatalogObjectBackend {
+            objects: Arc::clone(&metadata_backend.objects),
+            put_object_barrier: Some(barrier),
+        };
+        let first_commit_id = "33333333-3333-4333-8333-333333333333";
+        let second_commit_id = "44444444-4444-4444-8444-444444444444";
+        let first_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "commit-id": first_commit_id,
+            "updates": [
+                {
+                    "action": "set-properties",
+                    "updates": {
+                        "owner": "first"
+                    }
+                }
+            ]
+        }))
+        .expect("first standard commit table request should parse");
+        let second_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "commit-id": second_commit_id,
+            "updates": [
+                {
+                    "action": "set-properties",
+                    "updates": {
+                        "owner": "second"
+                    }
+                }
+            ]
+        }))
+        .expect("second standard commit table request should parse");
+
+        let (first, second) = tokio::join!(
+            commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", first_request),
+            commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", second_request)
+        );
+        let success_count = [first.is_ok(), second.is_ok()].into_iter().filter(|ok| *ok).count();
+
+        assert_eq!(success_count, 1);
+        assert!(
+            metadata_backend
+                .object_exists(
+                    "warehouse",
+                    ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-33333333-3333-4333-8333-333333333333.metadata.json"
+                )
+                .await
+                .expect("first metadata object lookup should succeed")
+        );
+        assert!(
+            metadata_backend
+                .object_exists(
+                    "warehouse",
+                    ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-44444444-4444-4444-8444-444444444444.metadata.json"
+                )
+                .await
+                .expect("second metadata object lookup should succeed")
         );
     }
 
@@ -4238,6 +4435,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct TestTableCatalogObjectBackend {
         objects: Arc<tokio::sync::Mutex<BTreeMap<(String, String), crate::table_catalog::TableCatalogObject>>>,
+        put_object_barrier: Option<Arc<tokio::sync::Barrier>>,
     }
 
     impl TestTableCatalogObjectBackend {
@@ -4262,6 +4460,46 @@ mod tests {
                 },
             );
         }
+    }
+
+    async fn create_standard_events_table(
+        store: &TestTableCatalogStore,
+        metadata_backend: &TestTableCatalogObjectBackend,
+        namespace: &crate::table_catalog::Namespace,
+    ) -> RestLoadTableResponse {
+        ensure_table_bucket_entry(store, "warehouse", true)
+            .await
+            .expect("table bucket entry should be seeded");
+        create_namespace_response(
+            store,
+            "warehouse",
+            CreateNamespaceRequest {
+                namespace: namespace.public_name().split('.').map(str::to_string).collect(),
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+        let create_request: CreateTableRequest = serde_json::from_value(serde_json::json!({
+            "name": "events",
+            "schema": {
+                "type": "struct",
+                "schema-id": 0,
+                "fields": [
+                    {
+                        "id": 1,
+                        "name": "id",
+                        "required": true,
+                        "type": "long"
+                    }
+                ]
+            }
+        }))
+        .expect("standard create table request should parse");
+        create_table_response(store, metadata_backend, "warehouse", namespace, create_request, true)
+            .await
+            .expect("table should be created")
     }
 
     async fn seed_object_table_for_metadata_maintenance(
@@ -4352,17 +4590,32 @@ mod tests {
             bucket: &str,
             object: &str,
             data: Vec<u8>,
-            _precondition: crate::table_catalog::TableCatalogPutPrecondition,
+            precondition: crate::table_catalog::TableCatalogPutPrecondition,
         ) -> crate::table_catalog::TableCatalogStoreResult<()> {
-            self.objects.lock().await.insert(
-                (bucket.to_string(), object.to_string()),
-                crate::table_catalog::TableCatalogObject {
-                    data,
-                    etag: Some("etag".to_string()),
-                    mod_time: None,
-                },
-            );
-            Ok(())
+            let key = (bucket.to_string(), object.to_string());
+            let mut objects = self.objects.lock().await;
+            let result = if matches!(precondition, crate::table_catalog::TableCatalogPutPrecondition::IfAbsent)
+                && objects.contains_key(&key)
+            {
+                Err(crate::table_catalog::TableCatalogStoreError::Conflict(format!(
+                    "object already exists: {object}"
+                )))
+            } else {
+                objects.insert(
+                    key,
+                    crate::table_catalog::TableCatalogObject {
+                        data,
+                        etag: Some("etag".to_string()),
+                        mod_time: None,
+                    },
+                );
+                Ok(())
+            };
+            drop(objects);
+            if let Some(barrier) = &self.put_object_barrier {
+                barrier.wait().await;
+            }
+            result
         }
 
         async fn delete_object(&self, bucket: &str, object: &str) -> crate::table_catalog::TableCatalogStoreResult<()> {
