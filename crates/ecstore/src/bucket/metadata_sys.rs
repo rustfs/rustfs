@@ -19,7 +19,7 @@ use crate::bucket::bucket_target_sys::BucketTargetSys;
 use crate::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, load_bucket_metadata_parse};
 use crate::bucket::utils::{deserialize, is_meta_bucketname};
 use crate::error::{Error, Result, is_err_bucket_not_found};
-use crate::global::{GLOBAL_Endpoints, is_dist_erasure, is_erasure, new_object_layer_fn};
+use crate::global::{GLOBAL_Endpoints, is_dist_erasure, is_erasure, resolve_object_store_handle};
 use crate::store::ECStore;
 use crate::store_api::HealOperations as _;
 use futures::future::join_all;
@@ -406,7 +406,7 @@ impl BucketMetadataSys {
     }
 
     async fn update_and_parse(&mut self, bucket: &str, config_file: &str, data: Vec<u8>, parse: bool) -> Result<OffsetDateTime> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(Error::other("errServerNotInitialized"));
         };
 
