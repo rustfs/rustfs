@@ -17,6 +17,13 @@ from dataclasses import dataclass
 from typing import Any
 
 DEFAULT_PROFILE = "rustfs"
+CATALOG_VENDED_PROFILE = "rustfs-vended-credentials"
+VENDED_CREDENTIAL_PROFILES = {CATALOG_VENDED_PROFILE}
+REQUIRED_STORAGE_CREDENTIAL_KEYS = (
+    "s3.access-key-id",
+    "s3.secret-access-key",
+    "s3.session-token",
+)
 
 PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
     "rustfs": {
@@ -34,6 +41,14 @@ PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
         "warehouse": "{bucket}",
         "credential_mode": "static-s3-credentials",
         "status": "compatibility-smoke-target",
+    },
+    CATALOG_VENDED_PROFILE: {
+        "catalog_uri": "{endpoint}/iceberg",
+        "rest_path": "/iceberg",
+        "rest_signing_name": "s3",
+        "warehouse": "{bucket}",
+        "credential_mode": "catalog-vended-temporary-credentials",
+        "status": "automated-credential-smoke-target",
     },
     "aws-s3tables": {
         "catalog_uri": "https://s3tables.{region}.amazonaws.com/iceberg",
@@ -73,7 +88,7 @@ CLIENT_MATRIX: list[dict[str, str]] = [
     {
         "client": "PyIceberg",
         "status": "automated",
-        "coverage": "create namespace, create table, append, reload, scan",
+        "coverage": "create namespace, create table, append, reload, scan, optional catalog-vended table credentials with exact-prefix data-plane scope probe",
         "entrypoint": "scripts/table-catalog/pyiceberg_smoke.py",
     },
     {
@@ -111,10 +126,10 @@ CLIENT_MATRIX: list[dict[str, str]] = [
 UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
     {
         "capability": "credential-vending",
-        "status": "manual-enable-temporary-credentials-no-client-profile",
+        "status": "automated-after-table-bootstrap",
         "roadmap_area": "credential-vending",
         "catalog_endpoint": "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials",
-        "expected_behavior": "load table advertises the table credential scope; the credentials endpoint returns an empty storage-credentials list unless server-side temporary credential vending is explicitly enabled",
+        "expected_behavior": "the rustfs-vended-credentials profile requires server-side temporary credential vending, verifies the returned prefix exactly matches the table warehouse location, verifies scoped data-plane access, and switches append, reload, and scan operations to the returned table-scoped credentials after table creation",
     },
     {
         "capability": "background-maintenance-worker",
@@ -161,6 +176,12 @@ class RuntimeDeps:
     load_catalog: Any
 
 
+@dataclass(frozen=True)
+class StorageCredential:
+    prefix: str
+    config: dict[str, str]
+
+
 def env_or_none(key: str) -> str | None:
     value = os.getenv(key)
     if value is None or value == "":
@@ -196,6 +217,8 @@ def apply_profile_defaults(args: argparse.Namespace) -> argparse.Namespace:
     args.rest_path = normalized_rest_path(args.rest_path)
     if args.rest_signing_name is None:
         args.rest_signing_name = defaults["rest_signing_name"]
+    if args.require_vended_credentials is None:
+        args.require_vended_credentials = args.profile in VENDED_CREDENTIAL_PROFILES
     return args
 
 
@@ -213,6 +236,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--catalog-name", default=os.getenv("RUSTFS_TABLE_CATALOG_NAME", "rustfs"))
     parser.add_argument("--rest-path", default=env_or_none("RUSTFS_TABLE_REST_PATH"))
     parser.add_argument("--rest-signing-name", default=env_or_none("RUSTFS_TABLE_REST_SIGNING_NAME"))
+    parser.add_argument(
+        "--require-vended-credentials",
+        action="store_true",
+        default=None,
+        help="Require table-scoped credentials from the REST credentials endpoint before data-plane operations.",
+    )
     parser.add_argument("--timeout", type=float, default=float(os.getenv("RUSTFS_TABLE_SMOKE_TIMEOUT", "20")))
     parser.add_argument("--cleanup", action="store_true", help="Drop the smoke table and namespace before exiting.")
     parser.add_argument("--replace", action="store_true", help="Drop an existing table with the same identifier first.")
@@ -330,15 +359,7 @@ def signed_rest_request(args: argparse.Namespace, deps: RuntimeDeps, method: str
 
 
 def ensure_bucket(args: argparse.Namespace, deps: RuntimeDeps) -> None:
-    client = deps.boto3.client(
-        "s3",
-        endpoint_url=normalized_endpoint(args.endpoint),
-        aws_access_key_id=args.access_key,
-        aws_secret_access_key=args.secret_key,
-        region_name=args.region,
-        verify=not args.insecure,
-        config=deps.botocore_config(signature_version="s3v4", s3={"addressing_style": "path"}),
-    )
+    client = configured_s3_client(args, deps)
     try:
         client.head_bucket(Bucket=args.bucket)
         return
@@ -354,12 +375,170 @@ def ensure_bucket(args: argparse.Namespace, deps: RuntimeDeps) -> None:
         client.create_bucket(Bucket=args.bucket, CreateBucketConfiguration={"LocationConstraint": args.region})
 
 
+def configured_s3_client(args: argparse.Namespace, deps: RuntimeDeps) -> Any:
+    return deps.boto3.client(
+        "s3",
+        endpoint_url=normalized_endpoint(args.endpoint),
+        aws_access_key_id=args.access_key,
+        aws_secret_access_key=args.secret_key,
+        region_name=args.region,
+        verify=not args.insecure,
+        config=deps.botocore_config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+
+
 def enable_table_bucket(args: argparse.Namespace, deps: RuntimeDeps) -> None:
     encoded_bucket = urllib.parse.quote(args.bucket, safe="")
     signed_rest_request(args, deps, "PUT", f"{args.rest_path}/v1/buckets/{encoded_bucket}")
 
 
-def catalog_properties(args: argparse.Namespace) -> dict[str, str]:
+def credentials_endpoint_path(args: argparse.Namespace) -> str:
+    encoded_bucket = urllib.parse.quote(args.bucket, safe="")
+    encoded_namespace = urllib.parse.quote(args.namespace, safe="")
+    encoded_table = urllib.parse.quote(args.table, safe="")
+    return f"{args.rest_path}/v1/{encoded_bucket}/namespaces/{encoded_namespace}/tables/{encoded_table}/credentials"
+
+
+def storage_credential_from_response(response: dict[str, Any]) -> StorageCredential:
+    credentials = response.get("storage-credentials")
+    if not isinstance(credentials, list) or not credentials:
+        raise RuntimeError("no storage credentials were returned by the table credentials endpoint")
+
+    for credential in credentials:
+        if not isinstance(credential, dict):
+            continue
+        config = credential.get("config")
+        if not isinstance(config, dict):
+            continue
+        missing_keys = [key for key in REQUIRED_STORAGE_CREDENTIAL_KEYS if not config.get(key)]
+        if missing_keys:
+            continue
+        prefix = credential.get("prefix")
+        if not isinstance(prefix, str):
+            prefix = ""
+        return StorageCredential(prefix=prefix, config={str(key): str(value) for key, value in config.items()})
+
+    required = ", ".join(REQUIRED_STORAGE_CREDENTIAL_KEYS)
+    raise RuntimeError(f"no storage credentials contained the required keys: {required}")
+
+
+def load_table_storage_credential(args: argparse.Namespace, deps: RuntimeDeps) -> StorageCredential:
+    response = signed_rest_request(args, deps, "GET", credentials_endpoint_path(args))
+    return storage_credential_from_response(response)
+
+
+def s3_scope_from_uri(s3_uri: str, description: str) -> tuple[str, str]:
+    parsed = urllib.parse.urlparse(s3_uri)
+    if parsed.scheme != "s3" or not parsed.netloc:
+        raise RuntimeError(f"{description} must be an s3 URI")
+    object_prefix = parsed.path.lstrip("/")
+    if not object_prefix:
+        raise RuntimeError(f"{description} must include an object prefix")
+    if not object_prefix.endswith("/"):
+        object_prefix = f"{object_prefix}/"
+    return parsed.netloc, object_prefix
+
+
+def s3_scope_from_credential(storage_credential: StorageCredential) -> tuple[str, str]:
+    return s3_scope_from_uri(storage_credential.prefix, "storage credential prefix")
+
+
+def string_value(value: Any) -> str | None:
+    if callable(value):
+        value = value()
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def table_warehouse_location(table: Any) -> str:
+    for source in (getattr(table, "metadata", None), table):
+        if callable(source):
+            source = source()
+        if source is None:
+            continue
+        if isinstance(source, dict):
+            location = string_value(source.get("location"))
+        else:
+            location = string_value(getattr(source, "location", None))
+        if location is not None:
+            return location
+    raise RuntimeError("created table did not expose a warehouse location")
+
+
+def safe_probe_segment(namespace: str, table: str) -> str:
+    source = f"{namespace}-{table}"
+    return "".join(char if char.isalnum() or char in {"-", "_", "."} else "-" for char in source)
+
+
+def scope_probe_keys(object_prefix: str, namespace: str, table: str) -> tuple[str, str]:
+    segment = safe_probe_segment(namespace, table)
+    suffix = f"{segment}-{int(time.time())}.txt"
+    return (
+        f"{object_prefix}.rustfs-vended-scope-probe/{suffix}",
+        f"__rustfs-vended-scope-denied/{suffix}",
+    )
+
+
+def vended_s3_client(args: argparse.Namespace, deps: RuntimeDeps, storage_credential: StorageCredential) -> Any:
+    return deps.boto3.client(
+        "s3",
+        endpoint_url=normalized_endpoint(args.endpoint),
+        aws_access_key_id=storage_credential.config["s3.access-key-id"],
+        aws_secret_access_key=storage_credential.config["s3.secret-access-key"],
+        aws_session_token=storage_credential.config["s3.session-token"],
+        region_name=args.region,
+        verify=not args.insecure,
+        config=deps.botocore_config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+
+
+def is_access_denied_error(error: BaseException) -> bool:
+    response = getattr(error, "response", {})
+    status_code = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    error_code = response.get("Error", {}).get("Code")
+    return status_code == 403 or error_code in {"AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch"}
+
+
+def verify_vended_credential_data_plane_scope(
+    args: argparse.Namespace,
+    deps: RuntimeDeps,
+    storage_credential: StorageCredential,
+    table_location: str,
+) -> None:
+    bucket, object_prefix = s3_scope_from_credential(storage_credential)
+    table_bucket, table_object_prefix = s3_scope_from_uri(table_location, "table warehouse location")
+    if bucket != table_bucket or object_prefix != table_object_prefix:
+        raise RuntimeError("storage credential prefix does not match table warehouse location")
+    if table_bucket != args.bucket:
+        raise RuntimeError(f"table warehouse bucket {table_bucket} does not match expected table bucket {args.bucket}")
+
+    inside_key, denied_key = scope_probe_keys(object_prefix, args.namespace, args.table)
+    client = vended_s3_client(args, deps, storage_credential)
+    put_inside = False
+    try:
+        client.put_object(Bucket=bucket, Key=inside_key, Body=b"rustfs table credential scope probe\n")
+        put_inside = True
+        client.head_object(Bucket=bucket, Key=inside_key)
+    finally:
+        if put_inside:
+            client.delete_object(Bucket=bucket, Key=inside_key)
+
+    try:
+        client.put_object(Bucket=bucket, Key=denied_key, Body=b"rustfs denied table credential scope probe\n")
+    except deps.botocore_client_error as error:
+        if is_access_denied_error(error):
+            return
+        raise RuntimeError(f"scope-denied data-plane probe failed with unexpected S3 error: {error}") from error
+
+    try:
+        configured_s3_client(args, deps).delete_object(Bucket=bucket, Key=denied_key)
+    except Exception as cleanup_error:
+        print(f"warning: failed to clean unexpected denied-scope probe object {denied_key}: {cleanup_error}", file=sys.stderr)
+    raise RuntimeError("vended table credentials unexpectedly wrote outside the table warehouse prefix")
+
+
+def catalog_properties(args: argparse.Namespace, storage_credential: StorageCredential | None = None) -> dict[str, str]:
     endpoint = normalized_endpoint(args.endpoint)
     properties = {
         "type": "rest",
@@ -376,6 +555,8 @@ def catalog_properties(args: argparse.Namespace) -> dict[str, str]:
         "rest.signing-region": args.region,
         "rest.signing-name": args.rest_signing_name,
     }
+    if storage_credential is not None:
+        properties.update(storage_credential.config)
     if args.insecure:
         properties["s3.verify-ssl"] = "false"
     return properties
@@ -484,24 +665,24 @@ def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> None:
     ensure_local_proxy_bypass(endpoint)
     ensure_aws_env(args.access_key, args.secret_key, args.region)
 
-    print(f"[1/7] ensuring S3 bucket {args.bucket}")
+    print(f"[1/9] ensuring S3 bucket {args.bucket}")
     ensure_bucket(args, deps)
 
-    print(f"[2/7] enabling RustFS table bucket {args.bucket} through {args.rest_path}/v1")
+    print(f"[2/9] enabling RustFS table bucket {args.bucket} through {args.rest_path}/v1")
     enable_table_bucket(args, deps)
 
-    print(f"[3/7] loading PyIceberg REST catalog at {endpoint}{args.rest_path}")
+    print(f"[3/9] loading PyIceberg REST catalog at {endpoint}{args.rest_path}")
     catalog = deps.load_catalog(args.catalog_name, **catalog_properties(args))
     install_rustfs_rest_sigv4_adapter(catalog, args, deps)
     identifier = table_identifier(args)
 
     if args.replace:
-        print(f"[4/7] replacing existing table {'.'.join(identifier)} if present")
+        print(f"[4/9] replacing existing table {'.'.join(identifier)} if present")
         drop_table_if_present(catalog, identifier)
     else:
-        print(f"[4/7] table {'.'.join(identifier)} is available")
+        print(f"[4/9] table {'.'.join(identifier)} is available")
 
-    print(f"[5/7] creating namespace and table {'.'.join(identifier)}")
+    print(f"[5/9] creating namespace and table {'.'.join(identifier)}")
     ensure_namespace(catalog, args.namespace)
     arrow_schema = deps.pyarrow.schema(
         [
@@ -509,9 +690,27 @@ def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> None:
             deps.pyarrow.field("payload", deps.pyarrow.string(), nullable=False),
         ]
     )
-    table = catalog.create_table(identifier, schema=arrow_schema)
+    created_table = catalog.create_table(identifier, schema=arrow_schema)
 
-    print(f"[6/7] appending rows through PyIceberg")
+    storage_credential = None
+    if args.require_vended_credentials:
+        print(f"[6/9] loading table-scoped storage credentials")
+        storage_credential = load_table_storage_credential(args, deps)
+        print(f"credential scope: {storage_credential.prefix or 'not reported'}")
+        print(f"[7/9] verifying table-scoped data-plane access")
+        try:
+            expected_table_location = table_warehouse_location(created_table)
+        except RuntimeError:
+            expected_table_location = table_warehouse_location(catalog.load_table(identifier))
+        verify_vended_credential_data_plane_scope(args, deps, storage_credential, expected_table_location)
+        catalog = deps.load_catalog(args.catalog_name, **catalog_properties(args, storage_credential=storage_credential))
+        install_rustfs_rest_sigv4_adapter(catalog, args, deps)
+    else:
+        print(f"[6/9] using configured S3 credentials for data-plane operations")
+        print(f"[7/9] skipping vended credential data-plane scope probe")
+
+    print(f"[8/9] appending rows through PyIceberg")
+    table = catalog.load_table(identifier)
     rows = deps.pyarrow.Table.from_pylist(
         [
             {"id": 1, "payload": "alpha"},
@@ -521,7 +720,7 @@ def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> None:
     )
     table.append(rows)
 
-    print(f"[7/7] reloading and scanning table")
+    print(f"[9/9] reloading and scanning table")
     loaded = catalog.load_table(identifier)
     scanned = loaded.scan().to_arrow()
     if scanned.num_rows != 2:
