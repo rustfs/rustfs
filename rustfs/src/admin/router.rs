@@ -14,6 +14,7 @@
 
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
+use crate::app::context::resolve_object_store_handle;
 use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
@@ -57,13 +58,10 @@ use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::config::com::read_config_without_migrate;
 use rustfs_ecstore::global::GLOBAL_BOOT_TIME;
+use rustfs_ecstore::global::{get_global_bucket_monitor, get_global_deployment_id, get_global_region};
 use rustfs_ecstore::notification_sys::get_global_notification_sys;
 use rustfs_ecstore::rpc::PeerRestClient;
 use rustfs_ecstore::store_api::BucketOperations;
-use rustfs_ecstore::{
-    global::{get_global_bucket_monitor, get_global_deployment_id, get_global_region},
-    new_object_layer_fn,
-};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_madmin::utils::parse_duration;
 use rustfs_notify::{Event as NotificationEvent, notification_system};
@@ -631,7 +629,7 @@ async fn load_current_server_config() -> S3Result<Config> {
         return Ok(system.config.read().await.clone());
     }
 
-    if let Some(store) = new_object_layer_fn() {
+    if let Some(store) = resolve_object_store_handle() {
         match read_config_without_migrate(store).await {
             Ok(config) => return Ok(config),
             Err(err) => {
@@ -1399,7 +1397,7 @@ fn build_listen_notification_response(uri: &Uri, bucket: Option<&str>) -> S3Resu
 }
 
 async fn ensure_replication_bucket_exists(bucket: &str) -> S3Result<()> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
     };
 
@@ -2276,7 +2274,7 @@ async fn handle_misc_extension_request(req: &mut S3Request<Body>, route: &MiscEx
         }
         MiscExtRoute::ListenNotification { bucket } => {
             if let Some(bucket_name) = bucket {
-                let Some(store) = new_object_layer_fn() else {
+                let Some(store) = resolve_object_store_handle() else {
                     return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
                 };
                 store

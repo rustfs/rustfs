@@ -14,6 +14,7 @@
 
 use crate::admin::auth::{authenticate_request, validate_admin_request};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::app::context::resolve_object_store_handle;
 use crate::server::ADMIN_PREFIX;
 use crate::server::RemoteAddr;
 use bytes::Bytes;
@@ -23,7 +24,6 @@ use matchit::Params;
 use rustfs_common::heal_channel::{HealChannelPriority, HealChannelRequest, HealOpts};
 use rustfs_config::MAX_HEAL_REQUEST_SIZE;
 use rustfs_ecstore::bucket::utils::is_valid_object_prefix;
-use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::HealOperations;
 use rustfs_ecstore::store_utils::is_reserved_or_invalid_bucket;
 use rustfs_policy::policy::action::{Action, AdminAction};
@@ -370,7 +370,7 @@ impl Operation for HealHandler {
         // The heal channel currently models bucket/object work. Root heal reuses the
         // existing format-heal path directly so `/v3/heal/` is accepted intentionally.
         if should_handle_root_heal_directly(&hip) {
-            let Some(store) = new_object_layer_fn() else {
+            let Some(store) = resolve_object_store_handle() else {
                 return Err(s3_error!(InternalError, "server not initialized"));
             };
 
@@ -560,7 +560,7 @@ impl Operation for BackgroundHealStatusHandler {
         warn!("handle BackgroundHealStatusHandler");
         validate_heal_admin_request(&req).await?;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(s3_error!(InternalError, "server not initialized"));
         };
 
