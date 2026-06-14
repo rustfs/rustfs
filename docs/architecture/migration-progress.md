@@ -5,19 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-internal-object-store-resolver`
-- Baseline: `upstream/main` at `8f6b1d47b5af689e0b3576ab4448cc4274786df1`
+- Branch: `overtrue/arch-app-usecase-object-store-fallback-cleanup`
+- Baseline: `origin/main` at `fc894c9b569229101f859a6c4097eb64d3f86f5c`
 - PR type for this branch: `consumer-migration`
-- Runtime behavior changes: no external behavior change expected; ECStore
-  internal/background object-store lookups prefer the AppContext-owned object
-  store through the ECStore-owned resolver and keep the existing global
-  fallback.
-- Rust code changes: migrate ECStore internal metrics, notification, tier,
-  decommission, admin info, bucket metadata, replication, lifecycle, and data
-  usage object-store lookups to the ECStore-owned resolver without touching app
-  compatibility fallbacks or the global fallback definition.
+- Runtime behavior changes: no external behavior change expected; app usecase
+  object-store lookups share the same explicit-context resolver and keep the
+  existing legacy global object-layer fallback when no usecase context exists.
+- Rust code changes: add an explicit AppContext object-store resolver helper,
+  migrate admin, bucket, multipart, and object usecases to it, and remove a
+  stale ECStore tier comment that referenced the old direct accessor.
 - CI/script changes: none.
-- Docs changes: record `CTX-010` consumer migration scope and verification.
+- Docs changes: record `CTX-011` compatibility fallback cleanup scope and
+  verification.
 
 ## Phase 0 Tasks
 
@@ -230,6 +229,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     tier config persistence, decommission startup, admin server info reporting,
     bucket metadata persistence, replication decisions, lifecycle queueing, data
     usage cache persistence, and existing storage error paths.
+  - Verification: formatting, compile checks, migration guards, diff hygiene,
+    Rust risk scan, and full `make pre-commit`.
+- [x] `CTX-011` Consolidate app usecase object-store fallback.
+  - Do: migrate app admin, bucket, multipart, and object usecases away from
+    direct `new_object_layer_fn` calls and through an explicit-context resolver
+    helper.
+  - Acceptance: usecase lookups keep their injected AppContext precedence,
+    preserve `without_context()` legacy global object-layer fallback semantics,
+    and avoid consulting the global AppContext when a usecase intentionally has
+    no context.
+  - Must preserve: admin storage/data-usage reads, bucket create/delete/list
+    behavior, multipart object writes, object API reads/writes, lifecycle
+    transition tests, and existing "Not init" error paths.
   - Verification: formatting, compile checks, migration guards, diff hygiene,
     Rust risk scan, and full `make pre-commit`.
 
@@ -538,8 +550,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `consumer-migration`: review app compatibility fallback call sites before
-   the final global-accessor cleanup phase.
+1. `consumer-migration`: remove the final old global object-layer accessor
+   compatibility path once downstream/public API cleanup is accepted.
 2. `pure-move`: start `R-009` boot wrapper with the IAM degraded readiness
    contract covered.
 
@@ -547,13 +559,13 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Single consumer-migration slice; ECStore internal/background consumers use the ECStore-owned resolver without adding application-layer dependencies or changing the fallback definition. |
-| Migration preservation | passed | Metrics, notification, tier, decommission, admin info, bucket metadata, replication, lifecycle, and data-usage call sites keep the same missing-store/error behavior while preferring the AppContext-owned store when installed. |
-| Testing/verification | passed | Formatting, compile checks, diff hygiene, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Single consumer-migration slice; app usecases delegate object-store fallback to the AppContext compatibility helper instead of duplicating direct global accessor calls. |
+| Migration preservation | passed | Admin, bucket, multipart, and object usecases keep injected context precedence and explicit no-context legacy global fallback behavior. |
+| Testing/verification | passed | Formatting, compile checks, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `8f6b1d47b5af689e0b3576ab4448cc4274786df1`:
+Passed on `fc894c9b569229101f859a6c4097eb64d3f86f5c`:
 
 - `cargo fmt --all --check`.
 - `cargo check -p rustfs-ecstore`.
@@ -563,26 +575,21 @@ Passed on `8f6b1d47b5af689e0b3576ab4448cc4274786df1`:
 - `./scripts/check_layer_dependencies.sh`.
 - `git rev-list --left-right --count HEAD...origin/main` returned `1 0`
   after rebase.
-- Rust risk scan for changed Rust files; full-file matches were existing tests,
-  existing relaxed counters, existing numeric casts, existing print/debug
-  helpers, and existing unwrap/expect paths, and the added-line scan returned
-  no `unwrap`/`expect`, numeric cast, string error, boxed error, print macro, or
-  relaxed-ordering match.
-- `make pre-commit`; all checks passed, including nextest 5954 passed and 111
-  skipped, plus doctests.
+- Rust risk scan for changed Rust files: full-file matches were existing tests,
+  existing numeric casts, existing string error signatures, and existing relaxed
+  counters; added-line scan returned no unwrap/expect, numeric cast, string
+  error, boxed error, print macro, or relaxed-ordering match.
+- `make pre-commit`: all checks passed, including nextest with 5961 passed
+  and 111 skipped, plus doctests.
 
 Notes:
 
-- This slice migrates ECStore internal/background object-store lookups to the
-  ECStore-owned resolver.
-- App compatibility fallback call sites remain on `new_object_layer_fn` as an
-  explicit fallback path.
+- This slice consolidates app usecase object-store fallback without changing
+  request behavior.
 - The old global accessor remains as the resolver fallback and public
   compatibility re-export for a later cleanup slice.
 
 ## Handoff Notes
 
-- CTX-010 is complete.
-- App compatibility fallback call sites remain on `new_object_layer_fn` as an
-  explicit fallback path.
+- CTX-011 is complete.
 - The global fallback definition and re-export remain for a later cleanup slice.

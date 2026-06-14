@@ -14,7 +14,9 @@
 
 //! Object application use-case contracts.
 
-use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
+use crate::app::context::{
+    AppContext, default_notify_interface, get_global_app_context, resolve_object_store_handle_for_context,
+};
 use crate::config::RustFSBufferConfig;
 use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
 use crate::error::ApiError;
@@ -73,7 +75,6 @@ use rustfs_ecstore::compress::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible}
 use rustfs_ecstore::config::storageclass;
 use rustfs_ecstore::disk::{error::DiskError, error_reduce::is_all_buckets_not_found};
 use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
-use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::rio::{DynReader, HashReader, WritePlan, wrap_reader};
 use rustfs_ecstore::set_disk::{get_lock_acquire_timeout, is_valid_storage_class};
 use rustfs_ecstore::store::ECStore;
@@ -1158,10 +1159,7 @@ impl DefaultObjectUsecase {
     }
 
     fn object_store(&self) -> Option<Arc<ECStore>> {
-        self.context
-            .as_ref()
-            .map(|context| context.object_store())
-            .or_else(new_object_layer_fn)
+        resolve_object_store_handle_for_context(self.context.as_deref())
     }
 
     fn base_buffer_size(&self) -> usize {
