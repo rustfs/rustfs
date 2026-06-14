@@ -66,7 +66,7 @@ impl NotifyRuntimeFacade {
                         subsystem = LOG_SUBSYSTEM_RUNTIME,
                         target_id = %target_id,
                         state = "replay_started",
-                        "Started notify replay worker"
+                        "notify runtime lifecycle"
                     );
                 } else {
                     debug!(
@@ -76,7 +76,7 @@ impl NotifyRuntimeFacade {
                         target_id = %target_id,
                         state = "replay_skipped",
                         reason = "no_store_configured",
-                        "Skipped notify replay worker startup"
+                        "notify runtime lifecycle"
                     );
                 }
             }),
@@ -122,7 +122,7 @@ impl NotifyRuntimeFacade {
             component = LOG_COMPONENT_NOTIFY,
             subsystem = LOG_SUBSYSTEM_RUNTIME,
             state = "stopping",
-            "Stopping notification runtime"
+            "notify runtime lifecycle"
         );
 
         let active_targets = self.replay_workers.read().await.len();
@@ -132,7 +132,7 @@ impl NotifyRuntimeFacade {
             subsystem = LOG_SUBSYSTEM_RUNTIME,
             state = "replay_stopping",
             active_targets,
-            "Stopping notify replay workers"
+            "notify runtime lifecycle"
         );
 
         {
@@ -160,7 +160,7 @@ impl NotifyRuntimeFacade {
             component = LOG_COMPONENT_NOTIFY,
             subsystem = LOG_SUBSYSTEM_RUNTIME,
             state = "stopped",
-            "Stopped notification runtime"
+            "notify runtime lifecycle"
         );
     }
 }

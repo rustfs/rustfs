@@ -54,7 +54,7 @@ use tokio::{
     },
 };
 use tracing::warn;
-use tracing::{error, info};
+use tracing::{debug, error};
 
 const IAM_FORMAT_FILE: &str = "format.json";
 const IAM_FORMAT_VERSION_1: i32 = 1;
@@ -153,10 +153,14 @@ where
             if let Err(e) = self.clone().load().await {
                 if attempt == MAX_RETRIES - 1 {
                     self.state.store(IamState::Error as u8, Ordering::SeqCst);
-                    warn!("IAM failed to load initial data after {} attempts: {:?}", MAX_RETRIES, e);
+                    warn!(
+                        attempts = MAX_RETRIES,
+                        error = ?e,
+                        "IAM initial load failed"
+                    );
                     load_error = Some(e);
                 } else {
-                    warn!("IAM load failed, retrying... attempt {}", attempt + 1);
+                    warn!(attempt = attempt + 1, max_attempts = MAX_RETRIES, "IAM load retry scheduled");
                     tokio::time::sleep(INITIAL_LOAD_RETRY_DELAY).await;
                 }
             } else {
@@ -169,7 +173,7 @@ where
         }
 
         self.state.store(IamState::Ready as u8, Ordering::SeqCst);
-        info!("IAM System successfully initialized and marked as READY");
+        debug!(state = "ready", "IAM manager ready");
 
         // Background ticker for synchronization
         // Check if environment variable is set
@@ -185,20 +189,20 @@ where
                     loop {
                         select! {
                             _ = ticker.tick() => {
-                                info!("iam load ticker");
+                                debug!(source = "ticker", "IAM reload tick");
                                 if let Err(err) =s.clone().load().await{
-                                    warn!("iam load err {:?}", err);
+                                    warn!(source = "ticker", error = ?err, "IAM reload failed");
                                 }
                             },
                             i = receiver.recv() => {
-                                info!("iam load receiver");
+                                debug!(source = "receiver", "IAM reload signal received");
                                 match i {
                                     Some(t) => {
                                         let last = s.last_timestamp.load(Ordering::Relaxed);
                                         if last <= t {
-                                            info!("iam load receiver load");
+                                            debug!(source = "receiver", "IAM reload accepted");
                                             if let Err(err) =s.clone().load().await{
-                                                warn!("iam load err {:?}", err);
+                                                warn!(source = "receiver", error = ?err, "IAM reload failed");
                                             }
                                             ticker.reset();
                                         }
@@ -1294,7 +1298,7 @@ where
         let cache = self.cache.snapshot();
         let users = Arc::clone(&cache.users);
         if let Some(x) = users.get(access_key) {
-            warn!("user already exists: {:?}", x);
+            warn!(error = ?x, "IAM user already exists");
             if x.credentials.is_temp() {
                 return Err(Error::IAMActionNotAllowed);
             }

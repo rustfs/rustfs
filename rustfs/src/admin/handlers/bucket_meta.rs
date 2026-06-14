@@ -65,6 +65,10 @@ use time::OffsetDateTime;
 use tracing::warn;
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
+const LOG_COMPONENT_ADMIN: &str = "admin";
+const LOG_SUBSYSTEM_BUCKET_META: &str = "bucket_meta";
+const EVENT_ADMIN_BUCKET_META_STATE: &str = "admin_bucket_meta_state";
+
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct ExportBucketMetadataQuery {
     pub bucket: String,
@@ -106,7 +110,7 @@ impl Operation for ExportBucketMetadata {
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: ExportBucketMetadataQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get query failed"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
                 input
             } else {
                 ExportBucketMetadataQuery::default()
@@ -114,7 +118,7 @@ impl Operation for ExportBucketMetadata {
         };
 
         let Some(input_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
+            return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
@@ -131,19 +135,19 @@ impl Operation for ExportBucketMetadata {
         .await?;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(s3_error!(InvalidRequest, "object store not init"));
+            return Err(s3_error!(InternalError, "object store is not initialized"));
         };
 
         let buckets = if query.bucket.is_empty() {
             store
                 .list_bucket(&BucketOptions::default())
                 .await
-                .map_err(|e| s3_error!(InternalError, "list buckets failed: {e}"))?
+                .map_err(|e| s3_error!(InternalError, "failed to list buckets: {e}"))?
         } else {
             let bucket = store
                 .get_bucket_info(&query.bucket, &BucketOptions::default())
                 .await
-                .map_err(|e| s3_error!(InternalError, "get bucket failed: {e}"))?;
+                .map_err(|e| s3_error!(InternalError, "failed to load bucket: {e}"))?;
             vec![bucket]
         };
 
@@ -173,17 +177,17 @@ impl Operation for ExportBucketMetadata {
                                 if e == StorageError::ConfigNotFound {
                                     continue;
                                 }
-                                return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
+                                return Err(s3_error!(InternalError, "failed to load bucket metadata: {e}"));
                             }
                         };
-                        let config_json =
-                            serde_json::to_vec(&config).map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
+                        let config_json = serde_json::to_vec(&config)
+                            .map_err(|e| s3_error!(InternalError, "failed to serialize config: {e}"))?;
                         zip_writer
                             .start_file(conf_path, SimpleFileOptions::default())
-                            .map_err(|e| s3_error!(InternalError, "start file failed: {e}"))?;
+                            .map_err(|e| s3_error!(InternalError, "failed to start archive entry: {e}"))?;
                         zip_writer
                             .write_all(&config_json)
-                            .map_err(|e| s3_error!(InternalError, "write file failed: {e}"))?;
+                            .map_err(|e| s3_error!(InternalError, "failed to write archive entry: {e}"))?;
                     }
                     BUCKET_NOTIFICATION_CONFIG => {
                         let config: s3s::dto::NotificationConfiguration =
@@ -215,18 +219,18 @@ impl Operation for ExportBucketMetadata {
                                 if e == StorageError::ConfigNotFound {
                                     continue;
                                 }
-                                return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
+                                return Err(s3_error!(InternalError, "failed to load bucket metadata: {e}"));
                             }
                         };
                         let config_xml =
-                            serialize(&config).map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
+                            serialize(&config).map_err(|e| s3_error!(InternalError, "failed to serialize config: {e}"))?;
 
                         zip_writer
                             .start_file(conf_path, SimpleFileOptions::default())
-                            .map_err(|e| s3_error!(InternalError, "start file failed: {e}"))?;
+                            .map_err(|e| s3_error!(InternalError, "failed to start archive entry: {e}"))?;
                         zip_writer
                             .write_all(&config_xml)
-                            .map_err(|e| s3_error!(InternalError, "write file failed: {e}"))?;
+                            .map_err(|e| s3_error!(InternalError, "failed to write archive entry: {e}"))?;
                     }
                     BUCKET_TAGGING_CONFIG => {
                         let config: Tagging = match metadata_sys::get_tagging_config(&bucket.name).await {
@@ -235,18 +239,18 @@ impl Operation for ExportBucketMetadata {
                                 if e == StorageError::ConfigNotFound {
                                     continue;
                                 }
-                                return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
+                                return Err(s3_error!(InternalError, "failed to load bucket metadata: {e}"));
                             }
                         };
                         let config_xml =
-                            serialize(&config).map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
+                            serialize(&config).map_err(|e| s3_error!(InternalError, "failed to serialize config: {e}"))?;
 
                         zip_writer
                             .start_file(conf_path, SimpleFileOptions::default())
-                            .map_err(|e| s3_error!(InternalError, "start file failed: {e}"))?;
+                            .map_err(|e| s3_error!(InternalError, "failed to start archive entry: {e}"))?;
                         zip_writer
                             .write_all(&config_xml)
-                            .map_err(|e| s3_error!(InternalError, "write file failed: {e}"))?;
+                            .map_err(|e| s3_error!(InternalError, "failed to write archive entry: {e}"))?;
                     }
                     BUCKET_QUOTA_CONFIG_FILE => {
                         let config: BucketQuota = match metadata_sys::get_quota_config(&bucket.name).await {
@@ -376,7 +380,7 @@ impl Operation for ExportBucketMetadata {
 
         let zip_bytes = zip_writer
             .finish()
-            .map_err(|e| s3_error!(InternalError, "finish zip failed: {e}"))?;
+            .map_err(|e| s3_error!(InternalError, "failed to finalize export archive: {e}"))?;
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/zip".parse().unwrap());
         header.insert(CONTENT_DISPOSITION, "attachment; filename=bucket-meta.zip".parse().unwrap());
@@ -399,7 +403,7 @@ impl Operation for ImportBucketMetadata {
         let _query = {
             if let Some(query) = req.uri.query() {
                 let input: ImportBucketMetadataQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get query failed"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
                 input
             } else {
                 ImportBucketMetadataQuery::default()
@@ -407,7 +411,7 @@ impl Operation for ImportBucketMetadata {
         };
 
         let Some(input_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
+            return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
@@ -427,24 +431,33 @@ impl Operation for ImportBucketMetadata {
         let body = match input.store_all_limited(MAX_BUCKET_METADATA_IMPORT_SIZE).await {
             Ok(b) => b,
             Err(e) => {
-                warn!("get body failed, e: {:?}", e);
+                warn!(
+                    event = EVENT_ADMIN_BUCKET_META_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_BUCKET_META,
+                    action = "import_bucket_metadata",
+                    result = "body_read_failed",
+                    error = ?e,
+                    "admin bucket meta state"
+                );
                 return Err(s3_error!(InvalidRequest, "bucket metadata import body too large or failed to read"));
             }
         };
 
-        let mut zip_reader = ZipArchive::new(Cursor::new(body)).map_err(|e| s3_error!(InternalError, "get body failed: {e}"))?;
+        let mut zip_reader =
+            ZipArchive::new(Cursor::new(body)).map_err(|e| s3_error!(InternalError, "failed to read import archive: {e}"))?;
 
         // First pass: read all file contents into memory
         let mut file_contents = Vec::new();
         for i in 0..zip_reader.len() {
             let mut file = zip_reader
                 .by_index(i)
-                .map_err(|e| s3_error!(InternalError, "get file failed: {e}"))?;
+                .map_err(|e| s3_error!(InternalError, "failed to read archive entry: {e}"))?;
             let file_path = file.name().to_string();
 
             let mut content = Vec::new();
             file.read_to_end(&mut content)
-                .map_err(|e| s3_error!(InternalError, "read file failed: {e}"))?;
+                .map_err(|e| s3_error!(InternalError, "failed to read archive entry content: {e}"))?;
 
             file_contents.push((file_path, content));
         }
@@ -455,7 +468,15 @@ impl Operation for ImportBucketMetadata {
             let file_path_split = file_path.split(SLASH_SEPARATOR).collect::<Vec<&str>>();
 
             if file_path_split.len() < 2 {
-                warn!("file path is invalid: {}", file_path);
+                warn!(
+                    event = EVENT_ADMIN_BUCKET_META_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_BUCKET_META,
+                    action = "import_bucket_metadata",
+                    result = "invalid_file_path",
+                    file_path = %file_path,
+                    "admin bucket meta state"
+                );
                 continue;
             }
 
@@ -474,17 +495,33 @@ impl Operation for ImportBucketMetadata {
                 }
                 Err(e) => {
                     if e == StorageError::ConfigNotFound {
-                        warn!("bucket metadata not found: {e}");
+                        warn!(
+                            event = EVENT_ADMIN_BUCKET_META_STATE,
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
+                            action = "import_bucket_metadata",
+                            result = "bucket_metadata_missing",
+                            error = %e,
+                            "admin bucket meta state"
+                        );
                         continue;
                     }
-                    warn!("get bucket metadata failed: {e}");
+                    warn!(
+                        event = EVENT_ADMIN_BUCKET_META_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_BUCKET_META,
+                        action = "import_bucket_metadata",
+                        result = "bucket_metadata_load_failed",
+                        error = %e,
+                        "admin bucket meta state"
+                    );
                     continue;
                 }
             };
         }
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(s3_error!(InvalidRequest, "object store not init"));
+            return Err(s3_error!(InternalError, "object store is not initialized"));
         };
 
         let update_at = OffsetDateTime::now_utc();
@@ -494,7 +531,15 @@ impl Operation for ImportBucketMetadata {
             let file_path_split = file_path.split(SLASH_SEPARATOR).collect::<Vec<&str>>();
 
             if file_path_split.len() < 2 {
-                warn!("file path is invalid: {}", file_path);
+                warn!(
+                    event = EVENT_ADMIN_BUCKET_META_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_BUCKET_META,
+                    action = "import_bucket_metadata",
+                    result = "invalid_file_path",
+                    file_path = %file_path,
+                    "admin bucket meta state"
+                );
                 continue;
             }
 
@@ -513,7 +558,16 @@ impl Operation for ImportBucketMetadata {
                     )
                     .await
                 {
-                    warn!("create bucket failed: {e}");
+                    warn!(
+                        event = EVENT_ADMIN_BUCKET_META_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_BUCKET_META,
+                        action = "import_bucket_metadata",
+                        result = "bucket_create_failed",
+                        bucket = %bucket_name,
+                        error = %e,
+                        "admin bucket meta state"
+                    );
                     continue;
                 }
 
@@ -527,7 +581,17 @@ impl Operation for ImportBucketMetadata {
                     let config: BucketPolicy = match serde_json::from_slice(&content) {
                         Ok(config) => config,
                         Err(e) => {
-                            warn!("deserialize config failed: {e}");
+                            warn!(
+                                event = EVENT_ADMIN_BUCKET_META_STATE,
+                                component = LOG_COMPONENT_ADMIN,
+                                subsystem = LOG_SUBSYSTEM_BUCKET_META,
+                                action = "import_bucket_metadata",
+                                result = "config_deserialize_failed",
+                                bucket = %bucket_name,
+                                config_name = %conf_name,
+                                error = %e,
+                                "admin bucket meta state"
+                            );
                             continue;
                         }
                     };
@@ -542,7 +606,17 @@ impl Operation for ImportBucketMetadata {
                 }
                 BUCKET_NOTIFICATION_CONFIG => {
                     if let Err(e) = deserialize::<s3s::dto::NotificationConfiguration>(&content) {
-                        warn!("deserialize config failed: {e}");
+                        warn!(
+                            event = EVENT_ADMIN_BUCKET_META_STATE,
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
+                            action = "import_bucket_metadata",
+                            result = "config_deserialize_failed",
+                            bucket = %bucket_name,
+                            config_name = %conf_name,
+                            error = %e,
+                            "admin bucket meta state"
+                        );
                         continue;
                     }
 
@@ -553,7 +627,17 @@ impl Operation for ImportBucketMetadata {
 
                 BUCKET_LIFECYCLE_CONFIG => {
                     if let Err(e) = deserialize::<BucketLifecycleConfiguration>(&content) {
-                        warn!("deserialize config failed: {e}");
+                        warn!(
+                            event = EVENT_ADMIN_BUCKET_META_STATE,
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
+                            action = "import_bucket_metadata",
+                            result = "config_deserialize_failed",
+                            bucket = %bucket_name,
+                            config_name = %conf_name,
+                            error = %e,
+                            "admin bucket meta state"
+                        );
                         continue;
                     }
 
@@ -564,7 +648,17 @@ impl Operation for ImportBucketMetadata {
 
                 BUCKET_SSECONFIG => {
                     if let Err(e) = deserialize::<ServerSideEncryptionConfiguration>(&content) {
-                        warn!("deserialize config failed: {e}");
+                        warn!(
+                            event = EVENT_ADMIN_BUCKET_META_STATE,
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
+                            action = "import_bucket_metadata",
+                            result = "config_deserialize_failed",
+                            bucket = %bucket_name,
+                            config_name = %conf_name,
+                            error = %e,
+                            "admin bucket meta state"
+                        );
                         continue;
                     }
 
@@ -575,7 +669,17 @@ impl Operation for ImportBucketMetadata {
 
                 BUCKET_TAGGING_CONFIG => {
                     if let Err(e) = deserialize::<Tagging>(&content) {
-                        warn!("deserialize config failed: {e}");
+                        warn!(
+                            event = EVENT_ADMIN_BUCKET_META_STATE,
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
+                            action = "import_bucket_metadata",
+                            result = "config_deserialize_failed",
+                            bucket = %bucket_name,
+                            config_name = %conf_name,
+                            error = %e,
+                            "admin bucket meta state"
+                        );
                         continue;
                     }
 
@@ -586,7 +690,17 @@ impl Operation for ImportBucketMetadata {
 
                 BUCKET_QUOTA_CONFIG_FILE => {
                     if let Err(e) = serde_json::from_slice::<BucketQuota>(&content) {
-                        warn!("deserialize config failed: {e}");
+                        warn!(
+                            event = EVENT_ADMIN_BUCKET_META_STATE,
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
+                            action = "import_bucket_metadata",
+                            result = "config_deserialize_failed",
+                            bucket = %bucket_name,
+                            config_name = %conf_name,
+                            error = %e,
+                            "admin bucket meta state"
+                        );
                         continue;
                     }
 
@@ -597,7 +711,17 @@ impl Operation for ImportBucketMetadata {
 
                 OBJECT_LOCK_CONFIG => {
                     if let Err(e) = deserialize::<ObjectLockConfiguration>(&content) {
-                        warn!("deserialize config failed: {e}");
+                        warn!(
+                            event = EVENT_ADMIN_BUCKET_META_STATE,
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
+                            action = "import_bucket_metadata",
+                            result = "config_deserialize_failed",
+                            bucket = %bucket_name,
+                            config_name = %conf_name,
+                            error = %e,
+                            "admin bucket meta state"
+                        );
                         continue;
                     }
 
@@ -608,7 +732,17 @@ impl Operation for ImportBucketMetadata {
 
                 BUCKET_VERSIONING_CONFIG => {
                     if let Err(e) = deserialize::<VersioningConfiguration>(&content) {
-                        warn!("deserialize config failed: {e}");
+                        warn!(
+                            event = EVENT_ADMIN_BUCKET_META_STATE,
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
+                            action = "import_bucket_metadata",
+                            result = "config_deserialize_failed",
+                            bucket = %bucket_name,
+                            config_name = %conf_name,
+                            error = %e,
+                            "admin bucket meta state"
+                        );
                         continue;
                     }
 
@@ -619,7 +753,17 @@ impl Operation for ImportBucketMetadata {
 
                 BUCKET_REPLICATION_CONFIG => {
                     if let Err(e) = deserialize::<ReplicationConfiguration>(&content) {
-                        warn!("deserialize config failed: {e}");
+                        warn!(
+                            event = EVENT_ADMIN_BUCKET_META_STATE,
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
+                            action = "import_bucket_metadata",
+                            result = "config_deserialize_failed",
+                            bucket = %bucket_name,
+                            config_name = %conf_name,
+                            error = %e,
+                            "admin bucket meta state"
+                        );
                         continue;
                     }
 
@@ -630,7 +774,17 @@ impl Operation for ImportBucketMetadata {
 
                 BUCKET_TARGETS_FILE => {
                     if let Err(e) = serde_json::from_slice::<BucketTargets>(&content) {
-                        warn!("deserialize config failed: {e}");
+                        warn!(
+                            event = EVENT_ADMIN_BUCKET_META_STATE,
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
+                            action = "import_bucket_metadata",
+                            result = "config_deserialize_failed",
+                            bucket = %bucket_name,
+                            config_name = %conf_name,
+                            error = %e,
+                            "admin bucket meta state"
+                        );
                         continue;
                     }
 

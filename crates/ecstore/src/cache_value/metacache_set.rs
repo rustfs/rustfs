@@ -29,7 +29,11 @@ use tokio::io::AsyncRead;
 use tokio::spawn;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{error, warn};
+
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_METACACHE: &str = "metacache";
+const EVENT_METACACHE_LISTING: &str = "metacache_listing";
 
 pub type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
 pub type PartialFn =
@@ -114,6 +118,9 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
         return Err(DiskError::ErasureReadQuorum);
     }
 
+    let log_bucket = opts.bucket.clone();
+    let log_path = opts.path.clone();
+
     let mut jobs: Vec<tokio::task::JoinHandle<std::result::Result<(), DiskError>>> = Vec::new();
     let mut readers = Vec::with_capacity(opts.disks.len());
     let fds = opts.fallback_disks.iter().flatten().cloned().collect::<VecDeque<_>>();
@@ -180,7 +187,17 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                 match disk.walk_dir(wakl_opts, &mut wr).await {
                     Ok(_res) => {}
                     Err(err) => {
-                        info!("walk dir err {:?}", &err);
+                        warn!(
+                            event = EVENT_METACACHE_LISTING,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_METACACHE,
+                            bucket = %opts_clone.bucket,
+                            path = %opts_clone.path,
+                            disk_index = disk_idx,
+                            state = "walk_dir_failed",
+                            error = ?err,
+                            "Metacache walk_dir failed"
+                        );
                         last_err = Some(err);
                         need_fallback = true;
                     }
@@ -205,7 +222,16 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                 }
 
                 let Some(disk) = disk_op else {
-                    warn!("list_path_raw: fallback disk is none");
+                    warn!(
+                        event = EVENT_METACACHE_LISTING,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_METACACHE,
+                        bucket = %opts_clone.bucket,
+                        path = %opts_clone.path,
+                        disk_index = disk_idx,
+                        state = "fallback_disk_missing",
+                        "Metacache fallback disk missing"
+                    );
                     let err = last_err.unwrap_or(DiskError::DiskNotFound);
                     record_producer_error(&producer_errs_clone, disk_idx, &err);
                     return Err(err);
@@ -234,7 +260,17 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                         last_err = None;
                     }
                     Err(err) => {
-                        error!("walk dir2 err {:?}", &err);
+                        error!(
+                            event = EVENT_METACACHE_LISTING,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_METACACHE,
+                            bucket = %opts_clone.bucket,
+                            path = %opts_clone.path,
+                            disk_index = disk_idx,
+                            state = "fallback_walk_dir_failed",
+                            error = ?err,
+                            "Metacache fallback walk_dir failed"
+                        );
                         last_err = Some(err);
                     }
                 }
@@ -355,11 +391,15 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                         )
                         .increment(1);
                         warn!(
+                            event = EVENT_METACACHE_LISTING,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_METACACHE,
                             drive = %endpoint,
                             bucket = %opts.bucket,
                             path = %opts.path,
                             timeout_ms = peek_timeout.as_millis(),
-                            "list_path_raw reader peek timed out; excluding drive from current merge"
+                            state = "peek_timed_out",
+                            "Metacache reader peek timed out"
                         );
                         let (detached_rd, write_half) = tokio::io::duplex(1);
                         drop(write_half);
@@ -439,8 +479,14 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                 });
 
                 error!(
-                    "list_path_raw: has_err > 0 && has_err > opts.disks.len() - opts.min_disks break, err: {:?}",
-                    &combined_err.join(", ")
+                    event = EVENT_METACACHE_LISTING,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_METACACHE,
+                    bucket = %opts.bucket,
+                    path = %opts.path,
+                    state = "quorum_failed",
+                    error = %combined_err.join(", "),
+                    "Metacache listing quorum failed"
                 );
                 return Err(DiskError::other(combined_err.join(", ")));
             }
@@ -493,7 +539,16 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
     });
 
     if let Err(err) = revjob.await.map_err(std::io::Error::other)? {
-        error!("list_path_raw: revjob err {:?}", err);
+        error!(
+            event = EVENT_METACACHE_LISTING,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_METACACHE,
+            bucket = %log_bucket,
+            path = %log_path,
+            state = "merge_job_failed",
+            error = ?err,
+            "Metacache merge job failed"
+        );
         cancel_rx.cancel();
         for job in jobs {
             job.abort();
@@ -521,9 +576,23 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 if matches!(err, DiskError::FileNotFound | DiskError::VolumeNotFound) {
-                    warn!("list_path_raw producer missing path {:?}", err);
+                    warn!(
+                        event = EVENT_METACACHE_LISTING,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_METACACHE,
+                        state = "producer_missing_path",
+                        error = ?err,
+                        "Metacache producer missing path"
+                    );
                 } else {
-                    error!("list_path_raw producer err {:?}", err);
+                    error!(
+                        event = EVENT_METACACHE_LISTING,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_METACACHE,
+                        state = "producer_failed",
+                        error = ?err,
+                        "Metacache producer failed"
+                    );
                 }
                 job_errs.push(err);
             }
@@ -531,7 +600,14 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                 if err.is_cancelled() {
                     continue;
                 }
-                error!("list_path_raw join err {:?}", err);
+                error!(
+                    event = EVENT_METACACHE_LISTING,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_METACACHE,
+                    state = "producer_join_failed",
+                    error = ?err,
+                    "Metacache producer join failed"
+                );
                 job_errs.push(err.into());
             }
         }

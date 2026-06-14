@@ -51,6 +51,10 @@ use std::{collections::HashMap, io::Cursor, str::from_utf8};
 use tracing::{debug, warn};
 use zip::{ZipArchive, ZipWriter, result::ZipError, write::SimpleFileOptions};
 
+const LOG_COMPONENT_ADMIN: &str = "admin";
+const LOG_SUBSYSTEM_USER: &str = "user";
+const EVENT_ADMIN_USER_STATE: &str = "admin_user_state";
+
 #[derive(Debug, Deserialize, Default)]
 pub struct AddUserQuery {
     #[serde(rename = "accessKey", alias = "access-key")]
@@ -184,7 +188,7 @@ impl Operation for AddUser {
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AddUserQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed1"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
                 input
             } else {
                 AddUserQuery::default()
@@ -192,7 +196,7 @@ impl Operation for AddUser {
         };
 
         let Some(input_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
+            return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
@@ -210,39 +214,41 @@ impl Operation for AddUser {
         //     .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidArgument, format!("decrypt_data err {}", e)))?;
 
         let args: AddOrUpdateUserReq = serde_json::from_slice(&body)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("unmarshal body err {e}")))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid JSON: {e}")))?;
 
         if args.secret_key.is_empty() {
-            return Err(s3_error!(InvalidArgument, "access key is empty"));
+            return Err(s3_error!(InvalidArgument, "secret key is required"));
         }
 
         if let Some(sys_cred) = get_global_action_cred()
             && constant_time_eq(&sys_cred.access_key, ak)
         {
-            return Err(s3_error!(InvalidArgument, "can't create user with system access key"));
+            return Err(s3_error!(InvalidArgument, "cannot create a user with the system access key"));
         }
 
         let Ok(iam_store) = rustfs_iam::get() else {
-            return Err(s3_error!(InvalidRequest, "iam not init"));
+            return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
         if let Some(user) = iam_store.get_user(ak).await {
             if (user.credentials.is_temp() || user.credentials.is_service_account()) && cred.parent_user == ak {
-                return Err(s3_error!(InvalidArgument, "can't create user with service account access key"));
+                return Err(s3_error!(InvalidArgument, "cannot create a user with a service account access key"));
             }
         } else if has_space_be(ak) {
-            return Err(s3_error!(InvalidArgument, "access key has space"));
+            return Err(s3_error!(InvalidArgument, "access key contains spaces"));
         }
 
         if from_utf8(ak.as_bytes()).is_err() {
-            return Err(s3_error!(InvalidArgument, "access key is not utf8"));
+            return Err(s3_error!(InvalidArgument, "access key is not valid UTF-8"));
         }
 
         let check_deny_only = should_check_deny_only(ak, &cred);
 
         debug!(
-            target = "rustfs::admin::handlers::user",
-            operation = "AddUser",
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_USER,
+            event = EVENT_ADMIN_USER_STATE,
+            action = "add_user",
             query_access_key = %ak,
             signer_access_key = %cred.access_key,
             is_temp = cred.is_temp(),
@@ -252,7 +258,8 @@ impl Operation for AddUser {
             jwt_parent_claim_present = cred.claims.as_ref().and_then(|c| c.get("parent")).is_some(),
             check_deny_only,
             is_owner = owner,
-            "authorization context before validate_admin_request (no secrets)"
+            state = "authorization_context",
+            "admin user state"
         );
 
         // For eligible self operations, only explicit Deny should block the request.
@@ -269,7 +276,7 @@ impl Operation for AddUser {
         let updated_at = iam_store
             .create_user(ak, &args)
             .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("create_user err {e}")))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to create user: {e}")))?;
 
         if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
             r#type: "iam-user".to_string(),
@@ -285,7 +292,16 @@ impl Operation for AddUser {
         })
         .await
         {
-            warn!(access_key = %ak, error = ?err, "site replication create user hook failed");
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_USER,
+                event = EVENT_ADMIN_USER_STATE,
+                access_key = %ak,
+                action = "create_user",
+                result = "site_replication_hook_failed",
+                error = ?err,
+                "admin user state"
+            );
         }
 
         let mut header = HeaderMap::new();
@@ -302,7 +318,7 @@ impl Operation for SetUserStatus {
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AddUserQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
                 input
             } else {
                 AddUserQuery::default()
@@ -316,11 +332,11 @@ impl Operation for SetUserStatus {
         }
 
         let Some(input_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
+            return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         if constant_time_eq(&input_cred.access_key, ak) {
-            return Err(s3_error!(InvalidArgument, "can't change status of self"));
+            return Err(s3_error!(InvalidArgument, "cannot change the status of the current user"));
         }
 
         let (cred, owner) =
@@ -340,13 +356,13 @@ impl Operation for SetUserStatus {
             .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidArgument, e))?;
 
         let Ok(iam_store) = rustfs_iam::get() else {
-            return Err(s3_error!(InvalidRequest, "iam not init"));
+            return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
         iam_store
             .set_user_status(ak, status)
             .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("set_user_status err {e}")))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to set user status: {e}")))?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -365,7 +381,7 @@ pub struct ListUsers {}
 impl Operation for ListUsers {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let Some(input_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
+            return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
@@ -384,7 +400,7 @@ impl Operation for ListUsers {
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: BucketQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
                 input
             } else {
                 BucketQuery::default()
@@ -392,7 +408,7 @@ impl Operation for ListUsers {
         };
 
         let Ok(iam_store) = rustfs_iam::get() else {
-            return Err(s3_error!(InvalidRequest, "iam not init"));
+            return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
         let users = {
@@ -410,7 +426,7 @@ impl Operation for ListUsers {
         };
 
         let data = serde_json::to_vec(&users)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal users err {e}")))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
         let (data, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, data)?;
 
         let mut header = HeaderMap::new();
@@ -425,7 +441,7 @@ pub struct RemoveUser {}
 impl Operation for RemoveUser {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let Some(input_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
+            return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
@@ -444,7 +460,7 @@ impl Operation for RemoveUser {
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AddUserQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
                 input
             } else {
                 AddUserQuery::default()
@@ -458,37 +474,35 @@ impl Operation for RemoveUser {
         }
 
         let sys_cred = get_global_action_cred()
-            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "get_global_action_cred failed"))?;
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "failed to load global credentials"))?;
 
         if ak == sys_cred.access_key || ak == cred.access_key || cred.parent_user == ak {
-            return Err(s3_error!(InvalidArgument, "can't remove self"));
+            return Err(s3_error!(InvalidArgument, "cannot remove the current user"));
         }
 
         let Ok(iam_store) = rustfs_iam::get() else {
-            return Err(s3_error!(InvalidRequest, "iam not init"));
+            return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
-        let (is_temp, _) = iam_store
-            .is_temp_user(ak)
-            .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("is_temp_user err {e}")))?;
+        let (is_temp, _) = iam_store.is_temp_user(ak).await.map_err(|e| {
+            S3Error::with_message(S3ErrorCode::InternalError, format!("failed to query temporary user state: {e}"))
+        })?;
 
         if is_temp {
-            return Err(s3_error!(InvalidArgument, "can't remove temp user"));
+            return Err(s3_error!(InvalidArgument, "cannot remove a temporary user"));
         }
 
-        let (is_service_account, _) = iam_store
-            .is_service_account(ak)
-            .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("is_service_account err {e}")))?;
+        let (is_service_account, _) = iam_store.is_service_account(ak).await.map_err(|e| {
+            S3Error::with_message(S3ErrorCode::InternalError, format!("failed to query service account state: {e}"))
+        })?;
         if is_service_account {
-            return Err(s3_error!(InvalidArgument, "can't remove service account"));
+            return Err(s3_error!(InvalidArgument, "cannot remove a service account"));
         }
 
         iam_store
             .delete_user(ak, true)
             .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("delete_user err {e}")))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to delete user: {e}")))?;
 
         if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
             r#type: "iam-user".to_string(),
@@ -504,7 +518,16 @@ impl Operation for RemoveUser {
         })
         .await
         {
-            warn!(access_key = %ak, error = ?err, "site replication delete user hook failed");
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_USER,
+                event = EVENT_ADMIN_USER_STATE,
+                access_key = %ak,
+                action = "delete_user",
+                result = "site_replication_hook_failed",
+                error = ?err,
+                "admin user state"
+            );
         }
 
         let mut header = HeaderMap::new();
@@ -521,7 +544,7 @@ impl Operation for GetUserInfo {
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AddUserQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
                 input
             } else {
                 AddUserQuery::default()
@@ -535,11 +558,11 @@ impl Operation for GetUserInfo {
         }
 
         let Ok(iam_store) = rustfs_iam::get() else {
-            return Err(s3_error!(InvalidRequest, "iam not init"));
+            return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
         let Some(input_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
+            return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
@@ -548,8 +571,10 @@ impl Operation for GetUserInfo {
         let check_deny_only = should_check_deny_only(ak, &cred);
 
         debug!(
-            target = "rustfs::admin::handlers::user",
-            operation = "GetUserInfo",
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_USER,
+            event = EVENT_ADMIN_USER_STATE,
+            action = "get_user_info",
             query_access_key = %ak,
             signer_access_key = %cred.access_key,
             is_temp = cred.is_temp(),
@@ -559,7 +584,8 @@ impl Operation for GetUserInfo {
             jwt_parent_claim_present = cred.claims.as_ref().and_then(|c| c.get("parent")).is_some(),
             check_deny_only,
             is_owner = owner,
-            "authorization context before validate_admin_request (no secrets)"
+            state = "authorization_context",
+            "admin user state"
         );
 
         // For eligible self operations, only explicit Deny should block the request.
@@ -576,7 +602,7 @@ impl Operation for GetUserInfo {
         let info = iam_store.get_user_info(ak).await.map_err(iam_error_to_s3_error)?;
 
         let data = serde_json::to_vec(&info)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal user err {e}")))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -845,7 +871,15 @@ impl Operation for ImportIam {
         let body = match input.store_all_limited(MAX_IAM_IMPORT_SIZE).await {
             Ok(b) => b,
             Err(e) => {
-                warn!("get body failed, e: {:?}", e);
+                warn!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_USER,
+                    event = EVENT_ADMIN_USER_STATE,
+                    action = "import_iam",
+                    result = "body_read_failed",
+                    error = ?e,
+                    "admin user state"
+                );
                 return Err(s3_error!(InvalidRequest, "get body failed"));
             }
         };
