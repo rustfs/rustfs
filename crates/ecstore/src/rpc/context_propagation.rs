@@ -14,10 +14,9 @@
 
 use http::{HeaderMap, HeaderValue};
 use opentelemetry::{global, propagation::Injector, trace::TraceContextExt};
+pub(crate) use rustfs_utils::http::headers::REQUEST_ID_HEADER;
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-
-pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
 
 struct HttpHeaderInjector<'a> {
     headers: &'a mut HeaderMap,
