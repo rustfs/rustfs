@@ -17,6 +17,13 @@ from dataclasses import dataclass
 from typing import Any
 
 DEFAULT_PROFILE = "rustfs"
+CATALOG_VENDED_PROFILE = "rustfs-vended-credentials"
+VENDED_CREDENTIAL_PROFILES = {CATALOG_VENDED_PROFILE}
+REQUIRED_STORAGE_CREDENTIAL_KEYS = (
+    "s3.access-key-id",
+    "s3.secret-access-key",
+    "s3.session-token",
+)
 
 PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
     "rustfs": {
@@ -34,6 +41,14 @@ PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
         "warehouse": "{bucket}",
         "credential_mode": "static-s3-credentials",
         "status": "compatibility-smoke-target",
+    },
+    CATALOG_VENDED_PROFILE: {
+        "catalog_uri": "{endpoint}/iceberg",
+        "rest_path": "/iceberg",
+        "rest_signing_name": "s3",
+        "warehouse": "{bucket}",
+        "credential_mode": "catalog-vended-temporary-credentials",
+        "status": "automated-credential-smoke-target",
     },
     "aws-s3tables": {
         "catalog_uri": "https://s3tables.{region}.amazonaws.com/iceberg",
@@ -73,7 +88,7 @@ CLIENT_MATRIX: list[dict[str, str]] = [
     {
         "client": "PyIceberg",
         "status": "automated",
-        "coverage": "create namespace, create table, append, reload, scan",
+        "coverage": "create namespace, create table, append, reload, scan, optional catalog-vended table credentials",
         "entrypoint": "scripts/table-catalog/pyiceberg_smoke.py",
     },
     {
@@ -111,10 +126,10 @@ CLIENT_MATRIX: list[dict[str, str]] = [
 UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
     {
         "capability": "credential-vending",
-        "status": "manual-enable-temporary-credentials-no-client-profile",
+        "status": "automated-after-table-bootstrap",
         "roadmap_area": "credential-vending",
         "catalog_endpoint": "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials",
-        "expected_behavior": "load table advertises the table credential scope; the credentials endpoint returns an empty storage-credentials list unless server-side temporary credential vending is explicitly enabled",
+        "expected_behavior": "the rustfs-vended-credentials profile requires server-side temporary credential vending and switches append, reload, and scan operations to the returned table-scoped credentials after table creation",
     },
     {
         "capability": "background-maintenance-worker",
@@ -161,6 +176,12 @@ class RuntimeDeps:
     load_catalog: Any
 
 
+@dataclass(frozen=True)
+class StorageCredential:
+    prefix: str
+    config: dict[str, str]
+
+
 def env_or_none(key: str) -> str | None:
     value = os.getenv(key)
     if value is None or value == "":
@@ -196,6 +217,8 @@ def apply_profile_defaults(args: argparse.Namespace) -> argparse.Namespace:
     args.rest_path = normalized_rest_path(args.rest_path)
     if args.rest_signing_name is None:
         args.rest_signing_name = defaults["rest_signing_name"]
+    if args.require_vended_credentials is None:
+        args.require_vended_credentials = args.profile in VENDED_CREDENTIAL_PROFILES
     return args
 
 
@@ -213,6 +236,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--catalog-name", default=os.getenv("RUSTFS_TABLE_CATALOG_NAME", "rustfs"))
     parser.add_argument("--rest-path", default=env_or_none("RUSTFS_TABLE_REST_PATH"))
     parser.add_argument("--rest-signing-name", default=env_or_none("RUSTFS_TABLE_REST_SIGNING_NAME"))
+    parser.add_argument(
+        "--require-vended-credentials",
+        action="store_true",
+        default=None,
+        help="Require table-scoped credentials from the REST credentials endpoint before data-plane operations.",
+    )
     parser.add_argument("--timeout", type=float, default=float(os.getenv("RUSTFS_TABLE_SMOKE_TIMEOUT", "20")))
     parser.add_argument("--cleanup", action="store_true", help="Drop the smoke table and namespace before exiting.")
     parser.add_argument("--replace", action="store_true", help="Drop an existing table with the same identifier first.")
@@ -359,7 +388,42 @@ def enable_table_bucket(args: argparse.Namespace, deps: RuntimeDeps) -> None:
     signed_rest_request(args, deps, "PUT", f"{args.rest_path}/v1/buckets/{encoded_bucket}")
 
 
-def catalog_properties(args: argparse.Namespace) -> dict[str, str]:
+def credentials_endpoint_path(args: argparse.Namespace) -> str:
+    encoded_bucket = urllib.parse.quote(args.bucket, safe="")
+    encoded_namespace = urllib.parse.quote(args.namespace, safe="")
+    encoded_table = urllib.parse.quote(args.table, safe="")
+    return f"{args.rest_path}/v1/{encoded_bucket}/namespaces/{encoded_namespace}/tables/{encoded_table}/credentials"
+
+
+def storage_credential_from_response(response: dict[str, Any]) -> StorageCredential:
+    credentials = response.get("storage-credentials")
+    if not isinstance(credentials, list) or not credentials:
+        raise RuntimeError("no storage credentials were returned by the table credentials endpoint")
+
+    for credential in credentials:
+        if not isinstance(credential, dict):
+            continue
+        config = credential.get("config")
+        if not isinstance(config, dict):
+            continue
+        missing_keys = [key for key in REQUIRED_STORAGE_CREDENTIAL_KEYS if not config.get(key)]
+        if missing_keys:
+            continue
+        prefix = credential.get("prefix")
+        if not isinstance(prefix, str):
+            prefix = ""
+        return StorageCredential(prefix=prefix, config={str(key): str(value) for key, value in config.items()})
+
+    required = ", ".join(REQUIRED_STORAGE_CREDENTIAL_KEYS)
+    raise RuntimeError(f"no storage credentials contained the required keys: {required}")
+
+
+def load_table_storage_credential(args: argparse.Namespace, deps: RuntimeDeps) -> StorageCredential:
+    response = signed_rest_request(args, deps, "GET", credentials_endpoint_path(args))
+    return storage_credential_from_response(response)
+
+
+def catalog_properties(args: argparse.Namespace, storage_credential: StorageCredential | None = None) -> dict[str, str]:
     endpoint = normalized_endpoint(args.endpoint)
     properties = {
         "type": "rest",
@@ -376,6 +440,8 @@ def catalog_properties(args: argparse.Namespace) -> dict[str, str]:
         "rest.signing-region": args.region,
         "rest.signing-name": args.rest_signing_name,
     }
+    if storage_credential is not None:
+        properties.update(storage_credential.config)
     if args.insecure:
         properties["s3.verify-ssl"] = "false"
     return properties
@@ -484,24 +550,24 @@ def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> None:
     ensure_local_proxy_bypass(endpoint)
     ensure_aws_env(args.access_key, args.secret_key, args.region)
 
-    print(f"[1/7] ensuring S3 bucket {args.bucket}")
+    print(f"[1/8] ensuring S3 bucket {args.bucket}")
     ensure_bucket(args, deps)
 
-    print(f"[2/7] enabling RustFS table bucket {args.bucket} through {args.rest_path}/v1")
+    print(f"[2/8] enabling RustFS table bucket {args.bucket} through {args.rest_path}/v1")
     enable_table_bucket(args, deps)
 
-    print(f"[3/7] loading PyIceberg REST catalog at {endpoint}{args.rest_path}")
+    print(f"[3/8] loading PyIceberg REST catalog at {endpoint}{args.rest_path}")
     catalog = deps.load_catalog(args.catalog_name, **catalog_properties(args))
     install_rustfs_rest_sigv4_adapter(catalog, args, deps)
     identifier = table_identifier(args)
 
     if args.replace:
-        print(f"[4/7] replacing existing table {'.'.join(identifier)} if present")
+        print(f"[4/8] replacing existing table {'.'.join(identifier)} if present")
         drop_table_if_present(catalog, identifier)
     else:
-        print(f"[4/7] table {'.'.join(identifier)} is available")
+        print(f"[4/8] table {'.'.join(identifier)} is available")
 
-    print(f"[5/7] creating namespace and table {'.'.join(identifier)}")
+    print(f"[5/8] creating namespace and table {'.'.join(identifier)}")
     ensure_namespace(catalog, args.namespace)
     arrow_schema = deps.pyarrow.schema(
         [
@@ -509,9 +575,19 @@ def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> None:
             deps.pyarrow.field("payload", deps.pyarrow.string(), nullable=False),
         ]
     )
-    table = catalog.create_table(identifier, schema=arrow_schema)
+    catalog.create_table(identifier, schema=arrow_schema)
 
-    print(f"[6/7] appending rows through PyIceberg")
+    if args.require_vended_credentials:
+        print(f"[6/8] loading table-scoped storage credentials")
+        storage_credential = load_table_storage_credential(args, deps)
+        print(f"credential scope: {storage_credential.prefix or 'not reported'}")
+        catalog = deps.load_catalog(args.catalog_name, **catalog_properties(args, storage_credential=storage_credential))
+        install_rustfs_rest_sigv4_adapter(catalog, args, deps)
+    else:
+        print(f"[6/8] using configured S3 credentials for data-plane operations")
+
+    print(f"[7/8] appending rows through PyIceberg")
+    table = catalog.load_table(identifier)
     rows = deps.pyarrow.Table.from_pylist(
         [
             {"id": 1, "payload": "alpha"},
@@ -521,7 +597,7 @@ def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> None:
     )
     table.append(rows)
 
-    print(f"[7/7] reloading and scanning table")
+    print(f"[8/8] reloading and scanning table")
     loaded = catalog.load_table(identifier)
     scanned = loaded.scan().to_arrow()
     if scanned.num_rows != 2:

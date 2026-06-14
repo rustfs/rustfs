@@ -69,6 +69,30 @@ python3 scripts/table-catalog/pyiceberg_smoke.py \
   --rest-signing-name s3
 ```
 
+To verify catalog-vended table credentials, enable server-side credential
+vending and use the vended credential profile:
+
+```text
+RUSTFS_TABLE_CATALOG_CREDENTIAL_VENDING=enabled
+```
+
+```bash
+python3 scripts/table-catalog/pyiceberg_smoke.py \
+  --profile rustfs-vended-credentials \
+  --endpoint http://127.0.0.1:9000 \
+  --access-key rustfsadmin \
+  --secret-key rustfsadmin \
+  --bucket rustfs-s3table-smoke \
+  --replace \
+  --cleanup
+```
+
+This profile uses the configured principal to create the bucket, enable the
+table bucket, and create the table. After the table exists, it calls the REST
+credentials endpoint and reloads the PyIceberg catalog with the returned
+table-scoped S3 access key, secret key, and session token before append, reload,
+and scan operations.
+
 ## Machine-Readable Inventories
 
 The script can print the current conformance inventories without importing
@@ -89,7 +113,7 @@ added.
 
 | Client | Current status | Claim |
 |---|---|---|
-| PyIceberg | Automated smoke target | create namespace, create table, append, reload, scan |
+| PyIceberg | Automated smoke target | create namespace, create table, append, reload, scan, optional catalog-vended table credentials |
 | Spark Iceberg REST catalog | Manual-ready | create/load/append/reload should be verified against a running RustFS endpoint |
 | Trino Iceberg REST catalog | Documented, not automated | no write compatibility claim yet |
 | DuckDB Iceberg | Documented, not automated | read-path reference only |
@@ -102,6 +126,7 @@ added.
 |---|---|---|---|---|
 | `rustfs` | `{endpoint}/iceberg` | `s3` | static S3 credentials | automated smoke target |
 | `rustfs-compat` | `{endpoint}/_iceberg` | `s3tables` by default | static S3 credentials | compatibility smoke target |
+| `rustfs-vended-credentials` | `{endpoint}/iceberg` | `s3` | catalog-vended table credentials after table creation | automated credential smoke target when server vending is enabled |
 | `aws-s3tables` | `https://s3tables.{region}.amazonaws.com/iceberg` | `s3tables` | AWS IAM/session credentials | reference only |
 | `minio-aistor` | `{endpoint}/_iceberg` | `s3tables` | policy-scoped S3 credentials | reference only |
 | `cloudflare-r2-data-catalog` | catalog URI returned by R2 | `s3` | catalog-vended credentials | reference only |
@@ -112,7 +137,7 @@ added.
 Unsupported behavior is documented instead of hidden behind internal errors. The
 current unsupported inventory is:
 
-- credential vending: table scope preview and credentials endpoint exist; temporary credentials are available only when explicitly enabled and are not yet covered by automated client profiles
+- credential vending: automated after table bootstrap; full no-long-term-data-credential bootstrap is not claimed
 - background maintenance worker: unsupported
 - manifest/data reachability cleanup: unsupported
 - snapshot expiration and compaction: unsupported
@@ -133,8 +158,12 @@ The endpoint returns an empty `storage-credentials` list unless table catalog
 credential vending is explicitly enabled. When enabled, RustFS issues temporary
 table-scoped S3 credentials through the credentials endpoint. Those credentials
 are constrained to the table warehouse prefix and include a session token and
-expiration. The automated smoke profiles still use configured S3 credentials for
-object data access until a catalog-vended credential profile is added.
+expiration.
+
+The `rustfs-vended-credentials` profile verifies the client handoff from the
+catalog principal to the table-scoped temporary credentials. It still uses the
+configured principal for setup and REST request signing; the vended credentials
+are applied to PyIceberg S3 data-plane access after the table has been created.
 
 Enablement is server-side and fail-closed:
 
