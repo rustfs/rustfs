@@ -14,7 +14,6 @@
 
 use crate::admin::console::is_console_path;
 use crate::admin::handlers::health::{HealthProbe, build_health_response_parts};
-use crate::admin::router::ADMIN_OBJECT_ZIP_DOWNLOADS_PATH;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::server::cors;
@@ -51,6 +50,7 @@ const HTTP_REQUEST_FAILED_EVENT: &str = "http_request_failed";
 const LOG_COMPONENT_SERVER: &str = "server";
 const LOG_SUBSYSTEM_HTTP: &str = "http";
 const REDACTED_QUERY_VALUE: &str = "redacted";
+const OBJECT_ZIP_DOWNLOADS_PATH: &str = "/v3/object-zip-downloads/";
 
 /// A carrier that adapts [`HeaderMap`] for OpenTelemetry trace context propagation.
 struct HeaderMapCarrier<'a>(&'a HeaderMap);
@@ -78,8 +78,7 @@ impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrier<'a> {
 
 pub(crate) fn redact_sensitive_uri_query(uri: &http::Uri) -> String {
     let path = uri.path();
-    let object_zip_download_prefix = format!("{ADMIN_PREFIX}{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH}/");
-    if !path.starts_with(&object_zip_download_prefix) || !path.ends_with(".zip") {
+    if !is_object_zip_download_path(path) {
         return uri.to_string();
     }
 
@@ -118,6 +117,12 @@ pub(crate) fn redact_sensitive_uri_query(uri: &http::Uri) -> String {
         }
         Err(_) => uri.to_string(),
     }
+}
+
+fn is_object_zip_download_path(path: &str) -> bool {
+    (path.starts_with(ADMIN_PREFIX) || path.starts_with(MINIO_ADMIN_PREFIX))
+        && path.contains(OBJECT_ZIP_DOWNLOADS_PATH)
+        && path.ends_with(".zip")
 }
 
 /// Tower middleware layer that creates a canonical [`RequestContext`] from HTTP headers
@@ -2725,6 +2730,20 @@ mod tests {
         let context = RequestLogContext::from_request(&request);
 
         assert_eq!(context.uri, "/rustfs/admin/v3/object-zip-downloads/download-id.zip?token=redacted&part=1");
+        assert!(!context.uri.contains("secret-token"));
+    }
+
+    #[test]
+    fn request_log_context_redacts_object_zip_download_tokens_for_minio_admin_prefix() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/minio/admin/v3/object-zip-downloads/download-id.zip?token=secret-token&part=1")
+            .body(())
+            .expect("request");
+
+        let context = RequestLogContext::from_request(&request);
+
+        assert_eq!(context.uri, "/minio/admin/v3/object-zip-downloads/download-id.zip?token=redacted&part=1");
         assert!(!context.uri.contains("secret-token"));
     }
 

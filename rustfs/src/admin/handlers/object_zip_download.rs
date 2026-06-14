@@ -46,7 +46,8 @@ use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::io::{AsyncReadExt, duplex};
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use url::form_urlencoded;
 use uuid::Uuid;
@@ -174,6 +175,10 @@ struct CreatedObjectZipDownloadToken {
     id: String,
     token: String,
     expires_at: OffsetDateTime,
+}
+
+struct PreparedZipArchive {
+    file: File,
 }
 
 impl From<&ReqInfo> for ObjectZipDownloadReqInfoSnapshot {
@@ -579,8 +584,8 @@ impl Operation for DownloadObjectZipHandler {
         let record = validate_download_token(id, &token, OffsetDateTime::now_utc())?;
         let _token_id = &record.id;
         let _principal = &record.principal;
-        validate_zip_download_request(&record).await?;
-        let body = build_zip_stream_body(record.request.clone());
+        let prepared = prepare_zip_download_archive(&record).await?;
+        let body = build_zip_stream_body(prepared);
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/zip"));
@@ -656,48 +661,7 @@ async fn validate_zip_download_request(record: &ObjectZipDownloadToken) -> S3Res
         .await
         .map_err(storage_error_to_s3)?;
 
-    let mut seen = HashSet::new();
-    let explicit_items = collect_explicit_zip_items(&record.request, &mut seen)?;
-    validate_zip_download_items(record, &explicit_items).await?;
-
-    for prefix in listing_prefixes(&record.request) {
-        let mut continuation_token = None;
-        loop {
-            let listed = store
-                .clone()
-                .list_objects_v2(
-                    &record.request.bucket,
-                    prefix,
-                    continuation_token.clone(),
-                    None,
-                    ZIP_LIST_MAX_KEYS,
-                    false,
-                    None,
-                    false,
-                )
-                .await
-                .map_err(storage_error_to_s3)?;
-
-            let mut page_items = Vec::new();
-
-            for object in listed.objects {
-                if object.name == *prefix && object.size == 0 {
-                    continue;
-                }
-                push_zip_item(&record.request, &mut seen, &mut page_items, object.name)?;
-            }
-            validate_zip_download_items(record, &page_items).await?;
-
-            if !listed.is_truncated {
-                break;
-            }
-            continuation_token = listed.next_continuation_token;
-            if continuation_token.is_none() {
-                break;
-            }
-        }
-    }
-
+    validate_zip_download_items(record, &collect_explicit_zip_items(&record.request)?).await?;
     Ok(())
 }
 
@@ -749,13 +713,11 @@ async fn authorize_zip_items_for_download(record: &ObjectZipDownloadToken, items
     Ok(())
 }
 
-fn collect_explicit_zip_items(
-    request: &CreateObjectZipDownloadRequest,
-    seen: &mut HashSet<String>,
-) -> S3Result<Vec<ZipDownloadItem>> {
+fn collect_explicit_zip_items(request: &CreateObjectZipDownloadRequest) -> S3Result<Vec<ZipDownloadItem>> {
     let mut items = Vec::new();
+    let mut seen = HashSet::new();
     for key in &request.objects {
-        push_zip_item(request, seen, &mut items, key.clone())?;
+        push_zip_item(request, &mut seen, &mut items, key.clone())?;
     }
     Ok(items)
 }
@@ -775,33 +737,64 @@ fn push_zip_item(
     Ok(())
 }
 
-fn build_zip_stream_body(request: CreateObjectZipDownloadRequest) -> Body {
-    let (reader, writer) = duplex(ZIP_STREAM_BUFFER_SIZE);
-    tokio::spawn(async move {
-        if let Err(err) = stream_zip_archive(request, writer).await {
-            tracing::error!("object ZIP download stream failed: {}", err);
+fn explicit_zip_item_keys(items: &[ZipDownloadItem]) -> HashSet<String> {
+    items.iter().map(|item| item.key.clone()).collect()
+}
+
+fn normalized_listing_prefixes(request: &CreateObjectZipDownloadRequest) -> Vec<String> {
+    let mut prefixes: Vec<String> = listing_prefixes(request).into_iter().map(str::to_string).collect();
+    prefixes.sort();
+    prefixes.dedup();
+
+    let mut normalized = Vec::new();
+    for prefix in prefixes {
+        if normalized.iter().any(|existing: &String| prefix.starts_with(existing)) {
+            continue;
         }
-    });
-    let stream = ReaderStream::with_capacity(reader, ZIP_STREAM_BUFFER_SIZE);
+        normalized.push(prefix);
+    }
+    normalized
+}
+
+fn build_zip_stream_body(prepared: PreparedZipArchive) -> Body {
+    let stream = ReaderStream::with_capacity(prepared.file, ZIP_STREAM_BUFFER_SIZE);
     Body::from(StreamingBlob::wrap(stream))
 }
 
-async fn stream_zip_archive(request: CreateObjectZipDownloadRequest, writer: tokio::io::DuplexStream) -> io::Result<()> {
-    let mut zip = ZipFileWriter::with_tokio(writer).force_zip64();
-    let store = new_object_layer_fn().ok_or_else(|| io::Error::other("object store not initialized"))?;
-    let mut seen = HashSet::new();
-    let explicit_items = collect_explicit_zip_items(&request, &mut seen)
-        .map_err(|err| io::Error::other(format!("failed to prepare explicit ZIP items: {err}")))?;
-    write_zip_items(&mut zip, &request.bucket, &explicit_items).await?;
+async fn prepare_zip_download_archive(record: &ObjectZipDownloadToken) -> S3Result<PreparedZipArchive> {
+    validate_zip_download_request(record).await?;
 
-    for prefix in listing_prefixes(&request) {
+    let temp_file = tempfile::tempfile().map_err(|err| s3_error!(InternalError, "failed to create ZIP temp file: {}", err))?;
+    let std_file = temp_file;
+    let mut file = File::from_std(std_file);
+
+    generate_zip_archive(record, &mut file)
+        .await
+        .map_err(|err| s3_error!(InternalError, "failed to prepare ZIP download: {}", err))?;
+    file.seek(std::io::SeekFrom::Start(0))
+        .await
+        .map_err(|err| s3_error!(InternalError, "failed to rewind ZIP temp file: {}", err))?;
+
+    Ok(PreparedZipArchive { file })
+}
+
+async fn generate_zip_archive(record: &ObjectZipDownloadToken, file: &mut File) -> io::Result<()> {
+    let mut zip = ZipFileWriter::with_tokio(file).force_zip64();
+    let store = new_object_layer_fn().ok_or_else(|| io::Error::other("object store not initialized"))?;
+
+    let explicit_items = collect_explicit_zip_items(&record.request)
+        .map_err(|err| io::Error::other(format!("failed to prepare explicit ZIP items: {err}")))?;
+    let explicit_keys = explicit_zip_item_keys(&explicit_items);
+    write_zip_items(&mut zip, &record.request.bucket, &explicit_items).await?;
+
+    for prefix in normalized_listing_prefixes(&record.request) {
         let mut continuation_token = None;
         loop {
             let listed = store
                 .clone()
                 .list_objects_v2(
-                    &request.bucket,
-                    prefix,
+                    &record.request.bucket,
+                    prefix.as_str(),
                     continuation_token.clone(),
                     None,
                     ZIP_LIST_MAX_KEYS,
@@ -814,13 +807,22 @@ async fn stream_zip_archive(request: CreateObjectZipDownloadRequest, writer: tok
 
             let mut page_items = Vec::new();
             for object in listed.objects {
-                if object.name == *prefix && object.size == 0 {
+                if object.name == prefix && object.size == 0 {
                     continue;
                 }
-                push_zip_item(&request, &mut seen, &mut page_items, object.name)
-                    .map_err(|err| io::Error::other(format!("failed to prepare ZIP entry name: {err}")))?;
+                if explicit_keys.contains(&object.name) {
+                    continue;
+                }
+                page_items.push(ZipDownloadItem {
+                    entry_name: zip_entry_name(record.request.prefix.as_deref(), &object.name)
+                        .map_err(|err| io::Error::other(format!("failed to prepare ZIP entry name: {err}")))?,
+                    key: object.name,
+                });
             }
-            write_zip_items(&mut zip, &request.bucket, &page_items).await?;
+            validate_zip_download_items(record, &page_items)
+                .await
+                .map_err(|err| io::Error::other(format!("failed to validate ZIP page for prefix `{prefix}`: {err}")))?;
+            write_zip_items(&mut zip, &record.request.bucket, &page_items).await?;
 
             if !listed.is_truncated {
                 break;
@@ -831,17 +833,21 @@ async fn stream_zip_archive(request: CreateObjectZipDownloadRequest, writer: tok
             }
         }
     }
+
     zip.close()
         .await
         .map(|_| ())
         .map_err(|err| io::Error::other(format!("failed to finish ZIP archive: {err}")))
 }
 
-async fn write_zip_items(
-    zip: &mut async_zip::tokio::write::ZipFileWriter<tokio::io::DuplexStream>,
+async fn write_zip_items<W>(
+    zip: &mut async_zip::tokio::write::ZipFileWriter<W>,
     bucket: &str,
     items: &[ZipDownloadItem],
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     for item in items {
         write_zip_item(zip, bucket, item).await.map_err(|err| {
             io::Error::other(format!(
@@ -853,11 +859,14 @@ async fn write_zip_items(
     Ok(())
 }
 
-async fn write_zip_item(
-    zip: &mut async_zip::tokio::write::ZipFileWriter<tokio::io::DuplexStream>,
+async fn write_zip_item<W>(
+    zip: &mut async_zip::tokio::write::ZipFileWriter<W>,
     bucket: &str,
     item: &ZipDownloadItem,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let store = new_object_layer_fn().ok_or_else(|| io::Error::other("object store not initialized"))?;
     let mut reader = store
         .get_object_reader(bucket, &item.key, None, HeaderMap::new(), &ObjectOptions::default())
@@ -1184,7 +1193,7 @@ mod tests {
             "2026/events/b.txt".to_string(),
         ];
 
-        let items = collect_explicit_zip_items(&request, &mut HashSet::new()).expect("items should collect");
+        let items = collect_explicit_zip_items(&request).expect("items should collect");
 
         assert_eq!(
             items,
@@ -1208,7 +1217,8 @@ mod tests {
         request.objects = vec!["2026/events/a.txt".to_string()];
 
         let mut seen = HashSet::new();
-        let mut items = collect_explicit_zip_items(&request, &mut seen).expect("explicit items should collect");
+        let mut items = collect_explicit_zip_items(&request).expect("explicit items should collect");
+        seen.extend(items.iter().map(|item| item.key.clone()));
 
         push_zip_item(&request, &mut seen, &mut items, "2026/events/a.txt".to_string())
             .expect("duplicate listed item should be ignored");
@@ -1244,7 +1254,21 @@ mod tests {
     }
 
     #[test]
-    fn download_handler_validates_and_streams_without_collecting_full_listing() {
+    fn normalized_listing_prefixes_removes_duplicates_and_nested_prefixes() {
+        let mut request = valid_request();
+        request.prefix = None;
+        request.prefixes = vec![
+            "2026/".to_string(),
+            "2026/reports/".to_string(),
+            "2026/".to_string(),
+            "2027/".to_string(),
+        ];
+
+        assert_eq!(normalized_listing_prefixes(&request), vec!["2026/".to_string(), "2027/".to_string()]);
+    }
+
+    #[test]
+    fn download_handler_prepares_archive_before_streaming_response() {
         let src = include_str!("object_zip_download.rs");
         let handler_block = extract_block_between_markers(
             src,
@@ -1253,16 +1277,16 @@ mod tests {
         );
 
         assert!(
-            handler_block.contains("validate_zip_download_request(&record).await?;"),
-            "download handler should validate access and object existence before returning the ZIP response"
+            handler_block.contains("prepare_zip_download_archive(&record).await?;"),
+            "download handler should fully prepare the ZIP archive before returning the ZIP response"
         );
         assert!(
-            handler_block.contains("build_zip_stream_body(record.request.clone())"),
-            "download handler should stream from the request scope instead of materializing a full item list first"
+            handler_block.contains("build_zip_stream_body(prepared)"),
+            "download handler should stream the prepared archive instead of rebuilding request scope during response"
         );
         assert!(
-            !handler_block.contains("collect_zip_items(&record.request).await?"),
-            "download handler must not collect every ZIP entry into memory before streaming"
+            !handler_block.contains("tokio::spawn"),
+            "download handler should not defer archive generation to a background task after returning 200"
         );
     }
 
@@ -1288,10 +1312,9 @@ mod tests {
         );
         assert!(
             validation_block.contains(".get_bucket_info(&record.request.bucket, &BucketOptions::default())")
-                && validation_block.contains(".list_objects_v2(")
                 && !validation_block.contains("failed to validate bucket")
                 && !validation_block.contains("failed to list prefix"),
-            "bucket and listing checks must not wrap expected user-facing errors with custom InternalError messages"
+            "bucket checks must not wrap expected user-facing errors with custom InternalError messages"
         );
     }
 
