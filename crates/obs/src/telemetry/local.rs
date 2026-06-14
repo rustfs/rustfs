@@ -99,9 +99,10 @@ where
         let mut buffer = String::new();
         self.inner.format_event(ctx, Writer::new(&mut buffer), event)?;
 
-        let Some(request_id) = span_scope_request_id(ctx, event) else {
+        let request_id = span_scope_request_id(ctx, event);
+        if request_id.is_none() {
             return writer.write_str(&buffer);
-        };
+        }
 
         let trimmed = buffer.trim_end();
         let mut payload: JsonValue = serde_json::from_str(trimmed).map_err(|_| fmt::Error)?;
