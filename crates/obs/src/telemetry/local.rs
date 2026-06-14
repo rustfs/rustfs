@@ -71,7 +71,7 @@ const LOG_SUBSYSTEM_LOCAL_LOGGING: &str = "local_logging";
 const EVENT_LOCAL_LOGGING_STATE: &str = "local_logging_state";
 const EVENT_LOG_CLEANER_STATE: &str = "log_cleaner_state";
 const STDERR_WARNING_PREFIX: &str = "[WARN]";
-const REQUEST_ID: &str = "request-id";
+const REQUEST_ID: &str = "request_id";
 
 #[derive(Clone, Debug)]
 struct RequestIdJsonFormat<T> {
@@ -98,17 +98,16 @@ where
         let mut buffer = String::new();
         self.inner.format_event(ctx, Writer::new(&mut buffer), event)?;
 
-        let request_id = span_scope_request_id(ctx, event);
-        if request_id.is_none() {
+        let Some(request_id) = span_scope_request_id(ctx, event) else {
             return writer.write_str(&buffer);
-        }
+        };
 
         let trimmed = buffer.trim_end();
         let mut payload: JsonValue = serde_json::from_str(trimmed).map_err(|_| fmt::Error)?;
         if let Some(object) = payload.as_object_mut() {
             object
                 .entry(REQUEST_ID.to_string())
-                .or_insert_with(|| JsonValue::String(request_id.expect("checked is_some")));
+                .or_insert_with(|| JsonValue::String(request_id));
         }
 
         let serialized = serde_json::to_string(&payload).map_err(|_| fmt::Error)?;
