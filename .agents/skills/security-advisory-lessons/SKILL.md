@@ -25,8 +25,8 @@ For the full pattern map, read [advisory-patterns.md](references/advisory-patter
 ## Workflow
 
 ### 1. Scope the change
-- Identify touched routes, handlers, storage paths, credentials, logs, browser surfaces, CI/release code, and policy checks.
-- Treat these paths as security-sensitive by default: `rustfs/src/admin/`, `rustfs/src/storage/`, `rustfs/src/auth.rs`, `rustfs/src/server/layer.rs`, `crates/iam/`, `crates/policy/`, `crates/credentials/`, `crates/ecstore/src/rpc/`, `crates/rio/`, and console preview/auth code.
+- Identify touched routes, protocol frontends, handlers, storage paths, credentials, logs, browser surfaces, CI/release code, and policy checks.
+- Treat these paths as security-sensitive by default: `rustfs/src/admin/`, `rustfs/src/storage/`, `rustfs/src/auth.rs`, `rustfs/src/server/layer.rs`, `crates/iam/`, `crates/policy/`, `crates/credentials/`, `crates/ecstore/src/rpc/`, `crates/protocols/`, `crates/rio/`, and console preview/auth code.
 
 ### 2. Map to advisory classes
 - Read [advisory-patterns.md](references/advisory-patterns.md) for matching GHSA lessons.
@@ -54,6 +54,7 @@ For the full pattern map, read [advisory-patterns.md](references/advisory-patter
 - Match the admin action to the operation exactly. Copy-paste action constants are a known RustFS vulnerability class.
 - Avoid authentication-only helpers for state-changing admin APIs; use `validate_admin_request` or the established equivalent with the right `AdminAction`.
 - Read-only admin APIs such as metrics, server info, and diagnostics still require admin authorization; checking only that credentials exist is not enough.
+- Replication admin reads can expose remote target credentials; list/get target endpoints require replication/admin authorization and must not return secrets to low-privilege callers.
 - Do not assume admin-action `Resource` scoping constrains blast radius unless the policy engine actually enforces resources for that action.
 
 ### IAM and service accounts
@@ -66,6 +67,12 @@ For the full pattern map, read [advisory-patterns.md](references/advisory-patter
 - Multipart copy must enforce source `GetObject` and destination `PutObject` semantics equivalent to `CopyObject`, including copy-source and policy conditions.
 - Do not let `CreateMultipartUpload`, `UploadPartCopy`, `CompleteMultipartUpload`, or `AbortMultipartUpload` return success without authorization.
 - Presigned POST policies are server-side contracts. Enforce `content-length-range`, key prefix, exact metadata/content-type, and all signed policy conditions.
+
+### Protocol frontends and IAM parity
+- FTP/FTPS, SFTP, gateway, and other protocol drivers must enforce IAM per operation before calling storage backends; authentication to a protocol listener is not authorization.
+- Match protocol commands to the same S3 actions as HTTP, such as `RETR` to `GetObject`, `SIZE`/`MDTM` to `HeadObject`, `MKD` to `CreateBucket`, and bucket probes to `ListBucket` or `HeadBucket`.
+- Review every handler in a protocol driver, not only the changed handler, because RustFS advisories show mixed guarded and unguarded siblings in the same driver.
+- Regression tests for protocol frontends should deny the shared authorization hook and prove the backend is not reached for the denied command.
 
 ### Paths, object keys, and filesystem access
 - Never join untrusted bucket/object/RPC path strings onto filesystem roots without normalization and boundary checks.
@@ -116,8 +123,10 @@ For the full pattern map, read [advisory-patterns.md](references/advisory-patter
 Use these prompts while reviewing a diff:
 
 - Could a low-privileged authenticated user reach this path with the wrong action, parent, bucket, or source object?
+- Does a non-HTTP protocol path call the same authorization boundary as the S3 API before touching storage?
 - Does a public/default/empty config change security behavior from fail-closed to fail-open?
 - Is any attacker-controlled value later used as a path, policy condition, credential identity, log field, URL, Origin, or response body?
+- Does this response contain stored replication, remote target, or service credentials that need redaction or stricter authorization?
 - Is an archive entry, object key, or policy resource normalized differently between authorization and storage?
 - Is the same operation implemented in multiple paths, such as `CopyObject` vs `UploadPartCopy`, and do all paths enforce the same security contract?
 - Does the test prove the exploit form is denied, or only that the intended form still works?
