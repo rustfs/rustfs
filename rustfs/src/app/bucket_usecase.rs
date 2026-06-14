@@ -55,6 +55,7 @@ use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::notification_sys::get_global_notification_sys;
+use rustfs_ecstore::store::ECStore;
 use rustfs_ecstore::store_api::{BucketOperations, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations, ObjectInfo};
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::{
@@ -738,6 +739,13 @@ impl DefaultBucketUsecase {
         self.context.as_ref().and_then(|context| context.region().get())
     }
 
+    fn object_store(&self) -> Option<Arc<ECStore>> {
+        self.context
+            .as_ref()
+            .map(|context| context.object_store())
+            .or_else(new_object_layer_fn)
+    }
+
     #[instrument(
         level = "debug",
         skip(self, req),
@@ -758,7 +766,7 @@ impl DefaultBucketUsecase {
         } = req.input;
         let lock_enabled = object_lock_enabled_for_bucket.is_some_and(|v| v);
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -801,7 +809,7 @@ impl DefaultBucketUsecase {
         let helper = OperationHelper::new(&req, EventName::BucketRemoved, S3Operation::DeleteBucket);
         let input = req.input.clone();
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -839,7 +847,7 @@ impl DefaultBucketUsecase {
     pub async fn execute_head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
         let input = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -858,7 +866,7 @@ impl DefaultBucketUsecase {
     ) -> S3Result<S3Response<GetBucketLocationOutput>> {
         let input = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -878,7 +886,7 @@ impl DefaultBucketUsecase {
 
     #[instrument(level = "debug", skip(self))]
     pub async fn execute_list_buckets(&self, req: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -936,7 +944,7 @@ impl DefaultBucketUsecase {
     ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
         let DeleteBucketEncryptionInput { bucket, .. } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -964,7 +972,7 @@ impl DefaultBucketUsecase {
     ) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
         let DeleteBucketCorsInput { bucket, .. } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -993,7 +1001,7 @@ impl DefaultBucketUsecase {
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketLifecycleInput { bucket, .. } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1023,7 +1031,7 @@ impl DefaultBucketUsecase {
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketPolicyInput { bucket, .. } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1052,7 +1060,7 @@ impl DefaultBucketUsecase {
     ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
         let DeleteBucketReplicationInput { bucket, .. } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1112,7 +1120,7 @@ impl DefaultBucketUsecase {
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeletePublicAccessBlockInput { bucket, .. } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1136,7 +1144,7 @@ impl DefaultBucketUsecase {
     ) -> S3Result<S3Response<GetBucketEncryptionOutput>> {
         let GetBucketEncryptionInput { bucket, .. } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1172,7 +1180,7 @@ impl DefaultBucketUsecase {
     pub async fn execute_get_bucket_cors(&self, req: S3Request<GetBucketCorsInput>) -> S3Result<S3Response<GetBucketCorsOutput>> {
         let GetBucketCorsInput { bucket, .. } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1214,7 +1222,7 @@ impl DefaultBucketUsecase {
     ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
         let GetBucketLifecycleConfigurationInput { bucket, .. } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1242,7 +1250,7 @@ impl DefaultBucketUsecase {
     ) -> S3Result<S3Response<GetBucketNotificationConfigurationOutput>> {
         let GetBucketNotificationConfigurationInput { bucket, .. } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1287,7 +1295,7 @@ impl DefaultBucketUsecase {
     ) -> S3Result<S3Response<GetBucketPolicyOutput>> {
         let GetBucketPolicyInput { bucket, .. } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1317,7 +1325,7 @@ impl DefaultBucketUsecase {
     ) -> S3Result<S3Response<GetBucketPolicyStatusOutput>> {
         let GetBucketPolicyStatusInput { bucket, .. } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1402,7 +1410,7 @@ impl DefaultBucketUsecase {
     ) -> S3Result<S3Response<GetBucketReplicationOutput>> {
         let GetBucketReplicationInput { bucket, .. } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1437,7 +1445,7 @@ impl DefaultBucketUsecase {
     ) -> S3Result<S3Response<GetBucketTaggingOutput>> {
         let GetBucketTaggingInput { bucket, .. } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1474,7 +1482,7 @@ impl DefaultBucketUsecase {
     ) -> S3Result<S3Response<GetPublicAccessBlockOutput>> {
         let GetPublicAccessBlockInput { bucket, .. } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1507,7 +1515,7 @@ impl DefaultBucketUsecase {
         req: S3Request<GetBucketVersioningInput>,
     ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
         let GetBucketVersioningInput { bucket, .. } = req.input;
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1555,7 +1563,7 @@ impl DefaultBucketUsecase {
 
         info!("sse_config {:?}", &server_side_encryption_configuration);
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1639,7 +1647,7 @@ impl DefaultBucketUsecase {
         }
 
         if lifecycle_has_transition_rules(&input_cfg)
-            && let Some(store) = new_object_layer_fn()
+            && let Some(store) = self.object_store()
         {
             let bucket_name = bucket.clone();
             let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
@@ -1651,7 +1659,7 @@ impl DefaultBucketUsecase {
         }
 
         if lifecycle_has_expiry_rules(&input_cfg)
-            && let Some(store) = new_object_layer_fn()
+            && let Some(store) = self.object_store()
         {
             let bucket_name = bucket.clone();
             let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
@@ -1679,7 +1687,7 @@ impl DefaultBucketUsecase {
 
         validate_notification_configuration_filters(&notification_configuration)?;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1747,7 +1755,7 @@ impl DefaultBucketUsecase {
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketPolicyInput { bucket, policy, .. } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1817,7 +1825,7 @@ impl DefaultBucketUsecase {
             ..
         } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1852,7 +1860,7 @@ impl DefaultBucketUsecase {
         } = req.input;
         info!(bucket = %bucket, "updating bucket replication config");
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1890,7 +1898,7 @@ impl DefaultBucketUsecase {
             ..
         } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1916,7 +1924,7 @@ impl DefaultBucketUsecase {
     ) -> S3Result<S3Response<PutBucketTaggingOutput>> {
         let PutBucketTaggingInput { bucket, tagging, .. } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 

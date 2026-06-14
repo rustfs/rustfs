@@ -5,15 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-app-context-tests`
-- Baseline: `origin/main` at `cb37a64a81bb857ea22efd2ebb015fbd3b64bef0`
-- PR type for this branch: `test-only`
-- Runtime behavior changes: none; resolver/global fallback semantics and IAM
-  degraded recovery behavior are unchanged.
-- Rust code changes: add AppContext resolver compatibility tests and IAM
-  deferred recovery readiness coverage.
+- Branch: `overtrue/arch-app-usecase-object-store-context`
+- Baseline: `origin/main` at `bed875d3e0d114398da8b2f94d4473293cbc45a8`
+- PR type for this branch: `consumer-migration`
+- Runtime behavior changes: no external behavior change expected; app usecases
+  prefer the AppContext-owned object store and keep the existing global
+  fallback.
+- Rust code changes: migrate admin, bucket, multipart, and object usecase
+  object-store lookups to AppContext-first resolution.
 - CI/script changes: none.
-- Docs changes: record `CTX-002`/`CTX-003` completion and verification scope.
+- Docs changes: record `CTX-004` consumer migration scope and verification.
 
 ## Phase 0 Tasks
 
@@ -159,6 +160,13 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: focused IAM recovery test, formatting, compile checks,
     migration guards, diff hygiene, Rust risk scan, and full
     `make pre-commit`.
+- [x] `CTX-004` Migrate app usecase object-store consumers.
+  - Do: migrate admin, bucket, multipart, and object usecases to resolve the
+    object store from AppContext first.
+  - Acceptance: usecase object-store lookups use AppContext when present and
+    preserve the existing global object-layer fallback when absent.
+  - Verification: formatting, compile check, migration guards, diff hygiene,
+    Rust risk scan, and full `make pre-commit`.
 
 ## Phase 1 Security Governance Tasks
 
@@ -467,41 +475,39 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 1. `pure-move`: start `R-009` boot wrapper with the IAM degraded readiness
    contract covered.
-2. `consumer-migration`: migrate a small consumer group to AppContext-first
-   access with resolver fallback tests in place.
+2. `consumer-migration`: migrate the next low-risk AppContext consumer group
+   while preserving global fallback.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Test-focused slice; resolver helpers stay private, AppContext test constructor is `#[cfg(test)]`, and no service container or registry is added. |
-| Migration preservation | pass | Context-first plus fallback semantics are asserted, object-store resolution remains AppContext-only, and IAM recovery still publishes `IamReady` before `FullReady`. |
-| Testing/verification | pass | Focused resolver/IAM tests, formatting, compile check, diff hygiene, migration guards, Rust risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | pass | Single `consumer-migration` slice; helpers stay private to each usecase and no service container, registry, or cross-layer dependency is added. |
+| Migration preservation | pass | AppContext object-store resolution is preferred when present, existing `new_object_layer_fn` fallback and `Not init` error paths are preserved, and method bodies keep their storage behavior. |
+| Testing/verification | pass | Formatting, compile check, diff hygiene, migration guards, added-line Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `cb37a64a81bb857ea22efd2ebb015fbd3b64bef0`:
+Passed on `bed875d3e0d114398da8b2f94d4473293cbc45a8`:
 - `cargo fmt --all`.
 - `cargo fmt --all --check`.
-- `cargo test -p rustfs app::context::compat::tests::resolver_helpers_are_context_first_and_fallback_when_context_is_absent -- --nocapture`.
-- `cargo test -p rustfs startup_iam::tests::recovery_loop_can_publish_iam_and_full_ready_after_degraded_init -- --nocapture`.
 - `cargo check -p rustfs --lib`.
 - `git diff --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
-- Rust risk scan for changed Rust files; matches are test-only `expect`
-  assertions, with no production `unwrap`/`expect`, numeric cast, string error,
-  boxed error, print macro, or relaxed-ordering match.
-- `make pre-commit`; all checks passed, including nextest 5891 passed and
+- Rust risk scan for changed Rust files; full-file matches were existing
+  code/tests, and the added-line scan returned no `unwrap`/`expect`, numeric
+  cast, string error, boxed error, print macro, or relaxed-ordering match.
+- `make pre-commit`; all checks passed, including nextest 5905 passed and
   111 skipped, plus doctests.
 
 Notes:
-- This slice adds coverage before further consumer migration.
-- Resolver helpers preserve the same AppContext-first and fallback order.
-- IAM degraded recovery keeps `IamReady` publication before `FullReady`.
+- This slice migrates one coherent app usecase consumer group.
+- Global object-layer fallback remains available until the planned cleanup
+  phase.
 
 ## Handoff Notes
 
-- CTX-002 and CTX-003 are complete.
-- Keep the next consumer or boot wrapper PR small and preserve global fallback
-  until the planned cleanup phase.
+- CTX-004 is complete.
+- Keep the next consumer or boot wrapper PR scoped to one PR type and preserve
+  global fallback until the planned cleanup phase.

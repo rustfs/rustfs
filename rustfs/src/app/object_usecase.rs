@@ -76,6 +76,7 @@ use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::rio::{DynReader, HashReader, WritePlan, wrap_reader};
 use rustfs_ecstore::set_disk::{get_lock_acquire_timeout, is_valid_storage_class};
+use rustfs_ecstore::store::ECStore;
 use rustfs_ecstore::store_api::{
     HTTPRangeSpec, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader,
 };
@@ -1151,6 +1152,13 @@ impl DefaultObjectUsecase {
 
     fn bucket_metadata_sys(&self) -> Option<Arc<RwLock<metadata_sys::BucketMetadataSys>>> {
         self.context.as_ref().and_then(|context| context.bucket_metadata().handle())
+    }
+
+    fn object_store(&self) -> Option<Arc<ECStore>> {
+        self.context
+            .as_ref()
+            .map(|context| context.object_store())
+            .or_else(new_object_layer_fn)
     }
 
     fn base_buffer_size(&self) -> usize {
@@ -2501,7 +2509,7 @@ impl DefaultObjectUsecase {
             ..
         } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -2798,7 +2806,7 @@ impl DefaultObjectUsecase {
 
         let cp_src_dst_same = path_join_buf(&[&src_bucket, &src_key]) == path_join_buf(&[&bucket, &key]);
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -3086,7 +3094,7 @@ impl DefaultObjectUsecase {
         )
         .await;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -3439,7 +3447,7 @@ impl DefaultObjectUsecase {
             // }
         }
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -3658,7 +3666,7 @@ impl DefaultObjectUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
         // Modification Points: Explicitly handles get_object_info errors, distinguishing between object absence and other errors
@@ -3962,7 +3970,7 @@ impl DefaultObjectUsecase {
             S3Error::with_message(S3ErrorCode::Custom("ErrValidRestoreObject".into()), "restore request is required")
         })?;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -4304,7 +4312,7 @@ impl DefaultObjectUsecase {
             s3_error!(InvalidArgument, "get entries err")
         })?;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
