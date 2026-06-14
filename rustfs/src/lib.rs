@@ -70,6 +70,7 @@ pub mod server;
 pub mod startup_fs_guard;
 pub mod startup_iam;
 pub mod startup_protocols;
+pub mod startup_runtime;
 pub mod startup_services;
 pub mod storage;
 pub(crate) mod table_catalog;

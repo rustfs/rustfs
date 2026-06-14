@@ -19,7 +19,7 @@ use rustfs::init::{
 
 use futures_util::future::join_all;
 use rustfs::capacity::capacity_integration::init_capacity_management;
-use rustfs::license::{init_license, license_status};
+use rustfs::license::init_license;
 use rustfs::server::{
     ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, shutdown_event_notifier, start_http_server,
     stop_audit_system, wait_for_shutdown,
@@ -27,6 +27,7 @@ use rustfs::server::{
 use rustfs::startup_fs_guard::enforce_unsupported_fs_policy;
 use rustfs::startup_iam::{bootstrap_or_defer_iam_init, publish_ready_for_iam_bootstrap};
 use rustfs::startup_protocols::{ProtocolShutdownSenders, init_protocol_shutdown_senders};
+use rustfs::startup_runtime::init_startup_runtime_foundation;
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
@@ -54,7 +55,6 @@ use rustfs_storage_api::BucketOptions;
 use rustfs_utils::{
     ExternalEnvCompatReport, apply_external_env_compat, get_env_bool_with_aliases, net::parse_and_resolve_address,
 };
-use rustls::crypto::aws_lc_rs::default_provider;
 use std::io::{Error, Result};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -66,16 +66,11 @@ const ENV_HEAL_ENABLED: &str = "RUSTFS_HEAL_ENABLED";
 const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
 const LOG_COMPONENT_MAIN: &str = "main";
 const LOG_SUBSYSTEM_STARTUP: &str = "startup";
-const LOG_SUBSYSTEM_LICENSE: &str = "license";
 const LOG_SUBSYSTEM_AUTH: &str = "auth";
 const LOG_SUBSYSTEM_STORAGE: &str = "storage";
 const EVENT_EXTERNAL_ENV_COMPAT_CONFLICT: &str = "external_env_compat_conflict";
 const EVENT_EXTERNAL_ENV_COMPAT_APPLIED: &str = "external_env_compat_applied";
-const EVENT_DIAL9_RUNTIME_STATUS: &str = "dial9_runtime_status";
-const EVENT_RUNTIME_LICENSE_STATUS: &str = "runtime_license_status";
 const EVENT_OBSERVABILITY_GUARD_SET_FAILED: &str = "observability_guard_set_failed";
-const EVENT_TLS_OUTBOUND_INITIALIZED: &str = "tls_outbound_initialized";
-const EVENT_TLS_OUTBOUND_INITIALIZATION_FAILED: &str = "tls_outbound_initialization_failed";
 const EVENT_DEFAULT_CREDENTIALS_DETECTED: &str = "default_credentials_detected";
 const EVENT_SERVER_CONFIG_SANITIZED: &str = "server_config_sanitized";
 const EVENT_SERVER_STARTING: &str = "server_starting";
@@ -83,7 +78,6 @@ const EVENT_SERVER_RUNTIME_FAILED: &str = "server_runtime_failed";
 const EVENT_ACTION_CREDENTIALS_INITIALIZED: &str = "action_credentials_initialized";
 const EVENT_ACTION_CREDENTIALS_INITIALIZATION_FAILED: &str = "action_credentials_initialization_failed";
 const EVENT_OBSERVABILITY_GUARD_SET: &str = "observability_guard_set";
-const EVENT_CRYPTO_PROVIDER_STATE: &str = "crypto_provider_state";
 const EVENT_ENDPOINT_PARSING_STARTED: &str = "endpoint_parsing_started";
 const EVENT_STARTUP_STORAGE_STAGE: &str = "startup_storage_stage";
 const EVENT_STORAGE_POOL_FORMATTING: &str = "storage_pool_formatting";
@@ -217,99 +211,7 @@ async fn async_main() -> Result<()> {
     }
 
     log_external_prefix_compat_report(&env_compat_report);
-
-    // Check dial9 Tokio runtime telemetry status
-    // Note: The actual telemetry session is created in build_tokio_runtime()
-    // which stores the TelemetryGuard globally for the program duration.
-    if rustfs_obs::dial9::is_enabled() {
-        info!(
-            target: "rustfs::main",
-            event = EVENT_DIAL9_RUNTIME_STATUS,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            enabled = true,
-            "Dial9 Tokio runtime telemetry is enabled"
-        );
-    } else {
-        debug!(
-            target: "rustfs::main",
-            event = EVENT_DIAL9_RUNTIME_STATUS,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            enabled = false,
-            "Dial9 Tokio runtime telemetry is disabled"
-        );
-    }
-
-    info!(
-        target: "rustfs::main",
-        event = EVENT_RUNTIME_LICENSE_STATUS,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_LICENSE,
-        license_status = %license_status(),
-        "Initialized runtime license state"
-    );
-
-    // print startup logo
-    debug!("{}", rustfs::server::LOGO);
-
-    // Initialize performance profiling if enabled
-    rustfs::profiling::init_from_env().await;
-
-    // Initialize trusted proxies system
-    rustfs_trusted_proxies::init();
-
-    // Make sure to use a modern encryption suite
-    if default_provider().install_default().is_err() {
-        // A crypto provider is already installed (e.g. by the host process); this is fine.
-        debug!(
-            target: "rustfs::main",
-            event = EVENT_CRYPTO_PROVIDER_STATE,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            provider = "aws_lc_rs",
-            state = "already_installed",
-            "Rustls crypto provider state checked"
-        );
-    }
-    // Initialize TLS outbound material (root CAs, mTLS identity) if configured.
-    // Server-side TLS acceptor is built separately inside start_http_server().
-    // Single load via tls-runtime; outbound is enriched with platform CAs and
-    // published to the global state before any HTTP listener starts.
-    if let Some(tls_path) = config.tls_path.as_deref().map(str::trim).filter(|path| !path.is_empty()) {
-        match rustfs::server::tls_material::load_tls_material(tls_path).await {
-            Ok(snapshot) => {
-                use rustfs_tls_runtime::{TlsGeneration, publish_global_outbound_tls_state, record_tls_generation};
-                let generation = TlsGeneration(rustfs_common::get_global_outbound_tls_generation().saturating_add(1));
-                publish_global_outbound_tls_state(generation, &snapshot.outbound).await;
-                record_tls_generation("rustfs_server_startup", generation.0);
-                info!(
-                    target: "rustfs::main",
-                    event = EVENT_TLS_OUTBOUND_INITIALIZED,
-                    component = LOG_COMPONENT_MAIN,
-                    subsystem = LOG_SUBSYSTEM_STARTUP,
-                    tls_path,
-                    generation = generation.0,
-                    "Initialized TLS outbound material"
-                );
-            }
-            Err(e) => {
-                error!(
-                    target: "rustfs::main",
-                    event = EVENT_TLS_OUTBOUND_INITIALIZATION_FAILED,
-                    component = LOG_COMPONENT_MAIN,
-                    subsystem = LOG_SUBSYSTEM_STARTUP,
-                    tls_path,
-                    error = %e,
-                    "Failed to initialize TLS outbound material"
-                );
-                return Err(Error::other(e.to_string()));
-            }
-        }
-        if rustfs_obs::observability_metric_enabled() {
-            rustfs_tls_runtime::init_tls_metrics();
-        }
-    }
+    init_startup_runtime_foundation(&config).await?;
 
     // Run parameters
     match run(*config).await {

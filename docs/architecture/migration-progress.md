@@ -5,17 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-startup-subsystems-bootstrap`
-- Baseline: `origin/main` at `949939137066435e590c8bd0f029ed1500e0e1cd`
+- Branch: `overtrue/arch-startup-core-runtime-bootstrap`
+- Baseline: `origin/main` at `73e534682e93d1ed2c7b0e752ad550d969ca96b2`
 - PR type for this branch: `pure-move`
-- Runtime behavior changes: no external behavior change expected; FTP, FTPS,
-  WebDAV, and SFTP startup still honors compile features and env-driven
-  enable/disable behavior, startup failure mapping, and shutdown handle flow.
-- Rust code changes: centralize protocol sidecar bootstrap in
-  `startup_protocols::init_protocol_shutdown_senders` and use it from binary
+- Runtime behavior changes: no external behavior change expected; startup
+  runtime foundation still logs dial9/license state, prints the logo, initializes
+  profiling and trusted proxies, installs the rustls provider, and publishes
+  outbound TLS material in the same order and with the same fatal boundary.
+- Rust code changes: centralize startup runtime foundation bootstrap in
+  `startup_runtime::init_startup_runtime_foundation` and use it from binary
   startup.
 - CI/script changes: none.
-- Docs changes: record `R-011` startup protocol bootstrap wrapper progress and
+- Docs changes: record `R-012` startup runtime foundation bootstrap progress and
   verification.
 
 ## Phase 0 Tasks
@@ -590,6 +591,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: focused startup protocol tests, binary/lib compile checks,
     formatting, migration guards, Rust risk scan, and pre-commit quality gate.
 
+- [x] `R-012` Centralize startup runtime foundation bootstrap.
+  - Do: move dial9 runtime status logging, runtime license status logging,
+    startup logo logging, profiling setup, trusted-proxy setup, rustls provider
+    setup, and outbound TLS material publication behind
+    `startup_runtime::init_startup_runtime_foundation`.
+  - Acceptance: BOOT-006 order is unchanged, configured TLS material load
+    remains fatal with the same `Error::other(err.to_string())` mapping, TLS
+    generation remains saturating, TLS metrics still initialize only when
+    metrics are enabled and TLS is configured, and profiling/proxy/provider
+    setup remains non-fatal.
+  - Must preserve: dial9/license log event names and fields, startup logo
+    logging, profiling init timing, trusted-proxy init timing, crypto provider
+    already-installed handling, outbound TLS publication, generation metric
+    consumer, TLS metric init condition, and fatal boundaries.
+  - Verification: focused startup runtime tests, binary/lib compile checks,
+    formatting, migration guards, Rust risk scan, branch freshness check, and
+    pre-commit quality gate.
+
 ## Next PRs
 
 1. `pure-move`: continue extracting startup boot wrappers in larger slices while
@@ -601,39 +620,38 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Pure-move slice centralizes protocol sidecar startup while keeping the binary boundary in charge of shutdown wiring. |
-| Migration preservation | passed | Protocol feature gates, env-driven disabled handling, startup log event/state/protocol fields, and `Error::other` failure mapping are preserved. |
-| Testing/verification | passed | Focused startup protocol tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Pure-move slice removes startup runtime foundation details from binary startup without changing ownership or adding abstraction beyond the existing startup module pattern. |
+| Migration preservation | passed | BOOT-006 order, dial9/license log fields, profiling/proxy/provider non-fatal setup, TLS fatal boundary, generation saturation, and TLS metric condition are preserved. |
+| Testing/verification | passed | Focused startup runtime tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `949939137066435e590c8bd0f029ed1500e0e1cd`:
+Passed on `73e534682e93d1ed2c7b0e752ad550d969ca96b2`:
 
+- `cargo test -p rustfs startup_runtime --no-fail-fast`.
 - `cargo check -p rustfs --lib`.
 - `cargo check -p rustfs --bin rustfs`.
-- `cargo test -p rustfs startup_protocols --no-fail-fast`.
 - `cargo fmt --all --check`.
 - `git diff --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - `git rev-list --left-right --count HEAD...origin/main` returned `0 0`.
-- Rust risk scan for changed Rust files: the only added-line match is the
-  `Box<dyn Error + Send + Sync>` type required by existing protocol init
-  signatures; full-file matches were existing docs examples and existing binary
-  startup error output.
-- `make pre-commit`: all checks passed, including nextest with 5971 passed and
+- Added-line Rust risk scan for changed Rust files: no matches.
+- Full-file risk scan for changed Rust files: matches are existing docs example
+  output and existing binary startup stderr/expect usage.
+- `make pre-commit`: all checks passed, including nextest with 6002 passed and
   111 skipped, plus doctests.
 
 Notes:
 
-- This slice centralizes startup protocol sidecar bootstrap without changing
-  startup ordering or shutdown handle ownership.
-- Protocol logging keeps the existing event, subsystem, protocol, and state
-  values.
+- This slice centralizes startup runtime foundation bootstrap without changing
+  startup ordering or fatal boundaries.
+- Observability initialization remains in binary startup so early fatal stderr
+  handling stays unchanged.
 
 ## Handoff Notes
 
-- R-011 is complete.
-- Next startup slices can be larger pure moves, but must keep startup ordering,
-  fatal/non-fatal boundaries, shutdown ownership, and readiness ownership
-  explicit in tests.
+- R-012 is complete.
+- Next startup slices can keep using larger pure moves, but must keep startup
+  ordering, fatal/non-fatal boundaries, shutdown ownership, and readiness
+  ownership explicit in tests.
