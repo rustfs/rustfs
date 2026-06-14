@@ -107,6 +107,7 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/diagnostics",
+    "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
 ];
 
@@ -135,6 +136,7 @@ static GET_TABLE_MAINTENANCE_JOB_HANDLER: GetTableMaintenanceJobHandler = GetTab
 static EXPORT_TABLE_CATALOG_HANDLER: ExportTableCatalogHandler = ExportTableCatalogHandler {};
 static IMPORT_TABLE_CATALOG_HANDLER: ImportTableCatalogHandler = ImportTableCatalogHandler {};
 static GET_TABLE_CATALOG_DIAGNOSTICS_HANDLER: GetTableCatalogDiagnosticsHandler = GetTableCatalogDiagnosticsHandler {};
+static RECOVER_TABLE_CATALOG_HANDLER: RecoverTableCatalogHandler = RecoverTableCatalogHandler {};
 static ROLLBACK_TABLE_CATALOG_HANDLER: RollbackTableCatalogHandler = RollbackTableCatalogHandler {};
 
 #[derive(Debug, Serialize)]
@@ -605,6 +607,11 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         Method::GET,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/catalog/diagnostics").as_str(),
         AdminOperation(&GET_TABLE_CATALOG_DIAGNOSTICS_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/catalog/recovery").as_str(),
+        AdminOperation(&RECOVER_TABLE_CATALOG_HANDLER),
     )?;
     r.insert(
         Method::POST,
@@ -2918,6 +2925,25 @@ impl Operation for GetTableCatalogDiagnosticsHandler {
     }
 }
 
+pub struct RecoverTableCatalogHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RecoverTableCatalogHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
+        let store = table_catalog_store()?;
+        let response = store
+            .recover_table_commits(&warehouse, &namespace.public_name(), &table)
+            .await
+            .map_err(catalog_store_error)?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
 pub struct RollbackTableCatalogHandler {}
 
 #[async_trait::async_trait]
@@ -3003,6 +3029,11 @@ mod tests {
                 .endpoints
                 .contains(&"GET /{warehouse}/namespaces/{namespace}/tables/{table}/credentials")
         );
+        assert!(
+            response
+                .endpoints
+                .contains(&"POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery")
+        );
     }
 
     #[test]
@@ -3043,6 +3074,7 @@ mod tests {
             ("ExportTableCatalogHandler", "AdminAction::GetTableMetadataAction"),
             ("ImportTableCatalogHandler", "AdminAction::RegisterTableAction"),
             ("GetTableCatalogDiagnosticsHandler", "AdminAction::GetTableMetadataAction"),
+            ("RecoverTableCatalogHandler", "AdminAction::CommitTableAction"),
             ("RollbackTableCatalogHandler", "AdminAction::CommitTableAction"),
         ] {
             let block = operation_block(src, handler);
@@ -3075,6 +3107,7 @@ mod tests {
             ("ExportTableCatalogHandler", "AdminAction::GetTableMetadataAction"),
             ("ImportTableCatalogHandler", "AdminAction::RegisterTableAction"),
             ("GetTableCatalogDiagnosticsHandler", "AdminAction::GetTableMetadataAction"),
+            ("RecoverTableCatalogHandler", "AdminAction::CommitTableAction"),
             ("RollbackTableCatalogHandler", "AdminAction::CommitTableAction"),
         ] {
             let block = operation_block(src, handler);
