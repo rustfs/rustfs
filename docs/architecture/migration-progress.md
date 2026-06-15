@@ -5,20 +5,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-startup-server-preflight`
-- Baseline: `origin/main` at `2288b1bb634bda8a06bf7c19780b0318473dbe33`
+- Branch: `overtrue/arch-startup-listen-and-server-bootstrap`
+- Baseline: `origin/main` at `c2e0792f6ffa6d0c30c4d516204fcc252c529592`
 - PR type for this branch: `pure-move`
-- Runtime behavior changes: no external behavior change expected; external
-  prefix compatibility reporting, config snapshot initialization, license
-  initialization, observability guard initialization/storage, and startup
-  runtime foundation bootstrap still run in the same order and with the same
-  fatal boundaries.
-- Rust code changes: centralize server startup preflight bootstrap in
-  `startup_preflight::init_startup_server_preflight` and use it from binary
-  startup.
+- Runtime behavior changes: no external behavior change expected; server config
+  logging, readiness creation, region/global address/global port setup, action
+  credentials, capacity/state setup, and S3/console HTTP server startup still
+  run in the same relative order.
+- Rust code changes: add
+  `startup_server::{init_startup_listen_context, init_startup_http_servers}`
+  and use them from binary startup.
 - CI/script changes: none.
-- Docs changes: record `R-013` startup server preflight bootstrap progress and
-  verification.
+- Docs changes: record `R-014` startup listen and HTTP server bootstrap progress
+  and verification.
 
 ## Phase 0 Tasks
 
@@ -627,6 +626,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     formatting, migration guards, Rust risk scan, branch freshness check, and
     pre-commit quality gate.
 
+- [x] `R-014` Centralize startup listen and HTTP server bootstrap.
+  - Do: move server config logging, readiness creation, region/address setup,
+    default credential warning, global action credentials, global port/address
+    publication, capacity management, service state manager setup, and
+    S3/console HTTP server startup behind `startup_server` helpers.
+  - Acceptance: endpoint/storage initialization still happens after listen
+    context setup and before HTTP server startup; S3 still disables console
+    mode; console server still starts only when enabled with a non-empty console
+    address; global action credential and address error mappings remain
+    unchanged.
+  - Must preserve: sanitized config/start/default credential/action credential
+    log events, region validation, server address/port derivation, global
+    port/address publication, capacity init timing, service `Starting` update,
+    S3/console server config shape, and shutdown handle ownership.
+  - Verification: focused startup server tests, binary/lib compile checks,
+    formatting, migration guards, Rust risk scan, branch freshness check, and
+    pre-commit quality gate.
+
 ## Next PRs
 
 1. `pure-move`: continue extracting startup boot wrappers in larger slices while
@@ -638,39 +655,41 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Pure-move slice removes server preflight details from binary startup behind the existing startup module pattern; the logging governance test was updated only to match the new fatal-stderr call shape. |
-| Migration preservation | passed | Env compatibility apply/report order, config snapshot, license init, observability init/store, fatal stderr sentinel, guard-store error return, and runtime foundation order are preserved. |
-| Testing/verification | passed | Focused startup preflight and logging-governance tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Pure-move slice removes listen context and HTTP server bootstrap details from binary startup behind the existing startup module pattern. |
+| Migration preservation | passed | Server config logging, readiness creation, region/address publication, action credentials, capacity/state setup, endpoint/storage interleaving, and shutdown handle ownership are preserved. |
+| Testing/verification | passed | Focused startup server tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `2288b1bb634bda8a06bf7c19780b0318473dbe33`:
+Passed on `c2e0792f6ffa6d0c30c4d516204fcc252c529592`:
 
-- `cargo test -p rustfs startup_preflight --no-fail-fast`: passed.
-- `cargo test -p rustfs-obs startup_fatal_stderr_uses_single_formatter_for_pre_observability_failures --no-fail-fast`: passed.
+- `cargo test -p rustfs startup_server --no-fail-fast`: passed.
 - `cargo check -p rustfs --lib`: passed.
 - `cargo check -p rustfs --bin rustfs`: passed.
 - `cargo fmt --all --check`: passed.
 - `git diff --check`: passed.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
-- `git rev-list --left-right --count HEAD...origin/main` returned `0 0`.
+- `git rev-list --left-right --count HEAD...origin/main` returned `1 0`
+  after the final rebase onto `origin/main`.
 - Added-line Rust risk scan for changed Rust files: no matches.
 - Full-file risk scan for changed Rust files: matches are existing docs example
   output and existing binary startup alias/stderr/expect usage.
-- `make pre-commit`: all checks passed, including nextest with 6003 passed and
-  111 skipped, plus doctests.
+- `make pre-commit`: all checks passed before the final clean rebase,
+  including nextest with 6006 passed and 111 skipped, plus doctests.
+- Post-rebase focused startup server tests, binary/lib compile checks,
+  formatting, migration/layer guards, and diff checks passed.
 
 Notes:
 
-- This slice centralizes server startup preflight bootstrap without changing
-  startup ordering or fatal boundaries.
-- Observability initialization failure still maps to the dedicated fatal stderr
-  sentinel in binary startup.
+- This slice centralizes startup listen context and HTTP server bootstrap
+  without changing startup ordering or shutdown handle ownership.
+- Endpoint/storage initialization remains between listen context setup and HTTP
+  server startup.
 
 ## Handoff Notes
 
-- R-013 is complete.
+- R-014 is complete.
 - Next startup slices can keep using larger pure moves, but must keep startup
   ordering, fatal/non-fatal boundaries, shutdown ownership, and readiness
   ownership explicit in tests.
