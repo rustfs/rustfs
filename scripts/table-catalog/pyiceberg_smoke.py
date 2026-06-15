@@ -135,13 +135,13 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
         "capability": "background-maintenance-worker",
         "status": "unsupported",
         "roadmap_area": "maintenance-worker",
-        "expected_behavior": "manual maintenance APIs may exist, but background-enabled maintenance is rejected",
+        "expected_behavior": "manual maintenance APIs expose retry/quarantine policy fields in reports, but background-enabled maintenance is rejected until a worker owns scheduling",
     },
     {
         "capability": "manifest-data-reachability-cleanup",
-        "status": "unsupported",
+        "status": "fail-closed-reporting",
         "roadmap_area": "reachability-cleanup",
-        "expected_behavior": "metadata-only cleanup must not delete manifest, data, or delete files",
+        "expected_behavior": "metadata maintenance reports expose reachability graph status and referenced manifest-list objects, but cleanup must not delete manifest, data, or delete files",
     },
     {
         "capability": "snapshot-expiration",
@@ -157,9 +157,15 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
     },
     {
         "capability": "iceberg-views",
-        "status": "unsupported",
+        "status": "stable-unsupported-routes",
         "roadmap_area": "view-api",
-        "expected_behavior": "view routes should return a stable unsupported response until implemented",
+        "expected_behavior": "view routes are registered and should return a stable unsupported JSON response until implemented",
+    },
+    {
+        "capability": "external-catalog-bridge",
+        "status": "metadata-import-only",
+        "roadmap_area": "external-catalog",
+        "expected_behavior": "catalog import/register supports an existing Iceberg metadata location, while Polaris, Glue, DLF, and Hive synchronization remain unsupported",
     },
     {
         "capability": "multi-table-transactions",

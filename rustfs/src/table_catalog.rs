@@ -83,6 +83,7 @@ const MAINTENANCE_JOB_ALIAS_LATEST: &str = "latest";
 const MAINTENANCE_JOB_ALIAS_CURRENT: &str = "current";
 const TABLE_CATALOG_LIST_MAX_KEYS: i32 = 1000;
 const TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS: i64 = 15 * 60;
+const TABLE_MAINTENANCE_RETRY_BACKOFF_MAX_SECONDS: u64 = 24 * 60 * 60;
 const TABLE_COMMIT_SLOW_LOG_THRESHOLD: StdDuration = StdDuration::from_secs(2);
 const ICEBERG_MAIN_REF: &str = "main";
 const ICEBERG_MIN_SNAPSHOTS_TO_KEEP_PROPERTY: &str = "history.expire.min-snapshots-to-keep";
@@ -273,6 +274,16 @@ pub(crate) struct TableMaintenanceConfig {
     pub delete_enabled: bool,
     #[serde(rename = "background-enabled")]
     pub background_enabled: bool,
+    #[serde(default, rename = "max-retry-attempts")]
+    pub max_retry_attempts: u16,
+    #[serde(default, rename = "retry-initial-backoff-seconds")]
+    pub retry_initial_backoff_seconds: u64,
+    #[serde(default, rename = "retry-max-backoff-seconds")]
+    pub retry_max_backoff_seconds: u64,
+    #[serde(default, rename = "quarantine-enabled")]
+    pub quarantine_enabled: bool,
+    #[serde(default, rename = "quarantine-retention-seconds")]
+    pub quarantine_retention_seconds: u64,
 }
 
 impl Default for TableMaintenanceConfig {
@@ -282,6 +293,11 @@ impl Default for TableMaintenanceConfig {
             retain_recent_metadata_files: 0,
             delete_enabled: false,
             background_enabled: false,
+            max_retry_attempts: 0,
+            retry_initial_backoff_seconds: 5,
+            retry_max_backoff_seconds: 300,
+            quarantine_enabled: false,
+            quarantine_retention_seconds: 0,
         }
     }
 }
@@ -322,6 +338,16 @@ pub(crate) struct TableMetadataMaintenanceJob {
     #[serde(default)]
     pub lease_id: String,
     #[serde(default)]
+    pub attempt: u16,
+    #[serde(default, rename = "max-retry-attempts")]
+    pub max_retry_attempts: u16,
+    #[serde(default, rename = "next-retry-after")]
+    pub next_retry_after: Option<String>,
+    #[serde(default, rename = "quarantine-enabled")]
+    pub quarantine_enabled: bool,
+    #[serde(default, rename = "quarantine-retention-seconds")]
+    pub quarantine_retention_seconds: u64,
+    #[serde(default)]
     pub heartbeat_at: Option<String>,
     #[serde(default)]
     pub started_at: Option<String>,
@@ -342,6 +368,8 @@ pub(crate) struct TableMetadataMaintenanceJob {
     pub deletable_metadata_file_count: usize,
     #[serde(default)]
     pub deleted_metadata_file_count: usize,
+    #[serde(default)]
+    pub quarantined_object_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,10 +383,42 @@ pub(crate) struct TableMetadataMaintenanceReport {
     pub object_reports: Vec<TableMetadataMaintenanceObjectReport>,
     #[serde(default)]
     pub referenced_object_reports: Vec<TableMetadataMaintenanceReferencedObjectReport>,
+    #[serde(default, rename = "reachability-graph")]
+    pub reachability_graph: TableMaintenanceReachabilityGraphReport,
     #[serde(default, rename = "snapshot-expiration")]
     pub snapshot_expiration: Option<TableSnapshotExpirationReport>,
     #[serde(default)]
     pub compaction: Option<TableCompactionPlanningReport>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TableMaintenanceReachabilityGraphReport {
+    pub status: TableMaintenanceReachabilityGraphStatus,
+    pub metadata_file_count: usize,
+    pub manifest_list_count: usize,
+    pub manifest_file_count: usize,
+    pub data_file_count: usize,
+    pub delete_file_count: usize,
+    pub manual_review_count: usize,
+    pub reasons: Vec<TableMaintenanceReachabilityGraphReason>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableMaintenanceReachabilityGraphStatus {
+    Complete,
+    #[default]
+    ManualReviewRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableMaintenanceReachabilityGraphReason {
+    MetadataJsonParsed,
+    ManifestListAvroReferenced,
+    ManifestAvroReaderUnavailable,
+    DataFileCleanupDeferred,
+    DeleteFileCleanupDeferred,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -518,6 +578,8 @@ pub(crate) enum TableMetadataMaintenanceReason {
     DeletedByMaintenance,
     ManifestList,
     UnsupportedManifestAvro,
+    QuarantineEnabled,
+    RetryScheduled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1372,9 +1434,13 @@ where
         let config_path = self
             .paths
             .table_maintenance_config_path(table_bucket, &namespace, &table, &entry.table_id);
-        self.read_entry::<TableMaintenanceConfig>(self.catalog_bucket(), &config_path)
-            .await
-            .map(|entry| entry.map(|(config, _)| config).unwrap_or_default())
+        let config = self
+            .read_entry::<TableMaintenanceConfig>(self.catalog_bucket(), &config_path)
+            .await?
+            .map(|(config, _)| config)
+            .unwrap_or_default();
+        validate_table_maintenance_config(&config)?;
+        Ok(config)
     }
 
     pub(crate) async fn put_table_bucket_maintenance_config(
@@ -1415,6 +1481,7 @@ where
             .read_entry::<TableMaintenanceConfig>(self.catalog_bucket(), &table_config_path)
             .await?
         {
+            validate_table_maintenance_config(&config)?;
             return Ok(TableMaintenanceEffectiveConfig {
                 config,
                 source: TableMaintenanceConfigSource::TableOverride,
@@ -1426,6 +1493,7 @@ where
             .read_entry::<TableMaintenanceConfig>(self.catalog_bucket(), &bucket_config_path)
             .await?
         {
+            validate_table_maintenance_config(&config)?;
             return Ok(TableMaintenanceEffectiveConfig {
                 config,
                 source: TableMaintenanceConfigSource::TableBucketDefault,
@@ -1893,6 +1961,8 @@ where
         let retained_metadata_locations = retained.into_iter().collect::<Vec<_>>();
         let object_reports = metadata_maintenance_object_reports(maintenance_reasons);
         let referenced_object_reports = metadata_maintenance_referenced_object_reports(&current_metadata);
+        let reachability_graph =
+            metadata_maintenance_reachability_graph_report(planned_metadata_file_count, &referenced_object_reports);
 
         Ok(TableMetadataMaintenanceReport {
             job: TableMetadataMaintenanceJob {
@@ -1907,6 +1977,11 @@ where
                 config_source: TableMaintenanceConfigSource::Default,
                 worker_id: None,
                 lease_id: String::new(),
+                attempt: 0,
+                max_retry_attempts: 0,
+                next_retry_after: None,
+                quarantine_enabled: false,
+                quarantine_retention_seconds: 0,
                 heartbeat_at: None,
                 started_at: None,
                 finished_at: None,
@@ -1921,6 +1996,7 @@ where
                 cleanup_candidate_count: cleanup_candidate_locations.len(),
                 deletable_metadata_file_count: deletable_metadata_locations.len(),
                 deleted_metadata_file_count: 0,
+                quarantined_object_count: 0,
             },
             current_metadata_location,
             retained_metadata_locations,
@@ -1928,6 +2004,7 @@ where
             deletable_metadata_locations,
             object_reports,
             referenced_object_reports,
+            reachability_graph,
             snapshot_expiration: None,
             compaction: None,
         })
@@ -2003,6 +2080,11 @@ where
         report.job.config_source = effective.source;
         report.job.worker_id = worker_id;
         report.job.lease_id = Uuid::new_v4().to_string();
+        report.job.attempt = 1;
+        report.job.max_retry_attempts = effective.config.max_retry_attempts;
+        report.job.next_retry_after = None;
+        report.job.quarantine_enabled = effective.config.quarantine_enabled;
+        report.job.quarantine_retention_seconds = effective.config.quarantine_retention_seconds;
         report.job.heartbeat_at = Some(started_at.clone());
         report.job.started_at = Some(started_at);
         report.job.finished_at = None;
@@ -2012,6 +2094,7 @@ where
             let mut failed = report;
             failed.job.status = TableMetadataMaintenanceJobStatus::Failed;
             failed.job.failure_reason = Some("metadata delete is disabled by maintenance config".to_string());
+            apply_maintenance_retry_after(&mut failed.job, &effective.config, OffsetDateTime::now_utc());
             failed.job.finished_at = Some(maintenance_timestamp(OffsetDateTime::now_utc()));
             self.put_table_metadata_maintenance_report(&failed).await?;
             return Ok(failed);
@@ -2028,6 +2111,7 @@ where
                     let mut failed = running_report;
                     failed.job.status = TableMetadataMaintenanceJobStatus::Failed;
                     failed.job.failure_reason = Some(err.to_string());
+                    apply_maintenance_retry_after(&mut failed.job, &effective.config, OffsetDateTime::now_utc());
                     failed.job.finished_at = Some(maintenance_timestamp(OffsetDateTime::now_utc()));
                     self.put_table_metadata_maintenance_report(&failed).await?;
                     return Err(err);
@@ -2159,6 +2243,7 @@ where
             deletable_metadata_locations: cleanup_candidate_locations,
             object_reports,
             referenced_object_reports,
+            reachability_graph: report.reachability_graph,
             snapshot_expiration: report.snapshot_expiration,
             compaction: report.compaction,
         })
@@ -2837,6 +2922,54 @@ fn metadata_maintenance_referenced_object_reports(
         .collect()
 }
 
+fn metadata_maintenance_reachability_graph_report(
+    metadata_file_count: usize,
+    referenced_object_reports: &[TableMetadataMaintenanceReferencedObjectReport],
+) -> TableMaintenanceReachabilityGraphReport {
+    let manifest_list_count = referenced_object_reports
+        .iter()
+        .filter(|report| report.object_kind == TableMetadataMaintenanceObjectKind::ManifestList)
+        .count();
+    let manifest_file_count = referenced_object_reports
+        .iter()
+        .filter(|report| report.object_kind == TableMetadataMaintenanceObjectKind::ManifestFile)
+        .count();
+    let data_file_count = referenced_object_reports
+        .iter()
+        .filter(|report| report.object_kind == TableMetadataMaintenanceObjectKind::DataFile)
+        .count();
+    let delete_file_count = referenced_object_reports
+        .iter()
+        .filter(|report| report.object_kind == TableMetadataMaintenanceObjectKind::DeleteFile)
+        .count();
+    let manual_review_count = referenced_object_reports
+        .iter()
+        .filter(|report| report.state == TableMetadataMaintenanceObjectState::ManualReviewRequired)
+        .count();
+    let mut reasons = BTreeSet::from([TableMaintenanceReachabilityGraphReason::MetadataJsonParsed]);
+    if manifest_list_count > 0 {
+        reasons.insert(TableMaintenanceReachabilityGraphReason::ManifestListAvroReferenced);
+        reasons.insert(TableMaintenanceReachabilityGraphReason::ManifestAvroReaderUnavailable);
+    }
+    reasons.insert(TableMaintenanceReachabilityGraphReason::DataFileCleanupDeferred);
+    reasons.insert(TableMaintenanceReachabilityGraphReason::DeleteFileCleanupDeferred);
+
+    TableMaintenanceReachabilityGraphReport {
+        status: if manual_review_count == 0 {
+            TableMaintenanceReachabilityGraphStatus::Complete
+        } else {
+            TableMaintenanceReachabilityGraphStatus::ManualReviewRequired
+        },
+        metadata_file_count,
+        manifest_list_count,
+        manifest_file_count,
+        data_file_count,
+        delete_file_count,
+        manual_review_count,
+        reasons: reasons.into_iter().collect(),
+    }
+}
+
 fn mark_deleted_metadata_object_reports(
     object_reports: &mut [TableMetadataMaintenanceObjectReport],
     deleted_locations: &BTreeSet<String>,
@@ -3338,7 +3471,50 @@ fn validate_table_maintenance_config(config: &TableMaintenanceConfig) -> TableCa
             "background table maintenance is not supported".to_string(),
         ));
     }
+    if config.max_retry_attempts > 10 {
+        return Err(TableCatalogStoreError::Invalid("max-retry-attempts cannot exceed 10".to_string()));
+    }
+    if config.max_retry_attempts > 0 && config.retry_initial_backoff_seconds == 0 {
+        return Err(TableCatalogStoreError::Invalid(
+            "retry-initial-backoff-seconds must be greater than zero when retry is enabled".to_string(),
+        ));
+    }
+    if config.max_retry_attempts > 0 && config.retry_initial_backoff_seconds > TABLE_MAINTENANCE_RETRY_BACKOFF_MAX_SECONDS {
+        return Err(TableCatalogStoreError::Invalid(format!(
+            "retry-initial-backoff-seconds cannot exceed {TABLE_MAINTENANCE_RETRY_BACKOFF_MAX_SECONDS}"
+        )));
+    }
+    if config.max_retry_attempts > 0 && config.retry_max_backoff_seconds > TABLE_MAINTENANCE_RETRY_BACKOFF_MAX_SECONDS {
+        return Err(TableCatalogStoreError::Invalid(format!(
+            "retry-max-backoff-seconds cannot exceed {TABLE_MAINTENANCE_RETRY_BACKOFF_MAX_SECONDS}"
+        )));
+    }
+    if config.max_retry_attempts > 0 && config.retry_max_backoff_seconds < config.retry_initial_backoff_seconds {
+        return Err(TableCatalogStoreError::Invalid(
+            "retry-max-backoff-seconds must be greater than or equal to retry-initial-backoff-seconds".to_string(),
+        ));
+    }
+    if config.quarantine_enabled && config.quarantine_retention_seconds == 0 {
+        return Err(TableCatalogStoreError::Invalid(
+            "quarantine-retention-seconds must be greater than zero when quarantine is enabled".to_string(),
+        ));
+    }
     Ok(())
+}
+
+fn apply_maintenance_retry_after(job: &mut TableMetadataMaintenanceJob, config: &TableMaintenanceConfig, now: OffsetDateTime) {
+    if config.max_retry_attempts == 0 || job.attempt >= config.max_retry_attempts {
+        job.next_retry_after = None;
+        return;
+    }
+    let attempt_index = u32::from(job.attempt.saturating_sub(1));
+    let multiplier = 1_u64.checked_shl(attempt_index).unwrap_or(u64::MAX);
+    let delay_seconds = config
+        .retry_initial_backoff_seconds
+        .saturating_mul(multiplier)
+        .min(config.retry_max_backoff_seconds);
+    let delay_seconds = i64::try_from(delay_seconds).unwrap_or(i64::MAX);
+    job.next_retry_after = Some(maintenance_timestamp(now.saturating_add(Duration::seconds(delay_seconds))));
 }
 
 fn validate_table_snapshot_expiration_config(config: &TableSnapshotExpirationConfig) -> TableCatalogStoreResult<()> {
@@ -4938,6 +5114,7 @@ mod tests {
                     retain_recent_metadata_files: 7,
                     delete_enabled: true,
                     background_enabled: false,
+                    ..Default::default()
                 },
             )
             .await
@@ -4998,6 +5175,7 @@ mod tests {
                     retain_recent_metadata_files: 1,
                     delete_enabled: false,
                     background_enabled: false,
+                    ..Default::default()
                 },
             )
             .await
@@ -5024,6 +5202,7 @@ mod tests {
                     retain_recent_metadata_files: 3,
                     delete_enabled: true,
                     background_enabled: false,
+                    ..Default::default()
                 },
             )
             .await
@@ -5049,6 +5228,7 @@ mod tests {
                     retain_recent_metadata_files: 1,
                     delete_enabled: false,
                     background_enabled: false,
+                    ..Default::default()
                 },
             )
             .await
@@ -5084,6 +5264,7 @@ mod tests {
                     retain_recent_metadata_files: 1,
                     delete_enabled: false,
                     background_enabled: true,
+                    ..Default::default()
                 },
             )
             .await
@@ -5100,11 +5281,142 @@ mod tests {
                     retain_recent_metadata_files: 1,
                     delete_enabled: false,
                     background_enabled: true,
+                    ..Default::default()
                 },
             )
             .await
             .unwrap_err();
         assert_matches!(table_err, TableCatalogStoreError::Invalid(_));
+    }
+
+    #[tokio::test]
+    async fn maintenance_config_accepts_retry_and_quarantine_policy() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+
+        let config = store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    retain_recent_metadata_files: 2,
+                    delete_enabled: false,
+                    background_enabled: false,
+                    max_retry_attempts: 3,
+                    retry_initial_backoff_seconds: 10,
+                    retry_max_backoff_seconds: 60,
+                    quarantine_enabled: true,
+                    quarantine_retention_seconds: 86_400,
+                },
+            )
+            .await
+            .expect("retry and quarantine maintenance config should persist");
+
+        assert_eq!(config.max_retry_attempts, 3);
+        assert_eq!(config.retry_initial_backoff_seconds, 10);
+        assert_eq!(config.retry_max_backoff_seconds, 60);
+        assert!(config.quarantine_enabled);
+        assert_eq!(config.quarantine_retention_seconds, 86_400);
+    }
+
+    #[tokio::test]
+    async fn maintenance_config_rejects_retry_backoff_above_limit() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+
+        let initial_err = store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    retain_recent_metadata_files: 1,
+                    delete_enabled: false,
+                    background_enabled: false,
+                    max_retry_attempts: 1,
+                    retry_initial_backoff_seconds: TABLE_MAINTENANCE_RETRY_BACKOFF_MAX_SECONDS.saturating_add(1),
+                    retry_max_backoff_seconds: TABLE_MAINTENANCE_RETRY_BACKOFF_MAX_SECONDS.saturating_add(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_matches!(initial_err, TableCatalogStoreError::Invalid(_));
+
+        let max_err = store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    retain_recent_metadata_files: 1,
+                    delete_enabled: false,
+                    background_enabled: false,
+                    max_retry_attempts: 1,
+                    retry_initial_backoff_seconds: TABLE_MAINTENANCE_RETRY_BACKOFF_MAX_SECONDS,
+                    retry_max_backoff_seconds: TABLE_MAINTENANCE_RETRY_BACKOFF_MAX_SECONDS.saturating_add(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_matches!(max_err, TableCatalogStoreError::Invalid(_));
+    }
+
+    #[tokio::test]
+    async fn maintenance_run_rejects_existing_invalid_retry_config_before_scheduling() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+        let config_path = store
+            .paths
+            .table_maintenance_config_path(bucket, &namespace, &table, "table-id");
+        store
+            .write_entry(
+                store.catalog_bucket(),
+                &config_path,
+                &TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    retain_recent_metadata_files: 1,
+                    delete_enabled: false,
+                    background_enabled: false,
+                    max_retry_attempts: 1,
+                    retry_initial_backoff_seconds: u64::MAX,
+                    retry_max_backoff_seconds: u64::MAX,
+                    ..Default::default()
+                },
+                TableCatalogPutPrecondition::Any,
+            )
+            .await
+            .expect("invalid legacy maintenance config should be seeded");
+
+        let err = store
+            .run_table_metadata_maintenance(bucket, "sales", "orders", true, Some("worker-a".to_string()))
+            .await
+            .unwrap_err();
+
+        assert_matches!(err, TableCatalogStoreError::Invalid(_));
     }
 
     #[tokio::test]
@@ -5126,6 +5438,7 @@ mod tests {
                     retain_recent_metadata_files: 0,
                     delete_enabled: false,
                     background_enabled: false,
+                    ..Default::default()
                 },
             )
             .await
@@ -5144,6 +5457,9 @@ mod tests {
         assert_eq!(report.job.config_source, TableMaintenanceConfigSource::TableBucketDefault);
         assert_eq!(report.job.worker_id.as_deref(), Some("worker-a"));
         assert!(!report.job.lease_id.is_empty());
+        assert_eq!(report.job.attempt, 1);
+        assert_eq!(report.job.max_retry_attempts, 0);
+        assert!(report.job.next_retry_after.is_none());
         assert!(report.job.heartbeat_at.is_some());
         assert!(report.job.started_at.is_some());
         assert!(report.job.finished_at.is_some());
@@ -5184,6 +5500,11 @@ mod tests {
                     retain_recent_metadata_files: 0,
                     delete_enabled: false,
                     background_enabled: false,
+                    max_retry_attempts: 2,
+                    retry_initial_backoff_seconds: 10,
+                    retry_max_backoff_seconds: 30,
+                    quarantine_enabled: true,
+                    quarantine_retention_seconds: 86_400,
                 },
             )
             .await
@@ -5201,6 +5522,10 @@ mod tests {
         assert_eq!(report.job.operation, TableMetadataMaintenanceOperation::Delete);
         assert_eq!(report.job.status, TableMetadataMaintenanceJobStatus::Failed);
         assert_eq!(report.job.config_source, TableMaintenanceConfigSource::TableOverride);
+        assert_eq!(report.job.max_retry_attempts, 2);
+        assert!(report.job.next_retry_after.is_some());
+        assert!(report.job.quarantine_enabled);
+        assert_eq!(report.job.quarantine_retention_seconds, 86_400);
         assert!(
             report
                 .job
@@ -5284,6 +5609,19 @@ mod tests {
                 TableMetadataMaintenanceReason::ManifestList,
                 TableMetadataMaintenanceReason::UnsupportedManifestAvro,
             ]
+        );
+        assert_eq!(
+            report.reachability_graph.status,
+            TableMaintenanceReachabilityGraphStatus::ManualReviewRequired
+        );
+        assert_eq!(report.reachability_graph.metadata_file_count, 2);
+        assert_eq!(report.reachability_graph.manifest_list_count, 1);
+        assert_eq!(report.reachability_graph.manual_review_count, 1);
+        assert!(
+            report
+                .reachability_graph
+                .reasons
+                .contains(&TableMaintenanceReachabilityGraphReason::ManifestAvroReaderUnavailable)
         );
     }
 

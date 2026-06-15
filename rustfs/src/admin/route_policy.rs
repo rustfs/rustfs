@@ -672,6 +672,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Get,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/views",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/views",
+        CREATE_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
         GET_TABLE_METADATA,
         RouteRiskLevel::Sensitive,
@@ -699,6 +711,30 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
         DELETE_TABLE,
         RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+        COMMIT_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+        DELETE_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/refs",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
     ),
     admin(
         HttpMethod::Get,
@@ -747,6 +783,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
         REGISTER_TABLE,
         RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
     ),
     admin(
         HttpMethod::Get,
@@ -829,6 +871,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/views",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/views",
+        CREATE_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
         "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
         GET_TABLE_METADATA,
         RouteRiskLevel::Sensitive,
@@ -856,6 +910,30 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
         DELETE_TABLE,
         RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+        COMMIT_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+        DELETE_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/refs",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
     ),
     admin(
         HttpMethod::Get,
@@ -904,6 +982,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
         REGISTER_TABLE,
         RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
     ),
     admin(
         HttpMethod::Get,
@@ -1106,7 +1190,7 @@ mod tests {
         let table_specs = ADMIN_ROUTE_POLICY_SPECS
             .iter()
             .filter(|spec| spec.path().starts_with("/iceberg/v1") || spec.path().starts_with("/_iceberg/v1"));
-        assert_eq!(table_specs.count(), 54);
+        assert_eq!(table_specs.count(), 68);
         assert_action(HttpMethod::Put, "/iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET);
         assert_action(HttpMethod::Get, "/_iceberg/v1/buckets/{warehouse}", GET_TABLE_BUCKET);
         assert_action(HttpMethod::Get, "/iceberg/v1/{warehouse}/namespaces", GET_TABLE_NAMESPACE);
@@ -1117,6 +1201,12 @@ mod tests {
         assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables", CREATE_TABLE);
         assert_action(
             HttpMethod::Get,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/views",
+            GET_TABLE_METADATA,
+        );
+        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/namespaces/{namespace}/views", CREATE_TABLE);
+        assert_action(
+            HttpMethod::Get,
             "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
             GET_TABLE_METADATA,
         );
@@ -1124,6 +1214,26 @@ mod tests {
             HttpMethod::Get,
             "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/credentials",
             GET_TABLE_CREDENTIALS,
+        );
+        assert_action(
+            HttpMethod::Get,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+            GET_TABLE_METADATA,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+            COMMIT_TABLE,
+        );
+        assert_action(
+            HttpMethod::Delete,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+            DELETE_TABLE,
+        );
+        assert_action(
+            HttpMethod::Get,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/refs",
+            GET_TABLE_METADATA,
         );
         assert_action(
             HttpMethod::Get,
@@ -1194,6 +1304,11 @@ mod tests {
             HttpMethod::Post,
             "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
             REGISTER_TABLE,
+        );
+        assert_action(
+            HttpMethod::Get,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
+            GET_TABLE_METADATA,
         );
         assert_action(
             HttpMethod::Post,

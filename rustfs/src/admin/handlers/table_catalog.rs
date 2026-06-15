@@ -96,11 +96,17 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /{warehouse}/namespaces/{namespace}/tables",
     "POST /{warehouse}/namespaces/{namespace}/tables",
     "POST /{warehouse}/namespaces/{namespace}/register",
+    "GET /{warehouse}/namespaces/{namespace}/views",
+    "POST /{warehouse}/namespaces/{namespace}/views",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}",
     "HEAD /{warehouse}/namespaces/{namespace}/tables/{table}",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/credentials",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}",
     "DELETE /{warehouse}/namespaces/{namespace}/tables/{table}",
+    "GET /{warehouse}/namespaces/{namespace}/views/{view}",
+    "POST /{warehouse}/namespaces/{namespace}/views/{view}",
+    "DELETE /{warehouse}/namespaces/{namespace}/views/{view}",
+    "GET /{warehouse}/namespaces/{namespace}/tables/{table}/refs",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
     "PUT /{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
@@ -109,6 +115,7 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
+    "GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/diagnostics",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
@@ -125,11 +132,17 @@ static DROP_NAMESPACE_HANDLER: RestDropNamespaceHandler = RestDropNamespaceHandl
 static LIST_TABLES_HANDLER: RestListTablesHandler = RestListTablesHandler {};
 static CREATE_TABLE_HANDLER: RestCreateTableHandler = RestCreateTableHandler {};
 static REGISTER_TABLE_HANDLER: RestRegisterTableHandler = RestRegisterTableHandler {};
+static LIST_VIEWS_HANDLER: RestListViewsHandler = RestListViewsHandler {};
+static CREATE_VIEW_HANDLER: RestCreateViewHandler = RestCreateViewHandler {};
 static LOAD_TABLE_HANDLER: RestLoadTableHandler = RestLoadTableHandler {};
 static TABLE_EXISTS_HANDLER: RestTableExistsHandler = RestTableExistsHandler {};
 static LOAD_CREDENTIALS_HANDLER: RestLoadCredentialsHandler = RestLoadCredentialsHandler {};
 static COMMIT_TABLE_HANDLER: RestCommitTableHandler = RestCommitTableHandler {};
 static DROP_TABLE_HANDLER: RestDropTableHandler = RestDropTableHandler {};
+static LOAD_VIEW_HANDLER: RestLoadViewHandler = RestLoadViewHandler {};
+static REPLACE_VIEW_HANDLER: RestReplaceViewHandler = RestReplaceViewHandler {};
+static DROP_VIEW_HANDLER: RestDropViewHandler = RestDropViewHandler {};
+static LIST_TABLE_REFS_HANDLER: ListTableRefsHandler = ListTableRefsHandler {};
 static GET_TABLE_METADATA_LOCATION_HANDLER: GetTableMetadataLocationHandler = GetTableMetadataLocationHandler {};
 static UPDATE_TABLE_METADATA_LOCATION_HANDLER: UpdateTableMetadataLocationHandler = UpdateTableMetadataLocationHandler {};
 static TABLE_METADATA_MAINTENANCE_HANDLER: RestTableMetadataMaintenanceHandler = RestTableMetadataMaintenanceHandler {};
@@ -138,6 +151,7 @@ static PUT_TABLE_MAINTENANCE_CONFIG_HANDLER: PutTableMaintenanceConfigHandler = 
 static GET_TABLE_MAINTENANCE_JOB_HANDLER: GetTableMaintenanceJobHandler = GetTableMaintenanceJobHandler {};
 static EXPORT_TABLE_CATALOG_HANDLER: ExportTableCatalogHandler = ExportTableCatalogHandler {};
 static IMPORT_TABLE_CATALOG_HANDLER: ImportTableCatalogHandler = ImportTableCatalogHandler {};
+static EXTERNAL_CATALOG_BRIDGE_HANDLER: ExternalCatalogBridgeHandler = ExternalCatalogBridgeHandler {};
 static GET_TABLE_CATALOG_DIAGNOSTICS_HANDLER: GetTableCatalogDiagnosticsHandler = GetTableCatalogDiagnosticsHandler {};
 static RECOVER_TABLE_CATALOG_HANDLER: RecoverTableCatalogHandler = RecoverTableCatalogHandler {};
 static ROLLBACK_TABLE_CATALOG_HANDLER: RollbackTableCatalogHandler = RollbackTableCatalogHandler {};
@@ -257,6 +271,47 @@ struct RollbackTableRequest {
     commit_id: Option<String>,
     #[serde(default, rename = "idempotency-key", alias = "idempotencyKey")]
     idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct UnsupportedCatalogFeatureResponse {
+    feature: &'static str,
+    status: &'static str,
+    reason: &'static str,
+    replacement: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct TableRefsResponse {
+    table_bucket: String,
+    namespace: String,
+    table: String,
+    current_metadata_location: String,
+    current_snapshot_id: Option<i64>,
+    protected_ref_count: usize,
+    user_defined_ref_count: usize,
+    refs: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct ExternalCatalogBridgeResponse {
+    table_bucket: String,
+    namespace: String,
+    table: String,
+    status: &'static str,
+    supported_import: &'static str,
+    unsupported_bridges: Vec<ExternalCatalogBridgeCapability>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct ExternalCatalogBridgeCapability {
+    catalog: &'static str,
+    status: &'static str,
+    reason: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -549,6 +604,16 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
     )?;
     r.insert(
         Method::GET,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/views").as_str(),
+        AdminOperation(&LIST_VIEWS_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/views").as_str(),
+        AdminOperation(&CREATE_VIEW_HANDLER),
+    )?;
+    r.insert(
+        Method::GET,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}").as_str(),
         AdminOperation(&LOAD_TABLE_HANDLER),
     )?;
@@ -571,6 +636,26 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         Method::DELETE,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}").as_str(),
         AdminOperation(&DROP_TABLE_HANDLER),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/views/{{view}}").as_str(),
+        AdminOperation(&LOAD_VIEW_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/views/{{view}}").as_str(),
+        AdminOperation(&REPLACE_VIEW_HANDLER),
+    )?;
+    r.insert(
+        Method::DELETE,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/views/{{view}}").as_str(),
+        AdminOperation(&DROP_VIEW_HANDLER),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/refs").as_str(),
+        AdminOperation(&LIST_TABLE_REFS_HANDLER),
     )?;
     r.insert(
         Method::GET,
@@ -614,6 +699,11 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
     )?;
     r.insert(
         Method::GET,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/catalog/external").as_str(),
+        AdminOperation(&EXTERNAL_CATALOG_BRIDGE_HANDLER),
+    )?;
+    r.insert(
+        Method::GET,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/catalog/diagnostics").as_str(),
         AdminOperation(&GET_TABLE_CATALOG_DIAGNOSTICS_HANDLER),
     )?;
@@ -652,6 +742,21 @@ fn build_json_response<T: Serialize>(status: StatusCode, body: &T) -> S3Result<S
 
 fn empty_response(status: StatusCode) -> S3Response<(StatusCode, Body)> {
     S3Response::new((status, Body::default()))
+}
+
+fn unsupported_catalog_feature_response(
+    feature: &'static str,
+    replacement: &'static str,
+) -> S3Result<S3Response<(StatusCode, Body)>> {
+    build_json_response(
+        StatusCode::NOT_IMPLEMENTED,
+        &UnsupportedCatalogFeatureResponse {
+            feature,
+            status: "unsupported",
+            reason: "the catalog advertises this advanced Iceberg surface explicitly but does not implement it yet",
+            replacement,
+        },
+    )
 }
 
 fn duration_millis_u64(duration: StdDuration) -> u64 {
@@ -840,6 +945,13 @@ fn table_name_from_params(params: &Params<'_, '_>) -> S3Result<String> {
     crate::table_catalog::IdentifierSegment::parse(table.to_string())
         .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
     Ok(table.to_string())
+}
+
+fn view_name_from_params(params: &Params<'_, '_>) -> S3Result<String> {
+    let view = params.get("view").unwrap_or("");
+    crate::table_catalog::IdentifierSegment::parse(view.to_string())
+        .map_err(|err| s3_error!(InvalidRequest, "invalid view name: {}", err))?;
+    Ok(view.to_string())
 }
 
 fn job_id_from_params(params: &Params<'_, '_>) -> S3Result<String> {
@@ -2623,6 +2735,91 @@ where
     Ok(report)
 }
 
+async fn table_refs_response<S>(
+    store: &S,
+    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+) -> S3Result<TableRefsResponse>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let Some(entry) = store
+        .load_table(bucket, &namespace.public_name(), table)
+        .await
+        .map_err(catalog_store_error)?
+    else {
+        return Err(s3_error!(InvalidRequest, "table not found"));
+    };
+    let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
+    let current_snapshot_id = metadata.get("current-snapshot-id").and_then(serde_json::Value::as_i64);
+    let refs = metadata
+        .get("refs")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let protected_ref_count = refs
+        .values()
+        .filter(|reference| {
+            reference
+                .get("snapshot-id")
+                .and_then(serde_json::Value::as_i64)
+                .is_some_and(|snapshot_id| Some(snapshot_id) != current_snapshot_id)
+        })
+        .count();
+    let user_defined_ref_count = refs.keys().filter(|name| name.as_str() != "main").count();
+
+    Ok(TableRefsResponse {
+        table_bucket: bucket.to_string(),
+        namespace: namespace.public_name(),
+        table: table.to_string(),
+        current_metadata_location: entry.metadata_location,
+        current_snapshot_id,
+        protected_ref_count,
+        user_defined_ref_count,
+        refs,
+    })
+}
+
+fn external_catalog_bridge_response(
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+) -> ExternalCatalogBridgeResponse {
+    ExternalCatalogBridgeResponse {
+        table_bucket: bucket.to_string(),
+        namespace: namespace.public_name(),
+        table: table.to_string(),
+        status: "metadata-import-supported",
+        supported_import: "register/import an existing Iceberg metadata location into the RustFS catalog; online external catalog synchronization is not implemented",
+        unsupported_bridges: vec![
+            ExternalCatalogBridgeCapability {
+                catalog: "polaris",
+                status: "unsupported",
+                reason: "online REST catalog bridge and policy synchronization are not implemented",
+            },
+            ExternalCatalogBridgeCapability {
+                catalog: "glue",
+                status: "unsupported",
+                reason: "Glue catalog synchronization is not implemented",
+            },
+            ExternalCatalogBridgeCapability {
+                catalog: "dlf",
+                status: "unsupported",
+                reason: "DLF catalog synchronization is not implemented",
+            },
+            ExternalCatalogBridgeCapability {
+                catalog: "hive-metastore",
+                status: "unsupported",
+                reason: "Hive Metastore synchronization is not implemented",
+            },
+        ],
+    }
+}
+
 async fn catalog_import_response<B>(
     store: &crate::table_catalog::ObjectTableCatalogStore<B>,
     metadata_backend: &B,
@@ -2883,6 +3080,32 @@ impl Operation for RestRegisterTableHandler {
     }
 }
 
+pub struct RestListViewsHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestListViewsHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let resource = TableCatalogResource::namespace(&warehouse, &namespace);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
+        unsupported_catalog_feature_response("iceberg-views", "use Iceberg tables; view catalog routes are reserved")
+    }
+}
+
+pub struct RestCreateViewHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestCreateViewHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let resource = TableCatalogResource::namespace(&warehouse, &namespace);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::CreateTableAction).await?;
+        unsupported_catalog_feature_response("iceberg-views", "create a table or register an existing Iceberg table")
+    }
+}
+
 pub struct RestLoadTableHandler {}
 
 #[async_trait::async_trait]
@@ -2964,6 +3187,65 @@ impl Operation for RestDropTableHandler {
         let store = table_catalog_store()?;
         drop_table_in_store(&store, &warehouse, &namespace, &table).await?;
         Ok(empty_response(StatusCode::NO_CONTENT))
+    }
+}
+
+pub struct RestLoadViewHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestLoadViewHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let _view = view_name_from_params(&params)?;
+        let resource = TableCatalogResource::namespace(&warehouse, &namespace);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
+        unsupported_catalog_feature_response("iceberg-views", "use Iceberg tables; view load is reserved")
+    }
+}
+
+pub struct RestReplaceViewHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestReplaceViewHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let _view = view_name_from_params(&params)?;
+        let resource = TableCatalogResource::namespace(&warehouse, &namespace);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
+        unsupported_catalog_feature_response("iceberg-views", "commit table metadata updates; view replacement is reserved")
+    }
+}
+
+pub struct RestDropViewHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestDropViewHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let _view = view_name_from_params(&params)?;
+        let resource = TableCatalogResource::namespace(&warehouse, &namespace);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::DeleteTableAction).await?;
+        unsupported_catalog_feature_response("iceberg-views", "drop table resources; view deletion is reserved")
+    }
+}
+
+pub struct ListTableRefsHandler {}
+
+#[async_trait::async_trait]
+impl Operation for ListTableRefsHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
+        let metadata_backend = table_catalog_backend()?;
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let response = table_refs_response(&store, &metadata_backend, &warehouse, &namespace, &table).await?;
+        build_json_response(StatusCode::OK, &response)
     }
 }
 
@@ -3126,6 +3408,20 @@ impl Operation for ImportTableCatalogHandler {
     }
 }
 
+pub struct ExternalCatalogBridgeHandler {}
+
+#[async_trait::async_trait]
+impl Operation for ExternalCatalogBridgeHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
+        build_json_response(StatusCode::OK, &external_catalog_bridge_response(&warehouse, &namespace, &table))
+    }
+}
+
 pub struct GetTableCatalogDiagnosticsHandler {}
 
 #[async_trait::async_trait]
@@ -3246,6 +3542,8 @@ mod tests {
                 .endpoints
                 .contains(&"POST /{warehouse}/namespaces/{namespace}/tables")
         );
+        assert!(response.endpoints.contains(&"GET /{warehouse}/namespaces/{namespace}/views"));
+        assert!(response.endpoints.contains(&"POST /{warehouse}/namespaces/{namespace}/views"));
         assert!(
             response
                 .endpoints
@@ -3265,6 +3563,21 @@ mod tests {
             response
                 .endpoints
                 .contains(&"GET /{warehouse}/namespaces/{namespace}/tables/{table}/credentials")
+        );
+        assert!(
+            response
+                .endpoints
+                .contains(&"GET /{warehouse}/namespaces/{namespace}/views/{view}")
+        );
+        assert!(
+            response
+                .endpoints
+                .contains(&"GET /{warehouse}/namespaces/{namespace}/tables/{table}/refs")
+        );
+        assert!(
+            response
+                .endpoints
+                .contains(&"GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external")
         );
         assert!(
             response
@@ -3306,11 +3619,17 @@ mod tests {
             ("RestListTablesHandler", "AdminAction::GetTableAction"),
             ("RestCreateTableHandler", "AdminAction::CreateTableAction"),
             ("RestRegisterTableHandler", "AdminAction::RegisterTableAction"),
+            ("RestListViewsHandler", "AdminAction::GetTableMetadataAction"),
+            ("RestCreateViewHandler", "AdminAction::CreateTableAction"),
             ("RestLoadTableHandler", "AdminAction::GetTableMetadataAction"),
             ("RestTableExistsHandler", "AdminAction::GetTableAction"),
             ("RestLoadCredentialsHandler", "AdminAction::GetTableCredentialsAction"),
             ("RestCommitTableHandler", "AdminAction::CommitTableAction"),
             ("RestDropTableHandler", "AdminAction::DeleteTableAction"),
+            ("RestLoadViewHandler", "AdminAction::GetTableMetadataAction"),
+            ("RestReplaceViewHandler", "AdminAction::CommitTableAction"),
+            ("RestDropViewHandler", "AdminAction::DeleteTableAction"),
+            ("ListTableRefsHandler", "AdminAction::GetTableMetadataAction"),
             ("GetTableMetadataLocationHandler", "AdminAction::GetTableMetadataLocationAction"),
             ("UpdateTableMetadataLocationHandler", "AdminAction::SetTableMetadataLocationAction"),
             ("RestTableMetadataMaintenanceHandler", "AdminAction::RunTableMaintenanceAction"),
@@ -3319,6 +3638,7 @@ mod tests {
             ("GetTableMaintenanceJobHandler", "AdminAction::GetTableLifecycleAction"),
             ("ExportTableCatalogHandler", "AdminAction::GetTableMetadataAction"),
             ("ImportTableCatalogHandler", "AdminAction::RegisterTableAction"),
+            ("ExternalCatalogBridgeHandler", "AdminAction::GetTableMetadataAction"),
             ("GetTableCatalogDiagnosticsHandler", "AdminAction::GetTableMetadataAction"),
             ("RecoverTableCatalogHandler", "AdminAction::CommitTableAction"),
             ("RollbackTableCatalogHandler", "AdminAction::CommitTableAction"),
@@ -3344,6 +3664,7 @@ mod tests {
             ("RestLoadCredentialsHandler", "AdminAction::GetTableCredentialsAction"),
             ("RestCommitTableHandler", "AdminAction::CommitTableAction"),
             ("RestDropTableHandler", "AdminAction::DeleteTableAction"),
+            ("ListTableRefsHandler", "AdminAction::GetTableMetadataAction"),
             ("GetTableMetadataLocationHandler", "AdminAction::GetTableMetadataLocationAction"),
             ("UpdateTableMetadataLocationHandler", "AdminAction::SetTableMetadataLocationAction"),
             ("RestTableMetadataMaintenanceHandler", "AdminAction::RunTableMaintenanceAction"),
@@ -3352,6 +3673,7 @@ mod tests {
             ("GetTableMaintenanceJobHandler", "AdminAction::GetTableLifecycleAction"),
             ("ExportTableCatalogHandler", "AdminAction::GetTableMetadataAction"),
             ("ImportTableCatalogHandler", "AdminAction::RegisterTableAction"),
+            ("ExternalCatalogBridgeHandler", "AdminAction::GetTableMetadataAction"),
             ("GetTableCatalogDiagnosticsHandler", "AdminAction::GetTableMetadataAction"),
             ("RecoverTableCatalogHandler", "AdminAction::CommitTableAction"),
             ("RollbackTableCatalogHandler", "AdminAction::CommitTableAction"),
@@ -3412,11 +3734,17 @@ mod tests {
         let _: &RestListTablesHandler = &LIST_TABLES_HANDLER;
         let _: &RestCreateTableHandler = &CREATE_TABLE_HANDLER;
         let _: &RestRegisterTableHandler = &REGISTER_TABLE_HANDLER;
+        let _: &RestListViewsHandler = &LIST_VIEWS_HANDLER;
+        let _: &RestCreateViewHandler = &CREATE_VIEW_HANDLER;
         let _: &RestLoadTableHandler = &LOAD_TABLE_HANDLER;
         let _: &RestTableExistsHandler = &TABLE_EXISTS_HANDLER;
         let _: &RestLoadCredentialsHandler = &LOAD_CREDENTIALS_HANDLER;
         let _: &RestCommitTableHandler = &COMMIT_TABLE_HANDLER;
         let _: &RestDropTableHandler = &DROP_TABLE_HANDLER;
+        let _: &RestLoadViewHandler = &LOAD_VIEW_HANDLER;
+        let _: &RestReplaceViewHandler = &REPLACE_VIEW_HANDLER;
+        let _: &RestDropViewHandler = &DROP_VIEW_HANDLER;
+        let _: &ListTableRefsHandler = &LIST_TABLE_REFS_HANDLER;
         let _: &GetTableMetadataLocationHandler = &GET_TABLE_METADATA_LOCATION_HANDLER;
         let _: &UpdateTableMetadataLocationHandler = &UPDATE_TABLE_METADATA_LOCATION_HANDLER;
         let _: &RestTableMetadataMaintenanceHandler = &TABLE_METADATA_MAINTENANCE_HANDLER;
@@ -3425,7 +3753,9 @@ mod tests {
         let _: &GetTableMaintenanceJobHandler = &GET_TABLE_MAINTENANCE_JOB_HANDLER;
         let _: &ExportTableCatalogHandler = &EXPORT_TABLE_CATALOG_HANDLER;
         let _: &ImportTableCatalogHandler = &IMPORT_TABLE_CATALOG_HANDLER;
+        let _: &ExternalCatalogBridgeHandler = &EXTERNAL_CATALOG_BRIDGE_HANDLER;
         let _: &GetTableCatalogDiagnosticsHandler = &GET_TABLE_CATALOG_DIAGNOSTICS_HANDLER;
+        let _: &RecoverTableCatalogHandler = &RECOVER_TABLE_CATALOG_HANDLER;
         let _: &RollbackTableCatalogHandler = &ROLLBACK_TABLE_CATALOG_HANDLER;
 
         assert_operation::<EnableTableBucketHandler>();
@@ -3438,11 +3768,17 @@ mod tests {
         assert_operation::<RestListTablesHandler>();
         assert_operation::<RestCreateTableHandler>();
         assert_operation::<RestRegisterTableHandler>();
+        assert_operation::<RestListViewsHandler>();
+        assert_operation::<RestCreateViewHandler>();
         assert_operation::<RestLoadTableHandler>();
         assert_operation::<RestTableExistsHandler>();
         assert_operation::<RestLoadCredentialsHandler>();
         assert_operation::<RestCommitTableHandler>();
         assert_operation::<RestDropTableHandler>();
+        assert_operation::<RestLoadViewHandler>();
+        assert_operation::<RestReplaceViewHandler>();
+        assert_operation::<RestDropViewHandler>();
+        assert_operation::<ListTableRefsHandler>();
         assert_operation::<GetTableMetadataLocationHandler>();
         assert_operation::<UpdateTableMetadataLocationHandler>();
         assert_operation::<RestTableMetadataMaintenanceHandler>();
@@ -3451,7 +3787,9 @@ mod tests {
         assert_operation::<GetTableMaintenanceJobHandler>();
         assert_operation::<ExportTableCatalogHandler>();
         assert_operation::<ImportTableCatalogHandler>();
+        assert_operation::<ExternalCatalogBridgeHandler>();
         assert_operation::<GetTableCatalogDiagnosticsHandler>();
+        assert_operation::<RecoverTableCatalogHandler>();
         assert_operation::<RollbackTableCatalogHandler>();
     }
 
@@ -4407,6 +4745,7 @@ mod tests {
                     retain_recent_metadata_files: 2,
                     delete_enabled: true,
                     background_enabled: false,
+                    ..Default::default()
                 },
             )
             .await
@@ -4424,6 +4763,7 @@ mod tests {
                         retain_recent_metadata_files: 2,
                         delete_enabled: true,
                         background_enabled: true,
+                        ..Default::default()
                     },
                 )
                 .await
@@ -4829,6 +5169,62 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn table_refs_response_reports_current_and_user_defined_refs() {
+        let backend = TestTableCatalogObjectBackend::default();
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "warehouse";
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
+        let current = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        seed_object_table_for_metadata_maintenance(&store, &backend, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .put_json_with_mod_time(
+                bucket,
+                &current,
+                serde_json::json!({
+                    "current-snapshot-id": 10,
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 10,
+                            "type": "branch"
+                        },
+                        "audit": {
+                            "snapshot-id": 9,
+                            "type": "tag"
+                        }
+                    }
+                }),
+                Some(OffsetDateTime::UNIX_EPOCH),
+            )
+            .await;
+
+        let response = table_refs_response(&store, &backend, bucket, &namespace, "events")
+            .await
+            .expect("refs response should load");
+
+        assert_eq!(response.current_snapshot_id, Some(10));
+        assert_eq!(response.protected_ref_count, 1);
+        assert_eq!(response.user_defined_ref_count, 1);
+        assert!(response.refs.contains_key("main"));
+        assert!(response.refs.contains_key("audit"));
+    }
+
+    #[test]
+    fn external_catalog_bridge_response_lists_unsupported_bridges() {
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let response = external_catalog_bridge_response("warehouse", &namespace, "events");
+
+        assert_eq!(response.status, "metadata-import-supported");
+        assert_eq!(response.unsupported_bridges.len(), 4);
+        assert!(
+            response
+                .unsupported_bridges
+                .iter()
+                .any(|bridge| bridge.catalog == "polaris" && bridge.status == "unsupported")
+        );
     }
 
     #[test]
