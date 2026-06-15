@@ -223,12 +223,12 @@ fn scanner_replication_repair_kind(roi: &ReplicateObjectInfo) -> Option<ScannerR
         return None;
     }
 
-    if !roi.version_purge_status.is_empty() {
+    if roi.op_type == ReplicationType::ExistingObject || roi.existing_obj_resync.must_resync() {
+        Some(ScannerReplicationRepairKind::BucketExistingObject)
+    } else if !roi.version_purge_status.is_empty() {
         Some(ScannerReplicationRepairKind::BucketVersionPurge)
     } else if roi.delete_marker {
         Some(ScannerReplicationRepairKind::BucketDeleteMarker)
-    } else if roi.op_type == ReplicationType::ExistingObject || roi.existing_obj_resync.must_resync() {
-        Some(ScannerReplicationRepairKind::BucketExistingObject)
     } else {
         Some(ScannerReplicationRepairKind::BucketObject)
     }
@@ -2434,7 +2434,7 @@ mod tests {
 
     use super::*;
     use rustfs_ecstore::disk::{DiskOption, endpoint::Endpoint, new_disk};
-    use rustfs_filemeta::{ReplicateObjectInfo, ReplicationType, VersionPurgeStatusType};
+    use rustfs_filemeta::{ReplicateObjectInfo, ReplicationType, ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType};
     use serial_test::serial;
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -2702,6 +2702,27 @@ mod tests {
         };
         assert_eq!(
             scanner_replication_repair_kind(&existing_object),
+            Some(ScannerReplicationRepairKind::BucketExistingObject)
+        );
+
+        let mut existing_obj_resync = ResyncDecision::new();
+        existing_obj_resync.targets.insert(
+            "arn:minio:replication:::target".to_string(),
+            ResyncTargetDecision {
+                replicate: true,
+                ..Default::default()
+            },
+        );
+        let existing_delete_marker = ReplicateObjectInfo {
+            bucket: "bucket-a".to_string(),
+            name: "existing-delete-marker-a".to_string(),
+            delete_marker: true,
+            replication_status: ReplicationStatusType::Completed,
+            existing_obj_resync,
+            ..Default::default()
+        };
+        assert_eq!(
+            scanner_replication_repair_kind(&existing_delete_marker),
             Some(ScannerReplicationRepairKind::BucketExistingObject)
         );
 
