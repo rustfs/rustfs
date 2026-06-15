@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::StorageAPI;
 use crate::bucket::bucket_target_sys::BucketTargetSys;
 use crate::bucket::metadata_sys;
 use crate::bucket::replication::ResyncOpts;
@@ -21,14 +20,14 @@ use crate::bucket::replication::replicate_delete;
 use crate::bucket::replication::replicate_object;
 use crate::bucket::replication::replication_resyncer::{
     BucketReplicationResyncStatus, DeletedObjectReplicationInfo, MRF_REPLICATION_FILE, REPLICATION_DIR, RESYNC_FILE_NAME,
-    ReplicationConfig, ReplicationResyncer, TargetReplicationResyncStatus, decode_mrf_file, decode_resync_file, encode_mrf_file,
-    get_heal_replicate_object_info, save_resync_status,
+    ReplicationConfig, ReplicationResyncer, ReplicationStorage, TargetReplicationResyncStatus, decode_mrf_file,
+    decode_resync_file, encode_mrf_file, get_heal_replicate_object_info, save_resync_status,
 };
 use crate::bucket::replication::replication_state::ReplicationStats;
 use crate::config::com::{read_config, save_config};
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::Error as EcstoreError;
-use crate::store_api::{NamespaceLocking, ObjectIO, ObjectInfo, ObjectOptions};
+use crate::store_api::{ObjectIO, ObjectInfo, ObjectOptions};
 use lazy_static::lazy_static;
 use rustfs_filemeta::MrfOpKind;
 use rustfs_filemeta::MrfReplicateEntry;
@@ -213,7 +212,7 @@ impl Default for ReplicationPoolOpts {
 }
 /// Main replication pool structure
 #[derive(Debug)]
-pub struct ReplicationPool<S: StorageAPI + NamespaceLocking> {
+pub struct ReplicationPool<S: ReplicationStorage> {
     // Atomic counters for active workers
     active_workers: Arc<AtomicI32>,
     active_lrg_workers: Arc<AtomicI32>,
@@ -254,7 +253,7 @@ pub struct ReplicationPool<S: StorageAPI + NamespaceLocking> {
     resyncer: Arc<ReplicationResyncer>,
 }
 
-impl<S: StorageAPI + NamespaceLocking> ReplicationPool<S> {
+impl<S: ReplicationStorage> ReplicationPool<S> {
     /// Creates a new replication pool with specified options
     pub async fn new(opts: ReplicationPoolOpts, stats: Arc<ReplicationStats>, storage: Arc<S>) -> Arc<Self> {
         let max_workers = opts.max_workers.unwrap_or(WORKER_MAX_LIMIT);
@@ -1330,7 +1329,7 @@ pub trait ReplicationPoolTrait: std::fmt::Debug {
 
 // Implement the trait for ReplicationPool
 #[async_trait::async_trait]
-impl<S: StorageAPI + NamespaceLocking> ReplicationPoolTrait for ReplicationPool<S> {
+impl<S: ReplicationStorage> ReplicationPoolTrait for ReplicationPool<S> {
     fn active_workers(&self) -> i32 {
         ReplicationPool::<S>::active_workers(self)
     }
@@ -1382,7 +1381,7 @@ lazy_static! {
 }
 
 /// Initializes background replication with the given options
-pub async fn init_background_replication<S: StorageAPI + NamespaceLocking>(storage: Arc<S>) {
+pub async fn init_background_replication<S: ReplicationStorage>(storage: Arc<S>) {
     let stats = GLOBAL_REPLICATION_STATS
         .get_or_init(|| async {
             let stats = Arc::new(ReplicationStats::new());
@@ -1406,7 +1405,7 @@ pub fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
     GLOBAL_REPLICATION_POOL.get().cloned()
 }
 
-pub async fn schedule_replication<S: StorageAPI + NamespaceLocking>(
+pub async fn schedule_replication<S: ReplicationStorage>(
     oi: ObjectInfo,
     o: Arc<S>,
     dsc: ReplicateDecision,

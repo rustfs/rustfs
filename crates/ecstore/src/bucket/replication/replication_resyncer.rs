@@ -31,11 +31,12 @@ use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_fo
 use crate::event_notification::{EventArgs, send_event};
 use crate::global::GLOBAL_LocalNodeName;
 use crate::global::get_global_bucket_monitor;
+use crate::resolve_object_store_handle;
 use crate::set_disk::get_lock_acquire_timeout;
 use crate::store_api::{
-    DeletedObject, HTTPRangeSpec, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOptions, ObjectToDelete, WalkOptions,
+    DeletedObject, HTTPRangeSpec, ListOperations, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions,
+    ObjectToDelete, WalkOptions,
 };
-use crate::{StorageAPI, resolve_object_store_handle};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
 use aws_sdk_s3::primitives::ByteStream;
@@ -102,6 +103,11 @@ const EVENT_REPLICATION_FORCE_DELETE_SKIPPED: &str = "replication_force_delete_s
 const EVENT_RESYNC_TASK_FAILED: &str = "replication_resync_task_failed";
 const EVENT_RESYNC_TARGET_OPERATION_FAILED: &str = "replication_resync_target_operation_failed";
 const EVENT_RESYNC_RUNTIME_CHANNEL_FAILED: &str = "replication_resync_runtime_channel_failed";
+
+/// Storage capabilities required by bucket replication workers.
+pub trait ReplicationStorage: ObjectIO + ObjectOperations + ListOperations + NamespaceLocking {}
+
+impl<T> ReplicationStorage for T where T: ObjectIO + ObjectOperations + ListOperations + NamespaceLocking {}
 
 pub(crate) const REPLICATION_DIR: &str = ".replication";
 pub(crate) const RESYNC_FILE_NAME: &str = "resync.bin";
@@ -707,7 +713,7 @@ impl ReplicationResyncer {
     }
 
     #[instrument(skip(cancellation_token, storage))]
-    pub async fn resync_bucket<S: StorageAPI + NamespaceLocking>(
+    pub async fn resync_bucket<S: ReplicationStorage>(
         self: Arc<Self>,
         cancellation_token: CancellationToken,
         storage: Arc<S>,
@@ -1734,7 +1740,7 @@ pub async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOpti
     dsc
 }
 
-pub async fn replicate_delete<S: StorageAPI + NamespaceLocking>(dobj: DeletedObjectReplicationInfo, storage: Arc<S>) {
+pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicationInfo, storage: Arc<S>) {
     if dobj.delete_object.force_delete {
         replicate_force_delete_to_targets(&dobj, storage).await;
         return;
@@ -2177,7 +2183,7 @@ pub async fn replicate_delete<S: StorageAPI + NamespaceLocking>(dobj: DeletedObj
     }
 }
 
-async fn source_delete_marker_missing<S: StorageAPI>(
+async fn source_delete_marker_missing<S: ObjectOperations>(
     storage: &S,
     bucket: &str,
     object_name: &str,
@@ -2236,10 +2242,7 @@ async fn replicate_delete_marker_purge_to_targets(bucket: &str, dobj: &DeletedOb
     }
 }
 
-async fn replicate_force_delete_to_targets<S: StorageAPI + NamespaceLocking>(
-    dobj: &DeletedObjectReplicationInfo,
-    storage: Arc<S>,
-) {
+async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &DeletedObjectReplicationInfo, storage: Arc<S>) {
     let bucket = &dobj.bucket;
     let object_name = &dobj.delete_object.object_name;
 
@@ -2634,7 +2637,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
     rinfo
 }
 
-pub async fn replicate_object<S: StorageAPI + NamespaceLocking>(roi: ReplicateObjectInfo, storage: Arc<S>) {
+pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, storage: Arc<S>) {
     let bucket = roi.bucket.clone();
     let object = roi.name.clone();
 
@@ -2872,13 +2875,13 @@ pub async fn replicate_object<S: StorageAPI + NamespaceLocking>(roi: ReplicateOb
 }
 
 trait ReplicateObjectInfoExt {
-    async fn replicate_object<S: StorageAPI>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo;
-    async fn replicate_all<S: StorageAPI>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo;
+    async fn replicate_object<S: ObjectIO>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo;
+    async fn replicate_all<S: ObjectIO>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo;
     fn to_object_info(&self) -> ObjectInfo;
 }
 
 impl ReplicateObjectInfoExt for ReplicateObjectInfo {
-    async fn replicate_object<S: StorageAPI>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
+    async fn replicate_object<S: ObjectIO>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
         let bucket = self.bucket.clone();
         let object = self.name.clone();
 
@@ -3173,7 +3176,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         rinfo
     }
 
-    async fn replicate_all<S: StorageAPI>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
+    async fn replicate_all<S: ObjectIO>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
         let start_time = OffsetDateTime::now_utc();
 
         let bucket = self.bucket.clone();
@@ -3895,7 +3898,7 @@ fn part_range_spec_from_actual_size(offset: i64, part_size: i64) -> std::io::Res
     ))
 }
 
-struct MultipartReplicationContext<'a, S: StorageAPI> {
+struct MultipartReplicationContext<'a, S: ObjectIO> {
     storage: Arc<S>,
     cli: Arc<TargetClient>,
     src_bucket: &'a str,
@@ -3907,7 +3910,7 @@ struct MultipartReplicationContext<'a, S: StorageAPI> {
     put_opts: PutObjectOptions,
 }
 
-async fn replicate_object_with_multipart<S: StorageAPI>(ctx: MultipartReplicationContext<'_, S>) -> std::io::Result<()> {
+async fn replicate_object_with_multipart<S: ObjectIO>(ctx: MultipartReplicationContext<'_, S>) -> std::io::Result<()> {
     let MultipartReplicationContext {
         storage,
         cli,
