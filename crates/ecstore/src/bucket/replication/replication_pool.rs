@@ -1884,23 +1884,45 @@ mod tests {
 
     #[test]
     fn mrf_legacy_file_without_op_field_decoded_as_object() {
-        // Simulate a file written by old code that has no "op" key.
-        // rmp_serde with #[serde(default)] must fill in MrfOpKind::Object.
-        let legacy = MrfReplicateEntry {
-            bucket: "old-bucket".to_string(),
-            object: "old-key".to_string(),
-            version_id: None,
-            retry_count: 2,
-            size: 100,
-            // Deliberately write as Object so serde emits "op":"object"; we then verify
-            // the round-trip is stable and default() is Object.
-            op: MrfOpKind::Object,
-            delete_marker_version_id: None,
-            delete_marker: false,
-        };
-        let encoded = encode_mrf_file(&[legacy]).expect("encode");
-        let decoded = decode_mrf_file(&encoded).expect("decode");
-        assert_eq!(decoded[0].op, MrfOpKind::Object);
-        assert_eq!(decoded[0].retry_count, 2);
+        // Hand-build the exact bytes a pre-MrfOpKind binary would have written to disk.
+        // The old MrfReplicateEntry had only 4 persisted keys (versionID is omitted when
+        // None due to skip_serializing_if): bucket, object, retryCount, size.
+        // There is no "op", "deleteMarker", or "deleteMarkerVersionID" key.
+        //
+        // This proves that #[serde(default)] on the `op` field carries real weight:
+        // if you remove that attribute, rmp_serde will return an error on this payload
+        // and the test will fail.
+        let mut msgpack = Vec::new();
+        // Outer: array of 1 (the Vec<MrfReplicateEntry>)
+        rmp::encode::write_array_len(&mut msgpack, 1).unwrap();
+        // Inner: named map with the 4 original fields only — no "op", no "deleteMarker*"
+        rmp::encode::write_map_len(&mut msgpack, 4).unwrap();
+        rmp::encode::write_str(&mut msgpack, "bucket").unwrap();
+        rmp::encode::write_str(&mut msgpack, "old-bucket").unwrap();
+        rmp::encode::write_str(&mut msgpack, "object").unwrap();
+        rmp::encode::write_str(&mut msgpack, "old-key").unwrap();
+        rmp::encode::write_str(&mut msgpack, "retryCount").unwrap();
+        rmp::encode::write_i32(&mut msgpack, 2).unwrap();
+        rmp::encode::write_str(&mut msgpack, "size").unwrap();
+        rmp::encode::write_i64(&mut msgpack, 100).unwrap();
+
+        // Prepend the MRF file header: format=1 (LE u16) || version=1 (LE u16)
+        let mut data = Vec::with_capacity(4 + msgpack.len());
+        data.extend_from_slice(&1u16.to_le_bytes()); // MRF_META_FORMAT
+        data.extend_from_slice(&1u16.to_le_bytes()); // MRF_META_VERSION
+        data.extend_from_slice(&msgpack);
+
+        let decoded = decode_mrf_file(&data).expect("legacy payload must decode without error");
+        assert_eq!(decoded.len(), 1);
+        let entry = &decoded[0];
+        assert_eq!(entry.bucket, "old-bucket");
+        assert_eq!(entry.object, "old-key");
+        assert_eq!(entry.retry_count, 2);
+        assert_eq!(entry.size, 100);
+        assert_eq!(entry.version_id, None);
+        // The "op" key was absent — #[serde(default)] must fill in MrfOpKind::Object.
+        assert_eq!(entry.op, MrfOpKind::Object, "missing op key must default to Object");
+        assert!(!entry.delete_marker);
+        assert_eq!(entry.delete_marker_version_id, None);
     }
 }
