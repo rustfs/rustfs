@@ -68,7 +68,7 @@ use crate::{
         BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
         HTTPRangeSpec, HealOperations, ListObjectsV2Info, ListOperations, MakeBucketOptions, MultipartOperations,
         MultipartUploadResult, NamespaceLocking, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo,
-        PutObjReader, StorageAPI,
+        PutObjReader,
     },
     store_init,
 };
@@ -702,9 +702,6 @@ impl HealOperations for ECStore {
         self.handle_check_abandoned_parts(bucket, object, opts).await
     }
 }
-
-#[async_trait::async_trait]
-impl StorageAPI for ECStore {}
 
 #[async_trait::async_trait]
 impl NamespaceLocking for ECStore {

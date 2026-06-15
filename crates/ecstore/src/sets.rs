@@ -31,7 +31,7 @@ use crate::{
         BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
         HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
         MakeBucketOptions, MultipartInfo, MultipartOperations, MultipartUploadResult, NamespaceLocking, ObjectIO, ObjectInfo,
-        ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
+        ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader,
     },
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
 };
@@ -895,9 +895,6 @@ impl HealOperations for Sets {
         unimplemented!()
     }
 }
-
-#[async_trait::async_trait]
-impl StorageAPI for Sets {}
 
 #[async_trait::async_trait]
 impl NamespaceLocking for Sets {
