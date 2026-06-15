@@ -1765,6 +1765,9 @@ impl Metrics {
     pub fn record_scanner_transition_failed(&self, count: u64) {
         self.scanner_transition_failed.fetch_add(count, Ordering::Relaxed);
         self.record_scanner_source_failed(ScannerWorkSource::Lifecycle, count);
+        if !self.current_scan_cycle_work_active.load(Ordering::Relaxed) {
+            self.record_last_cycle_scanner_source_work(ScannerWorkSource::Lifecycle, ScannerSourceWorkUpdate::failed(count));
+        }
     }
 
     pub fn record_scanner_checkpoint_set(&self, version: u16, resume_after: impl Into<String>, reason: impl Into<String>) {
@@ -1805,6 +1808,12 @@ impl Metrics {
 
     pub fn record_scanner_source_work(&self, source: ScannerWorkSource, work: ScannerSourceWorkUpdate) {
         if let Some(counters) = self.scanner_source_work.get(source.index()) {
+            counters.add(work);
+        }
+    }
+
+    fn record_last_cycle_scanner_source_work(&self, source: ScannerWorkSource, work: ScannerSourceWorkUpdate) {
+        if let Some(counters) = self.last_scan_cycle_source_work.get(source.index()) {
             counters.add(work);
         }
     }
@@ -2903,6 +2912,35 @@ mod tests {
         assert_eq!(lifecycle.state, "blocked");
         assert_eq!(lifecycle.reason, "transition_failed");
         assert_eq!(lifecycle.backlog, 2);
+    }
+
+    #[tokio::test]
+    async fn report_marks_off_cycle_transition_failures_as_blocked_lifecycle_control() {
+        let metrics = Metrics::new();
+        let start = metrics.start_scan_cycle_work();
+        metrics.finish_scan_cycle_work(start);
+
+        metrics.record_scanner_transition_failed(1);
+        let report = metrics.report().await;
+
+        assert!(report.current_cycle_source_work.is_empty());
+        let lifecycle_work = report
+            .last_cycle_source_work
+            .iter()
+            .find(|work| work.source == ScannerWorkSource::Lifecycle.as_str())
+            .expect("last-cycle lifecycle source work should be visible");
+        assert_eq!(lifecycle_work.failed, 1);
+
+        let lifecycle = report
+            .maintenance_control
+            .sources
+            .iter()
+            .find(|source| source.source == ScannerWorkSource::Lifecycle.as_str())
+            .expect("lifecycle source control should be visible");
+        assert_eq!(report.maintenance_control.primary_control, "blocked_source");
+        assert_eq!(lifecycle.state, "blocked");
+        assert_eq!(lifecycle.reason, "transition_failed");
+        assert_eq!(lifecycle.backlog, 1);
     }
 
     #[tokio::test]

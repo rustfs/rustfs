@@ -445,6 +445,15 @@ impl ExpiryState {
         usize::try_from(self.stats.pending_tasks().max(0)).unwrap_or(usize::MAX)
     }
 
+    async fn send_expiry_task(&self, wrkr: Sender<Option<ExpiryOpType>>, task: ExpiryOpType) -> bool {
+        self.stats.increment_pending_tasks();
+        let queued = wrkr.send(Some(task)).await.is_ok();
+        if !queued {
+            self.stats.decrement_pending_tasks();
+        }
+        queued
+    }
+
     pub async fn enqueue_tier_journal_entry(&mut self, je: &Jentry) -> Result<(), std::io::Error> {
         let wrkr = self.get_worker_ch(je.op_hash());
         if wrkr.is_none() {
@@ -453,10 +462,8 @@ impl ExpiryState {
             return Ok(());
         }
         let wrkr = wrkr.expect("worker channel should exist after None check");
-        let queued = wrkr.send(Some(Box::new(je.clone()))).await.is_ok();
-        if queued {
-            self.stats.increment_pending_tasks();
-        } else {
+        let queued = self.send_expiry_task(wrkr, Box::new(je.clone())).await;
+        if !queued {
             self.stats.increment_missed_tier_journal_tasks();
         }
         self.stats.record_scanner_expiry_state();
@@ -472,10 +479,8 @@ impl ExpiryState {
             return;
         }
         let wrkr = wrkr.expect("worker channel should exist after None check");
-        let queued = wrkr.send(Some(Box::new(task))).await.is_ok();
-        if queued {
-            self.stats.increment_pending_tasks();
-        } else {
+        let queued = self.send_expiry_task(wrkr, Box::new(task)).await;
+        if !queued {
             self.stats.increment_missed_freevers_tasks();
         }
         self.stats.record_scanner_expiry_state();
@@ -495,10 +500,8 @@ impl ExpiryState {
             return false;
         }
         let wrkr = wrkr.expect("worker channel should exist after None check");
-        let queued = wrkr.send(Some(Box::new(task))).await.is_ok();
-        if queued {
-            self.stats.increment_pending_tasks();
-        } else {
+        let queued = self.send_expiry_task(wrkr, Box::new(task)).await;
+        if !queued {
             self.stats.increment_missed_expiry_tasks();
         }
         record_scanner_lifecycle_enqueue_result(src, 1, queued);
@@ -531,10 +534,8 @@ impl ExpiryState {
             return false;
         }
         let wrkr = wrkr.expect("worker channel should exist after None check");
-        let queued = wrkr.send(Some(Box::new(task))).await.is_ok();
-        if queued {
-            self.stats.increment_pending_tasks();
-        } else {
+        let queued = self.send_expiry_task(wrkr, Box::new(task)).await;
+        if !queued {
             self.stats.increment_missed_expiry_tasks();
         }
         record_scanner_lifecycle_enqueue_result(src, version_count, queued);
