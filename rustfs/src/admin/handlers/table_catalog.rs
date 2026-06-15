@@ -16,38 +16,74 @@ use crate::admin::{
     auth::{AdminResourceScope, validate_admin_request, validate_admin_request_with_bucket_object},
     router::{AdminOperation, Operation, S3Router},
 };
+use crate::app::context::resolve_object_store_handle;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{RemoteAddr, TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX};
 use crate::table_catalog::{DEFAULT_WAREHOUSE_ID, TableCatalogStore};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
 use matchit::Params;
+use metrics::{counter, histogram};
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_ecstore::{bucket::metadata_sys, new_object_layer_fn, store::ECStore};
-use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_ecstore::{
+    bucket::{metadata::table_catalog_path_hash, metadata_sys},
+    store::ECStore,
+};
+use rustfs_iam::{manager::get_token_signing_key, sys::SESSION_POLICY_NAME};
+use rustfs_policy::{
+    auth::get_new_credentials_with_metadata,
+    policy::{
+        Policy,
+        action::{Action, AdminAction},
+    },
+};
 use s3s::{Body, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::BTreeMap;
-use time::OffsetDateTime;
+use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration as StdDuration, Instant};
+use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 const JSON_CONTENT_TYPE: &str = "application/json";
+const ENV_TABLE_CATALOG_CREDENTIAL_VENDING: &str = "RUSTFS_TABLE_CATALOG_CREDENTIAL_VENDING";
+const ENV_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: &str = "RUSTFS_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS";
+const DEFAULT_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 15 * 60;
+const MIN_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60;
+const MAX_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60 * 60;
 const WAREHOUSE_PROPERTY: &str = "warehouse";
 const CATALOG_ENDPOINT_PREFIX_CONFIG_KEY: &str = "rustfs.catalog-endpoint-prefix";
 const CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY: &str = "rustfs.catalog-compat-endpoint-prefix";
 const CREDENTIAL_VENDING_CONFIG_KEY: &str = "rustfs.credential-vending";
+const CREDENTIAL_VENDING_REASON_CONFIG_KEY: &str = "rustfs.credential-vending-reason";
+const CREDENTIAL_SCOPE_CONFIG_KEY: &str = "rustfs.credential-scope";
+const CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY: &str = "rustfs.credential-scope-prefix";
+const CREDENTIAL_MODE_CONFIG_KEY: &str = "rustfs.credential-mode";
+const CREDENTIAL_EXPIRATION_CONFIG_KEY: &str = "rustfs.credential-expiration-unix-seconds";
 const CREDENTIAL_VENDING_UNSUPPORTED: &str = "unsupported";
+const CREDENTIAL_VENDING_SUPPORTED: &str = "supported";
+const CREDENTIAL_VENDING_UNSUPPORTED_REASON: &str = "temporary-credentials-not-implemented";
+const CREDENTIAL_SCOPE_WAREHOUSE_PREFIX: &str = "warehouse-prefix";
+const CREDENTIAL_SCOPE_TABLE_PREFIX: &str = "table-prefix";
+const CREDENTIAL_MODE_CLIENT_PROVIDED: &str = "client-provided-s3-credentials-required";
+const CREDENTIAL_MODE_CATALOG_VENDED: &str = "catalog-vended-temporary-credentials";
+const S3_ACCESS_KEY_ID_CONFIG_KEY: &str = "s3.access-key-id";
+const S3_SECRET_ACCESS_KEY_CONFIG_KEY: &str = "s3.secret-access-key";
+const S3_SESSION_TOKEN_CONFIG_KEY: &str = "s3.session-token";
 const TABLE_CATALOG_NAMESPACE_RESOURCE_ROOT: &str = "namespaces";
 const TABLE_CATALOG_TABLE_RESOURCE_ROOT: &str = "tables";
+const TABLE_CATALOG_ADMIN_OPERATION_SLOW_LOG_THRESHOLD: StdDuration = StdDuration::from_secs(2);
 const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /v1/{prefix}/namespaces",
     "POST /v1/{prefix}/namespaces",
     "GET /v1/{prefix}/namespaces/{namespace}",
+    "HEAD /v1/{prefix}/namespaces/{namespace}",
     "DELETE /v1/{prefix}/namespaces/{namespace}",
     "GET /v1/{prefix}/namespaces/{namespace}/tables",
     "POST /v1/{prefix}/namespaces/{namespace}/tables",
     "POST /v1/{prefix}/namespaces/{namespace}/register",
     "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+    "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+    "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials",
     "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}",
     "DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}",
     "PUT /buckets/{warehouse}",
@@ -55,11 +91,14 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /{warehouse}/namespaces",
     "POST /{warehouse}/namespaces",
     "GET /{warehouse}/namespaces/{namespace}",
+    "HEAD /{warehouse}/namespaces/{namespace}",
     "DELETE /{warehouse}/namespaces/{namespace}",
     "GET /{warehouse}/namespaces/{namespace}/tables",
     "POST /{warehouse}/namespaces/{namespace}/tables",
     "POST /{warehouse}/namespaces/{namespace}/register",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}",
+    "HEAD /{warehouse}/namespaces/{namespace}/tables/{table}",
+    "GET /{warehouse}/namespaces/{namespace}/tables/{table}/credentials",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}",
     "DELETE /{warehouse}/namespaces/{namespace}/tables/{table}",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata",
@@ -71,6 +110,7 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/diagnostics",
+    "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
 ];
 
@@ -80,11 +120,14 @@ static GET_TABLE_BUCKET_HANDLER: GetTableBucketHandler = GetTableBucketHandler {
 static LIST_NAMESPACES_HANDLER: RestListNamespacesHandler = RestListNamespacesHandler {};
 static CREATE_NAMESPACE_HANDLER: RestCreateNamespaceHandler = RestCreateNamespaceHandler {};
 static GET_NAMESPACE_HANDLER: RestGetNamespaceHandler = RestGetNamespaceHandler {};
+static NAMESPACE_EXISTS_HANDLER: RestNamespaceExistsHandler = RestNamespaceExistsHandler {};
 static DROP_NAMESPACE_HANDLER: RestDropNamespaceHandler = RestDropNamespaceHandler {};
 static LIST_TABLES_HANDLER: RestListTablesHandler = RestListTablesHandler {};
 static CREATE_TABLE_HANDLER: RestCreateTableHandler = RestCreateTableHandler {};
 static REGISTER_TABLE_HANDLER: RestRegisterTableHandler = RestRegisterTableHandler {};
 static LOAD_TABLE_HANDLER: RestLoadTableHandler = RestLoadTableHandler {};
+static TABLE_EXISTS_HANDLER: RestTableExistsHandler = RestTableExistsHandler {};
+static LOAD_CREDENTIALS_HANDLER: RestLoadCredentialsHandler = RestLoadCredentialsHandler {};
 static COMMIT_TABLE_HANDLER: RestCommitTableHandler = RestCommitTableHandler {};
 static DROP_TABLE_HANDLER: RestDropTableHandler = RestDropTableHandler {};
 static GET_TABLE_METADATA_LOCATION_HANDLER: GetTableMetadataLocationHandler = GetTableMetadataLocationHandler {};
@@ -96,6 +139,7 @@ static GET_TABLE_MAINTENANCE_JOB_HANDLER: GetTableMaintenanceJobHandler = GetTab
 static EXPORT_TABLE_CATALOG_HANDLER: ExportTableCatalogHandler = ExportTableCatalogHandler {};
 static IMPORT_TABLE_CATALOG_HANDLER: ImportTableCatalogHandler = ImportTableCatalogHandler {};
 static GET_TABLE_CATALOG_DIAGNOSTICS_HANDLER: GetTableCatalogDiagnosticsHandler = GetTableCatalogDiagnosticsHandler {};
+static RECOVER_TABLE_CATALOG_HANDLER: RecoverTableCatalogHandler = RecoverTableCatalogHandler {};
 static ROLLBACK_TABLE_CATALOG_HANDLER: RollbackTableCatalogHandler = RollbackTableCatalogHandler {};
 
 #[derive(Debug, Serialize)]
@@ -225,6 +269,10 @@ struct TableBucketResponse {
     compat_catalog_uri: String,
     #[serde(rename = "credential-vending")]
     credential_vending: &'static str,
+    #[serde(rename = "credential-scope")]
+    credential_scope: &'static str,
+    #[serde(rename = "credential-scope-prefix")]
+    credential_scope_prefix: String,
     #[serde(rename = "catalog-entry-present")]
     catalog_entry_present: bool,
     properties: BTreeMap<String, String>,
@@ -258,12 +306,154 @@ struct RestStorageCredential {
     config: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone)]
+struct TableCredentialScope {
+    scope_prefix: String,
+    object_prefix: String,
+}
+
+#[derive(Debug, Clone)]
+struct TableCredentialIssueRequest<'a> {
+    entry: &'a crate::table_catalog::TableEntry,
+    principal: Option<&'a rustfs_credentials::Credentials>,
+    scope_prefix: String,
+    object_prefix: String,
+}
+
+#[derive(Debug, Clone)]
+struct IssuedTableCredentials {
+    access_key_id: String,
+    secret_access_key: String,
+    session_token: String,
+    expiration: OffsetDateTime,
+}
+
+#[async_trait::async_trait]
+trait TableCredentialIssuer: Sync {
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    async fn issue_table_credentials(&self, request: TableCredentialIssueRequest<'_>)
+    -> S3Result<Option<IssuedTableCredentials>>;
+}
+
+#[cfg(test)]
+struct DisabledTableCredentialIssuer;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl TableCredentialIssuer for DisabledTableCredentialIssuer {
+    fn enabled(&self) -> bool {
+        false
+    }
+
+    async fn issue_table_credentials(
+        &self,
+        _request: TableCredentialIssueRequest<'_>,
+    ) -> S3Result<Option<IssuedTableCredentials>> {
+        Ok(None)
+    }
+}
+
+struct IamTableCredentialIssuer {
+    enabled: bool,
+    ttl_seconds: i64,
+}
+
+impl IamTableCredentialIssuer {
+    fn from_env() -> Self {
+        Self {
+            enabled: table_credential_vending_enabled(),
+            ttl_seconds: table_credential_ttl_seconds(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl TableCredentialIssuer for IamTableCredentialIssuer {
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    async fn issue_table_credentials(
+        &self,
+        request: TableCredentialIssueRequest<'_>,
+    ) -> S3Result<Option<IssuedTableCredentials>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+
+        let Some(principal) = request.principal else {
+            return Err(s3_error!(InvalidRequest, "authentication required for table credentials"));
+        };
+        if principal.is_temp() || principal.is_service_account() {
+            return Err(s3_error!(
+                AccessDenied,
+                "table credential vending does not allow chained temporary credentials"
+            ));
+        }
+
+        let policy = table_credential_session_policy(request.entry, &request.object_prefix)?;
+        let policy_buf = serde_json::to_vec(&policy)
+            .map_err(|err| s3_error!(InternalError, "failed to serialize table credential session policy: {}", err))?;
+        let expiration = OffsetDateTime::now_utc().saturating_add(Duration::seconds(self.ttl_seconds));
+        let mut claims: HashMap<String, serde_json::Value> = principal.claims.clone().unwrap_or_default();
+        claims.insert(
+            "exp".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(expiration.unix_timestamp())),
+        );
+        claims.insert("parent".to_string(), serde_json::Value::String(principal.access_key.clone()));
+        claims.insert(
+            SESSION_POLICY_NAME.to_string(),
+            serde_json::Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&policy_buf)),
+        );
+        claims.insert(
+            "rustfs:table-bucket".to_string(),
+            serde_json::Value::String(request.entry.table_bucket.clone()),
+        );
+        claims.insert("rustfs:table-id".to_string(), serde_json::Value::String(request.entry.table_id.clone()));
+        claims.insert(
+            "rustfs:credential-scope-prefix".to_string(),
+            serde_json::Value::String(request.scope_prefix.clone()),
+        );
+
+        let secret = get_token_signing_key().ok_or_else(|| s3_error!(InternalError, "token signing key not initialized"))?;
+        let mut credential = get_new_credentials_with_metadata(&claims, &secret)
+            .map_err(|err| s3_error!(InternalError, "failed to generate table credentials: {}", err))?;
+        bind_table_credential_parent(&mut credential, principal);
+
+        let iam_store = rustfs_iam::get().map_err(|_| s3_error!(InternalError, "iam not init"))?;
+        iam_store
+            .set_temp_user(&credential.access_key, &credential, None)
+            .await
+            .map_err(|_| s3_error!(InternalError, "failed to store table credentials"))?;
+
+        Ok(Some(IssuedTableCredentials {
+            access_key_id: credential.access_key,
+            secret_access_key: credential.secret_key,
+            session_token: credential.session_token,
+            expiration,
+        }))
+    }
+}
+
+fn bind_table_credential_parent(credential: &mut rustfs_credentials::Credentials, principal: &rustfs_credentials::Credentials) {
+    credential.parent_user = principal.access_key.clone();
+}
+
 #[derive(Debug, Serialize)]
 struct RestLoadTableResponse {
     #[serde(rename = "metadata-location")]
     metadata_location: String,
     metadata: serde_json::Value,
     config: BTreeMap<String, String>,
+    #[serde(rename = "storage-credentials")]
+    storage_credentials: Vec<RestStorageCredential>,
+}
+
+#[derive(Debug, Serialize)]
+struct RestLoadCredentialsResponse {
     #[serde(rename = "storage-credentials")]
     storage_credentials: Vec<RestStorageCredential>,
 }
@@ -327,6 +517,11 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         AdminOperation(&GET_NAMESPACE_HANDLER),
     )?;
     r.insert(
+        Method::HEAD,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}").as_str(),
+        AdminOperation(&NAMESPACE_EXISTS_HANDLER),
+    )?;
+    r.insert(
         Method::DELETE,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}").as_str(),
         AdminOperation(&DROP_NAMESPACE_HANDLER),
@@ -350,6 +545,16 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         Method::GET,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}").as_str(),
         AdminOperation(&LOAD_TABLE_HANDLER),
+    )?;
+    r.insert(
+        Method::HEAD,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}").as_str(),
+        AdminOperation(&TABLE_EXISTS_HANDLER),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/credentials").as_str(),
+        AdminOperation(&LOAD_CREDENTIALS_HANDLER),
     )?;
     r.insert(
         Method::POST,
@@ -408,6 +613,11 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
     )?;
     r.insert(
         Method::POST,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/catalog/recovery").as_str(),
+        AdminOperation(&RECOVER_TABLE_CATALOG_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/catalog/rollback").as_str(),
         AdminOperation(&ROLLBACK_TABLE_CATALOG_HANDLER),
     )?;
@@ -432,6 +642,71 @@ fn build_json_response<T: Serialize>(status: StatusCode, body: &T) -> S3Result<S
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static(JSON_CONTENT_TYPE));
     Ok(S3Response::with_headers((status, Body::from(data)), headers))
+}
+
+fn empty_response(status: StatusCode) -> S3Response<(StatusCode, Body)> {
+    S3Response::new((status, Body::default()))
+}
+
+fn duration_millis_u64(duration: StdDuration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn table_catalog_admin_operation_result_label<T, E>(result: &Result<T, E>) -> &'static str {
+    if result.is_ok() { "success" } else { "failure" }
+}
+
+fn record_table_catalog_admin_operation_result<T, E>(
+    operation: &str,
+    warehouse: &str,
+    namespace: &str,
+    table: &str,
+    started: Instant,
+    result: &Result<T, E>,
+) {
+    let elapsed = started.elapsed();
+    let result_label = table_catalog_admin_operation_result_label(result);
+    counter!(
+        "rustfs_table_catalog_admin_operations_total",
+        "operation" => operation.to_string(),
+        "result" => result_label.to_string()
+    )
+    .increment(1);
+    histogram!(
+        "rustfs_table_catalog_admin_operation_duration_seconds",
+        "operation" => operation.to_string(),
+        "result" => result_label.to_string()
+    )
+    .record(elapsed.as_secs_f64());
+
+    if result.is_err() {
+        tracing::warn!(
+            operation,
+            warehouse,
+            namespace,
+            table,
+            result = result_label,
+            duration_ms = duration_millis_u64(elapsed),
+            "table catalog admin operation failed"
+        );
+    } else if elapsed >= TABLE_CATALOG_ADMIN_OPERATION_SLOW_LOG_THRESHOLD {
+        tracing::warn!(
+            operation,
+            warehouse,
+            namespace,
+            table,
+            duration_ms = duration_millis_u64(elapsed),
+            "slow table catalog admin operation"
+        );
+    }
+}
+
+fn exists_status(exists: bool) -> StatusCode {
+    if exists {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
 }
 
 async fn authorize_table_catalog_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
@@ -521,6 +796,15 @@ async fn authorize_table_catalog_resource_request(
     .await
 }
 
+async fn table_catalog_request_principal(req: &S3Request<Body>) -> S3Result<rustfs_credentials::Credentials> {
+    let Some(input_cred) = &req.credentials else {
+        return Err(s3_error!(InvalidRequest, "authentication required"));
+    };
+    let (cred, _owner) =
+        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+    Ok(cred)
+}
+
 async fn read_json_body<T: DeserializeOwned>(mut input: Body) -> S3Result<T> {
     let body = input
         .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
@@ -561,7 +845,7 @@ fn job_id_from_params(params: &Params<'_, '_>) -> S3Result<String> {
 }
 
 fn table_catalog_backend() -> S3Result<crate::table_catalog::EcStoreTableCatalogObjectBackend<ECStore>> {
-    let store = new_object_layer_fn().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
+    let store = resolve_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
     Ok(crate::table_catalog::EcStoreTableCatalogObjectBackend::new(store))
 }
 
@@ -635,10 +919,12 @@ where
         enabled,
         catalog_type,
         warehouse: bucket.to_string(),
-        warehouse_location,
+        warehouse_location: warehouse_location.clone(),
         catalog_uri: format!("{TABLE_CATALOG_PREFIX}/{bucket}"),
         compat_catalog_uri: format!("{TABLE_CATALOG_COMPAT_PREFIX}/{bucket}"),
         credential_vending: CREDENTIAL_VENDING_UNSUPPORTED,
+        credential_scope: CREDENTIAL_SCOPE_WAREHOUSE_PREFIX,
+        credential_scope_prefix: warehouse_location,
         catalog_entry_present,
         properties,
     })
@@ -708,10 +994,150 @@ fn list_tables_response_from_entries(entries: Vec<crate::table_catalog::TableEnt
     Ok(RestListTablesResponse { identifiers })
 }
 
+fn table_credential_vending_enabled() -> bool {
+    std::env::var(ENV_TABLE_CATALOG_CREDENTIAL_VENDING)
+        .ok()
+        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "enabled"))
+        .unwrap_or(false)
+}
+
+fn table_credential_ttl_seconds() -> i64 {
+    std::env::var(ENV_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .map(|seconds| seconds.clamp(MIN_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS, MAX_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS))
+        .unwrap_or(DEFAULT_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS)
+}
+
+fn table_credential_scope(entry: &crate::table_catalog::TableEntry) -> S3Result<TableCredentialScope> {
+    let location = entry
+        .warehouse_location
+        .strip_prefix("s3://")
+        .ok_or_else(|| s3_error!(InvalidRequest, "table warehouse location must be an s3 URI"))?;
+    let (bucket, object_prefix) = location
+        .split_once('/')
+        .ok_or_else(|| s3_error!(InvalidRequest, "table warehouse location must include an object prefix"))?;
+    if bucket != entry.table_bucket {
+        return Err(s3_error!(InvalidRequest, "table warehouse location must be inside the table bucket"));
+    }
+    let object_prefix = normalize_table_credential_object_prefix(object_prefix)?;
+    Ok(TableCredentialScope {
+        scope_prefix: format!("s3://{bucket}/{object_prefix}"),
+        object_prefix,
+    })
+}
+
+fn normalize_table_credential_object_prefix(object_prefix: &str) -> S3Result<String> {
+    let object_prefix = object_prefix.strip_suffix('/').unwrap_or(object_prefix);
+    if object_prefix.is_empty() {
+        return Err(s3_error!(InvalidRequest, "table credential scope prefix is empty"));
+    }
+    if object_prefix.contains('\\') {
+        return Err(s3_error!(
+            InvalidRequest,
+            "table credential scope prefix contains an invalid path separator"
+        ));
+    }
+    if object_prefix
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(s3_error!(
+            InvalidRequest,
+            "table credential scope prefix contains an invalid path segment"
+        ));
+    }
+
+    let mut normalized = object_prefix.to_string();
+    normalized.push('/');
+    Ok(normalized)
+}
+
+fn table_credential_catalog_resource(entry: &crate::table_catalog::TableEntry) -> S3Result<String> {
+    let namespace = crate::table_catalog::Namespace::parse(&entry.namespace)
+        .map_err(|err| s3_error!(InvalidRequest, "invalid table credential namespace: {}", err))?;
+    let table = crate::table_catalog::IdentifierSegment::parse(&entry.table)
+        .map_err(|err| s3_error!(InvalidRequest, "invalid table credential table name: {}", err))?;
+    Ok(format!("namespaces/{}/tables/{}", namespace.storage_id(), table.as_str()))
+}
+
+fn table_credential_session_policy(entry: &crate::table_catalog::TableEntry, object_prefix: &str) -> S3Result<Policy> {
+    let bucket = &entry.table_bucket;
+    let object_prefix = normalize_table_credential_object_prefix(object_prefix)?;
+    let catalog_resource = table_credential_catalog_resource(entry)?;
+    let policy = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "s3:GetObject",
+                    "s3:PutObject",
+                    "s3:DeleteObject",
+                    "s3:AbortMultipartUpload",
+                    "s3:ListMultipartUploadParts"
+                ],
+                "Resource": [
+                    format!("arn:aws:s3:::{bucket}/{object_prefix}*")
+                ]
+            },
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "s3:GetBucketLocation"
+                ],
+                "Resource": [
+                    format!("arn:aws:s3:::{bucket}")
+                ]
+            },
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "admin:GetTableMetadata",
+                    "admin:SetTableMetadata"
+                ],
+                "Resource": [
+                    format!("arn:aws:s3:::{bucket}/{catalog_resource}")
+                ]
+            }
+        ]
+    });
+    let data = serde_json::to_vec(&policy)
+        .map_err(|err| s3_error!(InternalError, "failed to serialize table credential policy: {}", err))?;
+    Policy::parse_config(&data).map_err(|err| s3_error!(InvalidRequest, "invalid table credential policy: {}", err))
+}
+
+fn storage_credential_from_issued(scope: TableCredentialScope, issued: IssuedTableCredentials) -> RestStorageCredential {
+    let mut config = BTreeMap::new();
+    config.insert(S3_ACCESS_KEY_ID_CONFIG_KEY.to_string(), issued.access_key_id);
+    config.insert(S3_SECRET_ACCESS_KEY_CONFIG_KEY.to_string(), issued.secret_access_key);
+    config.insert(S3_SESSION_TOKEN_CONFIG_KEY.to_string(), issued.session_token);
+    config.insert(CREDENTIAL_VENDING_CONFIG_KEY.to_string(), CREDENTIAL_VENDING_SUPPORTED.to_string());
+    config.insert(CREDENTIAL_MODE_CONFIG_KEY.to_string(), CREDENTIAL_MODE_CATALOG_VENDED.to_string());
+    config.insert(CREDENTIAL_SCOPE_CONFIG_KEY.to_string(), CREDENTIAL_SCOPE_TABLE_PREFIX.to_string());
+    config.insert(CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY.to_string(), scope.scope_prefix.clone());
+    config.insert(
+        CREDENTIAL_EXPIRATION_CONFIG_KEY.to_string(),
+        issued.expiration.unix_timestamp().to_string(),
+    );
+    RestStorageCredential {
+        prefix: scope.scope_prefix,
+        config,
+    }
+}
+
 fn load_table_response_from_entry(entry: crate::table_catalog::TableEntry, metadata: serde_json::Value) -> RestLoadTableResponse {
     let mut config = BTreeMap::new();
-    config.insert("warehouse-location".to_string(), entry.warehouse_location);
+    let warehouse_location = entry.warehouse_location.clone();
+    config.insert("warehouse-location".to_string(), warehouse_location.clone());
     config.insert(CREDENTIAL_VENDING_CONFIG_KEY.to_string(), CREDENTIAL_VENDING_UNSUPPORTED.to_string());
+    config.insert(
+        CREDENTIAL_VENDING_REASON_CONFIG_KEY.to_string(),
+        CREDENTIAL_VENDING_UNSUPPORTED_REASON.to_string(),
+    );
+    config.insert(CREDENTIAL_SCOPE_CONFIG_KEY.to_string(), CREDENTIAL_SCOPE_TABLE_PREFIX.to_string());
+    config.insert(CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY.to_string(), warehouse_location);
+    config.insert(CREDENTIAL_MODE_CONFIG_KEY.to_string(), CREDENTIAL_MODE_CLIENT_PROVIDED.to_string());
 
     RestLoadTableResponse {
         metadata_location: entry.metadata_location,
@@ -719,6 +1145,30 @@ fn load_table_response_from_entry(entry: crate::table_catalog::TableEntry, metad
         config,
         storage_credentials: Vec::new(),
     }
+}
+
+async fn load_credentials_response_from_entry(
+    entry: &crate::table_catalog::TableEntry,
+    issuer: &dyn TableCredentialIssuer,
+    principal: Option<&rustfs_credentials::Credentials>,
+) -> S3Result<RestLoadCredentialsResponse> {
+    if !issuer.enabled() {
+        return Ok(RestLoadCredentialsResponse {
+            storage_credentials: Vec::new(),
+        });
+    }
+    let scope = table_credential_scope(entry)?;
+    let request = TableCredentialIssueRequest {
+        entry,
+        principal,
+        scope_prefix: scope.scope_prefix.clone(),
+        object_prefix: scope.object_prefix.clone(),
+    };
+    let storage_credentials = match issuer.issue_table_credentials(request).await? {
+        Some(issued) => vec![storage_credential_from_issued(scope, issued)],
+        None => Vec::new(),
+    };
+    Ok(RestLoadCredentialsResponse { storage_credentials })
 }
 
 fn commit_table_response_from_result(
@@ -1079,8 +1529,27 @@ fn max_partition_field_id(value: &serde_json::Value) -> i64 {
     max_id
 }
 
-fn next_metadata_file_name(generation: u64) -> String {
-    format!("{generation:05}.metadata.json")
+fn standard_commit_ids(commit_id: Option<String>) -> (String, String) {
+    match commit_id {
+        Some(commit_id) => match Uuid::parse_str(&commit_id) {
+            Ok(uuid) => {
+                let commit_id = uuid.to_string();
+                (commit_id.clone(), commit_id)
+            }
+            Err(_) => {
+                let metadata_file_token = table_catalog_path_hash(&commit_id);
+                (commit_id, metadata_file_token)
+            }
+        },
+        None => {
+            let commit_id = Uuid::new_v4().to_string();
+            (commit_id.clone(), commit_id)
+        }
+    }
+}
+
+fn next_metadata_file_name(generation: u64, metadata_file_token: &str) -> String {
+    format!("{generation:05}-{metadata_file_token}.metadata.json")
 }
 
 fn validate_table_commit_requirements(metadata: &serde_json::Value, requirements: &[serde_json::Value]) -> S3Result<()> {
@@ -1651,6 +2120,18 @@ where
     namespace_response_from_entry(entry)
 }
 
+async fn namespace_exists_status<S>(store: &S, bucket: &str, namespace: &crate::table_catalog::Namespace) -> S3Result<StatusCode>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let exists = store
+        .get_namespace(bucket, &namespace.public_name())
+        .await
+        .map_err(catalog_store_error)?
+        .is_some();
+    Ok(exists_status(exists))
+}
+
 async fn drop_namespace_in_store<S>(store: &S, bucket: &str, namespace: &str) -> S3Result<()>
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
@@ -1760,6 +2241,44 @@ where
     };
     let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
     Ok(load_table_response_from_entry(entry, metadata))
+}
+
+async fn table_exists_status<S>(
+    store: &S,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+) -> S3Result<StatusCode>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let exists = store
+        .load_table(bucket, &namespace.public_name(), table)
+        .await
+        .map_err(catalog_store_error)?
+        .is_some();
+    Ok(exists_status(exists))
+}
+
+async fn load_credentials_response<S>(
+    store: &S,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+    issuer: &dyn TableCredentialIssuer,
+    principal: Option<&rustfs_credentials::Credentials>,
+) -> S3Result<RestLoadCredentialsResponse>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let Some(entry) = store
+        .load_table(bucket, &namespace.public_name(), table)
+        .await
+        .map_err(catalog_store_error)?
+    else {
+        return Err(s3_error!(InvalidRequest, "table not found"));
+    };
+    load_credentials_response_from_entry(&entry, issuer, principal).await
 }
 
 async fn get_table_metadata_location_response<S>(
@@ -1889,9 +2408,13 @@ where
     validate_metadata_matches_current_metadata(&expected_metadata, &next_metadata)?;
     let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
         .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
+    let (commit_id, metadata_file_token) = standard_commit_ids(request.commit_id);
     let next_generation = current.generation.saturating_add(1);
-    let next_metadata_location =
-        crate::table_catalog::default_table_metadata_file_path(namespace, &table_name, &next_metadata_file_name(next_generation));
+    let next_metadata_location = crate::table_catalog::default_table_metadata_file_path(
+        namespace,
+        &table_name,
+        &next_metadata_file_name(next_generation, &metadata_file_token),
+    );
     let next_metadata_data = serde_json::to_vec(&next_metadata)
         .map_err(|err| s3_error!(InternalError, "failed to serialize table metadata update: {}", err))?;
     metadata_backend
@@ -1908,7 +2431,7 @@ where
         table_bucket: bucket.to_string(),
         namespace: namespace.public_name(),
         table: table.to_string(),
-        commit_id: request.commit_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        commit_id,
         idempotency_key: request.idempotency_key,
         operation: request.operation.unwrap_or_else(|| table_commit_operation(&next_metadata)),
         expected_version_token: current.version_token,
@@ -1976,13 +2499,35 @@ async fn catalog_import_response<B>(
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
-    ensure_table_bucket_entry(store, bucket, table_bucket_enabled).await?;
-    let mut entry = table_entry_from_import_request(bucket, namespace, table, request)?;
-    let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
-    validate_metadata_table_location_in_bucket(bucket, &metadata)?;
-    adopt_registered_metadata_identity(&mut entry, &metadata)?;
-    store.register_table(entry.clone()).await.map_err(catalog_store_error)?;
-    Ok(load_table_response_from_entry(entry, metadata))
+    let started = Instant::now();
+    let result = async {
+        ensure_table_bucket_entry(store, bucket, table_bucket_enabled).await?;
+        let mut entry = table_entry_from_import_request(bucket, namespace, table, request)?;
+        let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
+        validate_metadata_table_location_in_bucket(bucket, &metadata)?;
+        adopt_registered_metadata_identity(&mut entry, &metadata)?;
+        if let Some(existing) = store
+            .load_table(bucket, &namespace.public_name(), table)
+            .await
+            .map_err(catalog_store_error)?
+        {
+            if existing.table_uuid == entry.table_uuid
+                && existing.metadata_location == entry.metadata_location
+                && existing.warehouse_location == entry.warehouse_location
+            {
+                return Ok(load_table_response_from_entry(existing, metadata));
+            }
+            return Err(s3_error!(
+                PreconditionFailed,
+                "catalog import target already exists with different table identity or metadata pointer"
+            ));
+        }
+        store.register_table(entry.clone()).await.map_err(catalog_store_error)?;
+        Ok(load_table_response_from_entry(entry, metadata))
+    }
+    .await;
+    record_table_catalog_admin_operation_result("import", bucket, &namespace.public_name(), table, started, &result);
+    result
 }
 
 async fn rollback_table_response<S>(
@@ -1996,38 +2541,44 @@ async fn rollback_table_response<S>(
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
-    let Some(current) = store
-        .load_table(bucket, &namespace.public_name(), table)
-        .await
-        .map_err(catalog_store_error)?
-    else {
-        return Err(s3_error!(InvalidRequest, "table not found"));
-    };
-    let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
-        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
-    if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table_name, &request.metadata_location) {
-        return Err(s3_error!(InvalidRequest, "metadata location must be inside the table metadata directory"));
+    let started = Instant::now();
+    let result = async {
+        let Some(current) = store
+            .load_table(bucket, &namespace.public_name(), table)
+            .await
+            .map_err(catalog_store_error)?
+        else {
+            return Err(s3_error!(InvalidRequest, "table not found"));
+        };
+        let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
+            .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
+        if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table_name, &request.metadata_location) {
+            return Err(s3_error!(InvalidRequest, "metadata location must be inside the table metadata directory"));
+        }
+        let current_metadata = read_table_metadata_json(metadata_backend, bucket, &current.metadata_location).await?;
+        validate_metadata_table_location_in_bucket(bucket, &current_metadata)?;
+        let target_metadata = read_table_metadata_json(metadata_backend, bucket, &request.metadata_location).await?;
+        validate_metadata_table_location_in_bucket(bucket, &target_metadata)?;
+        validate_metadata_matches_current_metadata(&current_metadata, &target_metadata)?;
+        let commit_request = crate::table_catalog::TableCommitRequest {
+            table_bucket: bucket.to_string(),
+            namespace: namespace.public_name(),
+            table: table.to_string(),
+            commit_id: request.commit_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+            idempotency_key: request.idempotency_key,
+            operation: "rollback".to_string(),
+            expected_version_token: request.version_token,
+            expected_metadata_location: current.metadata_location,
+            new_metadata_location: request.metadata_location,
+            requirements: Vec::new(),
+            writer: Some("rustfs-catalog-rollback-api".to_string()),
+        };
+        let result = store.commit_table(commit_request).await.map_err(catalog_store_error)?;
+        Ok(commit_table_response_from_result(result, target_metadata))
     }
-    let current_metadata = read_table_metadata_json(metadata_backend, bucket, &current.metadata_location).await?;
-    validate_metadata_table_location_in_bucket(bucket, &current_metadata)?;
-    let target_metadata = read_table_metadata_json(metadata_backend, bucket, &request.metadata_location).await?;
-    validate_metadata_table_location_in_bucket(bucket, &target_metadata)?;
-    validate_metadata_matches_current_metadata(&current_metadata, &target_metadata)?;
-    let commit_request = crate::table_catalog::TableCommitRequest {
-        table_bucket: bucket.to_string(),
-        namespace: namespace.public_name(),
-        table: table.to_string(),
-        commit_id: request.commit_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
-        idempotency_key: request.idempotency_key,
-        operation: "rollback".to_string(),
-        expected_version_token: request.version_token,
-        expected_metadata_location: current.metadata_location,
-        new_metadata_location: request.metadata_location,
-        requirements: Vec::new(),
-        writer: Some("rustfs-catalog-rollback-api".to_string()),
-    };
-    let result = store.commit_table(commit_request).await.map_err(catalog_store_error)?;
-    Ok(commit_table_response_from_result(result, target_metadata))
+    .await;
+    record_table_catalog_admin_operation_result("rollback", bucket, &namespace.public_name(), table, started, &result);
+    result
 }
 
 pub struct GetCatalogConfigHandler {}
@@ -2125,7 +2676,21 @@ impl Operation for RestDropNamespaceHandler {
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::DeleteTableNamespaceAction).await?;
         let store = table_catalog_store()?;
         drop_namespace_in_store(&store, &warehouse, &namespace.public_name()).await?;
-        Ok(S3Response::new((StatusCode::NO_CONTENT, Body::default())))
+        Ok(empty_response(StatusCode::NO_CONTENT))
+    }
+}
+
+pub struct RestNamespaceExistsHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestNamespaceExistsHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let resource = TableCatalogResource::namespace(&warehouse, &namespace);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableNamespaceAction).await?;
+        let store = table_catalog_store()?;
+        Ok(empty_response(namespace_exists_status(&store, &warehouse, &namespace).await?))
     }
 }
 
@@ -2199,6 +2764,39 @@ impl Operation for RestLoadTableHandler {
     }
 }
 
+pub struct RestTableExistsHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestTableExistsHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableAction).await?;
+        let store = table_catalog_store()?;
+        Ok(empty_response(table_exists_status(&store, &warehouse, &namespace, &table).await?))
+    }
+}
+
+pub struct RestLoadCredentialsHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestLoadCredentialsHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableCredentialsAction).await?;
+        let principal = table_catalog_request_principal(&req).await?;
+        let store = table_catalog_store()?;
+        let issuer = IamTableCredentialIssuer::from_env();
+        let response = load_credentials_response(&store, &warehouse, &namespace, &table, &issuer, Some(&principal)).await?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
 pub struct RestCommitTableHandler {}
 
 #[async_trait::async_trait]
@@ -2229,7 +2827,7 @@ impl Operation for RestDropTableHandler {
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::DeleteTableAction).await?;
         let store = table_catalog_store()?;
         drop_table_in_store(&store, &warehouse, &namespace, &table).await?;
-        Ok(S3Response::new((StatusCode::NO_CONTENT, Body::default())))
+        Ok(empty_response(StatusCode::NO_CONTENT))
     }
 }
 
@@ -2359,10 +2957,13 @@ impl Operation for ExportTableCatalogHandler {
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
         let store = table_catalog_store()?;
-        let response = store
+        let started = Instant::now();
+        let result = store
             .export_table_catalog_entry(&warehouse, &namespace.public_name(), &table)
             .await
-            .map_err(catalog_store_error)?;
+            .map_err(catalog_store_error);
+        record_table_catalog_admin_operation_result("export", &warehouse, &namespace.public_name(), &table, started, &result);
+        let response = result?;
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -2403,10 +3004,42 @@ impl Operation for GetTableCatalogDiagnosticsHandler {
             .get_table_maintenance_config(&warehouse, &namespace.public_name(), &table)
             .await
             .map_err(catalog_store_error)?;
-        let response = store
+        let started = Instant::now();
+        let result = store
             .diagnose_table_catalog(&warehouse, &namespace.public_name(), &table, config.retain_recent_metadata_files)
             .await
-            .map_err(catalog_store_error)?;
+            .map_err(catalog_store_error);
+        record_table_catalog_admin_operation_result(
+            "diagnostics",
+            &warehouse,
+            &namespace.public_name(),
+            &table,
+            started,
+            &result,
+        );
+        let response = result?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct RecoverTableCatalogHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RecoverTableCatalogHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
+        let store = table_catalog_store()?;
+        let started = Instant::now();
+        let result = store
+            .recover_table_commits(&warehouse, &namespace.public_name(), &table)
+            .await
+            .map_err(catalog_store_error);
+        record_table_catalog_admin_operation_result("recovery", &warehouse, &namespace.public_name(), &table, started, &result);
+        let response = result?;
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -2447,13 +3080,25 @@ mod tests {
         );
         assert!(response.overrides.is_empty());
         assert!(response.endpoints.contains(&"GET /v1/{prefix}/namespaces"));
+        assert!(response.endpoints.contains(&"HEAD /v1/{prefix}/namespaces/{namespace}"));
         assert!(
             response
                 .endpoints
                 .contains(&"GET /v1/{prefix}/namespaces/{namespace}/tables/{table}")
         );
+        assert!(
+            response
+                .endpoints
+                .contains(&"HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}")
+        );
+        assert!(
+            response
+                .endpoints
+                .contains(&"GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials")
+        );
         assert!(response.endpoints.contains(&"GET /{warehouse}/namespaces"));
         assert!(response.endpoints.contains(&"POST /{warehouse}/namespaces"));
+        assert!(response.endpoints.contains(&"HEAD /{warehouse}/namespaces/{namespace}"));
         assert!(
             response
                 .endpoints
@@ -2472,8 +3117,32 @@ mod tests {
         assert!(
             response
                 .endpoints
+                .contains(&"HEAD /{warehouse}/namespaces/{namespace}/tables/{table}")
+        );
+        assert!(
+            response
+                .endpoints
                 .contains(&"POST /{warehouse}/namespaces/{namespace}/tables/{table}")
         );
+        assert!(
+            response
+                .endpoints
+                .contains(&"GET /{warehouse}/namespaces/{namespace}/tables/{table}/credentials")
+        );
+        assert!(
+            response
+                .endpoints
+                .contains(&"POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery")
+        );
+    }
+
+    #[test]
+    fn table_catalog_admin_operation_result_labels_are_stable() {
+        let success: Result<(), ()> = Ok(());
+        let failure: Result<(), ()> = Err(());
+
+        assert_eq!(table_catalog_admin_operation_result_label(&success), "success");
+        assert_eq!(table_catalog_admin_operation_result_label(&failure), "failure");
     }
 
     #[test]
@@ -2495,11 +3164,14 @@ mod tests {
             ("RestListNamespacesHandler", "AdminAction::GetTableNamespaceAction"),
             ("RestCreateNamespaceHandler", "AdminAction::SetTableNamespaceAction"),
             ("RestGetNamespaceHandler", "AdminAction::GetTableNamespaceAction"),
+            ("RestNamespaceExistsHandler", "AdminAction::GetTableNamespaceAction"),
             ("RestDropNamespaceHandler", "AdminAction::DeleteTableNamespaceAction"),
             ("RestListTablesHandler", "AdminAction::GetTableAction"),
             ("RestCreateTableHandler", "AdminAction::CreateTableAction"),
             ("RestRegisterTableHandler", "AdminAction::RegisterTableAction"),
             ("RestLoadTableHandler", "AdminAction::GetTableMetadataAction"),
+            ("RestTableExistsHandler", "AdminAction::GetTableAction"),
+            ("RestLoadCredentialsHandler", "AdminAction::GetTableCredentialsAction"),
             ("RestCommitTableHandler", "AdminAction::CommitTableAction"),
             ("RestDropTableHandler", "AdminAction::DeleteTableAction"),
             ("GetTableMetadataLocationHandler", "AdminAction::GetTableMetadataLocationAction"),
@@ -2511,6 +3183,7 @@ mod tests {
             ("ExportTableCatalogHandler", "AdminAction::GetTableMetadataAction"),
             ("ImportTableCatalogHandler", "AdminAction::RegisterTableAction"),
             ("GetTableCatalogDiagnosticsHandler", "AdminAction::GetTableMetadataAction"),
+            ("RecoverTableCatalogHandler", "AdminAction::CommitTableAction"),
             ("RollbackTableCatalogHandler", "AdminAction::CommitTableAction"),
         ] {
             let block = operation_block(src, handler);
@@ -2530,6 +3203,8 @@ mod tests {
 
         for (handler, action) in [
             ("RestLoadTableHandler", "AdminAction::GetTableMetadataAction"),
+            ("RestTableExistsHandler", "AdminAction::GetTableAction"),
+            ("RestLoadCredentialsHandler", "AdminAction::GetTableCredentialsAction"),
             ("RestCommitTableHandler", "AdminAction::CommitTableAction"),
             ("RestDropTableHandler", "AdminAction::DeleteTableAction"),
             ("GetTableMetadataLocationHandler", "AdminAction::GetTableMetadataLocationAction"),
@@ -2541,6 +3216,7 @@ mod tests {
             ("ExportTableCatalogHandler", "AdminAction::GetTableMetadataAction"),
             ("ImportTableCatalogHandler", "AdminAction::RegisterTableAction"),
             ("GetTableCatalogDiagnosticsHandler", "AdminAction::GetTableMetadataAction"),
+            ("RecoverTableCatalogHandler", "AdminAction::CommitTableAction"),
             ("RollbackTableCatalogHandler", "AdminAction::CommitTableAction"),
         ] {
             let block = operation_block(src, handler);
@@ -2594,11 +3270,14 @@ mod tests {
         let _: &RestListNamespacesHandler = &LIST_NAMESPACES_HANDLER;
         let _: &RestCreateNamespaceHandler = &CREATE_NAMESPACE_HANDLER;
         let _: &RestGetNamespaceHandler = &GET_NAMESPACE_HANDLER;
+        let _: &RestNamespaceExistsHandler = &NAMESPACE_EXISTS_HANDLER;
         let _: &RestDropNamespaceHandler = &DROP_NAMESPACE_HANDLER;
         let _: &RestListTablesHandler = &LIST_TABLES_HANDLER;
         let _: &RestCreateTableHandler = &CREATE_TABLE_HANDLER;
         let _: &RestRegisterTableHandler = &REGISTER_TABLE_HANDLER;
         let _: &RestLoadTableHandler = &LOAD_TABLE_HANDLER;
+        let _: &RestTableExistsHandler = &TABLE_EXISTS_HANDLER;
+        let _: &RestLoadCredentialsHandler = &LOAD_CREDENTIALS_HANDLER;
         let _: &RestCommitTableHandler = &COMMIT_TABLE_HANDLER;
         let _: &RestDropTableHandler = &DROP_TABLE_HANDLER;
         let _: &GetTableMetadataLocationHandler = &GET_TABLE_METADATA_LOCATION_HANDLER;
@@ -2617,11 +3296,14 @@ mod tests {
         assert_operation::<RestListNamespacesHandler>();
         assert_operation::<RestCreateNamespaceHandler>();
         assert_operation::<RestGetNamespaceHandler>();
+        assert_operation::<RestNamespaceExistsHandler>();
         assert_operation::<RestDropNamespaceHandler>();
         assert_operation::<RestListTablesHandler>();
         assert_operation::<RestCreateTableHandler>();
         assert_operation::<RestRegisterTableHandler>();
         assert_operation::<RestLoadTableHandler>();
+        assert_operation::<RestTableExistsHandler>();
+        assert_operation::<RestLoadCredentialsHandler>();
         assert_operation::<RestCommitTableHandler>();
         assert_operation::<RestDropTableHandler>();
         assert_operation::<GetTableMetadataLocationHandler>();
@@ -2675,6 +3357,8 @@ mod tests {
         assert_eq!(response.catalog_uri, "/iceberg/v1/warehouse");
         assert_eq!(response.compat_catalog_uri, "/_iceberg/v1/warehouse");
         assert_eq!(response.credential_vending, CREDENTIAL_VENDING_UNSUPPORTED);
+        assert_eq!(response.credential_scope, "warehouse-prefix");
+        assert_eq!(response.credential_scope_prefix, "s3://warehouse/");
         assert!(response.catalog_entry_present);
     }
 
@@ -2821,6 +3505,94 @@ mod tests {
         assert_eq!(response.identifiers[0].name, "events");
     }
 
+    #[tokio::test]
+    async fn namespace_exists_status_uses_head_rest_semantics() {
+        let store = TestTableCatalogStore::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+
+        assert_eq!(
+            namespace_exists_status(&store, "warehouse", &namespace)
+                .await
+                .expect("missing namespace check should succeed"),
+            StatusCode::NOT_FOUND
+        );
+
+        create_namespace_response(
+            &store,
+            "warehouse",
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+
+        assert_eq!(
+            namespace_exists_status(&store, "warehouse", &namespace)
+                .await
+                .expect("existing namespace check should succeed"),
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    async fn table_exists_status_uses_head_rest_semantics() {
+        let store = TestTableCatalogStore::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+
+        create_namespace_response(
+            &store,
+            "warehouse",
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+
+        assert_eq!(
+            table_exists_status(&store, "warehouse", &namespace, "events")
+                .await
+                .expect("missing table check should succeed"),
+            StatusCode::NOT_FOUND
+        );
+
+        store
+            .create_table(crate::table_catalog::TableEntry {
+                version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+                table_bucket: "warehouse".to_string(),
+                namespace: namespace.public_name(),
+                table: "events".to_string(),
+                table_id: "table-id".to_string(),
+                table_uuid: "table-uuid".to_string(),
+                format: "ICEBERG".to_string(),
+                format_version: 2,
+                warehouse_location: "s3://warehouse/tables/table-id".to_string(),
+                metadata_location:
+                    ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json"
+                        .to_string(),
+                version_token: "token-v1".to_string(),
+                generation: 1,
+                state: crate::table_catalog::TableCatalogEntryState::Active,
+                properties: BTreeMap::new(),
+                created_at: None,
+                updated_at: None,
+            })
+            .await
+            .expect("table should be created");
+
+        assert_eq!(
+            table_exists_status(&store, "warehouse", &namespace, "events")
+                .await
+                .expect("existing table check should succeed"),
+            StatusCode::NO_CONTENT
+        );
+    }
+
     #[test]
     fn register_table_request_builds_initial_table_entry() {
         let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
@@ -2901,6 +3673,24 @@ mod tests {
         assert_eq!(request.requirements.len(), 1);
     }
 
+    #[test]
+    fn standard_commit_ids_use_uuid_for_metadata_file_when_provided() {
+        let commit_id = "11111111-1111-4111-8111-111111111111";
+        assert_eq!(
+            standard_commit_ids(Some(commit_id.to_string())),
+            (commit_id.to_string(), commit_id.to_string())
+        );
+    }
+
+    #[test]
+    fn standard_commit_ids_generate_metadata_hash_for_non_uuid_client_id() {
+        let (commit_id, metadata_file_token) = standard_commit_ids(Some("commit-1".to_string()));
+
+        assert_eq!(commit_id, "commit-1");
+        assert_ne!(metadata_file_token, commit_id);
+        assert_eq!(metadata_file_token, table_catalog_path_hash("commit-1"));
+    }
+
     #[tokio::test]
     async fn create_table_response_writes_initial_metadata_for_standard_request() {
         let store = TestTableCatalogStore::default();
@@ -2976,39 +3766,7 @@ mod tests {
         let store = TestTableCatalogStore::default();
         let metadata_backend = TestTableCatalogObjectBackend::default();
         let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
-        ensure_table_bucket_entry(&store, "warehouse", true)
-            .await
-            .expect("table bucket entry should be seeded");
-        create_namespace_response(
-            &store,
-            "warehouse",
-            CreateNamespaceRequest {
-                namespace: vec!["analytics".to_string()],
-                properties: BTreeMap::new(),
-            },
-            true,
-        )
-        .await
-        .expect("namespace should be created");
-        let create_request: CreateTableRequest = serde_json::from_value(serde_json::json!({
-            "name": "events",
-            "schema": {
-                "type": "struct",
-                "schema-id": 0,
-                "fields": [
-                    {
-                        "id": 1,
-                        "name": "id",
-                        "required": true,
-                        "type": "long"
-                    }
-                ]
-            }
-        }))
-        .expect("standard create table request should parse");
-        let created = create_table_response(&store, &metadata_backend, "warehouse", &namespace, create_request, true)
-            .await
-            .expect("table should be created");
+        let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
         let table_uuid = created.metadata["table-uuid"]
             .as_str()
             .expect("created metadata should have table uuid")
@@ -3058,10 +3816,15 @@ mod tests {
             .await
             .expect("standard commit should succeed");
 
-        assert_eq!(
-            commit.metadata_location,
-            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002.metadata.json"
-        );
+        let metadata_file_prefix = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-";
+        let metadata_file_suffix = ".metadata.json";
+        let generated_commit_id = commit
+            .metadata_location
+            .strip_prefix(metadata_file_prefix)
+            .and_then(|file| file.strip_suffix(metadata_file_suffix))
+            .expect("standard commit metadata file should include a UUID suffix");
+        Uuid::parse_str(generated_commit_id).expect("metadata file suffix should be a UUID");
+        assert_eq!(commit.commit_id, generated_commit_id);
         assert_eq!(commit.metadata["properties"]["owner"], serde_json::Value::String("lakehouse".to_string()));
         assert_eq!(commit.metadata["current-snapshot-id"], 10);
         assert_eq!(commit.metadata["last-sequence-number"], 1);
@@ -3081,6 +3844,186 @@ mod tests {
                 .object_exists("warehouse", &commit.metadata_location)
                 .await
                 .expect("committed metadata lookup should succeed")
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_commit_uses_client_uuid_commit_id_in_metadata_file_name() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        create_standard_events_table(&store, &metadata_backend, &namespace).await;
+
+        let commit_id = "11111111-1111-4111-8111-111111111111";
+        let commit_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "commit-id": commit_id,
+            "updates": [
+                {
+                    "action": "set-properties",
+                    "updates": {
+                        "owner": "lakehouse"
+                    }
+                }
+            ]
+        }))
+        .expect("standard commit table request should parse");
+        let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", commit_request)
+            .await
+            .expect("standard commit should succeed");
+
+        assert_eq!(commit.commit_id, commit_id);
+        assert_eq!(
+            commit.metadata_location,
+            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-11111111-1111-4111-8111-111111111111.metadata.json"
+        );
+        assert!(
+            metadata_backend
+                .object_exists("warehouse", &commit.metadata_location)
+                .await
+                .expect("committed metadata lookup should succeed")
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_commit_accepts_non_uuid_client_commit_id_without_using_it_in_metadata_file_name() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        create_standard_events_table(&store, &metadata_backend, &namespace).await;
+
+        let commit_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "commit-id": "commit-1",
+            "updates": [
+                {
+                    "action": "set-properties",
+                    "updates": {
+                        "owner": "lakehouse"
+                    }
+                }
+            ]
+        }))
+        .expect("standard commit table request should parse");
+        let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", commit_request)
+            .await
+            .expect("standard commit should succeed");
+
+        let metadata_file_prefix = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-";
+        let metadata_file_suffix = ".metadata.json";
+        let metadata_file_token = commit
+            .metadata_location
+            .strip_prefix(metadata_file_prefix)
+            .and_then(|file| file.strip_suffix(metadata_file_suffix))
+            .expect("standard commit metadata file should include a safe token suffix");
+        assert_eq!(commit.commit_id, "commit-1");
+        assert_ne!(metadata_file_token, commit.commit_id);
+        assert_eq!(metadata_file_token, table_catalog_path_hash("commit-1"));
+    }
+
+    #[tokio::test]
+    async fn standard_commit_ignores_generation_only_orphan_metadata_file() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        create_standard_events_table(&store, &metadata_backend, &namespace).await;
+        metadata_backend
+            .put_json(
+                "warehouse",
+                ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002.metadata.json",
+                serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "orphan",
+                    "location": "s3://warehouse/tables/table-id"
+                }),
+            )
+            .await;
+
+        let commit_id = "22222222-2222-4222-8222-222222222222";
+        let commit_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "commit-id": commit_id,
+            "updates": [
+                {
+                    "action": "set-properties",
+                    "updates": {
+                        "owner": "lakehouse"
+                    }
+                }
+            ]
+        }))
+        .expect("standard commit table request should parse");
+        let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", commit_request)
+            .await
+            .expect("standard commit should not collide with generation-only orphan");
+
+        assert_eq!(
+            commit.metadata_location,
+            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-22222222-2222-4222-8222-222222222222.metadata.json"
+        );
+        assert_eq!(commit.metadata["properties"]["owner"], "lakehouse");
+    }
+
+    #[tokio::test]
+    async fn concurrent_standard_commits_write_distinct_metadata_files_before_pointer_conflict() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        create_standard_events_table(&store, &metadata_backend, &namespace).await;
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let metadata_backend = TestTableCatalogObjectBackend {
+            objects: Arc::clone(&metadata_backend.objects),
+            put_object_barrier: Some(barrier),
+        };
+        let first_commit_id = "33333333-3333-4333-8333-333333333333";
+        let second_commit_id = "44444444-4444-4444-8444-444444444444";
+        let first_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "commit-id": first_commit_id,
+            "updates": [
+                {
+                    "action": "set-properties",
+                    "updates": {
+                        "owner": "first"
+                    }
+                }
+            ]
+        }))
+        .expect("first standard commit table request should parse");
+        let second_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "commit-id": second_commit_id,
+            "updates": [
+                {
+                    "action": "set-properties",
+                    "updates": {
+                        "owner": "second"
+                    }
+                }
+            ]
+        }))
+        .expect("second standard commit table request should parse");
+
+        let (first, second) = tokio::join!(
+            commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", first_request),
+            commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", second_request)
+        );
+        let success_count = [first.is_ok(), second.is_ok()].into_iter().filter(|ok| *ok).count();
+
+        assert_eq!(success_count, 1);
+        assert!(
+            metadata_backend
+                .object_exists(
+                    "warehouse",
+                    ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-33333333-3333-4333-8333-333333333333.metadata.json"
+                )
+                .await
+                .expect("first metadata object lookup should succeed")
+        );
+        assert!(
+            metadata_backend
+                .object_exists(
+                    "warehouse",
+                    ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-44444444-4444-4444-8444-444444444444.metadata.json"
+                )
+                .await
+                .expect("second metadata object lookup should succeed")
         );
     }
 
@@ -3393,35 +4336,292 @@ mod tests {
             "table-uuid": "table-uuid",
             "location": "s3://warehouse/tables/table-id"
         });
-        let response = load_table_response_from_entry(
-            crate::table_catalog::TableEntry {
-                version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
-                table_bucket: "warehouse".to_string(),
-                namespace: "analytics".to_string(),
-                table: "events".to_string(),
-                table_id: "table-id".to_string(),
-                table_uuid: "table-uuid".to_string(),
-                format: "ICEBERG".to_string(),
-                format_version: 2,
-                warehouse_location: "s3://warehouse/tables/table-id".to_string(),
-                metadata_location:
-                    ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json".to_string(),
-                version_token: "token-v1".to_string(),
-                generation: 1,
-                state: crate::table_catalog::TableCatalogEntryState::Active,
-                properties: BTreeMap::new(),
-                created_at: None,
-                updated_at: None,
-            },
-            metadata.clone(),
-        );
+        let response = load_table_response_from_entry(table_entry_for_credentials(), metadata.clone());
 
         assert_eq!(response.metadata, metadata);
         assert!(response.storage_credentials.is_empty());
         assert_eq!(response.config.get("rustfs.credential-vending"), Some(&"unsupported".to_string()));
+        assert_eq!(
+            response.config.get("rustfs.credential-vending-reason"),
+            Some(&"temporary-credentials-not-implemented".to_string())
+        );
+        assert_eq!(response.config.get("rustfs.credential-scope"), Some(&"table-prefix".to_string()));
+        assert_eq!(
+            response.config.get("rustfs.credential-scope-prefix"),
+            Some(&"s3://warehouse/tables/table-id".to_string())
+        );
+        assert_eq!(
+            response.config.get("rustfs.credential-mode"),
+            Some(&"client-provided-s3-credentials-required".to_string())
+        );
         assert!(!response.config.contains_key("s3.access-key-id"));
         assert!(!response.config.contains_key("s3.secret-access-key"));
         assert!(!response.config.contains_key("s3.session-token"));
+    }
+
+    fn table_entry_for_credentials() -> crate::table_catalog::TableEntry {
+        crate::table_catalog::TableEntry {
+            version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+            table_bucket: "warehouse".to_string(),
+            namespace: "analytics".to_string(),
+            table: "events".to_string(),
+            table_id: "table-id".to_string(),
+            table_uuid: "table-uuid".to_string(),
+            format: "ICEBERG".to_string(),
+            format_version: 2,
+            warehouse_location: "s3://warehouse/tables/table-id".to_string(),
+            metadata_location: ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json"
+                .to_string(),
+            version_token: "token-v1".to_string(),
+            generation: 1,
+            state: crate::table_catalog::TableCatalogEntryState::Active,
+            properties: BTreeMap::new(),
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_table_credential_issuer_keeps_credentials_empty() {
+        let issuer = DisabledTableCredentialIssuer;
+        let response = load_credentials_response_from_entry(&table_entry_for_credentials(), &issuer, None)
+            .await
+            .expect("disabled issuer should build an empty response");
+
+        assert!(response.storage_credentials.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabled_table_credential_issuer_skips_scope_validation() {
+        let issuer = DisabledTableCredentialIssuer;
+        let mut entry = table_entry_for_credentials();
+        entry.warehouse_location = "s3://warehouse/".to_string();
+
+        let response = load_credentials_response_from_entry(&entry, &issuer, None)
+            .await
+            .expect("disabled issuer should not validate credential scopes");
+
+        assert!(response.storage_credentials.is_empty());
+    }
+
+    struct TestTableCredentialIssuer;
+
+    #[async_trait::async_trait]
+    impl TableCredentialIssuer for TestTableCredentialIssuer {
+        async fn issue_table_credentials(
+            &self,
+            request: TableCredentialIssueRequest<'_>,
+        ) -> S3Result<Option<IssuedTableCredentials>> {
+            assert_eq!(request.entry.table_bucket, "warehouse");
+            assert_eq!(request.scope_prefix, "s3://warehouse/tables/table-id/");
+            assert_eq!(request.object_prefix, "tables/table-id/");
+            Ok(Some(IssuedTableCredentials {
+                access_key_id: "temporary-access-key".to_string(),
+                secret_access_key: "temporary-secret-key".to_string(),
+                session_token: "temporary-session-token".to_string(),
+                expiration: OffsetDateTime::from_unix_timestamp(1_800_000_000).expect("test timestamp should be valid"),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_issuer_returns_temporary_scoped_storage_credentials() {
+        let issuer = TestTableCredentialIssuer;
+        let principal = rustfs_credentials::Credentials {
+            access_key: "parent-access-key".to_string(),
+            secret_key: "parent-secret-key".to_string(),
+            ..Default::default()
+        };
+
+        let response = load_credentials_response_from_entry(&table_entry_for_credentials(), &issuer, Some(&principal))
+            .await
+            .expect("issuer should build a scoped credential response");
+
+        assert_eq!(response.storage_credentials.len(), 1);
+        let credential = &response.storage_credentials[0];
+        assert_eq!(credential.prefix, "s3://warehouse/tables/table-id/");
+        assert_eq!(credential.config.get("s3.access-key-id"), Some(&"temporary-access-key".to_string()));
+        assert_eq!(credential.config.get("s3.secret-access-key"), Some(&"temporary-secret-key".to_string()));
+        assert_eq!(credential.config.get("s3.session-token"), Some(&"temporary-session-token".to_string()));
+        assert_eq!(
+            credential.config.get("rustfs.credential-mode"),
+            Some(&"catalog-vended-temporary-credentials".to_string())
+        );
+        assert_eq!(
+            credential.config.get("rustfs.credential-scope-prefix"),
+            Some(&"s3://warehouse/tables/table-id/".to_string())
+        );
+        assert_eq!(
+            credential.config.get("rustfs.credential-expiration-unix-seconds"),
+            Some(&"1800000000".to_string())
+        );
+        assert!(!credential.config.contains_key("rustfs.credential-vending-reason"));
+    }
+
+    #[test]
+    fn table_credentials_do_not_snapshot_parent_groups() {
+        let principal = rustfs_credentials::Credentials {
+            access_key: "parent-access-key".to_string(),
+            groups: Some(vec!["analytics-writers".to_string()]),
+            ..Default::default()
+        };
+        let mut credential = rustfs_credentials::Credentials::default();
+
+        bind_table_credential_parent(&mut credential, &principal);
+
+        assert_eq!(credential.parent_user, "parent-access-key");
+        assert!(credential.groups.is_none());
+    }
+
+    #[tokio::test]
+    async fn table_credential_session_policy_is_limited_to_table_prefix() {
+        let policy = table_credential_session_policy(&table_entry_for_credentials(), "tables/table-id/")
+            .expect("table credential policy should build");
+        let groups = None;
+        let conditions = std::collections::HashMap::new();
+        let claims = std::collections::HashMap::new();
+
+        assert!(
+            policy
+                .is_allowed(&rustfs_policy::policy::Args {
+                    account: "temporary-access-key",
+                    groups: &groups,
+                    action: Action::S3Action(rustfs_policy::policy::action::S3Action::GetObjectAction),
+                    bucket: "warehouse",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "tables/table-id/data/file.parquet",
+                    claims: &claims,
+                    deny_only: false,
+                })
+                .await
+        );
+        assert!(
+            policy
+                .is_allowed(&rustfs_policy::policy::Args {
+                    account: "temporary-access-key",
+                    groups: &groups,
+                    action: Action::S3Action(rustfs_policy::policy::action::S3Action::GetBucketLocationAction),
+                    bucket: "warehouse",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "",
+                    claims: &claims,
+                    deny_only: false,
+                })
+                .await
+        );
+        assert!(
+            policy
+                .is_allowed(&rustfs_policy::policy::Args {
+                    account: "temporary-access-key",
+                    groups: &groups,
+                    action: Action::AdminAction(rustfs_policy::policy::action::AdminAction::SetTableMetadataAction),
+                    bucket: "warehouse",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "namespaces/analytics/tables/events",
+                    claims: &claims,
+                    deny_only: false,
+                })
+                .await
+        );
+        assert!(
+            !policy
+                .is_allowed(&rustfs_policy::policy::Args {
+                    account: "temporary-access-key",
+                    groups: &groups,
+                    action: Action::S3Action(rustfs_policy::policy::action::S3Action::GetObjectAction),
+                    bucket: "warehouse",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "tables/other/data/file.parquet",
+                    claims: &claims,
+                    deny_only: false,
+                })
+                .await
+        );
+        assert!(
+            !policy
+                .is_allowed(&rustfs_policy::policy::Args {
+                    account: "temporary-access-key",
+                    groups: &groups,
+                    action: Action::S3Action(rustfs_policy::policy::action::S3Action::PutObjectAction),
+                    bucket: "other-warehouse",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "tables/table-id/data/file.parquet",
+                    claims: &claims,
+                    deny_only: false,
+                })
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn table_credential_session_policy_includes_table_resource_actions() {
+        let policy = table_credential_session_policy(&table_entry_for_credentials(), "tables/table-id/")
+            .expect("table credential policy should build");
+        let groups = None;
+        let conditions = std::collections::HashMap::new();
+        let claims = std::collections::HashMap::new();
+
+        assert!(
+            policy
+                .is_allowed(&rustfs_policy::policy::Args {
+                    account: "temporary-access-key",
+                    groups: &groups,
+                    action: Action::AdminAction(rustfs_policy::policy::action::AdminAction::GetTableMetadataAction),
+                    bucket: "warehouse",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "namespaces/analytics/tables/events",
+                    claims: &claims,
+                    deny_only: false,
+                })
+                .await
+        );
+        assert!(
+            !policy
+                .is_allowed(&rustfs_policy::policy::Args {
+                    account: "temporary-access-key",
+                    groups: &groups,
+                    action: Action::AdminAction(rustfs_policy::policy::action::AdminAction::SetTableMetadataAction),
+                    bucket: "warehouse",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "namespaces/analytics/tables/orders",
+                    claims: &claims,
+                    deny_only: false,
+                })
+                .await
+        );
+        assert!(
+            !policy
+                .is_allowed(&rustfs_policy::policy::Args {
+                    account: "temporary-access-key",
+                    groups: &groups,
+                    action: Action::AdminAction(rustfs_policy::policy::action::AdminAction::CreateTableAction),
+                    bucket: "warehouse",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "namespaces/analytics/tables/events",
+                    claims: &claims,
+                    deny_only: false,
+                })
+                .await
+        );
+    }
+
+    #[test]
+    fn table_credential_scope_rejects_cross_bucket_or_unsafe_prefix() {
+        let mut entry = table_entry_for_credentials();
+        entry.warehouse_location = "s3://other-warehouse/tables/table-id".to_string();
+        assert!(table_credential_scope(&entry).is_err());
+
+        let mut entry = table_entry_for_credentials();
+        entry.warehouse_location = "s3://warehouse/tables/../table-id".to_string();
+        assert!(table_credential_scope(&entry).is_err());
     }
 
     #[test]
@@ -3467,6 +4667,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct TestTableCatalogObjectBackend {
         objects: Arc<tokio::sync::Mutex<BTreeMap<(String, String), crate::table_catalog::TableCatalogObject>>>,
+        put_object_barrier: Option<Arc<tokio::sync::Barrier>>,
     }
 
     impl TestTableCatalogObjectBackend {
@@ -3491,6 +4692,46 @@ mod tests {
                 },
             );
         }
+    }
+
+    async fn create_standard_events_table(
+        store: &TestTableCatalogStore,
+        metadata_backend: &TestTableCatalogObjectBackend,
+        namespace: &crate::table_catalog::Namespace,
+    ) -> RestLoadTableResponse {
+        ensure_table_bucket_entry(store, "warehouse", true)
+            .await
+            .expect("table bucket entry should be seeded");
+        create_namespace_response(
+            store,
+            "warehouse",
+            CreateNamespaceRequest {
+                namespace: namespace.public_name().split('.').map(str::to_string).collect(),
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+        let create_request: CreateTableRequest = serde_json::from_value(serde_json::json!({
+            "name": "events",
+            "schema": {
+                "type": "struct",
+                "schema-id": 0,
+                "fields": [
+                    {
+                        "id": 1,
+                        "name": "id",
+                        "required": true,
+                        "type": "long"
+                    }
+                ]
+            }
+        }))
+        .expect("standard create table request should parse");
+        create_table_response(store, metadata_backend, "warehouse", namespace, create_request, true)
+            .await
+            .expect("table should be created")
     }
 
     async fn seed_object_table_for_metadata_maintenance(
@@ -3581,17 +4822,32 @@ mod tests {
             bucket: &str,
             object: &str,
             data: Vec<u8>,
-            _precondition: crate::table_catalog::TableCatalogPutPrecondition,
+            precondition: crate::table_catalog::TableCatalogPutPrecondition,
         ) -> crate::table_catalog::TableCatalogStoreResult<()> {
-            self.objects.lock().await.insert(
-                (bucket.to_string(), object.to_string()),
-                crate::table_catalog::TableCatalogObject {
-                    data,
-                    etag: Some("etag".to_string()),
-                    mod_time: None,
-                },
-            );
-            Ok(())
+            let key = (bucket.to_string(), object.to_string());
+            let mut objects = self.objects.lock().await;
+            let result = if matches!(precondition, crate::table_catalog::TableCatalogPutPrecondition::IfAbsent)
+                && objects.contains_key(&key)
+            {
+                Err(crate::table_catalog::TableCatalogStoreError::Conflict(format!(
+                    "object already exists: {object}"
+                )))
+            } else {
+                objects.insert(
+                    key,
+                    crate::table_catalog::TableCatalogObject {
+                        data,
+                        etag: Some("etag".to_string()),
+                        mod_time: None,
+                    },
+                );
+                Ok(())
+            };
+            drop(objects);
+            if let Some(barrier) = &self.put_object_barrier {
+                barrier.wait().await;
+            }
+            result
         }
 
         async fn delete_object(&self, bucket: &str, object: &str) -> crate::table_catalog::TableCatalogStoreResult<()> {
@@ -4475,6 +5731,22 @@ mod tests {
             .expect("table lookup should succeed")
             .expect("table should exist");
         assert_eq!(current.properties.get("owner").map(String::as_str), Some("lakehouse"));
+
+        let imported_again = catalog_import_response(
+            &store,
+            &backend,
+            bucket,
+            &namespace,
+            "events",
+            CatalogImportRequest {
+                metadata_location: imported_location.clone(),
+                properties: BTreeMap::from([("owner".to_string(), "lakehouse".to_string())]),
+            },
+            true,
+        )
+        .await
+        .expect("repeated catalog import should be idempotent");
+        assert_eq!(imported_again.metadata_location, imported_location);
 
         let rollback_location = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
         backend

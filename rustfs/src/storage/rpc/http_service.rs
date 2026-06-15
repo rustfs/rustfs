@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::server::RPC_PREFIX;
+use crate::storage::request_context::spawn_traced;
 use bytes::{Bytes, BytesMut};
 use futures_util::TryStreamExt;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
@@ -243,9 +244,9 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
     };
 
     let (rd, mut wd) = tokio::io::duplex(DEFAULT_READ_BUFFER_SIZE);
-    tokio::spawn(async move {
+    spawn_traced(async move {
         if let Err(e) = disk.walk_dir(args, &mut wd).await {
-            warn!("walk dir err {}", e);
+            warn!(error = %e, "walk_dir failed");
         }
     });
 

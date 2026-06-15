@@ -19,6 +19,7 @@
 //! exposition endpoint.
 
 use crate::admin::router::Operation;
+use crate::storage::request_context::spawn_traced;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::{HeaderMap, HeaderValue, Uri};
@@ -35,9 +36,9 @@ use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration as StdDuration;
+use tokio::select;
 use tokio::sync::mpsc;
 use tokio::time::interval;
-use tokio::{select, spawn};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, warn};
 
@@ -217,7 +218,7 @@ impl Operation for MetricsHandler {
         });
         let body = Body::from(in_stream);
 
-        spawn(async move {
+        spawn_traced(async move {
             while n > 0 {
                 let mut metrics = RealtimeMetrics::default();
                 let local_metrics = collect_local_metrics(types, &opts).await;

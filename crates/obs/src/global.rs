@@ -17,6 +17,10 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
+const LOG_COMPONENT_OBS: &str = "obs";
+const LOG_SUBSYSTEM_GLOBAL: &str = "global";
+const EVENT_OBS_GLOBAL_STATE: &str = "obs_global_state";
+
 /// Global guard for OpenTelemetry tracing
 static GLOBAL_GUARD: OnceCell<Arc<Mutex<OtelGuard>>> = OnceCell::const_new();
 
@@ -50,9 +54,13 @@ pub(crate) fn set_observability_metric_enabled(enabled: bool) {
         && *current != enabled
     {
         warn!(
+            event = EVENT_OBS_GLOBAL_STATE,
+            component = LOG_COMPONENT_OBS,
+            subsystem = LOG_SUBSYSTEM_GLOBAL,
             current = *current,
             requested = enabled,
-            "OBSERVABILITY_METRIC_ENABLED was already initialized; keeping original value"
+            result = "metrics_flag_already_initialized",
+            "obs global state changed"
         );
     }
 }
@@ -143,7 +151,13 @@ pub async fn init_obs_with_config(config: &OtelConfig) -> Result<OtelGuard, Glob
 /// # }
 /// ```
 pub fn set_global_guard(guard: OtelGuard) -> Result<(), GlobalError> {
-    info!("Initializing global guard");
+    info!(
+        event = EVENT_OBS_GLOBAL_STATE,
+        component = LOG_COMPONENT_OBS,
+        subsystem = LOG_SUBSYSTEM_GLOBAL,
+        state = "guard_initializing",
+        "obs global state changed"
+    );
     GLOBAL_GUARD.set(Arc::new(Mutex::new(guard))).map_err(GlobalError::SetError)
 }
 

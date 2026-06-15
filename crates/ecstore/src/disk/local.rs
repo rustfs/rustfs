@@ -472,7 +472,15 @@ fn resolve_local_disk_root(ep_path: &str) -> Result<PathBuf> {
 
 impl LocalDisk {
     pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Self> {
-        debug!("Creating local disk");
+        debug!(
+            event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+            endpoint = %ep,
+            state = "create_started",
+            cleanup,
+            "Local disk creation started"
+        );
         let endpoint_path = ep.get_file_path();
         let root = resolve_local_disk_root(&endpoint_path).inspect_err(|err| {
             log_startup_disk_error("resolve_local_disk_root", Path::new(&endpoint_path), err);
@@ -501,13 +509,21 @@ impl LocalDisk {
                 root = ?root,
                 state = "failed",
                 error = ?err,
-                "Disk local startup cleanup failed"
+                "Local disk startup cleanup failed"
             );
         }
 
         // Use optimized path resolution instead of absolutize_virtually
         let format_path = root.join(RUSTFS_META_BUCKET).join(super::FORMAT_CONFIG_FILE);
-        debug!("format_path: {:?}", format_path);
+        debug!(
+            event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+            root = ?root,
+            format_path = ?format_path,
+            state = "format_path_resolved",
+            "Local disk format path resolved"
+        );
         let (format_data, format_meta) = read_file_exists(&format_path).await.inspect_err(|err| {
             log_startup_disk_error("read_format_json", &format_path, err);
         })?;
@@ -639,7 +655,15 @@ impl LocalDisk {
 
         let root = disk.root.clone();
         tokio::spawn(Self::cleanup_deleted_objects_loop(root, exit_rx));
-        debug!("LocalDisk created: {:?}", disk);
+        debug!(
+            event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+            endpoint = %disk.endpoint,
+            root = ?disk.root,
+            state = "created",
+            "Local disk created"
+        );
         Ok(disk)
     }
 

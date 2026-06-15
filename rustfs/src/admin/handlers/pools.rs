@@ -27,13 +27,12 @@ use crate::{
         router::{AdminOperation, Operation, S3Router},
     },
     app::admin_usecase::{DefaultAdminUsecase, QueryPoolStatusRequest},
-    app::context::resolve_endpoints_handle,
+    app::context::{resolve_endpoints_handle, resolve_object_store_handle},
     auth::{check_key_valid, get_session_token},
     error::ApiError,
     server::{ADMIN_PREFIX, RemoteAddr},
 };
 use hyper::Method;
-use rustfs_ecstore::new_object_layer_fn;
 
 use std::collections::HashSet;
 
@@ -284,7 +283,7 @@ impl Operation for StartDecommission {
             return Err(s3_error!(NotImplemented));
         }
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(decommission_admin_not_initialized_error("start decommission"));
         };
 
@@ -399,7 +398,7 @@ impl Operation for CancelDecommission {
             return Err(pool_admin_pool_not_found_error("cancel decommission", &query.pool));
         };
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(decommission_admin_not_initialized_error("cancel decommission"));
         };
 

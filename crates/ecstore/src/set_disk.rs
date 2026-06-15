@@ -127,8 +127,14 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::error;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 use uuid::Uuid;
+
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_SET_DISK: &str = "set_disk";
+const EVENT_SET_DISK_MULTIPART: &str = "set_disk_multipart";
+const EVENT_SET_DISK_WRITE: &str = "set_disk_write";
+const EVENT_SET_DISK_HEAL: &str = "set_disk_heal";
 
 use crate::rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
 
@@ -948,7 +954,16 @@ impl ObjectIO for SetDisks {
             )
             .await
             {
-                error!("get_object_with_fileinfo  {bucket}/{object} err {:?}", e);
+                error!(
+                    event = EVENT_SET_DISK_WRITE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    bucket,
+                    object,
+                    state = "read_pipeline_failed",
+                    error = ?e,
+                    "Set disk object read pipeline failed"
+                );
             };
         });
 
@@ -1065,7 +1080,15 @@ impl ObjectIO for SetDisks {
                             {
                                 Ok(writer) => (Some(writer), None),
                                 Err(err) => {
-                                    warn!("create_bitrot_writer  disk {}, err {:?}, skipping operation", disk.to_string(), err);
+                                    warn!(
+                                        event = EVENT_SET_DISK_WRITE,
+                                        component = LOG_COMPONENT_ECSTORE,
+                                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                                        disk = ?disk,
+                                        state = "bitrot_writer_skipped",
+                                        error = ?err,
+                                        "Set disk bitrot writer skipped"
+                                    );
                                     (None, Some(err))
                                 }
                             }
@@ -1085,7 +1108,18 @@ impl ObjectIO for SetDisks {
 
             let nil_count = errors.iter().filter(|&e| e.is_none()).count();
             if nil_count < write_quorum {
-                error!("not enough disks to write: {:?}", errors);
+                error!(
+                    event = EVENT_SET_DISK_WRITE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    bucket,
+                    object,
+                    write_quorum,
+                    available_writers = nil_count,
+                    state = "write_quorum_unavailable",
+                    error = ?errors,
+                    "Set disk write quorum unavailable"
+                );
                 if let Some(write_err) = reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, write_quorum) {
                     return Err(to_object_err(write_err.into(), vec![bucket, object]));
                 }
@@ -1136,7 +1170,17 @@ impl ObjectIO for SetDisks {
             // }
 
             if (w_size as i64) < data.size() {
-                warn!("put_object write size < data.size(), w_size={}, data.size={}", w_size, data.size());
+                warn!(
+                    event = EVENT_SET_DISK_WRITE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    bucket,
+                    object,
+                    written_size = w_size,
+                    expected_size = data.size(),
+                    state = "short_write",
+                    "Set disk write produced fewer bytes than expected"
+                );
                 return Err(Error::other(format!(
                     "put_object write size < data.size(), w_size={}, data.size={}",
                     w_size,
@@ -1447,55 +1491,58 @@ impl SetDisks {
         if !pending.is_empty() {
             let cleanup_requests = requests.clone();
             let lockers = self.lockers.clone();
-            let handle = tokio::spawn(async move {
-                let mut late_lock_ids_by_client = vec![Vec::new(); lockers.len()];
-                let mut pending = pending;
-                while let Some(join_result) = pending.join_next().await {
-                    match join_result {
-                        Ok((client_idx, Ok(responses))) => {
-                            for (req_idx, request) in cleanup_requests.iter().enumerate() {
-                                if let Some(response) = responses.get(req_idx)
-                                    && response.success
-                                {
-                                    let lock_id = response
-                                        .lock_info
-                                        .as_ref()
-                                        .map(|lock_info| lock_info.id.clone())
-                                        .unwrap_or_else(|| request.lock_id.clone());
-                                    if let Some(client_locks) = late_lock_ids_by_client.get_mut(client_idx) {
-                                        client_locks.push(lock_id);
+            let handle = tokio::spawn(
+                async move {
+                    let mut late_lock_ids_by_client = vec![Vec::new(); lockers.len()];
+                    let mut pending = pending;
+                    while let Some(join_result) = pending.join_next().await {
+                        match join_result {
+                            Ok((client_idx, Ok(responses))) => {
+                                for (req_idx, request) in cleanup_requests.iter().enumerate() {
+                                    if let Some(response) = responses.get(req_idx)
+                                        && response.success
+                                    {
+                                        let lock_id = response
+                                            .lock_info
+                                            .as_ref()
+                                            .map(|lock_info| lock_info.id.clone())
+                                            .unwrap_or_else(|| request.lock_id.clone());
+                                        if let Some(client_locks) = late_lock_ids_by_client.get_mut(client_idx) {
+                                            client_locks.push(lock_id);
+                                        }
                                     }
                                 }
                             }
-                        }
-                        Ok((_client_idx, Err(err))) => {
-                            tracing::warn!("late distributed delete lock batch request failed: {}", err);
-                        }
-                        Err(err) => {
-                            tracing::warn!("late distributed delete lock batch task join failed: {}", err);
-                        }
-                    }
-                }
-
-                join_all(lockers.iter().cloned().enumerate().filter_map(|(client_idx, client)| {
-                    let lock_ids = late_lock_ids_by_client.get(client_idx).cloned().unwrap_or_default();
-                    if lock_ids.is_empty() {
-                        None
-                    } else {
-                        Some(async move {
-                            if let Err(err) = client.release_locks_batch(&lock_ids).await {
-                                tracing::warn!(
-                                    client_idx,
-                                    lock_count = lock_ids.len(),
-                                    "failed to cleanup late distributed delete locks in batch: {}",
-                                    err
-                                );
+                            Ok((_client_idx, Err(err))) => {
+                                tracing::warn!("late distributed delete lock batch request failed: {}", err);
                             }
-                        })
+                            Err(err) => {
+                                tracing::warn!("late distributed delete lock batch task join failed: {}", err);
+                            }
+                        }
                     }
-                }))
-                .await;
-            });
+
+                    join_all(lockers.iter().cloned().enumerate().filter_map(|(client_idx, client)| {
+                        let lock_ids = late_lock_ids_by_client.get(client_idx).cloned().unwrap_or_default();
+                        if lock_ids.is_empty() {
+                            None
+                        } else {
+                            Some(async move {
+                                if let Err(err) = client.release_locks_batch(&lock_ids).await {
+                                    tracing::warn!(
+                                        client_idx,
+                                        lock_count = lock_ids.len(),
+                                        "failed to cleanup late distributed delete locks in batch: {}",
+                                        err
+                                    );
+                                }
+                            })
+                        }
+                    }))
+                    .await;
+                }
+                .instrument(tracing::Span::current()),
+            );
             drop(handle);
         }
 
@@ -2976,7 +3023,15 @@ impl MultipartOperations for SetDisks {
                 {
                     Ok(writer) => writer,
                     Err(err) => {
-                        warn!("create_bitrot_writer  disk {}, err {:?}, skipping operation", disk.to_string(), err);
+                        warn!(
+                            event = EVENT_SET_DISK_MULTIPART,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_SET_DISK,
+                            disk = ?disk,
+                            state = "bitrot_writer_skipped",
+                            error = ?err,
+                            "Set disk multipart bitrot writer skipped"
+                        );
                         errors.push(Some(err));
                         writers.push(None);
                         continue;
@@ -3021,7 +3076,18 @@ impl MultipartOperations for SetDisks {
         let _ = mem::replace(&mut data.stream, reader);
 
         if (w_size as i64) < data.size() {
-            warn!("put_object_part write size < data.size(), w_size={}, data.size={}", w_size, data.size());
+            warn!(
+                event = EVENT_SET_DISK_MULTIPART,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                bucket,
+                object,
+                part_number = part_id,
+                written_size = w_size,
+                expected_size = data.size(),
+                state = "short_write",
+                "Set disk multipart write produced fewer bytes than expected"
+            );
             return Err(Error::other(format!(
                 "put_object_part write size < data.size(), w_size={}, data.size={}",
                 w_size,
@@ -3657,7 +3723,17 @@ impl MultipartOperations for SetDisks {
                 );
                 return Err(Error::InvalidPart(p.part_num, "".to_owned(), p.etag.clone().unwrap_or_default()));
             };
-            info!(target:"rustfs_ecstore::set_disk", part_number = p.part_num, part_size = ext_part.size, part_actual_size = ext_part.actual_size, "Completing multipart part");
+            debug!(
+                target:"rustfs_ecstore::set_disk",
+                event = EVENT_SET_DISK_MULTIPART,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                part_number = p.part_num,
+                part_size = ext_part.size,
+                part_actual_size = ext_part.actual_size,
+                state = "part_validated",
+                "Set disk multipart part validated"
+            );
 
             // Normalize ETags by removing quotes before comparison (PR #592 compatibility)
             let client_etag = p.etag.as_ref().map(|e| rustfs_utils::path::trim_etag(e));
@@ -3988,7 +4064,16 @@ impl HealOperations for SetDisks {
         let disks = disks.clone();
         let (_, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false, false).await?;
         if DiskError::is_all_not_found(&errs) {
-            debug!(bucket, object, version_id, "heal_object skipped missing object");
+            debug!(
+                event = EVENT_SET_DISK_HEAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                bucket,
+                object,
+                version_id,
+                state = "missing_object_skipped",
+                "Set disk heal skipped missing object"
+            );
             let err = if !version_id.is_empty() {
                 Error::FileVersionNotFound
             } else {
@@ -4356,7 +4441,16 @@ async fn disks_with_all_parts(
                     verify_resp = v;
                 }
                 Err(err) => {
-                    info!("verify_file failed: {err:?}, object_name={}, index: {index}", object_name);
+                    debug!(
+                        event = EVENT_SET_DISK_HEAL,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        object = %object_name,
+                        disk_index = index,
+                        state = "verify_failed",
+                        error = ?err,
+                        "Set disk verify_file failed"
+                    );
                     verify_err = Some(err);
                 }
             }
@@ -4366,7 +4460,16 @@ async fn disks_with_all_parts(
                     verify_resp = v;
                 }
                 Err(err) => {
-                    info!("check_parts failed: {err:?}, object_name={}, index: {index}", object_name);
+                    debug!(
+                        event = EVENT_SET_DISK_HEAL,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        object = %object_name,
+                        disk_index = index,
+                        state = "check_parts_failed",
+                        error = ?err,
+                        "Set disk check_parts failed"
+                    );
                     verify_err = Some(err);
                 }
             }

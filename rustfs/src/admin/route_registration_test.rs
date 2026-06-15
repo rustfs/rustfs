@@ -225,6 +225,12 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::PUT, "/v3/module-switches"),
         admin_route(Method::GET, "/v4/extensions/catalog"),
         admin_route(Method::GET, "/v4/extensions/instances"),
+        admin_route(Method::POST, "/v3/object-zip-downloads"),
+        admin_route_sample(
+            Method::GET,
+            "/v3/object-zip-downloads/{id}.zip",
+            "/v3/object-zip-downloads/example-id.zip",
+        ),
         admin_route(Method::GET, "/v4/plugins/catalog"),
         admin_route(Method::GET, "/v4/plugins/instances"),
         admin_route_sample(Method::GET, "/v4/plugins/instances/{id}", "/v4/plugins/instances/example-id"),
@@ -241,6 +247,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/site-replication/status"),
         admin_route(Method::POST, "/v3/site-replication/devnull"),
         admin_route(Method::POST, "/v3/site-replication/netperf"),
+        admin_route(Method::POST, "/v3/site-replication/rotate-svc-acct"),
         admin_route(Method::PUT, "/v3/site-replication/peer/join"),
         admin_route(Method::PUT, "/v3/site-replication/peer/bucket-ops"),
         admin_route(Method::PUT, "/v3/site-replication/peer/iam-item"),
@@ -288,6 +295,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         table_route_sample(Method::GET, "/{warehouse}/namespaces", "/analytics/namespaces"),
         table_route_sample(Method::POST, "/{warehouse}/namespaces", "/analytics/namespaces"),
         table_route_sample(Method::GET, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
+        table_route_sample(Method::HEAD, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
         table_route_sample(Method::DELETE, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
         table_route_sample(
             Method::GET,
@@ -310,6 +318,16 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             "/analytics/namespaces/sales/tables/orders",
         ),
         table_route_sample(
+            Method::HEAD,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}",
+            "/analytics/namespaces/sales/tables/orders",
+        ),
+        table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/credentials",
+            "/analytics/namespaces/sales/tables/orders/credentials",
+        ),
+        table_route_sample(
             Method::POST,
             "/{warehouse}/namespaces/{namespace}/tables/{table}",
             "/analytics/namespaces/sales/tables/orders",
@@ -366,6 +384,11 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         ),
         table_route_sample(
             Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery",
+            "/analytics/namespaces/sales/tables/orders/catalog/recovery",
+        ),
+        table_route_sample(
+            Method::POST,
             "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
             "/analytics/namespaces/sales/tables/orders/catalog/rollback",
         ),
@@ -375,6 +398,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         compat_table_route_sample(Method::GET, "/{warehouse}/namespaces", "/analytics/namespaces"),
         compat_table_route_sample(Method::POST, "/{warehouse}/namespaces", "/analytics/namespaces"),
         compat_table_route_sample(Method::GET, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
+        compat_table_route_sample(Method::HEAD, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
         compat_table_route_sample(Method::DELETE, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
         compat_table_route_sample(
             Method::GET,
@@ -397,6 +421,16 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             "/analytics/namespaces/sales/tables/orders",
         ),
         compat_table_route_sample(
+            Method::HEAD,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}",
+            "/analytics/namespaces/sales/tables/orders",
+        ),
+        compat_table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/credentials",
+            "/analytics/namespaces/sales/tables/orders/credentials",
+        ),
+        compat_table_route_sample(
             Method::POST,
             "/{warehouse}/namespaces/{namespace}/tables/{table}",
             "/analytics/namespaces/sales/tables/orders",
@@ -450,6 +484,11 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             Method::GET,
             "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/diagnostics",
             "/analytics/namespaces/sales/tables/orders/catalog/diagnostics",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery",
+            "/analytics/namespaces/sales/tables/orders/catalog/recovery",
         ),
         compat_table_route_sample(
             Method::POST,
@@ -544,6 +583,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/module-switches"));
     assert_route(&router, Method::GET, &admin_path("/v4/extensions/catalog"));
     assert_route(&router, Method::GET, &admin_path("/v4/extensions/instances"));
+    assert_route(&router, Method::POST, &admin_path("/v3/object-zip-downloads"));
     assert_route(&router, Method::GET, &admin_path("/v4/plugins/catalog"));
     assert_route(&router, Method::GET, &admin_path("/v4/plugins/instances"));
     assert_route(&router, Method::GET, &admin_path("/v4/plugins/instances/example-id"));
@@ -575,6 +615,11 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces/sales/tables"));
     assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces/sales/register"));
     assert_route(&router, Method::GET, &table_catalog_path("/analytics/namespaces/sales/tables/orders"));
+    assert_route(
+        &router,
+        Method::GET,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/credentials"),
+    );
     assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces/sales/tables/orders"));
     assert_route(&router, Method::DELETE, &table_catalog_path("/analytics/namespaces/sales/tables/orders"));
     assert_route(
@@ -625,6 +670,11 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(
         &router,
         Method::POST,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/recovery"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
         &table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/rollback"),
     );
     assert_route(&router, Method::GET, &compat_table_catalog_path("/config"));
@@ -641,6 +691,11 @@ fn test_register_routes_cover_representative_admin_paths() {
         &router,
         Method::GET,
         &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/credentials"),
     );
     assert_route(
         &router,
@@ -700,6 +755,11 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(
         &router,
         Method::POST,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/recovery"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
         &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/rollback"),
     );
 
@@ -737,6 +797,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/site-replication/status"));
     assert_route(&router, Method::POST, &admin_path("/v3/site-replication/devnull"));
     assert_route(&router, Method::POST, &admin_path("/v3/site-replication/netperf"));
+    assert_route(&router, Method::POST, &admin_path("/v3/site-replication/rotate-svc-acct"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/join"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/bucket-ops"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/iam-item"));

@@ -1,5 +1,7 @@
 ## —— Code quality and Formatting ------------------------------------------------------------------
 
+.NOTPARALLEL: fix
+
 .PHONY: fmt
 fmt: core-deps fmt-deps ## Format code
 	@echo "🔧 Formatting code..."
@@ -13,8 +15,20 @@ fmt-check: core-deps fmt-deps ## Check code formatting
 .PHONY: clippy-check
 clippy-check: core-deps ## Run clippy checks
 	@echo "🔍 Running clippy checks..."
-	cargo clippy --fix --allow-dirty
 	cargo clippy --all-targets --all-features -- -D warnings
+
+.PHONY: clippy-fix
+clippy-fix: core-deps ## Apply clippy fixes
+	@echo "🔧 Applying clippy fixes..."
+	cargo clippy --fix --allow-dirty
+
+.PHONY: fix
+fix: fmt clippy-fix ## Format code and apply clippy fixes
+
+.PHONY: quick-check
+quick-check: core-deps ## Run fast workspace compilation check
+	@echo "🔨 Running fast compilation check..."
+	cargo check --workspace --exclude e2e_test
 
 .PHONY: unsafe-code-check
 unsafe-code-check: ## Check unsafe_code allowances have SAFETY comments

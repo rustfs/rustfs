@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const EXTENSION_SCHEMA_VERSION: &str = "rustfs.extension-schema.v1";
+pub const OPS_DIAGNOSTICS_CAPABILITY: &str = "ops.diagnostics.v1";
+pub const S3_POST_AUTH_HOOK_CAPABILITY: &str = "s3.hook.post_auth.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,6 +76,47 @@ pub struct ExtensionSchema {
     pub disabled_by_default: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum S3HookPoint {
+    PostAuthGetObject,
+    PostAuthPutObject,
+    PostAuthDeleteObject,
+    PostAuthListObjects,
+}
+
+impl S3HookPoint {
+    pub const fn is_post_auth(self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct S3HookContract {
+    pub hook_points: Vec<S3HookPoint>,
+    pub mutates_object_data: bool,
+    pub bypasses_iam: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpsDiagnosticSurface {
+    Metrics,
+    Trace,
+    Profile,
+    Health,
+    Diagnostics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsDiagnosticsContract {
+    pub surfaces: Vec<OpsDiagnosticSurface>,
+    pub mutates_object_data: bool,
+    pub requires_admin_action: bool,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ExtensionSchemaError {
     #[error("extension schema at index {index} has an empty extension id")]
@@ -108,6 +151,33 @@ pub enum ExtensionSchemaError {
 
     #[error("duplicate extension schema for {extension_id}")]
     DuplicateExtension { extension_id: String },
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ExtensionContractError {
+    #[error("s3 hook contract must declare at least one hook point")]
+    EmptyS3HookPoints,
+
+    #[error("s3 hook contract duplicates hook point {hook_point:?}")]
+    DuplicateS3HookPoint { hook_point: S3HookPoint },
+
+    #[error("s3 hook contract cannot mutate object data")]
+    S3HookMutatesObjectData,
+
+    #[error("s3 hook contract cannot bypass IAM")]
+    S3HookBypassesIam,
+
+    #[error("ops diagnostics contract must declare at least one surface")]
+    EmptyOpsDiagnosticSurfaces,
+
+    #[error("ops diagnostics contract duplicates surface {surface:?}")]
+    DuplicateOpsDiagnosticSurface { surface: OpsDiagnosticSurface },
+
+    #[error("ops diagnostics contract cannot mutate object data")]
+    OpsDiagnosticsMutatesObjectData,
+
+    #[error("ops diagnostics contract must require an admin action")]
+    OpsDiagnosticsMissingAdminAction,
 }
 
 pub fn validate_extension_schemas(schemas: &[ExtensionSchema]) -> Result<(), ExtensionSchemaError> {
@@ -188,11 +258,59 @@ pub fn validate_extension_schemas(schemas: &[ExtensionSchema]) -> Result<(), Ext
     Ok(())
 }
 
+pub fn validate_s3_hook_contract(contract: &S3HookContract) -> Result<(), ExtensionContractError> {
+    if contract.hook_points.is_empty() {
+        return Err(ExtensionContractError::EmptyS3HookPoints);
+    }
+
+    let mut hook_points = BTreeSet::new();
+    for hook_point in &contract.hook_points {
+        if !hook_points.insert(*hook_point) {
+            return Err(ExtensionContractError::DuplicateS3HookPoint { hook_point: *hook_point });
+        }
+    }
+
+    if contract.mutates_object_data {
+        return Err(ExtensionContractError::S3HookMutatesObjectData);
+    }
+
+    if contract.bypasses_iam {
+        return Err(ExtensionContractError::S3HookBypassesIam);
+    }
+
+    Ok(())
+}
+
+pub fn validate_ops_diagnostics_contract(contract: &OpsDiagnosticsContract) -> Result<(), ExtensionContractError> {
+    if contract.surfaces.is_empty() {
+        return Err(ExtensionContractError::EmptyOpsDiagnosticSurfaces);
+    }
+
+    let mut surfaces = BTreeSet::new();
+    for surface in &contract.surfaces {
+        if !surfaces.insert(*surface) {
+            return Err(ExtensionContractError::DuplicateOpsDiagnosticSurface { surface: *surface });
+        }
+    }
+
+    if contract.mutates_object_data {
+        return Err(ExtensionContractError::OpsDiagnosticsMutatesObjectData);
+    }
+
+    if !contract.requires_admin_action {
+        return Err(ExtensionContractError::OpsDiagnosticsMissingAdminAction);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        EXTENSION_SCHEMA_VERSION, ExtensionCapabilityRef, ExtensionKind, ExtensionRuntimeBoundary, ExtensionRuntimeContract,
-        ExtensionSchema, ExtensionSchemaError, validate_extension_schemas,
+        EXTENSION_SCHEMA_VERSION, ExtensionCapabilityRef, ExtensionContractError, ExtensionKind, ExtensionRuntimeBoundary,
+        ExtensionRuntimeContract, ExtensionSchema, ExtensionSchemaError, OPS_DIAGNOSTICS_CAPABILITY, OpsDiagnosticSurface,
+        OpsDiagnosticsContract, S3_POST_AUTH_HOOK_CAPABILITY, S3HookContract, S3HookPoint, validate_extension_schemas,
+        validate_ops_diagnostics_contract, validate_s3_hook_contract,
     };
     use serde_json::json;
 
@@ -256,7 +374,7 @@ mod tests {
                 api_version: "rustfs.extension.v1".to_string(),
                 boundary: ExtensionRuntimeBoundary::Builtin,
             },
-            capabilities: vec![ExtensionCapabilityRef::new("ops.diagnostics.v1")],
+            capabilities: vec![ExtensionCapabilityRef::new(OPS_DIAGNOSTICS_CAPABILITY)],
             disabled_by_default: false,
         }];
 
@@ -346,6 +464,97 @@ mod tests {
             ExtensionSchemaError::EmptyCapabilities {
                 extension_id: "rustfs.builtin.webhook".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn validates_s3_post_auth_hook_contract() {
+        let contract = S3HookContract {
+            hook_points: vec![S3HookPoint::PostAuthGetObject, S3HookPoint::PostAuthPutObject],
+            mutates_object_data: false,
+            bypasses_iam: false,
+        };
+
+        assert!(contract.hook_points.iter().all(|hook_point| hook_point.is_post_auth()));
+        assert!(validate_s3_hook_contract(&contract).is_ok());
+        assert_eq!(S3_POST_AUTH_HOOK_CAPABILITY, "s3.hook.post_auth.v1");
+    }
+
+    #[test]
+    fn rejects_s3_hooks_that_mutate_or_bypass_iam() {
+        let mut contract = S3HookContract {
+            hook_points: vec![S3HookPoint::PostAuthGetObject],
+            mutates_object_data: true,
+            bypasses_iam: false,
+        };
+
+        assert_eq!(
+            validate_s3_hook_contract(&contract).expect_err("object mutation should be rejected"),
+            ExtensionContractError::S3HookMutatesObjectData
+        );
+
+        contract.mutates_object_data = false;
+        contract.bypasses_iam = true;
+
+        assert_eq!(
+            validate_s3_hook_contract(&contract).expect_err("IAM bypass should be rejected"),
+            ExtensionContractError::S3HookBypassesIam
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_s3_hook_points() {
+        let contract = S3HookContract {
+            hook_points: vec![S3HookPoint::PostAuthDeleteObject, S3HookPoint::PostAuthDeleteObject],
+            mutates_object_data: false,
+            bypasses_iam: false,
+        };
+
+        assert_eq!(
+            validate_s3_hook_contract(&contract).expect_err("duplicate hook points should fail validation"),
+            ExtensionContractError::DuplicateS3HookPoint {
+                hook_point: S3HookPoint::PostAuthDeleteObject
+            }
+        );
+    }
+
+    #[test]
+    fn validates_ops_diagnostics_contract() {
+        let contract = OpsDiagnosticsContract {
+            surfaces: vec![
+                OpsDiagnosticSurface::Metrics,
+                OpsDiagnosticSurface::Trace,
+                OpsDiagnosticSurface::Profile,
+                OpsDiagnosticSurface::Health,
+                OpsDiagnosticSurface::Diagnostics,
+            ],
+            mutates_object_data: false,
+            requires_admin_action: true,
+        };
+
+        assert!(validate_ops_diagnostics_contract(&contract).is_ok());
+        assert_eq!(OPS_DIAGNOSTICS_CAPABILITY, "ops.diagnostics.v1");
+    }
+
+    #[test]
+    fn rejects_ops_diagnostics_without_admin_action_or_read_only_contract() {
+        let mut contract = OpsDiagnosticsContract {
+            surfaces: vec![OpsDiagnosticSurface::Metrics],
+            mutates_object_data: false,
+            requires_admin_action: false,
+        };
+
+        assert_eq!(
+            validate_ops_diagnostics_contract(&contract).expect_err("admin action should be required"),
+            ExtensionContractError::OpsDiagnosticsMissingAdminAction
+        );
+
+        contract.requires_admin_action = true;
+        contract.mutates_object_data = true;
+
+        assert_eq!(
+            validate_ops_diagnostics_contract(&contract).expect_err("object mutation should be rejected"),
+            ExtensionContractError::OpsDiagnosticsMutatesObjectData
         );
     }
 }

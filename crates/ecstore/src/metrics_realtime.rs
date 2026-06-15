@@ -12,15 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{admin_server_info::get_local_server_property, new_object_layer_fn};
+use crate::{admin_server_info::get_local_server_property, resolve_object_store_handle};
 use chrono::Utc;
 use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, heal_channel::DriveState, metrics::global_metrics};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_madmin::metrics::{
     DiskIOStats, DiskMetric, LastMinute as MadminLastMinute, NetDevLine, NetMetrics, RPCMetrics, RealtimeMetrics,
+    ScannerCheckpointReport as MadminScannerCheckpointReport,
     ScannerLifecycleTransitionSnapshot as MadminScannerLifecycleTransitionSnapshot, ScannerMetrics as MadminScannerMetrics,
     ScannerPacingPressureSnapshot as MadminScannerPacingPressureSnapshot,
-    ScannerSourceCycleSnapshot as MadminScannerSourceCycleSnapshot, TimedAction as MadminTimedAction,
+    ScannerSourceCycleSnapshot as MadminScannerSourceCycleSnapshot, ScannerSourceWorkSnapshot as MadminScannerSourceWorkSnapshot,
+    TimedAction as MadminTimedAction,
 };
 use rustfs_storage_api::StorageAdminApi;
 use rustfs_utils::os::get_drive_stats;
@@ -67,6 +69,8 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
         current_started: metrics.current_started,
         cycles_completed_at: metrics.cycles_completed_at,
         ongoing_buckets: metrics.ongoing_buckets,
+        active_scan_paths: metrics.active_scan_paths,
+        oldest_active_path_age_seconds: metrics.oldest_active_path_age_seconds,
         life_time_ops: metrics.life_time_ops,
         life_time_ilm: metrics.life_time_ilm,
         last_minute: MadminLastMinute {
@@ -102,12 +106,53 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
                 .collect(),
         },
         active_paths: metrics.active_paths,
+        current_scan_mode: metrics.current_scan_mode,
+        current_set_scan_concurrency_limit: metrics.current_set_scan_concurrency_limit,
+        current_set_scans_queued: metrics.current_set_scans_queued,
+        current_set_scans_active: metrics.current_set_scans_active,
+        current_disk_scan_concurrency_limit: metrics.current_disk_scan_concurrency_limit,
+        current_disk_bucket_scans_queued: metrics.current_disk_bucket_scans_queued,
+        current_disk_bucket_scans_active: metrics.current_disk_bucket_scans_active,
+        current_cycle_objects_scanned: metrics.current_cycle_objects_scanned,
+        current_cycle_directories_scanned: metrics.current_cycle_directories_scanned,
+        current_cycle_bucket_drive_scans: metrics.current_cycle_bucket_drive_scans,
+        current_cycle_bucket_drive_failures: metrics.current_cycle_bucket_drive_failures,
+        current_cycle_yield_events: metrics.current_cycle_yield_events,
+        current_cycle_yield_duration_seconds: metrics.current_cycle_yield_duration_seconds,
+        current_cycle_throttle_sleep_events: metrics.current_cycle_throttle_sleep_events,
+        current_cycle_throttle_sleep_duration_seconds: metrics.current_cycle_throttle_sleep_duration_seconds,
+        current_cycle_ilm_actions: metrics.current_cycle_ilm_actions,
         current_cycle_lifecycle_expiry_actions: metrics.current_cycle_lifecycle_expiry_actions,
         current_cycle_lifecycle_transition_actions: metrics.current_cycle_lifecycle_transition_actions,
+        current_cycle_heal_objects: metrics.current_cycle_heal_objects,
+        current_cycle_replication_checks: metrics.current_cycle_replication_checks,
+        current_cycle_usage_saves: metrics.current_cycle_usage_saves,
+        last_cycle_result: metrics.last_cycle_result,
+        last_cycle_result_code: metrics.last_cycle_result_code,
+        last_cycle_partial_reason: metrics.last_cycle_partial_reason,
+        last_cycle_partial_reason_code: metrics.last_cycle_partial_reason_code,
         last_cycle_lifecycle_expiry_actions: metrics.last_cycle_lifecycle_expiry_actions,
         last_cycle_lifecycle_transition_actions: metrics.last_cycle_lifecycle_transition_actions,
         last_cycle_partial_source: metrics.last_cycle_partial_source,
         last_cycle_partial_source_code: metrics.last_cycle_partial_source_code,
+        last_cycle_duration_seconds: metrics.last_cycle_duration_seconds,
+        last_cycle_objects_scanned: metrics.last_cycle_objects_scanned,
+        last_cycle_directories_scanned: metrics.last_cycle_directories_scanned,
+        last_cycle_bucket_drive_scans: metrics.last_cycle_bucket_drive_scans,
+        last_cycle_bucket_drive_failures: metrics.last_cycle_bucket_drive_failures,
+        last_cycle_yield_events: metrics.last_cycle_yield_events,
+        last_cycle_yield_duration_seconds: metrics.last_cycle_yield_duration_seconds,
+        last_cycle_throttle_sleep_events: metrics.last_cycle_throttle_sleep_events,
+        last_cycle_throttle_sleep_duration_seconds: metrics.last_cycle_throttle_sleep_duration_seconds,
+        last_cycle_ilm_actions: metrics.last_cycle_ilm_actions,
+        last_cycle_heal_objects: metrics.last_cycle_heal_objects,
+        last_cycle_replication_checks: metrics.last_cycle_replication_checks,
+        last_cycle_usage_saves: metrics.last_cycle_usage_saves,
+        failed_cycles: metrics.failed_cycles,
+        partial_cycles_unknown: metrics.partial_cycles_unknown,
+        partial_cycles_runtime: metrics.partial_cycles_runtime,
+        partial_cycles_objects: metrics.partial_cycles_objects,
+        partial_cycles_directories: metrics.partial_cycles_directories,
         pacing_pressure: MadminScannerPacingPressureSnapshot {
             primary_pressure: metrics.pacing_pressure.primary_pressure,
             current_queued_scans: metrics.pacing_pressure.current_queued_scans,
@@ -140,6 +185,66 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
                 cycles: source.cycles,
             })
             .collect(),
+        throttle_idle_mode_enabled: metrics.throttle_idle_mode_enabled,
+        throttle_sleep_factor: metrics.throttle_sleep_factor,
+        throttle_max_sleep_seconds: metrics.throttle_max_sleep_seconds,
+        yield_every_n_objects: metrics.yield_every_n_objects,
+        cycle_interval_seconds: metrics.cycle_interval_seconds,
+        cycle_max_duration_seconds: metrics.cycle_max_duration_seconds,
+        cycle_max_objects: metrics.cycle_max_objects,
+        cycle_max_directories: metrics.cycle_max_directories,
+        bitrot_cycle_enabled: metrics.bitrot_cycle_enabled,
+        bitrot_cycle_seconds: metrics.bitrot_cycle_seconds,
+        scan_checkpoint: metrics.scan_checkpoint.map(|checkpoint| MadminScannerCheckpointReport {
+            version: checkpoint.version,
+            resume_after: checkpoint.resume_after,
+            reason: checkpoint.reason,
+            last_event: checkpoint.last_event,
+        }),
+        scan_checkpoint_used: metrics.scan_checkpoint_used,
+        scan_checkpoint_cleared: metrics.scan_checkpoint_cleared,
+        scan_checkpoint_ignored: metrics.scan_checkpoint_ignored,
+        scan_checkpoint_stale: metrics.scan_checkpoint_stale,
+        source_work: metrics
+            .source_work
+            .into_iter()
+            .map(|work| MadminScannerSourceWorkSnapshot {
+                source: work.source,
+                checked: work.checked,
+                queued: work.queued,
+                executed: work.executed,
+                failed: work.failed,
+                skipped: work.skipped,
+                missed: work.missed,
+            })
+            .collect(),
+        current_cycle_source_work: metrics
+            .current_cycle_source_work
+            .into_iter()
+            .map(|work| MadminScannerSourceWorkSnapshot {
+                source: work.source,
+                checked: work.checked,
+                queued: work.queued,
+                executed: work.executed,
+                failed: work.failed,
+                skipped: work.skipped,
+                missed: work.missed,
+            })
+            .collect(),
+        last_cycle_source_work: metrics
+            .last_cycle_source_work
+            .into_iter()
+            .map(|work| MadminScannerSourceWorkSnapshot {
+                source: work.source,
+                checked: work.checked,
+                queued: work.queued,
+                executed: work.executed,
+                failed: work.failed,
+                skipped: work.skipped,
+                missed: work.missed,
+            })
+            .collect(),
+        partial_cycles: metrics.partial_cycles,
     }
 }
 
@@ -264,7 +369,7 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
 }
 
 async fn collect_local_disks_metrics(disks: &HashSet<String>) -> HashMap<String, DiskMetric> {
-    let store = match new_object_layer_fn() {
+    let store = match resolve_object_store_handle() {
         Some(store) => store,
         None => return HashMap::new(),
     };
@@ -473,5 +578,172 @@ mod test {
         assert_eq!(scanner.current_cycle_lifecycle_transition_actions, 3);
         assert_eq!(scanner.last_cycle_lifecycle_expiry_actions, 5);
         assert_eq!(scanner.last_cycle_lifecycle_transition_actions, 7);
+    }
+
+    #[test]
+    fn scanner_metrics_mapping_preserves_distributed_status_fields() {
+        let scanner = to_madmin_scanner_metrics(rustfs_common::metrics::ScannerMetricsReport {
+            active_scan_paths: 2,
+            oldest_active_path_age_seconds: 45,
+            active_paths: vec!["disk-a/bucket-a".to_string(), "disk-b/bucket-b".to_string()],
+            current_scan_mode: "normal".to_string(),
+            current_set_scan_concurrency_limit: 3,
+            current_set_scans_queued: 4,
+            current_set_scans_active: 5,
+            current_disk_scan_concurrency_limit: 6,
+            current_disk_bucket_scans_queued: 7,
+            current_disk_bucket_scans_active: 8,
+            current_cycle_objects_scanned: 9,
+            current_cycle_directories_scanned: 10,
+            current_cycle_bucket_drive_scans: 11,
+            current_cycle_bucket_drive_failures: 12,
+            current_cycle_yield_events: 13,
+            current_cycle_yield_duration_seconds: 1.5,
+            current_cycle_throttle_sleep_events: 14,
+            current_cycle_throttle_sleep_duration_seconds: 2.5,
+            current_cycle_ilm_actions: 15,
+            current_cycle_heal_objects: 16,
+            current_cycle_replication_checks: 17,
+            current_cycle_usage_saves: 18,
+            last_cycle_result: "partial".to_string(),
+            last_cycle_result_code: 2,
+            last_cycle_partial_reason: "objects".to_string(),
+            last_cycle_partial_reason_code: 3,
+            last_cycle_duration_seconds: 4.5,
+            last_cycle_objects_scanned: 19,
+            last_cycle_directories_scanned: 20,
+            last_cycle_bucket_drive_scans: 21,
+            last_cycle_bucket_drive_failures: 22,
+            last_cycle_yield_events: 23,
+            last_cycle_yield_duration_seconds: 5.5,
+            last_cycle_throttle_sleep_events: 24,
+            last_cycle_throttle_sleep_duration_seconds: 6.5,
+            last_cycle_ilm_actions: 25,
+            last_cycle_heal_objects: 26,
+            last_cycle_replication_checks: 27,
+            last_cycle_usage_saves: 28,
+            failed_cycles: 29,
+            partial_cycles_unknown: 30,
+            partial_cycles_runtime: 31,
+            partial_cycles_objects: 32,
+            partial_cycles_directories: 33,
+            throttle_idle_mode_enabled: true,
+            throttle_sleep_factor: 2.0,
+            throttle_max_sleep_seconds: 3.0,
+            yield_every_n_objects: 34,
+            cycle_interval_seconds: 35.0,
+            cycle_max_duration_seconds: 36.0,
+            cycle_max_objects: 37,
+            cycle_max_directories: 38,
+            bitrot_cycle_enabled: true,
+            bitrot_cycle_seconds: 39.0,
+            scan_checkpoint: Some(rustfs_common::metrics::ScannerCheckpointReport {
+                version: 1,
+                resume_after: "bucket-a/prefix-a".to_string(),
+                reason: "directories".to_string(),
+                last_event: "used".to_string(),
+            }),
+            scan_checkpoint_used: 40,
+            scan_checkpoint_cleared: 41,
+            scan_checkpoint_ignored: 42,
+            scan_checkpoint_stale: 43,
+            source_work: vec![rustfs_common::metrics::ScannerSourceWorkSnapshot {
+                source: "usage".to_string(),
+                checked: 44,
+                queued: 45,
+                executed: 46,
+                failed: 47,
+                skipped: 48,
+                missed: 49,
+            }],
+            current_cycle_source_work: vec![rustfs_common::metrics::ScannerSourceWorkSnapshot {
+                source: "lifecycle".to_string(),
+                checked: 50,
+                queued: 51,
+                executed: 52,
+                failed: 53,
+                skipped: 54,
+                missed: 55,
+            }],
+            last_cycle_source_work: vec![rustfs_common::metrics::ScannerSourceWorkSnapshot {
+                source: "heal".to_string(),
+                checked: 56,
+                queued: 57,
+                executed: 58,
+                failed: 59,
+                skipped: 60,
+                missed: 61,
+            }],
+            partial_cycles: 62,
+            ..Default::default()
+        });
+
+        assert_eq!(scanner.active_scan_paths, 2);
+        assert_eq!(scanner.oldest_active_path_age_seconds, 45);
+        assert_eq!(scanner.active_paths, vec!["disk-a/bucket-a".to_string(), "disk-b/bucket-b".to_string()]);
+        assert_eq!(scanner.current_scan_mode, "normal");
+        assert_eq!(scanner.current_set_scan_concurrency_limit, 3);
+        assert_eq!(scanner.current_set_scans_queued, 4);
+        assert_eq!(scanner.current_set_scans_active, 5);
+        assert_eq!(scanner.current_disk_scan_concurrency_limit, 6);
+        assert_eq!(scanner.current_disk_bucket_scans_queued, 7);
+        assert_eq!(scanner.current_disk_bucket_scans_active, 8);
+        assert_eq!(scanner.current_cycle_objects_scanned, 9);
+        assert_eq!(scanner.current_cycle_directories_scanned, 10);
+        assert_eq!(scanner.current_cycle_bucket_drive_scans, 11);
+        assert_eq!(scanner.current_cycle_bucket_drive_failures, 12);
+        assert_eq!(scanner.current_cycle_yield_events, 13);
+        assert_eq!(scanner.current_cycle_yield_duration_seconds, 1.5);
+        assert_eq!(scanner.current_cycle_throttle_sleep_events, 14);
+        assert_eq!(scanner.current_cycle_throttle_sleep_duration_seconds, 2.5);
+        assert_eq!(scanner.current_cycle_ilm_actions, 15);
+        assert_eq!(scanner.current_cycle_heal_objects, 16);
+        assert_eq!(scanner.current_cycle_replication_checks, 17);
+        assert_eq!(scanner.current_cycle_usage_saves, 18);
+        assert_eq!(scanner.last_cycle_result, "partial");
+        assert_eq!(scanner.last_cycle_result_code, 2);
+        assert_eq!(scanner.last_cycle_partial_reason, "objects");
+        assert_eq!(scanner.last_cycle_partial_reason_code, 3);
+        assert_eq!(scanner.last_cycle_duration_seconds, 4.5);
+        assert_eq!(scanner.last_cycle_objects_scanned, 19);
+        assert_eq!(scanner.last_cycle_directories_scanned, 20);
+        assert_eq!(scanner.last_cycle_bucket_drive_scans, 21);
+        assert_eq!(scanner.last_cycle_bucket_drive_failures, 22);
+        assert_eq!(scanner.last_cycle_yield_events, 23);
+        assert_eq!(scanner.last_cycle_yield_duration_seconds, 5.5);
+        assert_eq!(scanner.last_cycle_throttle_sleep_events, 24);
+        assert_eq!(scanner.last_cycle_throttle_sleep_duration_seconds, 6.5);
+        assert_eq!(scanner.last_cycle_ilm_actions, 25);
+        assert_eq!(scanner.last_cycle_heal_objects, 26);
+        assert_eq!(scanner.last_cycle_replication_checks, 27);
+        assert_eq!(scanner.last_cycle_usage_saves, 28);
+        assert_eq!(scanner.failed_cycles, 29);
+        assert_eq!(scanner.partial_cycles_unknown, 30);
+        assert_eq!(scanner.partial_cycles_runtime, 31);
+        assert_eq!(scanner.partial_cycles_objects, 32);
+        assert_eq!(scanner.partial_cycles_directories, 33);
+        assert!(scanner.throttle_idle_mode_enabled);
+        assert_eq!(scanner.throttle_sleep_factor, 2.0);
+        assert_eq!(scanner.throttle_max_sleep_seconds, 3.0);
+        assert_eq!(scanner.yield_every_n_objects, 34);
+        assert_eq!(scanner.cycle_interval_seconds, 35.0);
+        assert_eq!(scanner.cycle_max_duration_seconds, 36.0);
+        assert_eq!(scanner.cycle_max_objects, 37);
+        assert_eq!(scanner.cycle_max_directories, 38);
+        assert!(scanner.bitrot_cycle_enabled);
+        assert_eq!(scanner.bitrot_cycle_seconds, 39.0);
+        let checkpoint = scanner.scan_checkpoint.expect("checkpoint should be mapped");
+        assert_eq!(checkpoint.resume_after, "bucket-a/prefix-a");
+        assert_eq!(scanner.scan_checkpoint_used, 40);
+        assert_eq!(scanner.scan_checkpoint_cleared, 41);
+        assert_eq!(scanner.scan_checkpoint_ignored, 42);
+        assert_eq!(scanner.scan_checkpoint_stale, 43);
+        assert_eq!(scanner.source_work[0].source, "usage");
+        assert_eq!(scanner.source_work[0].missed, 49);
+        assert_eq!(scanner.current_cycle_source_work[0].source, "lifecycle");
+        assert_eq!(scanner.current_cycle_source_work[0].queued, 51);
+        assert_eq!(scanner.last_cycle_source_work[0].source, "heal");
+        assert_eq!(scanner.last_cycle_source_work[0].skipped, 60);
+        assert_eq!(scanner.partial_cycles, 62);
     }
 }

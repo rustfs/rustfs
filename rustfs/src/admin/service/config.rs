@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::app::context::resolve_object_store_handle;
 use rustfs_audit::reload_audit_config;
 use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_WEBHOOK_SUB_SYS};
 use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_REDIS_DEFAULT_CHANNEL, NOTIFY_WEBHOOK_SUB_SYS};
@@ -23,7 +24,6 @@ use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
 use rustfs_ecstore::config::com::{STORAGE_CLASS_SUB_SYS, read_config_without_migrate};
 use rustfs_ecstore::config::set_global_storage_class;
 use rustfs_ecstore::config::storageclass;
-use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::notification_sys::get_global_notification_sys;
 use rustfs_iam::oidc::load_oidc_provider_configs_from_server_config;
 use rustfs_storage_api::StorageAdminApi;
@@ -42,6 +42,22 @@ pub fn is_dynamic_config_subsystem(sub_system: &str) -> bool {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DynamicConfigWorkerMutation {
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DynamicConfigReloadPlan {
+    worker_mutation: DynamicConfigWorkerMutation,
+}
+
+fn dynamic_config_reload_plan(sub_system: &str) -> Option<DynamicConfigReloadPlan> {
+    is_dynamic_config_subsystem(sub_system).then_some(DynamicConfigReloadPlan {
+        worker_mutation: DynamicConfigWorkerMutation::None,
+    })
+}
+
 fn internal_error(message: impl Into<String>) -> S3Error {
     S3Error::with_message(S3ErrorCode::InternalError, message.into())
 }
@@ -51,7 +67,7 @@ fn invalid_request(message: impl Into<String>) -> S3Error {
 }
 
 async fn apply_storage_class_runtime_config(config: &ServerConfig) -> S3Result<()> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(internal_error("storage layer not initialized"));
     };
 
@@ -76,7 +92,7 @@ fn validate_storage_class_kvs(kvs: &KVS, set_drive_counts: &[usize]) -> S3Result
 }
 
 async fn validate_storage_class_config(config: &ServerConfig) -> S3Result<()> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(internal_error("storage layer not initialized"));
     };
 
@@ -257,7 +273,7 @@ pub async fn validate_server_config(config: &ServerConfig, sub_system: Option<&s
 }
 
 pub async fn apply_dynamic_config_for_subsystem(config: &ServerConfig, sub_system: &str) -> S3Result<bool> {
-    if !is_dynamic_config_subsystem(sub_system) {
+    if dynamic_config_reload_plan(sub_system).is_none() {
         return Ok(false);
     }
 
@@ -281,7 +297,7 @@ pub async fn reload_dynamic_config_runtime_state(sub_system: &str) -> S3Result<(
         return Err(internal_error(format!("unsupported dynamic config subsystem: {sub_system}")));
     }
 
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(internal_error("storage layer not initialized"));
     };
 
@@ -297,7 +313,7 @@ pub async fn reload_dynamic_config_runtime_state(sub_system: &str) -> S3Result<(
 }
 
 pub async fn reload_runtime_config_snapshot() -> S3Result<()> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(internal_error("storage layer not initialized"));
     };
 
@@ -359,6 +375,10 @@ mod tests {
     use rustfs_config::oidc::{OIDC_CLIENT_ID, OIDC_CONFIG_URL, OIDC_SCOPES};
     use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
     use rustfs_config::{MQTT_BROKER, MQTT_QUEUE_DIR, MQTT_TOPIC, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR};
+    use rustfs_ecstore::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG};
+
+    const LIFECYCLE_RELOAD_LABEL: &str = "lifecycle";
+    const REPLICATION_RELOAD_LABEL: &str = "replication";
 
     #[test]
     fn dynamic_config_subsystems_match_runtime_apply_support() {
@@ -369,6 +389,31 @@ mod tests {
         assert!(is_dynamic_config_subsystem(STORAGE_CLASS_SUB_SYS));
         assert!(!is_dynamic_config_subsystem("identity_openid"));
         assert!(!is_dynamic_config_subsystem("notify_webhook"));
+    }
+
+    #[test]
+    fn background_config_reload_plan_never_mutates_workers() {
+        for sub_system in [
+            STORAGE_CLASS_SUB_SYS,
+            AUDIT_WEBHOOK_SUB_SYS,
+            AUDIT_MQTT_SUB_SYS,
+            SCANNER_SUB_SYS,
+            HEAL_SUB_SYS,
+        ] {
+            assert_eq!(
+                dynamic_config_reload_plan(sub_system).map(|plan| plan.worker_mutation),
+                Some(DynamicConfigWorkerMutation::None)
+            );
+        }
+
+        for bucket_config in [
+            BUCKET_LIFECYCLE_CONFIG,
+            BUCKET_REPLICATION_CONFIG,
+            LIFECYCLE_RELOAD_LABEL,
+            REPLICATION_RELOAD_LABEL,
+        ] {
+            assert_eq!(dynamic_config_reload_plan(bucket_config), None);
+        }
     }
 
     #[test]

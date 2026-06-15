@@ -125,6 +125,7 @@ rustfs-zip = { path = "./crates/zip", version = "1.0.0-beta.8" }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"
+async_zip = { version = "0.0.18", default-features = false, features = ["tokio", "deflate"] }
 mysql_async = { version = "0.37", default-features = false, features = ["default-rustls", "tracing"] }
 async-compression = { version = "0.4.42" }
 async-recursion = "1.1.1"
@@ -133,6 +134,7 @@ async-nats = "0.49.1"
 axum = "0.8.9"
 futures = "0.3.32"
 futures-core = "0.3.32"
+futures-lite = "2.6.1"
 futures-util = "0.3.32"
 pollster = "0.4.0"
 pulsar = { version = "6.8.0", default-features = false, features = ["tokio-rustls-runtime"] }
@@ -159,7 +161,7 @@ tower-http = { version = "0.6.11", features = ["cors"] }
 
 # Serialization and Data Formats
 bytes = { version = "1.11.1", features = ["serde"] }
-bytesize = "2.3.1"
+bytesize = "2.4.0"
 byteorder = "1.5.0"
 flatbuffers = "25.12.19"
 form_urlencoded = "1.2.2"
@@ -188,17 +190,17 @@ rustls-pki-types = "1.14.1"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 subtle = "2.6"
-zeroize = { version = "1.8.2", features = ["derive"] }
+zeroize = { version = "1.9.0", features = ["derive"] }
 
 # Time and Date
 chrono = { version = "0.4.45", features = ["serde"] }
 humantime = "2.3.0"
 jiff = { version = "0.2.28", features = ["serde"] }
-time = { version = "0.3.47", features = ["std", "parsing", "formatting", "macros", "serde"] }
+time = { version = "0.3.49", features = ["std", "parsing", "formatting", "macros", "serde"] }
 
 # Database
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
-tokio-postgres = { version = "0.7", default-features = false, features = ["runtime", "with-serde_json-1"] }
+tokio-postgres = { version = "0.7.18", default-features = false, features = ["runtime", "with-serde_json-1"] }
 tokio-postgres-rustls = "0.14.0"
 
 # Utilities and Tools
@@ -209,9 +211,9 @@ atoi = "3.0.0"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.8.18" }
 aws-credential-types = { version = "1.2.14" }
-aws-sdk-s3 = { version = "1.135.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "1.136.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-smithy-http-client = { version = "1.1.13", default-features = false, features = ["default-client", "rustls-aws-lc"] }
-aws-smithy-types = { version = "1.4.9" }
+aws-smithy-types = { version = "1.5.0" }
 base64 = "0.22.1"
 base64-simd = "0.8.0"
 brotli = "8.0.3"
@@ -229,8 +231,8 @@ enumset = "1.1.13"
 faster-hex = "0.10.0"
 flate2 = "1.1.9"
 glob = "0.3.3"
-google-cloud-storage = "1.14.0"
-google-cloud-auth = "1.12.0"
+google-cloud-storage = "1.15.0"
+google-cloud-auth = "1.13.0"
 hashbrown = { version = "0.17.1", features = ["serde", "rayon"] }
 hex = "0.4.3"
 hex-simd = "0.8.0"
@@ -264,7 +266,7 @@ reed-solomon-erasure = { version = "6.0", default-features = false, features = [
 reed-solomon-simd = "3.1.0"
 regex = { version = "1.12.4" }
 rumqttc = { package = "rumqttc-next", version = "0.33.2", features = ["websocket"] }
-redis = { version = "1.2.2", features = ["connection-manager", "tokio-rustls-comp", "tls-rustls-insecure"] }
+redis = { version = "1.2.3", features = ["connection-manager", "tokio-rustls-comp", "tls-rustls-insecure"] }
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.2" }
@@ -272,11 +274,11 @@ s3s = { git = "https://github.com/rustfs/s3s", rev = "cf4c3346ed2554daa7fc6437f9
 serial_test = "3.5.0"
 shadow-rs = { version = "2.0.0", default-features = false }
 siphasher = "1.0.3"
-smallvec = { version = "1.15.1", features = ["serde"] }
+smallvec = { version = "1.15.2", features = ["serde"] }
 smartstring = "1.0.1"
 snafu = "0.9.1"
 snap = "1.1.1"
-starshard = { version = "2.2.0", features = ["rayon", "async", "serde"] }
+starshard = { version = "2.2.1", features = ["rayon", "async", "serde"] }
 strum = { version = "0.28.0", features = ["derive"] }
 sysinfo = "0.39.3"
 temp-env = "0.3.6"

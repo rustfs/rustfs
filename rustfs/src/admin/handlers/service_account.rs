@@ -48,6 +48,10 @@ use time::OffsetDateTime;
 use tracing::{debug, warn};
 use url::form_urlencoded;
 
+const LOG_COMPONENT_ADMIN: &str = "admin";
+const LOG_SUBSYSTEM_SERVICE_ACCOUNT: &str = "service_account";
+const EVENT_ADMIN_SERVICE_ACCOUNT_STATE: &str = "admin_service_account_state";
+
 fn sr_session_policy_from_value(value: Option<&serde_json::Value>) -> S3Result<SRSessionPolicy> {
     let Some(value) = value else {
         return Ok(SRSessionPolicy::default());
@@ -104,7 +108,15 @@ fn is_service_account_owner_of(caller: &StoredCredentials, target_parent_user: &
 }
 
 fn map_service_account_lookup_error(err: rustfs_iam::error::Error, action: &str) -> S3Error {
-    debug!("{action}, e: {:?}", err);
+    debug!(
+        component = LOG_COMPONENT_ADMIN,
+        subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
+        event = EVENT_ADMIN_SERVICE_ACCOUNT_STATE,
+        action,
+        result = "lookup_failed",
+        error = ?err,
+        "admin service account state"
+    );
     if is_err_no_such_service_account(&err) {
         iam_error_to_s3_error(err)
     } else {
@@ -113,7 +125,15 @@ fn map_service_account_lookup_error(err: rustfs_iam::error::Error, action: &str)
 }
 
 fn map_temp_account_lookup_error(err: rustfs_iam::error::Error, action: &str) -> S3Error {
-    debug!("{action}, e: {:?}", err);
+    debug!(
+        component = LOG_COMPONENT_ADMIN,
+        subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
+        event = EVENT_ADMIN_SERVICE_ACCOUNT_STATE,
+        action,
+        result = "temporary_lookup_failed",
+        error = ?err,
+        "admin service account state"
+    );
     if is_err_no_such_temp_account(&err) {
         iam_error_to_s3_error(err)
     } else {
@@ -124,7 +144,14 @@ fn map_temp_account_lookup_error(err: rustfs_iam::error::Error, action: &str) ->
 fn parse_service_account_policy(policy: &serde_json::Value) -> S3Result<Policy> {
     let policy_bytes = serde_json::to_vec(policy).map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?;
     Policy::parse_config(&policy_bytes).map_err(|e| {
-        debug!("parse service account policy failed, e: {:?}", e);
+        debug!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
+            event = EVENT_ADMIN_SERVICE_ACCOUNT_STATE,
+            result = "policy_parse_failed",
+            error = ?e,
+            "admin service account state"
+        );
         match e {
             rustfs_policy::error::Error::PolicyError(rustfs_policy::policy::Error::NonResource) => {
                 s3_error!(InvalidArgument, "invalid service account policy: Resource is empty")
@@ -214,7 +241,6 @@ pub struct AddServiceAccount {}
 #[async_trait::async_trait]
 impl Operation for AddServiceAccount {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle AddServiceAccount ");
         let Some(req_cred) = req.credentials else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
@@ -347,7 +373,15 @@ impl Operation for AddServiceAccount {
             .new_service_account(&target_user, target_groups, opts)
             .await
             .map_err(|e| {
-                debug!("create service account failed, e: {:?}", e);
+                debug!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
+                    event = EVENT_ADMIN_SERVICE_ACCOUNT_STATE,
+                    target_user = %target_user,
+                    result = "create_failed",
+                    error = ?e,
+                    "admin service account state"
+                );
                 s3_error!(InternalError, "create service account failed, e: {:?}", e)
             })?;
 
@@ -381,7 +415,16 @@ impl Operation for AddServiceAccount {
         })
         .await
         {
-            warn!(access_key = %new_cred.access_key, error = ?err, "site replication add service account hook failed");
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
+                event = EVENT_ADMIN_SERVICE_ACCOUNT_STATE,
+                access_key = %new_cred.access_key,
+                action = "create",
+                result = "site_replication_hook_failed",
+                error = ?err,
+                "admin service account state"
+            );
         }
 
         let resp = AddServiceAccountResp {
@@ -449,8 +492,6 @@ pub struct UpdateServiceAccount {}
 #[async_trait::async_trait]
 impl Operation for UpdateServiceAccount {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle UpdateServiceAccount");
-
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AccessKeyQuery =
@@ -583,8 +624,6 @@ pub struct InfoServiceAccount {}
 #[async_trait::async_trait]
 impl Operation for InfoServiceAccount {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle InfoServiceAccount");
-
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AccessKeyQuery =
@@ -657,8 +696,6 @@ pub struct TemporaryAccountInfo {}
 #[async_trait::async_trait]
 impl Operation for TemporaryAccountInfo {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle TemporaryAccountInfo");
-
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AccessKeyQuery =
@@ -727,8 +764,6 @@ pub struct InfoAccessKey {}
 #[async_trait::async_trait]
 impl Operation for InfoAccessKey {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle InfoAccessKey");
-
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AccessKeyQuery =
@@ -832,8 +867,6 @@ pub struct ListServiceAccount {}
 #[async_trait::async_trait]
 impl Operation for ListServiceAccount {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle ListServiceAccount");
-
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: ListServiceAccountQuery = from_bytes(query.as_bytes())
@@ -852,7 +885,14 @@ impl Operation for ListServiceAccount {
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key)
                 .await
                 .map_err(|e| {
-                    debug!("check key failed: {e:?}");
+                    debug!(
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
+                        event = EVENT_ADMIN_SERVICE_ACCOUNT_STATE,
+                        result = "check_key_failed",
+                        error = ?e,
+                        "admin service account state"
+                    );
                     s3_error!(InternalError, "check key failed")
                 })?;
 
@@ -908,7 +948,15 @@ impl Operation for ListServiceAccount {
         };
 
         let service_accounts = iam_store.list_service_accounts(&target_account).await.map_err(|e| {
-            debug!("list service account failed: {e:?}");
+            debug!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
+                event = EVENT_ADMIN_SERVICE_ACCOUNT_STATE,
+                target_user = %target_account,
+                result = "list_service_accounts_failed",
+                error = ?e,
+                "admin service account state"
+            );
             s3_error!(InternalError, "list service account failed")
         })?;
 
@@ -986,8 +1034,6 @@ pub struct ListAccessKeysBulk {}
 #[async_trait::async_trait]
 impl Operation for ListAccessKeysBulk {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle ListAccessKeysBulk");
-
         let query = { parse_list_access_keys_query(req.uri.query()) };
 
         if query.all && !query.users.is_empty() {
@@ -1097,7 +1143,15 @@ impl Operation for ListAccessKeysBulk {
 
             if list_sts_keys {
                 let sts_keys = iam_store.list_sts_accounts(&user).await.map_err(|e| {
-                    debug!("list sts account failed: {e:?}");
+                    debug!(
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
+                        event = EVENT_ADMIN_SERVICE_ACCOUNT_STATE,
+                        target_user = %user,
+                        result = "list_sts_accounts_failed",
+                        error = ?e,
+                        "admin service account state"
+                    );
                     s3_error!(InternalError, "list sts account failed")
                 })?;
 
@@ -1118,7 +1172,15 @@ impl Operation for ListAccessKeysBulk {
 
             if list_service_accounts {
                 let service_accounts = iam_store.list_service_accounts(&user).await.map_err(|e| {
-                    debug!("list service account failed: {e:?}");
+                    debug!(
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
+                        event = EVENT_ADMIN_SERVICE_ACCOUNT_STATE,
+                        target_user = %user,
+                        result = "list_service_accounts_failed",
+                        error = ?e,
+                        "admin service account state"
+                    );
                     s3_error!(InternalError, "list service account failed")
                 })?;
 
@@ -1155,7 +1217,6 @@ pub struct DeleteServiceAccount {}
 #[async_trait::async_trait]
 impl Operation for DeleteServiceAccount {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle DeleteServiceAccount");
         let Some(input_cred) = req.credentials else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
@@ -1164,7 +1225,14 @@ impl Operation for DeleteServiceAccount {
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key)
                 .await
                 .map_err(|e| {
-                    debug!("check key failed: {e:?}");
+                    debug!(
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
+                        event = "service_account_auth_failed",
+                        action = "delete",
+                        error = ?e,
+                        "Service account authentication failed"
+                    );
                     s3_error!(InternalError, "check key failed")
                 })?;
 
@@ -1229,7 +1297,14 @@ impl Operation for DeleteServiceAccount {
         }
 
         iam_store.delete_service_account(&query.access_key, true).await.map_err(|e| {
-            debug!("delete service account failed, e: {:?}", e);
+            debug!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
+                event = "service_account_delete_failed",
+                access_key = %query.access_key,
+                error = ?e,
+                "Failed to delete service account"
+            );
             s3_error!(InternalError, "delete service account failed")
         })?;
 
@@ -1249,7 +1324,16 @@ impl Operation for DeleteServiceAccount {
         })
         .await
         {
-            warn!(access_key = %query.access_key, error = ?err, "site replication delete service account hook failed");
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
+                event = EVENT_ADMIN_SERVICE_ACCOUNT_STATE,
+                access_key = %query.access_key,
+                action = "delete",
+                result = "site_replication_hook_failed",
+                error = ?err,
+                "admin service account state"
+            );
         }
 
         let mut header = HeaderMap::new();

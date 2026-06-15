@@ -21,7 +21,7 @@ use rustfs_iam::store::Store as IamStore;
 use rustfs_madmin::{
     InfoAccessKeyResp, InfoServiceAccountResp, LDAPSpecificAccessKeyInfo, OpenIDSpecificAccessKeyInfo, ServiceAccountInfo,
 };
-use rustfs_policy::policy::Policy;
+use rustfs_policy::policy::{DEFAULT_VERSION, Policy};
 use s3s::{S3Result, s3_error};
 use std::collections::HashMap;
 use time::OffsetDateTime;
@@ -236,7 +236,10 @@ pub(crate) async fn build_info_service_account_resp<T: IamStore>(
     };
 
     let policy = effective_policy
-        .map(|policy| {
+        .map(|mut policy| {
+            if policy.version.is_empty() {
+                policy.version = DEFAULT_VERSION.to_owned();
+            }
             serde_json::to_string_pretty(&policy).map_err(|e| {
                 debug!("marshal policy failed, e: {:?}", e);
                 s3_error!(InternalError, "marshal policy failed")
@@ -893,7 +896,7 @@ mod tests {
         assert_eq!(resp.open_id_specific_info.config_name, None);
         assert_eq!(
             resp.info.policy,
-            Some("{\n  \"ID\": \"\",\n  \"Version\": \"\",\n  \"Statement\": []\n}".to_string())
+            Some("{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": []\n}".to_string())
         );
 
         let body = serde_json::to_value(&resp).expect("serialize openid sts response");
@@ -932,7 +935,7 @@ mod tests {
         assert_eq!(body.get("description").and_then(|v| v.as_str()), Some("openid derived temporary account"));
         assert_eq!(
             body.get("policy").and_then(|v| v.as_str()),
-            Some("{\n  \"ID\": \"\",\n  \"Version\": \"\",\n  \"Statement\": []\n}")
+            Some("{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": []\n}")
         );
     }
 }

@@ -41,6 +41,10 @@ use serde::Deserialize;
 use serde_urlencoded::from_bytes;
 use tracing::warn;
 
+const LOG_COMPONENT_ADMIN: &str = "admin";
+const LOG_SUBSYSTEM_GROUP: &str = "group";
+const EVENT_ADMIN_GROUP_STATE: &str = "admin_group_state";
+
 pub fn register_group_management_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
         Method::GET,
@@ -85,10 +89,17 @@ pub struct ListGroups {}
 #[async_trait::async_trait]
 impl Operation for ListGroups {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle ListGroups");
+        warn!(
+            event = EVENT_ADMIN_GROUP_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_GROUP,
+            action = "list_groups",
+            state = "requested",
+            "admin group state"
+        );
 
         let Some(input_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
+            return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
@@ -104,14 +115,24 @@ impl Operation for ListGroups {
         )
         .await?;
 
-        let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else {
+            return Err(s3_error!(InternalError, "iam is not initialized"));
+        };
 
         let groups = iam_store.list_groups_load().await.map_err(|e| {
-            warn!("list groups failed, e: {:?}", e);
+            warn!(
+                event = EVENT_ADMIN_GROUP_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_GROUP,
+                action = "list_groups",
+                result = "load_failed",
+                error = ?e,
+                "admin group state"
+            );
             S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
         })?;
 
-        let body = serde_json::to_vec(&groups).map_err(|e| s3_error!(InternalError, "marshal body failed, e: {:?}", e))?;
+        let body = serde_json::to_vec(&groups).map_err(|e| s3_error!(InternalError, "failed to serialize response: {:?}", e))?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -124,10 +145,17 @@ pub struct GetGroup {}
 #[async_trait::async_trait]
 impl Operation for GetGroup {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle GetGroup");
+        warn!(
+            event = EVENT_ADMIN_GROUP_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_GROUP,
+            action = "get_group",
+            state = "requested",
+            "admin group state"
+        );
 
         let Some(input_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
+            return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
@@ -146,20 +174,31 @@ impl Operation for GetGroup {
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: GroupQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed1"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
                 input
             } else {
                 GroupQuery::default()
             }
         };
-        let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else {
+            return Err(s3_error!(InternalError, "iam is not initialized"));
+        };
 
         let g = iam_store.get_group_description(&query.group).await.map_err(|e| {
-            warn!("get group failed, e: {:?}", e);
+            warn!(
+                event = EVENT_ADMIN_GROUP_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_GROUP,
+                action = "get_group",
+                group = %query.group,
+                result = "load_failed",
+                error = ?e,
+                "admin group state"
+            );
             iam_error_to_s3_error(e)
         })?;
 
-        let body = serde_json::to_vec(&g).map_err(|e| s3_error!(InternalError, "marshal body failed, e: {:?}", e))?;
+        let body = serde_json::to_vec(&g).map_err(|e| s3_error!(InternalError, "failed to serialize response: {:?}", e))?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -189,10 +228,17 @@ pub struct DeleteGroup {}
 #[async_trait::async_trait]
 impl Operation for DeleteGroup {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle DeleteGroup");
+        warn!(
+            event = EVENT_ADMIN_GROUP_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_GROUP,
+            action = "delete_group",
+            state = "requested",
+            "admin group state"
+        );
 
         let Some(input_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
+            return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
@@ -210,22 +256,33 @@ impl Operation for DeleteGroup {
 
         let group = decode_delete_group_name(&params)?;
 
-        let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else {
+            return Err(s3_error!(InternalError, "iam is not initialized"));
+        };
 
         let updated_at = iam_store.remove_users_from_group(&group, vec![]).await.map_err(|e| {
-            warn!("delete group failed, e: {:?}", e);
+            warn!(
+                event = EVENT_ADMIN_GROUP_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_GROUP,
+                action = "delete_group",
+                group = %group,
+                result = "delete_failed",
+                error = ?e,
+                "admin group state"
+            );
             match e {
                 rustfs_iam::error::Error::GroupNotEmpty => {
                     s3_error!(InvalidRequest, "group is not empty")
                 }
                 rustfs_iam::error::Error::InvalidArgument => {
-                    s3_error!(InvalidArgument, "{e}")
+                    s3_error!(InvalidArgument, "invalid group request: {e}")
                 }
                 _ => {
                     if is_err_no_such_group(&e) {
                         iam_error_to_s3_error(e)
                     } else {
-                        s3_error!(InternalError, "{e}")
+                        s3_error!(InternalError, "failed to delete group: {e}")
                     }
                 }
             }
@@ -248,7 +305,15 @@ impl Operation for DeleteGroup {
         })
         .await
         {
-            warn!("site replication group delete hook failed, err: {err}");
+            warn!(
+                event = EVENT_ADMIN_GROUP_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_GROUP,
+                action = "delete_group",
+                result = "site_replication_hook_failed",
+                error = %err,
+                "admin group state"
+            );
         }
 
         let mut header = HeaderMap::new();
@@ -289,10 +354,17 @@ pub struct SetGroupStatus {}
 #[async_trait::async_trait]
 impl Operation for SetGroupStatus {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle SetGroupStatus");
+        warn!(
+            event = EVENT_ADMIN_GROUP_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_GROUP,
+            action = "set_group_status",
+            state = "requested",
+            "admin group state"
+        );
 
         let Some(input_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
+            return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
@@ -311,7 +383,7 @@ impl Operation for SetGroupStatus {
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: GroupQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed1"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
                 input
             } else {
                 GroupQuery::default()
@@ -322,16 +394,38 @@ impl Operation for SetGroupStatus {
             return Err(s3_error!(InvalidArgument, "group is required"));
         }
 
-        let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else {
+            return Err(s3_error!(InternalError, "iam is not initialized"));
+        };
 
         let updated_at = if let Some(status) = query.status.as_deref() {
             match status {
                 "enabled" => iam_store.set_group_status(&query.group, true).await.map_err(|e| {
-                    warn!("enable group failed, e: {:?}", e);
+                    warn!(
+                        event = EVENT_ADMIN_GROUP_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_GROUP,
+                        action = "set_group_status",
+                        group = %query.group,
+                        status = "enabled",
+                        result = "update_failed",
+                        error = ?e,
+                        "admin group state"
+                    );
                     iam_error_to_s3_error(e)
                 })?,
                 "disabled" => iam_store.set_group_status(&query.group, false).await.map_err(|e| {
-                    warn!("enable group failed, e: {:?}", e);
+                    warn!(
+                        event = EVENT_ADMIN_GROUP_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_GROUP,
+                        action = "set_group_status",
+                        group = %query.group,
+                        status = "disabled",
+                        result = "update_failed",
+                        error = ?e,
+                        "admin group state"
+                    );
                     iam_error_to_s3_error(e)
                 })?,
                 _ => {
@@ -363,7 +457,15 @@ impl Operation for SetGroupStatus {
         })
         .await
         {
-            warn!("site replication group status hook failed, err: {err}");
+            warn!(
+                event = EVENT_ADMIN_GROUP_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_GROUP,
+                action = "set_group_status",
+                result = "site_replication_hook_failed",
+                error = %err,
+                "admin group state"
+            );
         }
 
         let mut header = HeaderMap::new();
@@ -377,10 +479,17 @@ pub struct UpdateGroupMembers {}
 #[async_trait::async_trait]
 impl Operation for UpdateGroupMembers {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle UpdateGroupMembers");
+        warn!(
+            event = EVENT_ADMIN_GROUP_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_GROUP,
+            action = "update_group_members",
+            state = "requested",
+            "admin group state"
+        );
 
         let Some(input_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
+            return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
@@ -400,17 +509,37 @@ impl Operation for UpdateGroupMembers {
         let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
-                warn!("get body failed, e: {:?}", e);
+                warn!(
+                    event = EVENT_ADMIN_GROUP_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_GROUP,
+                    action = "update_group_members",
+                    result = "body_read_failed",
+                    error = ?e,
+                    "admin group state"
+                );
                 return Err(s3_error!(InvalidRequest, "group configuration body too large or failed to read"));
             }
         };
 
         let args: GroupAddRemove = serde_json::from_slice(&body)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("unmarshal body err {e}")))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid JSON: {e}")))?;
 
-        warn!("UpdateGroupMembers args {:?}", args);
+        warn!(
+            event = EVENT_ADMIN_GROUP_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_GROUP,
+            action = "update_group_members",
+            group = %args.group,
+            member_count = args.members.len(),
+            remove = args.is_remove,
+            state = "decoded",
+            "admin group state"
+        );
 
-        let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else {
+            return Err(s3_error!(InternalError, "iam is not initialized"));
+        };
 
         for member in args.members.iter() {
             match iam_store.is_temp_user(member).await {
@@ -433,7 +562,10 @@ impl Operation for UpdateGroupMembers {
                             Ok(())
                         })
                         .unwrap_or_else(|| {
-                            Err(S3Error::with_message(S3ErrorCode::InternalError, "get global cred failed".to_string()))
+                            Err(S3Error::with_message(
+                                S3ErrorCode::InternalError,
+                                "failed to load global credentials".to_string(),
+                            ))
                         })?;
                 }
                 Err(e) => {
@@ -445,29 +577,65 @@ impl Operation for UpdateGroupMembers {
         }
 
         let updated_at = if args.is_remove {
-            warn!("remove group members");
+            warn!(
+                event = EVENT_ADMIN_GROUP_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_GROUP,
+                action = "remove_group_members",
+                group = %args.group,
+                member_count = args.members.len(),
+                state = "requested",
+                "admin group state"
+            );
             iam_store
                 .remove_users_from_group(&args.group, args.members.clone())
                 .await
                 .map_err(|e| {
-                    warn!("remove group members failed, e: {:?}", e);
+                    warn!(
+                        event = EVENT_ADMIN_GROUP_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_GROUP,
+                        action = "remove_group_members",
+                        group = %args.group,
+                        result = "update_failed",
+                        error = ?e,
+                        "admin group state"
+                    );
                     iam_error_to_s3_error(e)
                 })?
         } else {
-            warn!("add group members");
+            warn!(
+                event = EVENT_ADMIN_GROUP_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_GROUP,
+                action = "add_group_members",
+                group = %args.group,
+                member_count = args.members.len(),
+                state = "requested",
+                "admin group state"
+            );
 
             if let Err(err) = iam_store.get_group_description(&args.group).await
                 && is_err_no_such_group(&err)
                 && has_space_be(&args.group)
             {
-                return Err(s3_error!(InvalidArgument, "not such group"));
+                return Err(s3_error!(InvalidArgument, "group not found"));
             }
 
             iam_store
                 .add_users_to_group(&args.group, args.members.clone())
                 .await
                 .map_err(|e| {
-                    warn!("add group members failed, e: {:?}", e);
+                    warn!(
+                        event = EVENT_ADMIN_GROUP_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_GROUP,
+                        action = "add_group_members",
+                        group = %args.group,
+                        result = "update_failed",
+                        error = ?e,
+                        "admin group state"
+                    );
                     iam_error_to_s3_error(e)
                 })?
         };
@@ -484,7 +652,15 @@ impl Operation for UpdateGroupMembers {
         })
         .await
         {
-            warn!("site replication group membership hook failed, err: {err}");
+            warn!(
+                event = EVENT_ADMIN_GROUP_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_GROUP,
+                action = "update_group_members",
+                result = "site_replication_hook_failed",
+                error = %err,
+                "admin group state"
+            );
         }
 
         let mut header = HeaderMap::new();

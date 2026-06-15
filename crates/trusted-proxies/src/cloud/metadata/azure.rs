@@ -46,7 +46,15 @@ impl AzureMetadataFetcher {
     async fn get_metadata(&self, path: &str) -> Result<String, AppError> {
         let url = format!("{}/metadata/{}?api-version=2021-05-01", self.metadata_endpoint, path);
 
-        debug!("Fetching Azure metadata from: {}", url);
+        debug!(
+            event = "trusted_proxies.cloud_metadata",
+            component = "trusted_proxies",
+            subsystem = "azure_metadata",
+            provider = "azure",
+            operation = "metadata_request",
+            path = %path,
+            "trusted proxy cloud metadata request started"
+        );
 
         match self.client.get(&url).header("Metadata", "true").send().await {
             Ok(response) => {
@@ -57,12 +65,32 @@ impl AzureMetadataFetcher {
                         .map_err(|e| AppError::cloud(format!("Failed to read Azure metadata response: {}", e)))?;
                     Ok(text)
                 } else {
-                    debug!("Azure metadata request failed with status: {}", response.status());
+                    debug!(
+                        event = "trusted_proxies.cloud_metadata",
+                        component = "trusted_proxies",
+                        subsystem = "azure_metadata",
+                        provider = "azure",
+                        operation = "metadata_request",
+                        path = %path,
+                        result = "http_error",
+                        status = %response.status(),
+                        "trusted proxy cloud metadata request failed"
+                    );
                     Err(AppError::cloud(format!("Azure metadata API returned status: {}", response.status())))
                 }
             }
             Err(e) => {
-                debug!("Azure metadata request failed: {}", e);
+                debug!(
+                    event = "trusted_proxies.cloud_metadata",
+                    component = "trusted_proxies",
+                    subsystem = "azure_metadata",
+                    provider = "azure",
+                    operation = "metadata_request",
+                    path = %path,
+                    result = "request_failed",
+                    error = %e,
+                    "trusted proxy cloud metadata request failed"
+                );
                 Err(AppError::cloud(format!("Azure metadata request failed: {}", e)))
             }
         }
@@ -91,7 +119,15 @@ impl AzureMetadataFetcher {
             address_prefixes: Vec<String>,
         }
 
-        debug!("Fetching Azure IP ranges from: {}", url);
+        debug!(
+            event = "trusted_proxies.cloud_metadata",
+            component = "trusted_proxies",
+            subsystem = "azure_metadata",
+            provider = "azure",
+            operation = "public_ip_ranges",
+            source = %url,
+            "trusted proxy cloud metadata request started"
+        );
 
         match self.client.get(url).timeout(Duration::from_secs(10)).send().await {
             Ok(response) => {
@@ -114,15 +150,45 @@ impl AzureMetadataFetcher {
                         }
                     }
 
-                    info!("Successfully fetched {} Azure public IP ranges", networks.len());
+                    info!(
+                        event = "trusted_proxies.cloud_metadata",
+                        component = "trusted_proxies",
+                        subsystem = "azure_metadata",
+                        provider = "azure",
+                        operation = "public_ip_ranges",
+                        source = "api",
+                        result = "loaded",
+                        range_count = networks.len(),
+                        "trusted proxy cloud metadata loaded"
+                    );
                     Ok(networks)
                 } else {
-                    debug!("Failed to fetch Azure IP ranges: HTTP {}", response.status());
+                    debug!(
+                        event = "trusted_proxies.cloud_metadata",
+                        component = "trusted_proxies",
+                        subsystem = "azure_metadata",
+                        provider = "azure",
+                        operation = "public_ip_ranges",
+                        source = %url,
+                        result = "http_error",
+                        status = %response.status(),
+                        "trusted proxy cloud metadata request failed"
+                    );
                     Ok(Vec::new())
                 }
             }
             Err(e) => {
-                debug!("Failed to fetch Azure IP ranges: {}", e);
+                debug!(
+                    event = "trusted_proxies.cloud_metadata",
+                    component = "trusted_proxies",
+                    subsystem = "azure_metadata",
+                    provider = "azure",
+                    operation = "public_ip_ranges",
+                    source = %url,
+                    result = "request_failed",
+                    error = %e,
+                    "trusted proxy cloud metadata request failed"
+                );
                 // Fallback to hardcoded ranges if the download fails.
                 Self::default_azure_ranges()
             }
@@ -217,7 +283,17 @@ impl AzureMetadataFetcher {
 
         match networks {
             Ok(networks) => {
-                debug!("Using default Azure public IP ranges");
+                debug!(
+                    event = "trusted_proxies.cloud_metadata",
+                    component = "trusted_proxies",
+                    subsystem = "azure_metadata",
+                    provider = "azure",
+                    operation = "public_ip_ranges",
+                    result = "fallback",
+                    source = "default_ranges",
+                    range_count = networks.len(),
+                    "trusted proxy cloud metadata fallback applied"
+                );
                 Ok(networks)
             }
             Err(e) => Err(AppError::cloud(format!("Failed to parse default Azure ranges: {}", e))),
@@ -265,15 +341,45 @@ impl CloudMetadataFetcher for AzureMetadataFetcher {
                 }
 
                 if !cidrs.is_empty() {
-                    info!("Successfully fetched {} network CIDRs from Azure metadata", cidrs.len());
+                    info!(
+                        event = "trusted_proxies.cloud_metadata",
+                        component = "trusted_proxies",
+                        subsystem = "azure_metadata",
+                        provider = "azure",
+                        operation = "network_cidrs",
+                        source = "metadata",
+                        result = "loaded",
+                        range_count = cidrs.len(),
+                        "trusted proxy cloud metadata loaded"
+                    );
                     Ok(cidrs)
                 } else {
-                    debug!("No network CIDRs found in Azure metadata, falling back to defaults");
+                    debug!(
+                        event = "trusted_proxies.cloud_metadata",
+                        component = "trusted_proxies",
+                        subsystem = "azure_metadata",
+                        provider = "azure",
+                        operation = "network_cidrs",
+                        source = "metadata",
+                        result = "fallback",
+                        reason = "empty_metadata",
+                        "trusted proxy cloud metadata fallback applied"
+                    );
                     Self::default_azure_network_ranges()
                 }
             }
             Err(e) => {
-                warn!("Failed to fetch Azure network metadata: {}", e);
+                warn!(
+                    event = "trusted_proxies.cloud_metadata",
+                    component = "trusted_proxies",
+                    subsystem = "azure_metadata",
+                    provider = "azure",
+                    operation = "network_cidrs",
+                    source = "metadata",
+                    result = "fallback",
+                    error = %e,
+                    "trusted proxy cloud metadata fallback applied"
+                );
                 Self::default_azure_network_ranges()
             }
         }
@@ -299,7 +405,17 @@ impl AzureMetadataFetcher {
 
         match networks {
             Ok(networks) => {
-                debug!("Using default Azure VNet network ranges");
+                debug!(
+                    event = "trusted_proxies.cloud_metadata",
+                    component = "trusted_proxies",
+                    subsystem = "azure_metadata",
+                    provider = "azure",
+                    operation = "network_cidrs",
+                    result = "fallback",
+                    source = "default_ranges",
+                    range_count = networks.len(),
+                    "trusted proxy cloud metadata fallback applied"
+                );
                 Ok(networks)
             }
             Err(e) => Err(AppError::cloud(format!("Failed to parse default Azure network ranges: {}", e))),

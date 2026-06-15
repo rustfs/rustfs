@@ -69,7 +69,7 @@ impl NotifyBucketConfigManager {
             bucket = %bucket,
             region = %cfg.region,
             available_arn_count = arn_list.len(),
-            "Loaded available notify target ARNs for bucket config validation"
+            "notify bucket config validation"
         );
 
         if let Err(e) = cfg.validate(&cfg.region, &arn_list) {
@@ -81,7 +81,7 @@ impl NotifyBucketConfigManager {
                 region = %cfg.region,
                 error = %e,
                 result = "validation_failed",
-                "Bucket notification config validation failed"
+                "notify bucket config validation"
             );
             if !matches!(e, ParseConfigError::ArnNotFound(_)) {
                 return Err(NotificationError::BucketNotification(e.to_string()));
@@ -94,7 +94,7 @@ impl NotifyBucketConfigManager {
                 region = %cfg.region,
                 error = %e,
                 result = "missing_target_arn",
-                "Bucket notification config references missing target ARN; keeping compatibility and loading remaining rules"
+                "notify bucket config validation"
             );
         }
 
@@ -107,7 +107,7 @@ impl NotifyBucketConfigManager {
             bucket = %bucket,
             region = %cfg.region,
             rule_count = cfg.get_rules_map().inner().len(),
-            "Loaded bucket notification config"
+            "notify bucket config state"
         );
         Ok(())
     }

@@ -56,6 +56,10 @@ use rustfs_credentials::Credentials;
 use s3s::Body;
 use tracing::debug;
 
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SWIFT_CORS: &str = "swift_cors";
+const EVENT_SWIFT_CORS_STATE: &str = "swift_cors_state";
+
 /// CORS configuration for a container
 #[derive(Debug, Clone, Default)]
 pub struct CorsConfig {
@@ -164,7 +168,15 @@ pub async fn handle_preflight(
     credentials: &Credentials,
     request_headers: &HeaderMap,
 ) -> SwiftResult<Response<Body>> {
-    debug!("CORS preflight request for container: {}", container_name);
+    debug!(
+        event = EVENT_SWIFT_CORS_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SWIFT_CORS,
+        state = "preflight_requested",
+        account = %account,
+        container = %container_name,
+        "swift cors state changed"
+    );
 
     // Load CORS configuration
     let config = CorsConfig::load(account, container_name, credentials).await?;

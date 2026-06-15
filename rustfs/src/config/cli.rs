@@ -72,6 +72,14 @@ pub fn preprocess_args_for_legacy(args: Vec<String>) -> Vec<String> {
     if KNOWN_SUBCOMMANDS.contains(&first.as_str()) {
         return args;
     }
+    // Preserve the traditional `rustfs help` entry point without exposing
+    // Clap's generated `help` subcommand in the top-level command list.
+    if first == "help" {
+        let mut out = vec![args[0].clone()];
+        out.extend(args[2..].iter().cloned());
+        out.push("--help".to_string());
+        return out;
+    }
     // If first arg is --info, treat it as info subcommand
     if first == "--info" {
         let mut out = vec![args[0].clone(), "info".to_string()];
@@ -91,6 +99,7 @@ pub fn preprocess_args_for_legacy(args: Vec<String>) -> Vec<String> {
 /// Main CLI parser
 #[derive(Parser, Clone)]
 #[command(name = "rustfs", version = SHORT_VERSION, long_version = LONG_VERSION)]
+#[command(disable_help_subcommand = true)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -180,7 +189,13 @@ pub struct ServerOpts {
     )]
     pub address: String,
 
-    /// Domain name used for virtual-hosted-style requests.
+    /// Domain name(s) for virtual-hosted-style S3 requests (comma-separated).
+    ///
+    /// Required for clients that default to virtual-hosted-style addressing
+    /// (AWS SDK, Terraform/Pulumi, etc.), e.g. `RUSTFS_SERVER_DOMAINS=s3.example.com`
+    /// so that `bucket.s3.example.com` is routed to bucket `bucket`. When unset, only
+    /// path-style addressing is supported (configure clients with
+    /// `s3_use_path_style = true` / `force_path_style=true`).
     #[arg(
         long,
         env = "RUSTFS_SERVER_DOMAINS",
@@ -332,5 +347,25 @@ pub fn default_server_opts() -> ServerOpts {
         kms_allow_insecure_dev_defaults: false,
         buffer_profile_disable: false,
         buffer_profile: "GeneralPurpose".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, preprocess_args_for_legacy};
+    use clap::Parser;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn preprocess_help_command_displays_top_level_help() {
+        let args = preprocess_args_for_legacy(vec!["rustfs".to_string(), "help".to_string()]);
+
+        assert_eq!(args, vec!["rustfs".to_string(), "--help".to_string()]);
+
+        let err = match Cli::try_parse_from(args) {
+            Ok(_) => panic!("rustfs help should display help"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
     }
 }

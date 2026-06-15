@@ -35,7 +35,7 @@ use crate::set_disk::get_lock_acquire_timeout;
 use crate::store_api::{
     DeletedObject, HTTPRangeSpec, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOptions, ObjectToDelete, WalkOptions,
 };
-use crate::{StorageAPI, new_object_layer_fn};
+use crate::{StorageAPI, resolve_object_store_handle};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
 use aws_sdk_s3::primitives::ByteStream;
@@ -87,7 +87,7 @@ use tokio::task::JoinSet;
 use tokio::time::Duration as TokioDuration;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, instrument, warn};
+use tracing::{debug, error, instrument, trace, warn};
 use uuid::Uuid;
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -98,7 +98,6 @@ const EVENT_RESYNC_OBJECT_PROCESSED: &str = "replication_resync_object_processed
 const EVENT_RESYNC_RUNTIME_SKIPPED: &str = "replication_resync_runtime_skipped";
 const EVENT_REPLICATION_DELETE_SKIPPED: &str = "replication_delete_skipped";
 const EVENT_REPLICATION_FORCE_DELETE_SKIPPED: &str = "replication_force_delete_skipped";
-const EVENT_RESYNC_WORKER_SIGNAL_FAILED: &str = "replication_resync_worker_signal_failed";
 const EVENT_RESYNC_TASK_FAILED: &str = "replication_resync_task_failed";
 const EVENT_RESYNC_TARGET_OPERATION_FAILED: &str = "replication_resync_target_operation_failed";
 const EVENT_RESYNC_RUNTIME_CHANNEL_FAILED: &str = "replication_resync_runtime_channel_failed";
@@ -459,33 +458,14 @@ pub struct ReplicationResyncer {
     pub status_map: Arc<RwLock<HashMap<String, BucketReplicationResyncStatus>>>,
     pub worker_size: usize,
     pub cancel_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
-    pub worker_tx: tokio::sync::broadcast::Sender<()>,
-    pub worker_rx: tokio::sync::broadcast::Receiver<()>,
 }
 
 impl ReplicationResyncer {
     pub async fn new() -> Self {
-        let (worker_tx, worker_rx) = tokio::sync::broadcast::channel(RESYNC_WORKER_COUNT);
-
-        for _ in 0..RESYNC_WORKER_COUNT {
-            if let Err(err) = worker_tx.send(()) {
-                error!(
-                    event = EVENT_RESYNC_WORKER_SIGNAL_FAILED,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                    reason = "worker_bootstrap_signal_failed",
-                    error = %err,
-                    "Failed to signal replication resync worker"
-                );
-            }
-        }
-
         Self {
             status_map: Arc::new(RwLock::new(HashMap::new())),
             worker_size: RESYNC_WORKER_COUNT,
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
-            worker_tx,
-            worker_rx,
         }
     }
 
@@ -686,18 +666,6 @@ impl ReplicationResyncer {
                 "Failed to update resync status"
             );
         }
-        if let Err(err) = self.worker_tx.send(()) {
-            error!(
-                event = EVENT_RESYNC_WORKER_SIGNAL_FAILED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                bucket = %opts.bucket,
-                arn = %opts.arn,
-                reason = "worker_release_signal_failed",
-                error = %err,
-                "Failed to signal replication resync worker"
-            );
-        }
         // TODO: Metrics
     }
 
@@ -709,14 +677,18 @@ impl ReplicationResyncer {
         heal: bool,
         opts: ResyncOpts,
     ) {
-        let mut worker_rx = self.worker_rx.resubscribe();
-
-        tokio::select! {
-            _ = cancellation_token.cancelled() => {
-                return;
-            }
-
-            _ = worker_rx.recv() => {}
+        // Check cancellation before starting the scan.
+        // NOTE: the previous design waited here on `worker_rx.resubscribe().recv()` to
+        // throttle concurrent resyncs, but `resubscribe()` positions the new receiver at
+        // the current write-head of the broadcast ring buffer, so all pre-sent bootstrap
+        // signals (written in `ReplicationResyncer::new`) are invisible to it.  Every
+        // spawned task therefore blocked forever, which is why `resync start` reported
+        // "started" yet objects never moved.  Throttling at this level is also incorrect
+        // for broadcast channels (one send unblocks ALL receivers).  The inner
+        // per-object worker pool (mpsc channels, line ~877) already provides the right
+        // concurrency limit.
+        if cancellation_token.is_cancelled() {
+            return;
         }
 
         let cfg = match get_replication_config(&opts.bucket).await {
@@ -948,18 +920,32 @@ impl ReplicationResyncer {
                         (roi.size, None)
                     };
 
-                    debug!(
-                        event = EVENT_RESYNC_OBJECT_PROCESSED,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                        reset_id = %reset_id,
-                        bucket = %bucket_name,
-                        object = %roi.name,
-                        version_id = %roi.version_id.unwrap_or_default(),
-                        size,
-                        error = ?err,
-                        "Processed resync object"
-                    );
+                    if err.is_some() {
+                        debug!(
+                            event = EVENT_RESYNC_OBJECT_PROCESSED,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                            reset_id = %reset_id,
+                            bucket = %bucket_name,
+                            object = %roi.name,
+                            version_id = %roi.version_id.unwrap_or_default(),
+                            size,
+                            error = ?err,
+                            "Processed resync object with verification error"
+                        );
+                    } else {
+                        trace!(
+                            event = EVENT_RESYNC_OBJECT_PROCESSED,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                            reset_id = %reset_id,
+                            bucket = %bucket_name,
+                            object = %roi.name,
+                            version_id = %roi.version_id.unwrap_or_default(),
+                            size,
+                            "Processed resync object"
+                        );
+                    }
 
                     if cancel_token.is_cancelled() {
                         return;
@@ -1608,7 +1594,7 @@ impl ObjectInfoExt for ObjectInfo {
 }
 
 pub async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOptions) -> ReplicateDecision {
-    if new_object_layer_fn().is_none() {
+    if resolve_object_store_handle().is_none() {
         return ReplicateDecision::default();
     }
 
@@ -2621,6 +2607,10 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
         name: object.clone(),
         user_tags: roi.user_tags.clone(),
         ssec: roi.ssec,
+        op_type: roi.op_type,
+        // ExistingObject ops must respect per-rule ExistingObjectReplicationStatus.
+        // Heal ops intentionally bypass it (repairing a past failure is not an initial sync).
+        existing_object: roi.op_type == ReplicationType::ExistingObject,
         ..Default::default()
     });
 

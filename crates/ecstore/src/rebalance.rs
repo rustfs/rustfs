@@ -82,6 +82,8 @@ pub struct RebalanceStats {
     pub participating: bool, // Whether the pool is participating in rebalance
     #[serde(rename = "inf")]
     pub info: RebalanceInfo, // Rebalance operation info
+    #[serde(rename = "cw", default)]
+    pub cleanup_warnings: RebalanceCleanupWarnings,
 }
 
 impl RebalanceStats {
@@ -514,6 +516,20 @@ pub struct RebalanceInfo {
     pub status: RebalStatus, // Current state of rebalance operation
 }
 
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RebalanceCleanupWarnings {
+    #[serde(rename = "count", default)]
+    pub count: u64,
+    #[serde(rename = "lastMsg", default)]
+    pub last_message: Option<String>,
+    #[serde(rename = "lastBucket", default)]
+    pub last_bucket: Option<String>,
+    #[serde(rename = "lastObject", default)]
+    pub last_object: Option<String>,
+    #[serde(rename = "lastAt", default)]
+    pub last_at: Option<OffsetDateTime>,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct DiskStat {
@@ -858,7 +874,14 @@ impl ECStore {
             "init_rebalance_meta",
         )?;
 
-        info!("init_rebalance_meta: rebalance meta saved");
+        info!(
+            event = EVENT_REBALANCE_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            state = "metadata_initialized",
+            bucket_count = bucktes.len(),
+            "Rebalance metadata initialized"
+        );
 
         let id = meta.id.clone();
 
@@ -898,9 +921,16 @@ impl ECStore {
 
     #[tracing::instrument(skip(self))]
     pub async fn next_rebal_bucket(&self, pool_index: usize) -> Result<Option<String>> {
-        info!("next_rebal_bucket: pool_index: {}", pool_index);
         let rebalance_meta = self.rebalance_meta.read().await;
-        info!("next_rebal_bucket: rebalance_meta: {:?}", rebalance_meta);
+        debug!(
+            event = EVENT_REBALANCE_BUCKET,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            pool_index,
+            has_meta = rebalance_meta.is_some(),
+            state = "next_bucket_lookup",
+            "Rebalance next bucket lookup"
+        );
         resolve_next_rebalance_bucket(rebalance_meta.as_ref(), pool_index)
     }
 
@@ -908,6 +938,24 @@ impl ECStore {
     pub async fn bucket_rebalance_done(&self, pool_index: usize, bucket: String) -> Result<()> {
         let mut rebalance_meta = self.rebalance_meta.write().await;
         mark_rebalance_bucket_done(rebalance_meta.as_mut(), pool_index, &bucket)
+    }
+
+    async fn record_rebalance_cleanup_warning(
+        &self,
+        pool_index: usize,
+        bucket: &str,
+        object: &str,
+        message: String,
+    ) -> Result<()> {
+        let mut rebalance_meta = self.rebalance_meta.write().await;
+        record_rebalance_cleanup_warning_in_meta(
+            rebalance_meta.as_mut(),
+            pool_index,
+            bucket,
+            object,
+            message,
+            OffsetDateTime::now_utc(),
+        )
     }
 
     async fn defer_rebalance_bucket(&self, pool_index: usize, bucket: String, last_error: String) -> Result<()> {
@@ -931,20 +979,38 @@ impl ECStore {
         let rebalance_meta = self.rebalance_meta.read().await;
         if let Some(meta) = rebalance_meta.as_ref() {
             meta.pool_stats.iter().enumerate().for_each(|(i, v)| {
-                info!(
-                    "is_rebalance_started: pool_index: {}, participating: {:?}, status: {:?}",
-                    i, v.participating, v.info.status
+                debug!(
+                    event = EVENT_REBALANCE_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    pool_index = i,
+                    participating = v.participating,
+                    status = ?v.info.status,
+                    state = "status_inspected",
+                    "Rebalance status inspected"
                 );
             });
 
             let started = is_rebalance_conflicting_with_decommission(meta);
             if started {
-                info!("is_rebalance_started: rebalance started");
+                debug!(
+                    event = EVENT_REBALANCE_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    state = "running",
+                    "Rebalance is running"
+                );
                 return true;
             }
         }
 
-        info!("is_rebalance_started: rebalance not started");
+        debug!(
+            event = EVENT_REBALANCE_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            state = "not_running",
+            "Rebalance is not running"
+        );
         false
     }
 
@@ -1023,7 +1089,11 @@ impl ECStore {
                 );
                 return Ok(());
             }
-            if complete_rebalance_pools_at_goal(meta, OffsetDateTime::now_utc()) {
+            let now = OffsetDateTime::now_utc();
+            if complete_rebalance_pools_at_goal(meta, now) {
+                meta_to_save = Some(meta.clone());
+            }
+            if complete_rebalance_pools_with_empty_queue(meta, now) {
                 meta_to_save = Some(meta.clone());
             }
             meta.cancel = Some(cancel_tx);
@@ -1054,6 +1124,19 @@ impl ECStore {
             Vec::new()
         };
 
+        if !participants.iter().any(|participating| *participating) {
+            debug!(
+                event = EVENT_REBALANCE_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                state = "start_skipped",
+                reason = "no_participants",
+                "Skipped rebalance start because no pools are participating"
+            );
+            return Ok(());
+        }
+
+        let mut workers_started = 0usize;
         for (idx, participating) in participants.iter().enumerate() {
             if !*participating {
                 debug!(
@@ -1088,20 +1171,41 @@ impl ECStore {
             let pool_idx = idx;
             let store = self.clone();
             let rx_clone = rx.clone();
+            workers_started += 1;
             tokio::spawn(async move {
                 if let Err(err) = store.rebalance_buckets(rx_clone, pool_idx).await {
-                    error!("Rebalance failed for pool {}: {}", pool_idx, err);
+                    error!(
+                        event = EVENT_REBALANCE_STATE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        pool_index = pool_idx,
+                        state = "pool_failed",
+                        error = %err,
+                        "Rebalance pool failed"
+                    );
                 } else {
-                    info!(
+                    debug!(
                         event = EVENT_REBALANCE_STATE,
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_REBALANCE,
                         pool_index = pool_idx,
                         state = "completed",
-                        "Completed rebalance pool"
+                        "Rebalance pool completed"
                     );
                 }
             });
+        }
+
+        if workers_started == 0 {
+            debug!(
+                event = EVENT_REBALANCE_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                state = "start_skipped",
+                reason = "no_local_participants",
+                "Skipped rebalance start because no local pools are participating"
+            );
+            return Ok(());
         }
 
         info!(
@@ -1109,7 +1213,8 @@ impl ECStore {
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REBALANCE,
             state = "started",
-            "Started rebalance"
+            worker_count = workers_started,
+            "Rebalance started"
         );
         Ok(())
     }
@@ -1210,7 +1315,7 @@ impl ECStore {
             subsystem = LOG_SUBSYSTEM_REBALANCE,
             pool_index,
             state = "pool_started",
-            "Started rebalance worker"
+            "Rebalance worker started"
         );
         let mut final_result: Result<()> = Ok(());
         let mut deferred_buckets = HashSet::new();
@@ -1237,7 +1342,15 @@ impl ECStore {
             let next_bucket = match self.next_rebal_bucket(pool_index).await {
                 Ok(bucket) => bucket,
                 Err(err) => {
-                    error!("next_rebal_bucket failed for pool {}: {:?}", pool_index, err);
+                    error!(
+                        event = EVENT_REBALANCE_BUCKET,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        pool_index,
+                        state = "next_bucket_failed",
+                        error = ?err,
+                        "Rebalance next bucket lookup failed"
+                    );
                     final_result = Err(resolve_rebalance_terminal_error(
                         err.clone(),
                         send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await,
@@ -1264,7 +1377,16 @@ impl ECStore {
                 ) {
                     Ok(outcome) => outcome,
                     Err(err) => {
-                        error!("Error rebalancing bucket {}: {:?}", bucket, err);
+                        error!(
+                            event = EVENT_REBALANCE_BUCKET,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_REBALANCE,
+                            pool_index,
+                            bucket = %bucket,
+                            state = "bucket_failed",
+                            error = ?err,
+                            "Rebalance bucket failed"
+                        );
                         final_result = Err(resolve_rebalance_terminal_error(
                             err.clone(),
                             send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await,
@@ -1278,7 +1400,16 @@ impl ECStore {
                         let err = Error::other(format!(
                             "rebalance bucket {bucket} deferred repeatedly due to transient object failures: {last_error}"
                         ));
-                        error!("Error rebalancing bucket {}: {:?}", bucket, err);
+                        error!(
+                            event = EVENT_REBALANCE_BUCKET,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_REBALANCE,
+                            pool_index,
+                            bucket = %bucket,
+                            state = "bucket_deferred_repeatedly",
+                            error = ?err,
+                            "Rebalance bucket failed after repeated deferral"
+                        );
                         final_result = Err(resolve_rebalance_terminal_error(
                             err.clone(),
                             send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await,
@@ -1297,7 +1428,16 @@ impl ECStore {
                         "Deferred rebalance bucket after transient object failures"
                     );
                     if let Err(err) = self.defer_rebalance_bucket(pool_index, bucket.clone(), last_error).await {
-                        error!("defer_rebalance_bucket failed for pool {}: {:?}", pool_index, err);
+                        error!(
+                            event = EVENT_REBALANCE_BUCKET,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_REBALANCE,
+                            pool_index,
+                            bucket = %bucket,
+                            state = "defer_failed",
+                            error = ?err,
+                            "Rebalance bucket defer failed"
+                        );
                         final_result = Err(resolve_rebalance_terminal_error(
                             err.clone(),
                             send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await,
@@ -1317,7 +1457,15 @@ impl ECStore {
                     "Completed rebalance bucket"
                 );
                 if let Err(err) = self.bucket_rebalance_done(pool_index, bucket).await {
-                    error!("bucket_rebalance_done failed for pool {}: {:?}", pool_index, err);
+                    error!(
+                        event = EVENT_REBALANCE_BUCKET,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        pool_index,
+                        state = "bucket_done_mark_failed",
+                        error = ?err,
+                        "Rebalance bucket completion mark failed"
+                    );
                     final_result = Err(resolve_rebalance_terminal_error(
                         err.clone(),
                         send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await,
@@ -1344,7 +1492,7 @@ impl ECStore {
             subsystem = LOG_SUBSYSTEM_REBALANCE,
             pool_index,
             state = "pool_done",
-            "Finished rebalance worker"
+            "Rebalance worker finished"
         );
 
         if final_result.is_ok()
@@ -1358,7 +1506,14 @@ impl ECStore {
         {
             final_result = Err(err);
         }
-        info!("Pool {} rebalancing is done2", pool_index);
+        debug!(
+            event = EVENT_REBALANCE_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            pool_index,
+            state = "pool_result_returned",
+            "Rebalance worker result returned"
+        );
         final_result
     }
 
@@ -1557,6 +1712,32 @@ fn mark_rebalance_bucket_done(meta: Option<&mut RebalanceMeta>, pool_index: usiz
     }
 }
 
+fn record_rebalance_cleanup_warning_in_meta(
+    meta: Option<&mut RebalanceMeta>,
+    pool_index: usize,
+    bucket: &str,
+    object: &str,
+    message: String,
+    now: OffsetDateTime,
+) -> Result<()> {
+    let Some(meta) = meta else {
+        return Err(rebalance_metadata_not_initialized_error("record rebalance cleanup warning"));
+    };
+
+    ensure_valid_rebalance_pool_index(meta.pool_stats.len(), pool_index)?;
+    let Some(pool_stat) = meta.pool_stats.get_mut(pool_index) else {
+        return Err(invalid_rebalance_pool_index_error(pool_index, meta.pool_stats.len()));
+    };
+
+    pool_stat.cleanup_warnings.count = pool_stat.cleanup_warnings.count.saturating_add(1);
+    pool_stat.cleanup_warnings.last_message = Some(message);
+    pool_stat.cleanup_warnings.last_bucket = Some(bucket.to_string());
+    pool_stat.cleanup_warnings.last_object = Some(object.to_string());
+    pool_stat.cleanup_warnings.last_at = Some(now);
+    meta.last_refreshed_at = Some(now);
+    Ok(())
+}
+
 fn take_bucket_from_rebalance_queue(pool_stat: &mut RebalanceStats, bucket: &str) -> bool {
     let mut found = false;
     pool_stat.buckets.retain(|name| {
@@ -1605,6 +1786,23 @@ fn complete_rebalance_pools_at_goal(meta: &mut RebalanceMeta, now: OffsetDateTim
             pool_stat.info.last_error = None;
             changed = true;
         }
+    }
+
+    changed
+}
+
+fn complete_rebalance_pools_with_empty_queue(meta: &mut RebalanceMeta, now: OffsetDateTime) -> bool {
+    let mut changed = false;
+
+    for pool_stat in meta.pool_stats.iter_mut() {
+        if !is_rebalance_pool_started(pool_stat) || !pool_stat.buckets.is_empty() {
+            continue;
+        }
+
+        pool_stat.info.status = RebalStatus::Completed;
+        pool_stat.info.end_time = Some(now);
+        pool_stat.info.last_error = None;
+        changed = true;
     }
 
     changed
@@ -1733,11 +1931,15 @@ where
     result.map_err(|err| Error::other(format!("rebalance file_info_versions failed for {bucket}/{object_name}: {err}")))
 }
 
-fn resolve_rebalance_entry_cleanup_delete_result(result: Result<ObjectInfo>, bucket: &str, object_name: &str) -> Result<()> {
+fn resolve_rebalance_entry_cleanup_delete_result(
+    result: Result<ObjectInfo>,
+    bucket: &str,
+    object_name: &str,
+) -> Result<Option<String>> {
     match result {
-        Ok(_) => Ok(()),
-        Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => Ok(()),
-        Err(err) => Err(Error::other(format!("rebalance cleanup delete failed for {bucket}/{object_name}: {err}"))),
+        Ok(_) => Ok(None),
+        Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => Ok(None),
+        Err(err) => Ok(Some(format!("rebalance cleanup delete failed for {bucket}/{object_name}: {err}"))),
     }
 }
 
@@ -2140,6 +2342,25 @@ fn remove_rebalanced_buckets_from_queue(pool_stat: &mut RebalanceStats) {
     pool_stat.buckets.retain(|bucket| !rebalanced_buckets.contains(bucket));
 }
 
+fn merge_rebalance_cleanup_warnings(remote: &mut RebalanceCleanupWarnings, local: &RebalanceCleanupWarnings) {
+    remote.count = remote.count.max(local.count);
+
+    if should_replace_rebalance_cleanup_warning(remote.last_at, local.last_at) {
+        remote.last_message = local.last_message.clone();
+        remote.last_bucket = local.last_bucket.clone();
+        remote.last_object = local.last_object.clone();
+        remote.last_at = local.last_at;
+    }
+}
+
+fn should_replace_rebalance_cleanup_warning(remote_at: Option<OffsetDateTime>, local_at: Option<OffsetDateTime>) -> bool {
+    match (remote_at, local_at) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(remote), Some(local)) => local >= remote,
+    }
+}
+
 fn merge_rebalance_pool_stats(remote: &mut RebalanceStats, local: &RebalanceStats) {
     remote.init_free_space = remote.init_free_space.max(local.init_free_space);
     remote.init_capacity = remote.init_capacity.max(local.init_capacity);
@@ -2153,6 +2374,7 @@ fn merge_rebalance_pool_stats(remote: &mut RebalanceStats, local: &RebalanceStat
     remote.num_objects = remote.num_objects.max(local.num_objects);
     remote.num_versions = remote.num_versions.max(local.num_versions);
     remote.bytes = remote.bytes.max(local.bytes);
+    merge_rebalance_cleanup_warnings(&mut remote.cleanup_warnings, &local.cleanup_warnings);
 
     if local_is_newer {
         remote.bucket = local.bucket.clone();
@@ -2482,7 +2704,7 @@ impl ECStore {
         )?;
 
         if should_cleanup_rebalance_source_entry(rebalanced, fivs.versions.len()) {
-            resolve_rebalance_entry_cleanup_delete_result(
+            let cleanup_warning = resolve_rebalance_entry_cleanup_delete_result(
                 set.delete_object(
                     bucket.as_str(),
                     &encode_dir_object(&entry.name),
@@ -2496,18 +2718,48 @@ impl ECStore {
                 .await,
                 bucket.as_str(),
                 entry.name.as_str(),
-            )
-            .map_err(|err| with_rebalance_entry_context("cleanup_source", bucket.as_str(), entry.name.as_str(), err))?;
-            debug!(
-                event = EVENT_REBALANCE_ENTRY,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REBALANCE,
-                pool_index,
-                bucket = %bucket,
-                object = %entry.name,
-                state = "source_deleted",
-                "Deleted rebalance source entry"
-            );
+            )?;
+            if let Some(message) = cleanup_warning {
+                warn!(
+                    event = EVENT_REBALANCE_ENTRY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    pool_index,
+                    bucket = %bucket,
+                    object = %entry.name,
+                    stage = "cleanup_source",
+                    cleanup_status = "failed_ignored",
+                    error = %message,
+                    "Ignored rebalance source cleanup failure"
+                );
+                if let Err(err) = self
+                    .record_rebalance_cleanup_warning(pool_index, bucket.as_str(), entry.name.as_str(), message)
+                    .await
+                {
+                    error!(
+                        event = EVENT_REBALANCE_ENTRY,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        pool_index,
+                        bucket = %bucket,
+                        object = %entry.name,
+                        stage = "cleanup_source",
+                        error = ?err,
+                        "Failed to record rebalance source cleanup warning"
+                    );
+                }
+            } else {
+                debug!(
+                    event = EVENT_REBALANCE_ENTRY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    pool_index,
+                    bucket = %bucket,
+                    object = %entry.name,
+                    state = "source_deleted",
+                    "Deleted rebalance source entry"
+                );
+            }
         }
 
         Ok(RebalanceEntryOutcome::Completed)
@@ -2544,7 +2796,15 @@ impl ECStore {
         ensure_valid_rebalance_pool_index(self.pools.len(), pool_index)?;
 
         // Placeholder for actual bucket rebalance logic
-        info!("Rebalancing bucket {} in pool {}", bucket, pool_index);
+        debug!(
+            event = EVENT_REBALANCE_BUCKET,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            pool_index,
+            bucket = %bucket,
+            state = "entry_scan_started",
+            "Rebalance bucket entry scan started"
+        );
 
         // TODO: other config
         // if bucket != RUSTFS_META_BUCKET{
@@ -2718,9 +2978,14 @@ impl ECStore {
 
         let pool = clone_first_arc(&self.pools, "save_rebalance_stats: no pools available")?;
 
-        info!(
-            "save_rebalance_stats: save rebalance meta, pool_idx: {}, opt: {:?}, meta: {:?}",
-            pool_idx, opt, meta_to_save
+        debug!(
+            event = EVENT_REBALANCE_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            pool_index = pool_idx,
+            save_opt = ?opt,
+            state = "metadata_save_requested",
+            "Rebalance metadata save requested"
         );
         let stage = format!("save_rebalance_stats for pool {pool_idx} opt {opt:?}");
         resolve_rebalance_meta_save_result(
@@ -2791,12 +3056,27 @@ impl SetDisks {
         bucket: String,
         cb: ListCallback,
     ) -> Result<()> {
-        info!("list_objects_to_rebalance: start list_objects_to_rebalance");
+        debug!(
+            event = EVENT_REBALANCE_LISTING,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            bucket = %bucket,
+            state = "started",
+            "Rebalance listing started"
+        );
         // Placeholder for actual object listing logic
         let (disks, _) = self.get_online_disks_with_healing(false).await;
         ensure_rebalance_listing_disks_available(!disks.is_empty(), &bucket)?;
 
-        info!("list_objects_to_rebalance: get online disks with healing");
+        debug!(
+            event = EVENT_REBALANCE_LISTING,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            bucket = %bucket,
+            disk_count = disks.len(),
+            state = "disks_resolved",
+            "Rebalance listing disks resolved"
+        );
         let listing_quorum = self.set_drive_count.div_ceil(2);
 
         let resolver = MetadataResolutionParams {
@@ -2816,7 +3096,14 @@ impl SetDisks {
                 min_disks: listing_quorum,
                 skip_walkdir_total_timeout: true,
                 agreed: Some(Box::new(move |entry: MetaCacheEntry| {
-                    info!("list_objects_to_rebalance: agreed: {:?}", &entry.name);
+                    debug!(
+                        event = EVENT_REBALANCE_LISTING,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        entry = %entry.name,
+                        state = "agreed_entry",
+                        "Rebalance listing agreed entry"
+                    );
                     Box::pin(cb1(entry))
                 })),
                 partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
@@ -2826,11 +3113,24 @@ impl SetDisks {
 
                     match entries.resolve(resolver) {
                         Some(entry) => {
-                            info!("list_objects_to_rebalance: list_objects_to_decommission get {}", &entry.name);
+                            debug!(
+                                event = EVENT_REBALANCE_LISTING,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                                entry = %entry.name,
+                                state = "resolved_partial_entry",
+                                "Rebalance listing resolved partial entry"
+                            );
                             Box::pin(async move { cb(entry).await })
                         }
                         None => {
-                            info!("list_objects_to_rebalance: list_objects_to_decommission get none");
+                            debug!(
+                                event = EVENT_REBALANCE_LISTING,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                                state = "partial_entry_missing",
+                                "Rebalance listing partial entry missing"
+                            );
                             Box::pin(async {})
                         }
                     }
@@ -2840,7 +3140,14 @@ impl SetDisks {
         )
         .await?;
 
-        info!("list_objects_to_rebalance: list_objects_to_rebalance done");
+        debug!(
+            event = EVENT_REBALANCE_LISTING,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            bucket = %bucket,
+            state = "completed",
+            "Rebalance listing completed"
+        );
         Ok(())
     }
 }
@@ -2856,17 +3163,18 @@ mod rebalance_unit_tests {
     use super::rebalance_goal_reached;
     use super::{
         DiskError, GetObjectReader, HTTPRangeSpec, MigrationBackend, MigrationVersionResult, ObjectInfo, ObjectOptions,
-        RebalSaveOpt, RebalStatus, RebalanceBucketOutcome, RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta, RebalanceStats,
-        RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event, apply_stopped_at,
-        classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
-        complete_rebalance_pools_at_goal, defer_bucket_in_rebalance_queue, ensure_rebalance_listing_disks_available,
-        ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, has_deferred_rebalance_error,
-        is_rebalance_stopped_terminal_event, is_transient_rebalance_error, load_rebalance_bucket_configs,
-        mark_rebalance_bucket_done, merge_rebalance_meta, migrate_entry_version, migrate_entry_version_with_retry_wait,
-        next_rebal_bucket_from_stat, rebalance_delete_marker_opts, rebalance_listing_retry_delay,
-        rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error,
-        rebalance_migration_retry_delay, resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket,
-        resolve_rebalance_bucket_error, resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
+        RebalSaveOpt, RebalStatus, RebalanceBucketOutcome, RebalanceCleanupWarnings, RebalanceEntryOutcome, RebalanceInfo,
+        RebalanceMeta, RebalanceStats, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event,
+        apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
+        complete_rebalance_pools_at_goal, complete_rebalance_pools_with_empty_queue, defer_bucket_in_rebalance_queue,
+        ensure_rebalance_listing_disks_available, ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index,
+        has_deferred_rebalance_error, is_rebalance_stopped_terminal_event, is_transient_rebalance_error,
+        load_rebalance_bucket_configs, mark_rebalance_bucket_done, merge_rebalance_meta, migrate_entry_version,
+        migrate_entry_version_with_retry_wait, next_rebal_bucket_from_stat, rebalance_delete_marker_opts,
+        rebalance_listing_retry_delay, rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error,
+        rebalance_meta_load_unknown_version_error, rebalance_migration_retry_delay, record_rebalance_cleanup_warning_in_meta,
+        resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket, resolve_rebalance_bucket_error,
+        resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
         resolve_rebalance_file_info_versions_result, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
         resolve_rebalance_migrate_result_error, resolve_rebalance_optional_bucket_config_result, resolve_rebalance_participants,
         resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error,
@@ -2885,6 +3193,7 @@ mod rebalance_unit_tests {
     use rustfs_filemeta::TRANSITION_COMPLETE;
     use rustfs_rio::Index;
     use s3s::dto::ReplicationConfiguration;
+    use serde::Serialize;
     use std::io::Cursor;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -2893,6 +3202,44 @@ mod rebalance_unit_tests {
     use tokio::sync::mpsc;
     use tokio::time::Duration;
     use tokio_util::sync::CancellationToken;
+
+    #[derive(Debug, Default, Serialize)]
+    struct LegacyRebalanceStats {
+        #[serde(rename = "ifs")]
+        init_free_space: u64,
+        #[serde(rename = "ic")]
+        init_capacity: u64,
+        #[serde(rename = "bus")]
+        buckets: Vec<String>,
+        #[serde(rename = "rbs")]
+        rebalanced_buckets: Vec<String>,
+        #[serde(rename = "bu")]
+        bucket: String,
+        #[serde(rename = "ob")]
+        object: String,
+        #[serde(rename = "no")]
+        num_objects: u64,
+        #[serde(rename = "nv")]
+        num_versions: u64,
+        #[serde(rename = "bs")]
+        bytes: u64,
+        #[serde(rename = "par")]
+        participating: bool,
+        #[serde(rename = "inf")]
+        info: RebalanceInfo,
+    }
+
+    #[derive(Debug, Default, Serialize)]
+    struct LegacyRebalanceMeta {
+        #[serde(rename = "stopTs")]
+        stopped_at: Option<OffsetDateTime>,
+        #[serde(rename = "id")]
+        id: String,
+        #[serde(rename = "pf")]
+        percent_free_goal: f64,
+        #[serde(rename = "rss")]
+        pool_stats: Vec<LegacyRebalanceStats>,
+    }
 
     struct MigrationBackendSpy {
         get_object_reader: Mutex<Option<core::result::Result<GetObjectReader, Error>>>,
@@ -3923,6 +4270,7 @@ mod rebalance_unit_tests {
     #[test]
     fn test_merge_rebalance_meta_preserves_updates_from_multiple_pools() {
         let start_time = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+        let warning_at = OffsetDateTime::from_unix_timestamp(1_500).unwrap();
         let mut remote = RebalanceMeta {
             id: "rebal-1".to_string(),
             percent_free_goal: 0.5,
@@ -3981,6 +4329,13 @@ mod rebalance_unit_tests {
                     bytes: 700,
                     bucket: "bucket-a".to_string(),
                     object: "local-object".to_string(),
+                    cleanup_warnings: RebalanceCleanupWarnings {
+                        count: 1,
+                        last_message: Some("cleanup failed".to_string()),
+                        last_bucket: Some("bucket-a".to_string()),
+                        last_object: Some("local-object".to_string()),
+                        last_at: Some(warning_at),
+                    },
                     ..Default::default()
                 },
             ],
@@ -3995,6 +4350,9 @@ mod rebalance_unit_tests {
         assert_eq!(remote.pool_stats[1].object, "local-object");
         assert!(remote.pool_stats[1].buckets.is_empty());
         assert_eq!(remote.pool_stats[1].rebalanced_buckets, vec!["bucket-a"]);
+        assert_eq!(remote.pool_stats[1].cleanup_warnings.count, 1);
+        assert_eq!(remote.pool_stats[1].cleanup_warnings.last_message.as_deref(), Some("cleanup failed"));
+        assert_eq!(remote.pool_stats[1].cleanup_warnings.last_at, Some(warning_at));
     }
 
     #[test]
@@ -4018,6 +4376,7 @@ mod rebalance_unit_tests {
         let local = RebalanceMeta {
             id: "rebal-1".to_string(),
             pool_stats: vec![RebalanceStats {
+                participating: true,
                 info: RebalanceInfo {
                     status: RebalStatus::Started,
                     ..Default::default()
@@ -4181,6 +4540,33 @@ mod rebalance_unit_tests {
     }
 
     #[test]
+    fn test_rebalance_meta_deserializes_legacy_stats_without_cleanup_warnings() {
+        let legacy = LegacyRebalanceMeta {
+            id: "rebal-legacy".to_string(),
+            percent_free_goal: 0.35,
+            pool_stats: vec![LegacyRebalanceStats {
+                buckets: vec!["bucket-a".to_string()],
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let data = rmp_serde::to_vec(&legacy).expect("legacy rebalance metadata should serialize");
+
+        let decoded: RebalanceMeta =
+            rmp_serde::from_slice(data.as_slice()).expect("legacy rebalance metadata should deserialize");
+
+        assert_eq!(decoded.id, "rebal-legacy");
+        assert_eq!(decoded.pool_stats.len(), 1);
+        assert_eq!(decoded.pool_stats[0].cleanup_warnings, RebalanceCleanupWarnings::default());
+        assert_eq!(decoded.pool_stats[0].info.status, RebalStatus::Started);
+    }
+
+    #[test]
     fn test_resolve_rebalance_stats_update_result_passthrough() {
         assert!(resolve_rebalance_stats_update_result(Ok(()), 0, "bucket", "object").is_ok());
     }
@@ -4246,7 +4632,7 @@ mod rebalance_unit_tests {
     #[test]
     fn test_resolve_rebalance_entry_cleanup_delete_result_passthrough() {
         let result = resolve_rebalance_entry_cleanup_delete_result(Ok(ObjectInfo::default()), "bucket-a", "obj.txt");
-        assert!(result.is_ok());
+        assert_eq!(result.expect("successful cleanup should pass through"), None);
     }
 
     #[test]
@@ -4256,14 +4642,15 @@ mod rebalance_unit_tests {
             "bucket-a",
             "obj.txt",
         );
-        assert!(result.is_ok());
+        assert_eq!(result.expect("missing cleanup source should be ignored"), None);
     }
 
     #[test]
-    fn test_resolve_rebalance_entry_cleanup_delete_result_wraps_error_context() {
-        let err = resolve_rebalance_entry_cleanup_delete_result(Err(Error::SlowDown), "bucket-a", "obj.txt")
-            .expect_err("unexpected cleanup errors should be wrapped");
-        let message = err.to_string();
+    fn test_resolve_rebalance_entry_cleanup_delete_result_returns_warning_for_failures() {
+        let warning = resolve_rebalance_entry_cleanup_delete_result(Err(Error::SlowDown), "bucket-a", "obj.txt")
+            .expect("cleanup delete failures should be downgraded to warnings")
+            .expect("cleanup delete failure should return warning");
+        let message = warning.as_str();
         assert!(message.contains("rebalance cleanup delete failed for bucket-a/obj.txt"));
     }
 
@@ -5017,6 +5404,41 @@ mod rebalance_unit_tests {
     }
 
     #[test]
+    fn test_complete_rebalance_pools_with_empty_queue_marks_started_participants_completed() {
+        let now = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+        let mut meta = RebalanceMeta {
+            pool_stats: vec![
+                RebalanceStats {
+                    participating: true,
+                    buckets: Vec::new(),
+                    info: RebalanceInfo {
+                        status: RebalStatus::Started,
+                        last_error: Some("stale error".to_string()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                RebalanceStats {
+                    participating: true,
+                    buckets: vec!["bucket-a".to_string()],
+                    info: RebalanceInfo {
+                        status: RebalStatus::Started,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(complete_rebalance_pools_with_empty_queue(&mut meta, now));
+        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Completed);
+        assert_eq!(meta.pool_stats[0].info.end_time, Some(now));
+        assert!(meta.pool_stats[0].info.last_error.is_none());
+        assert_eq!(meta.pool_stats[1].info.status, RebalStatus::Started);
+    }
+
+    #[test]
     fn test_should_skip_start_rebalance_only_when_running_and_cancel_attached() {
         assert!(should_skip_start_rebalance(true, true));
         assert!(!should_skip_start_rebalance(true, false));
@@ -5534,6 +5956,64 @@ mod rebalance_unit_tests {
             .expect("bucket in queue should be marked done after deferred retry succeeds");
 
         assert!(meta.pool_stats[0].info.last_error.is_none());
+    }
+
+    #[test]
+    fn test_record_rebalance_cleanup_warning_in_meta_preserves_last_error() {
+        let now = OffsetDateTime::from_unix_timestamp(10_000).unwrap();
+        let mut meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats {
+                info: RebalanceInfo {
+                    last_error: Some("old-error".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        record_rebalance_cleanup_warning_in_meta(Some(&mut meta), 0, "bucket-a", "obj.txt", "cleanup failed".to_string(), now)
+            .expect("cleanup warning should be recorded");
+
+        assert_eq!(meta.pool_stats[0].info.last_error.as_deref(), Some("old-error"));
+        assert_eq!(meta.pool_stats[0].cleanup_warnings.count, 1);
+        assert_eq!(meta.pool_stats[0].cleanup_warnings.last_message.as_deref(), Some("cleanup failed"));
+        assert_eq!(meta.pool_stats[0].cleanup_warnings.last_bucket.as_deref(), Some("bucket-a"));
+        assert_eq!(meta.pool_stats[0].cleanup_warnings.last_object.as_deref(), Some("obj.txt"));
+        assert_eq!(meta.pool_stats[0].cleanup_warnings.last_at, Some(now));
+        assert_eq!(meta.last_refreshed_at, Some(now));
+    }
+
+    #[test]
+    fn test_complete_rebalance_pools_with_empty_queue_preserves_cleanup_warnings() {
+        let warning_at = OffsetDateTime::from_unix_timestamp(9_000).unwrap();
+        let completed_at = OffsetDateTime::from_unix_timestamp(10_000).unwrap();
+        let mut meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                cleanup_warnings: RebalanceCleanupWarnings {
+                    count: 1,
+                    last_message: Some("cleanup failed".to_string()),
+                    last_bucket: Some("bucket-a".to_string()),
+                    last_object: Some("obj.txt".to_string()),
+                    last_at: Some(warning_at),
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(complete_rebalance_pools_with_empty_queue(&mut meta, completed_at));
+
+        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Completed);
+        assert!(meta.pool_stats[0].info.last_error.is_none());
+        assert_eq!(meta.pool_stats[0].cleanup_warnings.count, 1);
+        assert_eq!(meta.pool_stats[0].cleanup_warnings.last_message.as_deref(), Some("cleanup failed"));
+        assert_eq!(meta.pool_stats[0].cleanup_warnings.last_at, Some(warning_at));
     }
 
     #[test]

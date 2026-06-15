@@ -183,7 +183,9 @@ uer. `ClusterIssuer` or `Issuer`. |
 
 Scanner values map directly to scanner environment variables. For tuning
 workflow and `/v3/scanner/status` interpretation, see
-[Scanner Runtime Controls](../docs/operations/scanner-runtime-controls.md).
+[Scanner Runtime Controls](../docs/operations/scanner-runtime-controls.md). For
+repeatable scanner-pressure validation, see
+[Scanner Benchmark Runbook](../docs/operations/scanner-benchmark-runbook.md).
 
 ---
 

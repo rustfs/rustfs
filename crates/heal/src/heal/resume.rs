@@ -20,8 +20,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
+
+const LOG_COMPONENT_HEAL: &str = "heal";
+const LOG_SUBSYSTEM_RESUME: &str = "resume";
+const EVENT_HEAL_RESUME_STATE: &str = "heal_resume_state";
+const EVENT_HEAL_CHECKPOINT_STATE: &str = "heal_checkpoint_state";
 
 /// resume state file constants
 const RESUME_STATE_FILE: &str = "ahm_resume_state.json";
@@ -182,7 +187,15 @@ impl ResumeManager {
 
         // save initial state
         if let Err(e) = manager.save_state().await {
-            warn!("Failed to save initial resume state: {}", e);
+            warn!(
+                target: "rustfs::heal::resume",
+                event = EVENT_HEAL_RESUME_STATE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_RESUME,
+                state = "initial_save_failed",
+                error = %e,
+                "Heal resume state persistence failed"
+            );
         }
         Ok(manager)
     }
@@ -286,7 +299,15 @@ impl ResumeManager {
             let _ = self.disk.delete(RUSTFS_META_BUCKET, path_str, Default::default()).await;
         }
 
-        info!("Cleaned up resume state for task: {}", task_id);
+        debug!(
+            target: "rustfs::heal::resume",
+            event = EVENT_HEAL_RESUME_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_RESUME,
+            task_id,
+            state = "cleaned",
+            "Heal resume state cleaned"
+        );
         Ok(())
     }
 
@@ -302,7 +323,15 @@ impl ResumeManager {
         let path_str = path_to_str(&file_path)?;
         if let Err(e) = self.disk.write_all(RUSTFS_META_BUCKET, path_str, state_data.into()).await {
             if matches!(e, DiskError::UnformattedDisk) {
-                warn!("Cannot save resume state: unformatted disk");
+                warn!(
+                    target: "rustfs::heal::resume",
+                    event = EVENT_HEAL_RESUME_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_RESUME,
+                    task_id = %state.task_id,
+                    state = "skipped_unformatted_disk",
+                    "Heal resume state persistence skipped on unformatted disk"
+                );
                 return Ok(());
             }
             return Err(Error::TaskExecutionFailed {
@@ -310,7 +339,15 @@ impl ResumeManager {
             });
         }
 
-        debug!("Saved resume state for task: {}", state.task_id);
+        debug!(
+            target: "rustfs::heal::resume",
+            event = EVENT_HEAL_RESUME_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_RESUME,
+            task_id = %state.task_id,
+            state = "saved",
+            "Heal resume state persisted"
+        );
         Ok(())
     }
 
@@ -402,7 +439,15 @@ impl CheckpointManager {
 
         // save initial checkpoint
         if let Err(e) = manager.save_checkpoint().await {
-            warn!("Failed to save initial checkpoint: {}", e);
+            warn!(
+                target: "rustfs::heal::resume",
+                event = EVENT_HEAL_CHECKPOINT_STATE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_RESUME,
+                state = "initial_save_failed",
+                error = %e,
+                "Heal checkpoint persistence failed"
+            );
         }
         Ok(manager)
     }
@@ -479,7 +524,15 @@ impl CheckpointManager {
             let _ = self.disk.delete(RUSTFS_META_BUCKET, path_str, Default::default()).await;
         }
 
-        info!("Cleaned up checkpoint for task: {}", task_id);
+        debug!(
+            target: "rustfs::heal::resume",
+            event = EVENT_HEAL_CHECKPOINT_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_RESUME,
+            task_id,
+            state = "cleaned",
+            "Heal checkpoint cleaned"
+        );
         Ok(())
     }
 
@@ -500,7 +553,15 @@ impl CheckpointManager {
                 message: format!("Failed to save checkpoint: {e}"),
             })?;
 
-        debug!("Saved checkpoint for task: {}", checkpoint.task_id);
+        debug!(
+            target: "rustfs::heal::resume",
+            event = EVENT_HEAL_CHECKPOINT_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_RESUME,
+            task_id = %checkpoint.task_id,
+            state = "saved",
+            "Heal checkpoint persisted"
+        );
         Ok(())
     }
 
@@ -538,7 +599,15 @@ impl ResumeUtils {
         let entries = match disk.list_dir("", RUSTFS_META_BUCKET, BUCKET_META_PREFIX, -1).await {
             Ok(entries) => entries,
             Err(e) => {
-                debug!("Failed to list resume state files: {}", e);
+                debug!(
+                    target: "rustfs::heal::resume",
+                    event = EVENT_HEAL_RESUME_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_RESUME,
+                    state = "list_failed",
+                    error = %e,
+                    "Heal resume state listing failed"
+                );
                 return Ok(Vec::new());
             }
         };
@@ -557,7 +626,15 @@ impl ResumeUtils {
             }
         }
 
-        debug!("Found {} resumable tasks: {:?}", task_ids.len(), task_ids);
+        debug!(
+            target: "rustfs::heal::resume",
+            event = EVENT_HEAL_RESUME_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_RESUME,
+            task_count = task_ids.len(),
+            state = "listed",
+            "Heal resume states listed"
+        );
         Ok(task_ids)
     }
 
@@ -572,9 +649,28 @@ impl ResumeUtils {
                 let age_hours = (current_time - state.last_update) / 3600;
 
                 if age_hours > max_age_hours {
-                    info!("Cleaning up expired resume state for task: {} (age: {} hours)", task_id, age_hours);
+                    debug!(
+                        target: "rustfs::heal::resume",
+                        event = EVENT_HEAL_RESUME_STATE,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_RESUME,
+                        task_id,
+                        age_hours,
+                        state = "expired_cleanup_started",
+                        "Heal resume cleanup started"
+                    );
                     if let Err(e) = resume_manager.cleanup().await {
-                        warn!("Failed to cleanup expired resume state for task {}: {}", task_id, e);
+                        warn!(
+                            target: "rustfs::heal::resume",
+                            event = EVENT_HEAL_RESUME_STATE,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_RESUME,
+                            task_id,
+                            age_hours,
+                            state = "expired_cleanup_failed",
+                            error = %e,
+                            "Heal resume state cleanup failed"
+                        );
                     }
                 }
             }

@@ -24,14 +24,12 @@ use crate::server::{
     has_path_prefix, is_admin_path, is_table_catalog_path,
 };
 use crate::storage::apply_cors_headers;
-use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
+use crate::storage::request_context::{RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers};
 use bytes::Bytes;
-use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode};
+use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode, Uri};
 use http_body::Body;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
-use opentelemetry::global;
-use opentelemetry::trace::TraceContextExt;
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::get_env_opt_str;
 use rustfs_utils::http::headers::AMZ_REQUEST_ID;
@@ -43,34 +41,62 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 use tower::{Layer, Service};
 use tracing::{debug, error, info};
+use url::form_urlencoded;
 
 const HTTP_REQUEST_COMPLETED_EVENT: &str = "http_request_completed";
 const HTTP_REQUEST_FAILED_EVENT: &str = "http_request_failed";
 const LOG_COMPONENT_SERVER: &str = "server";
 const LOG_SUBSYSTEM_HTTP: &str = "http";
+const REDACTED_QUERY_VALUE: &str = "redacted";
+const OBJECT_ZIP_DOWNLOADS_PATH: &str = "/v3/object-zip-downloads/";
 
-/// A carrier that adapts [`HeaderMap`] for OpenTelemetry trace context propagation.
-struct HeaderMapCarrier<'a>(&'a HeaderMap);
-
-impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrier<'a> {
-    fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(key).and_then(|v| v.to_str().ok())
+pub(crate) fn redact_sensitive_uri_query(uri: &http::Uri) -> String {
+    let path = uri.path();
+    if !is_object_zip_download_path(path) {
+        return uri.to_string();
     }
 
-    fn keys(&self) -> Vec<&str> {
-        self.0.keys().map(|k| k.as_str()).collect()
+    let Some(query) = uri.query() else {
+        return uri.to_string();
+    };
+
+    let mut redacted_token = false;
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        if key == "token" {
+            redacted_token = true;
+            serializer.append_pair(&key, REDACTED_QUERY_VALUE);
+        } else {
+            serializer.append_pair(&key, &value);
+        }
     }
 
-    fn get_all(&self, key: &str) -> Option<Vec<&str>> {
-        let headers = self
-            .0
-            .get_all(key)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .collect::<Vec<_>>();
-
-        if headers.is_empty() { None } else { Some(headers) }
+    if !redacted_token {
+        return uri.to_string();
     }
+
+    let redacted_query = serializer.finish();
+    let path_and_query = if redacted_query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{redacted_query}")
+    };
+    let mut parts = uri.clone().into_parts();
+    match path_and_query.parse() {
+        Ok(path_and_query) => {
+            parts.path_and_query = Some(path_and_query);
+            http::Uri::from_parts(parts)
+                .map(|uri| uri.to_string())
+                .unwrap_or_else(|_| uri.to_string())
+        }
+        Err(_) => uri.to_string(),
+    }
+}
+
+fn is_object_zip_download_path(path: &str) -> bool {
+    (path.starts_with(ADMIN_PREFIX) || path.starts_with(MINIO_ADMIN_PREFIX))
+        && path.contains(OBJECT_ZIP_DOWNLOADS_PATH)
+        && path.ends_with(".zip")
 }
 
 /// Tower middleware layer that creates a canonical [`RequestContext`] from HTTP headers
@@ -79,8 +105,8 @@ impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrier<'a> {
 /// This layer must be placed after `SetRequestIdLayer` in the middleware stack,
 /// as it reads the `x-request-id` header that `SetRequestIdLayer` generates.
 ///
-/// Additionally, it stores the S3-compatible request ID alias in the request context
-/// without mutating signed request headers.
+/// Additionally, it preserves any upstream `x-amz-request-id` in the separate
+/// `RequestContext.x_amz_request_id` field without mutating signed request headers.
 #[derive(Clone, Default)]
 pub struct RequestContextLayer;
 
@@ -113,23 +139,12 @@ where
     fn call(&mut self, mut req: HttpRequest<B>) -> Self::Future {
         let request_id = extract_request_id_from_headers(req.headers());
 
-        // Extract OpenTelemetry trace/span context from incoming headers
-        let parent_cx = global::get_text_map_propagator(|propagator| propagator.extract(&HeaderMapCarrier(req.headers())));
-        let span_ref = parent_cx.span();
-        let span_context = span_ref.span_context();
-        let trace_id = if span_context.is_valid() {
-            Some(span_context.trace_id().to_string())
-        } else {
-            None
-        };
-        let span_id = if span_context.is_valid() {
-            Some(span_context.span_id().to_string())
-        } else {
-            None
-        };
+        let (trace_id, span_id) = extract_trace_context_ids_from_headers(req.headers())
+            .map(|(trace_id, span_id)| (Some(trace_id), Some(span_id)))
+            .unwrap_or((None, None));
 
-        // Preserve the upstream x-amz-request-id if present (S3 client forwarding),
-        // otherwise fall back to the canonical request_id.
+        // Preserve the upstream x-amz-request-id if present as the S3 compatibility alias;
+        // otherwise mirror the canonical internal request_id.
         let x_amz_request_id = req
             .headers()
             .get(AMZ_REQUEST_ID)
@@ -199,7 +214,7 @@ impl RequestLogContext {
             span_id: request_context.as_ref().and_then(|ctx| ctx.span_id.clone()),
             peer_addr,
             method: req.method().to_string(),
-            uri: req.uri().to_string(),
+            uri: redact_sensitive_uri_query(req.uri()),
             request_started_at: request_context,
             fallback_start: Instant::now(),
         }
@@ -940,6 +955,164 @@ where
     }
 }
 
+/// Structured-log event emitted when a virtual-hosted-style request cannot be
+/// routed because no server domain is configured.
+const VIRTUAL_HOST_STYLE_UNROUTABLE_EVENT: &str = "virtual_host_style_unroutable";
+
+/// Detects S3 requests that can only be virtual-hosted-style yet cannot be routed
+/// because no server domain is configured (`RUSTFS_SERVER_DOMAINS` unset).
+///
+/// Without a configured domain, s3s parses every request as path-style, so a
+/// virtual-hosted-style `PUT /` (the AWS SDK / Terraform default for `CreateBucket`)
+/// arrives with an empty bucket and fails with an opaque `501 NotImplemented`.
+///
+/// Only the service root (`/`) with a method that has no path-style equivalent
+/// (`PUT`/`DELETE`) and a DNS-style host (not an IP/socket address, and dotted like
+/// `bucket.example.com`) is matched. The host is read from the `Host` header
+/// (HTTP/1.1) or the request URI authority (HTTP/2 `:authority`). Such requests
+/// already fail today, so returning a clearer error never changes the outcome of a
+/// routable request. Returns the request host (without port) when matched.
+fn unroutable_virtual_host_target(method: &Method, uri: &Uri, headers: &HeaderMap) -> Option<String> {
+    if *method != Method::PUT && *method != Method::DELETE {
+        return None;
+    }
+    if uri.path() != "/" {
+        return None;
+    }
+
+    // `Host` is set for HTTP/1.1; HTTP/2 carries the host in the URI authority.
+    let raw_authority = match headers.get(http::header::HOST).and_then(|value| value.to_str().ok()) {
+        Some(value) => value,
+        None => uri.authority().map(|authority| authority.as_str())?,
+    };
+    if raw_authority.is_empty() {
+        return None;
+    }
+    // IP / socket-address hosts always use path-style addressing in s3s.
+    if rustfs_utils::is_socket_addr(raw_authority) {
+        return None;
+    }
+    // Parse as an Authority to split host/port robustly (e.g. bracketed IPv6) rather
+    // than slicing on `:`.
+    let authority = raw_authority.parse::<http::uri::Authority>().ok()?;
+    let host = authority.host();
+    // Require a dotted DNS name (the shape of a virtual-hosted bucket subdomain).
+    if !host.contains('.') || host.starts_with('.') || host.ends_with('.') {
+        return None;
+    }
+
+    Some(host.to_owned())
+}
+
+fn xml_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn build_virtual_host_hint_response<RestBody, GrpcBody>(
+    version: http::Version,
+    host: &str,
+    resource: &str,
+) -> Response<HybridBody<RestBody, GrpcBody>>
+where
+    RestBody: From<Bytes>,
+{
+    let message = format!(
+        "Virtual-hosted-style request for host '{host}' could not be routed because no server domain is \
+         configured. Set RUSTFS_SERVER_DOMAINS to the S3 endpoint domain your buckets are addressed under \
+         (for example RUSTFS_SERVER_DOMAINS=s3.example.com, so that bucket.s3.example.com routes to bucket \
+         'bucket'), or configure your S3 client to use path-style addressing (AWS SDK: force_path_style=true; \
+         Terraform aws provider: s3_use_path_style = true)."
+    );
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <Error><Code>NotImplemented</Code><Message>{message}</Message><Resource>{resource}</Resource></Error>",
+        message = xml_escape(&message),
+        resource = xml_escape(resource),
+    );
+
+    let mut builder = Response::builder()
+        .status(StatusCode::NOT_IMPLEMENTED)
+        .header(http::header::CONTENT_TYPE, "application/xml");
+    // This short-circuit path does not drain the request body. For HTTP/1.x, signal
+    // connection close so an undrained body cannot disrupt keep-alive reuse. `Connection`
+    // is a forbidden header in HTTP/2+, so it is only set for HTTP/1.x.
+    if !matches!(version, http::Version::HTTP_2 | http::Version::HTTP_3) {
+        builder = builder.header(http::header::CONNECTION, "close");
+    }
+    builder
+        .body(HybridBody::Rest {
+            rest_body: RestBody::from(Bytes::from(body)),
+        })
+        .expect("failed to build virtual-host hint response")
+}
+
+/// Returns an actionable error for virtual-hosted-style S3 requests that cannot be
+/// routed because `RUSTFS_SERVER_DOMAINS` is not configured. See
+/// [`unroutable_virtual_host_target`]. The layer is only installed when no server
+/// domain is configured, so it is a pure pass-through for every routable request.
+#[derive(Clone)]
+pub struct VirtualHostStyleHintLayer;
+
+impl<S> Layer<S> for VirtualHostStyleHintLayer {
+    type Service = VirtualHostStyleHintService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        VirtualHostStyleHintService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct VirtualHostStyleHintService<S> {
+    inner: S,
+}
+
+impl<S, ReqBody, RestBody, GrpcBody> Service<HttpRequest<ReqBody>> for VirtualHostStyleHintService<S>
+where
+    S: Service<HttpRequest<ReqBody>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    ReqBody: Send + 'static,
+    RestBody: From<Bytes> + Send + 'static,
+    GrpcBody: Send + 'static,
+{
+    type Response = Response<HybridBody<RestBody, GrpcBody>>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
+        if let Some(host) = unroutable_virtual_host_target(req.method(), req.uri(), req.headers()) {
+            let resource = req.uri().path().to_owned();
+            let version = req.version();
+            debug!(
+                event = VIRTUAL_HOST_STYLE_UNROUTABLE_EVENT,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_HTTP,
+                host = %host,
+                method = %req.method(),
+                "Rejected virtual-hosted-style request: no server domain configured (set RUSTFS_SERVER_DOMAINS or use path-style)"
+            );
+            return Box::pin(async move { Ok(build_virtual_host_hint_response(version, &host, &resource)) });
+        }
+
+        let mut inner = self.inner.clone();
+        Box::pin(async move { inner.call(req).await })
+    }
+}
+
 fn is_bodyless_status(status: StatusCode) -> bool {
     status.is_informational()
         || status == StatusCode::NO_CONTENT
@@ -1319,6 +1492,8 @@ mod tests {
     use http::Request;
     use http_body_util::BodyExt;
     use http_body_util::Full;
+    use opentelemetry::global;
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
     use serial_test::serial;
     use std::convert::Infallible;
     use std::io::{self, Write};
@@ -1435,6 +1610,160 @@ mod tests {
             assert!(body.windows(br#""status":"#.len()).any(|window| window == br#""status":"#));
         })
         .await;
+    }
+
+    #[test]
+    fn unroutable_virtual_host_target_matches_service_root_writes() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::HOST, HeaderValue::from_static("my-bucket.s3.example.com"));
+        assert_eq!(
+            unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/"), &headers),
+            Some("my-bucket.s3.example.com".to_owned())
+        );
+        assert_eq!(
+            unroutable_virtual_host_target(&Method::DELETE, &Uri::from_static("/"), &headers),
+            Some("my-bucket.s3.example.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn unroutable_virtual_host_target_strips_port() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::HOST, HeaderValue::from_static("bucket.localhost:9000"));
+        assert_eq!(
+            unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/"), &headers),
+            Some("bucket.localhost".to_owned())
+        );
+    }
+
+    #[test]
+    fn unroutable_virtual_host_target_uses_uri_authority_when_host_header_absent() {
+        // HTTP/2 clients carry the host in the URI authority (`:authority`) rather than a Host header.
+        let uri = Uri::from_static("https://my-bucket.s3.example.com/");
+        assert_eq!(
+            unroutable_virtual_host_target(&Method::PUT, &uri, &HeaderMap::new()),
+            Some("my-bucket.s3.example.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn unroutable_virtual_host_target_ignores_non_matching_requests() {
+        let mut vhost = HeaderMap::new();
+        vhost.insert(http::header::HOST, HeaderValue::from_static("bucket.s3.example.com"));
+        // Path-style request carries the bucket in the path.
+        assert_eq!(unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/bucket"), &vhost), None);
+        // GET / is ListBuckets, a valid path-style service call.
+        assert_eq!(unroutable_virtual_host_target(&Method::GET, &Uri::from_static("/"), &vhost), None);
+
+        // IP / socket-address hosts always use path-style addressing.
+        let mut ip = HeaderMap::new();
+        ip.insert(http::header::HOST, HeaderValue::from_static("127.0.0.1:9000"));
+        assert_eq!(unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/"), &ip), None);
+
+        // Bracketed IPv6 authority (with port) is a socket address, not a bucket subdomain.
+        let mut ipv6 = HeaderMap::new();
+        ipv6.insert(http::header::HOST, HeaderValue::from_static("[::1]:9000"));
+        assert_eq!(unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/"), &ipv6), None);
+
+        // Bare single-label hosts are not virtual-hosted bucket subdomains.
+        let mut bare = HeaderMap::new();
+        bare.insert(http::header::HOST, HeaderValue::from_static("localhost:9000"));
+        assert_eq!(unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/"), &bare), None);
+
+        // Trailing-dot FQDN is not matched (avoids suggesting a domain with a trailing dot).
+        let mut fqdn = HeaderMap::new();
+        fqdn.insert(http::header::HOST, HeaderValue::from_static("bucket.example.com."));
+        assert_eq!(unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/"), &fqdn), None);
+
+        // Missing Host header and no URI authority.
+        assert_eq!(
+            unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/"), &HeaderMap::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn build_virtual_host_hint_response_is_actionable() {
+        let response: Response<HybridBody<Full<Bytes>, Full<Bytes>>> =
+            build_virtual_host_hint_response(http::Version::HTTP_11, "my-bucket.s3.example.com", "/");
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/xml")
+        );
+        // HTTP/1.x error responses close the connection (the request body is not drained).
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONNECTION)
+                .and_then(|value| value.to_str().ok()),
+            Some("close")
+        );
+
+        // `Connection` is forbidden in HTTP/2, so it must not be set there.
+        let h2_response: Response<HybridBody<Full<Bytes>, Full<Bytes>>> =
+            build_virtual_host_hint_response(http::Version::HTTP_2, "my-bucket.s3.example.com", "/");
+        assert!(h2_response.headers().get(http::header::CONNECTION).is_none());
+    }
+
+    #[tokio::test]
+    async fn virtual_host_style_hint_layer_short_circuits_unroutable_put() {
+        let inner = CountingHybridService::default();
+        let calls = inner.calls();
+        let mut service = VirtualHostStyleHintLayer.layer(inner);
+
+        let response = service
+            .call(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/")
+                    .header(http::header::HOST, "my-bucket.s3.example.com")
+                    .body(Full::<Bytes>::from(Bytes::new()))
+                    .expect("request"),
+            )
+            .await
+            .expect("hint response");
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONNECTION)
+                .and_then(|value| value.to_str().ok()),
+            Some("close")
+        );
+
+        let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
+        let body = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(body.contains("RUSTFS_SERVER_DOMAINS=s3.example.com"));
+        assert!(body.contains("s3_use_path_style"));
+    }
+
+    #[tokio::test]
+    async fn virtual_host_style_hint_layer_passes_through_path_style() {
+        let inner = CountingHybridService::default();
+        let calls = inner.calls();
+        let mut service = VirtualHostStyleHintLayer.layer(inner);
+
+        let response = service
+            .call(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/my-bucket")
+                    .header(http::header::HOST, "s3.example.com")
+                    .body(Full::<Bytes>::from(Bytes::new()))
+                    .expect("request"),
+            )
+            .await
+            .expect("inner response");
+
+        // Path-style request reaches the inner service unchanged.
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -2268,6 +2597,29 @@ mod tests {
         assert_eq!(request.headers().get(AMZ_REQUEST_ID).unwrap(), "amz-456");
     }
 
+    #[test]
+    fn request_context_layer_extracts_trace_context_from_traceparent_header() {
+        global::set_text_map_propagator(TraceContextPropagator::new());
+
+        let mut service = RequestContextLayer.layer(CaptureService);
+        let request = Request::builder()
+            .uri("/bucket/object")
+            .header("x-request-id", "req-trace-123")
+            .header("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+            .body(())
+            .expect("request");
+
+        let request = service.call(request).into_inner().expect("service call should succeed");
+        let context = request
+            .extensions()
+            .get::<RequestContext>()
+            .expect("request context should be present");
+
+        assert_eq!(context.request_id, "req-trace-123");
+        assert_eq!(context.trace_id.as_deref(), Some("4bf92f3577b34da6a3ce929d0e0e4736"));
+        assert_eq!(context.span_id.as_deref(), Some("00f067aa0ba902b7"));
+    }
+
     #[tokio::test]
     async fn test_resolve_s3_options_cors_headers_no_headers_without_match() {
         let mut req_headers = HeaderMap::new();
@@ -2665,6 +3017,41 @@ mod tests {
         assert_eq!(context.peer_addr, "127.0.0.1:9000");
         assert_eq!(context.method, "PUT");
         assert_eq!(context.uri, "/bucket/object.txt");
+    }
+
+    #[test]
+    fn request_log_context_redacts_object_zip_download_tokens() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/rustfs/admin/v3/object-zip-downloads/download-id.zip?token=secret-token&part=1")
+            .body(())
+            .expect("request");
+
+        let context = RequestLogContext::from_request(&request);
+
+        assert_eq!(context.uri, "/rustfs/admin/v3/object-zip-downloads/download-id.zip?token=redacted&part=1");
+        assert!(!context.uri.contains("secret-token"));
+    }
+
+    #[test]
+    fn request_log_context_redacts_object_zip_download_tokens_for_minio_admin_prefix() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/minio/admin/v3/object-zip-downloads/download-id.zip?token=secret-token&part=1")
+            .body(())
+            .expect("request");
+
+        let context = RequestLogContext::from_request(&request);
+
+        assert_eq!(context.uri, "/minio/admin/v3/object-zip-downloads/download-id.zip?token=redacted&part=1");
+        assert!(!context.uri.contains("secret-token"));
+    }
+
+    #[test]
+    fn redact_sensitive_uri_query_preserves_non_zip_download_uris() {
+        let uri: http::Uri = "/rustfs/admin/v3/users?token=not-a-download-token".parse().expect("uri");
+
+        assert_eq!(redact_sensitive_uri_query(&uri), "/rustfs/admin/v3/users?token=not-a-download-token");
     }
 
     #[test]

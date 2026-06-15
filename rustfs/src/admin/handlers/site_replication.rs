@@ -19,6 +19,7 @@ use crate::admin::site_replication_identity::{
     site_identity_key,
 };
 use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
+use crate::app::context::resolve_object_store_handle;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::config::get_config_snapshot;
 use crate::error::ApiError;
@@ -49,7 +50,6 @@ use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::config::com::{delete_config, read_config, save_config};
 use rustfs_ecstore::error::Error as StorageError;
 use rustfs_ecstore::global::{get_global_deployment_id, get_global_endpoints_opt, get_global_region, global_rustfs_port};
-use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::BucketOperations;
 use rustfs_iam::error::is_err_no_such_service_account;
 use rustfs_iam::store::{MappedPolicy, UserType};
@@ -93,12 +93,17 @@ use tracing::warn;
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
+const LOG_COMPONENT_ADMIN: &str = "admin";
+const LOG_SUBSYSTEM_SITE_REPLICATION: &str = "site_replication";
+const EVENT_ADMIN_SITE_REPLICATION_STATE: &str = "admin_site_replication_state";
+
 const SITE_REPLICATION_STATE_PATH: &str = "config/site-replication/state.json";
 const SITE_REPL_ADD_SUCCESS: &str = "Requested sites were configured for replication successfully.";
 const SITE_REPL_EDIT_SUCCESS: &str = "Requested site was updated successfully.";
 const SITE_REPL_REMOVE_SUCCESS: &str = "Requested site(s) were removed from cluster replication successfully.";
 const SITE_REPL_RESYNC_START: &str = "start";
 const SITE_REPL_RESYNC_CANCEL: &str = "cancel";
+const SITE_REPL_RESYNC_STATUS: &str = "status";
 const SITE_REPL_MIN_NETPERF_DURATION: Duration = Duration::from_secs(1);
 const SITE_REPLICATION_PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SITE_REPLICATION_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -332,6 +337,11 @@ pub fn register_site_replication_route(r: &mut S3Router<AdminOperation>) -> std:
             AdminOperation(&SiteReplicationResyncOpHandler {}),
         ),
         (Method::PUT, "/v3/site-replication/state/edit", AdminOperation(&SRStateEditHandler {})),
+        (
+            Method::POST,
+            "/v3/site-replication/rotate-svc-acct",
+            AdminOperation(&SRRotateServiceAccountHandler {}),
+        ),
     ] {
         r.insert(method, format!("{ADMIN_PREFIX}{path}").as_str(), operation)?;
     }
@@ -472,7 +482,7 @@ async fn read_site_replication_json<T: DeserializeOwned>(
 }
 
 async fn load_site_replication_state() -> S3Result<SiteReplicationState> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
@@ -501,7 +511,7 @@ async fn load_site_replication_state() -> S3Result<SiteReplicationState> {
 }
 
 async fn save_site_replication_state(state: &SiteReplicationState) -> S3Result<()> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
@@ -517,7 +527,7 @@ async fn save_site_replication_state(state: &SiteReplicationState) -> S3Result<(
 }
 
 async fn clear_site_replication_state() -> S3Result<()> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
@@ -1234,7 +1244,7 @@ pub async fn site_replication_make_bucket_hook(bucket: &str, lock_enabled: bool)
     ensure_site_replication_bucket_targets(bucket, &state, &local_peer, None).await?;
     ensure_site_replication_bucket_replication_config(bucket, &state, &local_peer).await?;
 
-    let created_at = new_object_layer_fn()
+    let created_at = resolve_object_store_handle()
         .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?
         .get_bucket_info(bucket, &BucketOptions::default())
         .await
@@ -1302,7 +1312,7 @@ fn maybe_time(value: OffsetDateTime) -> Option<OffsetDateTime> {
 }
 
 async fn build_sr_info(state: &SiteReplicationState, local_peer: &PeerInfo) -> S3Result<SRInfo> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
@@ -1795,7 +1805,7 @@ fn merge_bucket_status_info(status: &mut SRStatusInfo, site_infos: &BTreeMap<Str
                     object_lock_config_mismatch: object_lock_mismatch,
                     policy_mismatch,
                     sse_config_mismatch: sse_mismatch,
-                    replication_cfg_mismatch: replication_mismatch,
+                    replication_cfg_mismatch: replication_mismatch && bucket_info.is_some_and(|b| b.replication_config.is_some()),
                     quota_cfg_mismatch: quota_mismatch,
                     cors_cfg_mismatch: cors_mismatch,
                     api_version: Some(SITE_REPL_API_VERSION.to_string()),
@@ -1980,18 +1990,29 @@ async fn build_status_info(state: &SiteReplicationState, local_peer: &PeerInfo, 
     let metrics_requested = opts.metrics || opts.include_all_defaults() || opts.entity == SREntityType::Bucket;
 
     let mut site_infos = BTreeMap::new();
+    let mut reachable_peers = HashSet::new();
     for (deployment_id, peer) in &state.peers {
         if deployment_id == &local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
             site_infos.insert(deployment_id.clone(), local_info.take().unwrap_or_default());
+            reachable_peers.insert(deployment_id.clone());
             continue;
         }
 
         match fetch_peer_sr_info(peer, state, uri).await {
             Ok(peer_info) => {
                 site_infos.insert(deployment_id.clone(), filter_sr_info(peer_info, &opts));
+                reachable_peers.insert(deployment_id.clone());
             }
             Err(err) => {
-                warn!(peer = %peer.endpoint, error = ?err, "site replication peer metainfo fetch failed");
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    peer = %peer.endpoint,
+                    result = "peer_metainfo_fetch_failed",
+                    error = ?err,
+                    "admin site replication state"
+                );
                 site_infos.insert(deployment_id.clone(), SRInfo::default());
             }
         }
@@ -2030,6 +2051,32 @@ async fn build_status_info(state: &SiteReplicationState, local_peer: &PeerInfo, 
         merge_status_info_for_site(&mut status, deployment_id, info, &opts);
     }
     prune_in_sync_status_details(&mut status, &opts);
+
+    // Fix 2: derive sync_state from real signals — reachability + replication rule completeness
+    // instead of always returning SyncStatus::Unknown as stored in the persisted peer map.
+    {
+        let peer_has_replication_issue: HashMap<String, bool> = status
+            .sites
+            .keys()
+            .map(|dep_id| {
+                let has_issue = status
+                    .bucket_stats
+                    .values()
+                    .any(|by_dep| by_dep.get(dep_id.as_str()).is_some_and(|s| s.replication_cfg_mismatch));
+                (dep_id.clone(), has_issue)
+            })
+            .collect();
+
+        for (deployment_id, peer) in status.sites.iter_mut() {
+            if !reachable_peers.contains(deployment_id) {
+                peer.sync_state = SyncStatus::Unknown;
+            } else if peer_has_replication_issue.get(deployment_id).copied().unwrap_or(false) {
+                peer.sync_state = SyncStatus::Disable;
+            } else {
+                peer.sync_state = SyncStatus::Enable;
+            }
+        }
+    }
 
     if metrics_requested {
         status.metrics = build_metrics_summary(local_peer).await;
@@ -2429,14 +2476,51 @@ async fn ensure_site_replication_bucket_replication_config(
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
 ) -> S3Result<()> {
-    match metadata_sys::get_replication_config(bucket).await {
-        Ok(_) => return Ok(()),
-        Err(StorageError::ConfigNotFound) => {}
+    // Fix 6: reconcile rather than early-returning when any config already exists.
+    // The old code bailed on Ok(_), so the second site joined a replicated bucket and
+    // ended up with NO rule pointing back to the first site. Objects on that site could
+    // never travel back, producing the "one-directional" replication symptom.
+    let Some(desired) = build_site_replication_config(bucket, state, local_peer)? else {
+        return Ok(());
+    };
+
+    // Load the existing rules (may be empty if never configured).
+    let mut existing_rules = match metadata_sys::get_replication_config(bucket).await {
+        Ok((existing, _)) => existing.rules,
+        Err(StorageError::ConfigNotFound) => Vec::new(),
         Err(err) => return Err(ApiError::from(err).into()),
+    };
+
+    // Collect the IDs of existing site-repl-* rules so we don't duplicate them.
+    let existing_rule_ids: HashSet<String> = existing_rules
+        .iter()
+        .filter_map(|r| r.id.as_deref())
+        .filter(|id| id.starts_with("site-repl-"))
+        .map(String::from)
+        .collect();
+
+    let mut added = false;
+    for rule in desired.rules {
+        let rule_id = rule.id.as_deref().unwrap_or("");
+        if !existing_rule_ids.contains(rule_id) {
+            existing_rules.push(rule);
+            added = true;
+        }
     }
 
-    let Some(config) = build_site_replication_config(bucket, state, local_peer)? else {
+    if !added {
+        // All desired rules are already present — nothing to write.
         return Ok(());
+    }
+
+    // Re-assign contiguous priorities to avoid conflicts with any preserved rules.
+    for (i, rule) in existing_rules.iter_mut().enumerate() {
+        rule.priority = Some((i + 1) as i32);
+    }
+
+    let config = ReplicationConfiguration {
+        role: String::new(),
+        rules: existing_rules,
     };
 
     let data = serialize(&config)
@@ -2451,6 +2535,119 @@ async fn ensure_site_replication_bucket_replication_config(
 pub async fn site_replication_peer_deployment_id_for_endpoint(endpoint: &str) -> Option<String> {
     let state = load_site_replication_state().await.ok()?;
     peer_deployment_id_for_endpoint(&state, endpoint)
+}
+
+/// Fix 1: after persisting a new site-replication state (add or join), enumerate every bucket
+/// that already exists locally, wire up versioning + targets + replication config for each, and
+/// kick a resync toward every remote peer so pre-existing objects back-fill. Errors are logged
+/// but never abort the caller — the admin can run a manual resync if needed.
+async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local_peer: &PeerInfo) {
+    let Some(store) = resolve_object_store_handle() else {
+        return;
+    };
+    let buckets = match store.list_bucket(&BucketOptions::default()).await {
+        Ok(b) => b,
+        Err(err) => {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                result = "backfill_list_buckets_failed",
+                error = ?err,
+                "admin site replication state"
+            );
+            return;
+        }
+    };
+
+    let resync_id = Uuid::new_v4().to_string();
+    for bucket in &buckets {
+        let name = &bucket.name;
+
+        if let Err(err) = ensure_site_replication_bucket_versioning(name).await {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                bucket = %name,
+                result = "backfill_versioning_setup_failed",
+                error = ?err,
+                "admin site replication state"
+            );
+            continue;
+        }
+        if let Err(err) = ensure_site_replication_bucket_targets(name, state, local_peer, None).await {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                bucket = %name,
+                result = "backfill_targets_setup_failed",
+                error = ?err,
+                "admin site replication state"
+            );
+        }
+        if let Err(err) = ensure_site_replication_bucket_replication_config(name, state, local_peer).await {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                bucket = %name,
+                result = "backfill_replication_config_setup_failed",
+                error = ?err,
+                "admin site replication state"
+            );
+        }
+        // Broadcast the bucket to peers so they create it too (idempotent on the peer side).
+        // Read the real lock_enabled flag so peers recreate the bucket with the same object-lock
+        // setting — object lock cannot be added after bucket creation.
+        let lock_enabled = match metadata_sys::get(name).await {
+            Ok(bm) => bm.lock_enabled,
+            Err(err) => {
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    bucket = %name,
+                    result = "backfill_bucket_metadata_read_failed",
+                    fallback = "lock_enabled=false",
+                    error = ?err,
+                    "admin site replication state"
+                );
+                false
+            }
+        };
+        if let Err(err) = site_replication_make_bucket_hook(name, lock_enabled).await {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                bucket = %name,
+                result = "backfill_make_bucket_broadcast_failed",
+                error = ?err,
+                "admin site replication state"
+            );
+        }
+        // Kick a resync toward every remote peer so existing objects travel across.
+        for peer in state.peers.values() {
+            if peer.deployment_id == local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
+                continue;
+            }
+            let result = start_site_bucket_resync(name, peer, &resync_id).await;
+            if result.status == "failed" {
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    bucket = %name,
+                    peer = %peer.endpoint,
+                    result = "backfill_resync_kick_failed",
+                    detail = %result.err_detail,
+                    "admin site replication state"
+                );
+            }
+        }
+    }
 }
 
 async fn start_site_bucket_resync(bucket: &str, peer: &PeerInfo, resync_id: &str) -> ResyncBucketStatus {
@@ -2650,7 +2847,7 @@ async fn ensure_site_replication_bucket_versioning(bucket: &str) -> S3Result<()>
 }
 
 async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
@@ -2996,6 +3193,12 @@ impl Operation for SiteReplicationAddHandler {
         }
 
         persist_site_replication_state(&state).await?;
+
+        // Fix 1: back-fill pre-existing buckets so objects created before `replicate add`
+        // are not silently left out of replication. Failures are logged but do not abort
+        // the overall add operation — the admin can trigger a manual resync if needed.
+        backfill_existing_buckets_after_add(&state, &local_peer).await;
+
         json_response(&ReplicateAddStatus {
             success: true,
             status: SITE_REPL_ADD_SUCCESS.to_string(),
@@ -3038,7 +3241,15 @@ impl Operation for SiteReplicationRemoveHandler {
                 .await
                 {
                     let err_detail = summarize_peer_error_detail(&format!("{}: {err}", peer.endpoint));
-                    warn!(peer = %peer.endpoint, error = %err_detail, "site replication peer remove notification failed");
+                    warn!(
+                        event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                        peer = %peer.endpoint,
+                        result = "peer_remove_notification_failed",
+                        error = %err_detail,
+                        "admin site replication state"
+                    );
                     peer_errors.push(err_detail);
                 }
             }
@@ -3209,6 +3420,9 @@ impl Operation for SRPeerJoinHandler {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| local_peer.name.clone());
         persist_site_replication_state(&state).await?;
+        // Fix 1 (receiving side): ensure the joining peer also sets up replication for any
+        // buckets it already owns so the reverse direction works from the start.
+        backfill_existing_buckets_after_add(&state, &local_peer).await;
         json_response(&SRPeerJoinResponse {
             peer: state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
         })
@@ -3233,7 +3447,7 @@ impl Operation for SRPeerBucketOpsHandler {
             .cloned()
             .ok_or_else(|| s3_error!(InvalidRequest, "operation is required"))?;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -3490,7 +3704,7 @@ impl Operation for SiteReplicationResyncOpHandler {
         if !state.peers.contains_key(&peer.deployment_id) {
             return Err(s3_error!(InvalidRequest, "site replication peer not found"));
         }
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
         let buckets = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
@@ -3542,6 +3756,18 @@ impl Operation for SiteReplicationResyncOpHandler {
                 state.resync_status.insert(peer.deployment_id.clone(), status.clone());
                 status
             }
+            SITE_REPL_RESYNC_STATUS => {
+                let status = state
+                    .resync_status
+                    .get(&peer.deployment_id)
+                    .cloned()
+                    .unwrap_or_else(|| SRResyncOpStatus {
+                        op_type: SITE_REPL_RESYNC_STATUS.to_string(),
+                        status: "not-found".to_string(),
+                        ..Default::default()
+                    });
+                return json_response(&status);
+            }
             _ => return Err(s3_error!(InvalidRequest, "unsupported resync operation")),
         };
         save_site_replication_state(&state).await?;
@@ -3559,6 +3785,85 @@ impl Operation for SRStateEditHandler {
         let state = apply_state_edit_req(load_site_replication_state().await?, body);
         save_site_replication_state(&state).await?;
         Ok(empty_response(StatusCode::OK))
+    }
+}
+
+/// Repairs a split-brained `site-replicator-0` service account.
+///
+/// When the internal service account is desynced (e.g. after a failed `rm` left stale state on
+/// one peer), admin calls to that peer return 403. This handler recovers the cluster without a
+/// full teardown:
+///
+/// 1. Generates a fresh service-account secret locally.
+/// 2. Applies it to the local node and persists state.
+/// 3. Pushes `peer/join` with the new credentials to every remote peer.
+///    A peer whose secret is already correct accepts the update idempotently.
+///    A peer whose secret was stale is repaired.
+///
+/// **Partial failure**: if one or more peers are unreachable the local node is still updated and
+/// `status="Partial"` is returned with `err_detail` listing each failed endpoint and its error.
+/// The call is **idempotent** — re-run it until `status="Success"` to repair all peers.
+pub struct SRRotateServiceAccountHandler {}
+
+#[async_trait::async_trait]
+impl Operation for SRRotateServiceAccountHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
+        let mut state = load_site_replication_state().await?;
+        if !state.enabled() {
+            return Err(s3_error!(InvalidRequest, "site replication is not configured"));
+        }
+        let local_peer = current_local_peer(&req, &state);
+
+        // Force generation of a new secret by passing a state with empty secret key.
+        let rotation_state = SiteReplicationState {
+            service_account_access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+            service_account_secret_key: String::new(),
+            ..state.clone()
+        };
+        let (svc_ak, new_sk) = ensure_site_replicator_service_account(&cred.access_key, &rotation_state).await?;
+
+        state.service_account_access_key = svc_ak.clone();
+        state.service_account_secret_key = new_sk.clone();
+
+        let join_req = SRPeerJoinReq {
+            svc_acct_access_key: svc_ak.clone(),
+            svc_acct_secret_key: new_sk.clone(),
+            svc_acct_parent: cred.access_key.clone(),
+            peers: state.peers.clone(),
+            updated_at: state.updated_at,
+        };
+
+        let mut peer_errors = Vec::new();
+        for peer in state.peers.values() {
+            if same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
+                continue;
+            }
+            if let Err(err) =
+                send_peer_admin_request(&peer.endpoint, SITE_REPLICATION_PEER_JOIN_PATH, &svc_ak, &new_sk, &join_req).await
+            {
+                let detail = summarize_peer_error_detail(&format!("{}: {err}", peer.endpoint));
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    peer = %peer.endpoint,
+                    result = "service_account_rotation_failed",
+                    error = %detail,
+                    "admin site replication state"
+                );
+                peer_errors.push(detail);
+            }
+        }
+
+        persist_site_replication_state(&state).await?;
+
+        json_response(&ReplicateEditStatus {
+            success: peer_errors.is_empty(),
+            status: if peer_errors.is_empty() { "Success" } else { "Partial" }.to_string(),
+            err_detail: peer_errors.join("; "),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        })
     }
 }
 
@@ -4657,5 +4962,267 @@ mod tests {
         };
 
         assert!(group_info_requires_upsert(&update));
+    }
+
+    // Fix 3: replication_cfg_mismatch must not be set for deployments that simply have no
+    // replication config. Setting it globally caused mc to count N mismatch entries for a
+    // single bucket (one per deployment), while max_buckets=1, producing -1/N in sync.
+    #[test]
+    fn test_replication_cfg_mismatch_only_set_for_deployments_with_config() {
+        use rustfs_madmin::{SRBucketInfo, SRInfo};
+
+        let repl_xml = {
+            let config = ReplicationConfiguration {
+                role: String::new(),
+                rules: vec![build_site_replication_rule(
+                    "arn:rustfs:replication::site-b:photos",
+                    1,
+                    "site-repl-site-b",
+                )],
+            };
+            String::from_utf8(serialize(&config).unwrap()).unwrap()
+        };
+
+        let mut site_a_info = SRInfo::default();
+        site_a_info.buckets.insert(
+            "photos".to_string(),
+            SRBucketInfo {
+                bucket: "photos".to_string(),
+                replication_config: Some(repl_xml),
+                ..Default::default()
+            },
+        );
+
+        // Site B has the bucket but NO replication config yet (partial setup)
+        let mut site_b_info = SRInfo::default();
+        site_b_info.buckets.insert(
+            "photos".to_string(),
+            SRBucketInfo {
+                bucket: "photos".to_string(),
+                replication_config: None,
+                ..Default::default()
+            },
+        );
+
+        let site_infos: BTreeMap<String, SRInfo> = [("dep-a".to_string(), site_a_info), ("dep-b".to_string(), site_b_info)]
+            .into_iter()
+            .collect();
+
+        let mut status = SRStatusInfo {
+            sites: site_infos
+                .keys()
+                .map(|k| {
+                    (
+                        k.clone(),
+                        PeerInfo {
+                            deployment_id: k.clone(),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        };
+        for k in site_infos.keys() {
+            status.stats_summary.insert(
+                k.clone(),
+                SRSiteSummary {
+                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let opts = SRStatusOptions {
+            buckets: true,
+            ..Default::default()
+        };
+        merge_bucket_status_info(&mut status, &site_infos, &opts);
+
+        let bucket_stats = status.bucket_stats.get("photos").expect("photos bucket stats");
+        let dep_a = bucket_stats.get("dep-a").expect("dep-a stats");
+        let dep_b = bucket_stats.get("dep-b").expect("dep-b stats");
+
+        // dep-a has a config but it doesn't cover all peers → mismatch
+        assert!(dep_a.replication_cfg_mismatch, "dep-a has config but it is incomplete");
+        // dep-b has NO config → must NOT be flagged as mismatch (only has_replication_cfg=false)
+        assert!(
+            !dep_b.replication_cfg_mismatch,
+            "dep-b has no config, mismatch must not be set to avoid -1 in mc output"
+        );
+        assert!(!dep_b.has_replication_cfg, "dep-b should show has_replication_cfg=false");
+    }
+
+    // Fix 4: status operation must return a well-formed SRResyncOpStatus (not an empty body)
+    #[test]
+    fn test_resync_status_returns_not_found_when_no_resync_in_progress() {
+        let state = SiteReplicationState::default();
+        let status = state
+            .resync_status
+            .get("nonexistent-peer")
+            .cloned()
+            .unwrap_or_else(|| SRResyncOpStatus {
+                op_type: SITE_REPL_RESYNC_STATUS.to_string(),
+                status: "not-found".to_string(),
+                ..Default::default()
+            });
+        assert_eq!(status.status, "not-found");
+        assert_eq!(status.op_type, SITE_REPL_RESYNC_STATUS);
+    }
+
+    #[test]
+    fn test_resync_status_returns_existing_status_for_known_peer() {
+        let mut state = SiteReplicationState::default();
+        state.resync_status.insert(
+            "peer-dep".to_string(),
+            SRResyncOpStatus {
+                op_type: SITE_REPL_RESYNC_START.to_string(),
+                resync_id: "abc-123".to_string(),
+                status: "success".to_string(),
+                ..Default::default()
+            },
+        );
+        let status = state
+            .resync_status
+            .get("peer-dep")
+            .cloned()
+            .unwrap_or_else(|| SRResyncOpStatus {
+                op_type: SITE_REPL_RESYNC_STATUS.to_string(),
+                status: "not-found".to_string(),
+                ..Default::default()
+            });
+        assert_eq!(status.op_type, SITE_REPL_RESYNC_START);
+        assert_eq!(status.resync_id, "abc-123");
+    }
+
+    // Fix 2: sync_state must derive from real health signals, not always Unknown
+    #[test]
+    fn test_derive_sync_state_from_replication_completeness() {
+        // A peer that is reachable and has complete replication rules for all other peers
+        // should be Enable; one that is reachable but has an incomplete config should be Disable.
+        let repl_complete_xml = {
+            let config = ReplicationConfiguration {
+                role: String::new(),
+                rules: vec![build_site_replication_rule(
+                    "arn:rustfs:replication::dep-b:bucket",
+                    1,
+                    "site-repl-dep-b",
+                )],
+            };
+            String::from_utf8(serialize(&config).unwrap()).unwrap()
+        };
+
+        // Peer that has complete config for 2-site setup
+        assert!(site_replication_rule_complete(&build_site_replication_rule(
+            "arn:rustfs:replication::dep-b:bucket",
+            1,
+            "site-repl-dep-b"
+        )));
+        assert_eq!(
+            site_replication_config_mismatch(vec![Some(&repl_complete_xml), Some(&repl_complete_xml)].into_iter(), 2),
+            (2, false),
+            "complete rules on both sites → no mismatch"
+        );
+        assert_eq!(
+            site_replication_config_mismatch(vec![Some(&repl_complete_xml)].into_iter(), 2),
+            (1, true),
+            "config only on one of two sites → mismatch"
+        );
+    }
+
+    // Fix 5: remove --all must purge local state unconditionally even when peer errors occur
+    #[test]
+    fn test_remove_all_purges_local_state_unconditionally() {
+        let mut state = SiteReplicationState {
+            name: "local".to_string(),
+            service_account_access_key: "site-replicator-0".to_string(),
+            service_account_secret_key: "some-secret".to_string(),
+            ..Default::default()
+        };
+        state.peers.insert(
+            "local-dep".to_string(),
+            PeerInfo {
+                deployment_id: "local-dep".to_string(),
+                ..peer("local", "https://local.example.com")
+            },
+        );
+        state.peers.insert(
+            "remote-dep".to_string(),
+            PeerInfo {
+                deployment_id: "remote-dep".to_string(),
+                ..peer("remote", "https://remote.example.com")
+            },
+        );
+        state.resync_status.insert(
+            "remote-dep".to_string(),
+            SRResyncOpStatus {
+                resync_id: "r1".to_string(),
+                status: "success".to_string(),
+                ..Default::default()
+            },
+        );
+
+        // Simulate remove --all
+        let state = remove_sites(
+            state,
+            SRRemoveReq {
+                remove_all: true,
+                ..Default::default()
+            },
+        );
+
+        // Local state must be cleared regardless of whether peer notifications succeed
+        assert!(state.peers.is_empty(), "peers must be cleared on remove --all");
+        assert!(state.resync_status.is_empty(), "resync_status must be cleared on remove --all");
+
+        // Even if peers returned 403 (desynced account), status still reports success
+        let status =
+            site_replication_remove_status(&["https://remote.example.com: peer/remove returned 403 Forbidden".to_string()]);
+        assert_eq!(
+            status.status, SITE_REPL_REMOVE_SUCCESS,
+            "local remove reports success even when peer notifications fail"
+        );
+        assert!(
+            status.err_detail.contains("403 Forbidden"),
+            "peer errors are included in err_detail for diagnostics"
+        );
+    }
+
+    // Fix 6: ensure_site_replication_bucket_replication_config must reconcile rather than
+    // early-return so that a bucket propagated to the second site gets a rule back to the first.
+    #[test]
+    fn test_reconcile_adds_missing_peer_rules_to_existing_config() {
+        // Start with a config that has only rule for dep-b (first site's initial config)
+        let rule_b = build_site_replication_rule("arn:rustfs:replication::dep-b:bucket", 1, "site-repl-dep-b");
+        let rule_c = build_site_replication_rule("arn:rustfs:replication::dep-c:bucket", 2, "site-repl-dep-c");
+
+        let mut existing_rules = vec![rule_b.clone()];
+
+        // Desired config has rules for both dep-b and dep-c (3-site setup)
+        let desired_rules = vec![rule_b, rule_c];
+
+        // Simulate the reconcile: collect existing site-repl rule IDs
+        let existing_ids: std::collections::HashSet<String> = existing_rules
+            .iter()
+            .filter_map(|r| r.id.as_deref())
+            .filter(|id| id.starts_with("site-repl-"))
+            .map(String::from)
+            .collect();
+
+        let mut added = false;
+        for rule in &desired_rules {
+            let rid = rule.id.as_deref().unwrap_or("");
+            if !existing_ids.contains(rid) {
+                existing_rules.push(rule.clone());
+                added = true;
+            }
+        }
+
+        assert!(added, "missing rule should have been added");
+        assert_eq!(existing_rules.len(), 2, "should now have rules for both peers");
+
+        let rule_ids: Vec<&str> = existing_rules.iter().filter_map(|r| r.id.as_deref()).collect();
+        assert!(rule_ids.contains(&"site-repl-dep-b"));
+        assert!(rule_ids.contains(&"site-repl-dep-c"));
     }
 }

@@ -56,7 +56,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_REPLICATION: &str = "replication";
@@ -64,7 +64,13 @@ const EVENT_REPLICATION_WORKER_RESIZE_SKIPPED: &str = "replication_worker_resize
 const EVENT_REPLICATION_WORKER_RESIZED: &str = "replication_worker_resized";
 const EVENT_REPLICATION_BACKPRESSURE: &str = "replication_backpressure";
 const EVENT_REPLICATION_RESYNC_LOAD_SKIPPED: &str = "replication_resync_load_skipped";
+const EVENT_REPLICATION_RESYNC_RECOVERED: &str = "replication_resync_recovered";
 const EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED: &str = "replication_config_lookup_skipped";
+const EVENT_REPLICATION_MRF_QUEUE_OVERFLOW: &str = "replication_mrf_queue_overflow";
+
+fn should_auto_resume_resync(status: ResyncStatusType) -> bool {
+    matches!(status, ResyncStatusType::ResyncPending | ResyncStatusType::ResyncStarted)
+}
 
 // Worker limits
 pub const WORKER_MAX_LIMIT: usize = 500;
@@ -588,6 +594,14 @@ impl<S: StorageAPI + NamespaceLocking> ReplicationPool<S> {
                     let admission = if self.mrf_save_tx.try_send(ri.to_mrf_entry()).is_ok() {
                         ReplicationQueueAdmission::Queued
                     } else {
+                        warn!(
+                            event = EVENT_REPLICATION_MRF_QUEUE_OVERFLOW,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_REPLICATION,
+                            bucket = %ri.bucket,
+                            object = %ri.name,
+                            "MRF queue full — large-worker replication failure entry dropped and will not be retried"
+                        );
                         ReplicationQueueAdmission::Missed
                     };
 
@@ -627,6 +641,14 @@ impl<S: StorageAPI + NamespaceLocking> ReplicationPool<S> {
         let admission = if self.mrf_save_tx.try_send(ri.to_mrf_entry()).is_ok() {
             ReplicationQueueAdmission::Queued
         } else {
+            warn!(
+                event = EVENT_REPLICATION_MRF_QUEUE_OVERFLOW,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                bucket = %ri.bucket,
+                object = %ri.name,
+                "MRF queue full — replication failure entry dropped and will not be retried"
+            );
             ReplicationQueueAdmission::Missed
         };
 
@@ -703,6 +725,14 @@ impl<S: StorageAPI + NamespaceLocking> ReplicationPool<S> {
         let admission = if self.mrf_save_tx.try_send(doi.to_mrf_entry()).is_ok() {
             ReplicationQueueAdmission::Queued
         } else {
+            warn!(
+                event = EVENT_REPLICATION_MRF_QUEUE_OVERFLOW,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                bucket = %doi.bucket,
+                object = %doi.delete_object.object_name,
+                "MRF queue full — delete replication failure entry dropped and will not be retried"
+            );
             ReplicationQueueAdmission::Missed
         };
 
@@ -749,7 +779,14 @@ impl<S: StorageAPI + NamespaceLocking> ReplicationPool<S> {
 
     /// Queues an MRF save operation
     async fn queue_mrf_save(&self, entry: MrfReplicateEntry) {
-        let _ = self.mrf_save_tx.try_send(entry);
+        if self.mrf_save_tx.try_send(entry).is_err() {
+            warn!(
+                event = EVENT_REPLICATION_MRF_QUEUE_OVERFLOW,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                "MRF queue full — replication failure entry dropped and will not be retried"
+            );
+        }
     }
 
     /// Starts the MRF processor background task
@@ -985,6 +1022,11 @@ impl<S: StorageAPI + NamespaceLocking> ReplicationPool<S> {
         // Note: Leader lock implementation would be needed here
         // let _lock_guard = global_leader_lock.get_lock().await?;
 
+        let mut recovered_statuses = Vec::new();
+        let mut restart_opts = Vec::new();
+        let mut recovered_bucket_count = 0usize;
+        let mut skipped_failed_target_count = 0usize;
+
         for bucket in buckets {
             let meta = match load_bucket_resync_metadata(bucket, self.storage.clone()).await {
                 Ok(meta) => meta,
@@ -1004,39 +1046,53 @@ impl<S: StorageAPI + NamespaceLocking> ReplicationPool<S> {
                 }
             };
 
-            // Store metadata in resyncer
-            {
-                let mut status_map = self.resyncer.status_map.write().await;
-                status_map.insert(bucket.clone(), meta.clone());
+            if meta.targets_map.is_empty() {
+                continue;
             }
 
-            // Process target statistics
-            let target_stats = meta.clone_tgt_stats();
-            for (arn, stats) in target_stats {
-                match stats.resync_status {
-                    ResyncStatusType::ResyncFailed | ResyncStatusType::ResyncStarted | ResyncStatusType::ResyncPending => {
-                        // Note: This would spawn a resync task in a real implementation
-                        // For now, we just log the resync request
-
-                        let ctx = CancellationToken::new();
-                        let bucket_clone = bucket.clone();
-                        let resync = self.resyncer.clone();
-                        let storage = self.storage.clone();
-                        let opts = ResyncOpts {
-                            bucket: bucket_clone,
-                            arn,
-                            resync_id: stats.resync_id,
-                            resync_before: stats.resync_before_date,
-                        };
-                        tokio::spawn(async move {
-                            resync.register_cancel_token(&opts, ctx.clone()).await;
-                            Box::pin(resync.clone().resync_bucket(ctx, storage, true, opts.clone())).await;
-                            resync.clear_cancel_token(&opts).await;
-                        });
-                    }
-                    _ => {}
+            recovered_bucket_count += 1;
+            for (arn, stats) in &meta.targets_map {
+                if should_auto_resume_resync(stats.resync_status) {
+                    restart_opts.push(ResyncOpts {
+                        bucket: bucket.clone(),
+                        arn: arn.clone(),
+                        resync_id: stats.resync_id.clone(),
+                        resync_before: stats.resync_before_date,
+                    });
+                } else if stats.resync_status == ResyncStatusType::ResyncFailed {
+                    skipped_failed_target_count += 1;
                 }
             }
+
+            recovered_statuses.push((bucket.clone(), meta));
+        }
+
+        if !recovered_statuses.is_empty() {
+            let mut status_map = self.resyncer.status_map.write().await;
+            status_map.extend(recovered_statuses);
+        }
+
+        if !restart_opts.is_empty() || skipped_failed_target_count > 0 {
+            info!(
+                event = EVENT_REPLICATION_RESYNC_RECOVERED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                recovered_buckets = recovered_bucket_count,
+                resumed_targets = restart_opts.len(),
+                skipped_failed_targets = skipped_failed_target_count,
+                "Recovered replication resync state from persisted metadata; failed targets require manual resync restart"
+            );
+        }
+
+        for opts in restart_opts {
+            let ctx = CancellationToken::new();
+            let resync = self.resyncer.clone();
+            let storage = self.storage.clone();
+            tokio::spawn(async move {
+                resync.register_cancel_token(&opts, ctx.clone()).await;
+                Box::pin(resync.clone().resync_bucket(ctx, storage, true, opts.clone())).await;
+                resync.clear_cancel_token(&opts).await;
+            });
         }
 
         Ok(())
@@ -1465,5 +1521,15 @@ mod tests {
 
         admission.merge(ReplicationQueueAdmission::Missed);
         assert_eq!(admission, ReplicationQueueAdmission::Missed);
+    }
+
+    #[test]
+    fn auto_resume_resync_only_for_inflight_states() {
+        assert!(should_auto_resume_resync(ResyncStatusType::ResyncPending));
+        assert!(should_auto_resume_resync(ResyncStatusType::ResyncStarted));
+        assert!(!should_auto_resume_resync(ResyncStatusType::NoResync));
+        assert!(!should_auto_resume_resync(ResyncStatusType::ResyncCanceled));
+        assert!(!should_auto_resume_resync(ResyncStatusType::ResyncCompleted));
+        assert!(!should_auto_resume_resync(ResyncStatusType::ResyncFailed));
     }
 }

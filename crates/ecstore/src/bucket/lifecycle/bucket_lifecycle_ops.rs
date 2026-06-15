@@ -77,7 +77,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 use xxhash_rust::xxh64;
 
@@ -735,7 +735,7 @@ impl TransitionState {
         tokio::spawn(async move {
             Self::inc_counter(&state.compensation_running_tasks);
             state.record_scanner_transition_state();
-            let Some(api) = crate::new_object_layer_fn() else {
+            let Some(api) = crate::resolve_object_store_handle() else {
                 scheduled.lock().unwrap().remove(&bucket);
                 Self::add_counter(&state.compensation_running_tasks, -1);
                 state.record_scanner_transition_state();
@@ -762,13 +762,13 @@ impl TransitionState {
                     "Transition compensation backfill failed"
                 );
             } else {
-                info!(
+                debug!(
                     event = EVENT_LIFECYCLE_TRANSITION_COMPENSATION,
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_LIFECYCLE,
                     bucket = %bucket,
                     state = "completed",
-                    "Completed transition compensation backfill"
+                    "Transition compensation completed"
                 );
             }
 
@@ -958,7 +958,7 @@ impl TransitionState {
 
     pub async fn init(api: Arc<ECStore>) {
         let (configured, absolute_max, n) = resolve_transition_worker_count();
-        info!(
+        debug!(
             event = EVENT_LIFECYCLE_WORKER_STATE,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_LIFECYCLE,
@@ -968,7 +968,7 @@ impl TransitionState {
             transition_queue_capacity = GLOBAL_TransitionState.transition_queue_capacity,
             transition_queue_send_timeout_ms = GLOBAL_TransitionState.transition_queue_send_timeout.as_millis() as u64,
             state = "configured",
-            "Lifecycle worker state resolved"
+            "Lifecycle worker configuration resolved"
         );
 
         //let mut transition_state = GLOBAL_TransitionState.write().await;
@@ -1158,7 +1158,7 @@ impl TransitionState {
         GLOBAL_TransitionState.num_workers.store(current_workers, Ordering::SeqCst);
         GLOBAL_TransitionState.record_scanner_transition_state();
 
-        info!(
+        debug!(
             event = EVENT_LIFECYCLE_WORKER_STATE,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_LIFECYCLE,
@@ -1169,7 +1169,7 @@ impl TransitionState {
             current_transition_workers = current_workers,
             pruned_finished_transition_workers = pruned_finished_workers,
             state = "resized",
-            "Lifecycle worker state updated"
+            "Lifecycle worker pool resized"
         );
     }
 }
@@ -1646,7 +1646,7 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
     let Some(lifecycle) = GLOBAL_LifecycleSys.get(&oi.bucket).await else {
         return;
     };
-    let Some(api) = crate::new_object_layer_fn() else {
+    let Some(api) = crate::resolve_object_store_handle() else {
         return;
     };
 
@@ -2008,14 +2008,14 @@ pub fn audit_tier_actions(_tier: &str, bytes: i64) -> TimeFn {
     Arc::new(move || {
         let tier = tier.clone();
         Box::pin(async move {
-            info!(
+            debug!(
                 event = EVENT_LIFECYCLE_TIER_AUDIT,
                 component = LOG_COMPONENT_ECSTORE,
                 subsystem = LOG_SUBSYSTEM_LIFECYCLE,
                 tier = %tier,
                 bytes = bytes,
                 state = "transition_completed",
-                "Lifecycle tier transition audit completed"
+                "Lifecycle tier transition recorded"
             );
         })
     })

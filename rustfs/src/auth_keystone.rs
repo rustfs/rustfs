@@ -17,22 +17,42 @@
 use http::HeaderMap;
 use rustfs_credentials::Credentials;
 use rustfs_keystone::{KeystoneAuthProvider, KeystoneClient, KeystoneConfig, KeystoneIdentityMapper};
+use rustfs_utils::MaskedAccessKey;
 use s3s::{S3Result, s3_error};
 use std::sync::{Arc, OnceLock};
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 static KEYSTONE_AUTH: OnceLock<Arc<KeystoneAuthProvider>> = OnceLock::new();
 static KEYSTONE_MAPPER: OnceLock<Arc<KeystoneIdentityMapper>> = OnceLock::new();
 static KEYSTONE_CONFIG: OnceLock<KeystoneConfig> = OnceLock::new();
 
+const LOG_COMPONENT_AUTH: &str = "auth";
+const LOG_SUBSYSTEM_KEYSTONE: &str = "keystone";
+
 /// Initialize Keystone authentication
 pub async fn init_keystone_auth(config: KeystoneConfig) -> Result<(), Box<dyn std::error::Error>> {
     if !config.enable {
-        info!("Keystone authentication disabled");
+        info!(
+            component = LOG_COMPONENT_AUTH,
+            subsystem = LOG_SUBSYSTEM_KEYSTONE,
+            event = "keystone_state",
+            state = "disabled",
+            "Keystone authentication state changed"
+        );
         return Ok(());
     }
 
-    info!("Initializing Keystone authentication...");
+    info!(
+        component = LOG_COMPONENT_AUTH,
+        subsystem = LOG_SUBSYSTEM_KEYSTONE,
+        event = "keystone_state",
+        state = "initializing",
+        auth_url = %config.auth_url,
+        version = %config.version,
+        enable_tenant_prefix = config.enable_tenant_prefix,
+        enable_cache = config.enable_cache,
+        "Keystone authentication state changed"
+    );
 
     // Validate configuration
     config.validate()?;
@@ -71,11 +91,17 @@ pub async fn init_keystone_auth(config: KeystoneConfig) -> Result<(), Box<dyn st
         .set(config.clone())
         .map_err(|_| "Keystone config already initialized")?;
 
-    info!("Keystone authentication initialized successfully");
-    info!("  Auth URL: {}", config.auth_url);
-    info!("  Version: {}", config.version);
-    info!("  Tenant prefix enabled: {}", config.enable_tenant_prefix);
-    info!("  Token caching enabled: {}", config.enable_cache);
+    info!(
+        component = LOG_COMPONENT_AUTH,
+        subsystem = LOG_SUBSYSTEM_KEYSTONE,
+        event = "keystone_state",
+        state = "initialized",
+        auth_url = %config.auth_url,
+        version = %config.version,
+        enable_tenant_prefix = config.enable_tenant_prefix,
+        enable_cache = config.enable_cache,
+        "Keystone authentication state changed"
+    );
 
     Ok(())
 }
@@ -125,15 +151,29 @@ pub async fn authenticate_keystone(headers: &HeaderMap) -> S3Result<Option<Crede
 
     // Check for X-Auth-Token header (Keystone v3)
     if let Some(token) = headers.get("X-Auth-Token").and_then(|v| v.to_str().ok()) {
-        debug!("Found X-Auth-Token header, validating with Keystone");
-
         return match auth_provider.authenticate_with_token(token).await {
             Ok(cred) => {
-                info!("Keystone token authentication successful: user={}", cred.parent_user);
+                info!(
+                    component = LOG_COMPONENT_AUTH,
+                    subsystem = LOG_SUBSYSTEM_KEYSTONE,
+                    event = "keystone_token_auth",
+                    token_type = "x_auth_token",
+                    principal = %MaskedAccessKey(&cred.parent_user),
+                    result = "success",
+                    "Keystone token authentication completed"
+                );
                 Ok(Some(cred))
             }
             Err(e) => {
-                error!("Keystone token authentication failed: {}", e);
+                error!(
+                    component = LOG_COMPONENT_AUTH,
+                    subsystem = LOG_SUBSYSTEM_KEYSTONE,
+                    event = "keystone_token_auth",
+                    token_type = "x_auth_token",
+                    result = "failed",
+                    error = %e,
+                    "Keystone token authentication completed"
+                );
                 Err(s3_error!(InvalidToken, "Invalid Keystone token: {}", e))
             }
         };
@@ -141,15 +181,29 @@ pub async fn authenticate_keystone(headers: &HeaderMap) -> S3Result<Option<Crede
 
     // Check for X-Storage-Token header (Swift compatibility)
     if let Some(token) = headers.get("X-Storage-Token").and_then(|v| v.to_str().ok()) {
-        debug!("Found X-Storage-Token header, validating with Keystone");
-
         return match auth_provider.authenticate_with_token(token).await {
             Ok(cred) => {
-                info!("Keystone Swift token authentication successful: user={}", cred.parent_user);
+                info!(
+                    component = LOG_COMPONENT_AUTH,
+                    subsystem = LOG_SUBSYSTEM_KEYSTONE,
+                    event = "keystone_token_auth",
+                    token_type = "x_storage_token",
+                    principal = %MaskedAccessKey(&cred.parent_user),
+                    result = "success",
+                    "Keystone token authentication completed"
+                );
                 Ok(Some(cred))
             }
             Err(e) => {
-                error!("Keystone Swift token authentication failed: {}", e);
+                error!(
+                    component = LOG_COMPONENT_AUTH,
+                    subsystem = LOG_SUBSYSTEM_KEYSTONE,
+                    event = "keystone_token_auth",
+                    token_type = "x_storage_token",
+                    result = "failed",
+                    error = %e,
+                    "Keystone token authentication completed"
+                );
                 Err(s3_error!(InvalidToken, "Invalid Keystone token: {}", e))
             }
         };

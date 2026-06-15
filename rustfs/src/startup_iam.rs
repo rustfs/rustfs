@@ -44,6 +44,33 @@ pub enum IamBootstrapDisposition {
     Deferred,
 }
 
+pub async fn publish_ready_for_iam_bootstrap(
+    disposition: IamBootstrapDisposition,
+    readiness: &GlobalReadiness,
+    state_manager: Option<&ServiceStateManager>,
+) -> Result<bool> {
+    publish_ready_for_iam_bootstrap_with(disposition, || async move {
+        publish_ready_when_runtime_ready(readiness, state_manager).await
+    })
+    .await
+}
+
+async fn publish_ready_for_iam_bootstrap_with<PublishFn, PublishFuture>(
+    disposition: IamBootstrapDisposition,
+    publish_ready: PublishFn,
+) -> Result<bool>
+where
+    PublishFn: FnOnce() -> PublishFuture,
+    PublishFuture: Future<Output = Result<()>>,
+{
+    if disposition == IamBootstrapDisposition::ReadyInline {
+        publish_ready().await?;
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
 fn init_app_context_if_needed(store: Arc<ECStore>, kms_interface: Arc<KmsServiceManager>) -> bool {
     if get_global_app_context().is_some() {
         return false;
@@ -341,13 +368,14 @@ pub async fn bootstrap_or_defer_iam_init(
 #[cfg(test)]
 mod tests {
     use super::{
-        IAM_RETRY_ESCALATION_THRESHOLD, IAM_RETRY_INITIAL_INTERVAL, IAM_RETRY_MAX_INTERVAL, compute_backoff_interval,
-        run_iam_recovery_loop,
+        IAM_RETRY_ESCALATION_THRESHOLD, IAM_RETRY_INITIAL_INTERVAL, IAM_RETRY_MAX_INTERVAL, IamBootstrapDisposition,
+        compute_backoff_interval, publish_ready_for_iam_bootstrap_with, run_iam_recovery_loop,
     };
+    use rustfs_common::{GlobalReadiness, SystemStage};
     use std::io::Error;
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
 
@@ -374,6 +402,51 @@ mod tests {
         assert_eq!(compute_backoff_interval(4, initial, max), Duration::from_secs(30));
         assert_eq!(compute_backoff_interval(5, initial, max), Duration::from_secs(30));
         assert_eq!(compute_backoff_interval(100, initial, max), Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn ready_inline_bootstrap_publishes_runtime_readiness() {
+        let publish_calls = Arc::new(AtomicUsize::new(0));
+        let publish_calls_for_assert = publish_calls.clone();
+
+        let published = publish_ready_for_iam_bootstrap_with(IamBootstrapDisposition::ReadyInline, move || async move {
+            publish_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+
+        assert!(published.is_ok(), "ready inline publication should succeed");
+        let published = published.unwrap_or(false);
+        assert!(published);
+        assert_eq!(publish_calls_for_assert.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn deferred_bootstrap_skips_runtime_readiness_publication() {
+        let publish_calls = Arc::new(AtomicUsize::new(0));
+        let publish_calls_for_assert = publish_calls.clone();
+
+        let published = publish_ready_for_iam_bootstrap_with(IamBootstrapDisposition::Deferred, move || async move {
+            publish_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+
+        assert!(published.is_ok(), "deferred publication should be a no-op");
+        let published = published.unwrap_or(true);
+        assert!(!published);
+        assert_eq!(publish_calls_for_assert.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn ready_inline_bootstrap_propagates_runtime_readiness_failure() {
+        let err = publish_ready_for_iam_bootstrap_with(IamBootstrapDisposition::ReadyInline, || async {
+            Err(Error::other("runtime readiness failed"))
+        })
+        .await
+        .expect_err("ready inline publication failure should be returned");
+
+        assert_eq!(err.to_string(), "runtime readiness failed");
     }
 
     #[tokio::test(start_paused = true)]
@@ -411,6 +484,51 @@ mod tests {
 
         assert_eq!(init_calls_for_assert.load(Ordering::SeqCst), 1);
         assert_eq!(finalize_calls_for_assert.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_loop_can_publish_iam_and_full_ready_after_degraded_init() {
+        let init_calls = Arc::new(AtomicUsize::new(0));
+        let readiness = Arc::new(GlobalReadiness::new());
+        let observed_iam_ready = Arc::new(AtomicBool::new(false));
+
+        let init_calls_for_assert = init_calls.clone();
+        let readiness_for_finalize = readiness.clone();
+        let observed_iam_ready_for_finalize = observed_iam_ready.clone();
+
+        run_iam_recovery_loop(
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            None,
+            move || {
+                let init_calls = init_calls.clone();
+                Box::pin(async move {
+                    let call = init_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    if call == 1 {
+                        Err(Error::other("degraded init"))
+                    } else {
+                        Ok(())
+                    }
+                })
+            },
+            move || {
+                let readiness = readiness_for_finalize.clone();
+                let observed_iam_ready = observed_iam_ready_for_finalize.clone();
+                Box::pin(async move {
+                    readiness.mark_stage(SystemStage::IamReady);
+                    if matches!(readiness.current_stage(), SystemStage::IamReady) {
+                        observed_iam_ready.store(true, Ordering::SeqCst);
+                    }
+                    readiness.mark_stage(SystemStage::FullReady);
+                    Ok(())
+                })
+            },
+        )
+        .await;
+
+        assert_eq!(init_calls_for_assert.load(Ordering::SeqCst), 2);
+        assert!(observed_iam_ready.load(Ordering::SeqCst));
+        assert!(readiness.is_ready());
     }
 
     #[tokio::test(start_paused = true)]

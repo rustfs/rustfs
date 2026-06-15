@@ -54,6 +54,10 @@ const METRIC_CACHE_SAVE_ATTEMPT_TOTAL: &str = "rustfs_scanner_cache_save_attempt
 const METRIC_CACHE_SAVE_TIMEOUT_TOTAL: &str = "rustfs_scanner_cache_save_timeout_total";
 const METRIC_CACHE_SAVE_RETRY_TOTAL: &str = "rustfs_scanner_cache_save_retry_total";
 const METRIC_CACHE_SAVE_DURATION_SECONDS: &str = "rustfs_scanner_cache_save_duration_seconds";
+const LOG_COMPONENT_SCANNER: &str = "scanner";
+const LOG_SUBSYSTEM_CACHE: &str = "cache";
+const EVENT_SCANNER_CACHE_LOAD_STATE: &str = "scanner_cache_load_state";
+const EVENT_SCANNER_CACHE_SAVE_STATE: &str = "scanner_cache_save_state";
 static CACHE_SAVE_METRICS_ONCE: Once = Once::new();
 
 pub const DATA_USAGE_SCAN_CHECKPOINT_VERSION: u16 = 1;
@@ -651,7 +655,16 @@ impl DataUsageCache {
         }
 
         if retries == 5 {
-            warn!("maximum retry reached to load the data usage cache `{}`", name);
+            warn!(
+                target: "rustfs::scanner::data_usage",
+                event = EVENT_SCANNER_CACHE_LOAD_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_CACHE,
+                cache_name = %name,
+                retries,
+                state = "max_retries_reached",
+                "Scanner cache load reached retry limit"
+            );
         }
 
         Ok(())
@@ -891,7 +904,17 @@ impl DataUsageCache {
             Self::save_path_with_retry(store, &backup_path, &buf, backup_timeout_duration, DATA_USAGE_CACHE_BACKUP_SAVE_RETRIES)
                 .await
         {
-            warn!("Failed to save data usage cache backup: {e}");
+            warn!(
+                target: "rustfs::scanner::data_usage",
+                event = EVENT_SCANNER_CACHE_SAVE_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_CACHE,
+                cache_name = %name,
+                backup_path = %backup_path,
+                state = "backup_save_failed",
+                error = %e,
+                "Scanner cache backup save failed"
+            );
         }
         Ok(())
     }

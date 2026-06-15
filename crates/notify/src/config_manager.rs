@@ -91,7 +91,7 @@ impl NotifyConfigManager {
             component = LOG_COMPONENT_NOTIFY,
             subsystem = LOG_SUBSYSTEM_CONFIG,
             state = "initializing",
-            "Initializing notification system"
+            "notify runtime lifecycle"
         );
 
         let config = {
@@ -111,7 +111,7 @@ impl NotifyConfigManager {
             subsystem = LOG_SUBSYSTEM_CONFIG,
             state = "targets_created",
             target_count = targets.len(),
-            "Created notification targets"
+            "notify runtime lifecycle"
         );
         if targets.is_empty() {
             debug!(
@@ -121,7 +121,7 @@ impl NotifyConfigManager {
                 state = "idle",
                 reason = "no_targets_configured",
                 hint = %notify_configuration_hint(),
-                "Notification runtime has no configured targets"
+                "notify runtime lifecycle"
             );
         }
 
@@ -132,7 +132,7 @@ impl NotifyConfigManager {
             component = LOG_COMPONENT_NOTIFY,
             subsystem = LOG_SUBSYSTEM_CONFIG,
             state = "initialized",
-            "Initialized notification system"
+            "notify runtime lifecycle"
         );
         Ok(())
     }
@@ -156,13 +156,13 @@ impl NotifyConfigManager {
             if let Some(targets_of_type) = config.0.get_mut(&ttype) {
                 if targets_of_type.remove(&tname).is_some() {
                     info!(
-                        event = EVENT_NOTIFY_CONFIG_UPDATE,
-                        component = LOG_COMPONENT_NOTIFY,
+                            event = EVENT_NOTIFY_CONFIG_UPDATE,
+                            component = LOG_COMPONENT_NOTIFY,
                         subsystem = LOG_SUBSYSTEM_CONFIG,
                         action = "remove_target",
                         target_id = %target_id,
                         result = "removed",
-                        "Removed notification target from configuration"
+                        "notify config update"
                     );
                     changed = true;
                 }
@@ -178,7 +178,7 @@ impl NotifyConfigManager {
                     action = "remove_target",
                     target_id = %target_id,
                     result = "not_found",
-                    "Notification target not found in configuration"
+                    "notify config update"
                 );
             }
             changed
@@ -246,7 +246,7 @@ impl NotifyConfigManager {
                     target_type = %target_type,
                     target_name = %target_name,
                     result = "not_found",
-                    "Notification target configuration not found"
+                    "notify config update"
                 );
             }
             debug!(
@@ -264,7 +264,7 @@ impl NotifyConfigManager {
             component = LOG_COMPONENT_NOTIFY,
             subsystem = LOG_SUBSYSTEM_CONFIG,
             state = "reloading",
-            "Reloading notification configuration"
+            "notify runtime lifecycle"
         );
 
         self.update_config(new_config.clone()).await;
@@ -281,7 +281,7 @@ impl NotifyConfigManager {
             subsystem = LOG_SUBSYSTEM_CONFIG,
             state = "targets_created",
             target_count = targets.len(),
-            "Created notification targets from reloaded configuration"
+            "notify runtime lifecycle"
         );
         if targets.is_empty() {
             debug!(
@@ -291,7 +291,7 @@ impl NotifyConfigManager {
                 state = "idle",
                 reason = "no_targets_configured",
                 hint = %notify_configuration_hint(),
-                "Notification runtime has no configured targets after reload"
+                "notify runtime lifecycle"
             );
         }
 
@@ -302,7 +302,7 @@ impl NotifyConfigManager {
             component = LOG_COMPONENT_NOTIFY,
             subsystem = LOG_SUBSYSTEM_CONFIG,
             state = "reloaded",
-            "Reloaded notification configuration"
+            "notify runtime lifecycle"
         );
         Ok(())
     }
@@ -316,7 +316,7 @@ impl NotifyConfigManager {
     where
         F: FnMut(&mut Config) -> bool,
     {
-        let Some(store) = rustfs_ecstore::global::new_object_layer_fn() else {
+        let Some(store) = rustfs_ecstore::global::resolve_object_store_handle() else {
             return Err(NotificationError::StorageNotAvailable(
                 "Failed to save target configuration: server storage not initialized".to_string(),
             ));
@@ -333,7 +333,7 @@ impl NotifyConfigManager {
                 subsystem = LOG_SUBSYSTEM_CONFIG,
                 action = "reload_if_changed",
                 result = "unchanged",
-                "Notification configuration unchanged; skipping reload"
+                "notify config update"
             );
             return Ok(());
         }
@@ -348,7 +348,7 @@ impl NotifyConfigManager {
             subsystem = LOG_SUBSYSTEM_CONFIG,
             action = "reload_if_changed",
             result = "updated",
-            "Notification configuration updated; reloading runtime"
+            "notify config update"
         );
         self.reload_config(new_config).await
     }

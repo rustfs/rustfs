@@ -47,6 +47,8 @@ pub mod crypto;
 #[cfg(feature = "compress")]
 pub mod compress;
 
+pub mod logging;
+
 #[cfg(feature = "path")]
 pub mod dirs;
 
@@ -74,3 +76,4 @@ mod dunce;
 pub use dunce::*;
 mod envs;
 pub use envs::*;
+pub use logging::*;

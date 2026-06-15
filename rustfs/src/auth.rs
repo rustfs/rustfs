@@ -19,9 +19,9 @@ use rustfs_iam::error::Error as IamError;
 use rustfs_iam::sys::{
     SESSION_POLICY_NAME, get_claims_from_token_with_secret, get_claims_from_token_with_secret_allow_missing_exp,
 };
-use rustfs_obs::MaskedAccessKey;
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
 use rustfs_trusted_proxies::ClientInfo;
+use rustfs_utils::MaskedAccessKey;
 use rustfs_utils::http::{AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER};
 use s3s::S3Error;
 use s3s::S3ErrorCode;
@@ -151,7 +151,7 @@ impl S3Auth for IAMAuth {
                 subsystem = LOG_SUBSYSTEM_KEYSTONE,
                 principal = %MaskedAccessKey(&creds.parent_user),
                 result = "token_auth",
-                "Keystone credentials found in task-local storage"
+                "Keystone task-local credentials detected"
             );
             // Return empty secret key - Keystone uses token validation, not AWS signatures
             return Ok(SecretKey::from(String::new()));
@@ -170,7 +170,7 @@ impl S3Auth for IAMAuth {
                 subsystem = LOG_SUBSYSTEM_KEYSTONE,
                 access_key = %MaskedAccessKey(access_key),
                 result = "token_auth",
-                "Keystone access key detected for token-based auth"
+                "Keystone token-auth access key detected"
             );
             // Return empty secret key - Keystone uses token validation, not AWS signatures
             // The actual credentials are stored in task-local storage by KeystoneAuthMiddleware
@@ -202,7 +202,7 @@ impl S3Auth for IAMAuth {
                         subsystem = LOG_SUBSYSTEM_CREDENTIALS,
                         access_key = %MaskedAccessKey(access_key),
                         reason = "no_such_user",
-                        "Secret key lookup failed"
+                        "Secret key lookup rejected"
                     );
                 }
                 Err(e) => {
@@ -213,7 +213,7 @@ impl S3Auth for IAMAuth {
                         access_key = %MaskedAccessKey(access_key),
                         error = ?e,
                         reason = "check_key_error",
-                        "Secret key lookup failed"
+                        "Secret key lookup errored"
                     );
                     return Err(iam_lookup_error_to_s3_error(&e));
                 }
@@ -225,7 +225,7 @@ impl S3Auth for IAMAuth {
                 subsystem = LOG_SUBSYSTEM_CREDENTIALS,
                 access_key = %MaskedAccessKey(access_key),
                 reason = "iam_not_initialized",
-                "Secret key lookup failed"
+                "Secret key lookup skipped"
             );
         }
 
@@ -257,7 +257,7 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
         subsystem = LOG_SUBSYSTEM_CREDENTIALS,
         access_key = %MaskedAccessKey(access_key),
         has_session_token = !session_token.is_empty(),
-        "Starting access key validation"
+        "Access key validation started"
     );
     if let Ok(Some(credentials)) = KEYSTONE_CREDENTIALS.try_with(|creds| creds.clone()) {
         debug!(
@@ -265,7 +265,7 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
             component = LOG_COMPONENT_AUTH,
             subsystem = LOG_SUBSYSTEM_KEYSTONE,
             result = "task_local",
-            "Keystone credentials found in task-local storage"
+            "Keystone task-local credentials detected"
         );
 
         if !auth_keystone::is_keystone_enabled() {
@@ -283,7 +283,7 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
                 .and_then(|c| c.get("keystone_project_name"))
                 .and_then(|v| v.as_str())
                 .is_some(),
-            "Validated Keystone credentials from task-local storage"
+            "Keystone task-local credentials validated"
         );
 
         // Determine if user is admin (owner-level access)
@@ -307,7 +307,7 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
             subsystem = LOG_SUBSYSTEM_KEYSTONE,
             principal = %MaskedAccessKey(&credentials.parent_user),
             is_owner,
-            "Evaluated Keystone owner permissions"
+            "Keystone owner permissions evaluated"
         );
 
         return Ok((credentials, is_owner));
@@ -320,7 +320,7 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
             component = LOG_COMPONENT_AUTH,
             subsystem = LOG_SUBSYSTEM_KEYSTONE,
             access_key = %MaskedAccessKey(access_key),
-            "Keystone access key detected without task-local credentials"
+            "Keystone context missing for access key"
         );
 
         if !auth_keystone::is_keystone_enabled() {
@@ -360,7 +360,7 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
                     subsystem = LOG_SUBSYSTEM_CREDENTIALS,
                     access_key = %MaskedAccessKey(access_key),
                     reason = "user_not_found",
-                    "Access key validation failed"
+                    "Access key validation rejected"
                 );
                 return Err(s3_error!(InvalidAccessKeyId, "check key failed"));
             };
@@ -372,7 +372,7 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
                     subsystem = LOG_SUBSYSTEM_CREDENTIALS,
                     access_key = %MaskedAccessKey(access_key),
                     reason = "account_disabled",
-                    "Access key validation failed"
+                    "Access key validation rejected"
                 );
                 return Err(s3_error!(InvalidRequest, "ErrAccessKeyDisabled"));
             }
@@ -383,7 +383,7 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
                 subsystem = LOG_SUBSYSTEM_CREDENTIALS,
                 access_key = %MaskedAccessKey(access_key),
                 reason = "validation_failed",
-                "Access key validation failed"
+                "Access key validation rejected"
             );
             return Err(s3_error!(InvalidRequest, "check key failed"));
         }

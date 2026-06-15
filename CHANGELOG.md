@@ -24,11 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **32 unit and integration tests** covering middleware, auth handlers, task-local storage, and role detection
 - **SFTPv3 Protocol Support**: SSH-hosted SFTPv3 subsystem that translates each file operation into S3 calls against the local object store. Authentication uses IAM credentials (SSH username = access key, SSH password = secret key).
   - Full SFTPv3 packet coverage: open, read, write, stat, lstat, fstat, mkdir, rmdir, rename, remove, opendir, readdir, realpath, close, plus the rest of the 21-packet specification
-  - Streaming multipart write up to S3's 5 TiB per-file ceiling
+  - Streaming multipart write up to the part size times 10000 parts (156.25 GiB at the default part size)
   - Per-handle read-ahead cache with configurable window size and process-wide memory ceiling
   - Per-session liveness watchdog: Linux probes `/proc/net/tcp` and cancels wedged sessions on the order of 45 seconds; non-Linux falls back to an inactivity ceiling on the order of 30 minutes
   - 30-second SSH handshake deadline, per-call backend operation timeout, bounded multipart-abort fan-out, graceful-shutdown cascade
-  - 33 SFTPv3 compliance test cases under `crates/e2e_test/src/protocols/sftp_compliance.rs` spread across three entry points: `test_sftp_compliance_suite` (shared session), `test_sftp_compliance_readonly` (read-only mode), and `test_sftp_compliance_standalone` (one rustfs spawn per case)
+  - 34 SFTPv3 compliance test cases under `crates/e2e_test/src/protocols/sftp_compliance.rs` spread across three entry points: `test_sftp_compliance_suite` (shared session), `test_sftp_compliance_readonly` (read-only mode), and `test_sftp_compliance_standalone` (one rustfs spawn per case)
   - Four-layer regression-prevention tests guard against silent feature deletion: compile-time module assertion, module-presence unit test, cross-module `Protocol` enum assertion, end-to-end SSH banner test against the running binary
 
 ### Changed
@@ -77,10 +77,12 @@ New environment variables:
 - `RUSTFS_SFTP_ENABLE` - Enable/disable SFTP (default: false)
 - `RUSTFS_SFTP_ADDRESS` - Listen address (default: 0.0.0.0:2222)
 - `RUSTFS_SFTP_HOST_KEY_DIR` - Directory containing host key files (must exist). On Unix each file must grant no group or other permission bits (owner access only). On Windows the files load without a mode check and rustfs trusts the directory NTFS ACL
+- `RUSTFS_SFTP_HOST_KEY_RELOAD_ENABLE` - Rescan the host-key directory without a restart (default: false)
+- `RUSTFS_SFTP_HOST_KEY_RELOAD_INTERVAL` - Host-key rescan interval in seconds, minimum 5 (default: 30)
 - `RUSTFS_SFTP_IDLE_TIMEOUT` - Session idle timeout in seconds (default: 600)
 - `RUSTFS_SFTP_PART_SIZE` - Multipart part size in bytes (default: 16 MiB)
 - `RUSTFS_SFTP_READ_ONLY` - Reject write packets at the protocol layer (default: false)
-- `RUSTFS_SFTP_BANNER` - Optional SSH banner text
+- `RUSTFS_SFTP_BANNER` - SSH protocol identification string, must begin with `SSH-2.0-` (default: `SSH-2.0-RustFS`)
 - `RUSTFS_SFTP_HANDLES_PER_SESSION` - Per-session open-handle cap, 8 to 1024 (default: 64)
 - `RUSTFS_SFTP_BACKEND_OP_TIMEOUT_SECS` - Per-call backend deadline in seconds, 5 to 600 (default: 60)
 - `RUSTFS_SFTP_READ_CACHE_WINDOW_BYTES` - Per-handle read-cache window in bytes, 256 KiB to 64 MiB or 0 to disable (default: 4 MiB)
@@ -95,6 +97,7 @@ New environment variables:
 - `crates/protocols/src/sftp/state.rs` - `HandleState` variants for read, write-buffering, write-streaming, write-failed handles
 - `crates/protocols/src/sftp/lifecycle.rs` - Per-session activity stamp, weak-ref registry, `/proc/net/tcp` probe for the wedge watchdog
 - `crates/protocols/src/sftp/wedge_watchdog.rs` - Per-session liveness watchdog cancelling sessions silent at the SFTP layer while the kernel reports CLOSE_WAIT
+- `crates/protocols/src/sftp/fallback_watchdog.rs` - Per-session silence-only liveness backstop for non-Linux targets, cancelling sessions only at the fallback idle ceiling
 - `crates/protocols/src/sftp/read_cache.rs` - Per-handle in-memory read-ahead cache with shared atomic accumulator for the process-wide memory ceiling
 - `crates/protocols/src/sftp/attrs.rs` - SFTPv3 `FileAttributes` mapping for objects and directories, longname formatting, mtime clamping
 - `crates/protocols/src/sftp/dir.rs` - OPENDIR / READDIR pagination, root-bucket listing, sub-directory listing under a prefix
@@ -106,7 +109,7 @@ New environment variables:
 - `crates/protocols/src/common/dummy_storage.rs` - In-memory `StorageBackend` test backend covering every method, used by SFTP unit tests and the FTPS / Swift / WebDAV test suites
 - `crates/e2e_test/src/protocols/sftp_core.rs` - End-to-end regressions for the handshake deadline, idle-timeout disconnect, and the wedge watchdog
 - `crates/e2e_test/src/protocols/sftp_compliance.rs` - SFTPv3 compliance suite entry points (`test_sftp_compliance_suite`, `test_sftp_compliance_readonly`, `test_sftp_compliance_standalone`)
-- `crates/e2e_test/src/protocols/sftp_compliance_tests.rs` - Per-case test bodies (CMPTST-01..33), shared fixture helpers, lifecycle counters
+- `crates/e2e_test/src/protocols/sftp_compliance_tests.rs` - Per-case test bodies (CMPTST-01..34), shared fixture helpers, lifecycle counters
 - `crates/e2e_test/src/protocols/sftp_helpers.rs` - SFTP-specific test helpers and fixture seeders
 
 ### Files Modified
@@ -146,7 +149,7 @@ New environment variables:
 - **Total: 32 tests** passing with zero compilation errors
 - Manual testing guide provided for end-to-end validation
 - All Keystone tests passing with `cargo test --all --exclude e2e_test`
-- 33 SFTPv3 compliance test cases (CMPTST-01..33) split across three entry points: `test_sftp_compliance_suite` (shared session, cases 01-14), `test_sftp_compliance_readonly` (read-only mode, cases 15-23), `test_sftp_compliance_standalone` (one rustfs spawn per case, cases 24-33)
+- 34 SFTPv3 compliance test cases (CMPTST-01..34) split across three entry points: `test_sftp_compliance_suite` (shared session, cases 01-14), `test_sftp_compliance_readonly` (read-only mode, cases 15-23), `test_sftp_compliance_standalone` (one rustfs spawn per case, cases 24-34)
 - Regression-prevention tests at four layers: compile-time module assertion in `crates/protocols/src/lib.rs`, module-presence unit test in `crates/protocols/src/sftp/mod.rs`, cross-module `Protocol` enum assertion, and end-to-end SSH banner test against the running binary
 - Standalone end-to-end regressions for the SSH handshake deadline, the idle-timeout disconnect path, and the wedge watchdog (Linux fast-kill and the cross-platform fallback path)
 - Inline unit tests in every SFTP source file covering pure helpers (path canonicalisation, attribute mapping, S3-error classification, env-var bound resolvers)

@@ -17,18 +17,17 @@ use crate::{
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
     },
+    app::context::resolve_object_store_handle,
     auth::{check_key_valid, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},
 };
 use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
 use matchit::Params;
-use rustfs_ecstore::rebalance::RebalanceMeta;
 use rustfs_ecstore::{
     error::StorageError,
-    new_object_layer_fn,
     notification_sys::get_global_notification_sys,
-    rebalance::{DiskStat, RebalSaveOpt},
+    rebalance::{DiskStat, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta},
     store_api::BucketOperations,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
@@ -41,7 +40,11 @@ use s3s::{
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use time::OffsetDateTime;
-use tracing::warn;
+use tracing::info;
+
+const LOG_COMPONENT_ADMIN: &str = "admin";
+const LOG_SUBSYSTEM_REBALANCE: &str = "rebalance";
+const EVENT_ADMIN_REBALANCE_STATE: &str = "admin_rebalance_state";
 
 pub fn register_rebalance_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -100,6 +103,8 @@ pub struct RebalancePoolStatus {
     pub used: f64, // Fraction of used space in range 0.0..=1.0
     #[serde(rename = "lastError")]
     pub last_error: Option<String>, // Last rebalance error message for this pool
+    #[serde(rename = "cleanupWarnings")]
+    pub cleanup_warnings: RebalanceCleanupWarnings,
     #[serde(rename = "progress")]
     pub progress: Option<RebalPoolProgress>, // None when rebalance is not running
 }
@@ -201,6 +206,7 @@ fn build_rebalance_pool_statuses(
                 status: ps.info.status.to_string(),
                 used: rebalance_pool_used(disk_stats, i),
                 last_error: ps.info.last_error.clone(),
+                cleanup_warnings: ps.cleanup_warnings.clone(),
                 progress: None,
             };
 
@@ -219,10 +225,17 @@ pub struct RebalanceStart {}
 impl Operation for RebalanceStart {
     #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle RebalanceStart");
+        info!(
+            event = EVENT_ADMIN_REBALANCE_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            action = "start",
+            state = "requested",
+            "admin rebalance state"
+        );
 
         let Some(input_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "Failed to start rebalance: missing credentials"));
+            return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
@@ -238,8 +251,8 @@ impl Operation for RebalanceStart {
         )
         .await?;
 
-        let Some(store) = new_object_layer_fn() else {
-            return Err(s3_error!(InternalError, "Failed to start rebalance: object layer not initialized"));
+        let Some(store) = resolve_object_store_handle() else {
+            return Err(s3_error!(InternalError, "object layer is not initialized"));
         };
 
         if store.pools.len() == 1 {
@@ -247,47 +260,74 @@ impl Operation for RebalanceStart {
         }
 
         if store.is_decommission_running().await {
-            return Err(s3_error!(
-                InvalidRequest,
-                "Rebalance cannot be started, decommission is already in progress"
-            ));
+            return Err(s3_error!(InvalidRequest, "cannot start rebalance while decommission is in progress"));
         }
 
         if store.is_rebalance_conflicting_with_decommission().await {
-            return Err(s3_error!(OperationAborted, "Rebalance already in progress"));
+            return Err(s3_error!(OperationAborted, "rebalance is already in progress"));
         }
 
         let bucket_infos = store
             .list_bucket(&BucketOptions::default())
             .await
-            .map_err(|e| s3_error!(InternalError, "Failed to list buckets for rebalance: {}", e))?;
+            .map_err(|e| s3_error!(InternalError, "failed to list buckets for rebalance: {}", e))?;
 
         let buckets: Vec<String> = bucket_infos.into_iter().map(|bucket| bucket.name).collect();
 
         let id = match store.init_rebalance_meta(buckets).await {
             Ok(id) => id,
             Err(e) => {
-                return Err(s3_error!(InternalError, "Failed to initialize rebalance metadata: {}", e));
+                return Err(s3_error!(InternalError, "failed to initialize rebalance metadata: {}", e));
             }
         };
 
         store
             .start_rebalance()
             .await
-            .map_err(|e| s3_error!(InternalError, "Failed to start rebalance: {}", e))?;
+            .map_err(|e| s3_error!(InternalError, "failed to start rebalance: {}", e))?;
 
-        warn!("Rebalance started with id: {}", id);
+        info!(
+            event = EVENT_ADMIN_REBALANCE_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            action = "start",
+            state = "started",
+            rebalance_id = %id,
+            "admin rebalance state"
+        );
         if let Some(notification_sys) = get_global_notification_sys() {
-            warn!("RebalanceStart Loading rebalance meta start");
+            info!(
+                event = EVENT_ADMIN_REBALANCE_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                action = "start",
+                state = "propagation_started",
+                "admin rebalance state"
+            );
             if let Err(err) = notification_sys.load_rebalance_meta(true).await {
-                warn!("rebalance start propagation failed after local state update: {err}");
+                info!(
+                    event = EVENT_ADMIN_REBALANCE_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    action = "start",
+                    result = "propagation_failed",
+                    error = %err,
+                    "admin rebalance state"
+                );
             }
-            warn!("RebalanceStart Loading rebalance meta done");
+            info!(
+                event = EVENT_ADMIN_REBALANCE_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                action = "start",
+                state = "propagation_completed",
+                "admin rebalance state"
+            );
         }
 
         let resp = RebalanceResp { id };
         let data = serde_json::to_string(&resp)
-            .map_err(|e| s3_error!(InternalError, "Failed to serialize rebalance start response: {}", e))?;
+            .map_err(|e| s3_error!(InternalError, "failed to serialize rebalance start response: {}", e))?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -303,10 +343,17 @@ pub struct RebalanceStatus {}
 impl Operation for RebalanceStatus {
     #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle RebalanceStatus");
+        info!(
+            event = EVENT_ADMIN_REBALANCE_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            action = "status",
+            state = "requested",
+            "admin rebalance state"
+        );
 
         let Some(input_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "Failed to load rebalance status: missing credentials"));
+            return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
@@ -322,27 +369,27 @@ impl Operation for RebalanceStatus {
         )
         .await?;
 
-        let Some(store) = new_object_layer_fn() else {
-            return Err(s3_error!(InternalError, "Failed to load rebalance status: object layer not initialized"));
+        let Some(store) = resolve_object_store_handle() else {
+            return Err(s3_error!(InternalError, "object layer is not initialized"));
         };
 
         if store.pools.is_empty() {
-            return Err(s3_error!(InternalError, "Failed to load rebalance status: no storage pools available"));
+            return Err(s3_error!(InternalError, "no storage pools are available"));
         }
 
         let first_pool = store
             .pools
             .first()
             .cloned()
-            .ok_or_else(|| s3_error!(InternalError, "Failed to load rebalance status: no storage pools available"))?;
+            .ok_or_else(|| s3_error!(InternalError, "no storage pools are available"))?;
 
         let mut meta = RebalanceMeta::new();
         if let Err(err) = meta.load(first_pool).await {
             if err == StorageError::ConfigNotFound {
-                return Err(s3_error!(NoSuchResource, "Pool rebalance is not started"));
+                return Err(s3_error!(NoSuchResource, "pool rebalance is not started"));
             }
 
-            return Err(s3_error!(InternalError, "Failed to load rebalance metadata from pool 0: {}", err));
+            return Err(s3_error!(InternalError, "failed to load rebalance metadata from pool 0: {}", err));
         }
 
         // Compute disk usage percentage
@@ -366,7 +413,7 @@ impl Operation for RebalanceStatus {
         };
 
         let data = serde_json::to_string(&admin_status)
-            .map_err(|e| s3_error!(InternalError, "Failed to serialize rebalance status response: {}", e))?;
+            .map_err(|e| s3_error!(InternalError, "failed to serialize rebalance status response: {}", e))?;
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
@@ -381,10 +428,17 @@ pub struct RebalanceStop {}
 impl Operation for RebalanceStop {
     #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle RebalanceStop");
+        info!(
+            event = EVENT_ADMIN_REBALANCE_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            action = "stop",
+            state = "requested",
+            "admin rebalance state"
+        );
 
         let Some(input_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "Failed to stop rebalance: missing credentials"));
+            return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
@@ -400,38 +454,67 @@ impl Operation for RebalanceStop {
         )
         .await?;
 
-        let Some(store) = new_object_layer_fn() else {
-            return Err(s3_error!(InternalError, "Failed to stop rebalance: object layer not initialized"));
+        let Some(store) = resolve_object_store_handle() else {
+            return Err(s3_error!(InternalError, "object layer is not initialized"));
         };
 
         if !store.is_rebalance_conflicting_with_decommission().await {
-            return Err(s3_error!(NoSuchResource, "Pool rebalance is not started"));
+            return Err(s3_error!(NoSuchResource, "pool rebalance is not started"));
         }
 
         if let Some(notification_sys) = get_global_notification_sys() {
             notification_sys
                 .stop_rebalance()
                 .await
-                .map_err(|e| s3_error!(InternalError, "Failed to stop rebalance via notification system: {}", e))?;
+                .map_err(|e| s3_error!(InternalError, "failed to stop rebalance via notification system: {}", e))?;
         } else {
             store
                 .stop_rebalance()
                 .await
-                .map_err(|e| s3_error!(InternalError, "Failed to stop rebalance: {}", e))?;
+                .map_err(|e| s3_error!(InternalError, "failed to stop rebalance: {}", e))?;
 
             store
                 .save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt)
                 .await
-                .map_err(|e| s3_error!(InternalError, "Failed to persist rebalance stop metadata: {}", e))?;
+                .map_err(|e| s3_error!(InternalError, "failed to persist rebalance stop metadata: {}", e))?;
         }
 
-        warn!("handle RebalanceStop save_rebalance_stats done ");
+        info!(
+            event = EVENT_ADMIN_REBALANCE_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            action = "stop",
+            state = "local_stop_persisted",
+            "admin rebalance state"
+        );
         if let Some(notification_sys) = get_global_notification_sys() {
-            warn!("handle RebalanceStop notification_sys load_rebalance_meta");
+            info!(
+                event = EVENT_ADMIN_REBALANCE_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                action = "stop",
+                state = "propagation_started",
+                "admin rebalance state"
+            );
             if let Err(err) = notification_sys.load_rebalance_meta(false).await {
-                warn!("rebalance stop propagation failed after local state update: {err}");
+                info!(
+                    event = EVENT_ADMIN_REBALANCE_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    action = "stop",
+                    result = "propagation_failed",
+                    error = %err,
+                    "admin rebalance state"
+                );
             }
-            warn!("handle RebalanceStop notification_sys load_rebalance_meta done");
+            info!(
+                event = EVENT_ADMIN_REBALANCE_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                action = "stop",
+                state = "propagation_completed",
+                "admin rebalance state"
+            );
         }
 
         let mut header = HeaderMap::new();
@@ -481,7 +564,7 @@ mod rebalance_handler_tests {
         RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, build_rebalance_pool_statuses, rebalance_pool_used,
         rebalance_remaining_buckets, rebalance_used_pct,
     };
-    use rustfs_ecstore::rebalance::{DiskStat, RebalStatus, RebalanceInfo, RebalanceStats};
+    use rustfs_ecstore::rebalance::{DiskStat, RebalStatus, RebalanceCleanupWarnings, RebalanceInfo, RebalanceStats};
     use time::OffsetDateTime;
 
     #[test]
@@ -587,6 +670,7 @@ mod rebalance_handler_tests {
                 start_time: Some(OffsetDateTime::from_unix_timestamp(1_000).unwrap()),
                 ..Default::default()
             },
+            ..Default::default()
         };
 
         let progress = build_rebalance_pool_progress(OffsetDateTime::from_unix_timestamp(1_050).unwrap(), None, 0.3, &ps)
@@ -691,6 +775,7 @@ mod rebalance_handler_tests {
                     start_time: Some(OffsetDateTime::from_unix_timestamp(1_000).unwrap()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
             RebalanceStats {
                 participating: false,
@@ -766,6 +851,7 @@ mod rebalance_handler_tests {
                     start_time: Some(OffsetDateTime::from_unix_timestamp(2_000).unwrap()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         ];
 
@@ -802,6 +888,13 @@ mod rebalance_handler_tests {
                 status: "Started".to_string(),
                 used: 0.5,
                 last_error: Some("temporary error".to_string()),
+                cleanup_warnings: RebalanceCleanupWarnings {
+                    count: 1,
+                    last_message: Some("cleanup warning".to_string()),
+                    last_bucket: Some("bucket-a".to_string()),
+                    last_object: Some("obj".to_string()),
+                    last_at: Some(OffsetDateTime::from_unix_timestamp(1_001).unwrap()),
+                },
                 progress: Some(RebalPoolProgress {
                     num_objects: 3,
                     num_versions: 5,
@@ -818,6 +911,8 @@ mod rebalance_handler_tests {
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"remainingBuckets\""));
         assert!(json.contains("\"lastError\""));
+        assert!(json.contains("\"cleanupWarnings\""));
+        assert!(json.contains("\"lastMsg\":\"cleanup warning\""));
         assert!(json.contains("\"stoppedAt\":null"));
     }
 
@@ -832,6 +927,7 @@ mod rebalance_handler_tests {
                 status: "Stopped".to_string(),
                 used: 0.3,
                 last_error: None,
+                cleanup_warnings: RebalanceCleanupWarnings::default(),
                 progress: None,
             }],
         };

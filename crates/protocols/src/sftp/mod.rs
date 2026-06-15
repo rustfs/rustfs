@@ -81,8 +81,10 @@
 //! handler dispatch type. SftpError is the error type returned by SFTP
 //! operations.
 //!
-//! Platform support. Host-key permission enforcement uses Unix mode bits.
-//! On non-Unix targets SftpConfig::load_host_keys returns
+//! Platform support. On Unix the host-key loader enforces owner-only mode
+//! bits. On Windows it loads host keys without a mode check and trusts the
+//! operator-managed NTFS ACLs on the key directory. On targets that are
+//! neither Unix nor Windows, SftpConfig::load_host_keys returns
 //! SftpInitError::UnsupportedPlatform and the SFTP listener does not start.
 //!
 //! Peer-initiated signal requests on an open SFTP channel are intercepted

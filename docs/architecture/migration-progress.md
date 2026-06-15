@@ -5,18 +5,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-kms-dev-defaults`
-- Baseline: `origin/main` at `a85cc0354c02fc55e2dd8eb64cfc6155c37921c7`
-- PR type for this branch: `security-change`
-- Runtime behavior changes: KMS development-only defaults now fail closed unless
-  `RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS=true` or an admin configure request
-  sets `allow_insecure_dev_defaults=true`.
-- Rust code changes: harden Local KMS missing-master-key/temp-dir defaults,
-  Vault HTTP/default-token/skip-TLS defaults, KMS service-manager validation,
-  admin configure request conversion, and server CLI KMS configuration.
+- Branch: `overtrue/arch-startup-core-runtime-bootstrap`
+- Baseline: `origin/main` at `73e534682e93d1ed2c7b0e752ad550d969ca96b2`
+- PR type for this branch: `pure-move`
+- Runtime behavior changes: no external behavior change expected; startup
+  runtime foundation still logs dial9/license state, prints the logo, initializes
+  profiling and trusted proxies, installs the rustls provider, and publishes
+  outbound TLS material in the same order and with the same fatal boundary.
+- Rust code changes: centralize startup runtime foundation bootstrap in
+  `startup_runtime::init_startup_runtime_foundation` and use it from binary
+  startup.
 - CI/script changes: none.
-- Docs changes: record KMS compatibility notes and mark `KMSD-002` through
-  `KMSD-005` complete.
+- Docs changes: record `R-012` startup runtime foundation bootstrap progress and
+  verification.
 
 ## Phase 0 Tasks
 
@@ -133,6 +134,117 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     storage-class global state, default registration wiring, and startup
     initialization; global server-config reads and writes keep the same
     `std::sync::RwLock<Option<Config>>` clone semantics.
+
+## Phase 1b Context Foundation Tasks
+
+- [x] `CTX-001` Split AppContext files.
+  - Current branch: split `rustfs/src/app/context.rs` into `interfaces`,
+    `handles`, `global`, and `compat` submodules.
+  - Acceptance: old `crate::app::context::*` imports continue to compile via
+    re-exports; context-first and global fallback resolver bodies are moved
+    without semantic changes.
+  - Must preserve: AppContext construction, default adapters, global singleton
+    initialization, resolver fallback order, and all consumer import paths.
+  - Verification: formatting, compile checks, migration guards, diff hygiene,
+    Rust risk scan, and full `make pre-commit`.
+- [x] `CTX-002` Add resolver compatibility tests.
+  - Do: test context-first and global fallback for KMS runtime, bucket
+    metadata, object store, endpoints, tier config, server config, and buffer
+    config.
+  - Acceptance: context wins when present and global fallback works when absent.
+  - Verification: focused resolver compatibility test, formatting, compile
+    checks, migration guards, diff hygiene, Rust risk scan, and full
+    `make pre-commit`.
+- [x] `CTX-003` Add IAM deferred recovery readiness test.
+  - Do: verify IAM degraded recovery can still publish `IamReady` and
+    `FullReady`.
+  - Acceptance: boot/lifecycle changes cannot lose deferred readiness
+    publication.
+  - Verification: focused IAM recovery test, formatting, compile checks,
+    migration guards, diff hygiene, Rust risk scan, and full
+    `make pre-commit`.
+- [x] `CTX-004` Migrate app usecase object-store consumers.
+  - Do: migrate admin, bucket, multipart, and object usecases to resolve the
+    object store from AppContext first.
+  - Acceptance: usecase object-store lookups use AppContext when present and
+    preserve the existing global object-layer fallback when absent.
+  - Verification: formatting, compile check, migration guards, diff hygiene,
+    Rust risk scan, and full `make pre-commit`.
+- [x] `CTX-005` Migrate admin object-store consumers.
+  - Do: migrate admin handlers, admin services, and admin router helpers to the
+    shared object-store resolver.
+  - Acceptance: admin object-store lookups use AppContext when present and
+    preserve the existing global object-layer fallback when absent.
+  - Verification: focused resolver test, formatting, compile check, migration
+    guards, diff hygiene, Rust risk scan, and full `make pre-commit`.
+- [x] `CTX-006` Migrate ECFS object-store consumers.
+  - Do: migrate S3 ECFS object operations to the shared object-store resolver.
+  - Acceptance: ECFS object-store lookups use AppContext when present and
+    preserve the existing global object-layer fallback when absent.
+  - Must preserve: S3 object/bucket API behavior, object-lock/tagging/metadata
+    semantics, and existing storage error paths.
+  - Verification: formatting, compile check, migration guards, diff hygiene,
+    Rust risk scan, and full `make pre-commit`.
+- [x] `CTX-007` Migrate admin ZIP object-store consumers.
+  - Do: migrate admin object ZIP download object-store lookups to the shared
+    object-store resolver.
+  - Acceptance: admin ZIP object-store lookups use AppContext when present and
+    preserve the existing global object-layer fallback when absent.
+  - Must preserve: admin download authorization/preflight behavior, ZIP listing
+    and streaming behavior, and existing storage error paths.
+  - Verification: formatting, compile check, migration guards, diff hygiene,
+    Rust risk scan, and full `make pre-commit`.
+- [x] `CTX-008` Migrate standalone crate object-store consumers.
+  - Do: add an ECStore-owned resolver hook for AppContext-first object-store
+    lookup and migrate Swift, S3 Select, scanner, notify, and observability
+    object-store consumers to that resolver.
+  - Acceptance: standalone crates can prefer the AppContext-owned object store
+    without depending on the `rustfs` application crate and preserve the
+    existing global object-layer fallback.
+  - Must preserve: Swift protocol behavior, S3 Select object reads, scanner
+    cache/scan behavior, notification config persistence, observability stats
+    collection, and existing storage error paths.
+  - Verification: formatting, compile checks, migration guards, diff hygiene,
+    Rust risk scan, and full `make pre-commit`.
+- [x] `CTX-009` Migrate server/storage infra object-store consumers.
+  - Do: migrate server readiness/module-switch and storage access, ecfs
+    extension, and node RPC object-store lookups to the ECStore-owned resolver.
+  - Acceptance: server/storage infra consumers prefer the AppContext-owned
+    object store after context initialization and preserve the existing global
+    object-layer fallback.
+  - Must preserve: readiness reporting, module-switch config persistence,
+    storage access authorization checks, ecfs extension validation, node RPC
+    metadata/storage-info/rebalance/tier reload behavior, and existing storage
+    error paths.
+  - Verification: formatting, compile checks, migration guards, diff hygiene,
+    Rust risk scan, and full `make pre-commit`.
+- [x] `CTX-010` Migrate ECStore internal object-store consumers.
+  - Do: migrate ECStore internal/background object-store lookups to the
+    ECStore-owned resolver.
+  - Acceptance: ECStore metrics realtime, notification, tier config save,
+    decommission, admin server info, bucket metadata, replication decision,
+    lifecycle compensation/expiry, and data-usage cache consumers prefer the
+    AppContext-owned object store after context initialization and preserve the
+    existing global object-layer fallback.
+  - Must preserve: metrics collection, notification rebalance stop behavior,
+    tier config persistence, decommission startup, admin server info reporting,
+    bucket metadata persistence, replication decisions, lifecycle queueing, data
+    usage cache persistence, and existing storage error paths.
+  - Verification: formatting, compile checks, migration guards, diff hygiene,
+    Rust risk scan, and full `make pre-commit`.
+- [x] `CTX-011` Consolidate app usecase object-store fallback.
+  - Do: migrate app admin, bucket, multipart, and object usecases away from
+    direct `new_object_layer_fn` calls and through an explicit-context resolver
+    helper.
+  - Acceptance: usecase lookups keep their injected AppContext precedence,
+    preserve `without_context()` legacy global object-layer fallback semantics,
+    and avoid consulting the global AppContext when a usecase intentionally has
+    no context.
+  - Must preserve: admin storage/data-usage reads, bucket create/delete/list
+    behavior, multipart object writes, object API reads/writes, lifecycle
+    transition tests, and existing "Not init" error paths.
+  - Verification: formatting, compile checks, migration guards, diff hygiene,
+    Rust risk scan, and full `make pre-commit`.
 
 ## Phase 1 Security Governance Tasks
 
@@ -381,56 +493,165 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     start/stop path, storage write, readiness change, peer signal, or runtime
     behavior change.
   - Verification: docs-only architecture checks and diff hygiene.
+- [x] `BGC-003` Add read-only status snapshot.
+  - Acceptance: memory observability exposes a typed status snapshot that reports
+    service state, metrics enablement, configured interval, cancellation source,
+    and shutdown handle shape.
+  - Must preserve: no controller framework, admin route, worker lifecycle
+    change, storage write, readiness change, peer signal, or metrics emission
+    behavior change.
+  - Verification: focused memory observability tests, compile checks, migration
+    guards, formatting, and pre-commit quality gate.
+- [x] `BGC-004` Pilot one controller.
+  - Acceptance: memory observability exposes a typed controller snapshot and
+    reconcile plan that compare desired state with current status.
+  - Must preserve: no admin route, scheduler, service registry, worker
+    lifecycle mutation, storage write, readiness signal, peer signal, or metrics
+    emission behavior change.
+  - Verification: focused controller tests prove repeated reconcile is
+    idempotent, cancellation state is preserved, and worker mutation remains
+    none.
+- [x] `TEST-BGC-001` Add controller harness coverage.
+  - Acceptance: controller tests cover cancellation state, repeated reconcile,
+    paused-time stability, and no worker mutation for the low-risk controller
+    surfaces.
+  - Must preserve: no worker spawn, start, stop, resize, wakeup, storage write,
+    readiness signal, peer signal, or metrics emission behavior change.
+  - Verification: focused memory observability and allocator reclaim controller
+    tests.
+- [x] `BGC-005` Add allocator reclaim controller/status surface.
+  - Acceptance: allocator reclaim exposes typed desired/status/controller
+    snapshots and a typed reconcile plan that reports backend, effective force,
+    idle interval, runtime cancellation, shutdown handle shape, and no-op worker
+    mutation.
+  - Must preserve: existing allocator reclaim enablement, backend-specific force
+    handling, idle-streak logic, metrics emission, runtime-token cancellation,
+    and startup call shape.
+  - Verification: focused allocator reclaim tests, compile checks, formatting,
+    migration guards, Rust risk scan, and pre-commit quality gate.
+- [x] `BGC-006` Add metrics runtime controller/status surface.
+  - Acceptance: metrics runtime exposes typed desired/status/controller
+    snapshots and a typed reconcile plan that reports observability enablement,
+    collector task count, configured intervals, runtime cancellation, shutdown
+    handle shape, and no-op worker mutation.
+  - Must preserve: existing metrics collector grouping, interval parsing,
+    replication bandwidth tombstone cycles, metrics emission, runtime-token
+    cancellation, and startup call shape.
+  - Verification: focused metrics runtime tests, compile checks, formatting,
+    migration guards, Rust risk scan, and pre-commit quality gate.
+- [x] `TEST-BGC-002` Preserve config reload and shutdown assumptions.
+  - Acceptance: dynamic server-config reload reports no worker mutation for
+    scanner/heal runtime config, bucket lifecycle/replication config files are
+    not dynamic server-config reload targets, and background shutdown keeps
+    scanner before AHM while preserving the scanner-implies-AHM dependency.
+  - Must preserve: no scanner, heal, lifecycle, replication, audit, storage
+    class, peer-signal, readiness, or worker lifecycle behavior change.
+  - Verification: focused config reload and shutdown tests, compile checks,
+    formatting, diff hygiene, and Rust risk scan.
+
+## Phase 9 Startup Bootstrap Tasks
+
+- [x] `R-009` Centralize startup IAM readiness publication bootstrap.
+  - Do: move the ReadyInline/Deferred readiness publication decision behind
+    `startup_iam::publish_ready_for_iam_bootstrap` and use it from binary and
+    embedded startup.
+  - Acceptance: inline IAM bootstrap still waits for runtime readiness and
+    updates service state, deferred IAM bootstrap does not publish readiness
+    from main or embedded startup, and embedded runtime readiness failures still
+    trigger embedded shutdown error mapping.
+  - Must preserve: startup ordering, IAM degraded recovery ownership,
+    `IamReady`/`FullReady` publication semantics, and embedded shutdown
+    behavior.
+  - Verification: focused startup IAM tests, binary/lib compile checks,
+    formatting, migration guards, Rust risk scan, and pre-commit quality gate.
+
+- [x] `R-010` Centralize startup optional service bootstrap.
+  - Do: move event notifier, audit startup, and notification system startup
+    behind `startup_services` helpers with caller-owned logging/error policy.
+  - Acceptance: binary still initializes the event notifier before audit, logs
+    audit start/failure through the same startup target, and treats notification
+    init failure as fatal; embedded still treats audit and notification failures
+    as non-fatal warnings.
+  - Must preserve: startup order, audit non-fatal behavior, notification fatal
+    boundary in binary, embedded warn-and-continue behavior, and event notifier
+    initialization.
+  - Verification: focused startup service tests, binary/lib compile checks,
+    formatting, migration guards, Rust risk scan, and pre-commit quality gate.
+
+- [x] `R-011` Centralize startup protocol sidecar bootstrap.
+  - Do: move FTP, FTPS, WebDAV, and SFTP startup orchestration behind
+    `startup_protocols::init_protocol_shutdown_senders`.
+  - Acceptance: feature-gated protocols still return `None` when not compiled
+    or enabled, started/disabled/failure logging preserves protocol and state
+    fields, and startup failures still abort binary startup with the same
+    `Error::other` mapping.
+  - Must preserve: protocol feature gates, env-driven enable/disable behavior,
+    startup log event/state/protocol values, shutdown handle ownership, and
+    existing shutdown ordering.
+  - Verification: focused startup protocol tests, binary/lib compile checks,
+    formatting, migration guards, Rust risk scan, and pre-commit quality gate.
+
+- [x] `R-012` Centralize startup runtime foundation bootstrap.
+  - Do: move dial9 runtime status logging, runtime license status logging,
+    startup logo logging, profiling setup, trusted-proxy setup, rustls provider
+    setup, and outbound TLS material publication behind
+    `startup_runtime::init_startup_runtime_foundation`.
+  - Acceptance: BOOT-006 order is unchanged, configured TLS material load
+    remains fatal with the same `Error::other(err.to_string())` mapping, TLS
+    generation remains saturating, TLS metrics still initialize only when
+    metrics are enabled and TLS is configured, and profiling/proxy/provider
+    setup remains non-fatal.
+  - Must preserve: dial9/license log event names and fields, startup logo
+    logging, profiling init timing, trusted-proxy init timing, crypto provider
+    already-installed handling, outbound TLS publication, generation metric
+    consumer, TLS metric init condition, and fatal boundaries.
+  - Verification: focused startup runtime tests, binary/lib compile checks,
+    formatting, migration guards, Rust risk scan, branch freshness check, and
+    pre-commit quality gate.
 
 ## Next PRs
 
-1. `security-change`: apply IAM and plugin secret redaction in `S-014`.
-2. `security-change`: classify and add strict serde ingress tests in `S-015`.
+1. `pure-move`: continue extracting startup boot wrappers in larger slices while
+   preserving startup order and readiness ownership.
+2. `ci-gate`: finish `G-006` public re-export and storage trait coverage checks
+   before the remaining cleanup slices.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed KMS unsafe-development defaults are enforced in `KmsConfig::validate()` and reused by env loading, admin configure conversion, service-manager lifecycle, and direct backend construction. |
-| Migration preservation | pass | Confirmed KMS runtime key operations, cache behavior, redaction behavior, storage SSE call sites, and admin route contracts keep their existing shapes except for the explicit development opt-in field. |
-| Testing/verification | pass | Confirmed KMS crate tests, rustfs config/SSE focused tests, rustfs lib/test compile, migration guards, format check, and diff check cover this larger security-change slice; full pre-commit is skipped under the current larger-granularity instruction. |
+| Quality/architecture | passed | Pure-move slice removes startup runtime foundation details from binary startup without changing ownership or adding abstraction beyond the existing startup module pattern. |
+| Migration preservation | passed | BOOT-006 order, dial9/license log fields, profiling/proxy/provider non-fatal setup, TLS fatal boundary, generation saturation, and TLS metric condition are preserved. |
+| Testing/verification | passed | Focused startup runtime tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `a85cc0354c02fc55e2dd8eb64cfc6155c37921c7`:
-- `cargo check -p rustfs --lib --tests`.
-- `cargo check -p rustfs-kms --tests`.
-- `cargo test -p rustfs-kms --no-fail-fast`; 57 passed, 1 ignored, doc-test
-  passed.
-- `cargo clippy -p rustfs-kms --all-targets -- -D warnings`.
-- `cargo test -p rustfs --lib config::config_test --no-fail-fast`; 20 passed.
-- `cargo test -p rustfs --lib storage::sse::tests::test_kms --no-fail-fast`;
-  1 passed.
-- `cargo test -p rustfs --lib -- --list | rg "sse.*kms|kms.*sse|config::config_test::tests::test_config_new_defaults"`.
+Passed on `73e534682e93d1ed2c7b0e752ad550d969ca96b2`:
+
+- `cargo test -p rustfs startup_runtime --no-fail-fast`.
+- `cargo check -p rustfs --lib`.
+- `cargo check -p rustfs --bin rustfs`.
 - `cargo fmt --all --check`.
+- `git diff --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
-- `./scripts/check_metrics_migration_refs.sh`.
-- `git diff --check`.
+- `git rev-list --left-right --count HEAD...origin/main` returned `0 0`.
+- Added-line Rust risk scan for changed Rust files: no matches.
+- Full-file risk scan for changed Rust files: matches are existing docs example
+  output and existing binary startup stderr/expect usage.
+- `make pre-commit`: all checks passed, including nextest with 6002 passed and
+  111 skipped, plus doctests.
 
 Notes:
-- Full pre-commit may be skipped if focused tests, compile checks, and guards
-  pass, per the current instruction to increase PR granularity.
-- `cargo test -p rustfs --lib storage::sse::tests::test_sse_kms --no-fail-fast`
-  and `cargo test -p rustfs --lib test_sse_kms_roundtrip --no-fail-fast`
-  matched 0 tests because the `rio-v2` roundtrip test is feature-gated out of
-  the default `rustfs --lib` test binary.
-- This slice includes a minimal compile unblock after PR #3365: table catalog's
-  ECStore object backend now declares `NamespaceLocking` where it calls
-  `new_ns_lock`; the lock path itself is unchanged.
-- This slice does not change KMS authorization actions, key operation behavior,
-  storage encryption metadata formats, or cache semantics.
+
+- This slice centralizes startup runtime foundation bootstrap without changing
+  startup ordering or fatal boundaries.
+- Observability initialization remains in binary startup so early fatal stderr
+  handling stays unchanged.
 
 ## Handoff Notes
 
-- Keep this KMS slice as a `security-change` PR covering KMSD-002 through
-  KMSD-005 plus the minimal table catalog compile unblock from PR #3365.
-- Do not change KMS key operation behavior, storage SSE metadata formats, IAM
-  policy actions, admin route wiring, or cache semantics in this PR.
-- If more time is available before the next slice, start `S-014` with IAM/plugin
-  secret redaction; otherwise start `S-015` strict serde ingress tests.
+- R-012 is complete.
+- Next startup slices can keep using larger pure moves, but must keep startup
+  ordering, fatal/non-fatal boundaries, shutdown ownership, and readiness
+  ownership explicit in tests.

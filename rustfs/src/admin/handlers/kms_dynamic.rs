@@ -16,14 +16,13 @@
 
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::context::resolve_kms_runtime_service_manager;
+use crate::app::context::{resolve_kms_runtime_service_manager, resolve_object_store_handle};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::config::com::{read_config, save_config};
-use rustfs_ecstore::new_object_layer_fn;
 use rustfs_kms::{
     ConfigureKmsRequest, ConfigureKmsResponse, KmsConfig, KmsConfigSummary, KmsServiceStatus, KmsStatusResponse, StartKmsRequest,
     StartKmsResponse, StopKmsResponse,
@@ -34,10 +33,19 @@ use tracing::{error, info, instrument, warn};
 
 /// Path to store KMS configuration in the cluster metadata
 const KMS_CONFIG_PATH: &str = "config/kms_config.json";
+const LOG_COMPONENT_ADMIN: &str = "admin";
+const LOG_SUBSYSTEM_KMS: &str = "kms";
+const EVENT_ADMIN_KMS_DYNAMIC_STATE: &str = "admin_kms_dynamic_state";
 
 fn kms_service_manager_from_context() -> std::sync::Arc<rustfs_kms::KmsServiceManager> {
     resolve_kms_runtime_service_manager().unwrap_or_else(|| {
-        warn!("KMS service manager not initialized, initializing now as fallback");
+        warn!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_KMS,
+            event = "kms_service_manager_fallback",
+            result = "service_manager_fallback_initialized",
+            "admin kms dynamic state"
+        );
         rustfs_kms::init_global_kms_service_manager()
     })
 }
@@ -95,7 +103,7 @@ fn normalize_configure_request_auth(
 /// Save KMS configuration to cluster storage
 #[instrument(skip(config))]
 async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err("Storage layer not initialized".to_string());
     };
 
@@ -105,35 +113,79 @@ async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
         .await
         .map_err(|e| format!("Failed to save KMS config to storage: {e}"))?;
 
-    info!("KMS configuration persisted to cluster storage at {}", KMS_CONFIG_PATH);
+    info!(
+        component = LOG_COMPONENT_ADMIN,
+        subsystem = LOG_SUBSYSTEM_KMS,
+        event = "kms_config_persisted",
+        storage_path = KMS_CONFIG_PATH,
+        state = "config_persisted",
+        "admin kms dynamic state"
+    );
     Ok(())
 }
 
 /// Load KMS configuration from cluster storage
 #[instrument]
 pub async fn load_kms_config() -> Option<KmsConfig> {
-    let Some(store) = new_object_layer_fn() else {
-        warn!("Storage layer not initialized, cannot load KMS config");
+    let Some(store) = resolve_object_store_handle() else {
+        warn!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_KMS,
+            event = "kms_config_load_skipped",
+            reason = "storage_uninitialized",
+            result = "config_load_skipped",
+            "admin kms dynamic state"
+        );
         return None;
     };
 
     match read_config(store, KMS_CONFIG_PATH).await {
         Ok(data) => match serde_json::from_slice::<KmsConfig>(&data) {
             Ok(config) => {
-                info!("Loaded KMS configuration from cluster storage");
+                info!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = "kms_config_loaded",
+                    storage_path = KMS_CONFIG_PATH,
+                    state = "config_loaded",
+                    "admin kms dynamic state"
+                );
                 Some(config)
             }
             Err(e) => {
-                error!("Failed to deserialize KMS config: {}", e);
+                error!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = "kms_config_deserialize_failed",
+                    storage_path = KMS_CONFIG_PATH,
+                    result = "config_deserialize_failed",
+                    error = %e,
+                    "admin kms dynamic state"
+                );
                 None
             }
         },
         Err(e) => {
             // Config not found is normal on first run
             if e.to_string().contains("ConfigNotFound") || e.to_string().contains("not found") {
-                info!("No persisted KMS configuration found (first run or not configured yet)");
+                info!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = "kms_config_loaded",
+                    state = "not_found",
+                    storage_path = KMS_CONFIG_PATH,
+                    "admin kms dynamic state"
+                );
             } else {
-                warn!("Failed to load KMS config from storage: {}", e);
+                warn!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = "kms_config_load_failed",
+                    storage_path = KMS_CONFIG_PATH,
+                    result = "config_load_failed",
+                    error = %e,
+                    "admin kms dynamic state"
+                );
             }
             None
         }
@@ -212,13 +264,28 @@ impl Operation for ConfigureKmsHandler {
             match serde_json::from_slice(&body) {
                 Ok(req) => req,
                 Err(e) => {
-                    error!("Invalid JSON in configure request: {}", e);
+                    error!(
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_KMS,
+                        event = "kms_request_decode_failed",
+                        operation = "configure",
+                        result = "request_decode_failed",
+                        error = %e,
+                        "admin kms dynamic state"
+                    );
                     return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(format!("Invalid JSON: {e}")))));
                 }
             }
         };
 
-        info!("Configuring KMS from admin request");
+        info!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_KMS,
+            event = "kms_service_state",
+            operation = "configure",
+            state = "requested",
+            "admin kms dynamic state"
+        );
 
         let service_manager = kms_service_manager_from_context();
         let existing_config = service_manager.get_config().await;
@@ -236,18 +303,42 @@ impl Operation for ConfigureKmsHandler {
                 // Persist the configuration to cluster storage
                 if let Err(e) = save_kms_config(&kms_config).await {
                     let error_msg = format!("KMS configured in memory but failed to persist: {e}");
-                    error!("{}", error_msg);
+                    error!(
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_KMS,
+                        event = "kms_service_state",
+                        operation = "configure",
+                        state = "persist_failed",
+                        error = %e,
+                        "admin kms dynamic state"
+                    );
                     let status = service_manager.get_status().await;
                     (false, error_msg, status)
                 } else {
                     let status = service_manager.get_status().await;
-                    info!("KMS configured successfully and persisted with status: {:?}", status);
+                    info!(
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_KMS,
+                        event = "kms_service_state",
+                        operation = "configure",
+                        state = "configured",
+                        status = ?status,
+                        "admin kms dynamic state"
+                    );
                     (true, "KMS configured successfully".to_string(), status)
                 }
             }
             Err(e) => {
                 let error_msg = format!("Failed to configure KMS: {e}");
-                error!("{}", error_msg);
+                error!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = "kms_service_state",
+                    operation = "configure",
+                    state = "configure_failed",
+                    error = %e,
+                    "admin kms dynamic state"
+                );
                 let status = service_manager.get_status().await;
                 (false, error_msg, status)
             }
@@ -262,7 +353,15 @@ impl Operation for ConfigureKmsHandler {
         let json_response = match serde_json::to_string(&response) {
             Ok(json) => json,
             Err(e) => {
-                error!("Failed to serialize response: {}", e);
+                error!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = EVENT_ADMIN_KMS_DYNAMIC_STATE,
+                    operation = "configure",
+                    result = "response_serialize_failed",
+                    error = %e,
+                    "admin kms dynamic state"
+                );
                 return Ok(S3Response::new((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Body::from("Serialization error".to_string()),
@@ -309,20 +408,43 @@ impl Operation for StartKmsHandler {
             match serde_json::from_slice(&body) {
                 Ok(req) => req,
                 Err(e) => {
-                    error!("Invalid JSON in start request: {}", e);
+                    error!(
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_KMS,
+                        event = "kms_request_decode_failed",
+                        operation = "start",
+                        result = "request_decode_failed",
+                        error = %e,
+                        "admin kms dynamic state"
+                    );
                     return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(format!("Invalid JSON: {e}")))));
                 }
             }
         };
 
-        info!("Starting KMS service with force: {:?}", start_request.force);
+        info!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_KMS,
+            event = "kms_service_state",
+            operation = "start",
+            state = "requested",
+            force = start_request.force.unwrap_or(false),
+            "admin kms dynamic state"
+        );
 
         let service_manager = kms_service_manager_from_context();
 
         // Check if already running and force flag
         let current_status = service_manager.get_status().await;
         if matches!(current_status, KmsServiceStatus::Running) && !start_request.force.unwrap_or(false) {
-            warn!("KMS service is already running");
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_KMS,
+                event = "kms_service_state",
+                operation = "start",
+                state = "already_running",
+                "admin kms dynamic state"
+            );
             let response = StartKmsResponse {
                 success: false,
                 message: "KMS service is already running. Use force=true to restart.".to_string(),
@@ -331,7 +453,15 @@ impl Operation for StartKmsHandler {
             let json_response = match serde_json::to_string(&response) {
                 Ok(json) => json,
                 Err(e) => {
-                    error!("Failed to serialize response: {}", e);
+                    error!(
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_KMS,
+                        event = EVENT_ADMIN_KMS_DYNAMIC_STATE,
+                        operation = "start",
+                        result = "response_serialize_failed",
+                        error = %e,
+                        "admin kms dynamic state"
+                    );
                     return Ok(S3Response::new((
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Body::from("Serialization error".to_string()),
@@ -349,19 +479,43 @@ impl Operation for StartKmsHandler {
                     Ok(()) => match service_manager.start().await {
                         Ok(()) => {
                             let status = service_manager.get_status().await;
-                            info!("KMS service restarted successfully");
+                            info!(
+                                component = LOG_COMPONENT_ADMIN,
+                                subsystem = LOG_SUBSYSTEM_KMS,
+                                event = "kms_service_state",
+                                operation = "restart",
+                                state = "running",
+                                status = ?status,
+                                "admin kms dynamic state"
+                            );
                             (true, "KMS service restarted successfully".to_string(), status)
                         }
                         Err(e) => {
                             let error_msg = format!("Failed to restart KMS service: {e}");
-                            error!("{}", error_msg);
+                            error!(
+                                component = LOG_COMPONENT_ADMIN,
+                                subsystem = LOG_SUBSYSTEM_KMS,
+                                event = "kms_service_state",
+                                operation = "restart",
+                                state = "start_failed",
+                                error = %e,
+                                "admin kms dynamic state"
+                            );
                             let status = service_manager.get_status().await;
                             (false, error_msg, status)
                         }
                     },
                     Err(e) => {
                         let error_msg = format!("Failed to stop KMS service for restart: {e}");
-                        error!("{}", error_msg);
+                        error!(
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_KMS,
+                            event = "kms_service_state",
+                            operation = "restart",
+                            state = "stop_failed",
+                            error = %e,
+                            "admin kms dynamic state"
+                        );
                         let status = service_manager.get_status().await;
                         (false, error_msg, status)
                     }
@@ -371,12 +525,28 @@ impl Operation for StartKmsHandler {
                 match service_manager.start().await {
                     Ok(()) => {
                         let status = service_manager.get_status().await;
-                        info!("KMS service started successfully");
+                        info!(
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_KMS,
+                            event = "kms_service_state",
+                            operation = "start",
+                            state = "running",
+                            status = ?status,
+                            "admin kms dynamic state"
+                        );
                         (true, "KMS service started successfully".to_string(), status)
                     }
                     Err(e) => {
                         let error_msg = format!("Failed to start KMS service: {e}");
-                        error!("{}", error_msg);
+                        error!(
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_KMS,
+                            event = "kms_service_state",
+                            operation = "start",
+                            state = "start_failed",
+                            error = %e,
+                            "admin kms dynamic state"
+                        );
                         let status = service_manager.get_status().await;
                         (false, error_msg, status)
                     }
@@ -392,7 +562,15 @@ impl Operation for StartKmsHandler {
         let json_response = match serde_json::to_string(&response) {
             Ok(json) => json,
             Err(e) => {
-                error!("Failed to serialize response: {}", e);
+                error!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = EVENT_ADMIN_KMS_DYNAMIC_STATE,
+                    operation = "start",
+                    result = "response_serialize_failed",
+                    error = %e,
+                    "admin kms dynamic state"
+                );
                 return Ok(S3Response::new((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Body::from("Serialization error".to_string()),
@@ -427,19 +605,42 @@ impl Operation for StopKmsHandler {
         )
         .await?;
 
-        info!("Stopping KMS service");
+        info!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_KMS,
+            event = "kms_service_state",
+            operation = "stop",
+            state = "requested",
+            "admin kms dynamic state"
+        );
 
         let service_manager = kms_service_manager_from_context();
 
         let (success, message, status) = match service_manager.stop().await {
             Ok(()) => {
                 let status = service_manager.get_status().await;
-                info!("KMS service stopped successfully");
+                info!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = "kms_service_state",
+                    operation = "stop",
+                    state = "stopped",
+                    status = ?status,
+                    "admin kms dynamic state"
+                );
                 (true, "KMS service stopped successfully".to_string(), status)
             }
             Err(e) => {
                 let error_msg = format!("Failed to stop KMS service: {e}");
-                error!("{}", error_msg);
+                error!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = "kms_service_state",
+                    operation = "stop",
+                    state = "stop_failed",
+                    error = %e,
+                    "admin kms dynamic state"
+                );
                 let status = service_manager.get_status().await;
                 (false, error_msg, status)
             }
@@ -454,7 +655,15 @@ impl Operation for StopKmsHandler {
         let json_response = match serde_json::to_string(&response) {
             Ok(json) => json,
             Err(e) => {
-                error!("Failed to serialize response: {}", e);
+                error!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = EVENT_ADMIN_KMS_DYNAMIC_STATE,
+                    operation = "stop",
+                    result = "response_serialize_failed",
+                    error = %e,
+                    "admin kms dynamic state"
+                );
                 return Ok(S3Response::new((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Body::from("Serialization error".to_string()),
@@ -489,7 +698,13 @@ impl Operation for GetKmsStatusHandler {
         )
         .await?;
 
-        info!("Getting KMS service status");
+        info!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_KMS,
+            event = "kms_status_requested",
+            state = "status_requested",
+            "admin kms dynamic state"
+        );
 
         let service_manager = kms_service_manager_from_context();
 
@@ -517,12 +732,30 @@ impl Operation for GetKmsStatusHandler {
             config_summary,
         };
 
-        info!("KMS status: {:?}", response);
+        info!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_KMS,
+            event = "kms_status_resolved",
+            status = ?response.status,
+            backend_type = ?response.backend_type,
+            healthy = response.healthy,
+            has_config_summary = response.config_summary.is_some(),
+            state = "status_resolved",
+            "admin kms dynamic state"
+        );
 
         let json_response = match serde_json::to_string(&response) {
             Ok(json) => json,
             Err(e) => {
-                error!("Failed to serialize response: {}", e);
+                error!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = EVENT_ADMIN_KMS_DYNAMIC_STATE,
+                    operation = "status",
+                    result = "response_serialize_failed",
+                    error = %e,
+                    "admin kms dynamic state"
+                );
                 return Ok(S3Response::new((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Body::from("Serialization error".to_string()),
@@ -572,13 +805,28 @@ impl Operation for ReconfigureKmsHandler {
             match serde_json::from_slice(&body) {
                 Ok(req) => req,
                 Err(e) => {
-                    error!("Invalid JSON in reconfigure request: {}", e);
+                    error!(
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_KMS,
+                        event = "kms_request_decode_failed",
+                        operation = "reconfigure",
+                        result = "request_decode_failed",
+                        error = %e,
+                        "admin kms dynamic state"
+                    );
                     return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(format!("Invalid JSON: {e}")))));
                 }
             }
         };
 
-        info!("Reconfiguring KMS");
+        info!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_KMS,
+            event = "kms_service_state",
+            operation = "reconfigure",
+            state = "requested",
+            "admin kms dynamic state"
+        );
 
         let service_manager = kms_service_manager_from_context();
         let existing_config = service_manager.get_config().await;
@@ -596,18 +844,42 @@ impl Operation for ReconfigureKmsHandler {
                 // Persist the configuration to cluster storage
                 if let Err(e) = save_kms_config(&kms_config).await {
                     let error_msg = format!("KMS reconfigured in memory but failed to persist: {e}");
-                    error!("{}", error_msg);
+                    error!(
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_KMS,
+                        event = "kms_service_state",
+                        operation = "reconfigure",
+                        state = "persist_failed",
+                        error = %e,
+                        "admin kms dynamic state"
+                    );
                     let status = service_manager.get_status().await;
                     (false, error_msg, status)
                 } else {
                     let status = service_manager.get_status().await;
-                    info!("KMS reconfigured successfully and persisted with status: {:?}", status);
+                    info!(
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_KMS,
+                        event = "kms_service_state",
+                        operation = "reconfigure",
+                        state = "reconfigured",
+                        status = ?status,
+                        "admin kms dynamic state"
+                    );
                     (true, "KMS reconfigured and restarted successfully".to_string(), status)
                 }
             }
             Err(e) => {
                 let error_msg = format!("Failed to reconfigure KMS: {e}");
-                error!("{}", error_msg);
+                error!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = "kms_service_state",
+                    operation = "reconfigure",
+                    state = "reconfigure_failed",
+                    error = %e,
+                    "admin kms dynamic state"
+                );
                 let status = service_manager.get_status().await;
                 (false, error_msg, status)
             }
@@ -622,7 +894,15 @@ impl Operation for ReconfigureKmsHandler {
         let json_response = match serde_json::to_string(&response) {
             Ok(json) => json,
             Err(e) => {
-                error!("Failed to serialize response: {}", e);
+                error!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = EVENT_ADMIN_KMS_DYNAMIC_STATE,
+                    operation = "reconfigure",
+                    result = "response_serialize_failed",
+                    error = %e,
+                    "admin kms dynamic state"
+                );
                 return Ok(S3Response::new((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Body::from("Serialization error".to_string()),

@@ -34,8 +34,8 @@ use rustfs_ecstore::bucket::metadata_sys::get_quota_config;
 use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
 use rustfs_ecstore::data_usage::load_data_usage_from_backend;
 use rustfs_ecstore::global::get_global_bucket_monitor;
-use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
+use rustfs_ecstore::resolve_object_store_handle;
 use rustfs_ecstore::store_api::BucketOperations;
 use rustfs_iam::{get_global_iam_sys, oidc::oidc_plugin_authn_metrics_snapshot};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
@@ -45,6 +45,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 use sysinfo::{Networks, System};
 use tracing::{instrument, warn};
+
+const LOG_COMPONENT_OBS: &str = "obs";
+const LOG_SUBSYSTEM_METRICS_COLLECTOR: &str = "metrics_collector";
+const EVENT_METRICS_COLLECTOR_STATE: &str = "metrics_collector_state";
 
 fn current_scanner_cycle_age_seconds(
     current_cycle: u64,
@@ -148,7 +152,7 @@ pub struct ProcessMetricBundle {
 
 /// Collect cluster and cluster-health statistics from a single storage snapshot.
 pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthStats) {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return (ClusterStats::default(), ClusterHealthStats::default());
     };
 
@@ -178,7 +182,7 @@ pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthS
     let (buckets_count, objects_count) = match load_data_usage_from_backend(store.clone()).await {
         Ok(data_usage) => (data_usage.buckets_count, data_usage.objects_total_count),
         Err(e) => {
-            warn!("Failed to load data usage from backend: {}", e);
+            warn!(event = EVENT_METRICS_COLLECTOR_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_COLLECTOR, collector = "cluster_stats", result = "data_usage_load_failed", error = %e, "metrics collector state changed");
             // Fall back to bucket list for buckets_count, objects_count stays 0.
             let buckets = store
                 .list_bucket(&BucketOptions {
@@ -187,7 +191,7 @@ pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthS
                 })
                 .await
                 .unwrap_or_else(|err| {
-                    warn!("Failed to list buckets for cluster metrics: {}", err);
+                    warn!(event = EVENT_METRICS_COLLECTOR_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_COLLECTOR, collector = "cluster_stats", result = "bucket_list_failed", error = %err, "metrics collector state changed");
                     Vec::new()
                 });
             (buckets.len() as u64, 0)
@@ -238,7 +242,7 @@ pub async fn collect_cluster_health_stats() -> ClusterHealthStats {
 
 /// Collect bucket statistics from the storage layer.
 pub async fn collect_bucket_stats() -> Vec<BucketStats> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Vec::new();
     };
 
@@ -246,7 +250,7 @@ pub async fn collect_bucket_stats() -> Vec<BucketStats> {
     let data_usage = match load_data_usage_from_backend(store.clone()).await {
         Ok(info) => Some(info),
         Err(e) => {
-            warn!("Failed to load data usage for bucket metrics: {}", e);
+            warn!(event = EVENT_METRICS_COLLECTOR_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_COLLECTOR, collector = "bucket_stats", result = "data_usage_load_failed", error = %e, "metrics collector state changed");
             None
         }
     };
@@ -261,7 +265,7 @@ pub async fn collect_bucket_stats() -> Vec<BucketStats> {
     {
         Ok(buckets) => buckets,
         Err(e) => {
-            warn!("Failed to list buckets for bucket metrics: {}", e);
+            warn!(event = EVENT_METRICS_COLLECTOR_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_COLLECTOR, collector = "bucket_stats", result = "bucket_list_failed", error = %e, "metrics collector state changed");
             return Vec::new();
         }
     };
@@ -310,10 +314,7 @@ pub fn collect_bucket_replication_bandwidth_stats() -> Vec<BucketReplicationBand
         .map(|(opts, details)| {
             let target_arn = opts.replication_arn;
             let limit_bytes_per_sec = u64::try_from(details.limit_bytes_per_sec).unwrap_or_else(|_| {
-                warn!(
-                    "Invalid bandwidth limit value for target {:?}: {}",
-                    target_arn, details.limit_bytes_per_sec
-                );
+                warn!(event = EVENT_METRICS_COLLECTOR_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_COLLECTOR, collector = "bucket_replication_bandwidth", result = "invalid_limit_value", target_arn = ?target_arn, limit_value = details.limit_bytes_per_sec, "metrics collector state changed");
                 0
             });
 
@@ -522,7 +523,7 @@ pub fn collect_system_memory_stats() -> MemoryStats {
 
 /// Collect node disk stats and drive stats from a single storage snapshot.
 pub async fn collect_disk_and_system_drive_stats() -> (Vec<DiskStats>, Vec<DriveDetailedStats>, DriveCountStats) {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return (Vec::new(), Vec::new(), DriveCountStats::default());
     };
 
@@ -710,7 +711,7 @@ pub fn collect_internode_network_stats() -> Option<NetworkStats> {
 
 /// Collect cluster config metrics from backend parity configuration.
 pub async fn collect_cluster_config_stats() -> Option<ClusterConfigStats> {
-    let store = new_object_layer_fn()?;
+    let store = resolve_object_store_handle()?;
     let backend = StorageAdminApi::backend_info(store.as_ref()).await;
 
     Some(ClusterConfigStats {
@@ -721,7 +722,7 @@ pub async fn collect_cluster_config_stats() -> Option<ClusterConfigStats> {
 
 /// Collect cluster erasure set metrics from storage and backend topology info.
 pub async fn collect_erasure_set_stats() -> Vec<ErasureSetStats> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Vec::new();
     };
 
@@ -800,7 +801,7 @@ pub async fn collect_iam_stats() -> Option<IamStats> {
 /// builds cluster totals plus per-bucket distributions from the returned
 /// histograms. It does not trigger an inline object-data rescan.
 pub async fn collect_cluster_usage_metric_stats() -> Option<(ClusterUsageStats, Vec<BucketUsageStats>)> {
-    let store = new_object_layer_fn()?;
+    let store = resolve_object_store_handle()?;
     let data_usage = load_data_usage_from_backend(store.clone()).await.ok()?;
     let mut buckets = Vec::with_capacity(data_usage.buckets_usage.len());
 

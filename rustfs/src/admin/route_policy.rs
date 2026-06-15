@@ -41,6 +41,7 @@ const GET_REPLICATION_METRICS: AdminActionRef = AdminActionRef::new("GetReplicat
 const GET_TABLE: AdminActionRef = AdminActionRef::new("GetTableAction");
 const GET_TABLE_BUCKET: AdminActionRef = AdminActionRef::new("GetTableBucketAction");
 const GET_TABLE_CATALOG: AdminActionRef = AdminActionRef::new("GetTableCatalogAction");
+const GET_TABLE_CREDENTIALS: AdminActionRef = AdminActionRef::new("GetTableCredentialsAction");
 const GET_TABLE_LIFECYCLE: AdminActionRef = AdminActionRef::new("GetTableLifecycleAction");
 const GET_TABLE_METADATA: AdminActionRef = AdminActionRef::new("GetTableMetadataAction");
 const GET_TABLE_METADATA_LOCATION: AdminActionRef = AdminActionRef::new("GetTableMetadataLocationAction");
@@ -437,6 +438,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::High,
     ),
     admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/site-replication/rotate-svc-acct",
+        SITE_REPLICATION_OPERATION,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
         HttpMethod::Put,
         "/rustfs/admin/v3/site-replication/peer/join",
         SITE_REPLICATION_ADD,
@@ -634,6 +641,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::Sensitive,
     ),
     admin(
+        HttpMethod::Head,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}",
+        GET_TABLE_NAMESPACE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
         HttpMethod::Delete,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}",
         DELETE_TABLE_NAMESPACE,
@@ -661,6 +674,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HttpMethod::Get,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
         GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Head,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
+        GET_TABLE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/credentials",
+        GET_TABLE_CREDENTIALS,
         RouteRiskLevel::Sensitive,
     ),
     admin(
@@ -731,6 +756,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery",
+        COMMIT_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
         COMMIT_TABLE,
         RouteRiskLevel::High,
@@ -767,6 +798,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::Sensitive,
     ),
     admin(
+        HttpMethod::Head,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}",
+        GET_TABLE_NAMESPACE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
         HttpMethod::Delete,
         "/_iceberg/v1/{warehouse}/namespaces/{namespace}",
         DELETE_TABLE_NAMESPACE,
@@ -794,6 +831,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HttpMethod::Get,
         "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
         GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Head,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
+        GET_TABLE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/credentials",
+        GET_TABLE_CREDENTIALS,
         RouteRiskLevel::Sensitive,
     ),
     admin(
@@ -861,6 +910,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/diagnostics",
         GET_TABLE_METADATA,
         RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery",
+        COMMIT_TABLE,
+        RouteRiskLevel::High,
     ),
     admin(
         HttpMethod::Post,
@@ -937,6 +992,16 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
         HttpMethod::Get,
         "/rustfs/admin/v3/datausageinfo",
         DeferredRoutePolicyReason::MultipleActions,
+    ),
+    deferred(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/object-zip-downloads",
+        DeferredRoutePolicyReason::S3Action,
+    ),
+    deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/object-zip-downloads/{id}.zip",
+        DeferredRoutePolicyReason::CredentialOnly,
     ),
     deferred(HttpMethod::Get, "/rustfs/admin/v3/metrics", DeferredRoutePolicyReason::CredentialOnly),
     deferred(HttpMethod::Get, "/rustfs/admin/v3/pools/list", DeferredRoutePolicyReason::MultipleActions),
@@ -1041,11 +1106,13 @@ mod tests {
         let table_specs = ADMIN_ROUTE_POLICY_SPECS
             .iter()
             .filter(|spec| spec.path().starts_with("/iceberg/v1") || spec.path().starts_with("/_iceberg/v1"));
-        assert_eq!(table_specs.count(), 46);
+        assert_eq!(table_specs.count(), 54);
         assert_action(HttpMethod::Put, "/iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET);
         assert_action(HttpMethod::Get, "/_iceberg/v1/buckets/{warehouse}", GET_TABLE_BUCKET);
         assert_action(HttpMethod::Get, "/iceberg/v1/{warehouse}/namespaces", GET_TABLE_NAMESPACE);
         assert_action(HttpMethod::Get, "/_iceberg/v1/{warehouse}/namespaces", GET_TABLE_NAMESPACE);
+        assert_action(HttpMethod::Head, "/iceberg/v1/{warehouse}/namespaces/{namespace}", GET_TABLE_NAMESPACE);
+        assert_action(HttpMethod::Head, "/_iceberg/v1/{warehouse}/namespaces/{namespace}", GET_TABLE_NAMESPACE);
         assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables", CREATE_TABLE);
         assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables", CREATE_TABLE);
         assert_action(
@@ -1055,8 +1122,33 @@ mod tests {
         );
         assert_action(
             HttpMethod::Get,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/credentials",
+            GET_TABLE_CREDENTIALS,
+        );
+        assert_action(
+            HttpMethod::Get,
             "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
             GET_TABLE_METADATA,
+        );
+        assert_action(
+            HttpMethod::Head,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
+            GET_TABLE,
+        );
+        assert_action(
+            HttpMethod::Head,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
+            GET_TABLE,
+        );
+        assert_action(
+            HttpMethod::Get,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/credentials",
+            GET_TABLE_CREDENTIALS,
+        );
+        assert_action(
+            HttpMethod::Get,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/credentials",
+            GET_TABLE_CREDENTIALS,
         );
         assert_action(
             HttpMethod::Post,
@@ -1105,6 +1197,16 @@ mod tests {
         );
         assert_action(
             HttpMethod::Post,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery",
+            COMMIT_TABLE,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery",
+            COMMIT_TABLE,
+        );
+        assert_action(
+            HttpMethod::Post,
             "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
             COMMIT_TABLE,
         );
@@ -1150,6 +1252,16 @@ mod tests {
             DeferredRoutePolicyReason::MultipleActions,
         );
         assert_deferred(HttpMethod::Get, "/rustfs/admin/v3/accountinfo", DeferredRoutePolicyReason::S3Action);
+        assert_deferred(
+            HttpMethod::Post,
+            "/rustfs/admin/v3/object-zip-downloads",
+            DeferredRoutePolicyReason::S3Action,
+        );
+        assert_deferred(
+            HttpMethod::Get,
+            "/rustfs/admin/v3/object-zip-downloads/{id}.zip",
+            DeferredRoutePolicyReason::CredentialOnly,
+        );
     }
 
     fn route_policy_inventory_keys() -> BTreeSet<String> {

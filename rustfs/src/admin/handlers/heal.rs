@@ -14,8 +14,10 @@
 
 use crate::admin::auth::{authenticate_request, validate_admin_request};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::app::context::resolve_object_store_handle;
 use crate::server::ADMIN_PREFIX;
 use crate::server::RemoteAddr;
+use crate::storage::request_context::spawn_traced;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
@@ -23,7 +25,6 @@ use matchit::Params;
 use rustfs_common::heal_channel::{HealChannelPriority, HealChannelRequest, HealOpts};
 use rustfs_config::MAX_HEAL_REQUEST_SIZE;
 use rustfs_ecstore::bucket::utils::is_valid_object_prefix;
-use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::HealOperations;
 use rustfs_ecstore::store_utils::is_reserved_or_invalid_bucket;
 use rustfs_policy::policy::action::{Action, AdminAction};
@@ -34,7 +35,6 @@ use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::spawn;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -370,7 +370,7 @@ impl Operation for HealHandler {
         // The heal channel currently models bucket/object work. Root heal reuses the
         // existing format-heal path directly so `/v3/heal/` is accepted intentionally.
         if should_handle_root_heal_directly(&hip) {
-            let Some(store) = new_object_layer_fn() else {
+            let Some(store) = resolve_object_store_handle() else {
                 return Err(s3_error!(InternalError, "server not initialized"));
             };
 
@@ -395,7 +395,7 @@ impl Operation for HealHandler {
             let tx_clone = tx.clone();
             let heal_path_str = heal_path.to_str().unwrap_or_default().to_string();
             let client_token = hip.client_token.clone();
-            spawn(async move {
+            spawn_traced(async move {
                 match rustfs_common::heal_channel::query_heal_status(heal_path_str, client_token).await {
                     Ok(response) if response.success => {
                         let (summary, items) = heal_channel_response_status(&response);
@@ -445,7 +445,7 @@ impl Operation for HealHandler {
             let client_token = hip.client_token.clone();
             let client_address = client_address.clone();
             let heal_settings = hip.hs;
-            spawn(async move {
+            spawn_traced(async move {
                 match rustfs_common::heal_channel::cancel_heal_task(heal_path_str, client_token.clone()).await {
                     Ok(response) if response.success => {
                         let resp_bytes = if client_token.is_empty() {
@@ -495,7 +495,7 @@ impl Operation for HealHandler {
             // Use new heal channel mechanism
             let tx_clone = tx.clone();
             let client_address = client_address.clone();
-            spawn(async move {
+            spawn_traced(async move {
                 // Create heal request through channel
                 let heal_request = build_heal_channel_request(&hip);
                 let client_token = heal_request.id.clone();
@@ -560,7 +560,7 @@ impl Operation for BackgroundHealStatusHandler {
         warn!("handle BackgroundHealStatusHandler");
         validate_heal_admin_request(&req).await?;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(s3_error!(InternalError, "server not initialized"));
         };
 

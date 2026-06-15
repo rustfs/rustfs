@@ -96,7 +96,7 @@ impl EventNotifier {
             component = LOG_COMPONENT_NOTIFY,
             subsystem = LOG_SUBSYSTEM_DISPATCH,
             state = "targets_cleared",
-            "Removed all notify targets"
+            "notify runtime lifecycle"
         );
     }
 
@@ -136,7 +136,7 @@ impl EventNotifier {
             bucket = %bucket_name,
             object = %object_key,
             target_count = target_ids_len,
-            "Dispatching notify event"
+            "notify dispatch"
         );
         for target_id in target_ids {
             // `get` now returns Option<Arc<dyn Target + Send + Sync>>
@@ -166,7 +166,7 @@ impl EventNotifier {
                     subsystem = LOG_SUBSYSTEM_DISPATCH,
                     target_id = %target_for_task.id(),
                     deferred = is_deferred,
-                    "Prepared notify target dispatch"
+                    "notify dispatch"
                 );
                 // Use cloned data in closures to avoid borrowing conflicts
                 // Create an EntityTarget from the event
@@ -217,7 +217,7 @@ impl EventNotifier {
                             subsystem = LOG_SUBSYSTEM_DISPATCH,
                             target_id = %target_name_for_task,
                             deferred = is_deferred,
-                            "Completed notify target dispatch"
+                            "notify dispatch"
                         );
                     }
                 });
@@ -256,7 +256,7 @@ impl EventNotifier {
             subsystem = LOG_SUBSYSTEM_DISPATCH,
             bucket = %bucket_name,
             target_count = target_ids_len,
-            "Finished notify dispatch fan-out"
+            "notify dispatch"
         );
     }
 
@@ -284,7 +284,7 @@ impl EventNotifier {
             subsystem = LOG_SUBSYSTEM_DISPATCH,
             state = "targets_initialized",
             target_count = target_list_guard.len(),
-            "Initialized notify runtime targets"
+            "notify runtime lifecycle"
         );
         Ok(())
     }

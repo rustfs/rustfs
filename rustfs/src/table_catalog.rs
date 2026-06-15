@@ -24,9 +24,11 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     sync::Arc,
+    time::{Duration as StdDuration, Instant},
 };
 
 use http::HeaderMap;
+use metrics::{counter, histogram};
 use rustfs_ecstore::bucket::{
     metadata::{
         BUCKET_TABLE_CATALOG_META_PREFIX, BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG,
@@ -77,6 +79,7 @@ const MAINTENANCE_CONFIG_FILE: &str = "config.json";
 const MAINTENANCE_JOB_ROOT: &str = "jobs";
 const TABLE_CATALOG_LIST_MAX_KEYS: i32 = 1000;
 const TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS: i64 = 15 * 60;
+const TABLE_COMMIT_SLOW_LOG_THRESHOLD: StdDuration = StdDuration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogIdentifierError {
@@ -302,6 +305,24 @@ pub(crate) struct TableCatalogExport {
     pub table: TableEntry,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableDataPlaneResource {
+    pub table_bucket: String,
+    pub namespace: String,
+    pub table: String,
+    pub table_id: String,
+    pub warehouse_object_prefix: String,
+}
+
+impl TableDataPlaneResource {
+    pub(crate) fn catalog_resource_object(&self) -> String {
+        let namespace = Namespace::parse(&self.namespace)
+            .map(|namespace| namespace.storage_id())
+            .unwrap_or_else(|_| self.namespace.clone());
+        format!("{NAMESPACE_ROOT}/{namespace}/{TABLE_ROOT}/{}", self.table)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableMetadataPointerStatus {
@@ -312,10 +333,86 @@ pub(crate) enum TableMetadataPointerStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogRecoveryStatus {
+    Healthy,
+    Recoverable,
+    ManualReviewRequired,
+    ReadOnlyRecommended,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogRecoveryAction {
+    RunCommitRecovery,
+    RetryCommit,
+    RestoreCurrentMetadataObject,
+    FixCurrentMetadataJson,
+    MoveCurrentMetadataInsideTable,
+    ReviewCommitLog,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct TableCatalogDiagnosticsReport {
     pub catalog: TableCatalogExport,
     pub current_metadata_status: TableMetadataPointerStatus,
+    pub recovery_status: TableCatalogRecoveryStatus,
+    pub recommended_actions: Vec<TableCatalogRecoveryAction>,
+    pub commit_recovery: TableCommitRecoveryReport,
     pub orphan_metadata_candidate_locations: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCommitRecoveryState {
+    Committed,
+    StagedBeforeTableUpdate,
+    FinalizationRequired,
+    IdempotencyIndexRepairRequired,
+    ManualReview,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCommitIdempotencyIndexStatus {
+    NotRequired,
+    Missing,
+    Matches,
+    Stale,
+    Conflicting,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableCommitRecoveryEntry {
+    pub commit_id: String,
+    pub idempotency_key: Option<String>,
+    pub operation: String,
+    pub status: CommitLogStatus,
+    pub recovery_state: TableCommitRecoveryState,
+    pub previous_metadata_location: String,
+    pub new_metadata_location: String,
+    pub expected_version_token: String,
+    pub new_version_token: String,
+    pub idempotency_index_present: bool,
+    pub idempotency_index_status: TableCommitIdempotencyIndexStatus,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableCommitRecoveryReport {
+    pub table_bucket: String,
+    pub namespace: String,
+    pub table: String,
+    pub table_id: String,
+    pub current_metadata_location: String,
+    pub current_version_token: String,
+    pub current_generation: u64,
+    pub commits: Vec<TableCommitRecoveryEntry>,
+    pub staged_before_table_update_count: usize,
+    pub finalization_required_count: usize,
+    pub idempotency_repair_required_count: usize,
+    pub manual_review_count: usize,
+    pub finalized_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,6 +437,118 @@ impl fmt::Display for TableCatalogStoreError {
 impl std::error::Error for TableCatalogStoreError {}
 
 pub(crate) type TableCatalogStoreResult<T> = Result<T, TableCatalogStoreError>;
+
+fn normalize_warehouse_object_prefix(object_prefix: &str) -> TableCatalogStoreResult<String> {
+    let object_prefix = object_prefix.strip_suffix('/').unwrap_or(object_prefix);
+    if object_prefix.is_empty() {
+        return Err(TableCatalogStoreError::Invalid(
+            "table warehouse location must include an object prefix".to_string(),
+        ));
+    }
+    if object_prefix.contains('\\') {
+        return Err(TableCatalogStoreError::Invalid(
+            "table warehouse location contains an invalid path separator".to_string(),
+        ));
+    }
+    if object_prefix
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(TableCatalogStoreError::Invalid(
+            "table warehouse location contains an invalid path segment".to_string(),
+        ));
+    }
+
+    let mut normalized = object_prefix.to_string();
+    normalized.push('/');
+    Ok(normalized)
+}
+
+fn table_warehouse_object_prefix_from_location(table_bucket: &str, warehouse_location: &str) -> TableCatalogStoreResult<String> {
+    let location = warehouse_location
+        .strip_prefix("s3://")
+        .ok_or_else(|| TableCatalogStoreError::Invalid("table warehouse location must be an s3 URI".to_string()))?;
+    let (bucket, object_prefix) = location
+        .split_once('/')
+        .ok_or_else(|| TableCatalogStoreError::Invalid("table warehouse location must include an object prefix".to_string()))?;
+    if bucket != table_bucket {
+        return Err(TableCatalogStoreError::Invalid(
+            "table warehouse location must be inside the table bucket".to_string(),
+        ));
+    }
+    normalize_warehouse_object_prefix(object_prefix)
+}
+
+fn table_warehouse_object_prefix(entry: &TableEntry) -> TableCatalogStoreResult<String> {
+    table_warehouse_object_prefix_from_location(&entry.table_bucket, &entry.warehouse_location)
+}
+
+fn metadata_warehouse_location(
+    table_bucket: &str,
+    metadata_location: &str,
+    metadata_object: &TableCatalogObject,
+) -> TableCatalogStoreResult<Option<String>> {
+    let metadata: serde_json::Value = serde_json::from_slice(&metadata_object.data)
+        .map_err(|err| TableCatalogStoreError::Invalid(format!("failed to parse new metadata {metadata_location}: {err}")))?;
+    let Some(location) = metadata.get("location").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    table_warehouse_object_prefix_from_location(table_bucket, location)?;
+    Ok(Some(location.to_string()))
+}
+
+pub(crate) async fn table_data_plane_resource_for_object<S>(
+    store: &S,
+    bucket: &str,
+    object: &str,
+) -> TableCatalogStoreResult<Option<TableDataPlaneResource>>
+where
+    S: TableCatalogStore + ?Sized,
+{
+    if bucket.is_empty() || object.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(table_bucket) = store.get_table_bucket(bucket).await? else {
+        return Ok(None);
+    };
+    if table_bucket.state != TableCatalogEntryState::Active {
+        return Ok(None);
+    }
+
+    let mut matched: Option<TableDataPlaneResource> = None;
+    for namespace in store.list_namespaces(bucket).await? {
+        if namespace.state != TableCatalogEntryState::Active {
+            continue;
+        }
+        for table in store.list_tables(bucket, &namespace.namespace).await? {
+            if table.state != TableCatalogEntryState::Active {
+                continue;
+            }
+            let Ok(warehouse_object_prefix) = table_warehouse_object_prefix(&table) else {
+                continue;
+            };
+            if !object.starts_with(&warehouse_object_prefix) {
+                continue;
+            }
+            if matched
+                .as_ref()
+                .is_some_and(|current| current.warehouse_object_prefix.len() >= warehouse_object_prefix.len())
+            {
+                continue;
+            }
+            matched = Some(TableDataPlaneResource {
+                table_bucket: table.table_bucket,
+                namespace: table.namespace,
+                table: table.table,
+                table_id: table.table_id,
+                warehouse_object_prefix,
+            });
+        }
+    }
+
+    Ok(matched)
+}
 
 #[async_trait::async_trait]
 pub(crate) trait TableCatalogStore: Send + Sync {
@@ -519,6 +728,15 @@ impl TableCatalogObjectPaths {
             COMMIT_LOG_ROOT,
             table_catalog_path_hash(table_id),
             table_catalog_path_hash(commit_id)
+        )
+    }
+
+    pub fn commit_log_entries_prefix(&self, table_bucket: &str, table_id: &str) -> String {
+        format!(
+            "{}{}/{}/",
+            self.table_bucket_root_prefix(table_bucket),
+            COMMIT_LOG_ROOT,
+            table_catalog_path_hash(table_id)
         )
     }
 
@@ -716,6 +934,139 @@ where
         Ok(())
     }
 
+    async fn table_commit_recovery_report_for_entry(
+        &self,
+        entry: &TableEntry,
+        finalized_count: usize,
+    ) -> TableCatalogStoreResult<TableCommitRecoveryReport> {
+        let commit_prefix = self.paths.commit_log_entries_prefix(&entry.table_bucket, &entry.table_id);
+        let mut commits = Vec::new();
+        for object in self.backend.list_objects(self.catalog_bucket(), &commit_prefix).await? {
+            if !object.ends_with(".json") {
+                continue;
+            }
+            let Some(commit_log) = self.read_commit_by_path(&object).await? else {
+                continue;
+            };
+            let idempotency_commit = match commit_log.idempotency_key.as_deref() {
+                Some(idempotency_key) => {
+                    let idempotency_path =
+                        self.paths
+                            .commit_idempotency_entry_path(&entry.table_bucket, &entry.table_id, idempotency_key);
+                    self.read_commit_by_path(&idempotency_path).await?
+                }
+                None => None,
+            };
+            commits.push(table_commit_recovery_entry(entry, &commit_log, idempotency_commit.as_ref()));
+        }
+        commits.sort_by(|left, right| left.commit_id.cmp(&right.commit_id));
+
+        let finalization_required_count = commits
+            .iter()
+            .filter(|commit| matches!(commit.recovery_state, TableCommitRecoveryState::FinalizationRequired))
+            .count();
+        let idempotency_repair_required_count = commits
+            .iter()
+            .filter(|commit| matches!(commit.recovery_state, TableCommitRecoveryState::IdempotencyIndexRepairRequired))
+            .count();
+        let staged_before_table_update_count = commits
+            .iter()
+            .filter(|commit| matches!(commit.recovery_state, TableCommitRecoveryState::StagedBeforeTableUpdate))
+            .count();
+        let manual_review_count = commits
+            .iter()
+            .filter(|commit| matches!(commit.recovery_state, TableCommitRecoveryState::ManualReview))
+            .count();
+
+        Ok(TableCommitRecoveryReport {
+            table_bucket: entry.table_bucket.clone(),
+            namespace: entry.namespace.clone(),
+            table: entry.table.clone(),
+            table_id: entry.table_id.clone(),
+            current_metadata_location: entry.metadata_location.clone(),
+            current_version_token: entry.version_token.clone(),
+            current_generation: entry.generation,
+            commits,
+            staged_before_table_update_count,
+            finalization_required_count,
+            idempotency_repair_required_count,
+            manual_review_count,
+            finalized_count,
+        })
+    }
+
+    pub(crate) async fn plan_table_commit_recovery(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<TableCommitRecoveryReport> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
+        let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &table_path).await? else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "table {}/{}/{}",
+                table_bucket,
+                namespace.public_name(),
+                table.as_str()
+            )));
+        };
+        self.table_commit_recovery_report_for_entry(&entry, 0).await
+    }
+
+    pub(crate) async fn recover_table_commits(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<TableCommitRecoveryReport> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
+        let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
+        let Some((entry, _)) = self.read_table_with_etag_unlocked(table_bucket, &namespace, &table).await? else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "table {}/{}/{}",
+                table_bucket,
+                namespace.public_name(),
+                table.as_str()
+            )));
+        };
+
+        let commit_prefix = self.paths.commit_log_entries_prefix(table_bucket, &entry.table_id);
+        let mut finalized_count = 0;
+        for commit_path in self.backend.list_objects(self.catalog_bucket(), &commit_prefix).await? {
+            if !commit_path.ends_with(".json") {
+                continue;
+            }
+            let Some(commit_log) = self.read_commit_by_path(&commit_path).await? else {
+                continue;
+            };
+            let idempotency_path = commit_log.idempotency_key.as_deref().map(|idempotency_key| {
+                self.paths
+                    .commit_idempotency_entry_path(table_bucket, &entry.table_id, idempotency_key)
+            });
+            let idempotency_commit = match idempotency_path.as_deref() {
+                Some(idempotency_path) => self.read_commit_by_path(idempotency_path).await?,
+                None => None,
+            };
+            let recovery_entry = table_commit_recovery_entry(&entry, &commit_log, idempotency_commit.as_ref());
+            if matches!(
+                recovery_entry.recovery_state,
+                TableCommitRecoveryState::FinalizationRequired | TableCommitRecoveryState::IdempotencyIndexRepairRequired
+            ) {
+                let mut committed = commit_log;
+                committed.status = CommitLogStatus::Committed;
+                self.finalize_commit_log(&commit_path, idempotency_path.as_deref(), &committed)
+                    .await?;
+                finalized_count += 1;
+            }
+        }
+
+        self.table_commit_recovery_report_for_entry(&entry, finalized_count).await
+    }
+
     pub(crate) async fn get_table_maintenance_config(
         &self,
         table_bucket: &str,
@@ -875,6 +1226,7 @@ where
         let current_metadata_location = catalog.table.metadata_location.clone();
 
         let mut retained = BTreeSet::new();
+        let mut current_metadata_for_refs = None;
         let current_metadata_status =
             if is_valid_table_metadata_location(&parsed_namespace, &parsed_table, &current_metadata_location) {
                 retained.insert(current_metadata_location.clone());
@@ -883,6 +1235,7 @@ where
                         match serde_json::from_slice::<serde_json::Value>(&current_metadata_object.data) {
                             Ok(current_metadata) if current_metadata.is_object() => {
                                 retained.extend(metadata_log_locations(&current_metadata, &parsed_namespace, &parsed_table));
+                                current_metadata_for_refs = Some(current_metadata);
                                 TableMetadataPointerStatus::Valid
                             }
                             Ok(_) | Err(_) => TableMetadataPointerStatus::InvalidJson,
@@ -908,15 +1261,34 @@ where
         for metadata_location in metadata_locations.iter().rev().take(retain_recent_metadata_files) {
             retained.insert(metadata_location.clone());
         }
+        if let Some(current_metadata) = current_metadata_for_refs.as_ref() {
+            retained.extend(
+                metadata_locations_for_protected_snapshot_refs(
+                    &self.backend,
+                    table_bucket,
+                    &parsed_namespace,
+                    &parsed_table,
+                    current_metadata,
+                    &metadata_locations,
+                )
+                .await?,
+            );
+        }
 
         let orphan_metadata_candidate_locations = metadata_locations
             .into_iter()
             .filter(|metadata_location| !retained.contains(metadata_location))
             .collect();
 
+        let commit_recovery = self.plan_table_commit_recovery(table_bucket, namespace, table).await?;
+        let (recovery_status, recommended_actions) = table_catalog_recovery_summary(&current_metadata_status, &commit_recovery);
+
         Ok(TableCatalogDiagnosticsReport {
             catalog,
             current_metadata_status,
+            recovery_status,
+            recommended_actions,
+            commit_recovery,
             orphan_metadata_candidate_locations,
         })
     }
@@ -977,6 +1349,17 @@ where
         for metadata_location in metadata_locations.iter().rev().take(retain_recent_metadata_files) {
             retained.insert(metadata_location.clone());
         }
+        retained.extend(
+            metadata_locations_for_protected_snapshot_refs(
+                &self.backend,
+                table_bucket,
+                &namespace,
+                &table,
+                &current_metadata,
+                &metadata_locations,
+            )
+            .await?,
+        );
 
         let cleanup_candidate_locations = metadata_locations
             .into_iter()
@@ -1080,6 +1463,17 @@ where
         let mut protected = metadata_log_locations(&current_metadata, &namespace, &table);
         protected.insert(entry.metadata_location.clone());
         protected.extend(report.retained_metadata_locations.iter().cloned());
+        protected.extend(
+            metadata_locations_for_protected_snapshot_refs(
+                &self.backend,
+                table_bucket,
+                &namespace,
+                &table,
+                &current_metadata,
+                &report.cleanup_candidate_locations,
+            )
+            .await?,
+        );
 
         let mut cleanup_candidate_locations = BTreeSet::new();
         let now = OffsetDateTime::now_utc();
@@ -1238,6 +1632,8 @@ where
     }
 
     async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult> {
+        let commit_started = Instant::now();
+        record_table_commit_attempt(&request.operation);
         let namespace = parse_namespace_for_store(&request.namespace)?;
         let table = parse_table_for_store(&request.table)?;
         let table_path = self.paths.table_entry_path(&request.table_bucket, &namespace, &table);
@@ -1247,10 +1643,18 @@ where
             .read_table_with_etag_unlocked(&request.table_bucket, &namespace, &table)
             .await?
         else {
-            return Err(TableCatalogStoreError::NotFound(format!(
-                "table {}/{}/{}",
-                request.table_bucket, request.namespace, request.table
-            )));
+            return table_commit_result(
+                &request.table_bucket,
+                &request.namespace,
+                &request.table,
+                &request.commit_id,
+                &request.operation,
+                commit_started,
+                Err(TableCatalogStoreError::NotFound(format!(
+                    "table {}/{}/{}",
+                    request.table_bucket, request.namespace, request.table
+                ))),
+            );
         };
 
         let commit_path = self
@@ -1268,10 +1672,18 @@ where
 
         if let Some(existing) = existing_commit.as_ref() {
             if !commit_log_matches_request(existing, &request, &current.table_id) {
-                return Err(TableCatalogStoreError::Conflict(format!(
-                    "commit id already exists: {}",
-                    request.commit_id
-                )));
+                return table_commit_result(
+                    &request.table_bucket,
+                    &request.namespace,
+                    &request.table,
+                    &request.commit_id,
+                    &request.operation,
+                    commit_started,
+                    Err(TableCatalogStoreError::Conflict(format!(
+                        "commit id already exists: {}",
+                        request.commit_id
+                    ))),
+                );
             }
             if matches!(existing.status, CommitLogStatus::Committed) || table_matches_committed_log(&current, existing) {
                 let mut committed = existing.clone();
@@ -1279,53 +1691,119 @@ where
                 let _ = self
                     .finalize_commit_log(&commit_path, idempotency_path.as_deref(), &committed)
                     .await;
-                return Ok(TableCommitResult {
-                    table: current,
-                    commit_log: committed,
-                });
+                return table_commit_result(
+                    &request.table_bucket,
+                    &request.namespace,
+                    &request.table,
+                    &request.commit_id,
+                    &request.operation,
+                    commit_started,
+                    Ok(TableCommitResult {
+                        table: current,
+                        commit_log: committed,
+                    }),
+                );
             }
             if !matches!(existing.status, CommitLogStatus::Staged) || !table_matches_staged_base(&current, existing) {
-                return Err(TableCatalogStoreError::Conflict(
-                    "existing commit record does not match current table state".to_string(),
-                ));
+                return table_commit_result(
+                    &request.table_bucket,
+                    &request.namespace,
+                    &request.table,
+                    &request.commit_id,
+                    &request.operation,
+                    commit_started,
+                    Err(TableCatalogStoreError::Conflict(
+                        "existing commit record does not match current table state".to_string(),
+                    )),
+                );
             }
         }
         if let Some(existing) = existing_idempotency_commit.as_ref()
             && !commit_log_matches_request(existing, &request, &current.table_id)
         {
-            return Err(TableCatalogStoreError::Conflict("idempotency key already exists".to_string()));
+            return table_commit_result(
+                &request.table_bucket,
+                &request.namespace,
+                &request.table,
+                &request.commit_id,
+                &request.operation,
+                commit_started,
+                Err(TableCatalogStoreError::Conflict("idempotency key already exists".to_string())),
+            );
         }
         if existing_commit.is_none() && existing_idempotency_commit.is_some() {
-            return Err(TableCatalogStoreError::Conflict(
-                "idempotency key exists without a recoverable commit record".to_string(),
-            ));
+            return table_commit_result(
+                &request.table_bucket,
+                &request.namespace,
+                &request.table,
+                &request.commit_id,
+                &request.operation,
+                commit_started,
+                Err(TableCatalogStoreError::Conflict(
+                    "idempotency key exists without a recoverable commit record".to_string(),
+                )),
+            );
         }
 
         if current.version_token != request.expected_version_token {
-            return Err(TableCatalogStoreError::Conflict(
-                "current table version token does not match expected token".to_string(),
-            ));
+            return table_commit_result(
+                &request.table_bucket,
+                &request.namespace,
+                &request.table,
+                &request.commit_id,
+                &request.operation,
+                commit_started,
+                Err(TableCatalogStoreError::Conflict(
+                    "current table version token does not match expected token".to_string(),
+                )),
+            );
         }
         if current.metadata_location != request.expected_metadata_location {
-            return Err(TableCatalogStoreError::Conflict(
-                "current table metadata location does not match expected location".to_string(),
-            ));
+            return table_commit_result(
+                &request.table_bucket,
+                &request.namespace,
+                &request.table,
+                &request.commit_id,
+                &request.operation,
+                commit_started,
+                Err(TableCatalogStoreError::Conflict(
+                    "current table metadata location does not match expected location".to_string(),
+                )),
+            );
         }
         if !is_valid_table_metadata_location(&namespace, &table, &request.new_metadata_location) {
-            return Err(TableCatalogStoreError::Invalid(
-                "new metadata location must be inside the table metadata directory".to_string(),
-            ));
+            return table_commit_result(
+                &request.table_bucket,
+                &request.namespace,
+                &request.table,
+                &request.commit_id,
+                &request.operation,
+                commit_started,
+                Err(TableCatalogStoreError::Invalid(
+                    "new metadata location must be inside the table metadata directory".to_string(),
+                )),
+            );
         }
-        if !self
+        let Some(new_metadata_object) = self
             .backend
-            .object_exists(&request.table_bucket, &request.new_metadata_location)
+            .read_object(&request.table_bucket, &request.new_metadata_location)
             .await?
-        {
-            return Err(TableCatalogStoreError::NotFound(format!(
-                "new metadata object {}",
-                request.new_metadata_location
-            )));
-        }
+        else {
+            return table_commit_result(
+                &request.table_bucket,
+                &request.namespace,
+                &request.table,
+                &request.commit_id,
+                &request.operation,
+                commit_started,
+                Err(TableCatalogStoreError::NotFound(format!(
+                    "new metadata object {}",
+                    request.new_metadata_location
+                ))),
+            );
+        };
+        let next_warehouse_location =
+            metadata_warehouse_location(&request.table_bucket, &request.new_metadata_location, &new_metadata_object)?;
 
         let has_existing_commit = existing_commit.is_some();
         let mut staged_commit_log = existing_commit.unwrap_or_else(|| CommitLogEntry {
@@ -1348,6 +1826,9 @@ where
 
         let mut next = current.clone();
         next.metadata_location = staged_commit_log.new_metadata_location.clone();
+        if let Some(warehouse_location) = next_warehouse_location {
+            next.warehouse_location = warehouse_location;
+        }
         next.version_token = staged_commit_log.new_version_token.clone();
         next.generation = current.generation.saturating_add(1);
 
@@ -1372,13 +1853,27 @@ where
             .await?;
         }
 
-        self.write_entry_unlocked(
-            self.catalog_bucket(),
-            &table_path,
-            &next,
-            TableCatalogPutPrecondition::IfMatch(current_etag),
-        )
-        .await?;
+        let cas_started = Instant::now();
+        let cas_result = self
+            .write_entry_unlocked(
+                self.catalog_bucket(),
+                &table_path,
+                &next,
+                TableCatalogPutPrecondition::IfMatch(current_etag),
+            )
+            .await;
+        record_table_commit_cas_result(&request.operation, cas_started, &cas_result);
+        if let Err(err) = cas_result {
+            return table_commit_result(
+                &request.table_bucket,
+                &request.namespace,
+                &request.table,
+                &request.commit_id,
+                &request.operation,
+                commit_started,
+                Err(err),
+            );
+        }
 
         let mut commit_log = staged_commit_log;
         commit_log.status = CommitLogStatus::Committed;
@@ -1388,7 +1883,15 @@ where
             .finalize_commit_log(&commit_path, idempotency_path.as_deref(), &commit_log)
             .await;
 
-        Ok(TableCommitResult { table: next, commit_log })
+        table_commit_result(
+            &request.table_bucket,
+            &request.namespace,
+            &request.table,
+            &request.commit_id,
+            &request.operation,
+            commit_started,
+            Ok(TableCommitResult { table: next, commit_log }),
+        )
     }
 
     async fn drop_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()> {
@@ -1645,6 +2148,79 @@ fn metadata_log_locations(
     locations
 }
 
+async fn metadata_locations_for_protected_snapshot_refs<B>(
+    backend: &B,
+    table_bucket: &str,
+    namespace: &Namespace,
+    table: &IdentifierSegment,
+    current_metadata: &serde_json::Value,
+    metadata_locations: &[String],
+) -> TableCatalogStoreResult<BTreeSet<String>>
+where
+    B: TableCatalogObjectBackend,
+{
+    let protected_snapshot_ids = protected_ref_snapshot_ids(current_metadata);
+    if protected_snapshot_ids.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    let mut retained = BTreeSet::new();
+    for metadata_location in metadata_locations {
+        if !is_valid_table_metadata_location(namespace, table, metadata_location) {
+            continue;
+        }
+        let Some(metadata_object) = backend.read_object(table_bucket, metadata_location).await? else {
+            continue;
+        };
+        let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&metadata_object.data) else {
+            continue;
+        };
+        if metadata_contains_protected_snapshot_ref(&metadata, &protected_snapshot_ids) {
+            retained.insert(metadata_location.clone());
+        }
+    }
+    Ok(retained)
+}
+
+fn protected_ref_snapshot_ids(current_metadata: &serde_json::Value) -> BTreeSet<i64> {
+    let mut snapshot_ids = BTreeSet::new();
+    let current_snapshot_id = current_metadata
+        .get("current-snapshot-id")
+        .and_then(serde_json::Value::as_i64);
+    let Some(refs) = current_metadata.get("refs").and_then(serde_json::Value::as_object) else {
+        return snapshot_ids;
+    };
+
+    for reference in refs.values() {
+        if let Some(snapshot_id) = reference.get("snapshot-id").and_then(serde_json::Value::as_i64)
+            && Some(snapshot_id) != current_snapshot_id
+        {
+            snapshot_ids.insert(snapshot_id);
+        }
+    }
+    snapshot_ids
+}
+
+fn metadata_contains_protected_snapshot_ref(metadata: &serde_json::Value, protected_snapshot_ids: &BTreeSet<i64>) -> bool {
+    let current_snapshot_matches = metadata
+        .get("current-snapshot-id")
+        .and_then(serde_json::Value::as_i64)
+        .is_some_and(|snapshot_id| protected_snapshot_ids.contains(&snapshot_id));
+    if current_snapshot_matches {
+        return true;
+    }
+
+    let Some(refs) = metadata.get("refs").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    refs.values().any(|reference| {
+        reference
+            .get("snapshot-id")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|snapshot_id| protected_snapshot_ids.contains(&snapshot_id))
+    })
+}
+
 fn metadata_candidate_is_past_safety_window(mod_time: Option<OffsetDateTime>, now: OffsetDateTime) -> bool {
     let Some(mod_time) = mod_time else {
         return false;
@@ -1691,6 +2267,269 @@ fn table_matches_staged_base(table: &TableEntry, commit_log: &CommitLogEntry) ->
     table.table_id == commit_log.table_id
         && table.metadata_location == commit_log.previous_metadata_location
         && table.version_token == commit_log.expected_version_token
+}
+
+fn table_catalog_recovery_summary(
+    metadata_status: &TableMetadataPointerStatus,
+    commit_recovery: &TableCommitRecoveryReport,
+) -> (TableCatalogRecoveryStatus, Vec<TableCatalogRecoveryAction>) {
+    let mut actions = Vec::new();
+    let metadata_status = match metadata_status {
+        TableMetadataPointerStatus::Valid => None,
+        TableMetadataPointerStatus::MissingObject => {
+            actions.push(TableCatalogRecoveryAction::RestoreCurrentMetadataObject);
+            Some(TableCatalogRecoveryStatus::ReadOnlyRecommended)
+        }
+        TableMetadataPointerStatus::InvalidJson => {
+            actions.push(TableCatalogRecoveryAction::FixCurrentMetadataJson);
+            Some(TableCatalogRecoveryStatus::ReadOnlyRecommended)
+        }
+        TableMetadataPointerStatus::InvalidLocation => {
+            actions.push(TableCatalogRecoveryAction::MoveCurrentMetadataInsideTable);
+            Some(TableCatalogRecoveryStatus::ReadOnlyRecommended)
+        }
+    };
+
+    if commit_recovery.manual_review_count > 0 {
+        actions.push(TableCatalogRecoveryAction::ReviewCommitLog);
+        return (metadata_status.unwrap_or(TableCatalogRecoveryStatus::ManualReviewRequired), actions);
+    }
+    if commit_recovery.finalization_required_count > 0 || commit_recovery.idempotency_repair_required_count > 0 {
+        actions.push(TableCatalogRecoveryAction::RunCommitRecovery);
+        return (metadata_status.unwrap_or(TableCatalogRecoveryStatus::Recoverable), actions);
+    }
+    if commit_recovery.staged_before_table_update_count > 0 {
+        actions.push(TableCatalogRecoveryAction::RetryCommit);
+        return (metadata_status.unwrap_or(TableCatalogRecoveryStatus::Recoverable), actions);
+    }
+
+    (metadata_status.unwrap_or(TableCatalogRecoveryStatus::Healthy), actions)
+}
+
+fn commit_logs_share_recovery_payload(left: &CommitLogEntry, right: &CommitLogEntry) -> bool {
+    left.version == right.version
+        && left.commit_id == right.commit_id
+        && left.idempotency_key == right.idempotency_key
+        && left.table_id == right.table_id
+        && left.operation == right.operation
+        && left.expected_version_token == right.expected_version_token
+        && left.new_version_token == right.new_version_token
+        && left.previous_metadata_location == right.previous_metadata_location
+        && left.new_metadata_location == right.new_metadata_location
+        && left.requirements == right.requirements
+        && left.writer == right.writer
+}
+
+fn commit_idempotency_index_status(
+    commit_log: &CommitLogEntry,
+    idempotency_commit: Option<&CommitLogEntry>,
+) -> TableCommitIdempotencyIndexStatus {
+    match (commit_log.idempotency_key.as_ref(), idempotency_commit) {
+        (None, _) => TableCommitIdempotencyIndexStatus::NotRequired,
+        (Some(_), None) => TableCommitIdempotencyIndexStatus::Missing,
+        (Some(_), Some(indexed)) if indexed == commit_log => TableCommitIdempotencyIndexStatus::Matches,
+        (Some(_), Some(indexed)) if commit_logs_share_recovery_payload(indexed, commit_log) => {
+            TableCommitIdempotencyIndexStatus::Stale
+        }
+        (Some(_), Some(_)) => TableCommitIdempotencyIndexStatus::Conflicting,
+    }
+}
+
+fn table_commit_recovery_entry(
+    table: &TableEntry,
+    commit_log: &CommitLogEntry,
+    idempotency_commit: Option<&CommitLogEntry>,
+) -> TableCommitRecoveryEntry {
+    let idempotency_index_status = commit_idempotency_index_status(commit_log, idempotency_commit);
+    let idempotency_index_present = matches!(
+        idempotency_index_status,
+        TableCommitIdempotencyIndexStatus::Matches
+            | TableCommitIdempotencyIndexStatus::Stale
+            | TableCommitIdempotencyIndexStatus::Conflicting
+    );
+    let idempotency_index_repair_required = matches!(
+        idempotency_index_status,
+        TableCommitIdempotencyIndexStatus::Missing | TableCommitIdempotencyIndexStatus::Stale
+    );
+
+    let (recovery_state, reason) = if matches!(idempotency_index_status, TableCommitIdempotencyIndexStatus::Conflicting) {
+        (
+            TableCommitRecoveryState::ManualReview,
+            "idempotency index points at a different commit payload".to_string(),
+        )
+    } else if table_matches_committed_log(table, commit_log) {
+        if matches!(commit_log.status, CommitLogStatus::Committed) {
+            if idempotency_index_repair_required {
+                (
+                    TableCommitRecoveryState::IdempotencyIndexRepairRequired,
+                    "committed table pointer is durable but idempotency index needs repair".to_string(),
+                )
+            } else {
+                (
+                    TableCommitRecoveryState::Committed,
+                    "commit log and current table pointer agree".to_string(),
+                )
+            }
+        } else {
+            (
+                TableCommitRecoveryState::FinalizationRequired,
+                "current table pointer already advanced but commit log is not finalized".to_string(),
+            )
+        }
+    } else if matches!(commit_log.status, CommitLogStatus::Committed) {
+        if idempotency_index_repair_required {
+            (
+                TableCommitRecoveryState::IdempotencyIndexRepairRequired,
+                "historical committed log needs idempotency index repair".to_string(),
+            )
+        } else {
+            (
+                TableCommitRecoveryState::Committed,
+                "commit is finalized and may be older than the current table pointer".to_string(),
+            )
+        }
+    } else if table_matches_staged_base(table, commit_log) {
+        (
+            TableCommitRecoveryState::StagedBeforeTableUpdate,
+            "staged commit exists but table pointer has not advanced".to_string(),
+        )
+    } else {
+        (
+            TableCommitRecoveryState::ManualReview,
+            "staged commit no longer matches the current table pointer or its expected base".to_string(),
+        )
+    };
+
+    TableCommitRecoveryEntry {
+        commit_id: commit_log.commit_id.clone(),
+        idempotency_key: commit_log.idempotency_key.clone(),
+        operation: commit_log.operation.clone(),
+        status: commit_log.status.clone(),
+        recovery_state,
+        previous_metadata_location: commit_log.previous_metadata_location.clone(),
+        new_metadata_location: commit_log.new_metadata_location.clone(),
+        expected_version_token: commit_log.expected_version_token.clone(),
+        new_version_token: commit_log.new_version_token.clone(),
+        idempotency_index_present,
+        idempotency_index_status,
+        reason,
+    }
+}
+
+fn record_table_commit_attempt(operation: &str) {
+    counter!("rustfs_table_catalog_commit_attempts_total", "operation" => operation.to_string()).increment(1);
+}
+
+fn table_catalog_store_result_label<T>(result: &TableCatalogStoreResult<T>) -> &'static str {
+    match result {
+        Ok(_) => "success",
+        Err(TableCatalogStoreError::Conflict(_)) => "conflict",
+        Err(TableCatalogStoreError::Invalid(_)) => "invalid",
+        Err(TableCatalogStoreError::NotFound(_)) => "not_found",
+        Err(TableCatalogStoreError::Internal(_)) => "failure",
+    }
+}
+
+fn duration_millis_u64(duration: StdDuration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn record_table_commit_cas_result(operation: &str, started: Instant, result: &TableCatalogStoreResult<()>) {
+    let elapsed = started.elapsed();
+    let result_label = table_catalog_store_result_label(result);
+    counter!(
+        "rustfs_table_catalog_commit_cas_results_total",
+        "operation" => operation.to_string(),
+        "result" => result_label.to_string()
+    )
+    .increment(1);
+    histogram!(
+        "rustfs_table_catalog_commit_cas_duration_seconds",
+        "operation" => operation.to_string(),
+        "result" => result_label.to_string()
+    )
+    .record(elapsed.as_secs_f64());
+}
+
+fn record_table_commit_result(
+    table_bucket: &str,
+    namespace: &str,
+    table: &str,
+    commit_id: &str,
+    operation: &str,
+    started: Instant,
+    result: &TableCatalogStoreResult<TableCommitResult>,
+) {
+    let elapsed = started.elapsed();
+    let result_label = table_catalog_store_result_label(result);
+    counter!(
+        "rustfs_table_catalog_commit_results_total",
+        "operation" => operation.to_string(),
+        "result" => result_label.to_string()
+    )
+    .increment(1);
+    if matches!(result, Err(TableCatalogStoreError::Conflict(_))) {
+        counter!("rustfs_table_catalog_commit_conflicts_total", "operation" => operation.to_string()).increment(1);
+    }
+    histogram!(
+        "rustfs_table_catalog_commit_duration_seconds",
+        "operation" => operation.to_string(),
+        "result" => result_label.to_string()
+    )
+    .record(elapsed.as_secs_f64());
+
+    match result {
+        Ok(commit) if elapsed >= TABLE_COMMIT_SLOW_LOG_THRESHOLD => {
+            tracing::warn!(
+                table_bucket,
+                namespace,
+                table,
+                commit_id,
+                operation,
+                generation = commit.table.generation,
+                duration_ms = duration_millis_u64(elapsed),
+                "slow table catalog commit"
+            );
+        }
+        Ok(commit) => {
+            tracing::debug!(
+                table_bucket,
+                namespace,
+                table,
+                commit_id,
+                operation,
+                generation = commit.table.generation,
+                duration_ms = duration_millis_u64(elapsed),
+                "table catalog commit completed"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                table_bucket,
+                namespace,
+                table,
+                commit_id,
+                operation,
+                result = result_label,
+                duration_ms = duration_millis_u64(elapsed),
+                error = %error,
+                "table catalog commit did not complete"
+            );
+        }
+    }
+}
+
+fn table_commit_result(
+    table_bucket: &str,
+    namespace: &str,
+    table: &str,
+    commit_id: &str,
+    operation: &str,
+    started: Instant,
+    result: TableCatalogStoreResult<TableCommitResult>,
+) -> TableCatalogStoreResult<TableCommitResult> {
+    record_table_commit_result(table_bucket, namespace, table, commit_id, operation, started, &result);
+    result
 }
 
 fn http_preconditions_for_catalog_put(precondition: TableCatalogPutPrecondition) -> Option<HTTPPreconditions> {
@@ -2679,6 +3518,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn table_data_plane_resource_resolves_registered_warehouse_prefix() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+
+        let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/part-00001.parquet")
+            .await
+            .expect("data-plane resource lookup should succeed")
+            .expect("object should resolve to the registered table");
+
+        assert_eq!(resource.table_bucket, bucket);
+        assert_eq!(resource.namespace, "sales");
+        assert_eq!(resource.table, "orders");
+        assert_eq!(resource.table_id, "table-id");
+        assert_eq!(resource.warehouse_object_prefix, "tables/table-id/");
+        assert_eq!(resource.catalog_resource_object(), "namespaces/sales/tables/orders");
+    }
+
+    #[tokio::test]
+    async fn table_data_plane_resource_does_not_match_sibling_prefix() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+
+        let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id-other/data/part-00001.parquet")
+            .await
+            .expect("data-plane resource lookup should succeed");
+
+        assert!(resource.is_none());
+    }
+
+    #[tokio::test]
+    async fn table_data_plane_resource_prefers_longest_registered_warehouse_prefix() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let parent_table = IdentifierSegment::parse("orders").unwrap();
+        let child_table = IdentifierSegment::parse("orders_child").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &parent_table, "00001.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &parent_table, current.clone()).await;
+        let mut child_entry = test_table_entry(bucket, &namespace, &child_table, current);
+        child_entry.table_id = "table-id-child".to_string();
+        child_entry.warehouse_location = format!("s3://{bucket}/tables/table-id/child");
+        store.create_table(child_entry).await.unwrap();
+
+        let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/child/data/part-00001.parquet")
+            .await
+            .expect("data-plane resource lookup should succeed")
+            .expect("object should resolve to the child table");
+
+        assert_eq!(resource.table, "orders_child");
+        assert_eq!(resource.table_id, "table-id-child");
+        assert_eq!(resource.warehouse_object_prefix, "tables/table-id/child/");
+        assert_eq!(resource.catalog_resource_object(), "namespaces/sales/tables/orders_child");
+    }
+
+    #[tokio::test]
+    async fn table_data_plane_resource_skips_invalid_warehouse_locations() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let invalid_table = IdentifierSegment::parse("bad_orders").unwrap();
+        let valid_table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &valid_table, "00001.metadata.json");
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+
+        let mut invalid_entry = test_table_entry(bucket, &namespace, &invalid_table, current.clone());
+        invalid_entry.table_id = "bad-table-id".to_string();
+        invalid_entry.warehouse_location = format!("s3://{bucket}/");
+        store.create_table(invalid_entry).await.unwrap();
+        store
+            .create_table(test_table_entry(bucket, &namespace, &valid_table, current))
+            .await
+            .unwrap();
+
+        let unrelated = table_data_plane_resource_for_object(&store, bucket, "ordinary/object.parquet")
+            .await
+            .expect("invalid table warehouse location should not deny unrelated object lookup");
+        assert!(unrelated.is_none());
+
+        let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/part-00001.parquet")
+            .await
+            .expect("invalid table warehouse location should not block a later valid match")
+            .expect("valid table warehouse object should resolve to the table");
+        assert_eq!(resource.table, "orders");
+        assert_eq!(resource.table_id, "table-id");
+        assert_eq!(resource.warehouse_object_prefix, "tables/table-id/");
+    }
+
+    #[tokio::test]
     async fn maintenance_dry_run_reports_job_context_and_deletable_candidates() {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend.clone());
@@ -2851,6 +3798,71 @@ mod tests {
         assert!(report.retained_metadata_locations.contains(&current));
         assert!(report.retained_metadata_locations.contains(&logged));
         assert_eq!(report.cleanup_candidate_locations, vec![v1, v3]);
+    }
+
+    #[tokio::test]
+    async fn maintenance_dry_run_keeps_metadata_for_protected_snapshot_refs() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let orphan = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let tagged = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let unreferenced = default_table_metadata_file_path(&namespace, &table, "00003.metadata.json");
+        let current = default_table_metadata_file_path(&namespace, &table, "00004.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend.seed_object(bucket, &orphan, b"{}".to_vec()).await;
+        backend
+            .seed_object(
+                bucket,
+                &tagged,
+                serde_json::to_vec(&serde_json::json!({
+                    "current-snapshot-id": 10
+                }))
+                .unwrap(),
+            )
+            .await;
+        backend
+            .seed_object(
+                bucket,
+                &unreferenced,
+                serde_json::to_vec(&serde_json::json!({
+                    "current-snapshot-id": 20
+                }))
+                .unwrap(),
+            )
+            .await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "current-snapshot-id": 30,
+                    "metadata-log": [],
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 30,
+                            "type": "branch"
+                        },
+                        "audit": {
+                            "snapshot-id": 10,
+                            "type": "tag"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let report = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .unwrap();
+
+        assert!(report.retained_metadata_locations.contains(&tagged));
+        assert_eq!(report.cleanup_candidate_locations, vec![orphan, unreferenced]);
     }
 
     #[tokio::test]
@@ -3049,6 +4061,8 @@ mod tests {
 
         assert_eq!(report.catalog.table.metadata_location, current.clone());
         assert_eq!(report.current_metadata_status, TableMetadataPointerStatus::MissingObject);
+        assert_eq!(report.recovery_status, TableCatalogRecoveryStatus::ReadOnlyRecommended);
+        assert_eq!(report.recommended_actions, vec![TableCatalogRecoveryAction::RestoreCurrentMetadataObject]);
         assert!(report.orphan_metadata_candidate_locations.is_empty());
     }
 
@@ -3101,6 +4115,53 @@ mod tests {
         assert_eq!(report.current_metadata_status, TableMetadataPointerStatus::Valid);
         assert_eq!(report.catalog.table.metadata_location, current);
         assert_eq!(report.orphan_metadata_candidate_locations, vec![uncommitted]);
+    }
+
+    #[tokio::test]
+    async fn orphan_metadata_scan_keeps_metadata_for_protected_snapshot_refs() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let orphan = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let tagged = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let current = default_table_metadata_file_path(&namespace, &table, "00003.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend.seed_object(bucket, &orphan, b"{}".to_vec()).await;
+        backend
+            .seed_object(
+                bucket,
+                &tagged,
+                serde_json::to_vec(&serde_json::json!({
+                    "current-snapshot-id": 10
+                }))
+                .unwrap(),
+            )
+            .await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "current-snapshot-id": 20,
+                    "metadata-log": [],
+                    "refs": {
+                        "audit": {
+                            "snapshot-id": 10,
+                            "type": "tag"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let report = store.diagnose_table_catalog(bucket, "sales", "orders", 0).await.unwrap();
+
+        assert_eq!(report.current_metadata_status, TableMetadataPointerStatus::Valid);
+        assert_eq!(report.orphan_metadata_candidate_locations, vec![orphan]);
     }
 
     #[tokio::test]
@@ -3163,6 +4224,63 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn object_table_catalog_store_syncs_warehouse_location_from_committed_metadata() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+        store
+            .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
+            .await
+            .unwrap();
+        backend
+            .seed_object(
+                bucket,
+                &new_metadata,
+                serde_json::to_vec(&serde_json::json!({
+                    "location": "s3://analytics/tables/relocated-table-id",
+                    "table-uuid": "table-uuid"
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let result = store
+            .commit_table(TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                commit_id: "commit-1".to_string(),
+                idempotency_key: None,
+                operation: "set-location".to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current_metadata,
+                new_metadata_location: new_metadata,
+                requirements: vec![serde_json::json!({"type": "assert-table-uuid", "uuid": "table-uuid"})],
+                writer: Some("pyiceberg/test".to_string()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.table.warehouse_location, "s3://analytics/tables/relocated-table-id");
+        let resource = table_data_plane_resource_for_object(&store, bucket, "tables/relocated-table-id/data/part-00001.parquet")
+            .await
+            .expect("data-plane resource lookup should succeed")
+            .expect("relocated table warehouse object should resolve to the table");
+        assert_eq!(resource.table, "orders");
+        assert_eq!(resource.warehouse_object_prefix, "tables/relocated-table-id/");
     }
 
     #[tokio::test]
@@ -3270,6 +4388,289 @@ mod tests {
         assert_eq!(retry.commit_log.status, CommitLogStatus::Committed);
         let committed = store.get_commit_by_id(bucket, "table-id", "commit-1").await.unwrap().unwrap();
         assert_eq!(committed.status, CommitLogStatus::Committed);
+    }
+
+    #[tokio::test]
+    async fn table_commit_recovery_reports_post_cas_staged_commit() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let commit_path = TableCatalogObjectPaths::default().commit_log_entry_path(bucket, "table-id", "commit-1");
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+        store
+            .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
+            .await
+            .unwrap();
+        backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+        backend
+            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &commit_path, 2)
+            .await;
+
+        let result = store
+            .commit_table(TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                commit_id: "commit-1".to_string(),
+                idempotency_key: None,
+                operation: "append".to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current_metadata,
+                new_metadata_location: new_metadata.clone(),
+                requirements: Vec::new(),
+                writer: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.commit_log.status, CommitLogStatus::Committed);
+
+        let report = store.plan_table_commit_recovery(bucket, "sales", "orders").await.unwrap();
+
+        assert_eq!(report.current_metadata_location, new_metadata);
+        assert_eq!(report.finalization_required_count, 1);
+        assert_eq!(report.manual_review_count, 0);
+        assert_eq!(report.commits.len(), 1);
+        assert_eq!(report.commits[0].commit_id, "commit-1");
+        assert_eq!(report.commits[0].status, CommitLogStatus::Staged);
+        assert_eq!(report.commits[0].recovery_state, TableCommitRecoveryState::FinalizationRequired);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_report_includes_table_commit_recovery_state() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let commit_path = TableCatalogObjectPaths::default().commit_log_entry_path(bucket, "table-id", "commit-1");
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+        store
+            .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
+            .await
+            .unwrap();
+        backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+        backend
+            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &commit_path, 2)
+            .await;
+
+        store
+            .commit_table(TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                commit_id: "commit-1".to_string(),
+                idempotency_key: None,
+                operation: "append".to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current_metadata,
+                new_metadata_location: new_metadata,
+                requirements: Vec::new(),
+                writer: None,
+            })
+            .await
+            .unwrap();
+
+        let report = store.diagnose_table_catalog(bucket, "sales", "orders", 0).await.unwrap();
+
+        assert_eq!(report.recovery_status, TableCatalogRecoveryStatus::Recoverable);
+        assert_eq!(report.recommended_actions, vec![TableCatalogRecoveryAction::RunCommitRecovery]);
+        assert_eq!(report.commit_recovery.finalization_required_count, 1);
+        assert_eq!(report.commit_recovery.commits.len(), 1);
+        assert_eq!(
+            report.commit_recovery.commits[0].recovery_state,
+            TableCommitRecoveryState::FinalizationRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn table_commit_recovery_finalizes_post_cas_staged_commit() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let commit_path = TableCatalogObjectPaths::default().commit_log_entry_path(bucket, "table-id", "commit-1");
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+        store
+            .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
+            .await
+            .unwrap();
+        backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+        backend
+            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &commit_path, 2)
+            .await;
+
+        store
+            .commit_table(TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                commit_id: "commit-1".to_string(),
+                idempotency_key: None,
+                operation: "append".to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current_metadata,
+                new_metadata_location: new_metadata,
+                requirements: Vec::new(),
+                writer: None,
+            })
+            .await
+            .unwrap();
+
+        let report = store.recover_table_commits(bucket, "sales", "orders").await.unwrap();
+
+        assert_eq!(report.finalized_count, 1);
+        assert_eq!(report.finalization_required_count, 0);
+        let committed = store.get_commit_by_id(bucket, "table-id", "commit-1").await.unwrap().unwrap();
+        assert_eq!(committed.status, CommitLogStatus::Committed);
+    }
+
+    #[tokio::test]
+    async fn table_commit_recovery_reports_staged_commit_after_table_cas_failure() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let table_path = TableCatalogObjectPaths::default().table_entry_path(bucket, &namespace, &table);
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+        store
+            .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
+            .await
+            .unwrap();
+        backend.seed_object(bucket, &current_metadata, b"{}".to_vec()).await;
+        backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+        backend
+            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &table_path, 2)
+            .await;
+
+        let err = store
+            .commit_table(TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                commit_id: "commit-1".to_string(),
+                idempotency_key: None,
+                operation: "append".to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current_metadata.clone(),
+                new_metadata_location: new_metadata,
+                requirements: Vec::new(),
+                writer: None,
+            })
+            .await
+            .unwrap_err();
+        assert_matches!(err, TableCatalogStoreError::Internal(_));
+        let loaded = store.load_table(bucket, "sales", "orders").await.unwrap().unwrap();
+        assert_eq!(loaded.metadata_location, current_metadata);
+
+        let report = store.plan_table_commit_recovery(bucket, "sales", "orders").await.unwrap();
+        assert_eq!(report.staged_before_table_update_count, 1);
+        assert_eq!(report.finalization_required_count, 0);
+        assert_eq!(report.commits[0].recovery_state, TableCommitRecoveryState::StagedBeforeTableUpdate);
+
+        let diagnostics = store.diagnose_table_catalog(bucket, "sales", "orders", 0).await.unwrap();
+        assert_eq!(diagnostics.current_metadata_status, TableMetadataPointerStatus::Valid);
+        assert_eq!(diagnostics.recovery_status, TableCatalogRecoveryStatus::Recoverable);
+        assert_eq!(diagnostics.recommended_actions, vec![TableCatalogRecoveryAction::RetryCommit]);
+    }
+
+    #[tokio::test]
+    async fn table_commit_recovery_repairs_stale_idempotency_index_after_partial_finalization() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let idempotency_path =
+            TableCatalogObjectPaths::default().commit_idempotency_entry_path(bucket, "table-id", "client-request-1");
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+        store
+            .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
+            .await
+            .unwrap();
+        backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+        backend
+            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &idempotency_path, 2)
+            .await;
+
+        let result = store
+            .commit_table(TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                commit_id: "commit-1".to_string(),
+                idempotency_key: Some("client-request-1".to_string()),
+                operation: "append".to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current_metadata,
+                new_metadata_location: new_metadata,
+                requirements: Vec::new(),
+                writer: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.commit_log.status, CommitLogStatus::Committed);
+        let stale_index = store
+            .get_commit_by_idempotency_key(bucket, "table-id", "client-request-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale_index.status, CommitLogStatus::Staged);
+
+        let report = store.plan_table_commit_recovery(bucket, "sales", "orders").await.unwrap();
+        assert_eq!(report.idempotency_repair_required_count, 1);
+        assert_eq!(report.manual_review_count, 0);
+        assert_eq!(report.commits[0].recovery_state, TableCommitRecoveryState::IdempotencyIndexRepairRequired);
+        assert_eq!(report.commits[0].idempotency_index_status, TableCommitIdempotencyIndexStatus::Stale);
+
+        let repaired = store.recover_table_commits(bucket, "sales", "orders").await.unwrap();
+
+        assert_eq!(repaired.finalized_count, 1);
+        assert_eq!(repaired.idempotency_repair_required_count, 0);
+        let repaired_index = store
+            .get_commit_by_idempotency_key(bucket, "table-id", "client-request-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired_index.status, CommitLogStatus::Committed);
     }
 
     #[tokio::test]

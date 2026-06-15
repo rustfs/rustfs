@@ -47,6 +47,10 @@ use thiserror::Error;
 
 use tracing::warn;
 
+const LOG_COMPONENT_OBS: &str = "obs";
+const LOG_SUBSYSTEM_GPU_METRICS: &str = "gpu_metrics";
+const EVENT_GPU_METRICS_STATE: &str = "gpu_metrics_state";
+
 /// GPU statistics.
 ///
 /// Contains GPU memory usage metrics for the monitored process.
@@ -138,7 +142,14 @@ impl GpuCollector {
                     }
                 }
             } else {
-                warn!("Could not get GPU stats, recording 0 for GPU memory usage");
+                warn!(
+                    event = EVENT_GPU_METRICS_STATE,
+                    component = LOG_COMPONENT_OBS,
+                    subsystem = LOG_SUBSYSTEM_GPU_METRICS,
+                    result = "process_stats_unavailable",
+                    fallback_memory_usage = 0,
+                    "gpu metrics state changed"
+                );
             }
         } else {
             return Err(GpuError::DeviceError("No GPU device found".to_string()));

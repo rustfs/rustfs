@@ -17,6 +17,7 @@ use crate::common::gateway::S3Action;
 use crate::common::gateway::authorize_operation;
 use async_trait::async_trait;
 use futures_util::stream;
+use rustfs_utils::MaskedAccessKey;
 use rustfs_utils::path;
 use s3s::dto::*;
 use std::fmt::Debug;
@@ -24,6 +25,19 @@ use std::path::{Path, PathBuf};
 use tokio::io::AsyncRead;
 use tracing::{debug, error};
 use unftp_core::storage::{Error, ErrorKind, Fileinfo, Metadata, Result, StorageBackend};
+
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_FTPS_DRIVER: &str = "ftps_driver";
+const EVENT_FTPS_BUCKET_DELETE_FAILED: &str = "ftps_bucket_delete_failed";
+const EVENT_FTPS_METADATA_FAILED: &str = "ftps_metadata_failed";
+const EVENT_FTPS_LIST_FAILED: &str = "ftps_list_failed";
+const EVENT_FTPS_STREAM_READ_FAILED: &str = "ftps_stream_read_failed";
+const EVENT_FTPS_OBJECT_GET_FAILED: &str = "ftps_object_get_failed";
+const EVENT_FTPS_OBJECT_PUT_FAILED: &str = "ftps_object_put_failed";
+const EVENT_FTPS_OBJECT_DELETE_STATE: &str = "ftps_object_delete_state";
+const EVENT_FTPS_DIRECTORY_STATE: &str = "ftps_directory_state";
+const EVENT_FTPS_CWD_FAILED: &str = "ftps_cwd_failed";
+const EVENT_FTPS_RENAME_STATE: &str = "ftps_rename_state";
 
 /// FTPS metadata implementation
 #[derive(Debug, Clone)]
@@ -210,7 +224,14 @@ where
             Ok(_) => Ok(()),
             Err(e) if e.to_string().contains("NoSuchBucket") => Ok(()),
             Err(e) => {
-                error!("Failed to delete bucket '{}': {}", bucket, e);
+                error!(
+                    event = EVENT_FTPS_BUCKET_DELETE_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                    bucket = %bucket,
+                    error = %e,
+                    "ftps bucket delete failed"
+                );
                 Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("Delete bucket failed: {}", e)))
             }
         }
@@ -263,7 +284,16 @@ where
                     })
                 }
                 Err(e) => {
-                    error!("Failed to get metadata for '{}': {}", path_str, e);
+                    error!(
+                        event = EVENT_FTPS_METADATA_FAILED,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                        path = %path_str,
+                        bucket = %bucket,
+                        object = %key,
+                        error = %e,
+                        "ftps metadata failed"
+                    );
                     Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Metadata failed", e)))
                 }
             }
@@ -290,7 +320,15 @@ where
                     is_dir: true,
                 }),
                 Err(e) => {
-                    error!("Failed to get bucket metadata for '{}': {}", bucket_clone, e);
+                    error!(
+                        event = EVENT_FTPS_METADATA_FAILED,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                        path = %path_str,
+                        bucket = %bucket_clone,
+                        error = %e,
+                        "ftps metadata failed"
+                    );
                     Err(Error::new(
                         ErrorKind::PermanentFileNotAvailable,
                         format!("{}: {}", "Bucket metadata failed", e),
@@ -423,7 +461,15 @@ where
                 Ok(fileinfos)
             }
             Err(e) => {
-                error!("Failed to list '{}': {}", path_str, e);
+                error!(
+                    event = EVENT_FTPS_LIST_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                    path = %path_str,
+                    bucket = %prefix_with_slash.unwrap_or_default(),
+                    error = %e,
+                    "ftps list failed"
+                );
                 Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "List failed", e)))
             }
         }
@@ -437,6 +483,7 @@ where
     ) -> Result<Box<dyn AsyncRead + Send + Sync + Unpin>> {
         let path_str = path.as_ref().to_string_lossy();
         let session_context = &user.session_context;
+        let masked_username = MaskedAccessKey(&user.username);
 
         let (bucket, key) = self
             .parse_s3_path(&path_str)
@@ -472,7 +519,17 @@ where
                     match chunk_result {
                         Ok(bytes) => data.extend_from_slice(&bytes),
                         Err(e) => {
-                            error!("Error reading stream: {}", e);
+                            error!(
+                                event = EVENT_FTPS_STREAM_READ_FAILED,
+                                component = LOG_COMPONENT_PROTOCOLS,
+                                subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                                username = %masked_username,
+                                path = %path_str,
+                                bucket = %bucket,
+                                object = %key,
+                                error = %e,
+                                "ftps stream read failed"
+                            );
                             return Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("Stream error: {}", e)));
                         }
                     }
@@ -481,7 +538,18 @@ where
                 Ok(Box::new(std::io::Cursor::new(data)))
             }
             Err(e) => {
-                error!("Failed to get '{}': {}", path_str, e);
+                error!(
+                    event = EVENT_FTPS_OBJECT_GET_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                    username = %masked_username,
+                    path = %path_str,
+                    bucket = %bucket,
+                    object = %key,
+                    start_pos,
+                    error = %e,
+                    "ftps object get failed"
+                );
                 Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Get failed", e)))
             }
         }
@@ -496,6 +564,7 @@ where
     ) -> Result<u64> {
         let path_str = path.as_ref().to_string_lossy();
         let session_context = &user.session_context;
+        let masked_username = MaskedAccessKey(&user.username);
 
         let (bucket, key) = self
             .parse_s3_path(&path_str)
@@ -555,7 +624,18 @@ where
                 Ok(file_size as u64) // Return the size of the uploaded object
             }
             Err(e) => {
-                error!("FTPS put - S3 error details: {:?}", e);
+                error!(
+                    event = EVENT_FTPS_OBJECT_PUT_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                    username = %masked_username,
+                    path = %path_str,
+                    bucket = %bucket,
+                    object = %key,
+                    file_size,
+                    error = ?e,
+                    "ftps object put failed"
+                );
                 Err(Error::new(
                     ErrorKind::PermanentFileNotAvailable,
                     format!("Failed to upload object: {:?}", e),
@@ -567,7 +647,16 @@ where
     async fn del<P: AsRef<Path> + Send>(&self, user: &super::server::FtpsUser, path: P) -> Result<()> {
         let path_str = path.as_ref().to_string_lossy();
         let session_context = &user.session_context;
-        debug!("FTPS delete request for user '{}' path '{}'", user.username, path_str);
+        let masked_username = MaskedAccessKey(&user.username);
+        debug!(
+            event = EVENT_FTPS_OBJECT_DELETE_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+            state = "requested",
+            username = %masked_username,
+            path = %path_str,
+            "FTPS delete requested"
+        );
 
         let (bucket, key) = self
             .parse_s3_path(&path_str)
@@ -592,7 +681,18 @@ where
             {
                 Ok(_) => Ok(()),
                 Err(e) => {
-                    error!("Failed to delete file '{}': {}", path_str, e);
+                    error!(
+                        event = EVENT_FTPS_OBJECT_DELETE_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                        state = "delete_failed",
+                        username = %masked_username,
+                        path = %path_str,
+                        bucket = %bucket,
+                        object = %key,
+                        error = %e,
+                        "ftps object delete state changed"
+                    );
                     Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("Delete failed: {}", e)))
                 }
             }
@@ -615,7 +715,16 @@ where
     async fn mkd<P: AsRef<Path> + Send>(&self, user: &super::server::FtpsUser, path: P) -> Result<()> {
         let path_str = path.as_ref().to_string_lossy();
         let session_context = &user.session_context;
-        debug!("FTPS mkdir request for user '{}' path '{}'", user.username, path_str);
+        let masked_username = MaskedAccessKey(&user.username);
+        debug!(
+            event = EVENT_FTPS_DIRECTORY_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+            state = "create_requested",
+            username = %masked_username,
+            path = %path_str,
+            "ftps directory state changed"
+        );
 
         let (bucket, _key) = self
             .parse_s3_path(&path_str)
@@ -632,11 +741,30 @@ where
             .await
         {
             Ok(_) => {
-                debug!("Successfully created directory/bucket '{}'", path_str);
+                debug!(
+                    event = EVENT_FTPS_DIRECTORY_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                    state = "created",
+                    username = %masked_username,
+                    path = %path_str,
+                    bucket = %bucket,
+                    "FTPS directory created"
+                );
                 Ok(())
             }
             Err(e) => {
-                error!("Failed to create directory/bucket '{}': {}", path_str, e);
+                error!(
+                    event = EVENT_FTPS_DIRECTORY_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                    state = "create_failed",
+                    username = %masked_username,
+                    path = %path_str,
+                    bucket = %bucket,
+                    error = %e,
+                    "ftps directory state changed"
+                );
                 Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("Mkdir failed: {}", e)))
             }
         }
@@ -658,17 +786,41 @@ where
         // Try to delete bucket recursively
         match self.delete_bucket_recursively(&bucket, session_context).await {
             Ok(_) => {
-                debug!("Successfully removed directory/bucket '{}'", path_str);
+                debug!(
+                    event = EVENT_FTPS_DIRECTORY_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                    state = "removed",
+                    path = %path_str,
+                    bucket = %bucket,
+                    "FTPS directory removed"
+                );
                 Ok(())
             }
             Err(e) => {
                 // Check if error is NoSuchBucket - treat as success (idempotent)
                 let error_msg = e.to_string();
                 if error_msg.contains("NoSuchBucket") || error_msg.contains("does not exist") {
-                    debug!("Bucket '{}' already deleted", bucket);
+                    debug!(
+                        event = EVENT_FTPS_DIRECTORY_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                        state = "already_removed",
+                        bucket = %bucket,
+                        "FTPS directory already removed"
+                    );
                     Ok(())
                 } else {
-                    error!("Failed to remove directory/bucket '{}': {}", path_str, e);
+                    error!(
+                        event = EVENT_FTPS_DIRECTORY_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                        state = "remove_failed",
+                        path = %path_str,
+                        bucket = %bucket,
+                        error = %e,
+                        "ftps directory state changed"
+                    );
                     Err(e)
                 }
             }
@@ -700,7 +852,15 @@ where
         {
             Ok(_) => Ok(()),
             Err(e) => {
-                error!("CWD to '{}' failed: {}", path_str, e);
+                error!(
+                    event = EVENT_FTPS_CWD_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                    path = %path_str,
+                    bucket = %bucket,
+                    error = %e,
+                    "ftps cwd failed"
+                );
                 Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("CWD failed: {}", e)))
             }
         }
@@ -709,7 +869,16 @@ where
     async fn rename<P: AsRef<Path> + Send>(&self, user: &super::server::FtpsUser, from: P, to: P) -> Result<()> {
         let from_str = from.as_ref().to_string_lossy();
         let to_str = to.as_ref().to_string_lossy();
-        debug!("FTPS rename request for user '{}' from '{}' to '{}'", user.username, from_str, to_str);
+        debug!(
+            event = EVENT_FTPS_RENAME_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+            state = "unsupported",
+            username = %MaskedAccessKey(&user.username),
+            from = %from_str,
+            to = %to_str,
+            "FTPS rename unsupported"
+        );
 
         Err(Error::new(
             ErrorKind::CommandNotImplemented,

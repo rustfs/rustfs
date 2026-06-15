@@ -28,8 +28,10 @@ pub mod sys;
 pub mod target;
 
 pub use catalog::extension::{
-    TARGET_AUDIT_CAPABILITY, TARGET_NOTIFY_CAPABILITY, builtin_target_extension_schemas, target_marketplace_extension_schema,
-    target_runtime_boundary,
+    OPS_DIAGNOSTICS_EXTENSION_API_VERSION, S3_HOOK_EXTENSION_API_VERSION, TARGET_AUDIT_CAPABILITY, TARGET_NOTIFY_CAPABILITY,
+    builtin_extension_schemas, builtin_ops_diagnostics_contract, builtin_ops_diagnostics_extension_schema,
+    builtin_s3_hook_contract, builtin_s3_hook_extension_schema, builtin_target_extension_schemas,
+    target_marketplace_extension_schema, target_runtime_boundary,
 };
 pub use check::{
     check_amqp_broker_available, check_kafka_broker_available, check_mqtt_broker_available, check_mqtt_broker_available_with_tls,
@@ -42,9 +44,11 @@ pub use config::{
     normalize_legacy_target_instances_from_env, normalize_target_plugin_instances, normalize_target_plugin_instances_from_env,
 };
 pub use control_plane::{
-    TargetPluginEnableState, TargetPluginInstallState, TargetPluginInstallation, TargetPluginOperationalState,
-    TargetPluginRevision, TargetPluginRuntimeState, builtin_target_plugin_installation, builtin_target_plugin_operational_state,
-    external_target_plugin_installation, rollback_target_plugin_installation, runtime_state_from_status_label,
+    TargetPluginEnableState, TargetPluginExternalAction, TargetPluginExternalActionDecision, TargetPluginExternalActionError,
+    TargetPluginExternalFlowGate, TargetPluginExternalFlowGateStatus, TargetPluginInstallState, TargetPluginInstallation,
+    TargetPluginOperationalState, TargetPluginRevision, TargetPluginRuntimeState, builtin_target_plugin_installation,
+    builtin_target_plugin_operational_state, external_target_plugin_installation, plan_external_target_plugin_action,
+    rollback_target_plugin_installation, runtime_state_from_status_label,
 };
 pub use domain::TargetDomain;
 pub use error::{StoreError, TargetError};
@@ -63,7 +67,12 @@ pub use runtime::{
     RuntimeTargetHealthState, RuntimeTargetSnapshot, SharedTarget, TargetRuntimeManager, activate_targets_with_replay,
     adapter::{BuiltinPluginRuntimeAdapter, PluginRuntimeAdapter},
     init_target_and_optionally_start_replay,
-    sidecar::{SidecarPluginRuntime, SidecarRuntimePolicy, SidecarRuntimeSafetyChecks},
+    ops_diagnostics::{
+        OpsDiagnosticsAccessDecision, OpsDiagnosticsReadRequest, OpsDiagnosticsRegistration, OpsDiagnosticsRegistry,
+        OpsDiagnosticsRegistryError,
+    },
+    s3_hooks::{S3HookContext, S3HookDecision, S3HookRegistration, S3HookRegistry, S3HookRegistryError},
+    sidecar::{SidecarPluginRuntime, SidecarRuntimePolicy, SidecarRuntimePolicyError, SidecarRuntimeSafetyChecks},
     sidecar_protocol::{SIDECAR_RUNTIME_PROTOCOL_VERSION, SidecarHandshake, SidecarPluginCapability},
     start_replay_worker,
 };
