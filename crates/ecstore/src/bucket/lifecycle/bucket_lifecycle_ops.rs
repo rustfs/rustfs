@@ -803,6 +803,7 @@ impl TransitionState {
             queue_full: nonnegative_i64_to_u64(Self::counter_value(&self.queue_full_tasks)),
             queue_send_timeout: nonnegative_i64_to_u64(Self::counter_value(&self.queue_send_timeout_tasks)),
             compensation_scheduled: nonnegative_i64_to_u64(Self::counter_value(&self.compensation_scheduled_tasks)),
+            compensation_pending: self.compensation_pending_tasks(),
             compensation_running: nonnegative_i64_to_u64(Self::counter_value(&self.compensation_running_tasks)),
         }
     }
@@ -1000,6 +1001,13 @@ impl TransitionState {
 
     pub fn compensation_scheduled_tasks(&self) -> i64 {
         Self::counter_value(&self.compensation_scheduled_tasks)
+    }
+
+    pub fn compensation_pending_tasks(&self) -> u64 {
+        match self.compensation_buckets.lock() {
+            Ok(scheduled) => usize_to_u64_saturated(scheduled.len()),
+            Err(poisoned) => usize_to_u64_saturated(poisoned.into_inner().len()),
+        }
     }
 
     pub fn compensation_running_tasks(&self) -> i64 {
@@ -3058,6 +3066,17 @@ mod tests {
         assert!(first);
         assert!(!second);
         assert_eq!(state.compensation_scheduled_tasks(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scanner_transition_state_reports_compensation_pending_buckets() {
+        let state = TransitionState::new_with_capacity(1);
+
+        assert_eq!(state.scanner_transition_state_update().compensation_pending, 0);
+        state.compensation_buckets.lock().unwrap().insert("bucket-a".to_string());
+        assert_eq!(state.scanner_transition_state_update().compensation_pending, 1);
+        state.compensation_buckets.lock().unwrap().insert("bucket-a".to_string());
+        assert_eq!(state.scanner_transition_state_update().compensation_pending, 1);
     }
 
     #[tokio::test]

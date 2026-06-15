@@ -173,6 +173,7 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
             queue_full: metrics.lifecycle_transition.queue_full,
             queue_send_timeout: metrics.lifecycle_transition.queue_send_timeout,
             compensation_scheduled: metrics.lifecycle_transition.compensation_scheduled,
+            compensation_pending: metrics.lifecycle_transition.compensation_pending,
             compensation_running: metrics.lifecycle_transition.compensation_running,
             scanner_queued: metrics.lifecycle_transition.scanner_queued,
             scanner_missed: metrics.lifecycle_transition.scanner_missed,
@@ -574,6 +575,7 @@ mod test {
                 queue_full: 3,
                 queue_send_timeout: 1,
                 compensation_scheduled: 2,
+                compensation_pending: 3,
                 compensation_running: 1,
                 scanner_queued: 6,
                 scanner_missed: 2,
@@ -590,6 +592,7 @@ mod test {
         assert_eq!(scanner.lifecycle_transition.queue_full, 3);
         assert_eq!(scanner.lifecycle_transition.queue_send_timeout, 1);
         assert_eq!(scanner.lifecycle_transition.compensation_scheduled, 2);
+        assert_eq!(scanner.lifecycle_transition.compensation_pending, 3);
         assert_eq!(scanner.lifecycle_transition.compensation_running, 1);
         assert_eq!(scanner.lifecycle_transition.scanner_queued, 6);
         assert_eq!(scanner.lifecycle_transition.scanner_missed, 2);

@@ -373,6 +373,8 @@ pub struct ScannerLifecycleTransitionSnapshot {
     pub queue_send_timeout: u64,
     #[serde(rename = "compensation_scheduled", default)]
     pub compensation_scheduled: u64,
+    #[serde(rename = "compensation_pending", default)]
+    pub compensation_pending: u64,
     #[serde(rename = "compensation_running", default)]
     pub compensation_running: u64,
     #[serde(rename = "scanner_queued", default)]
@@ -394,6 +396,7 @@ impl ScannerLifecycleTransitionSnapshot {
         self.queue_full = self.queue_full.saturating_add(other.queue_full);
         self.queue_send_timeout = self.queue_send_timeout.saturating_add(other.queue_send_timeout);
         self.compensation_scheduled = self.compensation_scheduled.saturating_add(other.compensation_scheduled);
+        self.compensation_pending = self.compensation_pending.saturating_add(other.compensation_pending);
         self.compensation_running = self.compensation_running.saturating_add(other.compensation_running);
         self.scanner_queued = self.scanner_queued.saturating_add(other.scanner_queued);
         self.scanner_missed = self.scanner_missed.saturating_add(other.scanner_missed);
@@ -1362,6 +1365,7 @@ mod tests {
                 queue_full: 3,
                 queue_send_timeout: 1,
                 compensation_scheduled: 1,
+                compensation_pending: 2,
                 compensation_running: 1,
                 scanner_queued: 5,
                 scanner_missed: 2,
@@ -1385,6 +1389,7 @@ mod tests {
                 queue_full: 2,
                 queue_send_timeout: 3,
                 compensation_scheduled: 4,
+                compensation_pending: 3,
                 compensation_running: 0,
                 scanner_queued: 6,
                 scanner_missed: 4,
@@ -1401,6 +1406,7 @@ mod tests {
         assert_eq!(scanner.lifecycle_transition.queue_full, 5);
         assert_eq!(scanner.lifecycle_transition.queue_send_timeout, 4);
         assert_eq!(scanner.lifecycle_transition.compensation_scheduled, 5);
+        assert_eq!(scanner.lifecycle_transition.compensation_pending, 5);
         assert_eq!(scanner.lifecycle_transition.compensation_running, 1);
         assert_eq!(scanner.lifecycle_transition.scanner_queued, 11);
         assert_eq!(scanner.lifecycle_transition.scanner_missed, 6);
