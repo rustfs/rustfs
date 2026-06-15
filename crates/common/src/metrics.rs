@@ -763,6 +763,34 @@ pub struct ScannerSourceWorkSnapshot {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerMaintenanceSourceSnapshot {
+    pub source: String,
+    pub state: String,
+    pub reason: String,
+    pub backlog: u64,
+    pub current_checked: u64,
+    pub current_queued: u64,
+    pub current_missed: u64,
+    pub lifetime_missed: u64,
+    pub partial_cycles: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerMaintenanceControlSnapshot {
+    pub primary_control: String,
+    pub sources: Vec<ScannerMaintenanceSourceSnapshot>,
+}
+
+impl Default for ScannerMaintenanceControlSnapshot {
+    fn default() -> Self {
+        Self {
+            primary_control: SCANNER_MAINTENANCE_CONTROL_NONE.to_string(),
+            sources: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScannerSourceCycleSnapshot {
     pub source: String,
     pub cycles: u64,
@@ -940,6 +968,8 @@ pub struct ScannerMetricsReport {
     #[serde(default)]
     pub lifecycle_transition: ScannerLifecycleTransitionSnapshot,
     #[serde(default)]
+    pub maintenance_control: ScannerMaintenanceControlSnapshot,
+    #[serde(default)]
     pub throttle_idle_mode_enabled: bool,
     #[serde(default)]
     pub throttle_sleep_factor: f64,
@@ -1087,6 +1117,164 @@ fn scanner_pacing_pressure(metrics: &ScannerMetricsReport) -> ScannerPacingPress
         last_cycle_throttle_sleep_ratio,
         last_cycle_yield_ratio,
         last_cycle_total_pause_ratio,
+    }
+}
+
+const SCANNER_MAINTENANCE_CONTROL_NONE: &str = "none";
+const SCANNER_MAINTENANCE_CONTROL_BLOCKED_SOURCE: &str = "blocked_source";
+const SCANNER_MAINTENANCE_CONTROL_DEFERRED_SOURCE: &str = "deferred_source";
+const SCANNER_MAINTENANCE_CONTROL_ACTIVE_SOURCE: &str = "active_source";
+const SCANNER_MAINTENANCE_CONTROL_PACING_PRESSURE: &str = "pacing_pressure";
+
+const SCANNER_MAINTENANCE_STATE_IDLE: &str = "idle";
+const SCANNER_MAINTENANCE_STATE_ACTIVE: &str = "active";
+const SCANNER_MAINTENANCE_STATE_DEFERRED: &str = "deferred";
+const SCANNER_MAINTENANCE_STATE_BLOCKED: &str = "blocked";
+
+const SCANNER_MAINTENANCE_REASON_IDLE: &str = "idle";
+const SCANNER_MAINTENANCE_REASON_ACTIVE_WORK: &str = "active_work";
+const SCANNER_MAINTENANCE_REASON_QUEUED_WORK: &str = "queued_work";
+const SCANNER_MAINTENANCE_REASON_PARTIAL_CYCLE: &str = "partial_cycle";
+const SCANNER_MAINTENANCE_REASON_MISSED_WORK: &str = "missed_work";
+const SCANNER_MAINTENANCE_REASON_TRANSITION_QUEUE_BACKLOG: &str = "transition_queue_backlog";
+const SCANNER_MAINTENANCE_REASON_TRANSITION_QUEUE_FULL: &str = "transition_queue_full";
+
+fn scanner_source_work_snapshot(work: &[ScannerSourceWorkSnapshot], source: ScannerWorkSource) -> ScannerSourceWorkSnapshot {
+    work.iter()
+        .find(|snapshot| snapshot.source == source.as_str())
+        .cloned()
+        .unwrap_or_else(|| ScannerSourceWorkSnapshot {
+            source: source.as_str().to_string(),
+            ..Default::default()
+        })
+}
+
+fn scanner_source_partial_cycles(metrics: &ScannerMetricsReport, source: ScannerWorkSource) -> u64 {
+    metrics
+        .partial_cycles_by_source
+        .iter()
+        .find(|snapshot| snapshot.source == source.as_str())
+        .map(|snapshot| snapshot.cycles)
+        .unwrap_or_default()
+}
+
+fn scanner_source_has_current_work(work: &ScannerSourceWorkSnapshot) -> bool {
+    work.checked > 0 || work.queued > 0 || work.executed > 0 || work.failed > 0 || work.skipped > 0 || work.missed > 0
+}
+
+fn scanner_lifecycle_transition_backlog(metrics: &ScannerMetricsReport) -> u64 {
+    metrics
+        .lifecycle_transition
+        .current_queued
+        .saturating_add(metrics.lifecycle_transition.current_active)
+}
+
+fn scanner_source_maintenance_state(
+    source: ScannerWorkSource,
+    current: &ScannerSourceWorkSnapshot,
+    metrics: &ScannerMetricsReport,
+) -> (&'static str, &'static str, u64) {
+    if current.missed > 0 {
+        return (SCANNER_MAINTENANCE_STATE_BLOCKED, SCANNER_MAINTENANCE_REASON_MISSED_WORK, current.missed);
+    }
+
+    if source == ScannerWorkSource::Lifecycle {
+        let transition_backlog = scanner_lifecycle_transition_backlog(metrics);
+        if metrics.lifecycle_transition.current_queue_capacity > 0
+            && metrics.lifecycle_transition.current_queued >= metrics.lifecycle_transition.current_queue_capacity
+        {
+            return (
+                SCANNER_MAINTENANCE_STATE_BLOCKED,
+                SCANNER_MAINTENANCE_REASON_TRANSITION_QUEUE_FULL,
+                transition_backlog,
+            );
+        }
+    }
+
+    if metrics.last_cycle_partial_source == source.as_str() && metrics.pacing_pressure.last_cycle_budget_limited {
+        return (SCANNER_MAINTENANCE_STATE_DEFERRED, SCANNER_MAINTENANCE_REASON_PARTIAL_CYCLE, 0);
+    }
+
+    if current.queued > 0 {
+        return (SCANNER_MAINTENANCE_STATE_ACTIVE, SCANNER_MAINTENANCE_REASON_QUEUED_WORK, current.queued);
+    }
+
+    if source == ScannerWorkSource::Lifecycle {
+        let transition_backlog = scanner_lifecycle_transition_backlog(metrics);
+        if transition_backlog > 0 {
+            return (
+                SCANNER_MAINTENANCE_STATE_ACTIVE,
+                SCANNER_MAINTENANCE_REASON_TRANSITION_QUEUE_BACKLOG,
+                transition_backlog,
+            );
+        }
+    }
+
+    if scanner_source_has_current_work(current) {
+        return (SCANNER_MAINTENANCE_STATE_ACTIVE, SCANNER_MAINTENANCE_REASON_ACTIVE_WORK, 0);
+    }
+
+    (SCANNER_MAINTENANCE_STATE_IDLE, SCANNER_MAINTENANCE_REASON_IDLE, 0)
+}
+
+fn scanner_maintenance_source_work(metrics: &ScannerMetricsReport) -> &[ScannerSourceWorkSnapshot] {
+    if metrics.current_cycle_source_work.is_empty() {
+        &metrics.last_cycle_source_work
+    } else {
+        &metrics.current_cycle_source_work
+    }
+}
+
+fn scanner_maintenance_control(metrics: &ScannerMetricsReport) -> ScannerMaintenanceControlSnapshot {
+    let mut has_blocked = false;
+    let mut has_deferred = false;
+    let mut has_active = false;
+    let current_source_work = scanner_maintenance_source_work(metrics);
+
+    let sources = ScannerWorkSource::all()
+        .iter()
+        .map(|source| {
+            let current = scanner_source_work_snapshot(current_source_work, *source);
+            let lifetime = scanner_source_work_snapshot(&metrics.source_work, *source);
+            let partial_cycles = scanner_source_partial_cycles(metrics, *source);
+            let (state, reason, backlog) = scanner_source_maintenance_state(*source, &current, metrics);
+
+            match state {
+                SCANNER_MAINTENANCE_STATE_BLOCKED => has_blocked = true,
+                SCANNER_MAINTENANCE_STATE_DEFERRED => has_deferred = true,
+                SCANNER_MAINTENANCE_STATE_ACTIVE => has_active = true,
+                _ => {}
+            }
+
+            ScannerMaintenanceSourceSnapshot {
+                source: source.as_str().to_string(),
+                state: state.to_string(),
+                reason: reason.to_string(),
+                backlog,
+                current_checked: current.checked,
+                current_queued: current.queued,
+                current_missed: current.missed,
+                lifetime_missed: lifetime.missed,
+                partial_cycles,
+            }
+        })
+        .collect();
+
+    let primary_control = if has_blocked {
+        SCANNER_MAINTENANCE_CONTROL_BLOCKED_SOURCE
+    } else if has_deferred {
+        SCANNER_MAINTENANCE_CONTROL_DEFERRED_SOURCE
+    } else if has_active {
+        SCANNER_MAINTENANCE_CONTROL_ACTIVE_SOURCE
+    } else if metrics.pacing_pressure.primary_pressure != SCANNER_MAINTENANCE_CONTROL_NONE {
+        SCANNER_MAINTENANCE_CONTROL_PACING_PRESSURE
+    } else {
+        SCANNER_MAINTENANCE_CONTROL_NONE
+    };
+
+    ScannerMaintenanceControlSnapshot {
+        primary_control: primary_control.to_string(),
+        sources,
     }
 }
 
@@ -2163,6 +2351,7 @@ impl Metrics {
         }
 
         m.pacing_pressure = scanner_pacing_pressure(&m);
+        m.maintenance_control = scanner_maintenance_control(&m);
 
         m
     }
@@ -2477,6 +2666,86 @@ mod tests {
         assert_eq!(report.lifecycle_transition.scanner_missed, 2);
         assert_eq!(report.lifecycle_transition.completed, 4);
         assert_eq!(report.lifecycle_transition.failed, 1);
+    }
+
+    #[tokio::test]
+    async fn report_derives_scanner_maintenance_control_status() {
+        let metrics = Metrics::new();
+        let start = metrics.start_scan_cycle_work();
+        metrics.record_scanner_source_checked(ScannerWorkSource::Usage, 3);
+        metrics.record_scanner_source_missed(ScannerWorkSource::Lifecycle, 2);
+        metrics.record_scanner_source_queued(ScannerWorkSource::BucketReplication, 1);
+        metrics.record_scan_cycle_partial_with_source(
+            Duration::from_secs(5),
+            ScanCyclePartialReason::Objects,
+            Some(ScannerWorkSource::Usage),
+        );
+        metrics.record_scanner_lifecycle_transition_state(ScannerLifecycleTransitionStateUpdate {
+            queue_capacity: 4,
+            queued: 2,
+            queue_full: 1,
+            ..Default::default()
+        });
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.maintenance_control.primary_control, "blocked_source");
+        let usage = report
+            .maintenance_control
+            .sources
+            .iter()
+            .find(|source| source.source == ScannerWorkSource::Usage.as_str())
+            .expect("usage source control should be visible");
+        assert_eq!(usage.state, "deferred");
+        assert_eq!(usage.reason, "partial_cycle");
+        assert_eq!(usage.current_checked, 3);
+        assert_eq!(usage.partial_cycles, 1);
+
+        let lifecycle = report
+            .maintenance_control
+            .sources
+            .iter()
+            .find(|source| source.source == ScannerWorkSource::Lifecycle.as_str())
+            .expect("lifecycle source control should be visible");
+        assert_eq!(lifecycle.state, "blocked");
+        assert_eq!(lifecycle.reason, "missed_work");
+        assert_eq!(lifecycle.current_missed, 2);
+        assert_eq!(lifecycle.backlog, 2);
+
+        let bucket_replication = report
+            .maintenance_control
+            .sources
+            .iter()
+            .find(|source| source.source == ScannerWorkSource::BucketReplication.as_str())
+            .expect("bucket replication source control should be visible");
+        assert_eq!(bucket_replication.state, "active");
+        assert_eq!(bucket_replication.reason, "queued_work");
+        assert_eq!(bucket_replication.current_queued, 1);
+
+        metrics.finish_scan_cycle_work(start);
+    }
+
+    #[tokio::test]
+    async fn report_uses_last_cycle_source_work_for_maintenance_control_between_cycles() {
+        let metrics = Metrics::new();
+        let start = metrics.start_scan_cycle_work();
+        metrics.record_scanner_source_missed(ScannerWorkSource::Lifecycle, 2);
+
+        metrics.finish_scan_cycle_work(start);
+        let report = metrics.report().await;
+
+        assert!(report.current_cycle_source_work.is_empty());
+        let lifecycle = report
+            .maintenance_control
+            .sources
+            .iter()
+            .find(|source| source.source == ScannerWorkSource::Lifecycle.as_str())
+            .expect("lifecycle source control should be visible");
+        assert_eq!(report.maintenance_control.primary_control, "blocked_source");
+        assert_eq!(lifecycle.state, "blocked");
+        assert_eq!(lifecycle.reason, "missed_work");
+        assert_eq!(lifecycle.current_missed, 2);
+        assert_eq!(lifecycle.backlog, 2);
     }
 
     #[tokio::test]
