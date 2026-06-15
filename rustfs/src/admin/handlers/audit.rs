@@ -315,15 +315,14 @@ impl Operation for AuditTargetConfig {
             true
         })
         .await
-        .map_err(|e| {
+        .inspect_err(|e| {
             log_audit_target_request_failed(
                 "set_audit_target_config",
                 "update_audit_config_failed",
                 Some(target_type),
                 Some(target_name),
-                &e,
+                e,
             );
-            e
         })?;
         log_audit_target_config_updated("set_audit_target_config", target_type, target_name);
 
@@ -389,15 +388,14 @@ impl Operation for RemoveAuditTarget {
             changed
         })
         .await
-        .map_err(|e| {
+        .inspect_err(|e| {
             log_audit_target_request_failed(
                 "remove_audit_target_config",
                 "update_audit_config_failed",
                 Some(target_type),
                 Some(target_name),
-                &e,
+                e,
             );
-            e
         })?;
         log_audit_target_config_updated("remove_audit_target_config", target_type, target_name);
 
