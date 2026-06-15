@@ -33,6 +33,9 @@ pub(crate) struct ParallelReader<R> {
     shard_file_size: usize,
     data_shards: usize,
     total_shards: usize,
+    // Shard buffers handed back by the caller to be reused by the next `read`,
+    // avoiding a per-stripe allocation + zero-fill on the object read hot path.
+    recycled: Vec<Option<Vec<u8>>>,
 }
 }
 
@@ -56,6 +59,7 @@ where
             shard_file_size,
             data_shards: e.data_shards,
             total_shards: e.data_shards + e.parity_shards,
+            recycled: Vec::new(),
         }
     }
 }
@@ -83,12 +87,21 @@ where
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; num_readers];
         let mut errs = vec![None; num_readers];
 
+        // Reuse the previous stripe's shard buffers instead of allocating and
+        // zero-filling a fresh `vec![0u8; shard_size]` per shard every stripe.
+        // `BitrotReader::read` overwrites `buf[..n]` and the caller truncates to
+        // `n`, so leftover bytes from the prior stripe are never observed.
+        let mut recycled = std::mem::take(&mut self.recycled);
+        recycled.resize_with(num_readers, || None);
+
         let mut futures = Vec::with_capacity(self.total_shards);
         let reader_iter: std::slice::IterMut<'_, Option<BitrotReader<R>>> = self.readers.iter_mut();
         for (i, reader) in reader_iter.enumerate() {
+            let recycled_buf = recycled[i].take();
             let future = if let Some(reader) = reader {
                 Box::pin(async move {
-                    let mut buf = vec![0u8; shard_size];
+                    let mut buf = recycled_buf.unwrap_or_default();
+                    buf.resize(shard_size, 0);
                     match reader.read(&mut buf).await {
                         Ok(n) => {
                             buf.truncate(n);
@@ -303,6 +316,9 @@ impl Erasure {
             };
 
             written += n;
+
+            // Hand this stripe's buffers back so the next `read` reuses them.
+            reader.recycled = shards;
         }
 
         if ret_err.is_some() {
@@ -430,6 +446,69 @@ mod tests {
             assert!(err.is_none(), "{}: unexpected error: {:?}", desc, err);
             assert_eq!(written, len, "{}: written != length", desc);
             assert_eq!(output, total_data[off..off + len], "{}: bytes mismatch", desc);
+        }
+    }
+
+    /// Guards the shard-buffer reuse in `ParallelReader`: a multi-stripe
+    /// `Erasure::decode` that reconstructs missing data shards on every stripe
+    /// must still return byte-exact output. Reconstructed and parity buffers are
+    /// recycled into the next stripe, so this catches stale-byte leaks or a
+    /// missing resize between stripes (including the short final stripe). Run
+    /// with bitrot verification both on and off.
+    #[tokio::test]
+    async fn test_erasure_decode_with_missing_shards_reuses_buffers() {
+        const DATA_SHARDS: usize = 4;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+
+        // 200 bytes => 3 full blocks + 1 partial: several stripes are decoded
+        // through the same `ParallelReader`, so its buffers are reused.
+        let total_data: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let total_len = total_data.len();
+
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let total_shards = DATA_SHARDS + PARITY_SHARDS;
+        let shard_size = erasure.shard_size();
+        let hash_algo = HashAlgorithm::HighwayHash256;
+
+        let mut shard_writers: Vec<BitrotWriter<Cursor<Vec<u8>>>> = (0..total_shards)
+            .map(|_| BitrotWriter::new(Cursor::new(Vec::new()), shard_size, hash_algo.clone()))
+            .collect();
+
+        let mut offset = 0;
+        while offset < total_len {
+            let end = (offset + BLOCK_SIZE).min(total_len);
+            let shards = erasure.encode_data(&total_data[offset..end]).unwrap();
+            for (i, shard) in shards.iter().enumerate() {
+                shard_writers[i].write(shard).await.unwrap();
+            }
+            offset = end;
+        }
+
+        let shard_bufs: Vec<Vec<u8>> = shard_writers.into_iter().map(|w| w.into_inner().into_inner()).collect();
+
+        // Drop two data shards: each stripe must be reconstructed from the
+        // remaining data + parity shards, and those reconstructed buffers are
+        // what gets recycled.
+        let missing = [0usize, 2usize];
+        for verify in [true, false] {
+            let readers: Vec<Option<BitrotReader<Cursor<Vec<u8>>>>> = shard_bufs
+                .iter()
+                .enumerate()
+                .map(|(i, buf)| {
+                    if missing.contains(&i) {
+                        None
+                    } else {
+                        Some(BitrotReader::new(Cursor::new(buf.clone()), shard_size, hash_algo.clone(), !verify))
+                    }
+                })
+                .collect();
+
+            let mut output = Vec::new();
+            let (written, err) = erasure.decode(&mut output, readers, 0, total_len, total_len).await;
+            assert!(err.is_none(), "verify={verify}: unexpected error: {err:?}");
+            assert_eq!(written, total_len, "verify={verify}: short write");
+            assert_eq!(output, total_data, "verify={verify}: reconstructed bytes mismatch");
         }
     }
 
