@@ -1552,8 +1552,8 @@ fn get_quorum_disk_infos(disks: &[DiskStore], infos: &[DiskInfo], read_quorum: u
     for (i, info) in infos.iter().enumerate() {
         let mutations = info.metrics.total_deletes + info.metrics.total_writes;
         if mutations >= common_mutations {
-            new_disks.push(disks[i].clone()); // Assuming StorageAPI derives Clone
-            new_infos.push(infos[i].clone()); // Assuming DiskInfo derives Clone
+            new_disks.push(disks[i].clone());
+            new_infos.push(infos[i].clone());
         }
     }
 
