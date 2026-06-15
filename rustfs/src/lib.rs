@@ -67,6 +67,7 @@ pub mod profiling;
 #[cfg(any(feature = "ftps", feature = "webdav", feature = "sftp"))]
 pub mod protocols;
 pub mod server;
+pub mod startup_entrypoint;
 pub mod startup_fs_guard;
 pub mod startup_iam;
 pub mod startup_preflight;

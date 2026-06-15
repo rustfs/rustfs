@@ -5,17 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-startup-ready-shutdown-runtime`
-- Baseline: `origin/main` at `e26eea7f3a5ef6c272a322a47f58f5a10cb2342b0`
+- Branch: `overtrue/arch-startup-command-bootstrap`
+- Baseline: `origin/main` at `941b8afee8619c6a038c20aac51565a65c959ee4`
 - PR type for this branch: `pure-move`
-- Runtime behavior changes: no external behavior change expected; server-ready
-  publication, global init time, scanner start, shutdown wait, and shutdown
-  ordering still run in the same relative order after runtime services.
-- Rust code changes: add `startup_services::run_startup_runtime_lifecycle` and
-  use it from binary startup.
+- Runtime behavior changes: no external behavior change expected; the binary
+  entrypoint still builds the Tokio runtime, applies preflight, dispatches
+  non-server commands, and starts server/bootstrap stages in the same order.
+- Rust code changes: add `startup_entrypoint::run_process`, move remaining
+  command dispatch, server bootstrap orchestration, and fatal stderr helpers
+  out of `main.rs`, and keep `main.rs` as the process entry shim.
 - CI/script changes: none.
-- Docs changes: record `R-018` startup runtime lifecycle progress and
-  verification.
+- Docs changes: record `R-019` startup command/bootstrap entrypoint progress
+  and update startup timeline ownership.
 
 ## Phase 0 Tasks
 
@@ -721,10 +722,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     formatting, migration guards, Rust risk scan, branch freshness check, and
     pre-commit quality gate.
 
+- [x] `R-019` Centralize startup command and bootstrap entrypoint.
+  - Do: move Tokio runtime result handling, command parsing/dispatch, server
+    preflight error mapping, startup run orchestration, and pre-observability
+    fatal stderr formatting behind `startup_entrypoint::run_process`.
+  - Acceptance: `main.rs` only owns the global allocator declarations and calls
+    the startup entrypoint; `startup_entrypoint` preserves the existing
+    command, preflight, listen, storage, runtime-service, ready, and shutdown
+    order.
+  - Must preserve: Tokio runtime build fatal `expect`, command parse fatal
+    stderr context and exit code, info/TLS subcommand behavior, observability
+    fatal sentinel suppression, server runtime failure log fields, startup stage
+    ordering, readiness publication, and shutdown ownership.
+  - Verification: focused startup entrypoint and observability guardrail tests,
+    binary/lib compile checks, formatting, migration guards, Rust risk scan,
+    branch freshness check, and pre-commit quality gate.
+
 ## Next PRs
 
-1. `pure-move`: continue collapsing remaining binary startup glue around command
-   dispatch and server bootstrap without changing fatal stderr behavior.
+1. `pure-move`: continue shrinking startup entrypoint orchestration only where a
+   clean module boundary remains without changing fatal stderr behavior.
 2. `ci-gate`: finish `G-006` public re-export and storage trait coverage checks
    before the remaining cleanup slices.
 
@@ -732,40 +749,43 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Pure-move slice removes ready/scanner/shutdown lifecycle details from binary startup behind the existing startup services boundary. |
-| Migration preservation | passed | Server-ready publication, scanner start, shutdown wait, background/protocol/notifier/audit/profiling/HTTP shutdown order, and stopped state are preserved. |
-| Testing/verification | passed | Focused startup services tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Pure-move slice removes command dispatch and bootstrap orchestration details from binary startup behind a dedicated startup entrypoint boundary. |
+| Migration preservation | passed | Command parse stderr, info/TLS dispatch, observability fatal sentinel, startup order, readiness publication, and shutdown ownership are preserved. |
+| Testing/verification | passed | Focused startup entrypoint and observability guardrail tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `e26eea7f3a5ef6c272a322a47f58f5a10cb2342b0`:
+Passed on `941b8afee8619c6a038c20aac51565a65c959ee4`:
 
-- `cargo test -p rustfs startup_services --no-fail-fast`: passed.
+- `cargo test -p rustfs startup_entrypoint --no-fail-fast`: passed.
+- `cargo test -p rustfs-obs startup_ --no-fail-fast`: passed.
 - `cargo check -p rustfs --lib`: passed.
 - `cargo check -p rustfs --bin rustfs`: passed.
 - `cargo fmt --all --check`: passed.
 - `git diff --check`: passed.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
-- Added-line Rust risk scan for changed Rust files: passed.
-- Full-file risk scan for changed Rust files: existing `main.rs` process setup
-  entries only.
-- `make pre-commit`: passed, including nextest `6027` passed / `111` skipped
+- Added-line and changed-file Rust risk scan: expected fatal-boundary
+  `expect`/`eprintln!` only.
+- Full-file risk scan for changed Rust files: expected process exit and fatal
+  stderr entries are isolated in `startup_entrypoint.rs`.
+- `make pre-commit`: passed, including nextest `6038` passed / `111` skipped
   and doctests.
 - `git rev-list --left-right --count HEAD...origin/main`: returned `1 0`
   after commit.
 
 Notes:
 
-- This slice centralizes startup lifecycle completion without changing startup
-  ordering, shutdown token ownership, readiness ownership, or shutdown handle
-  ownership.
-- Ready publication and scanner start remain after runtime services; shutdown
-  wait remains after scanner start.
+- This slice centralizes remaining command/bootstrap entrypoint orchestration
+  without changing startup ordering, fatal stderr behavior, readiness ownership,
+  shutdown token ownership, or shutdown handle ownership.
+- Ready publication, scanner start, and shutdown wait remain owned by
+  `startup_services`; `startup_entrypoint` only orchestrates the existing
+  startup sequence and process-level fatal handling.
 
 ## Handoff Notes
 
-- R-018 is implemented, locally verified, and current with `origin/main`.
+- R-019 is implemented, locally verified, and current with `origin/main`.
 - Next startup slices can keep using larger pure moves, but must keep startup
   ordering, fatal/non-fatal boundaries, shutdown ownership, readiness ownership,
   and fatal stderr behavior explicit in tests and review notes.
