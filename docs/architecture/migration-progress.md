@@ -5,18 +5,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-startup-core-runtime-bootstrap`
-- Baseline: `origin/main` at `73e534682e93d1ed2c7b0e752ad550d969ca96b2`
+- Branch: `overtrue/arch-startup-server-preflight`
+- Baseline: `origin/main` at `2288b1bb634bda8a06bf7c19780b0318473dbe33`
 - PR type for this branch: `pure-move`
-- Runtime behavior changes: no external behavior change expected; startup
-  runtime foundation still logs dial9/license state, prints the logo, initializes
-  profiling and trusted proxies, installs the rustls provider, and publishes
-  outbound TLS material in the same order and with the same fatal boundary.
-- Rust code changes: centralize startup runtime foundation bootstrap in
-  `startup_runtime::init_startup_runtime_foundation` and use it from binary
+- Runtime behavior changes: no external behavior change expected; external
+  prefix compatibility reporting, config snapshot initialization, license
+  initialization, observability guard initialization/storage, and startup
+  runtime foundation bootstrap still run in the same order and with the same
+  fatal boundaries.
+- Rust code changes: centralize server startup preflight bootstrap in
+  `startup_preflight::init_startup_server_preflight` and use it from binary
   startup.
 - CI/script changes: none.
-- Docs changes: record `R-012` startup runtime foundation bootstrap progress and
+- Docs changes: record `R-013` startup server preflight bootstrap progress and
   verification.
 
 ## Phase 0 Tasks
@@ -609,6 +610,23 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     formatting, migration guards, Rust risk scan, branch freshness check, and
     pre-commit quality gate.
 
+- [x] `R-013` Centralize startup server preflight bootstrap.
+  - Do: move external-prefix compatibility reporting, config snapshot
+    initialization, runtime license initialization, observability guard
+    initialization/storage, and startup runtime foundation bootstrap behind
+    `startup_preflight::init_startup_server_preflight`.
+  - Acceptance: env compatibility is applied before command parsing and reported
+    after observability starts, config snapshot and license init happen before
+    runtime foundation, observability init failure still emits the dedicated
+    fatal stderr and sentinel, guard storage failure still returns the original
+    error, and runtime foundation ordering/fatal boundaries stay unchanged.
+  - Must preserve: env compat conflict/applied events, observability guard
+    set/failure events, startup order, fatal stderr suppression sentinel, and
+    existing command/subcommand behavior.
+  - Verification: focused startup preflight tests, binary/lib compile checks,
+    formatting, migration guards, Rust risk scan, branch freshness check, and
+    pre-commit quality gate.
+
 ## Next PRs
 
 1. `pure-move`: continue extracting startup boot wrappers in larger slices while
@@ -620,38 +638,39 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Pure-move slice removes startup runtime foundation details from binary startup without changing ownership or adding abstraction beyond the existing startup module pattern. |
-| Migration preservation | passed | BOOT-006 order, dial9/license log fields, profiling/proxy/provider non-fatal setup, TLS fatal boundary, generation saturation, and TLS metric condition are preserved. |
-| Testing/verification | passed | Focused startup runtime tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Pure-move slice removes server preflight details from binary startup behind the existing startup module pattern; the logging governance test was updated only to match the new fatal-stderr call shape. |
+| Migration preservation | passed | Env compatibility apply/report order, config snapshot, license init, observability init/store, fatal stderr sentinel, guard-store error return, and runtime foundation order are preserved. |
+| Testing/verification | passed | Focused startup preflight and logging-governance tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `73e534682e93d1ed2c7b0e752ad550d969ca96b2`:
+Passed on `2288b1bb634bda8a06bf7c19780b0318473dbe33`:
 
-- `cargo test -p rustfs startup_runtime --no-fail-fast`.
-- `cargo check -p rustfs --lib`.
-- `cargo check -p rustfs --bin rustfs`.
-- `cargo fmt --all --check`.
-- `git diff --check`.
-- `./scripts/check_architecture_migration_rules.sh`.
-- `./scripts/check_layer_dependencies.sh`.
+- `cargo test -p rustfs startup_preflight --no-fail-fast`: passed.
+- `cargo test -p rustfs-obs startup_fatal_stderr_uses_single_formatter_for_pre_observability_failures --no-fail-fast`: passed.
+- `cargo check -p rustfs --lib`: passed.
+- `cargo check -p rustfs --bin rustfs`: passed.
+- `cargo fmt --all --check`: passed.
+- `git diff --check`: passed.
+- `./scripts/check_architecture_migration_rules.sh`: passed.
+- `./scripts/check_layer_dependencies.sh`: passed.
 - `git rev-list --left-right --count HEAD...origin/main` returned `0 0`.
 - Added-line Rust risk scan for changed Rust files: no matches.
 - Full-file risk scan for changed Rust files: matches are existing docs example
-  output and existing binary startup stderr/expect usage.
-- `make pre-commit`: all checks passed, including nextest with 6002 passed and
+  output and existing binary startup alias/stderr/expect usage.
+- `make pre-commit`: all checks passed, including nextest with 6003 passed and
   111 skipped, plus doctests.
 
 Notes:
 
-- This slice centralizes startup runtime foundation bootstrap without changing
+- This slice centralizes server startup preflight bootstrap without changing
   startup ordering or fatal boundaries.
-- Observability initialization remains in binary startup so early fatal stderr
-  handling stays unchanged.
+- Observability initialization failure still maps to the dedicated fatal stderr
+  sentinel in binary startup.
 
 ## Handoff Notes
 
-- R-012 is complete.
+- R-013 is complete.
 - Next startup slices can keep using larger pure moves, but must keep startup
   ordering, fatal/non-fatal boundaries, shutdown ownership, and readiness
   ownership explicit in tests.
