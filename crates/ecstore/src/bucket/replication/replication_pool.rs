@@ -1732,7 +1732,7 @@ mod tests {
             delete_marker: false,
         };
 
-        let encoded = encode_mrf_file(&[entry.clone()]).expect("encode");
+        let encoded = encode_mrf_file(std::slice::from_ref(&entry)).expect("encode");
         let decoded = decode_mrf_file(&encoded).expect("decode");
 
         assert_eq!(decoded.len(), 1);
@@ -1761,7 +1761,7 @@ mod tests {
             delete_marker: true,
         };
 
-        let encoded = encode_mrf_file(&[entry.clone()]).expect("encode");
+        let encoded = encode_mrf_file(std::slice::from_ref(&entry)).expect("encode");
         let decoded = decode_mrf_file(&encoded).expect("decode");
 
         assert_eq!(decoded.len(), 1);
