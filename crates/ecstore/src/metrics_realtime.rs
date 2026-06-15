@@ -24,6 +24,7 @@ use rustfs_madmin::metrics::{
     ScannerMaintenanceControlSnapshot as MadminScannerMaintenanceControlSnapshot,
     ScannerMaintenanceSourceSnapshot as MadminScannerMaintenanceSourceSnapshot, ScannerMetrics as MadminScannerMetrics,
     ScannerPacingPressureSnapshot as MadminScannerPacingPressureSnapshot,
+    ScannerReplicationRepairSnapshot as MadminScannerReplicationRepairSnapshot,
     ScannerSourceCycleSnapshot as MadminScannerSourceCycleSnapshot, ScannerSourceWorkSnapshot as MadminScannerSourceWorkSnapshot,
     TimedAction as MadminTimedAction,
 };
@@ -274,6 +275,48 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
                 failed: work.failed,
                 skipped: work.skipped,
                 missed: work.missed,
+            })
+            .collect(),
+        replication_repair: metrics
+            .replication_repair
+            .into_iter()
+            .map(|repair| MadminScannerReplicationRepairSnapshot {
+                source: repair.source,
+                kind: repair.kind,
+                checked: repair.checked,
+                queued: repair.queued,
+                executed: repair.executed,
+                failed: repair.failed,
+                skipped: repair.skipped,
+                missed: repair.missed,
+            })
+            .collect(),
+        current_cycle_replication_repair: metrics
+            .current_cycle_replication_repair
+            .into_iter()
+            .map(|repair| MadminScannerReplicationRepairSnapshot {
+                source: repair.source,
+                kind: repair.kind,
+                checked: repair.checked,
+                queued: repair.queued,
+                executed: repair.executed,
+                failed: repair.failed,
+                skipped: repair.skipped,
+                missed: repair.missed,
+            })
+            .collect(),
+        last_cycle_replication_repair: metrics
+            .last_cycle_replication_repair
+            .into_iter()
+            .map(|repair| MadminScannerReplicationRepairSnapshot {
+                source: repair.source,
+                kind: repair.kind,
+                checked: repair.checked,
+                queued: repair.queued,
+                executed: repair.executed,
+                failed: repair.failed,
+                skipped: repair.skipped,
+                missed: repair.missed,
             })
             .collect(),
         partial_cycles: metrics.partial_cycles,
@@ -761,7 +804,37 @@ mod test {
                 skipped: 60,
                 missed: 61,
             }],
-            partial_cycles: 62,
+            replication_repair: vec![rustfs_common::metrics::ScannerReplicationRepairSnapshot {
+                source: "bucket_replication".to_string(),
+                kind: "object".to_string(),
+                checked: 62,
+                queued: 63,
+                executed: 64,
+                failed: 65,
+                skipped: 66,
+                missed: 67,
+            }],
+            current_cycle_replication_repair: vec![rustfs_common::metrics::ScannerReplicationRepairSnapshot {
+                source: "bucket_replication".to_string(),
+                kind: "delete_marker".to_string(),
+                checked: 68,
+                queued: 69,
+                executed: 70,
+                failed: 71,
+                skipped: 72,
+                missed: 73,
+            }],
+            last_cycle_replication_repair: vec![rustfs_common::metrics::ScannerReplicationRepairSnapshot {
+                source: "site_replication".to_string(),
+                kind: "active_resync".to_string(),
+                checked: 74,
+                queued: 75,
+                executed: 76,
+                failed: 77,
+                skipped: 78,
+                missed: 79,
+            }],
+            partial_cycles: 80,
             ..Default::default()
         });
 
@@ -831,6 +904,14 @@ mod test {
         assert_eq!(scanner.current_cycle_source_work[0].queued, 51);
         assert_eq!(scanner.last_cycle_source_work[0].source, "heal");
         assert_eq!(scanner.last_cycle_source_work[0].skipped, 60);
-        assert_eq!(scanner.partial_cycles, 62);
+        assert_eq!(scanner.replication_repair[0].source, "bucket_replication");
+        assert_eq!(scanner.replication_repair[0].kind, "object");
+        assert_eq!(scanner.replication_repair[0].missed, 67);
+        assert_eq!(scanner.current_cycle_replication_repair[0].kind, "delete_marker");
+        assert_eq!(scanner.current_cycle_replication_repair[0].queued, 69);
+        assert_eq!(scanner.last_cycle_replication_repair[0].source, "site_replication");
+        assert_eq!(scanner.last_cycle_replication_repair[0].kind, "active_resync");
+        assert_eq!(scanner.last_cycle_replication_repair[0].skipped, 78);
+        assert_eq!(scanner.partial_cycles, 80);
     }
 }

@@ -36,8 +36,8 @@ use rustfs_common::heal_channel::{
     send_heal_request_with_admission,
 };
 use rustfs_common::metrics::{
-    IlmAction, Metric, Metrics, ScannerSourceWorkUpdate, ScannerWorkSource, UpdateCurrentPathFn, current_path_updater,
-    global_metrics,
+    IlmAction, Metric, Metrics, ScannerReplicationRepairKind, ScannerSourceWorkUpdate, ScannerWorkSource, UpdateCurrentPathFn,
+    current_path_updater, global_metrics,
 };
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::{GLOBAL_ExpiryState, apply_expiry_rule};
@@ -59,7 +59,9 @@ use rustfs_ecstore::global::is_erasure;
 use rustfs_ecstore::pools::{path2_bucket_object, path2_bucket_object_with_base_path};
 use rustfs_ecstore::store_api::{ObjectInfo, ObjectToDelete};
 use rustfs_ecstore::store_utils::is_reserved_or_invalid_bucket;
-use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ReplicationStatusType};
+use rustfs_filemeta::{
+    MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ReplicateObjectInfo, ReplicationStatusType, ReplicationType,
+};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
 use time::OffsetDateTime;
@@ -205,16 +207,39 @@ fn record_scanner_ilm_action_if_queued(metrics: &Metrics, action: IlmAction, cou
     queued
 }
 
-fn record_scanner_replication_admission(metrics: &Metrics, admission: ReplicationQueueAdmission) {
-    let work = match admission {
+fn scanner_replication_work_update(admission: ReplicationQueueAdmission) -> ScannerSourceWorkUpdate {
+    match admission {
         ReplicationQueueAdmission::Queued => ScannerSourceWorkUpdate::queued(1),
         ReplicationQueueAdmission::Missed => ScannerSourceWorkUpdate::missed(1),
         ReplicationQueueAdmission::Skipped => ScannerSourceWorkUpdate {
             skipped: 1,
             ..Default::default()
         },
-    };
+    }
+}
+
+fn scanner_replication_repair_kind(roi: &ReplicateObjectInfo) -> Option<ScannerReplicationRepairKind> {
+    if roi.bucket.is_empty() && roi.name.is_empty() {
+        return None;
+    }
+
+    if !roi.version_purge_status.is_empty() {
+        Some(ScannerReplicationRepairKind::BucketVersionPurge)
+    } else if roi.delete_marker {
+        Some(ScannerReplicationRepairKind::BucketDeleteMarker)
+    } else if roi.op_type == ReplicationType::ExistingObject || roi.existing_obj_resync.must_resync() {
+        Some(ScannerReplicationRepairKind::BucketExistingObject)
+    } else {
+        Some(ScannerReplicationRepairKind::BucketObject)
+    }
+}
+
+fn record_scanner_replication_admission(metrics: &Metrics, roi: &ReplicateObjectInfo, admission: ReplicationQueueAdmission) {
+    let work = scanner_replication_work_update(admission);
     metrics.record_scanner_source_work(ScannerWorkSource::BucketReplication, work);
+    if let Some(kind) = scanner_replication_repair_kind(roi) {
+        metrics.record_scanner_replication_repair_work(kind, work);
+    }
 }
 
 fn scanner_heal_source(scan_mode: HealScanMode) -> ScannerWorkSource {
@@ -920,8 +945,8 @@ impl ScannerItem {
         let done_replication = Metrics::time(Metric::CheckReplication);
         let replication_result = queue_replication_heal_internal(&oi.bucket, oi.clone(), (*replication).clone(), 0).await;
         done_replication();
-        record_scanner_replication_admission(global_metrics(), replication_result.admission);
         let roi = replication_result.object_info;
+        record_scanner_replication_admission(global_metrics(), &roi, replication_result.admission);
         if !Self::should_account_replication_stats(oi) {
             return;
         }
@@ -2409,7 +2434,7 @@ mod tests {
 
     use super::*;
     use rustfs_ecstore::disk::{DiskOption, endpoint::Endpoint, new_disk};
-    use rustfs_filemeta::VersionPurgeStatusType;
+    use rustfs_filemeta::{ReplicateObjectInfo, ReplicationType, VersionPurgeStatusType};
     use serial_test::serial;
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -2605,10 +2630,15 @@ mod tests {
     #[tokio::test]
     async fn test_scanner_replication_admission_accounting_maps_source_work() {
         let metrics = Metrics::new();
+        let object = ReplicateObjectInfo {
+            bucket: "bucket-a".to_string(),
+            name: "object-a".to_string(),
+            ..Default::default()
+        };
 
-        record_scanner_replication_admission(&metrics, ReplicationQueueAdmission::Skipped);
-        record_scanner_replication_admission(&metrics, ReplicationQueueAdmission::Queued);
-        record_scanner_replication_admission(&metrics, ReplicationQueueAdmission::Missed);
+        record_scanner_replication_admission(&metrics, &object, ReplicationQueueAdmission::Skipped);
+        record_scanner_replication_admission(&metrics, &object, ReplicationQueueAdmission::Queued);
+        record_scanner_replication_admission(&metrics, &object, ReplicationQueueAdmission::Missed);
 
         let report = metrics.report().await;
         let replication = report
@@ -2620,6 +2650,62 @@ mod tests {
         assert_eq!(replication.skipped, 1);
         assert_eq!(replication.queued, 1);
         assert_eq!(replication.missed, 1);
+
+        let object_repair = report
+            .replication_repair
+            .iter()
+            .find(|repair| repair.source == ScannerWorkSource::BucketReplication.as_str() && repair.kind == "object")
+            .expect("bucket object repair work should be visible");
+        assert_eq!(object_repair.skipped, 1);
+        assert_eq!(object_repair.queued, 1);
+        assert_eq!(object_repair.missed, 1);
+    }
+
+    #[test]
+    fn test_scanner_replication_repair_kind_maps_bucket_variants() {
+        let object = ReplicateObjectInfo {
+            bucket: "bucket-a".to_string(),
+            name: "object-a".to_string(),
+            replication_status: ReplicationStatusType::Pending,
+            ..Default::default()
+        };
+        assert_eq!(scanner_replication_repair_kind(&object), Some(ScannerReplicationRepairKind::BucketObject));
+
+        let delete_marker = ReplicateObjectInfo {
+            bucket: "bucket-a".to_string(),
+            name: "delete-marker-a".to_string(),
+            delete_marker: true,
+            replication_status: ReplicationStatusType::Failed,
+            ..Default::default()
+        };
+        assert_eq!(
+            scanner_replication_repair_kind(&delete_marker),
+            Some(ScannerReplicationRepairKind::BucketDeleteMarker)
+        );
+
+        let version_purge = ReplicateObjectInfo {
+            bucket: "bucket-a".to_string(),
+            name: "version-purge-a".to_string(),
+            version_purge_status: VersionPurgeStatusType::Pending,
+            ..Default::default()
+        };
+        assert_eq!(
+            scanner_replication_repair_kind(&version_purge),
+            Some(ScannerReplicationRepairKind::BucketVersionPurge)
+        );
+
+        let existing_object = ReplicateObjectInfo {
+            bucket: "bucket-a".to_string(),
+            name: "existing-object-a".to_string(),
+            op_type: ReplicationType::ExistingObject,
+            ..Default::default()
+        };
+        assert_eq!(
+            scanner_replication_repair_kind(&existing_object),
+            Some(ScannerReplicationRepairKind::BucketExistingObject)
+        );
+
+        assert_eq!(scanner_replication_repair_kind(&ReplicateObjectInfo::default()), None);
     }
 
     #[tokio::test]
