@@ -49,6 +49,111 @@ const EVENT_ADMIN_REQUEST_FAILED: &str = "admin_request_failed";
 const EVENT_ADMIN_RESPONSE_EMITTED: &str = "admin_response_emitted";
 const EVENT_ADMIN_OPERATION_BLOCKED: &str = "admin_operation_blocked";
 
+macro_rules! log_audit_target_operation_blocked {
+    ($operation:expr, Some($target_type:expr), Some($target_name:expr), $reason:expr) => {
+        warn!(
+            event = EVENT_ADMIN_OPERATION_BLOCKED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_AUDIT_TARGET,
+            operation = $operation,
+            result = "blocked",
+            target_type = $target_type,
+            target_name = $target_name,
+            reason = $reason,
+            "admin request rejected"
+        );
+    };
+    ($operation:expr, None, None, $reason:expr) => {
+        warn!(
+            event = EVENT_ADMIN_OPERATION_BLOCKED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_AUDIT_TARGET,
+            operation = $operation,
+            result = "blocked",
+            reason = $reason,
+            "admin request rejected"
+        );
+    };
+}
+
+macro_rules! log_audit_target_body_read_failed {
+    ($target_type:expr, $target_name:expr, $err:expr) => {
+        warn!(
+            event = EVENT_ADMIN_REQUEST_REJECTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_AUDIT_TARGET,
+            operation = "set_audit_target_config",
+            result = "rejected",
+            reason = "request_body_read_failed",
+            target_type = $target_type,
+            target_name = $target_name,
+            error = %$err,
+            "admin request rejected"
+        );
+    };
+}
+
+macro_rules! log_audit_target_body_decode_failed {
+    ($target_type:expr, $target_name:expr, $err:expr) => {
+        warn!(
+            event = EVENT_ADMIN_REQUEST_REJECTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_AUDIT_TARGET,
+            operation = "set_audit_target_config",
+            result = "rejected",
+            reason = "request_body_decode_failed",
+            target_type = $target_type,
+            target_name = $target_name,
+            error = %$err,
+            "admin request rejected"
+        );
+    };
+}
+
+macro_rules! log_audit_target_config_updated {
+    ($operation:expr, $target_type:expr, $target_name:expr) => {
+        info!(
+            event = EVENT_ADMIN_RESPONSE_EMITTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_AUDIT_TARGET,
+            operation = $operation,
+            result = "success",
+            target_type = $target_type,
+            target_name = $target_name,
+            "admin response emitted"
+        );
+    };
+}
+
+macro_rules! log_audit_target_request_failed {
+    ($operation:expr, $reason:expr, Some($target_type:expr), Some($target_name:expr), $err:expr) => {
+        error!(
+            event = EVENT_ADMIN_REQUEST_FAILED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_AUDIT_TARGET,
+            operation = $operation,
+            result = "failed",
+            reason = $reason,
+            target_type = $target_type,
+            target_name = $target_name,
+            error = %$err,
+            "admin request failed"
+        );
+    };
+    ($operation:expr, $reason:expr, None, None, $err:expr) => {
+        error!(
+            event = EVENT_ADMIN_REQUEST_FAILED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_AUDIT_TARGET,
+            operation = $operation,
+            result = "failed",
+            reason = $reason,
+            error = %$err,
+            "admin request failed"
+        );
+    };
+}
+
 pub fn register_audit_target_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
         Method::GET,
@@ -159,112 +264,6 @@ fn extract_target_params<'a>(params: &'a Params<'_, '_>) -> S3Result<(&'a str, &
     extract_supported_target_params(audit_target_specs(), params, "audit")
 }
 
-fn log_audit_target_operation_blocked(
-    operation: &'static str,
-    target_type: Option<&str>,
-    target_name: Option<&str>,
-    reason: &str,
-) {
-    match (target_type, target_name) {
-        (Some(target_type), Some(target_name)) => warn!(
-            event = EVENT_ADMIN_OPERATION_BLOCKED,
-            component = LOG_COMPONENT_ADMIN_API,
-            subsystem = LOG_SUBSYSTEM_AUDIT_TARGET,
-            operation,
-            result = "blocked",
-            target_type,
-            target_name,
-            reason,
-            "admin request rejected"
-        ),
-        _ => warn!(
-            event = EVENT_ADMIN_OPERATION_BLOCKED,
-            component = LOG_COMPONENT_ADMIN_API,
-            subsystem = LOG_SUBSYSTEM_AUDIT_TARGET,
-            operation,
-            result = "blocked",
-            reason,
-            "admin request rejected"
-        ),
-    }
-}
-
-fn log_audit_target_body_read_failed(target_type: &str, target_name: &str, err: &dyn std::fmt::Display) {
-    warn!(
-        event = EVENT_ADMIN_REQUEST_REJECTED,
-        component = LOG_COMPONENT_ADMIN_API,
-        subsystem = LOG_SUBSYSTEM_AUDIT_TARGET,
-        operation = "set_audit_target_config",
-        result = "rejected",
-        reason = "request_body_read_failed",
-        target_type,
-        target_name,
-        error = %err,
-        "admin request rejected"
-    );
-}
-
-fn log_audit_target_body_decode_failed(target_type: &str, target_name: &str, err: &dyn std::fmt::Display) {
-    warn!(
-        event = EVENT_ADMIN_REQUEST_REJECTED,
-        component = LOG_COMPONENT_ADMIN_API,
-        subsystem = LOG_SUBSYSTEM_AUDIT_TARGET,
-        operation = "set_audit_target_config",
-        result = "rejected",
-        reason = "request_body_decode_failed",
-        target_type,
-        target_name,
-        error = %err,
-        "admin request rejected"
-    );
-}
-
-fn log_audit_target_config_updated(operation: &'static str, target_type: &str, target_name: &str) {
-    info!(
-        event = EVENT_ADMIN_RESPONSE_EMITTED,
-        component = LOG_COMPONENT_ADMIN_API,
-        subsystem = LOG_SUBSYSTEM_AUDIT_TARGET,
-        operation,
-        result = "success",
-        target_type,
-        target_name,
-        "admin response emitted"
-    );
-}
-
-fn log_audit_target_request_failed(
-    operation: &'static str,
-    reason: &'static str,
-    target_type: Option<&str>,
-    target_name: Option<&str>,
-    err: &dyn std::fmt::Display,
-) {
-    match (target_type, target_name) {
-        (Some(target_type), Some(target_name)) => error!(
-            event = EVENT_ADMIN_REQUEST_FAILED,
-            component = LOG_COMPONENT_ADMIN_API,
-            subsystem = LOG_SUBSYSTEM_AUDIT_TARGET,
-            operation,
-            result = "failed",
-            reason,
-            target_type,
-            target_name,
-            error = %err,
-            "admin request failed"
-        ),
-        _ => error!(
-            event = EVENT_ADMIN_REQUEST_FAILED,
-            component = LOG_COMPONENT_ADMIN_API,
-            subsystem = LOG_SUBSYSTEM_AUDIT_TARGET,
-            operation,
-            result = "failed",
-            reason,
-            error = %err,
-            "admin request failed"
-        ),
-    }
-}
-
 pub struct AuditTargetConfig {}
 
 #[async_trait::async_trait]
@@ -276,23 +275,23 @@ impl Operation for AuditTargetConfig {
 
         authorize_audit_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
         if let Some(reason) = audit_target_operation_block_reason("managing audit targets from the console").await {
-            log_audit_target_operation_blocked("set_audit_target_config", Some(target_type), Some(target_name), &reason);
+            log_audit_target_operation_blocked!("set_audit_target_config", Some(target_type), Some(target_name), &reason);
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
         let config_snapshot = load_server_config_from_store().await?;
         if let Some(reason) = audit_target_mutation_block_reason(&config_snapshot, target_type, target_name) {
-            log_audit_target_operation_blocked("set_audit_target_config", Some(target_type), Some(target_name), &reason);
+            log_audit_target_operation_blocked!("set_audit_target_config", Some(target_type), Some(target_name), &reason);
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
 
         let mut input = req.input;
         let body_bytes = input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await.map_err(|e| {
-            log_audit_target_body_read_failed(target_type, target_name, &e);
+            log_audit_target_body_read_failed!(target_type, target_name, e);
             s3_error!(InvalidRequest, "failed to read request body")
         })?;
 
         let audit_body: AuditTargetBody = serde_json::from_slice(&body_bytes).map_err(|e| {
-            log_audit_target_body_decode_failed(target_type, target_name, &e);
+            log_audit_target_body_decode_failed!(target_type, target_name, e);
             s3_error!(InvalidArgument, "invalid json body for audit target config: {}", e)
         })?;
 
@@ -316,15 +315,15 @@ impl Operation for AuditTargetConfig {
         })
         .await
         .inspect_err(|e| {
-            log_audit_target_request_failed(
+            log_audit_target_request_failed!(
                 "set_audit_target_config",
                 "update_audit_config_failed",
                 Some(target_type),
                 Some(target_name),
-                e,
+                e
             );
         })?;
-        log_audit_target_config_updated("set_audit_target_config", target_type, target_name);
+        log_audit_target_config_updated!("set_audit_target_config", target_type, target_name);
 
         Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
     }
@@ -347,7 +346,7 @@ impl Operation for ListAuditTargets {
         let config = load_server_config_from_store().await?;
         let audit_endpoints = merge_audit_endpoints(&config, runtime_statuses);
         let data = serde_json::to_vec(&AuditEndpointsResponse { audit_endpoints }).map_err(|e| {
-            log_audit_target_request_failed("list_audit_targets", "serialize_audit_targets_failed", None, None, &e);
+            log_audit_target_request_failed!("list_audit_targets", "serialize_audit_targets_failed", None, None, e);
             s3_error!(InternalError, "failed to serialize audit targets: {}", e)
         })?;
 
@@ -366,12 +365,12 @@ impl Operation for RemoveAuditTarget {
 
         authorize_audit_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
         if let Some(reason) = audit_target_operation_block_reason("managing audit targets from the console").await {
-            log_audit_target_operation_blocked("remove_audit_target_config", Some(target_type), Some(target_name), &reason);
+            log_audit_target_operation_blocked!("remove_audit_target_config", Some(target_type), Some(target_name), &reason);
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
         let config_snapshot = load_server_config_from_store().await?;
         if let Some(reason) = audit_target_mutation_block_reason(&config_snapshot, target_type, target_name) {
-            log_audit_target_operation_blocked("remove_audit_target_config", Some(target_type), Some(target_name), &reason);
+            log_audit_target_operation_blocked!("remove_audit_target_config", Some(target_type), Some(target_name), &reason);
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
 
@@ -389,15 +388,15 @@ impl Operation for RemoveAuditTarget {
         })
         .await
         .inspect_err(|e| {
-            log_audit_target_request_failed(
+            log_audit_target_request_failed!(
                 "remove_audit_target_config",
                 "update_audit_config_failed",
                 Some(target_type),
                 Some(target_name),
-                e,
+                e
             );
         })?;
-        log_audit_target_config_updated("remove_audit_target_config", target_type, target_name);
+        log_audit_target_config_updated!("remove_audit_target_config", target_type, target_name);
 
         Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
     }

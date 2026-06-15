@@ -49,6 +49,111 @@ const EVENT_ADMIN_REQUEST_FAILED: &str = "admin_request_failed";
 const EVENT_ADMIN_RESPONSE_EMITTED: &str = "admin_response_emitted";
 const EVENT_ADMIN_OPERATION_BLOCKED: &str = "admin_operation_blocked";
 
+macro_rules! log_notification_target_operation_blocked {
+    ($operation:expr, Some($target_type:expr), Some($target_name:expr), $reason:expr) => {
+        warn!(
+            event = EVENT_ADMIN_OPERATION_BLOCKED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
+            operation = $operation,
+            result = "blocked",
+            target_type = $target_type,
+            target_name = $target_name,
+            reason = $reason,
+            "admin request rejected"
+        );
+    };
+    ($operation:expr, None, None, $reason:expr) => {
+        warn!(
+            event = EVENT_ADMIN_OPERATION_BLOCKED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
+            operation = $operation,
+            result = "blocked",
+            reason = $reason,
+            "admin request rejected"
+        );
+    };
+}
+
+macro_rules! log_notification_target_body_read_failed {
+    ($target_type:expr, $target_name:expr, $err:expr) => {
+        warn!(
+            event = EVENT_ADMIN_REQUEST_REJECTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
+            operation = "set_target_config",
+            result = "rejected",
+            reason = "request_body_read_failed",
+            target_type = $target_type,
+            target_name = $target_name,
+            error = %$err,
+            "admin request rejected"
+        );
+    };
+}
+
+macro_rules! log_notification_target_body_decode_failed {
+    ($target_type:expr, $target_name:expr, $err:expr) => {
+        warn!(
+            event = EVENT_ADMIN_REQUEST_REJECTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
+            operation = "set_target_config",
+            result = "rejected",
+            reason = "request_body_decode_failed",
+            target_type = $target_type,
+            target_name = $target_name,
+            error = %$err,
+            "admin request rejected"
+        );
+    };
+}
+
+macro_rules! log_notification_target_config_updated {
+    ($operation:expr, $target_type:expr, $target_name:expr) => {
+        info!(
+            event = EVENT_ADMIN_RESPONSE_EMITTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
+            operation = $operation,
+            result = "success",
+            target_type = $target_type,
+            target_name = $target_name,
+            "admin response emitted"
+        );
+    };
+}
+
+macro_rules! log_notification_target_request_failed {
+    ($operation:expr, $reason:expr, Some($target_type:expr), Some($target_name:expr), $err:expr) => {
+        error!(
+            event = EVENT_ADMIN_REQUEST_FAILED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
+            operation = $operation,
+            result = "failed",
+            reason = $reason,
+            target_type = $target_type,
+            target_name = $target_name,
+            error = %$err,
+            "admin request failed"
+        );
+    };
+    ($operation:expr, $reason:expr, None, None, $err:expr) => {
+        error!(
+            event = EVENT_ADMIN_REQUEST_FAILED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
+            operation = $operation,
+            result = "failed",
+            reason = $reason,
+            error = %$err,
+            "admin request failed"
+        );
+    };
+}
+
 pub fn register_notification_target_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
         Method::GET,
@@ -170,112 +275,6 @@ fn collect_online_target_arns(region: &str, target_statuses: Vec<(rustfs_targets
         .collect()
 }
 
-fn log_notification_target_operation_blocked(
-    operation: &'static str,
-    target_type: Option<&str>,
-    target_name: Option<&str>,
-    reason: &str,
-) {
-    match (target_type, target_name) {
-        (Some(target_type), Some(target_name)) => warn!(
-            event = EVENT_ADMIN_OPERATION_BLOCKED,
-            component = LOG_COMPONENT_ADMIN_API,
-            subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
-            operation,
-            result = "blocked",
-            target_type,
-            target_name,
-            reason,
-            "admin request rejected"
-        ),
-        _ => warn!(
-            event = EVENT_ADMIN_OPERATION_BLOCKED,
-            component = LOG_COMPONENT_ADMIN_API,
-            subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
-            operation,
-            result = "blocked",
-            reason,
-            "admin request rejected"
-        ),
-    }
-}
-
-fn log_notification_target_body_read_failed(target_type: &str, target_name: &str, err: &dyn std::fmt::Display) {
-    warn!(
-        event = EVENT_ADMIN_REQUEST_REJECTED,
-        component = LOG_COMPONENT_ADMIN_API,
-        subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
-        operation = "set_target_config",
-        result = "rejected",
-        reason = "request_body_read_failed",
-        target_type,
-        target_name,
-        error = %err,
-        "admin request rejected"
-    );
-}
-
-fn log_notification_target_body_decode_failed(target_type: &str, target_name: &str, err: &dyn std::fmt::Display) {
-    warn!(
-        event = EVENT_ADMIN_REQUEST_REJECTED,
-        component = LOG_COMPONENT_ADMIN_API,
-        subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
-        operation = "set_target_config",
-        result = "rejected",
-        reason = "request_body_decode_failed",
-        target_type,
-        target_name,
-        error = %err,
-        "admin request rejected"
-    );
-}
-
-fn log_notification_target_config_updated(operation: &'static str, target_type: &str, target_name: &str) {
-    info!(
-        event = EVENT_ADMIN_RESPONSE_EMITTED,
-        component = LOG_COMPONENT_ADMIN_API,
-        subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
-        operation,
-        result = "success",
-        target_type,
-        target_name,
-        "admin response emitted"
-    );
-}
-
-fn log_notification_target_request_failed(
-    operation: &'static str,
-    reason: &'static str,
-    target_type: Option<&str>,
-    target_name: Option<&str>,
-    err: &dyn std::fmt::Display,
-) {
-    match (target_type, target_name) {
-        (Some(target_type), Some(target_name)) => error!(
-            event = EVENT_ADMIN_REQUEST_FAILED,
-            component = LOG_COMPONENT_ADMIN_API,
-            subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
-            operation,
-            result = "failed",
-            reason,
-            target_type,
-            target_name,
-            error = %err,
-            "admin request failed"
-        ),
-        _ => error!(
-            event = EVENT_ADMIN_REQUEST_FAILED,
-            component = LOG_COMPONENT_ADMIN_API,
-            subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
-            operation,
-            result = "failed",
-            reason,
-            error = %err,
-            "admin request failed"
-        ),
-    }
-}
-
 // --- Operations ---
 
 pub struct NotificationTarget {}
@@ -288,23 +287,23 @@ impl Operation for NotificationTarget {
 
         authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
         if let Some(reason) = notification_target_operation_block_reason("managing notification targets from the console").await {
-            log_notification_target_operation_blocked("set_target_config", Some(target_type), Some(target_name), &reason);
+            log_notification_target_operation_blocked!("set_target_config", Some(target_type), Some(target_name), &reason);
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
         let (ns, config_snapshot) = load_notification_config_snapshot().await?;
         if let Some(reason) = target_mutation_block_reason(&config_snapshot, target_type, target_name) {
-            log_notification_target_operation_blocked("set_target_config", Some(target_type), Some(target_name), &reason);
+            log_notification_target_operation_blocked!("set_target_config", Some(target_type), Some(target_name), &reason);
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
 
         let mut input = req.input;
         let body_bytes = input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await.map_err(|e| {
-            log_notification_target_body_read_failed(target_type, target_name, &e);
+            log_notification_target_body_read_failed!(target_type, target_name, e);
             s3_error!(InvalidRequest, "failed to read request body")
         })?;
 
         let notification_body: NotificationTargetBody = serde_json::from_slice(&body_bytes).map_err(|e| {
-            log_notification_target_body_decode_failed(target_type, target_name, &e);
+            log_notification_target_body_decode_failed!(target_type, target_name, e);
             s3_error!(InvalidArgument, "invalid json body for target config: {}", e)
         })?;
 
@@ -322,16 +321,16 @@ impl Operation for NotificationTarget {
         .await?;
 
         ns.set_target_config(target_type, target_name, kvs).await.map_err(|e| {
-            log_notification_target_request_failed(
+            log_notification_target_request_failed!(
                 "set_target_config",
                 "set_target_config_failed",
                 Some(target_type),
                 Some(target_name),
-                &e,
+                e
             );
             s3_error!(InternalError, "failed to set target config: {}", e)
         })?;
-        log_notification_target_config_updated("set_target_config", target_type, target_name);
+        log_notification_target_config_updated!("set_target_config", target_type, target_name);
 
         Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
     }
@@ -349,7 +348,7 @@ impl Operation for ListNotificationTargets {
         let notification_endpoints = merge_notification_endpoints(&config, runtime_statuses);
 
         let data = serde_json::to_vec(&NotificationEndpointsResponse { notification_endpoints }).map_err(|e| {
-            log_notification_target_request_failed("list_targets", "serialize_targets_failed", None, None, &e);
+            log_notification_target_request_failed!("list_targets", "serialize_targets_failed", None, None, e);
             s3_error!(InternalError, "failed to serialize targets: {}", e)
         })?;
 
@@ -369,7 +368,7 @@ impl Operation for ListTargetsArns {
         )
         .await
         {
-            log_notification_target_operation_blocked("list_target_arns", None, None, &reason);
+            log_notification_target_operation_blocked!("list_target_arns", None, None, &reason);
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
         let ns = get_notification_system()?;
@@ -395,7 +394,7 @@ impl Operation for ListTargetsArns {
         let data_target_arn_list = collect_online_target_arns(region.as_str(), target_statuses);
 
         let data = serde_json::to_vec(&data_target_arn_list).map_err(|e| {
-            log_notification_target_request_failed("list_target_arns", "serialize_targets_failed", None, None, &e);
+            log_notification_target_request_failed!("list_target_arns", "serialize_targets_failed", None, None, e);
             s3_error!(InternalError, "failed to serialize targets: {}", e)
         })?;
 
@@ -413,26 +412,26 @@ impl Operation for RemoveNotificationTarget {
 
         authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
         if let Some(reason) = notification_target_operation_block_reason("managing notification targets from the console").await {
-            log_notification_target_operation_blocked("remove_target_config", Some(target_type), Some(target_name), &reason);
+            log_notification_target_operation_blocked!("remove_target_config", Some(target_type), Some(target_name), &reason);
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
         let (ns, config_snapshot) = load_notification_config_snapshot().await?;
         if let Some(reason) = target_mutation_block_reason(&config_snapshot, target_type, target_name) {
-            log_notification_target_operation_blocked("remove_target_config", Some(target_type), Some(target_name), &reason);
+            log_notification_target_operation_blocked!("remove_target_config", Some(target_type), Some(target_name), &reason);
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
 
         ns.remove_target_config(target_type, target_name).await.map_err(|e| {
-            log_notification_target_request_failed(
+            log_notification_target_request_failed!(
                 "remove_target_config",
                 "remove_target_config_failed",
                 Some(target_type),
                 Some(target_name),
-                &e,
+                e
             );
             s3_error!(InternalError, "failed to remove target config: {}", e)
         })?;
-        log_notification_target_config_updated("remove_target_config", target_type, target_name);
+        log_notification_target_config_updated!("remove_target_config", target_type, target_name);
 
         Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
     }

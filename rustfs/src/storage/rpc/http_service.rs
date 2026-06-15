@@ -55,6 +55,165 @@ const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
 const PUT_FILE_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream";
 const WALK_DIR_PATH: &str = "/rustfs/rpc/walk_dir";
 
+macro_rules! log_internode_rpc_response_failure {
+    ($status:expr, $rpc_path:expr, $method:expr, $operation:expr, $reason:expr, $result:expr, Some(($context_key:expr, $context_value:expr)), Some($error_text:expr)) => {{
+        let operation = $operation.unwrap_or(RPC_OPERATION_UNKNOWN);
+        let subsystem = internode_rpc_subsystem(Some(operation));
+        if $status.is_server_error() {
+            error!(
+                event = EVENT_RPC_REQUEST_FAILED,
+                component = LOG_COMPONENT_INTERNODE_RPC,
+                subsystem,
+                operation,
+                result = $result,
+                status_code = $status.as_u16(),
+                rpc_path = $rpc_path,
+                method = %$method,
+                reason = $reason,
+                $context_key = $context_value,
+                error = %$error_text,
+                "internode rpc request failed"
+            );
+        } else {
+            warn!(
+                event = EVENT_RPC_REQUEST_REJECTED,
+                component = LOG_COMPONENT_INTERNODE_RPC,
+                subsystem,
+                operation,
+                result = $result,
+                status_code = $status.as_u16(),
+                rpc_path = $rpc_path,
+                method = %$method,
+                reason = $reason,
+                $context_key = $context_value,
+                error = %$error_text,
+                "internode rpc request rejected"
+            );
+        }
+    }};
+    ($status:expr, $rpc_path:expr, $method:expr, $operation:expr, $reason:expr, $result:expr, Some(($context_key:expr, $context_value:expr)), None) => {{
+        let operation = $operation.unwrap_or(RPC_OPERATION_UNKNOWN);
+        let subsystem = internode_rpc_subsystem(Some(operation));
+        if $status.is_server_error() {
+            error!(
+                event = EVENT_RPC_REQUEST_FAILED,
+                component = LOG_COMPONENT_INTERNODE_RPC,
+                subsystem,
+                operation,
+                result = $result,
+                status_code = $status.as_u16(),
+                rpc_path = $rpc_path,
+                method = %$method,
+                reason = $reason,
+                $context_key = $context_value,
+                "internode rpc request failed"
+            );
+        } else {
+            warn!(
+                event = EVENT_RPC_REQUEST_REJECTED,
+                component = LOG_COMPONENT_INTERNODE_RPC,
+                subsystem,
+                operation,
+                result = $result,
+                status_code = $status.as_u16(),
+                rpc_path = $rpc_path,
+                method = %$method,
+                reason = $reason,
+                $context_key = $context_value,
+                "internode rpc request rejected"
+            );
+        }
+    }};
+    ($status:expr, $rpc_path:expr, $method:expr, $operation:expr, $reason:expr, $result:expr, None, Some($error_text:expr)) => {{
+        let operation = $operation.unwrap_or(RPC_OPERATION_UNKNOWN);
+        let subsystem = internode_rpc_subsystem(Some(operation));
+        if $status.is_server_error() {
+            error!(
+                event = EVENT_RPC_REQUEST_FAILED,
+                component = LOG_COMPONENT_INTERNODE_RPC,
+                subsystem,
+                operation,
+                result = $result,
+                status_code = $status.as_u16(),
+                rpc_path = $rpc_path,
+                method = %$method,
+                reason = $reason,
+                error = %$error_text,
+                "internode rpc request failed"
+            );
+        } else {
+            warn!(
+                event = EVENT_RPC_REQUEST_REJECTED,
+                component = LOG_COMPONENT_INTERNODE_RPC,
+                subsystem,
+                operation,
+                result = $result,
+                status_code = $status.as_u16(),
+                rpc_path = $rpc_path,
+                method = %$method,
+                reason = $reason,
+                error = %$error_text,
+                "internode rpc request rejected"
+            );
+        }
+    }};
+    ($status:expr, $rpc_path:expr, $method:expr, $operation:expr, $reason:expr, $result:expr, None, None) => {{
+        let operation = $operation.unwrap_or(RPC_OPERATION_UNKNOWN);
+        let subsystem = internode_rpc_subsystem(Some(operation));
+        if $status.is_server_error() {
+            error!(
+                event = EVENT_RPC_REQUEST_FAILED,
+                component = LOG_COMPONENT_INTERNODE_RPC,
+                subsystem,
+                operation,
+                result = $result,
+                status_code = $status.as_u16(),
+                rpc_path = $rpc_path,
+                method = %$method,
+                reason = $reason,
+                "internode rpc request failed"
+            );
+        } else {
+            warn!(
+                event = EVENT_RPC_REQUEST_REJECTED,
+                component = LOG_COMPONENT_INTERNODE_RPC,
+                subsystem,
+                operation,
+                result = $result,
+                status_code = $status.as_u16(),
+                rpc_path = $rpc_path,
+                method = %$method,
+                reason = $reason,
+                "internode rpc request rejected"
+            );
+        }
+    }};
+}
+
+macro_rules! log_internode_put_file_stage_failure {
+    ($stage:expr, $query:expr, $err:expr) => {
+        error!(
+            event = EVENT_RPC_REQUEST_FAILED,
+            component = LOG_COMPONENT_INTERNODE_RPC,
+            subsystem = LOG_SUBSYSTEM_FILE_TRANSFER,
+            operation = INTERNODE_OPERATION_PUT_FILE_STREAM,
+            result = "failed",
+            status_code = StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+            rpc_path = PUT_FILE_STREAM_PATH,
+            method = %Method::PUT,
+            reason = "put_file_stage_failed",
+            stage = $stage,
+            disk = %$query.disk,
+            volume = %$query.volume,
+            path = %$query.path,
+            append = $query.append,
+            size = $query.size,
+            error = %$err,
+            "internode rpc request failed"
+        );
+    };
+}
+
 #[derive(Clone)]
 pub struct InternodeRpcService<S> {
     inner: S,
@@ -166,7 +325,7 @@ fn verify_internode_rpc_signature(uri: &Uri, method: &Method, headers: &HeaderMa
 
     verify_rpc_signature(&uri.to_string(), method, headers).map_err(|e| {
         let message = format!("rpc signature verification failed: {e}");
-        log_internode_rpc_response_failure(
+        log_internode_rpc_response_failure!(
             StatusCode::FORBIDDEN,
             uri.path(),
             method,
@@ -174,7 +333,7 @@ fn verify_internode_rpc_signature(uri: &Uri, method: &Method, headers: &HeaderMa
             "signature_verification_failed",
             "rejected",
             None,
-            Some(&e),
+            Some(&e)
         );
         Box::new(response_with_status(StatusCode::FORBIDDEN, message))
     })
@@ -304,7 +463,7 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
         Ok(body) => body.to_bytes(),
         Err(e) => {
             let message = format!("read body err {e}");
-            log_internode_rpc_response_failure(
+            log_internode_rpc_response_failure!(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 WALK_DIR_PATH,
                 &Method::GET,
@@ -312,7 +471,7 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
                 "request_body_read_failed",
                 "rejected",
                 Some(("disk", query.disk.as_str())),
-                Some(&e),
+                Some(&e)
             );
             return response_with_status(StatusCode::PAYLOAD_TOO_LARGE, message);
         }
@@ -402,7 +561,7 @@ async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
     };
 
     let Some(disk) = find_local_disk_by_ref(&query.disk).await else {
-        log_internode_rpc_response_failure(
+        log_internode_rpc_response_failure!(
             StatusCode::BAD_REQUEST,
             &path,
             &method,
@@ -410,7 +569,7 @@ async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
             "disk_not_found",
             "rejected",
             Some(("disk", query.disk.as_str())),
-            None,
+            None
         );
         return response_with_status(StatusCode::BAD_REQUEST, "disk not found");
     };
@@ -420,7 +579,7 @@ async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
             Ok(file) => file,
             Err(e) => {
                 let message = put_file_stage_error_message("append", &query, &e);
-                log_internode_put_file_stage_failure("append", &query, &e);
+                log_internode_put_file_stage_failure!("append", query, e);
                 return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, message);
             }
         }
@@ -429,7 +588,7 @@ async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
             Ok(file) => file,
             Err(e) => {
                 let message = put_file_stage_error_message("create", &query, &e);
-                log_internode_put_file_stage_failure("create", &query, &e);
+                log_internode_put_file_stage_failure!("create", query, e);
                 return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, message);
             }
         }
@@ -439,7 +598,7 @@ async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
         Ok(copied) => copied,
         Err(e) => {
             let message = put_file_stage_error_message("write_body", &query, &e);
-            log_internode_put_file_stage_failure("write_body", &query, &e);
+            log_internode_put_file_stage_failure!("write_body", query, e);
             return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, message);
         }
     };
@@ -456,7 +615,7 @@ async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
 
     if let Err(e) = file.flush().await {
         let message = put_file_stage_error_message("flush", &query, &e);
-        log_internode_put_file_stage_failure("flush", &query, &e);
+        log_internode_put_file_stage_failure!("flush", query, e);
         return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, message);
     }
 
@@ -497,7 +656,7 @@ where
     match req.uri().query() {
         Some(query) => from_bytes(query.as_bytes()).map_err(|e| {
             let message = format!("get query failed {e}");
-            log_internode_rpc_response_failure(
+            log_internode_rpc_response_failure!(
                 StatusCode::BAD_REQUEST,
                 req.uri().path(),
                 req.method(),
@@ -505,7 +664,7 @@ where
                 "query_parse_failed",
                 "rejected",
                 None,
-                Some(&e),
+                Some(&e)
             );
             Box::new(response_with_status(StatusCode::BAD_REQUEST, message))
         }),
@@ -534,153 +693,6 @@ fn internode_rpc_subsystem(operation: Option<&'static str>) -> &'static str {
         Some(INTERNODE_OPERATION_READ_FILE_STREAM | INTERNODE_OPERATION_PUT_FILE_STREAM) => LOG_SUBSYSTEM_FILE_TRANSFER,
         _ => LOG_SUBSYSTEM_ROUTING,
     }
-}
-
-fn log_internode_rpc_response_failure(
-    status: StatusCode,
-    rpc_path: &str,
-    method: &Method,
-    operation: Option<&'static str>,
-    reason: &'static str,
-    result: &'static str,
-    context: Option<(&'static str, &str)>,
-    error_text: Option<&dyn std::fmt::Display>,
-) {
-    let operation = operation.unwrap_or(RPC_OPERATION_UNKNOWN);
-    let subsystem = internode_rpc_subsystem(Some(operation));
-
-    match (status.is_server_error(), context, error_text) {
-        (true, Some((context_key, context_value)), Some(error_text)) => error!(
-            event = EVENT_RPC_REQUEST_FAILED,
-            component = LOG_COMPONENT_INTERNODE_RPC,
-            subsystem,
-            operation,
-            result,
-            status_code = status.as_u16(),
-            rpc_path,
-            method = %method,
-            reason,
-            context_key,
-            context_value,
-            error = %error_text,
-            "internode rpc request failed"
-        ),
-        (true, Some((context_key, context_value)), None) => error!(
-            event = EVENT_RPC_REQUEST_FAILED,
-            component = LOG_COMPONENT_INTERNODE_RPC,
-            subsystem,
-            operation,
-            result,
-            status_code = status.as_u16(),
-            rpc_path,
-            method = %method,
-            reason,
-            context_key,
-            context_value,
-            "internode rpc request failed"
-        ),
-        (true, None, Some(error_text)) => error!(
-            event = EVENT_RPC_REQUEST_FAILED,
-            component = LOG_COMPONENT_INTERNODE_RPC,
-            subsystem,
-            operation,
-            result,
-            status_code = status.as_u16(),
-            rpc_path,
-            method = %method,
-            reason,
-            error = %error_text,
-            "internode rpc request failed"
-        ),
-        (true, None, None) => error!(
-            event = EVENT_RPC_REQUEST_FAILED,
-            component = LOG_COMPONENT_INTERNODE_RPC,
-            subsystem,
-            operation,
-            result,
-            status_code = status.as_u16(),
-            rpc_path,
-            method = %method,
-            reason,
-            "internode rpc request failed"
-        ),
-        (false, Some((context_key, context_value)), Some(error_text)) => warn!(
-            event = EVENT_RPC_REQUEST_REJECTED,
-            component = LOG_COMPONENT_INTERNODE_RPC,
-            subsystem,
-            operation,
-            result,
-            status_code = status.as_u16(),
-            rpc_path,
-            method = %method,
-            reason,
-            context_key,
-            context_value,
-            error = %error_text,
-            "internode rpc request rejected"
-        ),
-        (false, Some((context_key, context_value)), None) => warn!(
-            event = EVENT_RPC_REQUEST_REJECTED,
-            component = LOG_COMPONENT_INTERNODE_RPC,
-            subsystem,
-            operation,
-            result,
-            status_code = status.as_u16(),
-            rpc_path,
-            method = %method,
-            reason,
-            context_key,
-            context_value,
-            "internode rpc request rejected"
-        ),
-        (false, None, Some(error_text)) => warn!(
-            event = EVENT_RPC_REQUEST_REJECTED,
-            component = LOG_COMPONENT_INTERNODE_RPC,
-            subsystem,
-            operation,
-            result,
-            status_code = status.as_u16(),
-            rpc_path,
-            method = %method,
-            reason,
-            error = %error_text,
-            "internode rpc request rejected"
-        ),
-        (false, None, None) => warn!(
-            event = EVENT_RPC_REQUEST_REJECTED,
-            component = LOG_COMPONENT_INTERNODE_RPC,
-            subsystem,
-            operation,
-            result,
-            status_code = status.as_u16(),
-            rpc_path,
-            method = %method,
-            reason,
-            "internode rpc request rejected"
-        ),
-    }
-}
-
-fn log_internode_put_file_stage_failure(stage: &'static str, query: &PutFileQuery, err: &dyn std::fmt::Display) {
-    error!(
-        event = EVENT_RPC_REQUEST_FAILED,
-        component = LOG_COMPONENT_INTERNODE_RPC,
-        subsystem = LOG_SUBSYSTEM_FILE_TRANSFER,
-        operation = INTERNODE_OPERATION_PUT_FILE_STREAM,
-        result = "failed",
-        status_code = StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-        rpc_path = PUT_FILE_STREAM_PATH,
-        method = %Method::PUT,
-        reason = "put_file_stage_failed",
-        stage,
-        disk = %query.disk,
-        volume = %query.volume,
-        path = %query.path,
-        append = query.append,
-        size = query.size,
-        error = %err,
-        "internode rpc request failed"
-    );
 }
 
 fn put_file_stage_error_message(stage: &str, query: &PutFileQuery, err: &dyn std::fmt::Display) -> String {

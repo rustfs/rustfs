@@ -67,6 +67,65 @@ const EVENT_RPC_RESPONSE_EMITTED: &str = "rpc_response_emitted";
 const EVENT_RPC_BACKGROUND_TASK_SPAWNED: &str = "rpc_background_task_spawned";
 const EVENT_RPC_BACKGROUND_TASK_FAILED: &str = "rpc_background_task_failed";
 
+macro_rules! log_load_rebalance_meta_rejected {
+    ($reason:expr, $start_rebalance:expr) => {
+        warn!(
+            event = EVENT_RPC_REQUEST_REJECTED,
+            component = LOG_COMPONENT_STORAGE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            operation = "load_rebalance_meta",
+            result = "rejected",
+            reason = $reason,
+            start_rebalance = $start_rebalance,
+            "node rpc request rejected"
+        );
+    };
+}
+
+macro_rules! log_load_rebalance_meta_failed {
+    ($reason:expr, $start_rebalance:expr, $err:expr) => {
+        error!(
+            event = EVENT_RPC_REQUEST_FAILED,
+            component = LOG_COMPONENT_STORAGE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            operation = "load_rebalance_meta",
+            result = "failed",
+            reason = $reason,
+            start_rebalance = $start_rebalance,
+            error = %$err,
+            "node rpc request failed"
+        );
+    };
+}
+
+macro_rules! log_load_rebalance_meta_response_emitted {
+    ($start_rebalance:expr) => {
+        info!(
+            event = EVENT_RPC_RESPONSE_EMITTED,
+            component = LOG_COMPONENT_STORAGE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            operation = "load_rebalance_meta",
+            result = "success",
+            start_rebalance = $start_rebalance,
+            "node rpc response emitted"
+        );
+    };
+}
+
+macro_rules! log_background_rebalance_task_spawned {
+    ($start_rebalance:expr) => {
+        info!(
+            event = EVENT_RPC_BACKGROUND_TASK_SPAWNED,
+            component = LOG_COMPONENT_STORAGE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            operation = "start_rebalance",
+            state = "spawned",
+            start_rebalance = $start_rebalance,
+            "node rpc background task spawned"
+        );
+    };
+}
+
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
 fn unimplemented_rpc(method: &str) -> Status {
@@ -75,57 +134,6 @@ fn unimplemented_rpc(method: &str) -> Status {
 
 fn background_rebalance_start_error_message(result: rustfs_ecstore::error::Result<()>) -> Option<String> {
     result.err().map(|err| format!("start_rebalance failed: {err}"))
-}
-
-fn log_load_rebalance_meta_rejected(reason: &'static str, start_rebalance: bool) {
-    warn!(
-        event = EVENT_RPC_REQUEST_REJECTED,
-        component = LOG_COMPONENT_STORAGE,
-        subsystem = LOG_SUBSYSTEM_REBALANCE,
-        operation = "load_rebalance_meta",
-        result = "rejected",
-        reason,
-        start_rebalance,
-        "node rpc request rejected"
-    );
-}
-
-fn log_load_rebalance_meta_failed(reason: &'static str, start_rebalance: bool, err: &dyn std::fmt::Display) {
-    error!(
-        event = EVENT_RPC_REQUEST_FAILED,
-        component = LOG_COMPONENT_STORAGE,
-        subsystem = LOG_SUBSYSTEM_REBALANCE,
-        operation = "load_rebalance_meta",
-        result = "failed",
-        reason,
-        start_rebalance,
-        error = %err,
-        "node rpc request failed"
-    );
-}
-
-fn log_load_rebalance_meta_response_emitted(start_rebalance: bool) {
-    info!(
-        event = EVENT_RPC_RESPONSE_EMITTED,
-        component = LOG_COMPONENT_STORAGE,
-        subsystem = LOG_SUBSYSTEM_REBALANCE,
-        operation = "load_rebalance_meta",
-        result = "success",
-        start_rebalance,
-        "node rpc response emitted"
-    );
-}
-
-fn log_background_rebalance_task_spawned(start_rebalance: bool) {
-    info!(
-        event = EVENT_RPC_BACKGROUND_TASK_SPAWNED,
-        component = LOG_COMPONENT_STORAGE,
-        subsystem = LOG_SUBSYSTEM_REBALANCE,
-        operation = "start_rebalance",
-        state = "spawned",
-        start_rebalance,
-        "node rpc background task spawned"
-    );
 }
 
 #[path = "bucket.rs"]
@@ -999,7 +1007,7 @@ impl Node for NodeService {
     ) -> Result<Response<LoadRebalanceMetaResponse>, Status> {
         let LoadRebalanceMetaRequest { start_rebalance } = request.into_inner();
         let Some(store) = resolve_object_store_handle() else {
-            log_load_rebalance_meta_rejected("server_not_initialized", start_rebalance);
+            log_load_rebalance_meta_rejected!("server_not_initialized", start_rebalance);
             return Ok(Response::new(LoadRebalanceMetaResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -1007,13 +1015,13 @@ impl Node for NodeService {
         };
 
         store.load_rebalance_meta().await.map_err(|err| {
-            log_load_rebalance_meta_failed("load_rebalance_meta_failed", start_rebalance, &err);
+            log_load_rebalance_meta_failed!("load_rebalance_meta_failed", start_rebalance, err);
             Status::internal(err.to_string())
         })?;
-        log_load_rebalance_meta_response_emitted(start_rebalance);
+        log_load_rebalance_meta_response_emitted!(start_rebalance);
 
         if start_rebalance {
-            log_background_rebalance_task_spawned(start_rebalance);
+            log_background_rebalance_task_spawned!(start_rebalance);
             let store = store.clone();
             spawn(async move {
                 if let Some(message) = background_rebalance_start_error_message(store.start_rebalance().await) {
