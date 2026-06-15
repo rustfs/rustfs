@@ -309,6 +309,62 @@ impl ScannerWorkSource {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScannerReplicationRepairKind {
+    BucketObject,
+    BucketDeleteMarker,
+    BucketVersionPurge,
+    BucketExistingObject,
+    SitePassiveRequeue,
+    SiteActiveResync,
+}
+
+impl ScannerReplicationRepairKind {
+    const ALL: [Self; 6] = [
+        Self::BucketObject,
+        Self::BucketDeleteMarker,
+        Self::BucketVersionPurge,
+        Self::BucketExistingObject,
+        Self::SitePassiveRequeue,
+        Self::SiteActiveResync,
+    ];
+
+    pub fn source(self) -> ScannerWorkSource {
+        match self {
+            Self::BucketObject | Self::BucketDeleteMarker | Self::BucketVersionPurge | Self::BucketExistingObject => {
+                ScannerWorkSource::BucketReplication
+            }
+            Self::SitePassiveRequeue | Self::SiteActiveResync => ScannerWorkSource::SiteReplication,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BucketObject => "object",
+            Self::BucketDeleteMarker => "delete_marker",
+            Self::BucketVersionPurge => "version_purge",
+            Self::BucketExistingObject => "existing_object",
+            Self::SitePassiveRequeue => "passive_requeue",
+            Self::SiteActiveResync => "active_resync",
+        }
+    }
+
+    fn all() -> &'static [Self] {
+        &Self::ALL
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::BucketObject => 0,
+            Self::BucketDeleteMarker => 1,
+            Self::BucketVersionPurge => 2,
+            Self::BucketExistingObject => 3,
+            Self::SitePassiveRequeue => 4,
+            Self::SiteActiveResync => 5,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct ScannerSourceWorkCounters {
     checked: AtomicU64,
@@ -446,6 +502,19 @@ impl ScannerSourceWorkValues {
     fn snapshot(self, source: ScannerWorkSource) -> ScannerSourceWorkSnapshot {
         ScannerSourceWorkSnapshot {
             source: source.as_str().to_string(),
+            checked: self.checked,
+            queued: self.queued,
+            executed: self.executed,
+            failed: self.failed,
+            skipped: self.skipped,
+            missed: self.missed,
+        }
+    }
+
+    fn replication_repair_snapshot(self, kind: ScannerReplicationRepairKind) -> ScannerReplicationRepairSnapshot {
+        ScannerReplicationRepairSnapshot {
+            source: kind.source().as_str().to_string(),
+            kind: kind.as_str().to_string(),
             checked: self.checked,
             queued: self.queued,
             executed: self.executed,
@@ -687,6 +756,9 @@ pub struct Metrics {
     scanner_source_work: Vec<ScannerSourceWorkCounters>,
     current_scan_cycle_source_work_start: Vec<ScannerSourceWorkCounters>,
     last_scan_cycle_source_work: Vec<ScannerSourceWorkCounters>,
+    scanner_replication_repair_work: Vec<ScannerSourceWorkCounters>,
+    current_scan_cycle_replication_repair_work_start: Vec<ScannerSourceWorkCounters>,
+    last_scan_cycle_replication_repair_work: Vec<ScannerSourceWorkCounters>,
     partial_scan_cycles: AtomicU64,
 }
 
@@ -772,6 +844,19 @@ pub struct ScannerCheckpointReport {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScannerSourceWorkSnapshot {
     pub source: String,
+    pub checked: u64,
+    pub queued: u64,
+    pub executed: u64,
+    pub failed: u64,
+    pub skipped: u64,
+    #[serde(default)]
+    pub missed: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerReplicationRepairSnapshot {
+    pub source: String,
+    pub kind: String,
     pub checked: u64,
     pub queued: u64,
     pub executed: u64,
@@ -1049,6 +1134,12 @@ pub struct ScannerMetricsReport {
     pub current_cycle_source_work: Vec<ScannerSourceWorkSnapshot>,
     #[serde(default)]
     pub last_cycle_source_work: Vec<ScannerSourceWorkSnapshot>,
+    #[serde(default)]
+    pub replication_repair: Vec<ScannerReplicationRepairSnapshot>,
+    #[serde(default)]
+    pub current_cycle_replication_repair: Vec<ScannerReplicationRepairSnapshot>,
+    #[serde(default)]
+    pub last_cycle_replication_repair: Vec<ScannerReplicationRepairSnapshot>,
     #[serde(default)]
     pub partial_cycles: u64,
 }
@@ -1549,6 +1640,18 @@ impl Metrics {
                 .iter()
                 .map(|_| ScannerSourceWorkCounters::default())
                 .collect(),
+            scanner_replication_repair_work: ScannerReplicationRepairKind::all()
+                .iter()
+                .map(|_| ScannerSourceWorkCounters::default())
+                .collect(),
+            current_scan_cycle_replication_repair_work_start: ScannerReplicationRepairKind::all()
+                .iter()
+                .map(|_| ScannerSourceWorkCounters::default())
+                .collect(),
+            last_scan_cycle_replication_repair_work: ScannerReplicationRepairKind::all()
+                .iter()
+                .map(|_| ScannerSourceWorkCounters::default())
+                .collect(),
             partial_scan_cycles: AtomicU64::new(0),
         }
     }
@@ -1812,6 +1915,12 @@ impl Metrics {
         }
     }
 
+    pub fn record_scanner_replication_repair_work(&self, kind: ScannerReplicationRepairKind, work: ScannerSourceWorkUpdate) {
+        if let Some(counters) = self.scanner_replication_repair_work.get(kind.index()) {
+            counters.add(work);
+        }
+    }
+
     fn record_last_cycle_scanner_source_work(&self, source: ScannerWorkSource, work: ScannerSourceWorkUpdate) {
         if let Some(counters) = self.last_scan_cycle_source_work.get(source.index()) {
             counters.add(work);
@@ -2060,6 +2169,7 @@ impl Metrics {
     pub fn start_scan_cycle_work(&self) -> ScanCycleWorkSnapshot {
         let snapshot = self.scan_cycle_work_snapshot();
         let source_snapshot = self.scanner_source_work_values();
+        let replication_repair_snapshot = self.scanner_replication_repair_work_values();
         self.current_scan_cycle_objects_start
             .store(snapshot.objects_scanned, Ordering::Relaxed);
         self.current_scan_cycle_directories_start
@@ -2089,6 +2199,10 @@ impl Metrics {
         self.current_scan_cycle_usage_saves_start
             .store(snapshot.usage_saves, Ordering::Relaxed);
         self.store_scanner_source_work_values(&self.current_scan_cycle_source_work_start, &source_snapshot);
+        self.store_scanner_replication_repair_work_values(
+            &self.current_scan_cycle_replication_repair_work_start,
+            &replication_repair_snapshot,
+        );
         self.current_scan_cycle_work_active.store(true, Ordering::Relaxed);
         snapshot
     }
@@ -2096,8 +2210,11 @@ impl Metrics {
     pub fn finish_scan_cycle_work(&self, start: ScanCycleWorkSnapshot) {
         let work = self.scan_cycle_work_since(start);
         let source_work = self.scanner_source_work_since(&self.current_scan_cycle_source_work_start_values());
+        let replication_repair_work =
+            self.scanner_replication_repair_work_since(&self.current_scan_cycle_replication_repair_work_start_values());
         self.record_scan_cycle_work(work);
         self.record_scan_cycle_source_work(&source_work);
+        self.record_scan_cycle_replication_repair_work(&replication_repair_work);
         self.current_scan_cycle_work_active.store(false, Ordering::Relaxed);
     }
 
@@ -2213,9 +2330,79 @@ impl Metrics {
             .collect()
     }
 
+    fn scanner_replication_repair_work_values(&self) -> Vec<ScannerSourceWorkValues> {
+        ScannerReplicationRepairKind::all()
+            .iter()
+            .filter_map(|kind| {
+                self.scanner_replication_repair_work
+                    .get(kind.index())
+                    .map(ScannerSourceWorkCounters::values)
+            })
+            .collect()
+    }
+
+    fn current_scan_cycle_replication_repair_work_start_values(&self) -> Vec<ScannerSourceWorkValues> {
+        ScannerReplicationRepairKind::all()
+            .iter()
+            .filter_map(|kind| {
+                self.current_scan_cycle_replication_repair_work_start
+                    .get(kind.index())
+                    .map(ScannerSourceWorkCounters::values)
+            })
+            .collect()
+    }
+
+    fn scanner_replication_repair_work_since(&self, start: &[ScannerSourceWorkValues]) -> Vec<ScannerSourceWorkValues> {
+        self.scanner_replication_repair_work_values()
+            .into_iter()
+            .enumerate()
+            .map(|(index, current)| current.saturating_sub(start.get(index).copied().unwrap_or_default()))
+            .collect()
+    }
+
+    fn scanner_replication_repair_work_snapshots(
+        &self,
+        values: &[ScannerSourceWorkValues],
+    ) -> Vec<ScannerReplicationRepairSnapshot> {
+        ScannerReplicationRepairKind::all()
+            .iter()
+            .filter_map(|kind| {
+                values
+                    .get(kind.index())
+                    .map(|values| values.replication_repair_snapshot(*kind))
+            })
+            .collect()
+    }
+
+    fn scanner_replication_repair_work_counter_snapshots(
+        &self,
+        counters: &[ScannerSourceWorkCounters],
+    ) -> Vec<ScannerReplicationRepairSnapshot> {
+        ScannerReplicationRepairKind::all()
+            .iter()
+            .filter_map(|kind| {
+                counters
+                    .get(kind.index())
+                    .map(|counters| counters.values().replication_repair_snapshot(*kind))
+            })
+            .collect()
+    }
+
     fn store_scanner_source_work_values(&self, counters: &[ScannerSourceWorkCounters], values: &[ScannerSourceWorkValues]) {
         for source in ScannerWorkSource::all() {
             if let (Some(counter), Some(values)) = (counters.get(source.index()), values.get(source.index())) {
+                counter.store(*values);
+            }
+        }
+    }
+
+    fn store_scanner_replication_repair_work_values(
+        &self,
+        counters: &[ScannerSourceWorkCounters],
+        values: &[ScannerSourceWorkValues],
+    ) {
+        for kind in ScannerReplicationRepairKind::all() {
+            if let (Some(counter), Some(values)) = (counters.get(kind.index()), values.get(kind.index())) {
                 counter.store(*values);
             }
         }
@@ -2252,6 +2439,10 @@ impl Metrics {
 
     fn record_scan_cycle_source_work(&self, work: &[ScannerSourceWorkValues]) {
         self.store_scanner_source_work_values(&self.last_scan_cycle_source_work, work);
+    }
+
+    fn record_scan_cycle_replication_repair_work(&self, work: &[ScannerSourceWorkValues]) {
+        self.store_scanner_replication_repair_work_values(&self.last_scan_cycle_replication_repair_work, work);
     }
 
     /// Snapshot of every path currently being scanned.
@@ -2326,6 +2517,8 @@ impl Metrics {
         if self.current_scan_cycle_work_active.load(Ordering::Relaxed) {
             let current_work = self.scan_cycle_work_since(self.current_scan_cycle_work_start());
             let current_source_work = self.scanner_source_work_since(&self.current_scan_cycle_source_work_start_values());
+            let current_replication_repair_work =
+                self.scanner_replication_repair_work_since(&self.current_scan_cycle_replication_repair_work_start_values());
             m.current_cycle_objects_scanned = current_work.objects_scanned;
             m.current_cycle_directories_scanned = current_work.directories_scanned;
             m.current_cycle_bucket_drive_scans = current_work.bucket_drive_scans;
@@ -2341,6 +2534,7 @@ impl Metrics {
             m.current_cycle_replication_checks = current_work.replication_checks;
             m.current_cycle_usage_saves = current_work.usage_saves;
             m.current_cycle_source_work = self.scanner_source_work_snapshots(&current_source_work);
+            m.current_cycle_replication_repair = self.scanner_replication_repair_work_snapshots(&current_replication_repair_work);
         }
         let last_cycle_result = self.last_scan_cycle_result.load(Ordering::Relaxed);
         m.last_cycle_result = scan_cycle_result_label(last_cycle_result).to_string();
@@ -2371,6 +2565,8 @@ impl Metrics {
         m.last_cycle_replication_checks = self.last_scan_cycle_replication_checks.load(Ordering::Relaxed);
         m.last_cycle_usage_saves = self.last_scan_cycle_usage_saves.load(Ordering::Relaxed);
         m.last_cycle_source_work = self.scanner_source_work_counter_snapshots(&self.last_scan_cycle_source_work);
+        m.last_cycle_replication_repair =
+            self.scanner_replication_repair_work_counter_snapshots(&self.last_scan_cycle_replication_repair_work);
         m.failed_cycles = self.failed_scan_cycles.load(Ordering::Relaxed);
         m.partial_cycles_unknown = self.partial_scan_cycles_unknown.load(Ordering::Relaxed);
         m.partial_cycles_runtime = self.partial_scan_cycles_runtime.load(Ordering::Relaxed);
@@ -2430,6 +2626,7 @@ impl Metrics {
         m.scan_checkpoint_ignored = self.scanner_checkpoint_ignored.load(Ordering::Relaxed);
         m.scan_checkpoint_stale = self.scanner_checkpoint_stale.load(Ordering::Relaxed);
         m.source_work = self.scanner_source_work_counter_snapshots(&self.scanner_source_work);
+        m.replication_repair = self.scanner_replication_repair_work_counter_snapshots(&self.scanner_replication_repair_work);
         m.partial_cycles = self.partial_scan_cycles.load(Ordering::Relaxed);
 
         // Lifetime operation counts
@@ -3067,6 +3264,60 @@ mod tests {
             .expect("heal source work should be visible");
         assert_eq!(heal.checked, 5);
         assert_eq!(heal.executed, 0);
+    }
+
+    #[tokio::test]
+    async fn report_includes_scanner_replication_repair_work() {
+        let metrics = Metrics::new();
+
+        metrics.record_scanner_replication_repair_work(
+            ScannerReplicationRepairKind::BucketObject,
+            ScannerSourceWorkUpdate::queued(2),
+        );
+        metrics.record_scanner_replication_repair_work(
+            ScannerReplicationRepairKind::BucketDeleteMarker,
+            ScannerSourceWorkUpdate::missed(1),
+        );
+        metrics.record_scanner_replication_repair_work(
+            ScannerReplicationRepairKind::BucketVersionPurge,
+            ScannerSourceWorkUpdate {
+                skipped: 3,
+                ..Default::default()
+            },
+        );
+        metrics.record_scanner_replication_repair_work(
+            ScannerReplicationRepairKind::BucketExistingObject,
+            ScannerSourceWorkUpdate::queued(4),
+        );
+
+        let report = metrics.report().await;
+        let object = report
+            .replication_repair
+            .iter()
+            .find(|repair| repair.source == "bucket_replication" && repair.kind == "object")
+            .expect("bucket object repair work should be visible");
+        assert_eq!(object.queued, 2);
+
+        let delete_marker = report
+            .replication_repair
+            .iter()
+            .find(|repair| repair.source == "bucket_replication" && repair.kind == "delete_marker")
+            .expect("bucket delete-marker repair work should be visible");
+        assert_eq!(delete_marker.missed, 1);
+
+        let version_purge = report
+            .replication_repair
+            .iter()
+            .find(|repair| repair.source == "bucket_replication" && repair.kind == "version_purge")
+            .expect("bucket version purge repair work should be visible");
+        assert_eq!(version_purge.skipped, 3);
+
+        let existing_object = report
+            .replication_repair
+            .iter()
+            .find(|repair| repair.source == "bucket_replication" && repair.kind == "existing_object")
+            .expect("bucket existing object repair work should be visible");
+        assert_eq!(existing_object.queued, 4);
     }
 
     #[tokio::test]

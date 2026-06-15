@@ -292,6 +292,9 @@ Compare these fields between baseline and tuned runs:
 | `metrics.source_work` | Shows cumulative work found, queued, skipped, missed, executed, and failed by source. |
 | `metrics.current_cycle_source_work` | Shows which source is consuming the current scan cycle. |
 | `metrics.last_cycle_source_work` | Shows which source consumed the previous scan cycle. |
+| `metrics.replication_repair` | Splits scanner-discovered replication repair by source and kind, including bucket object, delete-marker, version-purge, existing-object repair, and site replication boundary states. |
+| `metrics.current_cycle_replication_repair` | Shows which replication repair kind is being discovered or admitted in the current cycle. |
+| `metrics.last_cycle_replication_repair` | Shows which replication repair kind consumed the previous cycle. |
 | `metrics.lifecycle_expiry.current_queued` | Shows scanner-driven expiry/delete work waiting in the expiry worker queue. |
 | `metrics.lifecycle_expiry.current_active` | Shows scanner-driven expiry/delete work currently running in expiry workers. |
 | `metrics.lifecycle_expiry.queue_missed` | Shows expiry/delete queue admission failures outside the scanner walk itself. |
