@@ -292,8 +292,14 @@ Compare these fields between baseline and tuned runs:
 | `metrics.source_work` | Shows cumulative work found, queued, skipped, missed, executed, and failed by source. |
 | `metrics.current_cycle_source_work` | Shows which source is consuming the current scan cycle. |
 | `metrics.last_cycle_source_work` | Shows which source consumed the previous scan cycle. |
+| `metrics.lifecycle_expiry.current_queued` | Shows scanner-driven expiry/delete work waiting in the expiry worker queue. |
+| `metrics.lifecycle_expiry.current_active` | Shows scanner-driven expiry/delete work currently running in expiry workers. |
+| `metrics.lifecycle_expiry.queue_missed` | Shows expiry/delete queue admission failures outside the scanner walk itself. |
+| `metrics.lifecycle_expiry.scanner_missed` | Shows scanner-discovered expiry/delete work that could not be queued. |
 | `metrics.lifecycle_transition.scanner_missed` | Shows scanner-discovered transition work that could not be queued. |
 | `metrics.lifecycle_transition.queue_full` | Shows transition queue pressure outside the scanner walk itself. |
+| `metrics.lifecycle_transition.compensation_pending` | Shows transition compensation still pending or running after queue pressure. |
+| `metrics.lifecycle_transition.failed` | Shows transition worker failures, which should also surface as lifecycle source failure. |
 | `metrics.scan_checkpoint` | Confirms partial cycles preserve resume context. |
 | `metrics.oldest_active_path_age_seconds` | Helps identify scanner paths that may be stuck. |
 
@@ -318,8 +324,12 @@ Treat these as failure signals:
 - CPU drops only because the scanner stops making progress;
 - `primary_pressure` stays at `queued_scans` while queues grow;
 - `last_cycle_partial_reason` repeats forever with no checkpoint movement;
-- lifecycle transition `scanner_missed` or `queue_full` grows during a run that
-  was expected to reduce backlog;
+- lifecycle expiry `queue_missed`, `scanner_missed`, `current_queued`, or
+  `current_active` grows during a run that was expected to reduce expiry
+  backlog;
+- lifecycle transition `scanner_missed`, `queue_full`,
+  `compensation_pending`, or `failed` grows during a run that was expected to
+  reduce backlog;
 - heal or bitrot work moves from `queued` to `missed` after a scanner pacing
   change.
 

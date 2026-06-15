@@ -173,7 +173,7 @@ Each `metrics.maintenance_control.sources[]` entry has:
 |---|---|
 | `source` | Scanner source such as `usage`, `lifecycle`, `bucket_replication`, `site_replication`, `heal`, `bitrot`, or `alerts`. |
 | `state` | `idle`, `active`, `deferred`, or `blocked`. |
-| `reason` | Derived reason such as `active_work`, `queued_work`, `partial_cycle`, `missed_work`, `transition_queue_backlog`, or `transition_queue_full`. |
+| `reason` | Derived reason such as `active_work`, `queued_work`, `partial_cycle`, `missed_work`, `expiry_queue_backlog`, `transition_failed`, `transition_compensation_backlog`, `transition_queue_backlog`, or `transition_queue_full`. |
 | `backlog` | Current source-level backlog estimate from queued or missed work. |
 | `current_checked` | Current-cycle checked work for this source, or the last completed cycle when no scan cycle is active. |
 | `current_queued` | Current-cycle queued work for this source, or the last completed cycle when no scan cycle is active. |
@@ -184,7 +184,25 @@ Each `metrics.maintenance_control.sources[]` entry has:
 Use this snapshot before changing scanner controls. For example,
 `blocked_source` with `lifecycle/missed_work` points at downstream lifecycle
 admission, while `deferred_source` with `usage/partial_cycle` points at scanner
-cycle budgets.
+cycle budgets. `lifecycle/expiry_queue_backlog` means scanner-driven expiry or
+delete work is still queued or active in the expiry worker pool.
+`lifecycle/transition_failed` means transition worker execution failed during
+the current or last completed scan cycle, while
+`lifecycle/transition_compensation_backlog` means transition compensation is
+still pending or running after queue backpressure.
+
+`metrics.lifecycle_expiry` exposes the expiry/delete worker queue observed by
+scanner-driven lifecycle work:
+
+| Field | Meaning |
+|---|---|
+| `current_queue_capacity` | Effective expiry worker queue capacity for this node. |
+| `current_queued` | Expiry/delete tasks currently waiting in the worker queue. |
+| `current_active` | Expiry/delete tasks currently running in a worker. |
+| `current_workers` | Configured expiry worker count. |
+| `queue_missed` | Expiry/delete tasks that could not be queued because no worker channel was available or the queue was closed. |
+| `scanner_queued` | Scanner-discovered expiry/delete object versions admitted to the expiry queue. |
+| `scanner_missed` | Scanner-discovered expiry/delete object versions that could not be admitted. |
 
 ## Reading Distributed Metrics
 
@@ -209,9 +227,10 @@ done
 ```
 
 The `aggregated.scanner` payload preserves the same scanner progress,
-checkpoint, pacing, source work, maintenance control, and lifecycle transition
-fields used by the local scanner status, but only for the node that returned
-the response. The `by_host.*.scanner` payload keeps that node's host view.
+checkpoint, pacing, source work, maintenance control, lifecycle expiry, and
+lifecycle transition fields used by the local scanner status, but only for the
+node that returned the response. The `by_host.*.scanner` payload keeps that
+node's host view.
 Compare the per-node artifacts externally to find old active paths, partial
 checkpoints, pacing pressure, source-level control pressure, or downstream
 queue admission problems across the deployment.
@@ -230,6 +249,7 @@ work:
 | `queue_full` | Queue-full observations in the transition state. |
 | `queue_send_timeout` | Send timeouts for transition queue admission. |
 | `compensation_scheduled` | Buckets scheduled for transition compensation. |
+| `compensation_pending` | Buckets with transition compensation still pending or running. |
 | `compensation_running` | Transition compensation tasks currently running. |
 | `scanner_queued` | Scanner transition tasks admitted to the queue. |
 | `scanner_missed` | Scanner transition tasks that could not be admitted. |
