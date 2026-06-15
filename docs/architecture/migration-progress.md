@@ -5,15 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-namespace-lock-large-cleanup`
-- Baseline: `origin/main` at `49c0f131205035d125271bb5b87db5b0f5bc2a6d`
+- Branch: `overtrue/arch-config-storage-boundary-cleanup`
+- Baseline: `origin/main` at `fbab160c2b09075f5e2503a669d82917ef82d40e`
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: no external behavior change expected.
-- Rust code changes: narrow replication pool, resync, delete replication, and
-  object replication storage bounds away from full `StorageAPI` to their actual
-  object I/O, object operation, list, and namespace-lock capabilities.
+- Rust code changes: remove stale full `StorageAPI` coupling from config
+  persistence tests, an unused S3 remove-client import, and an obsolete storage
+  list comment.
 - CI/script changes: none.
-- Docs changes: record the current `API-012` consumer cleanup slice and its
+- Docs changes: refresh the ECStore config persistence inventory and current
   verification state.
 
 ## Phase 0 Tasks
@@ -419,6 +419,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     full `StorageAPI` when the helper only needs `ObjectIO`,
     `ObjectOperations`, `BucketOperations`, `ListOperations`, or
     `StorageAdminApi`.
+  - Cleanup slice: remove stale full `StorageAPI` dependencies from config
+    persistence test support after the server-config persistence helpers moved
+    to their actual object I/O and storage-admin bounds.
   - Acceptance: metadata helper contracts express the actual operation group
     they need, while callers and persistence behavior remain unchanged.
 
@@ -463,10 +466,10 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     catalog backend and rebalance metadata helper consumers away from full
     `StorageAPI` where they only need object I/O, object operations, list
     operations, and namespace locking.
-  - Current cleanup slice: narrow replication pool, resync leader-lock, delete
-    replication, object replication, and multipart replication helpers away
-    from full `StorageAPI` where they only need object I/O, object operations,
-    list operations, and namespace locking.
+  - Completed follow-up slice: `rustfs/rustfs#3485` narrowed replication pool,
+    resync leader-lock, delete replication, object replication, and multipart
+    replication helpers away from full `StorageAPI` where they only need object
+    I/O, object operations, list operations, and namespace locking.
   - Acceptance: table catalog object backend contracts express the actual
     object read/write, metadata/delete, list, and namespace-lock capabilities
     they need; namespace-lock consumers depend on `NamespaceLocking` instead of
@@ -759,18 +762,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Replication consumers now depend on a local replication storage capability boundary plus object-I/O-only helper bounds, without changing replication method bodies. |
-| Migration preservation | passed | Resync leader locks, per-object replication locks, delete replication, object reader flow, multipart upload flow, MRF recovery, and replication scheduling semantics are unchanged. |
-| Testing/verification | passed | Focused replication tests, storage API compatibility test, compile checks, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Config persistence tests now express their actual object I/O, namespace-lock, and storage-admin requirements instead of a full storage facade. |
+| Migration preservation | passed | Config object encoding/decoding, metadata reads, namespace-lock behavior, and S3 remove-client behavior are unchanged. |
+| Testing/verification | passed | Focused config tests, compile checks, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `49c0f131205035d125271bb5b87db5b0f5bc2a6d`:
+Passed on `fbab160c2b09075f5e2503a669d82917ef82d40e`:
 
 - `cargo check -p rustfs-ecstore`: passed.
-- `cargo test -p rustfs-ecstore bucket::replication --no-fail-fast`: passed.
-- `cargo test -p rustfs-ecstore --test storage_api_compat_test --no-fail-fast`:
-  passed.
+- `cargo test -p rustfs-ecstore config::com --no-fail-fast`: passed.
 - `cargo check -p rustfs -p rustfs-ecstore`: passed.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
@@ -783,17 +784,16 @@ Passed on `49c0f131205035d125271bb5b87db5b0f5bc2a6d`:
 
 Notes:
 
-- This slice keeps the existing replication method bodies unchanged while
-  narrowing the generic storage capabilities they require.
-- Replication storage still depends on object I/O, object metadata/delete
-  operations, bucket walking, and namespace locking; multipart replication
-  helpers only need object reader access to stream source ranges.
+- This slice removes test-only full facade scaffolding after config persistence
+  helpers already moved to narrower object I/O and storage-admin contracts.
+- The S3 remove client had a stale full facade import only; behavior remains
+  unchanged.
 - The slice does not remove the full storage facade or move traits across crate
   boundaries.
 
 ## Handoff Notes
 
-- API-012 replication storage cleanup is locally verified and current with
+- Config storage boundary cleanup is locally verified and current with
   `origin/main`.
-- Remaining namespace-lock cleanup can continue by migrating other consumers
+- Remaining storage-facade cleanup can continue by migrating other consumers
   that no longer need the full storage facade.
