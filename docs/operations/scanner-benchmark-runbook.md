@@ -156,6 +156,27 @@ scripts/run_scanner_validation_harness.sh \
 The harness writes scanner/heal config snapshots, scanner status samples, host
 telemetry when available, run metadata, and `scanner-summary.csv`.
 
+For distributed runs, capture scanner admin metrics from every node with
+`by-host=true`. The metrics endpoint reports the node that handles the request;
+`by-host=true` preserves that node's host view but does not collect peer nodes.
+These per-node artifacts include active path age, checkpoint state, pacing
+pressure, source work, and queued/skipped/missed downstream admission counters.
+
+```bash
+for endpoint in http://node-a:9000 http://node-b:9000 http://node-c:9000; do
+  node="${endpoint#http://}"
+  node="${node%%:*}"
+  awscurl \
+    --service s3 \
+    --region us-east-1 \
+    --access_key "$RUSTFS_ACCESS_KEY" \
+    --secret_key "$RUSTFS_SECRET_KEY" \
+    --request GET \
+    "${endpoint}/rustfs/admin/v3/metrics?types=1&by-host=true&n=1" \
+    > "artifacts/scanner-metrics.${node}.$(date -u +%Y%m%dT%H%M%SZ).ndjson"
+done
+```
+
 Example status request:
 
 ```bash
