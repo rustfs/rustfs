@@ -22,26 +22,20 @@ use rustfs::server::{
     ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, shutdown_event_notifier, stop_audit_system,
     wait_for_shutdown,
 };
-use rustfs::startup_fs_guard::enforce_unsupported_fs_policy;
 use rustfs::startup_iam::{bootstrap_or_defer_iam_init, publish_ready_for_iam_bootstrap};
 use rustfs::startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight};
 use rustfs::startup_protocols::{ProtocolShutdownSenders, init_protocol_shutdown_senders};
 use rustfs::startup_server::{StartupHttpServers, StartupListenContext, init_startup_http_servers, init_startup_listen_context};
+use rustfs::startup_storage::init_startup_storage_foundation;
 use rustfs_common::SystemStage;
-use rustfs_ecstore::store::init_lock_clients;
 use rustfs_ecstore::{
     bucket::metadata_sys::init_bucket_metadata_sys,
     bucket::migration::{try_migrate_bucket_metadata, try_migrate_iam_config},
     bucket::replication::{get_global_replication_pool, init_background_replication},
     config as ecconfig,
-    endpoints::EndpointServerPools,
     global::shutdown_background_services,
-    set_global_endpoints,
     store::ECStore,
-    store::init_local_disks,
-    store::prewarm_local_disk_id_map,
     store_api::BucketOperations,
-    update_erasure_type,
 };
 use rustfs_heal::{
     create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
@@ -65,10 +59,7 @@ const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const LOG_SUBSYSTEM_AUTH: &str = "auth";
 const LOG_SUBSYSTEM_STORAGE: &str = "storage";
 const EVENT_SERVER_RUNTIME_FAILED: &str = "server_runtime_failed";
-const EVENT_ENDPOINT_PARSING_STARTED: &str = "endpoint_parsing_started";
 const EVENT_STARTUP_STORAGE_STAGE: &str = "startup_storage_stage";
-const EVENT_STORAGE_POOL_FORMATTING: &str = "storage_pool_formatting";
-const EVENT_STORAGE_POOL_HOST_RISK: &str = "storage_pool_host_risk";
 const EVENT_PROTOCOL_SYSTEM_STATE: &str = "protocol_system_state";
 const EVENT_AUDIT_SYSTEM_STATE: &str = "audit_system_state";
 const EVENT_DEADLOCK_DETECTOR_STATE: &str = "deadlock_detector_state";
@@ -171,110 +162,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
         server_address,
     } = init_startup_listen_context(&config).await?;
 
-    // For RPC
-    info!(
-        target: "rustfs::main::run",
-        event = EVENT_ENDPOINT_PARSING_STARTED,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STORAGE,
-        server_address = %server_address,
-        volume_count = config.volumes.len(),
-        "Starting endpoint parsing"
-    );
-    let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), config.volumes.clone())
-        .await
-        .inspect_err(|err| {
-            error!(
-                target: "rustfs::main::run",
-                event = EVENT_STARTUP_STORAGE_STAGE,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STORAGE,
-                stage = "endpoint_parsing",
-                state = "failed",
-                error = ?err,
-                "Endpoint parsing failed"
-            );
-        })
-        .map_err(Error::other)?;
-    enforce_unsupported_fs_policy(&endpoint_pools)?;
-
-    set_global_endpoints(endpoint_pools.as_ref().clone());
-    update_erasure_type(setup_type).await;
-
-    // Initialize the local disk
-    debug!(
-        target: "rustfs::main::run",
-        event = EVENT_STARTUP_STORAGE_STAGE,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STORAGE,
-        stage = "local_disk_initialization",
-        state = "starting",
-        "starting local disk initialization"
-    );
-    init_local_disks(endpoint_pools.clone())
-        .await
-        .inspect_err(|err| {
-            error!(
-                target: "rustfs::main::run",
-                event = EVENT_STARTUP_STORAGE_STAGE,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STORAGE,
-                stage = "local_disk_initialization",
-                state = "failed",
-                error = ?err,
-                "Local disk initialization failed"
-            );
-        })
-        .map_err(Error::other)?;
-    prewarm_local_disk_id_map().await;
-    // Initialize the lock clients
-
-    init_lock_clients(endpoint_pools.clone());
-
-    for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
-        info!(
-            target: "rustfs::main::run",
-            event = EVENT_STORAGE_POOL_FORMATTING,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STORAGE,
-            pool_id = i + 1,
-            set_count = eps.set_count,
-            drives_per_set = eps.drives_per_set,
-            "Formatting storage pool"
-        );
-
-        if eps.drives_per_set > 1 {
-            warn!(
-                target: "rustfs::main::run",
-                event = EVENT_STORAGE_POOL_HOST_RISK,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STORAGE,
-                pool_id = i + 1,
-                drives_per_set = eps.drives_per_set,
-                risk = "host_failure_data_unavailable",
-                "Detected multi-drive local set host failure risk"
-            );
-        }
-    }
-
-    for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
-        debug!(
-            target: "rustfs::main::run",
-            id = i,
-            set_count = eps.set_count,
-            drives_per_set = eps.drives_per_set,
-            cmd = ?eps.cmd_line,
-            "created endpoints {}, set_count:{}, drives_per_set: {}, cmd: {:?}",
-            i, eps.set_count, eps.drives_per_set, eps.cmd_line
-        );
-
-        for ep in eps.endpoints.as_ref().iter() {
-            debug!(
-                target: "rustfs::main::run",
-                "  - endpoint: {}", ep
-            );
-        }
-    }
+    let endpoint_pools = init_startup_storage_foundation(&server_address, &config.volumes).await?;
     let StartupHttpServers {
         state_manager,
         s3_shutdown_tx,

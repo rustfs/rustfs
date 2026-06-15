@@ -74,6 +74,7 @@ pub mod startup_protocols;
 pub mod startup_runtime;
 pub mod startup_server;
 pub mod startup_services;
+pub mod startup_storage;
 pub mod storage;
 pub(crate) mod table_catalog;
 pub mod tls;
