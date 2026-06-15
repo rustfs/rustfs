@@ -216,6 +216,12 @@ struct TableMetadataMaintenanceRequest {
     retain_recent_metadata_files: usize,
     #[serde(default)]
     delete: bool,
+    #[serde(default, rename = "snapshot-expiration")]
+    snapshot_expiration: Option<crate::table_catalog::TableSnapshotExpirationConfig>,
+    #[serde(default, rename = "commit-snapshot-expiration")]
+    commit_snapshot_expiration: bool,
+    #[serde(default)]
+    compaction: Option<crate::table_catalog::TableCompactionPlanningConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2456,6 +2462,7 @@ where
 
 async fn table_metadata_maintenance_response<B>(
     store: &crate::table_catalog::ObjectTableCatalogStore<B>,
+    metadata_backend: &B,
     bucket: &str,
     namespace: &crate::table_catalog::Namespace,
     table: &str,
@@ -2464,7 +2471,35 @@ async fn table_metadata_maintenance_response<B>(
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
-    store
+    if request.delete && request.commit_snapshot_expiration {
+        return Err(s3_error!(
+            InvalidRequest,
+            "snapshot expiration commit cannot be combined with metadata deletion"
+        ));
+    }
+
+    let snapshot_expiration_request = request.snapshot_expiration;
+    let commit_snapshot_expiration = request.commit_snapshot_expiration;
+    let compaction_request = request.compaction;
+    let compaction = match compaction_request {
+        Some(config) => Some(
+            store
+                .plan_table_compaction(bucket, &namespace.public_name(), table, config)
+                .await
+                .map_err(catalog_store_error)?,
+        ),
+        None => None,
+    };
+    let snapshot_expiration_plan = match snapshot_expiration_request {
+        Some(config) => Some(
+            store
+                .plan_table_snapshot_expiration(bucket, &namespace.public_name(), table, config)
+                .await
+                .map_err(catalog_store_error)?,
+        ),
+        None => None,
+    };
+    let mut report = store
         .run_table_metadata_maintenance_with_retention(
             bucket,
             &namespace.public_name(),
@@ -2474,7 +2509,118 @@ where
             request.retain_recent_metadata_files,
         )
         .await
-        .map_err(catalog_store_error)
+        .map_err(catalog_store_error)?;
+    let snapshot_expiration = match (snapshot_expiration_plan, commit_snapshot_expiration) {
+        (Some(plan), true) => {
+            Some(commit_table_snapshot_expiration_response(store, metadata_backend, bucket, namespace, table, plan).await?)
+        }
+        (Some(plan), false) => Some(plan),
+        (None, _) => None,
+    };
+    report.snapshot_expiration = snapshot_expiration;
+    report.compaction = compaction;
+    if report.snapshot_expiration.is_some() || report.compaction.is_some() {
+        let committed_snapshot_expiration = report
+            .snapshot_expiration
+            .as_ref()
+            .is_some_and(|snapshot_expiration| snapshot_expiration.committed_metadata_location.is_some());
+        match store.put_table_metadata_maintenance_report(&report).await {
+            Ok(()) => {}
+            Err(err) if committed_snapshot_expiration => {
+                tracing::warn!(
+                    error = %err,
+                    warehouse = bucket,
+                    namespace = namespace.public_name(),
+                    table,
+                    "failed to persist table maintenance report after snapshot expiration commit"
+                );
+            }
+            Err(err) => return Err(catalog_store_error(err)),
+        }
+    }
+    Ok(report)
+}
+
+async fn commit_table_snapshot_expiration_response<B>(
+    store: &crate::table_catalog::ObjectTableCatalogStore<B>,
+    metadata_backend: &B,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+    mut report: crate::table_catalog::TableSnapshotExpirationReport,
+) -> S3Result<crate::table_catalog::TableSnapshotExpirationReport>
+where
+    B: crate::table_catalog::TableCatalogObjectBackend,
+{
+    let Some(current) = store
+        .load_table(bucket, &namespace.public_name(), table)
+        .await
+        .map_err(catalog_store_error)?
+    else {
+        return Err(s3_error!(InvalidRequest, "table not found"));
+    };
+    if report.table_id != current.table_id || report.current_metadata_location != current.metadata_location {
+        return Err(s3_error!(PreconditionFailed, "snapshot expiration plan is stale"));
+    }
+    if report.manual_review_count > 0 {
+        return Err(s3_error!(InvalidRequest, "snapshot expiration plan requires manual review before commit"));
+    }
+    let expired_snapshot_ids = report
+        .snapshot_reports
+        .iter()
+        .filter(|snapshot| snapshot.state == crate::table_catalog::TableSnapshotExpirationSnapshotState::ExpirationCandidate)
+        .filter_map(|snapshot| snapshot.snapshot_id)
+        .collect::<Vec<_>>();
+    if expired_snapshot_ids.is_empty() {
+        return Ok(report);
+    }
+
+    let current_metadata = read_table_metadata_json(metadata_backend, bucket, &current.metadata_location).await?;
+    let updates = [serde_json::json!({
+        "action": "remove-snapshots",
+        "snapshot-ids": expired_snapshot_ids.clone()
+    })];
+    let next_metadata = apply_table_commit_updates(current_metadata.clone(), &updates, &current.metadata_location)?;
+    validate_metadata_matches_current_metadata(&current_metadata, &next_metadata)?;
+    validate_metadata_table_location_in_bucket(bucket, &next_metadata)?;
+    let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
+        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
+    let (commit_id, metadata_file_token) = standard_commit_ids(None);
+    let next_generation = current.generation.saturating_add(1);
+    let next_metadata_location = crate::table_catalog::default_table_metadata_file_path(
+        namespace,
+        &table_name,
+        &next_metadata_file_name(next_generation, &metadata_file_token),
+    );
+    let next_metadata_data = serde_json::to_vec(&next_metadata)
+        .map_err(|err| s3_error!(InternalError, "failed to serialize snapshot expiration metadata: {}", err))?;
+    metadata_backend
+        .put_object(
+            bucket,
+            &next_metadata_location,
+            next_metadata_data,
+            crate::table_catalog::TableCatalogPutPrecondition::IfAbsent,
+        )
+        .await
+        .map_err(catalog_store_error)?;
+
+    let commit_request = crate::table_catalog::TableCommitRequest {
+        table_bucket: bucket.to_string(),
+        namespace: namespace.public_name(),
+        table: table.to_string(),
+        commit_id,
+        idempotency_key: None,
+        operation: "expire-snapshots".to_string(),
+        expected_version_token: current.version_token,
+        expected_metadata_location: current.metadata_location,
+        new_metadata_location: next_metadata_location,
+        requirements: Vec::new(),
+        writer: Some("rustfs-maintenance".to_string()),
+    };
+    let result = store.commit_table(commit_request).await.map_err(catalog_store_error)?;
+    report.expired_snapshot_ids = expired_snapshot_ids;
+    report.committed_metadata_location = Some(result.table.metadata_location);
+    Ok(report)
 }
 
 async fn catalog_import_response<B>(
@@ -2868,8 +3014,9 @@ impl Operation for RestTableMetadataMaintenanceHandler {
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
         let request = read_json_body::<TableMetadataMaintenanceRequest>(req.input).await?;
         let metadata_backend = table_catalog_backend()?;
-        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend);
-        let response = table_metadata_maintenance_response(&store, &warehouse, &namespace, &table, request).await?;
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let response =
+            table_metadata_maintenance_response(&store, &metadata_backend, &warehouse, &namespace, &table, request).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -3315,6 +3462,9 @@ mod tests {
 
         assert_eq!(request.retain_recent_metadata_files, 0);
         assert!(!request.delete);
+        assert!(request.snapshot_expiration.is_none());
+        assert!(!request.commit_snapshot_expiration);
+        assert!(request.compaction.is_none());
     }
 
     #[test]
@@ -3327,6 +3477,39 @@ mod tests {
 
         assert_eq!(request.retain_recent_metadata_files, 2);
         assert!(request.delete);
+        assert!(request.snapshot_expiration.is_none());
+        assert!(!request.commit_snapshot_expiration);
+        assert!(request.compaction.is_none());
+    }
+
+    #[test]
+    fn table_metadata_maintenance_request_accepts_snapshot_and_compaction_plans() {
+        let request: TableMetadataMaintenanceRequest = serde_json::from_value(serde_json::json!({
+            "commit-snapshot-expiration": true,
+            "snapshot-expiration": {
+                "min-snapshots-to-keep": 2,
+                "max-snapshot-age-ms": 3600000
+            },
+            "compaction": {
+                "target-file-size-bytes": 536870912,
+                "small-file-threshold-bytes": 67108864,
+                "min-input-files": 5,
+                "max-rewrite-bytes-per-job": 10737418240u64
+            }
+        }))
+        .expect("metadata maintenance request should parse maintenance planning config");
+
+        let snapshot_expiration = request
+            .snapshot_expiration
+            .expect("snapshot expiration config should be present");
+        assert_eq!(snapshot_expiration.min_snapshots_to_keep, 2);
+        assert_eq!(snapshot_expiration.max_snapshot_age_ms, 3_600_000);
+        assert!(request.commit_snapshot_expiration);
+        let compaction = request.compaction.expect("compaction config should be present");
+        assert_eq!(compaction.target_file_size_bytes, 536_870_912);
+        assert_eq!(compaction.small_file_threshold_bytes, 67_108_864);
+        assert_eq!(compaction.min_input_files, 5);
+        assert_eq!(compaction.max_rewrite_bytes_per_job, 10_737_418_240);
     }
 
     #[tokio::test]
@@ -4184,7 +4367,26 @@ mod tests {
                 bucket,
                 &current,
                 serde_json::json!({
-                    "metadata-log": []
+                    "current-snapshot-id": 20,
+                    "metadata-log": [],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 10,
+                            "timestamp-ms": 1000,
+                            "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro"
+                        },
+                        {
+                            "snapshot-id": 20,
+                            "timestamp-ms": 2000,
+                            "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-20.avro"
+                        }
+                    ],
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 20,
+                            "type": "branch"
+                        }
+                    }
                 }),
                 Some(OffsetDateTime::UNIX_EPOCH),
             )
@@ -4230,18 +4432,45 @@ mod tests {
 
         let dry_run = table_metadata_maintenance_response(
             &store,
+            &backend,
             bucket,
             &namespace,
             "events",
             TableMetadataMaintenanceRequest {
                 retain_recent_metadata_files: 0,
                 delete: false,
+                snapshot_expiration: Some(crate::table_catalog::TableSnapshotExpirationConfig {
+                    min_snapshots_to_keep: 1,
+                    max_snapshot_age_ms: 1,
+                }),
+                commit_snapshot_expiration: false,
+                compaction: Some(crate::table_catalog::TableCompactionPlanningConfig {
+                    target_file_size_bytes: 512 * 1024 * 1024,
+                    small_file_threshold_bytes: 64 * 1024 * 1024,
+                    min_input_files: 2,
+                    max_rewrite_bytes_per_job: 1024 * 1024 * 1024,
+                }),
             },
         )
         .await
         .expect("metadata maintenance dry-run should succeed");
         assert_eq!(dry_run.cleanup_candidate_locations, vec![old.clone()]);
         assert_eq!(dry_run.deletable_metadata_locations, vec![old.clone()]);
+        let snapshot_expiration = dry_run
+            .snapshot_expiration
+            .as_ref()
+            .expect("dry-run report should include snapshot expiration planning");
+        assert_eq!(snapshot_expiration.expiration_candidate_count, 1);
+        assert_eq!(snapshot_expiration.current_snapshot_id, Some(20));
+        let compaction = dry_run
+            .compaction
+            .as_ref()
+            .expect("dry-run report should include compaction planning");
+        assert_eq!(
+            compaction.status,
+            crate::table_catalog::TableCompactionPlanningStatus::ManualReviewRequired
+        );
+        assert_eq!(compaction.manual_review_count, 1);
         let stored_dry_run = store
             .get_table_metadata_maintenance_report(bucket, "analytics", "events", &dry_run.job.job_id)
             .await
@@ -4257,12 +4486,16 @@ mod tests {
 
         let deleted = table_metadata_maintenance_response(
             &store,
+            &backend,
             bucket,
             &namespace,
             "events",
             TableMetadataMaintenanceRequest {
                 retain_recent_metadata_files: 0,
                 delete: true,
+                snapshot_expiration: None,
+                commit_snapshot_expiration: false,
+                compaction: None,
             },
         )
         .await
@@ -4275,6 +4508,327 @@ mod tests {
                 .await
                 .expect("old metadata lookup should succeed after delete")
         );
+    }
+
+    #[tokio::test]
+    async fn table_metadata_maintenance_helper_commits_snapshot_expiration() {
+        let backend = TestTableCatalogObjectBackend::default();
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "warehouse";
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
+        let current = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+        seed_object_table_for_metadata_maintenance(&store, &backend, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .put_json_with_mod_time(
+                bucket,
+                &current,
+                serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://warehouse/tables/table-id",
+                    "last-sequence-number": 2,
+                    "last-updated-ms": 2000,
+                    "last-column-id": 1,
+                    "schemas": [],
+                    "current-schema-id": 0,
+                    "partition-specs": [],
+                    "default-spec-id": 0,
+                    "sort-orders": [],
+                    "default-sort-order-id": 0,
+                    "current-snapshot-id": 20,
+                    "metadata-log": [],
+                    "snapshot-log": [
+                        {
+                            "timestamp-ms": 1000,
+                            "snapshot-id": 10
+                        },
+                        {
+                            "timestamp-ms": 2000,
+                            "snapshot-id": 20
+                        }
+                    ],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 10,
+                            "timestamp-ms": 1000,
+                            "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro"
+                        },
+                        {
+                            "snapshot-id": 20,
+                            "timestamp-ms": 2000,
+                            "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-20.avro"
+                        }
+                    ],
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 20,
+                            "type": "branch"
+                        }
+                    }
+                }),
+                Some(OffsetDateTime::UNIX_EPOCH),
+            )
+            .await;
+
+        let report = table_metadata_maintenance_response(
+            &store,
+            &backend,
+            bucket,
+            &namespace,
+            "events",
+            TableMetadataMaintenanceRequest {
+                retain_recent_metadata_files: 0,
+                delete: false,
+                snapshot_expiration: Some(crate::table_catalog::TableSnapshotExpirationConfig {
+                    min_snapshots_to_keep: 1,
+                    max_snapshot_age_ms: 1,
+                }),
+                commit_snapshot_expiration: true,
+                compaction: None,
+            },
+        )
+        .await
+        .expect("snapshot expiration commit should succeed");
+
+        let snapshot_expiration = report
+            .snapshot_expiration
+            .as_ref()
+            .expect("maintenance report should include snapshot expiration");
+        assert_eq!(snapshot_expiration.expired_snapshot_ids, vec![10]);
+        let committed_location = snapshot_expiration
+            .committed_metadata_location
+            .as_ref()
+            .expect("snapshot expiration commit should report committed metadata")
+            .clone();
+        assert_ne!(committed_location, current);
+
+        let entry = store
+            .load_table(bucket, "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+        assert_eq!(entry.metadata_location, committed_location);
+        assert_eq!(entry.generation, 2);
+
+        let committed_object = backend
+            .read_object(bucket, &entry.metadata_location)
+            .await
+            .expect("committed metadata lookup should succeed")
+            .expect("committed metadata object should exist");
+        let committed_metadata =
+            serde_json::from_slice::<serde_json::Value>(&committed_object.data).expect("committed metadata should be valid JSON");
+        let snapshots = committed_metadata
+            .get("snapshots")
+            .and_then(serde_json::Value::as_array)
+            .expect("committed metadata should contain snapshots");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].get("snapshot-id").and_then(serde_json::Value::as_i64), Some(20));
+        let snapshot_log = committed_metadata
+            .get("snapshot-log")
+            .and_then(serde_json::Value::as_array)
+            .expect("committed metadata should contain snapshot-log");
+        assert_eq!(snapshot_log.len(), 1);
+        assert_eq!(
+            committed_metadata["metadata-log"][0]["metadata-file"],
+            serde_json::Value::String(current.clone())
+        );
+        assert!(
+            backend
+                .object_exists(bucket, &current)
+                .await
+                .expect("previous metadata lookup should succeed")
+        );
+    }
+
+    #[tokio::test]
+    async fn table_metadata_maintenance_helper_rejects_snapshot_expiration_manual_review_commit() {
+        let backend = TestTableCatalogObjectBackend::default();
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "warehouse";
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
+        let current = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+        seed_object_table_for_metadata_maintenance(&store, &backend, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .put_json_with_mod_time(
+                bucket,
+                &current,
+                serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://warehouse/tables/table-id",
+                    "current-snapshot-id": 20,
+                    "metadata-log": [],
+                    "snapshot-log": [],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 10,
+                            "timestamp-ms": 1000,
+                            "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro"
+                        },
+                        {
+                            "snapshot-id": 20,
+                            "timestamp-ms": 2000,
+                            "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-20.avro"
+                        }
+                    ],
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 20,
+                            "type": "branch"
+                        },
+                        "audit": {
+                            "snapshot-id": 10,
+                            "type": "tag"
+                        }
+                    }
+                }),
+                Some(OffsetDateTime::UNIX_EPOCH),
+            )
+            .await;
+
+        let result = table_metadata_maintenance_response(
+            &store,
+            &backend,
+            bucket,
+            &namespace,
+            "events",
+            TableMetadataMaintenanceRequest {
+                retain_recent_metadata_files: 0,
+                delete: false,
+                snapshot_expiration: Some(crate::table_catalog::TableSnapshotExpirationConfig {
+                    min_snapshots_to_keep: 1,
+                    max_snapshot_age_ms: 1,
+                }),
+                commit_snapshot_expiration: true,
+                compaction: None,
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        let entry = store
+            .load_table(bucket, "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+        assert_eq!(entry.metadata_location, current);
+        assert_eq!(entry.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn table_metadata_maintenance_helper_rejects_stale_snapshot_expiration_plan() {
+        let backend = TestTableCatalogObjectBackend::default();
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "warehouse";
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
+        let current = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let next = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00003.metadata.json");
+
+        let metadata = serde_json::json!({
+            "format-version": 2,
+            "table-uuid": "table-uuid",
+            "location": "s3://warehouse/tables/table-id",
+            "current-snapshot-id": 20,
+            "metadata-log": [],
+            "snapshot-log": [],
+            "snapshots": [
+                {
+                    "snapshot-id": 10,
+                    "timestamp-ms": 1000,
+                    "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro"
+                },
+                {
+                    "snapshot-id": 20,
+                    "timestamp-ms": 2000,
+                    "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-20.avro"
+                }
+            ],
+            "refs": {
+                "main": {
+                    "snapshot-id": 20,
+                    "type": "branch"
+                }
+            }
+        });
+        seed_object_table_for_metadata_maintenance(&store, &backend, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .put_json_with_mod_time(bucket, &current, metadata.clone(), Some(OffsetDateTime::UNIX_EPOCH))
+            .await;
+        backend
+            .put_json_with_mod_time(bucket, &next, metadata, Some(OffsetDateTime::UNIX_EPOCH))
+            .await;
+
+        let stale_plan = store
+            .plan_table_snapshot_expiration(
+                bucket,
+                "analytics",
+                "events",
+                crate::table_catalog::TableSnapshotExpirationConfig {
+                    min_snapshots_to_keep: 1,
+                    max_snapshot_age_ms: 1,
+                },
+            )
+            .await
+            .expect("snapshot expiration plan should build");
+        store
+            .commit_table(crate::table_catalog::TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                commit_id: "advance-pointer".to_string(),
+                idempotency_key: None,
+                operation: "append".to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current,
+                new_metadata_location: next,
+                requirements: Vec::new(),
+                writer: Some("test".to_string()),
+            })
+            .await
+            .expect("pointer advance should succeed");
+
+        let result = commit_table_snapshot_expiration_response(&store, &backend, bucket, &namespace, "events", stale_plan).await;
+
+        assert!(result.is_err());
+        let entry = store
+            .load_table(bucket, "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+        assert_eq!(entry.generation, 2);
+    }
+
+    #[tokio::test]
+    async fn table_metadata_maintenance_helper_rejects_delete_with_snapshot_expiration_commit() {
+        let backend = TestTableCatalogObjectBackend::default();
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+
+        let result = table_metadata_maintenance_response(
+            &store,
+            &backend,
+            "warehouse",
+            &namespace,
+            "events",
+            TableMetadataMaintenanceRequest {
+                retain_recent_metadata_files: 0,
+                delete: true,
+                snapshot_expiration: Some(crate::table_catalog::TableSnapshotExpirationConfig {
+                    min_snapshots_to_keep: 1,
+                    max_snapshot_age_ms: 1,
+                }),
+                commit_snapshot_expiration: true,
+                compaction: None,
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
     }
 
     #[test]

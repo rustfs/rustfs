@@ -144,10 +144,16 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
         "expected_behavior": "metadata-only cleanup must not delete manifest, data, or delete files",
     },
     {
-        "capability": "snapshot-expiration-and-compaction",
-        "status": "unsupported",
+        "capability": "snapshot-expiration",
+        "status": "manual-maintenance-supported",
         "roadmap_area": "snapshot-maintenance",
-        "expected_behavior": "no automatic snapshot expiration or data rewrite is claimed",
+        "expected_behavior": "metadata maintenance can report snapshot expiration plans and manually commit safe snapshot expiration through the catalog; background scheduling and manifest/data cleanup are not claimed",
+    },
+    {
+        "capability": "compaction-rewrite",
+        "status": "planning-only",
+        "roadmap_area": "snapshot-maintenance",
+        "expected_behavior": "compaction planning fails closed when manifest Avro reading is required; no data file rewrite or automatic compaction is claimed",
     },
     {
         "capability": "iceberg-views",
