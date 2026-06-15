@@ -137,7 +137,7 @@ futures-core = "0.3.32"
 futures-lite = "2.6.1"
 futures-util = "0.3.32"
 pollster = "0.4.0"
-pulsar = { version = "6.8.0", default-features = false, features = ["tokio-rustls-runtime"] }
+pulsar = { version = "6.8.0", default-features = false, features = ["tokio-rustls-runtime","telemetry"] }
 lapin = { version = "4.10.0", default-features = false, features = ["tokio", "rustls", "rustls--aws_lc_rs"] }
 hyper = { version = "1.10.1", features = ["http2", "http1", "server"] }
 hyper-rustls = { version = "0.27.9", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs", "webpki-roots"] }

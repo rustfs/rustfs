@@ -122,7 +122,11 @@ docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/log
 If you use [podman](https://github.com/containers/podman) instead of docker, you can install the RustFS with the below command
 
 ```bash
-podman run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
+# Create data and logs directories
+mkdir -p data logs
+
+# Run the container (podman will automatically set the folders ownership)
+podman run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data:Z,U -v $(pwd)/logs:/logs:Z,U rustfs/rustfs:latest
 ```
 
 If you enable TLS with a bind-mounted certificate directory, prepare that mount the same way:

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::StorageAPI;
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use crate::config::com::{read_config_with_metadata, save_config_with_opts};
 use crate::data_movement;
@@ -667,7 +666,7 @@ impl RebalanceMeta {
 }
 
 impl ECStore {
-    async fn save_rebalance_meta_with_merge<S: StorageAPI + NamespaceLocking>(
+    async fn save_rebalance_meta_with_merge<S: ObjectIO + NamespaceLocking>(
         &self,
         pool: Arc<S>,
         local_snapshot: &RebalanceMeta,

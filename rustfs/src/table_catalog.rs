@@ -40,7 +40,7 @@ use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::{
     set_disk::get_lock_acquire_timeout,
-    store_api::{HTTPPreconditions, NamespaceLocking, ObjectOptions, PutObjReader, StorageAPI},
+    store_api::{HTTPPreconditions, ListOperations, NamespaceLocking, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use time::{Duration, OffsetDateTime};
@@ -84,6 +84,8 @@ const MAINTENANCE_JOB_ALIAS_CURRENT: &str = "current";
 const TABLE_CATALOG_LIST_MAX_KEYS: i32 = 1000;
 const TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS: i64 = 15 * 60;
 const TABLE_MAINTENANCE_RETRY_BACKOFF_MAX_SECONDS: u64 = 24 * 60 * 60;
+const TABLE_MAINTENANCE_WORKER_LEASE_TIMEOUT_DEFAULT_SECONDS: u64 = 15 * 60;
+const TABLE_MAINTENANCE_WORKER_LEASE_TIMEOUT_MAX_SECONDS: u64 = 24 * 60 * 60;
 const TABLE_COMMIT_SLOW_LOG_THRESHOLD: StdDuration = StdDuration::from_secs(2);
 const ICEBERG_MAIN_REF: &str = "main";
 const ICEBERG_MIN_SNAPSHOTS_TO_KEEP_PROPERTY: &str = "history.expire.min-snapshots-to-keep";
@@ -274,6 +276,13 @@ pub(crate) struct TableMaintenanceConfig {
     pub delete_enabled: bool,
     #[serde(rename = "background-enabled")]
     pub background_enabled: bool,
+    #[serde(default, rename = "worker-paused")]
+    pub worker_paused: bool,
+    #[serde(
+        default = "default_table_maintenance_worker_lease_timeout_seconds",
+        rename = "worker-lease-timeout-seconds"
+    )]
+    pub worker_lease_timeout_seconds: u64,
     #[serde(default, rename = "max-retry-attempts")]
     pub max_retry_attempts: u16,
     #[serde(default, rename = "retry-initial-backoff-seconds")]
@@ -293,6 +302,8 @@ impl Default for TableMaintenanceConfig {
             retain_recent_metadata_files: 0,
             delete_enabled: false,
             background_enabled: false,
+            worker_paused: false,
+            worker_lease_timeout_seconds: TABLE_MAINTENANCE_WORKER_LEASE_TIMEOUT_DEFAULT_SECONDS,
             max_retry_attempts: 0,
             retry_initial_backoff_seconds: 5,
             retry_max_backoff_seconds: 300,
@@ -553,6 +564,7 @@ pub(crate) enum TableMetadataMaintenanceJobStatus {
     Successful,
     Failed,
     Disabled,
+    Paused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -605,6 +617,26 @@ pub(crate) struct TableMetadataMaintenanceReferencedObjectReport {
     pub object_kind: TableMetadataMaintenanceObjectKind,
     pub state: TableMetadataMaintenanceObjectState,
     pub reasons: Vec<TableMetadataMaintenanceReason>,
+}
+
+struct TableMaintenanceHeartbeatRef<'a> {
+    table_bucket: &'a str,
+    namespace: &'a str,
+    table: &'a str,
+    job_id: &'a str,
+    lease_id: &'a str,
+    worker_id: &'a str,
+}
+
+struct TableMaintenanceWorkerControlReport<'a> {
+    table_bucket: &'a str,
+    namespace: &'a str,
+    table: &'a str,
+    worker_id: String,
+    effective: &'a TableMaintenanceEffectiveConfig,
+    status: TableMetadataMaintenanceJobStatus,
+    reason: &'a str,
+    now: OffsetDateTime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1595,6 +1627,219 @@ where
         self.read_entry::<TableMetadataMaintenanceReport>(self.catalog_bucket(), &job_path)
             .await
             .map(|entry| entry.map(|(report, _)| report))
+    }
+
+    pub(crate) async fn run_table_metadata_maintenance_worker_once(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        worker_id: String,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        self.run_table_metadata_maintenance_worker_once_at(table_bucket, namespace, table, worker_id, OffsetDateTime::now_utc())
+            .await
+    }
+
+    async fn run_table_metadata_maintenance_worker_once_at(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        worker_id: String,
+        now: OffsetDateTime,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        let effective = self
+            .get_effective_table_maintenance_config(table_bucket, namespace, table)
+            .await?;
+        if !effective.config.background_enabled {
+            return self
+                .put_table_metadata_maintenance_worker_control_report(TableMaintenanceWorkerControlReport {
+                    table_bucket,
+                    namespace,
+                    table,
+                    worker_id,
+                    effective: &effective,
+                    status: TableMetadataMaintenanceJobStatus::Disabled,
+                    reason: "background maintenance is disabled",
+                    now,
+                })
+                .await;
+        }
+        if effective.config.worker_paused {
+            return self
+                .put_table_metadata_maintenance_worker_control_report(TableMaintenanceWorkerControlReport {
+                    table_bucket,
+                    namespace,
+                    table,
+                    worker_id,
+                    effective: &effective,
+                    status: TableMetadataMaintenanceJobStatus::Paused,
+                    reason: "background maintenance worker is paused",
+                    now,
+                })
+                .await;
+        }
+
+        if let Some(current) = self
+            .get_table_metadata_maintenance_report(table_bucket, namespace, table, MAINTENANCE_JOB_ALIAS_CURRENT)
+            .await?
+        {
+            if matches!(current.job.status, TableMetadataMaintenanceJobStatus::Running) {
+                if table_maintenance_job_lease_is_active(&current.job, effective.config.worker_lease_timeout_seconds, now) {
+                    return Ok(current);
+                }
+                let mut expired = current;
+                expired.job.status = TableMetadataMaintenanceJobStatus::Failed;
+                expired.job.failure_reason = Some("maintenance worker lease expired".to_string());
+                expired.job.finished_at = Some(maintenance_timestamp(now));
+                self.put_table_metadata_maintenance_report(&expired).await?;
+            } else if table_maintenance_job_retry_is_pending(&current.job, now) {
+                return Ok(current);
+            }
+        }
+
+        self.run_table_metadata_maintenance_with_config(
+            table_bucket,
+            namespace,
+            table,
+            effective.config.delete_enabled,
+            Some(worker_id),
+            effective,
+        )
+        .await
+    }
+
+    pub(crate) async fn heartbeat_table_metadata_maintenance_job(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        job_id: &str,
+        lease_id: &str,
+        worker_id: &str,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        self.heartbeat_table_metadata_maintenance_job_at(
+            TableMaintenanceHeartbeatRef {
+                table_bucket,
+                namespace,
+                table,
+                job_id,
+                lease_id,
+                worker_id,
+            },
+            OffsetDateTime::now_utc(),
+        )
+        .await
+    }
+
+    async fn heartbeat_table_metadata_maintenance_job_at(
+        &self,
+        heartbeat: TableMaintenanceHeartbeatRef<'_>,
+        now: OffsetDateTime,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        let namespace = parse_namespace_for_store(heartbeat.namespace)?;
+        let table = parse_table_for_store(heartbeat.table)?;
+        let table_path = self.paths.table_entry_path(heartbeat.table_bucket, &namespace, &table);
+        let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
+        let Some(mut report) = self
+            .get_table_metadata_maintenance_report(
+                heartbeat.table_bucket,
+                &namespace.public_name(),
+                table.as_str(),
+                MAINTENANCE_JOB_ALIAS_CURRENT,
+            )
+            .await?
+        else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "maintenance job {}/{}/{}/{}",
+                heartbeat.table_bucket,
+                namespace.public_name(),
+                table.as_str(),
+                heartbeat.job_id
+            )));
+        };
+        if report.job.job_id != heartbeat.job_id {
+            return Err(TableCatalogStoreError::Conflict("maintenance job is not current".to_string()));
+        }
+        if !matches!(report.job.status, TableMetadataMaintenanceJobStatus::Running) {
+            return Err(TableCatalogStoreError::Conflict("maintenance job is not running".to_string()));
+        }
+        if report.job.lease_id != heartbeat.lease_id {
+            return Err(TableCatalogStoreError::Conflict("maintenance lease does not match".to_string()));
+        }
+        if report.job.worker_id.as_deref() != Some(heartbeat.worker_id) {
+            return Err(TableCatalogStoreError::Conflict("maintenance worker does not match".to_string()));
+        }
+
+        report.job.heartbeat_at = Some(maintenance_timestamp(now));
+        self.put_table_metadata_maintenance_report(&report).await?;
+        Ok(report)
+    }
+
+    async fn put_table_metadata_maintenance_worker_control_report(
+        &self,
+        control: TableMaintenanceWorkerControlReport<'_>,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        let namespace = parse_namespace_for_store(control.namespace)?;
+        let table = parse_table_for_store(control.table)?;
+        let table_path = self.paths.table_entry_path(control.table_bucket, &namespace, &table);
+        let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &table_path).await? else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "table {}/{}/{}",
+                control.table_bucket,
+                namespace.public_name(),
+                table.as_str()
+            )));
+        };
+        let timestamp = maintenance_timestamp(control.now);
+        let cleanup_watermark_unix_seconds =
+            (control.now - Duration::seconds(TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS)).unix_timestamp();
+        let current_metadata_location = entry.metadata_location.clone();
+        let report = TableMetadataMaintenanceReport {
+            job: TableMetadataMaintenanceJob {
+                job_id: Uuid::new_v4().to_string(),
+                table_bucket: control.table_bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                table_id: entry.table_id,
+                operation: TableMetadataMaintenanceOperation::DryRun,
+                status: control.status,
+                failure_reason: Some(control.reason.to_string()),
+                config_source: control.effective.source,
+                worker_id: Some(control.worker_id),
+                lease_id: String::new(),
+                attempt: 0,
+                max_retry_attempts: control.effective.config.max_retry_attempts,
+                next_retry_after: None,
+                quarantine_enabled: control.effective.config.quarantine_enabled,
+                quarantine_retention_seconds: control.effective.config.quarantine_retention_seconds,
+                heartbeat_at: None,
+                started_at: Some(timestamp.clone()),
+                finished_at: Some(timestamp),
+                current_metadata_location: current_metadata_location.clone(),
+                current_generation: entry.generation,
+                retain_recent_metadata_files: control.effective.config.retain_recent_metadata_files,
+                safety_window_seconds: TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS,
+                cleanup_watermark_unix_seconds,
+                planned_metadata_file_count: 0,
+                retained_metadata_file_count: 0,
+                cleanup_candidate_count: 0,
+                deletable_metadata_file_count: 0,
+                deleted_metadata_file_count: 0,
+                quarantined_object_count: 0,
+            },
+            current_metadata_location,
+            retained_metadata_locations: Vec::new(),
+            cleanup_candidate_locations: Vec::new(),
+            deletable_metadata_locations: Vec::new(),
+            object_reports: Vec::new(),
+            referenced_object_reports: Vec::new(),
+            reachability_graph: TableMaintenanceReachabilityGraphReport::default(),
+            snapshot_expiration: None,
+            compaction: None,
+        };
+        self.put_table_metadata_maintenance_report(&report).await?;
+        Ok(report)
     }
 
     pub(crate) async fn plan_table_snapshot_expiration(
@@ -2688,7 +2933,7 @@ impl<S> Clone for EcStoreTableCatalogObjectBackend<S> {
 
 impl<S> EcStoreTableCatalogObjectBackend<S>
 where
-    S: StorageAPI + NamespaceLocking,
+    S: ObjectIO + ObjectOperations + ListOperations + NamespaceLocking,
 {
     pub fn new(store: Arc<S>) -> Self {
         Self { store }
@@ -2700,7 +2945,7 @@ pub(crate) type EcStoreTableCatalogStore<S> = ObjectTableCatalogStore<EcStoreTab
 #[async_trait::async_trait]
 impl<S> TableCatalogObjectBackend for EcStoreTableCatalogObjectBackend<S>
 where
-    S: StorageAPI + NamespaceLocking,
+    S: ObjectIO + ObjectOperations + ListOperations + NamespaceLocking,
 {
     async fn read_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
         self.read_object_with_options(bucket, object, ObjectOptions::default()).await
@@ -2799,7 +3044,7 @@ where
 
 impl<S> EcStoreTableCatalogObjectBackend<S>
 where
-    S: StorageAPI + NamespaceLocking,
+    S: ObjectIO + ObjectOperations + ListOperations + NamespaceLocking,
 {
     async fn read_object_with_options(
         &self,
@@ -3448,6 +3693,36 @@ fn maintenance_timestamp(now: OffsetDateTime) -> String {
         .unwrap_or_else(|_| now.unix_timestamp().to_string())
 }
 
+fn default_table_maintenance_worker_lease_timeout_seconds() -> u64 {
+    TABLE_MAINTENANCE_WORKER_LEASE_TIMEOUT_DEFAULT_SECONDS
+}
+
+fn parse_maintenance_timestamp(timestamp: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(timestamp, &time::format_description::well_known::Rfc3339).ok()
+}
+
+fn table_maintenance_job_lease_is_active(
+    job: &TableMetadataMaintenanceJob,
+    worker_lease_timeout_seconds: u64,
+    now: OffsetDateTime,
+) -> bool {
+    let Some(heartbeat_at) = job.heartbeat_at.as_deref().and_then(parse_maintenance_timestamp) else {
+        return false;
+    };
+    let timeout_seconds = i64::try_from(worker_lease_timeout_seconds).unwrap_or(i64::MAX);
+    heartbeat_at.saturating_add(Duration::seconds(timeout_seconds)) > now
+}
+
+fn table_maintenance_job_retry_is_pending(job: &TableMetadataMaintenanceJob, now: OffsetDateTime) -> bool {
+    if !matches!(job.status, TableMetadataMaintenanceJobStatus::Failed) {
+        return false;
+    }
+    let Some(next_retry_after) = job.next_retry_after.as_deref().and_then(parse_maintenance_timestamp) else {
+        return false;
+    };
+    next_retry_after > now
+}
+
 fn validate_catalog_entry_version(kind: &str, version: u16) -> TableCatalogStoreResult<()> {
     if version != TABLE_CATALOG_ENTRY_VERSION {
         return Err(TableCatalogStoreError::Invalid(format!("unsupported {kind} entry version")));
@@ -3466,10 +3741,15 @@ fn validate_table_maintenance_config_version(version: u16) -> TableCatalogStoreR
 
 fn validate_table_maintenance_config(config: &TableMaintenanceConfig) -> TableCatalogStoreResult<()> {
     validate_table_maintenance_config_version(config.version)?;
-    if config.background_enabled {
+    if config.worker_lease_timeout_seconds == 0 {
         return Err(TableCatalogStoreError::Invalid(
-            "background table maintenance is not supported".to_string(),
+            "worker-lease-timeout-seconds must be greater than zero".to_string(),
         ));
+    }
+    if config.worker_lease_timeout_seconds > TABLE_MAINTENANCE_WORKER_LEASE_TIMEOUT_MAX_SECONDS {
+        return Err(TableCatalogStoreError::Invalid(format!(
+            "worker-lease-timeout-seconds cannot exceed {TABLE_MAINTENANCE_WORKER_LEASE_TIMEOUT_MAX_SECONDS}"
+        )));
     }
     if config.max_retry_attempts > 10 {
         return Err(TableCatalogStoreError::Invalid("max-retry-attempts cannot exceed 10".to_string()));
@@ -5246,7 +5526,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maintenance_config_rejects_background_enabled_until_worker_exists() {
+    async fn maintenance_config_accepts_background_enabled_worker_runtime_controls() {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend);
         let bucket = "analytics";
@@ -5256,7 +5536,7 @@ mod tests {
 
         seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
 
-        let bucket_err = store
+        let bucket_config = store
             .put_table_bucket_maintenance_config(
                 bucket,
                 TableMaintenanceConfig {
@@ -5264,14 +5544,18 @@ mod tests {
                     retain_recent_metadata_files: 1,
                     delete_enabled: false,
                     background_enabled: true,
+                    worker_paused: true,
+                    worker_lease_timeout_seconds: 60,
                     ..Default::default()
                 },
             )
             .await
-            .unwrap_err();
-        assert_matches!(bucket_err, TableCatalogStoreError::Invalid(_));
+            .expect("background maintenance bucket config should persist");
+        assert!(bucket_config.background_enabled);
+        assert!(bucket_config.worker_paused);
+        assert_eq!(bucket_config.worker_lease_timeout_seconds, 60);
 
-        let table_err = store
+        let table_config = store
             .put_table_maintenance_config(
                 bucket,
                 "sales",
@@ -5281,12 +5565,16 @@ mod tests {
                     retain_recent_metadata_files: 1,
                     delete_enabled: false,
                     background_enabled: true,
+                    worker_paused: false,
+                    worker_lease_timeout_seconds: 120,
                     ..Default::default()
                 },
             )
             .await
-            .unwrap_err();
-        assert_matches!(table_err, TableCatalogStoreError::Invalid(_));
+            .expect("background maintenance table config should persist");
+        assert!(table_config.background_enabled);
+        assert!(!table_config.worker_paused);
+        assert_eq!(table_config.worker_lease_timeout_seconds, 120);
     }
 
     #[tokio::test]
@@ -5315,6 +5603,7 @@ mod tests {
                     retry_max_backoff_seconds: 60,
                     quarantine_enabled: true,
                     quarantine_retention_seconds: 86_400,
+                    ..Default::default()
                 },
             )
             .await
@@ -5505,6 +5794,7 @@ mod tests {
                     retry_max_backoff_seconds: 30,
                     quarantine_enabled: true,
                     quarantine_retention_seconds: 86_400,
+                    ..Default::default()
                 },
             )
             .await
@@ -5542,6 +5832,307 @@ mod tests {
             .expect("failed maintenance job should be stored");
         assert_eq!(latest.job.job_id, report.job.job_id);
         assert_eq!(latest.job.status, TableMetadataMaintenanceJobStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn maintenance_worker_run_skips_when_background_is_disabled() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let old = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend.seed_object(bucket, &old, b"{}".to_vec()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+
+        let report = store
+            .run_table_metadata_maintenance_worker_once(bucket, "sales", "orders", "worker-a".to_string())
+            .await
+            .expect("disabled background worker tick should report a safe no-op");
+
+        assert_eq!(report.job.status, TableMetadataMaintenanceJobStatus::Disabled);
+        assert_eq!(report.job.worker_id.as_deref(), Some("worker-a"));
+        assert_eq!(report.job.deleted_metadata_file_count, 0);
+        assert!(backend.object_exists(bucket, &old).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn maintenance_worker_run_honors_paused_config() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let old = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend.seed_object(bucket, &old, b"{}".to_vec()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+        store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    retain_recent_metadata_files: 0,
+                    delete_enabled: true,
+                    background_enabled: true,
+                    worker_paused: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("paused background maintenance config should persist");
+
+        let report = store
+            .run_table_metadata_maintenance_worker_once(bucket, "sales", "orders", "worker-a".to_string())
+            .await
+            .expect("paused worker tick should report a safe no-op");
+
+        assert_eq!(report.job.status, TableMetadataMaintenanceJobStatus::Paused);
+        assert_eq!(report.job.operation, TableMetadataMaintenanceOperation::DryRun);
+        assert_eq!(report.job.deleted_metadata_file_count, 0);
+        assert!(backend.object_exists(bucket, &old).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn maintenance_worker_run_defers_until_retry_after() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let old = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(100);
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend.seed_object(bucket, &old, b"{}".to_vec()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+        store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    retain_recent_metadata_files: 0,
+                    delete_enabled: false,
+                    background_enabled: true,
+                    max_retry_attempts: 2,
+                    retry_initial_backoff_seconds: 60,
+                    retry_max_backoff_seconds: 60,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("retry-enabled maintenance config should persist");
+        let mut failed = store
+            .run_table_metadata_maintenance(bucket, "sales", "orders", true, Some("worker-a".to_string()))
+            .await
+            .expect("delete failure should be recorded when delete is disabled");
+        failed.job.next_retry_after = Some(maintenance_timestamp(now + Duration::seconds(30)));
+        store
+            .put_table_metadata_maintenance_report(&failed)
+            .await
+            .expect("failed retry report should be seeded");
+
+        let deferred = store
+            .run_table_metadata_maintenance_worker_once_at(bucket, "sales", "orders", "worker-b".to_string(), now)
+            .await
+            .expect("worker tick should defer while retry backoff is active");
+
+        assert_eq!(deferred.job.job_id, failed.job.job_id);
+        assert_eq!(deferred.job.status, TableMetadataMaintenanceJobStatus::Failed);
+        assert_eq!(deferred.job.worker_id.as_deref(), Some("worker-a"));
+        assert!(backend.object_exists(bucket, &old).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn maintenance_worker_run_backpressures_active_running_job() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(100);
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+        store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    retain_recent_metadata_files: 0,
+                    delete_enabled: false,
+                    background_enabled: true,
+                    worker_lease_timeout_seconds: 300,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("background maintenance config should persist");
+        let mut running = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .expect("maintenance report should be planned");
+        running.job.status = TableMetadataMaintenanceJobStatus::Running;
+        running.job.worker_id = Some("worker-a".to_string());
+        running.job.lease_id = "lease-a".to_string();
+        running.job.heartbeat_at = Some(maintenance_timestamp(now - Duration::seconds(10)));
+        store
+            .put_table_metadata_maintenance_report(&running)
+            .await
+            .expect("running maintenance report should be seeded");
+
+        let report = store
+            .run_table_metadata_maintenance_worker_once_at(bucket, "sales", "orders", "worker-b".to_string(), now)
+            .await
+            .expect("worker tick should return the active running job");
+
+        assert_eq!(report.job.job_id, running.job.job_id);
+        assert_eq!(report.job.status, TableMetadataMaintenanceJobStatus::Running);
+        assert_eq!(report.job.worker_id.as_deref(), Some("worker-a"));
+    }
+
+    #[tokio::test]
+    async fn maintenance_worker_run_recovers_expired_running_job() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let old = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(1000);
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend.seed_object(bucket, &old, b"{}".to_vec()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+        store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    retain_recent_metadata_files: 0,
+                    delete_enabled: false,
+                    background_enabled: true,
+                    worker_lease_timeout_seconds: 60,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("background maintenance config should persist");
+        let mut running = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .expect("maintenance report should be planned");
+        let expired_job_id = running.job.job_id.clone();
+        running.job.status = TableMetadataMaintenanceJobStatus::Running;
+        running.job.worker_id = Some("worker-a".to_string());
+        running.job.lease_id = "lease-a".to_string();
+        running.job.heartbeat_at = Some(maintenance_timestamp(now - Duration::seconds(120)));
+        store
+            .put_table_metadata_maintenance_report(&running)
+            .await
+            .expect("expired running maintenance report should be seeded");
+
+        let report = store
+            .run_table_metadata_maintenance_worker_once_at(bucket, "sales", "orders", "worker-b".to_string(), now)
+            .await
+            .expect("worker tick should recover expired running job and run again");
+
+        assert_ne!(report.job.job_id, expired_job_id);
+        assert_eq!(report.job.status, TableMetadataMaintenanceJobStatus::Successful);
+        assert_eq!(report.job.worker_id.as_deref(), Some("worker-b"));
+
+        let expired = store
+            .get_table_metadata_maintenance_report(bucket, "sales", "orders", &expired_job_id)
+            .await
+            .expect("expired job lookup should succeed")
+            .expect("expired job should remain addressable");
+        assert_eq!(expired.job.status, TableMetadataMaintenanceJobStatus::Failed);
+        assert!(
+            expired
+                .job
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("lease expired"))
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_worker_heartbeat_updates_current_running_job() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let first = OffsetDateTime::UNIX_EPOCH + Duration::seconds(100);
+        let second = OffsetDateTime::UNIX_EPOCH + Duration::seconds(130);
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+        backend
+            .seed_object(
+                bucket,
+                &default_table_metadata_file_path(&namespace, &table, "00002.metadata.json"),
+                br#"{"metadata-log":[]}"#.to_vec(),
+            )
+            .await;
+        let mut running = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .expect("maintenance report should be planned");
+        running.job.status = TableMetadataMaintenanceJobStatus::Running;
+        running.job.worker_id = Some("worker-a".to_string());
+        running.job.lease_id = "lease-a".to_string();
+        running.job.heartbeat_at = Some(maintenance_timestamp(first));
+        let job_id = running.job.job_id.clone();
+        store
+            .put_table_metadata_maintenance_report(&running)
+            .await
+            .expect("running maintenance report should be seeded");
+
+        let heartbeat = store
+            .heartbeat_table_metadata_maintenance_job_at(
+                TableMaintenanceHeartbeatRef {
+                    table_bucket: bucket,
+                    namespace: "sales",
+                    table: "orders",
+                    job_id: &job_id,
+                    lease_id: "lease-a",
+                    worker_id: "worker-a",
+                },
+                second,
+            )
+            .await
+            .expect("heartbeat should update the current running job");
+
+        assert_eq!(heartbeat.job.job_id, job_id);
+        assert_eq!(heartbeat.job.status, TableMetadataMaintenanceJobStatus::Running);
+        assert_eq!(heartbeat.job.heartbeat_at.as_deref(), Some(maintenance_timestamp(second).as_str()));
     }
 
     #[tokio::test]

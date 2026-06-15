@@ -133,9 +133,10 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
     },
     {
         "capability": "background-maintenance-worker",
-        "status": "unsupported",
+        "status": "controlled-run-once-supported",
         "roadmap_area": "maintenance-worker",
-        "expected_behavior": "manual maintenance APIs expose retry/quarantine policy fields in reports, but background-enabled maintenance is rejected until a worker owns scheduling",
+        "catalog_endpoint": "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/maintenance/worker/run",
+        "expected_behavior": "background-enabled maintenance can be driven by the worker run endpoint with current-job backpressure, retry deferral, lease expiry recovery, and heartbeat updates; built-in periodic scheduling is not claimed",
     },
     {
         "capability": "manifest-data-reachability-cleanup",
