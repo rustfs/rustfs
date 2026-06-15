@@ -5,17 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-startup-storage-runtime`
-- Baseline: `origin/main` at `a19560da419c6d354a805fc127951cc9b56ad887`
+- Branch: `overtrue/arch-startup-runtime-services`
+- Baseline: `origin/main` at `3e723a2476692051cac1eab2cc31984c62063130`
 - PR type for this branch: `pure-move`
-- Runtime behavior changes: no external behavior change expected; ECStore
-  creation, ECStore config initialization, global config retry policy,
-  `StorageReady` publication, and background replication startup still run in
-  the same relative order after HTTP server startup and before KMS startup.
-- Rust code changes: add `startup_storage::init_startup_storage_runtime` and
+- Runtime behavior changes: no external behavior change expected; KMS, optional
+  protocols, diagnostics services, bucket metadata migration, IAM bootstrap,
+  auth integrations, notification runtime, heal/scanner setup, and metrics
+  initialization still run in the same relative order after storage runtime and
+  before the server-ready log.
+- Rust code changes: add `startup_services::init_startup_runtime_services` and
   use it from binary startup.
 - CI/script changes: none.
-- Docs changes: record `R-016` startup storage runtime bootstrap progress and
+- Docs changes: record `R-017` startup runtime service bootstrap progress and
   verification.
 
 ## Phase 0 Tasks
@@ -680,10 +681,33 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     formatting, migration guards, Rust risk scan, branch freshness check, and
     pre-commit quality gate.
 
+- [x] `R-017` Centralize startup runtime service bootstrap.
+  - Do: move KMS startup, optional protocol shutdown collection, buffer
+    profiling, event notifier/audit startup, deadlock detector startup, bucket
+    metadata migration, replication resync, IAM bootstrap, Keystone/OIDC auth
+    integration startup, notification runtime setup, AHM/heal setup, server info,
+    update check, allocator reclaim, metrics runtime, memory observability, and
+    auto-tuner startup behind the `startup_services` boundary.
+  - Acceptance: startup service initialization still runs after storage runtime
+    initialization and before the server-ready log; `main.rs` keeps ownership of
+    shutdown handling, server-ready publication, global init time, and scanner
+    start; `startup_services` returns protocol shutdown handles, IAM bootstrap
+    disposition, and scanner enablement.
+  - Must preserve: KMS fatal behavior, protocol fatal/disabled behavior, audit
+    non-fatal behavior, deadlock detector logging, bucket list and replication
+    resync fatal behavior, bucket/IAM metadata migration non-fatal behavior, IAM
+    deferred recovery semantics, Keystone parse fatal and runtime non-fatal
+    behavior, OIDC non-fatal behavior, notification init fatal behavior,
+    scanner-implies-heal behavior, metric-enabled guard, and shutdown token
+    ownership.
+  - Verification: focused startup services tests, binary/lib compile checks,
+    formatting, migration guards, Rust risk scan, branch freshness check, and
+    pre-commit quality gate.
+
 ## Next PRs
 
-1. `pure-move`: continue extracting startup boot wrappers in larger slices while
-   preserving startup order and readiness ownership.
+1. `pure-move`: continue extracting startup ready/scanner/shutdown wrappers while
+   preserving startup order, readiness ownership, and shutdown ownership.
 2. `ci-gate`: finish `G-006` public re-export and storage trait coverage checks
    before the remaining cleanup slices.
 
@@ -691,38 +715,39 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Pure-move slice removes storage runtime details from binary startup behind the existing startup storage boundary. |
-| Migration preservation | passed | HTTP server startup, ECStore creation, config init/migration, global config retry, `StorageReady`, replication startup, and KMS startup order are preserved. |
-| Testing/verification | passed | Focused startup storage tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Pure-move slice removes runtime service details from binary startup behind the existing startup services boundary. |
+| Migration preservation | passed | Storage runtime, KMS, optional protocols, diagnostics, bucket metadata, IAM, auth, notification, heal/scanner, metrics, and server-ready order are preserved. |
+| Testing/verification | passed | Focused startup services tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `a19560da419c6d354a805fc127951cc9b56ad887`:
+Passed on `3e723a2476692051cac1eab2cc31984c62063130`:
 
-- `cargo test -p rustfs startup_storage --no-fail-fast`: passed.
+- `cargo test -p rustfs startup_services --no-fail-fast`: passed.
 - `cargo check -p rustfs --lib`: passed.
 - `cargo check -p rustfs --bin rustfs`: passed.
 - `cargo fmt --all --check`: passed.
 - `git diff --check`: passed.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
-- `git rev-list --left-right --count HEAD...origin/main` returned `1 0`
-  after commit and rebase.
-- Added-line Rust risk scan for changed Rust files: no matches.
-- Full-file risk scan for changed Rust files: matches are existing binary
-  startup stderr/expect usage.
-- `make pre-commit`: all checks passed, including nextest with 6016 passed
-  and 111 skipped, plus doctests.
+- Added-line Rust risk scan for changed Rust files: passed.
+- Full-file risk scan for changed Rust files: existing `main.rs` process setup
+  entries only.
+- `make pre-commit`: passed, including nextest `6027` passed / `111` skipped
+  and doctests.
+- `git rev-list --left-right --count HEAD...origin/main`: returned `1 0`
+  after commit.
 
 Notes:
 
-- This slice centralizes startup storage runtime without changing startup
-  ordering, shutdown token ownership, or endpoint pool ownership.
-- Storage runtime remains after HTTP server startup and before KMS startup.
+- This slice centralizes startup runtime services without changing startup
+  ordering, shutdown token ownership, readiness ownership, or endpoint pool
+  ownership.
+- Runtime services remain after storage runtime and before the server-ready log.
 
 ## Handoff Notes
 
-- R-016 is complete.
+- R-017 is implemented, locally verified, and current with `origin/main`.
 - Next startup slices can keep using larger pure moves, but must keep startup
   ordering, fatal/non-fatal boundaries, shutdown ownership, and readiness
-  ownership explicit in tests.
+  ownership explicit in tests and review notes.
