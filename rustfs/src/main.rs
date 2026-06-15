@@ -26,15 +26,12 @@ use rustfs::startup_iam::{bootstrap_or_defer_iam_init, publish_ready_for_iam_boo
 use rustfs::startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight};
 use rustfs::startup_protocols::{ProtocolShutdownSenders, init_protocol_shutdown_senders};
 use rustfs::startup_server::{StartupHttpServers, StartupListenContext, init_startup_http_servers, init_startup_listen_context};
-use rustfs::startup_storage::init_startup_storage_foundation;
-use rustfs_common::SystemStage;
+use rustfs::startup_storage::{StartupStorageRuntime, init_startup_storage_foundation, init_startup_storage_runtime};
 use rustfs_ecstore::{
     bucket::metadata_sys::init_bucket_metadata_sys,
     bucket::migration::{try_migrate_bucket_metadata, try_migrate_iam_config},
-    bucket::replication::{get_global_replication_pool, init_background_replication},
-    config as ecconfig,
+    bucket::replication::get_global_replication_pool,
     global::shutdown_background_services,
-    store::ECStore,
     store_api::BucketOperations,
 };
 use rustfs_heal::{
@@ -57,9 +54,7 @@ const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
 const LOG_COMPONENT_MAIN: &str = "main";
 const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const LOG_SUBSYSTEM_AUTH: &str = "auth";
-const LOG_SUBSYSTEM_STORAGE: &str = "storage";
 const EVENT_SERVER_RUNTIME_FAILED: &str = "server_runtime_failed";
-const EVENT_STARTUP_STORAGE_STAGE: &str = "startup_storage_stage";
 const EVENT_PROTOCOL_SYSTEM_STATE: &str = "protocol_system_state";
 const EVENT_AUDIT_SYSTEM_STATE: &str = "audit_system_state";
 const EVENT_DEADLOCK_DETECTOR_STATE: &str = "deadlock_detector_state";
@@ -169,61 +164,11 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
         console_shutdown_tx,
     } = init_startup_http_servers(&config, readiness.clone()).await?;
 
-    let ctx = CancellationToken::new();
+    let StartupStorageRuntime {
+        store,
+        shutdown_token: ctx,
+    } = init_startup_storage_runtime(server_addr, &endpoint_pools, readiness.clone()).await?;
 
-    // init store
-    // 2. Start Storage Engine (ECStore)
-    debug!(
-        target: "rustfs::main::run",
-        event = EVENT_STARTUP_STORAGE_STAGE,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STORAGE,
-        stage = "ecstore_initialization",
-        state = "starting",
-        "starting ECStore initialization"
-    );
-    let store = ECStore::new(server_addr, endpoint_pools.clone(), ctx.clone())
-        .await
-        .inspect_err(|err| {
-            error!(
-                target: "rustfs::main::run",
-                event = EVENT_STARTUP_STORAGE_STAGE,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STORAGE,
-                stage = "ecstore_initialization",
-                state = "failed",
-                error = ?err,
-                "ECStore initialization failed"
-            );
-        })?;
-
-    ecconfig::init();
-    ecconfig::try_migrate_server_config(store.clone()).await;
-
-    // // Initialize global configuration system
-    let mut retry_count = 0;
-    while let Err(e) = ecconfig::init_global_config_sys(store.clone()).await {
-        error!(
-            target: "rustfs::main::run",
-            event = EVENT_STARTUP_STORAGE_STAGE,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STORAGE,
-            stage = "global_config_initialization",
-            state = "retrying",
-            retry_count = retry_count + 1,
-            error = ?e,
-            "Global config initialization retry failed"
-        );
-        // TODO: check error type
-        retry_count += 1;
-        if retry_count > 15 {
-            return Err(Error::other("ecconfig::init_global_config_sys failed"));
-        }
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    }
-    readiness.mark_stage(SystemStage::StorageReady);
-    // init replication_pool
-    init_background_replication(store.clone()).await;
     // Initialize KMS system if enabled
     init_kms_system(&config).await?;
 
