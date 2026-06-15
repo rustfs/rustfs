@@ -5,19 +5,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-startup-listen-and-server-bootstrap`
-- Baseline: `origin/main` at `c2e0792f6ffa6d0c30c4d516204fcc252c529592`
+- Branch: `overtrue/arch-startup-storage-bootstrap`
+- Baseline: `origin/main` at `6508f88d3a5edb428a5d623f927ce384691f0cd4`
 - PR type for this branch: `pure-move`
-- Runtime behavior changes: no external behavior change expected; server config
-  logging, readiness creation, region/global address/global port setup, action
-  credentials, capacity/state setup, and S3/console HTTP server startup still
-  run in the same relative order.
-- Rust code changes: add
-  `startup_server::{init_startup_listen_context, init_startup_http_servers}`
-  and use them from binary startup.
+- Runtime behavior changes: no external behavior change expected; endpoint
+  parsing, unsupported filesystem policy enforcement, global endpoint/erasure
+  type publication, local disk/prewarm, lock clients, and storage pool logging
+  still run in the same relative order between listen context and HTTP server
+  startup.
+- Rust code changes: add `startup_storage::init_startup_storage_foundation`
+  and use it from binary startup.
 - CI/script changes: none.
-- Docs changes: record `R-014` startup listen and HTTP server bootstrap progress
-  and verification.
+- Docs changes: record `R-015` startup storage foundation bootstrap progress and
+  verification.
 
 ## Phase 0 Tasks
 
@@ -644,6 +644,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     formatting, migration guards, Rust risk scan, branch freshness check, and
     pre-commit quality gate.
 
+- [x] `R-015` Centralize startup storage foundation bootstrap.
+  - Do: move endpoint parsing, unsupported filesystem policy enforcement, global
+    endpoint publication, erasure type update, local disk initialization, local
+    disk ID map prewarm, lock client initialization, and storage pool logging
+    behind a `startup_storage` helper.
+  - Acceptance: storage foundation still runs after listen context setup and
+    before HTTP server startup; endpoint parse errors and local disk init errors
+    keep the same logging and `Error::other` mappings; global endpoints and
+    erasure type are published before local disk and lock client setup.
+  - Must preserve: endpoint parse start/failure events, unsupported filesystem
+    policy enforcement, global endpoint clone shape, erasure type update timing,
+    local disk init/prewarm order, lock client setup, storage pool
+    formatting/host-risk/debug logs, and endpoint pool ownership for later
+    ECStore startup.
+  - Verification: focused startup storage tests, binary/lib compile checks,
+    formatting, migration guards, Rust risk scan, branch freshness check, and
+    pre-commit quality gate.
+
 ## Next PRs
 
 1. `pure-move`: continue extracting startup boot wrappers in larger slices while
@@ -655,41 +673,39 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Pure-move slice removes listen context and HTTP server bootstrap details from binary startup behind the existing startup module pattern. |
-| Migration preservation | passed | Server config logging, readiness creation, region/address publication, action credentials, capacity/state setup, endpoint/storage interleaving, and shutdown handle ownership are preserved. |
-| Testing/verification | passed | Focused startup server tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Pure-move slice removes storage foundation details from binary startup behind the existing startup module pattern. |
+| Migration preservation | passed | Endpoint parsing, filesystem policy, global endpoint/erasure publication, local disk/prewarm, lock clients, and pool logging order are preserved. |
+| Testing/verification | passed | Focused startup storage tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `c2e0792f6ffa6d0c30c4d516204fcc252c529592`:
+Passed on `6508f88d3a5edb428a5d623f927ce384691f0cd4`:
 
-- `cargo test -p rustfs startup_server --no-fail-fast`: passed.
+- `cargo test -p rustfs startup_storage --no-fail-fast`: passed.
 - `cargo check -p rustfs --lib`: passed.
 - `cargo check -p rustfs --bin rustfs`: passed.
 - `cargo fmt --all --check`: passed.
 - `git diff --check`: passed.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
-- `git rev-list --left-right --count HEAD...origin/main` returned `1 0`
-  after the final rebase onto `origin/main`.
+- `git rev-list --left-right --count HEAD...origin/main` returned `0 0`
+  before commit.
 - Added-line Rust risk scan for changed Rust files: no matches.
 - Full-file risk scan for changed Rust files: matches are existing docs example
   output and existing binary startup alias/stderr/expect usage.
-- `make pre-commit`: all checks passed before the final clean rebase,
-  including nextest with 6006 passed and 111 skipped, plus doctests.
-- Post-rebase focused startup server tests, binary/lib compile checks,
-  formatting, migration/layer guards, and diff checks passed.
+- `make pre-commit`: all checks passed, including nextest with 6009 passed
+  and 111 skipped, plus doctests.
 
 Notes:
 
-- This slice centralizes startup listen context and HTTP server bootstrap
-  without changing startup ordering or shutdown handle ownership.
-- Endpoint/storage initialization remains between listen context setup and HTTP
-  server startup.
+- This slice centralizes startup storage foundation without changing startup
+  ordering or endpoint pool ownership.
+- Storage foundation remains after listen context setup and before HTTP server
+  startup.
 
 ## Handoff Notes
 
-- R-014 is complete.
+- R-015 is complete.
 - Next startup slices can keep using larger pure moves, but must keep startup
   ordering, fatal/non-fatal boundaries, shutdown ownership, and readiness
   ownership explicit in tests.
