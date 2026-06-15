@@ -1260,9 +1260,14 @@ impl ReplicationWorkerOperation for DeletedObjectReplicationInfo {
         MrfReplicateEntry {
             bucket: self.bucket.clone(),
             object: self.delete_object.object_name.clone(),
-            version_id: None,
+            // version_id here is the version being purged (if any); the delete-marker
+            // version is stored separately in delete_marker_version_id.
+            version_id: self.delete_object.version_id,
             retry_count: 0,
             size: 0,
+            op: rustfs_filemeta::MrfOpKind::Delete,
+            delete_marker_version_id: self.delete_object.delete_marker_version_id,
+            delete_marker: self.delete_object.delete_marker,
         }
     }
 

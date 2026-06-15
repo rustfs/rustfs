@@ -534,7 +534,20 @@ impl ReplicatedInfos {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+/// Distinguishes the kind of operation stored in [`MrfReplicateEntry`].
+///
+/// Old serialized files lack the `op` key; `default` maps to `Object`, which preserves
+/// the pre-existing replay behaviour for entries written before this field existed.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MrfOpKind {
+    #[default]
+    #[serde(rename = "object")]
+    Object,
+    #[serde(rename = "delete")]
+    Delete,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MrfReplicateEntry {
     #[serde(rename = "bucket")]
     pub bucket: String,
@@ -552,6 +565,20 @@ pub struct MrfReplicateEntry {
 
     #[serde(rename = "size", default)]
     pub size: i64,
+
+    // Operation kind. Old files lack this key; default=Object preserves existing behaviour.
+    #[serde(rename = "op", default)]
+    pub op: MrfOpKind,
+
+    // For delete entries: the delete-marker version id (distinct from version_id, which is
+    // the version being purged). Old files lack this; default=None is correct.
+    #[serde(rename = "deleteMarkerVersionID", skip_serializing_if = "Option::is_none", default)]
+    pub delete_marker_version_id: Option<Uuid>,
+
+    // For delete entries: whether this is a delete-marker vs a versioned-object delete.
+    // Old files lack this; default=false is correct.
+    #[serde(rename = "deleteMarker", default)]
+    pub delete_marker: bool,
 }
 
 pub trait ReplicationWorkerOperation: Any + Send + Sync {
@@ -750,6 +777,9 @@ impl ReplicationWorkerOperation for ReplicateObjectInfo {
             version_id: self.version_id,
             retry_count: self.retry_count as i32,
             size: self.size,
+            op: MrfOpKind::Object,
+            delete_marker_version_id: None,
+            delete_marker: false,
         }
     }
 
@@ -797,6 +827,9 @@ impl ReplicateObjectInfo {
             version_id: self.version_id,
             retry_count: self.retry_count as i32,
             size: self.size,
+            op: MrfOpKind::Object,
+            delete_marker_version_id: None,
+            delete_marker: false,
         }
     }
 }

@@ -30,6 +30,7 @@ use crate::disk::BUCKET_META_PREFIX;
 use crate::error::Error as EcstoreError;
 use crate::store_api::{NamespaceLocking, ObjectIO, ObjectInfo, ObjectOptions};
 use lazy_static::lazy_static;
+use rustfs_filemeta::MrfOpKind;
 use rustfs_filemeta::MrfReplicateEntry;
 use rustfs_filemeta::ReplicateDecision;
 use rustfs_filemeta::ReplicateObjectInfo;
@@ -832,29 +833,52 @@ impl<S: StorageAPI + NamespaceLocking> ReplicationPool<S> {
             let mut queued_count = 0usize;
 
             for entry in entries.iter() {
-                let opts = ObjectOptions {
-                    version_id: entry.version_id.map(|u| u.to_string()),
-                    ..Default::default()
-                };
-                let oi = match storage.get_object_info(&entry.bucket, &entry.object, &opts).await {
-                    Ok(oi) => oi,
-                    Err(e) => {
-                        debug!(
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_REPLICATION,
-                            bucket = %entry.bucket,
-                            object = %entry.object,
-                            error = %e,
-                            "MRF recovery: object not found, skipping"
-                        );
-                        continue;
+                match entry.op {
+                    MrfOpKind::Delete => {
+                        // Reconstruct a heal delete and re-queue it.  We do NOT call
+                        // get_object_info here because the delete-marker or version may
+                        // already be absent from the local store — that is expected.
+                        let dv = DeletedObjectReplicationInfo {
+                            delete_object: crate::store_api::DeletedObject {
+                                object_name: entry.object.clone(),
+                                version_id: entry.version_id,
+                                delete_marker_version_id: entry.delete_marker_version_id,
+                                delete_marker: entry.delete_marker,
+                                ..Default::default()
+                            },
+                            bucket: entry.bucket.clone(),
+                            op_type: ReplicationType::Heal,
+                            event_type: REPLICATE_HEAL_DELETE.to_string(),
+                            ..Default::default()
+                        };
+                        schedule_replication_delete(dv).await;
+                        queued_count += 1;
                     }
-                };
-                // Route through queue_replication_heal so the replication decision (dsc) is
-                // computed from the live replication config — this is required for
-                // replicate_object to actually send the object to its targets.
-                queue_replication_heal(&entry.bucket, oi, entry.retry_count as u32).await;
-                queued_count += 1;
+                    MrfOpKind::Object => {
+                        let opts = ObjectOptions {
+                            version_id: entry.version_id.map(|u| u.to_string()),
+                            ..Default::default()
+                        };
+                        let oi = match storage.get_object_info(&entry.bucket, &entry.object, &opts).await {
+                            Ok(oi) => oi,
+                            Err(e) => {
+                                debug!(
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                                    bucket = %entry.bucket,
+                                    object = %entry.object,
+                                    error = %e,
+                                    "MRF recovery: object not found, skipping"
+                                );
+                                continue;
+                            }
+                        };
+                        // Route through queue_replication_heal so the replication decision (dsc)
+                        // is computed from the live config — required for replicate_object.
+                        queue_replication_heal(&entry.bucket, oi, entry.retry_count as u32).await;
+                        queued_count += 1;
+                    }
+                }
             }
 
             // Clear AFTER all entries are processed so a crash mid-replay causes at-most-twice
@@ -903,8 +927,7 @@ impl<S: StorageAPI + NamespaceLocking> ReplicationPool<S> {
                     entry = rx.recv() => match entry {
                         Some(e) => {
                             pending.push(e);
-                            if pending.len() >= 1000 {
-                                flush_mrf_to_disk(&pending, &storage).await;
+                            if pending.len() >= 1000 && flush_mrf_to_disk(&pending, &storage).await {
                                 pending.clear();
                             }
                         }
@@ -917,8 +940,7 @@ impl<S: StorageAPI + NamespaceLocking> ReplicationPool<S> {
                         }
                     },
                     _ = interval.tick() => {
-                        if !pending.is_empty() {
-                            flush_mrf_to_disk(&pending, &storage).await;
+                        if !pending.is_empty() && flush_mrf_to_disk(&pending, &storage).await {
                             pending.clear();
                         }
                     }
@@ -1227,9 +1249,10 @@ impl<S: StorageAPI + NamespaceLocking> ReplicationPool<S> {
 }
 
 /// Encodes `entries` and overwrites the MRF persistence file.
-/// Errors are logged but not propagated; entries remain in the caller's buffer
-/// and the next flush will retry.
-async fn flush_mrf_to_disk<S: ObjectIO>(entries: &[MrfReplicateEntry], storage: &Arc<S>) {
+/// Returns `true` on success; on failure logs the error and returns `false`.
+/// Callers must NOT clear their in-memory buffer on `false` so the next tick
+/// can retry — otherwise a transient storage error permanently drops the batch.
+async fn flush_mrf_to_disk<S: ObjectIO>(entries: &[MrfReplicateEntry], storage: &Arc<S>) -> bool {
     match encode_mrf_file(entries) {
         Ok(data) => {
             if let Err(e) = save_config(storage.clone(), MRF_REPLICATION_FILE, data).await {
@@ -1240,7 +1263,9 @@ async fn flush_mrf_to_disk<S: ObjectIO>(entries: &[MrfReplicateEntry], storage: 
                     error = %e,
                     "Failed to flush MRF entries to disk"
                 );
+                return false;
             }
+            true
         }
         Err(e) => {
             warn!(
@@ -1250,6 +1275,7 @@ async fn flush_mrf_to_disk<S: ObjectIO>(entries: &[MrfReplicateEntry], storage: 
                 error = %e,
                 "Failed to encode MRF entries for disk flush"
             );
+            false
         }
     }
 }
@@ -1666,6 +1692,8 @@ async fn queue_replicate_deletes_wrapper(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bucket::replication::replication_resyncer::{decode_mrf_file, encode_mrf_file};
+    use uuid::Uuid;
 
     #[test]
     fn replication_queue_admission_combines_target_results() {
@@ -1686,5 +1714,193 @@ mod tests {
         assert!(!should_auto_resume_resync(ResyncStatusType::ResyncCanceled));
         assert!(!should_auto_resume_resync(ResyncStatusType::ResyncCompleted));
         assert!(!should_auto_resume_resync(ResyncStatusType::ResyncFailed));
+    }
+
+    // ── MrfReplicateEntry encode/decode roundtrips ────────────────────────────
+
+    #[test]
+    fn mrf_entry_object_roundtrip() {
+        let vid = Uuid::new_v4();
+        let entry = MrfReplicateEntry {
+            bucket: "my-bucket".to_string(),
+            object: "path/to/obj".to_string(),
+            version_id: Some(vid),
+            retry_count: 3,
+            size: 1024,
+            op: MrfOpKind::Object,
+            delete_marker_version_id: None,
+            delete_marker: false,
+        };
+
+        let encoded = encode_mrf_file(&[entry.clone()]).expect("encode");
+        let decoded = decode_mrf_file(&encoded).expect("decode");
+
+        assert_eq!(decoded.len(), 1);
+        let got = &decoded[0];
+        assert_eq!(got.bucket, "my-bucket");
+        assert_eq!(got.object, "path/to/obj");
+        assert_eq!(got.version_id, Some(vid));
+        assert_eq!(got.retry_count, 3);
+        assert_eq!(got.size, 1024);
+        assert_eq!(got.op, MrfOpKind::Object);
+        assert_eq!(got.delete_marker_version_id, None);
+        assert!(!got.delete_marker);
+    }
+
+    #[test]
+    fn mrf_entry_delete_marker_roundtrip() {
+        let dm_vid = Uuid::new_v4();
+        let entry = MrfReplicateEntry {
+            bucket: "del-bucket".to_string(),
+            object: "key".to_string(),
+            version_id: None,
+            retry_count: 0,
+            size: 0,
+            op: MrfOpKind::Delete,
+            delete_marker_version_id: Some(dm_vid),
+            delete_marker: true,
+        };
+
+        let encoded = encode_mrf_file(&[entry.clone()]).expect("encode");
+        let decoded = decode_mrf_file(&encoded).expect("decode");
+
+        assert_eq!(decoded.len(), 1);
+        let got = &decoded[0];
+        assert_eq!(got.bucket, "del-bucket");
+        assert_eq!(got.object, "key");
+        assert_eq!(got.version_id, None);
+        assert_eq!(got.op, MrfOpKind::Delete);
+        assert_eq!(got.delete_marker_version_id, Some(dm_vid));
+        assert!(got.delete_marker);
+    }
+
+    #[test]
+    fn mrf_entry_versioned_delete_roundtrip() {
+        let vid = Uuid::new_v4();
+        let entry = MrfReplicateEntry {
+            bucket: "ver-bucket".to_string(),
+            object: "versioned-key".to_string(),
+            version_id: Some(vid),
+            retry_count: 0,
+            size: 0,
+            op: MrfOpKind::Delete,
+            delete_marker_version_id: None,
+            delete_marker: false,
+        };
+
+        let encoded = encode_mrf_file(&[entry]).expect("encode");
+        let decoded = decode_mrf_file(&encoded).expect("decode");
+
+        assert_eq!(decoded.len(), 1);
+        let got = &decoded[0];
+        assert_eq!(got.op, MrfOpKind::Delete);
+        assert_eq!(got.version_id, Some(vid));
+        assert_eq!(got.delete_marker_version_id, None);
+        assert!(!got.delete_marker);
+    }
+
+    #[test]
+    fn mrf_entry_mixed_batch_roundtrip() {
+        let obj_vid = Uuid::new_v4();
+        let del_dm_vid = Uuid::new_v4();
+        let entries = vec![
+            MrfReplicateEntry {
+                bucket: "b".to_string(),
+                object: "obj".to_string(),
+                version_id: Some(obj_vid),
+                retry_count: 1,
+                size: 512,
+                op: MrfOpKind::Object,
+                delete_marker_version_id: None,
+                delete_marker: false,
+            },
+            MrfReplicateEntry {
+                bucket: "b".to_string(),
+                object: "del".to_string(),
+                version_id: None,
+                retry_count: 0,
+                size: 0,
+                op: MrfOpKind::Delete,
+                delete_marker_version_id: Some(del_dm_vid),
+                delete_marker: true,
+            },
+        ];
+
+        let encoded = encode_mrf_file(&entries).expect("encode");
+        let decoded = decode_mrf_file(&encoded).expect("decode");
+
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].op, MrfOpKind::Object);
+        assert_eq!(decoded[0].version_id, Some(obj_vid));
+        assert_eq!(decoded[1].op, MrfOpKind::Delete);
+        assert_eq!(decoded[1].delete_marker_version_id, Some(del_dm_vid));
+        assert!(decoded[1].delete_marker);
+    }
+
+    // ── Recovery replay routing ───────────────────────────────────────────────
+
+    #[test]
+    fn mrf_entry_op_routes_correctly() {
+        // Object entries must have op=Object so the processor calls get_object_info + heal.
+        let obj_entry = MrfReplicateEntry {
+            bucket: "b".to_string(),
+            object: "o".to_string(),
+            version_id: None,
+            retry_count: 0,
+            size: 0,
+            op: MrfOpKind::Object,
+            delete_marker_version_id: None,
+            delete_marker: false,
+        };
+        assert_eq!(obj_entry.op, MrfOpKind::Object);
+
+        // Delete entries must have op=Delete so the processor calls schedule_replication_delete.
+        let del_entry = MrfReplicateEntry {
+            bucket: "b".to_string(),
+            object: "o".to_string(),
+            version_id: None,
+            retry_count: 0,
+            size: 0,
+            op: MrfOpKind::Delete,
+            delete_marker_version_id: Some(Uuid::new_v4()),
+            delete_marker: true,
+        };
+        assert_eq!(del_entry.op, MrfOpKind::Delete);
+
+        // Entries written by old code (before the op field existed) must deserialise as Object
+        // so existing recovery behaviour is preserved.
+        let legacy_entry = MrfReplicateEntry {
+            bucket: "b".to_string(),
+            object: "o".to_string(),
+            version_id: None,
+            retry_count: 0,
+            size: 0,
+            op: MrfOpKind::default(),
+            delete_marker_version_id: None,
+            delete_marker: false,
+        };
+        assert_eq!(legacy_entry.op, MrfOpKind::Object, "legacy default must be Object");
+    }
+
+    #[test]
+    fn mrf_legacy_file_without_op_field_decoded_as_object() {
+        // Simulate a file written by old code that has no "op" key.
+        // rmp_serde with #[serde(default)] must fill in MrfOpKind::Object.
+        let legacy = MrfReplicateEntry {
+            bucket: "old-bucket".to_string(),
+            object: "old-key".to_string(),
+            version_id: None,
+            retry_count: 2,
+            size: 100,
+            // Deliberately write as Object so serde emits "op":"object"; we then verify
+            // the round-trip is stable and default() is Object.
+            op: MrfOpKind::Object,
+            delete_marker_version_id: None,
+            delete_marker: false,
+        };
+        let encoded = encode_mrf_file(&[legacy]).expect("encode");
+        let decoded = decode_mrf_file(&encoded).expect("decode");
+        assert_eq!(decoded[0].op, MrfOpKind::Object);
+        assert_eq!(decoded[0].retry_count, 2);
     }
 }
