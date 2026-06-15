@@ -819,13 +819,23 @@ impl TransitionState {
         })
     }
 
-    fn schedule_bucket_compensation(self: &Arc<Self>, bucket: &str) -> bool {
-        let mut scheduled = self.compensation_buckets.lock().unwrap();
-        if !scheduled.insert(bucket.to_string()) {
+    fn reserve_bucket_compensation(&self, bucket: &str) -> bool {
+        let inserted = match self.compensation_buckets.lock() {
+            Ok(mut scheduled) => scheduled.insert(bucket.to_string()),
+            Err(poisoned) => poisoned.into_inner().insert(bucket.to_string()),
+        };
+        if !inserted {
             return false;
         }
         Self::inc_counter(&self.compensation_scheduled_tasks);
         self.record_scanner_transition_state();
+        true
+    }
+
+    fn schedule_bucket_compensation(self: &Arc<Self>, bucket: &str) -> bool {
+        if !self.reserve_bucket_compensation(bucket) {
+            return false;
+        }
         let bucket = bucket.to_string();
         let scheduled = Arc::clone(&self.compensation_buckets);
         let state = Arc::clone(self);
@@ -3158,16 +3168,17 @@ mod tests {
         });
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn schedule_bucket_compensation_deduplicates_same_bucket() {
+    #[test]
+    fn reserve_bucket_compensation_deduplicates_same_bucket() {
         let state = TransitionState::new_with_capacity(1);
 
-        let first = state.schedule_bucket_compensation("bucket-a");
-        let second = state.schedule_bucket_compensation("bucket-a");
+        let first = state.reserve_bucket_compensation("bucket-a");
+        let second = state.reserve_bucket_compensation("bucket-a");
 
         assert!(first);
         assert!(!second);
         assert_eq!(state.compensation_scheduled_tasks(), 1);
+        assert_eq!(state.compensation_pending_tasks(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
