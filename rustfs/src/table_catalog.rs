@@ -77,9 +77,20 @@ const COMMIT_IDEMPOTENCY_ROOT: &str = "commit-idempotency";
 const MAINTENANCE_ROOT: &str = "maintenance";
 const MAINTENANCE_CONFIG_FILE: &str = "config.json";
 const MAINTENANCE_JOB_ROOT: &str = "jobs";
+const MAINTENANCE_LATEST_JOB_FILE: &str = "latest.json";
+const MAINTENANCE_CURRENT_JOB_FILE: &str = "current.json";
+const MAINTENANCE_JOB_ALIAS_LATEST: &str = "latest";
+const MAINTENANCE_JOB_ALIAS_CURRENT: &str = "current";
 const TABLE_CATALOG_LIST_MAX_KEYS: i32 = 1000;
 const TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS: i64 = 15 * 60;
 const TABLE_COMMIT_SLOW_LOG_THRESHOLD: StdDuration = StdDuration::from_secs(2);
+const ICEBERG_MAIN_REF: &str = "main";
+const ICEBERG_MIN_SNAPSHOTS_TO_KEEP_PROPERTY: &str = "history.expire.min-snapshots-to-keep";
+const ICEBERG_MAX_SNAPSHOT_AGE_MS_PROPERTY: &str = "history.expire.max-snapshot-age-ms";
+const ICEBERG_MAX_REF_AGE_MS_PROPERTY: &str = "history.expire.max-ref-age-ms";
+const ICEBERG_REF_MIN_SNAPSHOTS_TO_KEEP_FIELD: &str = "min-snapshots-to-keep";
+const ICEBERG_REF_MAX_SNAPSHOT_AGE_MS_FIELD: &str = "max-snapshot-age-ms";
+const ICEBERG_REF_MAX_REF_AGE_MS_FIELD: &str = "max-ref-age-ms";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogIdentifierError {
@@ -275,6 +286,22 @@ impl Default for TableMaintenanceConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableMaintenanceConfigSource {
+    #[default]
+    Default,
+    TableBucketDefault,
+    TableOverride,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TableMaintenanceEffectiveConfig {
+    pub config: TableMaintenanceConfig,
+    pub source: TableMaintenanceConfigSource,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TableMetadataMaintenanceJob {
     pub job_id: String,
@@ -282,11 +309,39 @@ pub(crate) struct TableMetadataMaintenanceJob {
     pub namespace: String,
     pub table: String,
     pub table_id: String,
+    #[serde(default)]
+    pub operation: TableMetadataMaintenanceOperation,
+    #[serde(default)]
+    pub status: TableMetadataMaintenanceJobStatus,
+    #[serde(default)]
+    pub failure_reason: Option<String>,
+    #[serde(default)]
+    pub config_source: TableMaintenanceConfigSource,
+    #[serde(default)]
+    pub worker_id: Option<String>,
+    #[serde(default)]
+    pub lease_id: String,
+    #[serde(default)]
+    pub heartbeat_at: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub finished_at: Option<String>,
     pub current_metadata_location: String,
     pub current_generation: u64,
     pub retain_recent_metadata_files: usize,
     pub safety_window_seconds: i64,
     pub cleanup_watermark_unix_seconds: i64,
+    #[serde(default)]
+    pub planned_metadata_file_count: usize,
+    #[serde(default)]
+    pub retained_metadata_file_count: usize,
+    #[serde(default)]
+    pub cleanup_candidate_count: usize,
+    #[serde(default)]
+    pub deletable_metadata_file_count: usize,
+    #[serde(default)]
+    pub deleted_metadata_file_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,6 +351,198 @@ pub(crate) struct TableMetadataMaintenanceReport {
     pub retained_metadata_locations: Vec<String>,
     pub cleanup_candidate_locations: Vec<String>,
     pub deletable_metadata_locations: Vec<String>,
+    #[serde(default)]
+    pub object_reports: Vec<TableMetadataMaintenanceObjectReport>,
+    #[serde(default)]
+    pub referenced_object_reports: Vec<TableMetadataMaintenanceReferencedObjectReport>,
+    #[serde(default, rename = "snapshot-expiration")]
+    pub snapshot_expiration: Option<TableSnapshotExpirationReport>,
+    #[serde(default)]
+    pub compaction: Option<TableCompactionPlanningReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TableSnapshotExpirationConfig {
+    #[serde(rename = "min-snapshots-to-keep")]
+    pub min_snapshots_to_keep: usize,
+    #[serde(rename = "max-snapshot-age-ms")]
+    pub max_snapshot_age_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TableSnapshotExpirationReport {
+    pub table_bucket: String,
+    pub namespace: String,
+    pub table: String,
+    pub table_id: String,
+    pub current_metadata_location: String,
+    pub current_snapshot_id: Option<i64>,
+    pub config: TableSnapshotExpirationConfig,
+    pub expiration_watermark_ms: i64,
+    pub retained_snapshot_count: usize,
+    pub expiration_candidate_count: usize,
+    pub manual_review_count: usize,
+    #[serde(default)]
+    pub expired_snapshot_ids: Vec<i64>,
+    #[serde(default)]
+    pub committed_metadata_location: Option<String>,
+    pub snapshot_reports: Vec<TableSnapshotExpirationSnapshotReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TableSnapshotExpirationSnapshotReport {
+    pub snapshot_id: Option<i64>,
+    pub sequence_number: Option<i64>,
+    pub timestamp_ms: Option<i64>,
+    pub manifest_list: Option<String>,
+    pub state: TableSnapshotExpirationSnapshotState,
+    pub reasons: Vec<TableSnapshotExpirationReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableSnapshotExpirationSnapshotState {
+    Retained,
+    ExpirationCandidate,
+    ManualReviewRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableSnapshotExpirationReason {
+    CurrentSnapshot,
+    MinSnapshotsToKeep,
+    ProtectedSnapshotRef,
+    UserDefinedSnapshotRef,
+    SnapshotRefRetentionConflict,
+    TableRetentionPropertyConflict,
+    MissingSnapshotId,
+    MissingSnapshotTimestamp,
+    SnapshotAgeWithinRetention,
+    SnapshotAgeExpired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TableCompactionPlanningConfig {
+    #[serde(rename = "target-file-size-bytes")]
+    pub target_file_size_bytes: u64,
+    #[serde(rename = "small-file-threshold-bytes")]
+    pub small_file_threshold_bytes: u64,
+    #[serde(rename = "min-input-files")]
+    pub min_input_files: usize,
+    #[serde(rename = "max-rewrite-bytes-per-job")]
+    pub max_rewrite_bytes_per_job: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TableCompactionPlanningReport {
+    pub table_bucket: String,
+    pub namespace: String,
+    pub table: String,
+    pub table_id: String,
+    pub current_metadata_location: String,
+    pub current_snapshot_id: Option<i64>,
+    pub config: TableCompactionPlanningConfig,
+    pub status: TableCompactionPlanningStatus,
+    pub candidate_file_count: usize,
+    pub rewrite_group_count: usize,
+    pub manual_review_count: usize,
+    pub snapshot_reports: Vec<TableCompactionSnapshotReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TableCompactionSnapshotReport {
+    pub snapshot_id: Option<i64>,
+    pub manifest_list: Option<String>,
+    pub status: TableCompactionPlanningStatus,
+    pub reasons: Vec<TableCompactionPlanningReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCompactionPlanningStatus {
+    NoCandidates,
+    ManualReviewRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCompactionPlanningReason {
+    ManifestList,
+    ManifestAvroReaderUnavailable,
+    MissingCurrentSnapshot,
+    MissingManifestList,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableMetadataMaintenanceOperation {
+    #[default]
+    DryRun,
+    Delete,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableMetadataMaintenanceJobStatus {
+    NotYetRun,
+    Running,
+    #[default]
+    Successful,
+    Failed,
+    Disabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableMetadataMaintenanceObjectState {
+    Retained,
+    PendingSafetyWindow,
+    Deletable,
+    Deleted,
+    ManualReviewRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableMetadataMaintenanceReason {
+    CurrentMetadata,
+    MetadataLog,
+    ProtectedSnapshotRef,
+    RecentMetadata,
+    NoCurrentReachability,
+    SafetyWindowPending,
+    SafetyWindowSatisfied,
+    DeletedByMaintenance,
+    ManifestList,
+    UnsupportedManifestAvro,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableMetadataMaintenanceObjectKind {
+    MetadataFile,
+    ManifestList,
+    ManifestFile,
+    DataFile,
+    DeleteFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TableMetadataMaintenanceObjectReport {
+    pub metadata_location: String,
+    pub state: TableMetadataMaintenanceObjectState,
+    pub reasons: Vec<TableMetadataMaintenanceReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TableMetadataMaintenanceReferencedObjectReport {
+    pub object_location: String,
+    pub object_kind: TableMetadataMaintenanceObjectKind,
+    pub state: TableMetadataMaintenanceObjectState,
+    pub reasons: Vec<TableMetadataMaintenanceReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -658,6 +905,13 @@ impl TableCatalogObjectPaths {
         format!("{}{}", self.table_bucket_root_prefix(table_bucket), TABLE_BUCKET_ENTRY_FILE)
     }
 
+    pub fn table_bucket_maintenance_config_path(&self, table_bucket: &str) -> String {
+        format!(
+            "{}{MAINTENANCE_ROOT}/{MAINTENANCE_CONFIG_FILE}",
+            self.table_bucket_root_prefix(table_bucket)
+        )
+    }
+
     pub fn namespace_entries_prefix(&self, table_bucket: &str) -> String {
         format!("{}{}/", self.table_bucket_root_prefix(table_bucket), NAMESPACE_ROOT)
     }
@@ -718,6 +972,36 @@ impl TableCatalogObjectPaths {
             table.as_str(),
             table_catalog_path_hash(table_id),
             table_catalog_path_hash(job_id)
+        )
+    }
+
+    pub fn table_maintenance_latest_job_path(
+        &self,
+        table_bucket: &str,
+        namespace: &Namespace,
+        table: &IdentifierSegment,
+        table_id: &str,
+    ) -> String {
+        format!(
+            "{}{}/{MAINTENANCE_ROOT}/{}/{MAINTENANCE_LATEST_JOB_FILE}",
+            self.table_entries_prefix(table_bucket, namespace),
+            table.as_str(),
+            table_catalog_path_hash(table_id)
+        )
+    }
+
+    pub fn table_maintenance_current_job_path(
+        &self,
+        table_bucket: &str,
+        namespace: &Namespace,
+        table: &IdentifierSegment,
+        table_id: &str,
+    ) -> String {
+        format!(
+            "{}{}/{MAINTENANCE_ROOT}/{}/{MAINTENANCE_CURRENT_JOB_FILE}",
+            self.table_entries_prefix(table_bucket, namespace),
+            table.as_str(),
+            table_catalog_path_hash(table_id)
         )
     }
 
@@ -1093,6 +1377,67 @@ where
             .map(|entry| entry.map(|(config, _)| config).unwrap_or_default())
     }
 
+    pub(crate) async fn put_table_bucket_maintenance_config(
+        &self,
+        table_bucket: &str,
+        config: TableMaintenanceConfig,
+    ) -> TableCatalogStoreResult<TableMaintenanceConfig> {
+        validate_table_maintenance_config(&config)?;
+        self.require_table_bucket(table_bucket).await?;
+        let config_path = self.paths.table_bucket_maintenance_config_path(table_bucket);
+        self.write_entry(self.catalog_bucket(), &config_path, &config, TableCatalogPutPrecondition::Any)
+            .await?;
+        Ok(config)
+    }
+
+    pub(crate) async fn get_effective_table_maintenance_config(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<TableMaintenanceEffectiveConfig> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
+        let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &table_path).await? else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "table {}/{}/{}",
+                table_bucket,
+                namespace.public_name(),
+                table.as_str()
+            )));
+        };
+
+        let table_config_path = self
+            .paths
+            .table_maintenance_config_path(table_bucket, &namespace, &table, &entry.table_id);
+        if let Some((config, _)) = self
+            .read_entry::<TableMaintenanceConfig>(self.catalog_bucket(), &table_config_path)
+            .await?
+        {
+            return Ok(TableMaintenanceEffectiveConfig {
+                config,
+                source: TableMaintenanceConfigSource::TableOverride,
+            });
+        }
+
+        let bucket_config_path = self.paths.table_bucket_maintenance_config_path(table_bucket);
+        if let Some((config, _)) = self
+            .read_entry::<TableMaintenanceConfig>(self.catalog_bucket(), &bucket_config_path)
+            .await?
+        {
+            return Ok(TableMaintenanceEffectiveConfig {
+                config,
+                source: TableMaintenanceConfigSource::TableBucketDefault,
+            });
+        }
+
+        Ok(TableMaintenanceEffectiveConfig {
+            config: TableMaintenanceConfig::default(),
+            source: TableMaintenanceConfigSource::Default,
+        })
+    }
+
     pub(crate) async fn put_table_maintenance_config(
         &self,
         table_bucket: &str,
@@ -1100,12 +1445,7 @@ where
         table: &str,
         config: TableMaintenanceConfig,
     ) -> TableCatalogStoreResult<TableMaintenanceConfig> {
-        validate_table_maintenance_config_version(config.version)?;
-        if config.background_enabled {
-            return Err(TableCatalogStoreError::Invalid(
-                "background table maintenance is not supported".to_string(),
-            ));
-        }
+        validate_table_maintenance_config(&config)?;
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
         let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
@@ -1139,7 +1479,17 @@ where
             &report.job.table_id,
             &report.job.job_id,
         );
+        let latest_job_path =
+            self.paths
+                .table_maintenance_latest_job_path(&report.job.table_bucket, &namespace, &table, &report.job.table_id);
+        let current_job_path =
+            self.paths
+                .table_maintenance_current_job_path(&report.job.table_bucket, &namespace, &table, &report.job.table_id);
         self.write_entry(self.catalog_bucket(), &job_path, report, TableCatalogPutPrecondition::Any)
+            .await?;
+        self.write_entry(self.catalog_bucket(), &latest_job_path, report, TableCatalogPutPrecondition::Any)
+            .await?;
+        self.write_entry(self.catalog_bucket(), &current_job_path, report, TableCatalogPutPrecondition::Any)
             .await
     }
 
@@ -1161,12 +1511,125 @@ where
                 table.as_str()
             )));
         };
-        let job_path = self
-            .paths
-            .table_maintenance_job_path(table_bucket, &namespace, &table, &entry.table_id, job_id);
+        let job_path = match job_id {
+            MAINTENANCE_JOB_ALIAS_LATEST => {
+                self.paths
+                    .table_maintenance_latest_job_path(table_bucket, &namespace, &table, &entry.table_id)
+            }
+            MAINTENANCE_JOB_ALIAS_CURRENT => {
+                self.paths
+                    .table_maintenance_current_job_path(table_bucket, &namespace, &table, &entry.table_id)
+            }
+            _ => self
+                .paths
+                .table_maintenance_job_path(table_bucket, &namespace, &table, &entry.table_id, job_id),
+        };
         self.read_entry::<TableMetadataMaintenanceReport>(self.catalog_bucket(), &job_path)
             .await
             .map(|entry| entry.map(|(report, _)| report))
+    }
+
+    pub(crate) async fn plan_table_snapshot_expiration(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        config: TableSnapshotExpirationConfig,
+    ) -> TableCatalogStoreResult<TableSnapshotExpirationReport> {
+        validate_table_snapshot_expiration_config(&config)?;
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
+        let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &table_path).await? else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "table {}/{}/{}",
+                table_bucket,
+                namespace.public_name(),
+                table.as_str()
+            )));
+        };
+        if !is_valid_table_metadata_location(&namespace, &table, &entry.metadata_location) {
+            return Err(TableCatalogStoreError::Invalid(
+                "current metadata location must be inside the table metadata directory".to_string(),
+            ));
+        }
+
+        let Some(current_metadata_object) = self.backend.read_object(table_bucket, &entry.metadata_location).await? else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "current metadata object {}",
+                entry.metadata_location
+            )));
+        };
+        let current_metadata = serde_json::from_slice::<serde_json::Value>(&current_metadata_object.data).map_err(|err| {
+            TableCatalogStoreError::Invalid(format!("failed to parse current metadata {}: {err}", entry.metadata_location))
+        })?;
+        if !current_metadata.is_object() {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "current metadata {} must be a JSON object",
+                entry.metadata_location
+            )));
+        }
+
+        Ok(table_snapshot_expiration_report(
+            table_bucket,
+            &namespace,
+            &table,
+            &entry,
+            &current_metadata,
+            config,
+            OffsetDateTime::now_utc(),
+        ))
+    }
+
+    pub(crate) async fn plan_table_compaction(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        config: TableCompactionPlanningConfig,
+    ) -> TableCatalogStoreResult<TableCompactionPlanningReport> {
+        validate_table_compaction_planning_config(&config)?;
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
+        let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &table_path).await? else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "table {}/{}/{}",
+                table_bucket,
+                namespace.public_name(),
+                table.as_str()
+            )));
+        };
+        if !is_valid_table_metadata_location(&namespace, &table, &entry.metadata_location) {
+            return Err(TableCatalogStoreError::Invalid(
+                "current metadata location must be inside the table metadata directory".to_string(),
+            ));
+        }
+
+        let Some(current_metadata_object) = self.backend.read_object(table_bucket, &entry.metadata_location).await? else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "current metadata object {}",
+                entry.metadata_location
+            )));
+        };
+        let current_metadata = serde_json::from_slice::<serde_json::Value>(&current_metadata_object.data).map_err(|err| {
+            TableCatalogStoreError::Invalid(format!("failed to parse current metadata {}: {err}", entry.metadata_location))
+        })?;
+        if !current_metadata.is_object() {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "current metadata {} must be a JSON object",
+                entry.metadata_location
+            )));
+        }
+
+        Ok(table_compaction_planning_report(
+            table_bucket,
+            &namespace,
+            &table,
+            &entry,
+            &current_metadata,
+            config,
+        ))
     }
 
     pub(crate) async fn export_table_catalog_entry(
@@ -1333,8 +1796,22 @@ where
             )));
         }
 
-        let mut retained = metadata_log_locations(&current_metadata, &namespace, &table);
+        let mut retained = BTreeSet::new();
+        let mut maintenance_reasons = BTreeMap::<String, BTreeSet<TableMetadataMaintenanceReason>>::new();
+        for metadata_location in metadata_log_locations(&current_metadata, &namespace, &table) {
+            retained.insert(metadata_location.clone());
+            insert_metadata_maintenance_reason(
+                &mut maintenance_reasons,
+                metadata_location,
+                TableMetadataMaintenanceReason::MetadataLog,
+            );
+        }
         retained.insert(entry.metadata_location.clone());
+        insert_metadata_maintenance_reason(
+            &mut maintenance_reasons,
+            entry.metadata_location.clone(),
+            TableMetadataMaintenanceReason::CurrentMetadata,
+        );
 
         let mut metadata_locations = Vec::new();
         let metadata_prefix = format!("{}/", default_table_metadata_dir_path(&namespace, &table));
@@ -1345,38 +1822,77 @@ where
         }
         metadata_locations.sort();
         metadata_locations.dedup();
+        let planned_metadata_file_count = metadata_locations.len();
 
         for metadata_location in metadata_locations.iter().rev().take(retain_recent_metadata_files) {
             retained.insert(metadata_location.clone());
+            if metadata_location != &entry.metadata_location {
+                insert_metadata_maintenance_reason(
+                    &mut maintenance_reasons,
+                    metadata_location.clone(),
+                    TableMetadataMaintenanceReason::RecentMetadata,
+                );
+            }
         }
-        retained.extend(
-            metadata_locations_for_protected_snapshot_refs(
-                &self.backend,
-                table_bucket,
-                &namespace,
-                &table,
-                &current_metadata,
-                &metadata_locations,
-            )
-            .await?,
-        );
+        for metadata_location in metadata_locations_for_protected_snapshot_refs(
+            &self.backend,
+            table_bucket,
+            &namespace,
+            &table,
+            &current_metadata,
+            &metadata_locations,
+        )
+        .await?
+        {
+            retained.insert(metadata_location.clone());
+            insert_metadata_maintenance_reason(
+                &mut maintenance_reasons,
+                metadata_location,
+                TableMetadataMaintenanceReason::ProtectedSnapshotRef,
+            );
+        }
 
         let cleanup_candidate_locations = metadata_locations
-            .into_iter()
-            .filter(|metadata_location| !retained.contains(metadata_location))
+            .iter()
+            .filter(|metadata_location| !retained.contains(metadata_location.as_str()))
+            .cloned()
             .collect::<Vec<_>>();
 
         let now = OffsetDateTime::now_utc();
         let mut deletable_metadata_locations = Vec::new();
         for metadata_location in &cleanup_candidate_locations {
+            insert_metadata_maintenance_reason(
+                &mut maintenance_reasons,
+                metadata_location.clone(),
+                TableMetadataMaintenanceReason::NoCurrentReachability,
+            );
             let Some(candidate_object) = self.backend.read_object(table_bucket, metadata_location).await? else {
+                insert_metadata_maintenance_reason(
+                    &mut maintenance_reasons,
+                    metadata_location.clone(),
+                    TableMetadataMaintenanceReason::SafetyWindowPending,
+                );
                 continue;
             };
             if metadata_candidate_is_past_safety_window(candidate_object.mod_time, now) {
                 deletable_metadata_locations.push(metadata_location.clone());
+                insert_metadata_maintenance_reason(
+                    &mut maintenance_reasons,
+                    metadata_location.clone(),
+                    TableMetadataMaintenanceReason::SafetyWindowSatisfied,
+                );
+            } else {
+                insert_metadata_maintenance_reason(
+                    &mut maintenance_reasons,
+                    metadata_location.clone(),
+                    TableMetadataMaintenanceReason::SafetyWindowPending,
+                );
             }
         }
         let current_metadata_location = entry.metadata_location;
+        let retained_metadata_locations = retained.into_iter().collect::<Vec<_>>();
+        let object_reports = metadata_maintenance_object_reports(maintenance_reasons);
+        let referenced_object_reports = metadata_maintenance_referenced_object_reports(&current_metadata);
 
         Ok(TableMetadataMaintenanceReport {
             job: TableMetadataMaintenanceJob {
@@ -1385,17 +1901,35 @@ where
                 namespace: namespace.public_name(),
                 table: table.as_str().to_string(),
                 table_id: entry.table_id,
+                operation: TableMetadataMaintenanceOperation::DryRun,
+                status: TableMetadataMaintenanceJobStatus::Successful,
+                failure_reason: None,
+                config_source: TableMaintenanceConfigSource::Default,
+                worker_id: None,
+                lease_id: String::new(),
+                heartbeat_at: None,
+                started_at: None,
+                finished_at: None,
                 current_metadata_location: current_metadata_location.clone(),
                 current_generation: entry.generation,
                 retain_recent_metadata_files,
                 safety_window_seconds: TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS,
                 cleanup_watermark_unix_seconds: (now - Duration::seconds(TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS))
                     .unix_timestamp(),
+                planned_metadata_file_count,
+                retained_metadata_file_count: retained_metadata_locations.len(),
+                cleanup_candidate_count: cleanup_candidate_locations.len(),
+                deletable_metadata_file_count: deletable_metadata_locations.len(),
+                deleted_metadata_file_count: 0,
             },
             current_metadata_location,
-            retained_metadata_locations: retained.into_iter().collect(),
+            retained_metadata_locations,
             cleanup_candidate_locations,
             deletable_metadata_locations,
+            object_reports,
+            referenced_object_reports,
+            snapshot_expiration: None,
+            compaction: None,
         })
     }
 
@@ -1411,6 +1945,103 @@ where
             .await?;
         self.delete_table_metadata_maintenance_report(table_bucket, namespace, table, report)
             .await
+    }
+
+    pub(crate) async fn run_table_metadata_maintenance(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        delete: bool,
+        worker_id: Option<String>,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        let effective = self
+            .get_effective_table_maintenance_config(table_bucket, namespace, table)
+            .await?;
+        self.run_table_metadata_maintenance_with_config(table_bucket, namespace, table, delete, worker_id, effective)
+            .await
+    }
+
+    pub(crate) async fn run_table_metadata_maintenance_with_retention(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        delete: bool,
+        worker_id: Option<String>,
+        retain_recent_metadata_files: usize,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        let mut effective = self
+            .get_effective_table_maintenance_config(table_bucket, namespace, table)
+            .await?;
+        effective.config.retain_recent_metadata_files = retain_recent_metadata_files;
+        self.run_table_metadata_maintenance_with_config(table_bucket, namespace, table, delete, worker_id, effective)
+            .await
+    }
+
+    async fn run_table_metadata_maintenance_with_config(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        delete: bool,
+        worker_id: Option<String>,
+        effective: TableMaintenanceEffectiveConfig,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        let mut report = self
+            .plan_table_metadata_maintenance(table_bucket, namespace, table, effective.config.retain_recent_metadata_files)
+            .await?;
+
+        let started_at = maintenance_timestamp(OffsetDateTime::now_utc());
+        report.job.operation = if delete {
+            TableMetadataMaintenanceOperation::Delete
+        } else {
+            TableMetadataMaintenanceOperation::DryRun
+        };
+        report.job.status = TableMetadataMaintenanceJobStatus::Running;
+        report.job.failure_reason = None;
+        report.job.config_source = effective.source;
+        report.job.worker_id = worker_id;
+        report.job.lease_id = Uuid::new_v4().to_string();
+        report.job.heartbeat_at = Some(started_at.clone());
+        report.job.started_at = Some(started_at);
+        report.job.finished_at = None;
+        self.put_table_metadata_maintenance_report(&report).await?;
+
+        if delete && !effective.config.delete_enabled {
+            let mut failed = report;
+            failed.job.status = TableMetadataMaintenanceJobStatus::Failed;
+            failed.job.failure_reason = Some("metadata delete is disabled by maintenance config".to_string());
+            failed.job.finished_at = Some(maintenance_timestamp(OffsetDateTime::now_utc()));
+            self.put_table_metadata_maintenance_report(&failed).await?;
+            return Ok(failed);
+        }
+
+        if delete {
+            let running_report = report.clone();
+            let mut deleted = match self
+                .delete_table_metadata_maintenance_report(table_bucket, namespace, table, report)
+                .await
+            {
+                Ok(report) => report,
+                Err(err) => {
+                    let mut failed = running_report;
+                    failed.job.status = TableMetadataMaintenanceJobStatus::Failed;
+                    failed.job.failure_reason = Some(err.to_string());
+                    failed.job.finished_at = Some(maintenance_timestamp(OffsetDateTime::now_utc()));
+                    self.put_table_metadata_maintenance_report(&failed).await?;
+                    return Err(err);
+                }
+            };
+            deleted.job.finished_at = Some(maintenance_timestamp(OffsetDateTime::now_utc()));
+            self.put_table_metadata_maintenance_report(&deleted).await?;
+            return Ok(deleted);
+        }
+
+        report.job.status = TableMetadataMaintenanceJobStatus::Successful;
+        report.job.finished_at = Some(maintenance_timestamp(OffsetDateTime::now_utc()));
+        self.put_table_metadata_maintenance_report(&report).await?;
+        Ok(report)
     }
 
     async fn delete_table_metadata_maintenance_report(
@@ -1475,39 +2106,61 @@ where
             .await?,
         );
 
+        let cleanup_candidate_count = report.cleanup_candidate_locations.len();
+        let planned_deletable_locations = report.deletable_metadata_locations.iter().cloned().collect::<BTreeSet<_>>();
         let mut cleanup_candidate_locations = BTreeSet::new();
         let now = OffsetDateTime::now_utc();
-        for metadata_location in report.cleanup_candidate_locations {
-            if !is_valid_table_metadata_location(&namespace, &table, &metadata_location) {
+        for metadata_location in &report.cleanup_candidate_locations {
+            if !is_valid_table_metadata_location(&namespace, &table, metadata_location) {
                 return Err(TableCatalogStoreError::Invalid(format!(
                     "cleanup candidate {metadata_location} must be inside the table metadata directory"
                 )));
             }
-            if protected.contains(&metadata_location) {
+            if protected.contains(metadata_location.as_str()) {
                 return Err(TableCatalogStoreError::Conflict(format!(
                     "cleanup candidate {metadata_location} is retained by current metadata"
                 )));
             }
-            let Some(candidate_object) = self.backend.read_object(table_bucket, &metadata_location).await? else {
+            let Some(candidate_object) = self.backend.read_object(table_bucket, metadata_location).await? else {
                 continue;
             };
+            if !planned_deletable_locations.contains(metadata_location.as_str()) {
+                continue;
+            }
             if !metadata_candidate_is_past_safety_window(candidate_object.mod_time, now) {
                 continue;
             }
-            cleanup_candidate_locations.insert(metadata_location);
+            cleanup_candidate_locations.insert(metadata_location.clone());
         }
 
         let cleanup_candidate_locations = cleanup_candidate_locations.into_iter().collect::<Vec<_>>();
+        let deleted_locations = cleanup_candidate_locations.iter().cloned().collect::<BTreeSet<_>>();
         for metadata_location in &cleanup_candidate_locations {
             self.backend.delete_object(table_bucket, metadata_location).await?;
         }
+        let retained_metadata_locations = protected.into_iter().collect::<Vec<_>>();
+        let mut job = report.job;
+        job.operation = TableMetadataMaintenanceOperation::Delete;
+        job.status = TableMetadataMaintenanceJobStatus::Successful;
+        job.failure_reason = None;
+        job.retained_metadata_file_count = retained_metadata_locations.len();
+        job.cleanup_candidate_count = cleanup_candidate_count;
+        job.deletable_metadata_file_count = planned_deletable_locations.len();
+        job.deleted_metadata_file_count = cleanup_candidate_locations.len();
+        let mut object_reports = report.object_reports;
+        mark_deleted_metadata_object_reports(&mut object_reports, &deleted_locations);
+        let referenced_object_reports = report.referenced_object_reports;
 
         Ok(TableMetadataMaintenanceReport {
-            job: report.job,
+            job,
             current_metadata_location: entry.metadata_location,
-            retained_metadata_locations: protected.into_iter().collect(),
+            retained_metadata_locations,
             cleanup_candidate_locations: cleanup_candidate_locations.clone(),
             deletable_metadata_locations: cleanup_candidate_locations,
+            object_reports,
+            referenced_object_reports,
+            snapshot_expiration: report.snapshot_expiration,
+            compaction: report.compaction,
         })
     }
 }
@@ -2126,6 +2779,84 @@ fn parse_table_for_store(table: &str) -> TableCatalogStoreResult<IdentifierSegme
     IdentifierSegment::parse(table).map_err(|err| TableCatalogStoreError::Invalid(format!("invalid table name: {err}")))
 }
 
+fn insert_metadata_maintenance_reason(
+    reasons_by_location: &mut BTreeMap<String, BTreeSet<TableMetadataMaintenanceReason>>,
+    metadata_location: String,
+    reason: TableMetadataMaintenanceReason,
+) {
+    reasons_by_location.entry(metadata_location).or_default().insert(reason);
+}
+
+fn metadata_maintenance_object_reports(
+    reasons_by_location: BTreeMap<String, BTreeSet<TableMetadataMaintenanceReason>>,
+) -> Vec<TableMetadataMaintenanceObjectReport> {
+    reasons_by_location
+        .into_iter()
+        .map(|(metadata_location, reasons)| {
+            let reasons = reasons.into_iter().collect::<Vec<_>>();
+            let state = if reasons.contains(&TableMetadataMaintenanceReason::SafetyWindowSatisfied) {
+                TableMetadataMaintenanceObjectState::Deletable
+            } else if reasons.contains(&TableMetadataMaintenanceReason::SafetyWindowPending) {
+                TableMetadataMaintenanceObjectState::PendingSafetyWindow
+            } else {
+                TableMetadataMaintenanceObjectState::Retained
+            };
+            TableMetadataMaintenanceObjectReport {
+                metadata_location,
+                state,
+                reasons,
+            }
+        })
+        .collect()
+}
+
+fn metadata_maintenance_referenced_object_reports(
+    current_metadata: &serde_json::Value,
+) -> Vec<TableMetadataMaintenanceReferencedObjectReport> {
+    let mut reasons_by_location = BTreeMap::<String, BTreeSet<TableMetadataMaintenanceReason>>::new();
+    if let Some(snapshots) = current_metadata.get("snapshots").and_then(serde_json::Value::as_array) {
+        for snapshot in snapshots {
+            let Some(manifest_list) = snapshot.get("manifest-list").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            reasons_by_location.entry(manifest_list.to_string()).or_default().extend([
+                TableMetadataMaintenanceReason::ManifestList,
+                TableMetadataMaintenanceReason::UnsupportedManifestAvro,
+            ]);
+        }
+    }
+
+    reasons_by_location
+        .into_iter()
+        .map(|(object_location, reasons)| TableMetadataMaintenanceReferencedObjectReport {
+            object_location,
+            object_kind: TableMetadataMaintenanceObjectKind::ManifestList,
+            state: TableMetadataMaintenanceObjectState::ManualReviewRequired,
+            reasons: reasons.into_iter().collect(),
+        })
+        .collect()
+}
+
+fn mark_deleted_metadata_object_reports(
+    object_reports: &mut [TableMetadataMaintenanceObjectReport],
+    deleted_locations: &BTreeSet<String>,
+) {
+    for object_report in object_reports {
+        if !deleted_locations.contains(&object_report.metadata_location) {
+            continue;
+        }
+        object_report.state = TableMetadataMaintenanceObjectState::Deleted;
+        if !object_report
+            .reasons
+            .contains(&TableMetadataMaintenanceReason::DeletedByMaintenance)
+        {
+            object_report
+                .reasons
+                .push(TableMetadataMaintenanceReason::DeletedByMaintenance);
+        }
+    }
+}
+
 fn metadata_log_locations(
     current_metadata: &serde_json::Value,
     namespace: &Namespace,
@@ -2228,6 +2959,362 @@ fn metadata_candidate_is_past_safety_window(mod_time: Option<OffsetDateTime>, no
     mod_time <= now - Duration::seconds(TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS)
 }
 
+#[derive(Debug)]
+struct TableSnapshotExpirationDraft {
+    snapshot_id: Option<i64>,
+    sequence_number: Option<i64>,
+    timestamp_ms: Option<i64>,
+    manifest_list: Option<String>,
+    reasons: BTreeSet<TableSnapshotExpirationReason>,
+}
+
+fn table_snapshot_expiration_report(
+    table_bucket: &str,
+    namespace: &Namespace,
+    table: &IdentifierSegment,
+    entry: &TableEntry,
+    current_metadata: &serde_json::Value,
+    config: TableSnapshotExpirationConfig,
+    now: OffsetDateTime,
+) -> TableSnapshotExpirationReport {
+    let current_snapshot_id = current_metadata
+        .get("current-snapshot-id")
+        .and_then(serde_json::Value::as_i64);
+    let expiration_watermark_ms = unix_timestamp_millis(now).saturating_sub(config.max_snapshot_age_ms);
+    let (protected_ref_snapshot_ids, user_defined_ref_snapshot_ids, ref_retention_conflict_snapshot_ids) =
+        snapshot_expiration_ref_state(current_metadata, current_snapshot_id);
+    let table_retention_property_conflict = snapshot_expiration_table_property_conflicts(current_metadata, &config);
+
+    let mut drafts = snapshot_expiration_drafts(current_metadata, current_snapshot_id);
+    mark_recent_snapshots_to_keep(&mut drafts, config.min_snapshots_to_keep);
+
+    let mut snapshot_reports = Vec::with_capacity(drafts.len());
+    for mut draft in drafts {
+        if let Some(snapshot_id) = draft.snapshot_id {
+            if protected_ref_snapshot_ids.contains(&snapshot_id) {
+                draft.reasons.insert(TableSnapshotExpirationReason::ProtectedSnapshotRef);
+            }
+            if user_defined_ref_snapshot_ids.contains(&snapshot_id) {
+                draft.reasons.insert(TableSnapshotExpirationReason::UserDefinedSnapshotRef);
+            }
+            if ref_retention_conflict_snapshot_ids.contains(&snapshot_id) {
+                draft
+                    .reasons
+                    .insert(TableSnapshotExpirationReason::SnapshotRefRetentionConflict);
+            }
+        }
+        if table_retention_property_conflict {
+            draft
+                .reasons
+                .insert(TableSnapshotExpirationReason::TableRetentionPropertyConflict);
+        }
+
+        let state = if snapshot_expiration_requires_manual_review(&draft.reasons) {
+            TableSnapshotExpirationSnapshotState::ManualReviewRequired
+        } else if snapshot_expiration_is_retained(&draft.reasons) {
+            TableSnapshotExpirationSnapshotState::Retained
+        } else if let Some(timestamp_ms) = draft.timestamp_ms {
+            if timestamp_ms <= expiration_watermark_ms {
+                draft.reasons.insert(TableSnapshotExpirationReason::SnapshotAgeExpired);
+                TableSnapshotExpirationSnapshotState::ExpirationCandidate
+            } else {
+                draft
+                    .reasons
+                    .insert(TableSnapshotExpirationReason::SnapshotAgeWithinRetention);
+                TableSnapshotExpirationSnapshotState::Retained
+            }
+        } else {
+            draft.reasons.insert(TableSnapshotExpirationReason::MissingSnapshotTimestamp);
+            TableSnapshotExpirationSnapshotState::ManualReviewRequired
+        };
+
+        snapshot_reports.push(TableSnapshotExpirationSnapshotReport {
+            snapshot_id: draft.snapshot_id,
+            sequence_number: draft.sequence_number,
+            timestamp_ms: draft.timestamp_ms,
+            manifest_list: draft.manifest_list,
+            state,
+            reasons: draft.reasons.into_iter().collect(),
+        });
+    }
+
+    let retained_snapshot_count = snapshot_reports
+        .iter()
+        .filter(|snapshot| snapshot.state == TableSnapshotExpirationSnapshotState::Retained)
+        .count();
+    let expiration_candidate_count = snapshot_reports
+        .iter()
+        .filter(|snapshot| snapshot.state == TableSnapshotExpirationSnapshotState::ExpirationCandidate)
+        .count();
+    let manual_review_count = snapshot_reports
+        .iter()
+        .filter(|snapshot| snapshot.state == TableSnapshotExpirationSnapshotState::ManualReviewRequired)
+        .count();
+
+    TableSnapshotExpirationReport {
+        table_bucket: table_bucket.to_string(),
+        namespace: namespace.public_name(),
+        table: table.as_str().to_string(),
+        table_id: entry.table_id.clone(),
+        current_metadata_location: entry.metadata_location.clone(),
+        current_snapshot_id,
+        config,
+        expiration_watermark_ms,
+        retained_snapshot_count,
+        expiration_candidate_count,
+        manual_review_count,
+        expired_snapshot_ids: Vec::new(),
+        committed_metadata_location: None,
+        snapshot_reports,
+    }
+}
+
+fn table_compaction_planning_report(
+    table_bucket: &str,
+    namespace: &Namespace,
+    table: &IdentifierSegment,
+    entry: &TableEntry,
+    current_metadata: &serde_json::Value,
+    config: TableCompactionPlanningConfig,
+) -> TableCompactionPlanningReport {
+    let current_snapshot_id = current_metadata
+        .get("current-snapshot-id")
+        .and_then(serde_json::Value::as_i64);
+    let snapshot_reports = match current_snapshot_id {
+        Some(current_snapshot_id) => {
+            let current_snapshot = current_metadata
+                .get("snapshots")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|snapshot| {
+                    snapshot
+                        .get("snapshot-id")
+                        .and_then(serde_json::Value::as_i64)
+                        .is_some_and(|snapshot_id| snapshot_id == current_snapshot_id)
+                });
+            match current_snapshot {
+                Some(snapshot) => {
+                    let manifest_list = snapshot
+                        .get("manifest-list")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string);
+                    let mut reasons = BTreeSet::new();
+                    if manifest_list.is_some() {
+                        reasons.insert(TableCompactionPlanningReason::ManifestList);
+                        reasons.insert(TableCompactionPlanningReason::ManifestAvroReaderUnavailable);
+                    } else {
+                        reasons.insert(TableCompactionPlanningReason::MissingManifestList);
+                    }
+
+                    vec![TableCompactionSnapshotReport {
+                        snapshot_id: Some(current_snapshot_id),
+                        manifest_list,
+                        status: TableCompactionPlanningStatus::ManualReviewRequired,
+                        reasons: reasons.into_iter().collect(),
+                    }]
+                }
+                None => vec![TableCompactionSnapshotReport {
+                    snapshot_id: Some(current_snapshot_id),
+                    manifest_list: None,
+                    status: TableCompactionPlanningStatus::ManualReviewRequired,
+                    reasons: vec![TableCompactionPlanningReason::MissingCurrentSnapshot],
+                }],
+            }
+        }
+        None => Vec::new(),
+    };
+
+    let (status, manual_review_count) = if snapshot_reports.is_empty() {
+        (TableCompactionPlanningStatus::NoCandidates, 0)
+    } else {
+        (
+            TableCompactionPlanningStatus::ManualReviewRequired,
+            snapshot_reports
+                .iter()
+                .filter(|snapshot| snapshot.status == TableCompactionPlanningStatus::ManualReviewRequired)
+                .count(),
+        )
+    };
+
+    TableCompactionPlanningReport {
+        table_bucket: table_bucket.to_string(),
+        namespace: namespace.public_name(),
+        table: table.as_str().to_string(),
+        table_id: entry.table_id.clone(),
+        current_metadata_location: entry.metadata_location.clone(),
+        current_snapshot_id,
+        config,
+        status,
+        candidate_file_count: 0,
+        rewrite_group_count: 0,
+        manual_review_count,
+        snapshot_reports,
+    }
+}
+
+fn snapshot_expiration_drafts(
+    current_metadata: &serde_json::Value,
+    current_snapshot_id: Option<i64>,
+) -> Vec<TableSnapshotExpirationDraft> {
+    let Some(snapshots) = current_metadata.get("snapshots").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+
+    snapshots
+        .iter()
+        .map(|snapshot| {
+            let snapshot_id = snapshot.get("snapshot-id").and_then(serde_json::Value::as_i64);
+            let timestamp_ms = snapshot.get("timestamp-ms").and_then(serde_json::Value::as_i64);
+            let mut reasons = BTreeSet::new();
+            if snapshot_id.is_none() {
+                reasons.insert(TableSnapshotExpirationReason::MissingSnapshotId);
+            }
+            if timestamp_ms.is_none() {
+                reasons.insert(TableSnapshotExpirationReason::MissingSnapshotTimestamp);
+            }
+            if snapshot_id.is_some() && snapshot_id == current_snapshot_id {
+                reasons.insert(TableSnapshotExpirationReason::CurrentSnapshot);
+            }
+
+            TableSnapshotExpirationDraft {
+                snapshot_id,
+                sequence_number: snapshot.get("sequence-number").and_then(serde_json::Value::as_i64),
+                timestamp_ms,
+                manifest_list: snapshot
+                    .get("manifest-list")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string),
+                reasons,
+            }
+        })
+        .collect()
+}
+
+fn mark_recent_snapshots_to_keep(drafts: &mut [TableSnapshotExpirationDraft], min_snapshots_to_keep: usize) {
+    let mut snapshots_by_time = drafts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, draft)| Some((draft.timestamp_ms?, index)))
+        .collect::<Vec<_>>();
+    snapshots_by_time.sort_by(|(left_timestamp, left_index), (right_timestamp, right_index)| {
+        right_timestamp.cmp(left_timestamp).then_with(|| left_index.cmp(right_index))
+    });
+
+    for (_, index) in snapshots_by_time.into_iter().take(min_snapshots_to_keep) {
+        drafts[index]
+            .reasons
+            .insert(TableSnapshotExpirationReason::MinSnapshotsToKeep);
+    }
+}
+
+fn snapshot_expiration_ref_state(
+    current_metadata: &serde_json::Value,
+    current_snapshot_id: Option<i64>,
+) -> (BTreeSet<i64>, BTreeSet<i64>, BTreeSet<i64>) {
+    let mut protected_ref_snapshot_ids = BTreeSet::new();
+    let mut user_defined_ref_snapshot_ids = BTreeSet::new();
+    let mut ref_retention_conflict_snapshot_ids = BTreeSet::new();
+    let Some(refs) = current_metadata.get("refs").and_then(serde_json::Value::as_object) else {
+        return (
+            protected_ref_snapshot_ids,
+            user_defined_ref_snapshot_ids,
+            ref_retention_conflict_snapshot_ids,
+        );
+    };
+
+    for (name, reference) in refs {
+        let Some(snapshot_id) = reference.get("snapshot-id").and_then(serde_json::Value::as_i64) else {
+            continue;
+        };
+        if name != ICEBERG_MAIN_REF || Some(snapshot_id) != current_snapshot_id {
+            protected_ref_snapshot_ids.insert(snapshot_id);
+        }
+        if name != ICEBERG_MAIN_REF {
+            user_defined_ref_snapshot_ids.insert(snapshot_id);
+        }
+        if snapshot_ref_has_retention_policy(reference) {
+            ref_retention_conflict_snapshot_ids.insert(snapshot_id);
+        }
+    }
+
+    (
+        protected_ref_snapshot_ids,
+        user_defined_ref_snapshot_ids,
+        ref_retention_conflict_snapshot_ids,
+    )
+}
+
+fn snapshot_ref_has_retention_policy(reference: &serde_json::Value) -> bool {
+    reference.get(ICEBERG_REF_MIN_SNAPSHOTS_TO_KEEP_FIELD).is_some()
+        || reference.get(ICEBERG_REF_MAX_SNAPSHOT_AGE_MS_FIELD).is_some()
+        || reference.get(ICEBERG_REF_MAX_REF_AGE_MS_FIELD).is_some()
+}
+
+fn snapshot_expiration_table_property_conflicts(
+    current_metadata: &serde_json::Value,
+    config: &TableSnapshotExpirationConfig,
+) -> bool {
+    let Some(properties) = current_metadata.get("properties").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+
+    if properties.contains_key(ICEBERG_MAX_REF_AGE_MS_PROPERTY) {
+        return true;
+    }
+    if retention_property_conflicts_usize(properties, ICEBERG_MIN_SNAPSHOTS_TO_KEEP_PROPERTY, config.min_snapshots_to_keep) {
+        return true;
+    }
+    retention_property_conflicts_i64(properties, ICEBERG_MAX_SNAPSHOT_AGE_MS_PROPERTY, config.max_snapshot_age_ms)
+}
+
+fn retention_property_conflicts_usize(
+    properties: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    expected: usize,
+) -> bool {
+    let Some(value) = properties.get(key) else {
+        return false;
+    };
+    serde_json_i64(value).and_then(|value| usize::try_from(value).ok()) != Some(expected)
+}
+
+fn retention_property_conflicts_i64(properties: &serde_json::Map<String, serde_json::Value>, key: &str, expected: i64) -> bool {
+    let Some(value) = properties.get(key) else {
+        return false;
+    };
+    serde_json_i64(value) != Some(expected)
+}
+
+fn serde_json_i64(value: &serde_json::Value) -> Option<i64> {
+    value.as_i64().or_else(|| value.as_str()?.parse::<i64>().ok())
+}
+
+fn snapshot_expiration_requires_manual_review(reasons: &BTreeSet<TableSnapshotExpirationReason>) -> bool {
+    reasons.contains(&TableSnapshotExpirationReason::MissingSnapshotId)
+        || reasons.contains(&TableSnapshotExpirationReason::MissingSnapshotTimestamp)
+        || reasons.contains(&TableSnapshotExpirationReason::UserDefinedSnapshotRef)
+        || reasons.contains(&TableSnapshotExpirationReason::SnapshotRefRetentionConflict)
+        || reasons.contains(&TableSnapshotExpirationReason::TableRetentionPropertyConflict)
+}
+
+fn snapshot_expiration_is_retained(reasons: &BTreeSet<TableSnapshotExpirationReason>) -> bool {
+    reasons.contains(&TableSnapshotExpirationReason::CurrentSnapshot)
+        || reasons.contains(&TableSnapshotExpirationReason::MinSnapshotsToKeep)
+        || reasons.contains(&TableSnapshotExpirationReason::ProtectedSnapshotRef)
+}
+
+fn unix_timestamp_millis(now: OffsetDateTime) -> i64 {
+    now.unix_timestamp()
+        .saturating_mul(1000)
+        .saturating_add(i64::from(now.millisecond()))
+}
+
+fn maintenance_timestamp(now: OffsetDateTime) -> String {
+    now.format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| now.unix_timestamp().to_string())
+}
+
 fn validate_catalog_entry_version(kind: &str, version: u16) -> TableCatalogStoreResult<()> {
     if version != TABLE_CATALOG_ENTRY_VERSION {
         return Err(TableCatalogStoreError::Invalid(format!("unsupported {kind} entry version")));
@@ -2239,6 +3326,55 @@ fn validate_table_maintenance_config_version(version: u16) -> TableCatalogStoreR
     if version != TABLE_MAINTENANCE_CONFIG_VERSION {
         return Err(TableCatalogStoreError::Invalid(
             "unsupported table maintenance config entry version".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_table_maintenance_config(config: &TableMaintenanceConfig) -> TableCatalogStoreResult<()> {
+    validate_table_maintenance_config_version(config.version)?;
+    if config.background_enabled {
+        return Err(TableCatalogStoreError::Invalid(
+            "background table maintenance is not supported".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_table_snapshot_expiration_config(config: &TableSnapshotExpirationConfig) -> TableCatalogStoreResult<()> {
+    if config.min_snapshots_to_keep == 0 {
+        return Err(TableCatalogStoreError::Invalid(
+            "min-snapshots-to-keep must be greater than zero".to_string(),
+        ));
+    }
+    if config.max_snapshot_age_ms < 0 {
+        return Err(TableCatalogStoreError::Invalid("max-snapshot-age-ms cannot be negative".to_string()));
+    }
+    Ok(())
+}
+
+fn validate_table_compaction_planning_config(config: &TableCompactionPlanningConfig) -> TableCatalogStoreResult<()> {
+    if config.target_file_size_bytes == 0 {
+        return Err(TableCatalogStoreError::Invalid(
+            "target-file-size-bytes must be greater than zero".to_string(),
+        ));
+    }
+    if config.small_file_threshold_bytes == 0 {
+        return Err(TableCatalogStoreError::Invalid(
+            "small-file-threshold-bytes must be greater than zero".to_string(),
+        ));
+    }
+    if config.small_file_threshold_bytes > config.target_file_size_bytes {
+        return Err(TableCatalogStoreError::Invalid(
+            "small-file-threshold-bytes cannot exceed target-file-size-bytes".to_string(),
+        ));
+    }
+    if config.min_input_files < 2 {
+        return Err(TableCatalogStoreError::Invalid("min-input-files must be at least two".to_string()));
+    }
+    if config.max_rewrite_bytes_per_job < config.target_file_size_bytes {
+        return Err(TableCatalogStoreError::Invalid(
+            "max-rewrite-bytes-per-job must be at least target-file-size-bytes".to_string(),
         ));
     }
     Ok(())
@@ -3318,6 +4454,36 @@ mod tests {
         }
     }
 
+    fn maintenance_object_report<'a>(
+        report: &'a TableMetadataMaintenanceReport,
+        metadata_location: &str,
+    ) -> &'a TableMetadataMaintenanceObjectReport {
+        report
+            .object_reports
+            .iter()
+            .find(|object| object.metadata_location == metadata_location)
+            .expect("metadata maintenance object report should exist")
+    }
+
+    fn snapshot_expiration_report(
+        report: &TableSnapshotExpirationReport,
+        snapshot_id: i64,
+    ) -> &TableSnapshotExpirationSnapshotReport {
+        report
+            .snapshot_reports
+            .iter()
+            .find(|snapshot| snapshot.snapshot_id == Some(snapshot_id))
+            .expect("snapshot expiration report should include the snapshot")
+    }
+
+    fn compaction_snapshot_report(report: &TableCompactionPlanningReport, snapshot_id: i64) -> &TableCompactionSnapshotReport {
+        report
+            .snapshot_reports
+            .iter()
+            .find(|snapshot| snapshot.snapshot_id == Some(snapshot_id))
+            .expect("compaction planning report should include the snapshot")
+    }
+
     #[async_trait::async_trait]
     impl TableCatalogObjectBackend for TestCatalogObjectBackend {
         async fn read_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
@@ -3654,12 +4820,94 @@ mod tests {
         assert_eq!(report.job.namespace, "sales");
         assert_eq!(report.job.table, "orders");
         assert_eq!(report.job.table_id, "table-id");
+        assert_eq!(report.job.operation, TableMetadataMaintenanceOperation::DryRun);
+        assert_eq!(report.job.status, TableMetadataMaintenanceJobStatus::Successful);
+        assert_eq!(report.job.deleted_metadata_file_count, 0);
         assert_eq!(report.job.current_generation, 1);
         assert_eq!(report.job.safety_window_seconds, TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS);
         assert!(!report.job.job_id.is_empty());
         assert!(report.job.cleanup_watermark_unix_seconds <= OffsetDateTime::now_utc().unix_timestamp());
         assert_eq!(report.cleanup_candidate_locations, vec![old.clone(), fresh]);
         assert_eq!(report.deletable_metadata_locations, vec![old]);
+    }
+
+    #[tokio::test]
+    async fn maintenance_dry_run_explains_metadata_reachability() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let logged = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let fresh = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let old = default_table_metadata_file_path(&namespace, &table, "00003.metadata.json");
+        let recent = default_table_metadata_file_path(&namespace, &table, "00004.metadata.json");
+        let current = default_table_metadata_file_path(&namespace, &table, "00005.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend.seed_object(bucket, &logged, b"{}".to_vec()).await;
+        backend.seed_object(bucket, &recent, b"{}".to_vec()).await;
+        backend.seed_object(bucket, &old, b"{}".to_vec()).await;
+        backend
+            .seed_object_with_mod_time(bucket, &fresh, b"{}".to_vec(), Some(OffsetDateTime::now_utc()))
+            .await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "metadata-log": [
+                        {
+                            "timestamp-ms": 1,
+                            "metadata-file": logged
+                        }
+                    ]
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let report = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 2)
+            .await
+            .unwrap();
+
+        assert_eq!(report.job.planned_metadata_file_count, 5);
+        assert_eq!(report.job.retained_metadata_file_count, 3);
+        assert_eq!(report.job.cleanup_candidate_count, 2);
+        assert_eq!(report.job.deletable_metadata_file_count, 1);
+
+        let current_report = maintenance_object_report(&report, &current);
+        assert_eq!(current_report.state, TableMetadataMaintenanceObjectState::Retained);
+        assert_eq!(current_report.reasons, vec![TableMetadataMaintenanceReason::CurrentMetadata]);
+
+        let logged_report = maintenance_object_report(&report, &logged);
+        assert_eq!(logged_report.state, TableMetadataMaintenanceObjectState::Retained);
+        assert_eq!(logged_report.reasons, vec![TableMetadataMaintenanceReason::MetadataLog]);
+
+        let recent_report = maintenance_object_report(&report, &recent);
+        assert_eq!(recent_report.state, TableMetadataMaintenanceObjectState::Retained);
+        assert_eq!(recent_report.reasons, vec![TableMetadataMaintenanceReason::RecentMetadata]);
+
+        let old_report = maintenance_object_report(&report, &old);
+        assert_eq!(old_report.state, TableMetadataMaintenanceObjectState::Deletable);
+        assert_eq!(
+            old_report.reasons,
+            vec![
+                TableMetadataMaintenanceReason::NoCurrentReachability,
+                TableMetadataMaintenanceReason::SafetyWindowSatisfied,
+            ]
+        );
+
+        let fresh_report = maintenance_object_report(&report, &fresh);
+        assert_eq!(fresh_report.state, TableMetadataMaintenanceObjectState::PendingSafetyWindow);
+        assert_eq!(
+            fresh_report.reasons,
+            vec![
+                TableMetadataMaintenanceReason::NoCurrentReachability,
+                TableMetadataMaintenanceReason::SafetyWindowPending,
+            ]
+        );
     }
 
     #[tokio::test]
@@ -3756,6 +5004,287 @@ mod tests {
             .unwrap_err();
 
         assert_matches!(err, TableCatalogStoreError::Invalid(_));
+    }
+
+    #[tokio::test]
+    async fn maintenance_config_inherits_bucket_default_and_tracks_override_source() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+        store
+            .put_table_bucket_maintenance_config(
+                bucket,
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    retain_recent_metadata_files: 3,
+                    delete_enabled: true,
+                    background_enabled: false,
+                },
+            )
+            .await
+            .expect("bucket default maintenance config should persist");
+
+        let inherited = store
+            .get_effective_table_maintenance_config(bucket, "sales", "orders")
+            .await
+            .expect("effective maintenance config should load");
+
+        assert_eq!(inherited.source, TableMaintenanceConfigSource::TableBucketDefault);
+        assert_eq!(inherited.config.retain_recent_metadata_files, 3);
+        assert!(inherited.config.delete_enabled);
+        assert!(!inherited.config.background_enabled);
+
+        store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    retain_recent_metadata_files: 1,
+                    delete_enabled: false,
+                    background_enabled: false,
+                },
+            )
+            .await
+            .expect("table maintenance override should persist");
+
+        let overridden = store
+            .get_effective_table_maintenance_config(bucket, "sales", "orders")
+            .await
+            .expect("effective maintenance override should load");
+
+        assert_eq!(overridden.source, TableMaintenanceConfigSource::TableOverride);
+        assert_eq!(overridden.config.retain_recent_metadata_files, 1);
+        assert!(!overridden.config.delete_enabled);
+        assert!(!overridden.config.background_enabled);
+    }
+
+    #[tokio::test]
+    async fn maintenance_config_rejects_background_enabled_until_worker_exists() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+
+        let bucket_err = store
+            .put_table_bucket_maintenance_config(
+                bucket,
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    retain_recent_metadata_files: 1,
+                    delete_enabled: false,
+                    background_enabled: true,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_matches!(bucket_err, TableCatalogStoreError::Invalid(_));
+
+        let table_err = store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    retain_recent_metadata_files: 1,
+                    delete_enabled: false,
+                    background_enabled: true,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_matches!(table_err, TableCatalogStoreError::Invalid(_));
+    }
+
+    #[tokio::test]
+    async fn maintenance_run_persists_latest_job_alias_with_worker_and_lease_context() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let old = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        store
+            .put_table_bucket_maintenance_config(
+                bucket,
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    retain_recent_metadata_files: 0,
+                    delete_enabled: false,
+                    background_enabled: false,
+                },
+            )
+            .await
+            .expect("bucket default maintenance config should persist");
+        backend.seed_object(bucket, &old, b"{}".to_vec()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+
+        let report = store
+            .run_table_metadata_maintenance(bucket, "sales", "orders", false, Some("worker-a".to_string()))
+            .await
+            .expect("metadata maintenance run should succeed");
+
+        assert_eq!(report.job.status, TableMetadataMaintenanceJobStatus::Successful);
+        assert_eq!(report.job.config_source, TableMaintenanceConfigSource::TableBucketDefault);
+        assert_eq!(report.job.worker_id.as_deref(), Some("worker-a"));
+        assert!(!report.job.lease_id.is_empty());
+        assert!(report.job.heartbeat_at.is_some());
+        assert!(report.job.started_at.is_some());
+        assert!(report.job.finished_at.is_some());
+
+        let latest = store
+            .get_table_metadata_maintenance_report(bucket, "sales", "orders", "latest")
+            .await
+            .expect("latest maintenance lookup should succeed")
+            .expect("latest maintenance job should be stored");
+        let current_alias = store
+            .get_table_metadata_maintenance_report(bucket, "sales", "orders", "current")
+            .await
+            .expect("current maintenance lookup should succeed")
+            .expect("current maintenance job should be stored");
+
+        assert_eq!(latest.job.job_id, report.job.job_id);
+        assert_eq!(current_alias.job.job_id, report.job.job_id);
+    }
+
+    #[tokio::test]
+    async fn maintenance_delete_request_records_failed_job_when_delete_is_disabled() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let old = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    retain_recent_metadata_files: 0,
+                    delete_enabled: false,
+                    background_enabled: false,
+                },
+            )
+            .await
+            .expect("table maintenance override should persist");
+        backend.seed_object(bucket, &old, b"{}".to_vec()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+
+        let report = store
+            .run_table_metadata_maintenance(bucket, "sales", "orders", true, Some("worker-a".to_string()))
+            .await
+            .expect("disabled delete request should still persist a failed maintenance job");
+
+        assert_eq!(report.job.operation, TableMetadataMaintenanceOperation::Delete);
+        assert_eq!(report.job.status, TableMetadataMaintenanceJobStatus::Failed);
+        assert_eq!(report.job.config_source, TableMaintenanceConfigSource::TableOverride);
+        assert!(
+            report
+                .job
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("disabled"))
+        );
+        assert!(backend.object_exists(bucket, &old).await.unwrap());
+
+        let latest = store
+            .get_table_metadata_maintenance_report(bucket, "sales", "orders", "latest")
+            .await
+            .expect("latest maintenance lookup should succeed")
+            .expect("failed maintenance job should be stored");
+        assert_eq!(latest.job.job_id, report.job.job_id);
+        assert_eq!(latest.job.status, TableMetadataMaintenanceJobStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn maintenance_reachability_reports_manifest_lists_as_manual_review() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let old = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let manifest_list = format!("{}/snap-10.avro", default_table_metadata_dir_path(&namespace, &table));
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend.seed_object(bucket, &old, b"{}".to_vec()).await;
+        backend.seed_object(bucket, &manifest_list, b"avro".to_vec()).await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "metadata-log": [],
+                    "schemas": [],
+                    "partition-specs": [],
+                    "sort-orders": [],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 10,
+                            "manifest-list": manifest_list
+                        }
+                    ],
+                    "snapshot-log": [
+                        {
+                            "timestamp-ms": 1,
+                            "snapshot-id": 10
+                        }
+                    ],
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 10,
+                            "type": "branch"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let report = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .expect("metadata maintenance dry-run should succeed");
+
+        assert_eq!(report.cleanup_candidate_locations, vec![old]);
+        let manifest_report = report
+            .referenced_object_reports
+            .iter()
+            .find(|object| object.object_location == manifest_list)
+            .expect("manifest list should be reported as a referenced object");
+        assert_eq!(manifest_report.object_kind, TableMetadataMaintenanceObjectKind::ManifestList);
+        assert_eq!(manifest_report.state, TableMetadataMaintenanceObjectState::ManualReviewRequired);
+        assert_eq!(
+            manifest_report.reasons,
+            vec![
+                TableMetadataMaintenanceReason::ManifestList,
+                TableMetadataMaintenanceReason::UnsupportedManifestAvro,
+            ]
+        );
     }
 
     #[tokio::test]
@@ -3866,6 +5395,349 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_expiration_plan_retains_current_recent_and_protected_refs() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00004.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "current-snapshot-id": 30,
+                    "metadata-log": [],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 10,
+                            "timestamp-ms": 1000,
+                            "manifest-list": "s3://analytics/tables/table-id/metadata/snap-10.avro"
+                        },
+                        {
+                            "snapshot-id": 20,
+                            "timestamp-ms": 2000,
+                            "manifest-list": "s3://analytics/tables/table-id/metadata/snap-20.avro"
+                        },
+                        {
+                            "snapshot-id": 30,
+                            "timestamp-ms": 3000,
+                            "manifest-list": "s3://analytics/tables/table-id/metadata/snap-30.avro"
+                        }
+                    ],
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 30,
+                            "type": "branch"
+                        },
+                        "audit": {
+                            "snapshot-id": 10,
+                            "type": "tag"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let report = store
+            .plan_table_snapshot_expiration(
+                bucket,
+                "sales",
+                "orders",
+                TableSnapshotExpirationConfig {
+                    min_snapshots_to_keep: 1,
+                    max_snapshot_age_ms: 1,
+                },
+            )
+            .await
+            .expect("snapshot expiration planning should succeed");
+
+        let current_snapshot = snapshot_expiration_report(&report, 30);
+        assert_eq!(current_snapshot.state, TableSnapshotExpirationSnapshotState::Retained);
+        assert!(
+            current_snapshot
+                .reasons
+                .contains(&TableSnapshotExpirationReason::CurrentSnapshot)
+        );
+
+        let protected_snapshot = snapshot_expiration_report(&report, 10);
+        assert_eq!(protected_snapshot.state, TableSnapshotExpirationSnapshotState::ManualReviewRequired);
+        assert!(
+            protected_snapshot
+                .reasons
+                .contains(&TableSnapshotExpirationReason::ProtectedSnapshotRef)
+        );
+        assert!(
+            protected_snapshot
+                .reasons
+                .contains(&TableSnapshotExpirationReason::UserDefinedSnapshotRef)
+        );
+
+        let expired_snapshot = snapshot_expiration_report(&report, 20);
+        assert_eq!(expired_snapshot.state, TableSnapshotExpirationSnapshotState::ExpirationCandidate);
+        assert!(
+            expired_snapshot
+                .reasons
+                .contains(&TableSnapshotExpirationReason::SnapshotAgeExpired)
+        );
+        assert_eq!(report.expiration_candidate_count, 1);
+        assert_eq!(report.manual_review_count, 1);
+    }
+
+    #[tokio::test]
+    async fn snapshot_expiration_plan_fails_closed_for_table_retention_property_conflicts() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00004.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "current-snapshot-id": 20,
+                    "metadata-log": [],
+                    "properties": {
+                        "history.expire.min-snapshots-to-keep": "5"
+                    },
+                    "snapshots": [
+                        {
+                            "snapshot-id": 10,
+                            "timestamp-ms": 1000,
+                            "manifest-list": "s3://analytics/tables/table-id/metadata/snap-10.avro"
+                        },
+                        {
+                            "snapshot-id": 20,
+                            "timestamp-ms": 2000,
+                            "manifest-list": "s3://analytics/tables/table-id/metadata/snap-20.avro"
+                        }
+                    ],
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 20,
+                            "type": "branch"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let report = store
+            .plan_table_snapshot_expiration(
+                bucket,
+                "sales",
+                "orders",
+                TableSnapshotExpirationConfig {
+                    min_snapshots_to_keep: 1,
+                    max_snapshot_age_ms: 1,
+                },
+            )
+            .await
+            .expect("snapshot expiration planning should succeed");
+
+        assert_eq!(report.expiration_candidate_count, 0);
+        assert_eq!(report.manual_review_count, 2);
+        for snapshot in &report.snapshot_reports {
+            assert_eq!(snapshot.state, TableSnapshotExpirationSnapshotState::ManualReviewRequired);
+            assert!(
+                snapshot
+                    .reasons
+                    .contains(&TableSnapshotExpirationReason::TableRetentionPropertyConflict)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_expiration_plan_requires_snapshot_timestamps() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00004.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "current-snapshot-id": 20,
+                    "metadata-log": [],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 10,
+                            "manifest-list": "s3://analytics/tables/table-id/metadata/snap-10.avro"
+                        },
+                        {
+                            "snapshot-id": 20,
+                            "timestamp-ms": 2000,
+                            "manifest-list": "s3://analytics/tables/table-id/metadata/snap-20.avro"
+                        }
+                    ],
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 20,
+                            "type": "branch"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let report = store
+            .plan_table_snapshot_expiration(
+                bucket,
+                "sales",
+                "orders",
+                TableSnapshotExpirationConfig {
+                    min_snapshots_to_keep: 1,
+                    max_snapshot_age_ms: 1,
+                },
+            )
+            .await
+            .expect("snapshot expiration planning should succeed");
+
+        let missing_timestamp = snapshot_expiration_report(&report, 10);
+        assert_eq!(missing_timestamp.state, TableSnapshotExpirationSnapshotState::ManualReviewRequired);
+        assert!(
+            missing_timestamp
+                .reasons
+                .contains(&TableSnapshotExpirationReason::MissingSnapshotTimestamp)
+        );
+        assert_eq!(report.expiration_candidate_count, 0);
+        assert_eq!(report.manual_review_count, 1);
+    }
+
+    #[tokio::test]
+    async fn compaction_plan_reports_manifest_reader_gap_without_rewrite_candidates() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00004.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "current-snapshot-id": 20,
+                    "metadata-log": [],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 20,
+                            "timestamp-ms": 2000,
+                            "manifest-list": "s3://analytics/tables/table-id/metadata/snap-20.avro"
+                        }
+                    ],
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 20,
+                            "type": "branch"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let report = store
+            .plan_table_compaction(
+                bucket,
+                "sales",
+                "orders",
+                TableCompactionPlanningConfig {
+                    target_file_size_bytes: 512 * 1024 * 1024,
+                    small_file_threshold_bytes: 64 * 1024 * 1024,
+                    min_input_files: 2,
+                    max_rewrite_bytes_per_job: 1024 * 1024 * 1024,
+                },
+            )
+            .await
+            .expect("compaction planning should succeed");
+
+        assert_eq!(report.status, TableCompactionPlanningStatus::ManualReviewRequired);
+        assert_eq!(report.candidate_file_count, 0);
+        assert_eq!(report.rewrite_group_count, 0);
+        assert_eq!(report.manual_review_count, 1);
+        let snapshot = compaction_snapshot_report(&report, 20);
+        assert_eq!(snapshot.status, TableCompactionPlanningStatus::ManualReviewRequired);
+        assert!(snapshot.reasons.contains(&TableCompactionPlanningReason::ManifestList));
+        assert!(
+            snapshot
+                .reasons
+                .contains(&TableCompactionPlanningReason::ManifestAvroReaderUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_plan_requires_current_snapshot_metadata() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00004.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "current-snapshot-id": 30,
+                    "metadata-log": [],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 20,
+                            "timestamp-ms": 2000,
+                            "manifest-list": "s3://analytics/tables/table-id/metadata/snap-20.avro"
+                        }
+                    ]
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let report = store
+            .plan_table_compaction(
+                bucket,
+                "sales",
+                "orders",
+                TableCompactionPlanningConfig {
+                    target_file_size_bytes: 512 * 1024 * 1024,
+                    small_file_threshold_bytes: 64 * 1024 * 1024,
+                    min_input_files: 2,
+                    max_rewrite_bytes_per_job: 1024 * 1024 * 1024,
+                },
+            )
+            .await
+            .expect("compaction planning should succeed");
+
+        assert_eq!(report.status, TableCompactionPlanningStatus::ManualReviewRequired);
+        assert_eq!(report.manual_review_count, 1);
+        let snapshot = compaction_snapshot_report(&report, 30);
+        assert!(
+            snapshot
+                .reasons
+                .contains(&TableCompactionPlanningReason::MissingCurrentSnapshot)
+        );
+    }
+
+    #[tokio::test]
     async fn maintenance_dry_run_keeps_recent_metadata_files_and_ignores_non_metadata_objects() {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend.clone());
@@ -3968,6 +5840,56 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.cleanup_candidate_locations, vec![old.clone()]);
+        assert!(!backend.object_exists(bucket, &old).await.unwrap());
+        assert!(backend.object_exists(bucket, &fresh).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn maintenance_delete_does_not_expand_beyond_planned_deletable_candidates() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let old = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let fresh = default_table_metadata_file_path(&namespace, &table, "00003.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend.seed_object(bucket, &old, b"{}".to_vec()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+        backend
+            .seed_object_with_mod_time(bucket, &fresh, b"{}".to_vec(), Some(OffsetDateTime::now_utc()))
+            .await;
+
+        let report = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .unwrap();
+        assert_eq!(report.cleanup_candidate_locations, vec![old.clone(), fresh.clone()]);
+        assert_eq!(report.deletable_metadata_locations, vec![old.clone()]);
+
+        backend.seed_object(bucket, &fresh, b"{}".to_vec()).await;
+        let deleted = store
+            .delete_table_metadata_maintenance_report(bucket, "sales", "orders", report)
+            .await
+            .unwrap();
+
+        assert_eq!(deleted.job.operation, TableMetadataMaintenanceOperation::Delete);
+        assert_eq!(deleted.job.status, TableMetadataMaintenanceJobStatus::Successful);
+        assert_eq!(deleted.job.deleted_metadata_file_count, 1);
+        assert_eq!(deleted.cleanup_candidate_locations, vec![old.clone()]);
+        assert_eq!(deleted.deletable_metadata_locations, vec![old.clone()]);
+        assert_eq!(
+            maintenance_object_report(&deleted, &old).state,
+            TableMetadataMaintenanceObjectState::Deleted
+        );
+        assert_eq!(
+            maintenance_object_report(&deleted, &fresh).state,
+            TableMetadataMaintenanceObjectState::PendingSafetyWindow
+        );
         assert!(!backend.object_exists(bucket, &old).await.unwrap());
         assert!(backend.object_exists(bucket, &fresh).await.unwrap());
     }

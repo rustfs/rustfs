@@ -26,7 +26,7 @@ use crate::bucket::target::BucketTargets;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::api_get_options::{AdvancedGetOptions, StatObjectOptions};
 use crate::config::com::save_config;
-use crate::disk::BUCKET_META_PREFIX;
+use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use crate::event_notification::{EventArgs, send_event};
 use crate::global::GLOBAL_LocalNodeName;
@@ -52,6 +52,7 @@ use http::HeaderMap;
 use http_body::Frame;
 use http_body_util::StreamBody;
 use regex::Regex;
+use rmp_serde;
 use rustfs_filemeta::{
     MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo,
     ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction, ReplicationState, ReplicationStatusType,
@@ -106,6 +107,12 @@ pub(crate) const REPLICATION_DIR: &str = ".replication";
 pub(crate) const RESYNC_FILE_NAME: &str = "resync.bin";
 pub(crate) const RESYNC_META_FORMAT: u16 = 1;
 pub(crate) const RESYNC_META_VERSION: u16 = 1;
+
+// MRF (Most Recent Failures) persistence file — stored at
+// `{RUSTFS_META_BUCKET}/config/replication/mrf.bin`, cross-bucket.
+pub(crate) const MRF_REPLICATION_FILE: &str = "config/replication/mrf.bin";
+const MRF_META_FORMAT: u16 = 1;
+const MRF_META_VERSION: u16 = 1;
 const RESYNC_TIME_INTERVAL: TokioDuration = TokioDuration::from_secs(60);
 const WIRE_ZERO_TIME_UNIX: i64 = -62_135_596_800;
 
@@ -353,6 +360,36 @@ pub(crate) fn decode_resync_file(data: &[u8]) -> Result<BucketReplicationResyncS
         return Err(Error::CorruptedFormat);
     }
     Ok(status)
+}
+
+pub(crate) fn encode_mrf_file(entries: &[MrfReplicateEntry]) -> Result<Vec<u8>> {
+    let payload = rmp_serde::to_vec_named(entries).map_err(|e| Error::other(e.to_string()))?;
+    let mut data = Vec::with_capacity(4 + payload.len());
+    let mut fmt = [0u8; 2];
+    byteorder::LittleEndian::write_u16(&mut fmt, MRF_META_FORMAT);
+    data.extend_from_slice(&fmt);
+    let mut ver = [0u8; 2];
+    byteorder::LittleEndian::write_u16(&mut ver, MRF_META_VERSION);
+    data.extend_from_slice(&ver);
+    data.extend_from_slice(&payload);
+    Ok(data)
+}
+
+pub(crate) fn decode_mrf_file(data: &[u8]) -> Result<Vec<MrfReplicateEntry>> {
+    if data.len() <= 4 {
+        return Err(Error::CorruptedFormat);
+    }
+    let mut fmt = [0u8; 2];
+    fmt.copy_from_slice(&data[0..2]);
+    if byteorder::LittleEndian::read_u16(&fmt) != MRF_META_FORMAT {
+        return Err(Error::CorruptedFormat);
+    }
+    let mut ver = [0u8; 2];
+    ver.copy_from_slice(&data[2..4]);
+    if byteorder::LittleEndian::read_u16(&ver) != MRF_META_VERSION {
+        return Err(Error::CorruptedFormat);
+    }
+    rmp_serde::from_slice(&data[4..]).map_err(|e| Error::other(e.to_string()))
 }
 
 impl TargetReplicationResyncStatus {
@@ -690,6 +727,42 @@ impl ReplicationResyncer {
         if cancellation_token.is_cancelled() {
             return;
         }
+
+        // Acquire a cluster-wide leader lock for this (bucket, ARN) pair so that only
+        // one node runs the resync scan at a time. Without this, every cluster node would
+        // scan and replicate every object independently, causing N-fold duplicate traffic.
+        let resync_lock_key = format!("{}/{}/{}", REPLICATION_DIR, opts.bucket, opts.arn);
+        let resync_ns_lock = match storage.new_ns_lock(RUSTFS_META_BUCKET, &resync_lock_key).await {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(
+                    event = EVENT_RESYNC_STATUS_UPDATE_SKIPPED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                    bucket = %opts.bucket,
+                    arn = %opts.arn,
+                    error = %e,
+                    reason = "leader_lock_create_failed",
+                    "Failed to create resync leader lock — skipping resync"
+                );
+                return;
+            }
+        };
+        let _resync_leader_guard = match resync_ns_lock.get_write_lock(get_lock_acquire_timeout()).await {
+            Ok(g) => g,
+            Err(_) => {
+                debug!(
+                    event = EVENT_RESYNC_STATUS_UPDATE_SKIPPED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                    bucket = %opts.bucket,
+                    arn = %opts.arn,
+                    reason = "leader_lock_held_by_another_node",
+                    "Another node is already running resync for this bucket/ARN — skipping"
+                );
+                return;
+            }
+        };
 
         let cfg = match get_replication_config(&opts.bucket).await {
             Ok(cfg) => cfg,
@@ -1187,9 +1260,14 @@ impl ReplicationWorkerOperation for DeletedObjectReplicationInfo {
         MrfReplicateEntry {
             bucket: self.bucket.clone(),
             object: self.delete_object.object_name.clone(),
-            version_id: None,
+            // version_id here is the version being purged (if any); the delete-marker
+            // version is stored separately in delete_marker_version_id.
+            version_id: self.delete_object.version_id,
             retry_count: 0,
             size: 0,
+            op: rustfs_filemeta::MrfOpKind::Delete,
+            delete_marker_version_id: self.delete_object.delete_marker_version_id,
+            delete_marker: self.delete_object.delete_marker,
         }
     }
 
@@ -2556,7 +2634,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
     rinfo
 }
 
-pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: Arc<S>) {
+pub async fn replicate_object<S: StorageAPI + NamespaceLocking>(roi: ReplicateObjectInfo, storage: Arc<S>) {
     let bucket = roi.bucket.clone();
     let object = roi.name.clone();
 
@@ -2614,7 +2692,57 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
         ..Default::default()
     });
 
-    // TODO: NSLOCK
+    // Acquire a per-object namespace lock so that at most one worker (across all cluster
+    // nodes and MRF retry goroutines) replicates this object version at a time.
+    let obj_lock_key = format!("/[replicate]/{}", object);
+    let obj_ns_lock = match storage.new_ns_lock(&bucket, &obj_lock_key).await {
+        Ok(l) => l,
+        Err(e) => {
+            debug!(
+                event = EVENT_RESYNC_RUNTIME_SKIPPED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket = %bucket,
+                object = %object,
+                error = %e,
+                reason = "ns_lock_create_failed",
+                "Skipping replication object"
+            );
+            send_event(EventArgs {
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
+                bucket_name: bucket.clone(),
+                object: roi.to_object_info(),
+                host: GLOBAL_LocalNodeName.to_string(),
+                user_agent: "Internal: [Replication]".to_string(),
+                ..Default::default()
+            });
+            return;
+        }
+    };
+    let _obj_lock_guard = match obj_ns_lock.get_write_lock(get_lock_acquire_timeout()).await {
+        Ok(g) => g,
+        Err(e) => {
+            debug!(
+                event = EVENT_RESYNC_RUNTIME_SKIPPED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket = %bucket,
+                object = %object,
+                error = %e,
+                reason = "ns_lock_write_lock_failed",
+                "Skipping replication object"
+            );
+            send_event(EventArgs {
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
+                bucket_name: bucket.clone(),
+                object: roi.to_object_info(),
+                host: GLOBAL_LocalNodeName.to_string(),
+                user_agent: "Internal: [Replication]".to_string(),
+                ..Default::default()
+            });
+            return;
+        }
+    };
 
     let mut join_set = JoinSet::new();
 

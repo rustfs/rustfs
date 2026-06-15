@@ -158,6 +158,108 @@ pub struct ScannerSourceWorkSnapshot {
     pub missed: u64,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerMaintenanceSourceSnapshot {
+    #[serde(rename = "source", default)]
+    pub source: String,
+    #[serde(rename = "state", default)]
+    pub state: String,
+    #[serde(rename = "reason", default)]
+    pub reason: String,
+    #[serde(rename = "backlog", default)]
+    pub backlog: u64,
+    #[serde(rename = "current_checked", default)]
+    pub current_checked: u64,
+    #[serde(rename = "current_queued", default)]
+    pub current_queued: u64,
+    #[serde(rename = "current_missed", default)]
+    pub current_missed: u64,
+    #[serde(rename = "lifetime_missed", default)]
+    pub lifetime_missed: u64,
+    #[serde(rename = "partial_cycles", default)]
+    pub partial_cycles: u64,
+}
+
+impl ScannerMaintenanceSourceSnapshot {
+    fn merge(&mut self, other: &Self) {
+        if scanner_maintenance_state_priority(&other.state) > scanner_maintenance_state_priority(&self.state) {
+            self.state = other.state.clone();
+            self.reason = other.reason.clone();
+        } else if self.reason.is_empty() || self.reason == SCANNER_MAINTENANCE_REASON_IDLE {
+            self.reason = other.reason.clone();
+        }
+
+        self.backlog = self.backlog.saturating_add(other.backlog);
+        self.current_checked = self.current_checked.saturating_add(other.current_checked);
+        self.current_queued = self.current_queued.saturating_add(other.current_queued);
+        self.current_missed = self.current_missed.saturating_add(other.current_missed);
+        self.lifetime_missed = self.lifetime_missed.saturating_add(other.lifetime_missed);
+        self.partial_cycles = self.partial_cycles.saturating_add(other.partial_cycles);
+    }
+}
+
+const SCANNER_MAINTENANCE_CONTROL_NONE: &str = "none";
+const SCANNER_MAINTENANCE_REASON_IDLE: &str = "idle";
+
+fn scanner_maintenance_state_priority(state: &str) -> u8 {
+    match state {
+        "blocked" => 3,
+        "deferred" => 2,
+        "active" => 1,
+        _ => 0,
+    }
+}
+
+fn scanner_maintenance_control_priority(control: &str) -> u8 {
+    match control {
+        "blocked_source" => 4,
+        "deferred_source" => 3,
+        "active_source" => 2,
+        "pacing_pressure" => 1,
+        _ => 0,
+    }
+}
+
+fn default_scanner_maintenance_control() -> String {
+    SCANNER_MAINTENANCE_CONTROL_NONE.to_string()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerMaintenanceControlSnapshot {
+    #[serde(rename = "primary_control", default = "default_scanner_maintenance_control")]
+    pub primary_control: String,
+    #[serde(rename = "sources", default)]
+    pub sources: Vec<ScannerMaintenanceSourceSnapshot>,
+}
+
+impl Default for ScannerMaintenanceControlSnapshot {
+    fn default() -> Self {
+        Self {
+            primary_control: default_scanner_maintenance_control(),
+            sources: Vec::new(),
+        }
+    }
+}
+
+impl ScannerMaintenanceControlSnapshot {
+    fn merge(&mut self, other: &Self) {
+        if scanner_maintenance_control_priority(&other.primary_control)
+            > scanner_maintenance_control_priority(&self.primary_control)
+        {
+            self.primary_control = other.primary_control.clone();
+        }
+
+        for source in other.sources.iter() {
+            if let Some(existing) = self.sources.iter_mut().find(|existing| existing.source == source.source) {
+                existing.merge(source);
+            } else {
+                self.sources.push(source.clone());
+            }
+        }
+        self.sources.sort_by(|left, right| left.source.cmp(&right.source));
+    }
+}
+
 impl ScannerSourceWorkSnapshot {
     fn merge(&mut self, other: &Self) {
         self.checked = self.checked.saturating_add(other.checked);
@@ -256,6 +358,36 @@ impl ScannerPacingPressureSnapshot {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerLifecycleExpirySnapshot {
+    #[serde(rename = "current_queue_capacity", default)]
+    pub current_queue_capacity: u64,
+    #[serde(rename = "current_queued", default)]
+    pub current_queued: u64,
+    #[serde(rename = "current_active", default)]
+    pub current_active: u64,
+    #[serde(rename = "current_workers", default)]
+    pub current_workers: u64,
+    #[serde(rename = "queue_missed", default)]
+    pub queue_missed: u64,
+    #[serde(rename = "scanner_queued", default)]
+    pub scanner_queued: u64,
+    #[serde(rename = "scanner_missed", default)]
+    pub scanner_missed: u64,
+}
+
+impl ScannerLifecycleExpirySnapshot {
+    fn merge(&mut self, other: &Self) {
+        self.current_queue_capacity = self.current_queue_capacity.saturating_add(other.current_queue_capacity);
+        self.current_queued = self.current_queued.saturating_add(other.current_queued);
+        self.current_active = self.current_active.saturating_add(other.current_active);
+        self.current_workers = self.current_workers.saturating_add(other.current_workers);
+        self.queue_missed = self.queue_missed.saturating_add(other.queue_missed);
+        self.scanner_queued = self.scanner_queued.saturating_add(other.scanner_queued);
+        self.scanner_missed = self.scanner_missed.saturating_add(other.scanner_missed);
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScannerLifecycleTransitionSnapshot {
     #[serde(rename = "current_queue_capacity", default)]
     pub current_queue_capacity: u64,
@@ -271,6 +403,8 @@ pub struct ScannerLifecycleTransitionSnapshot {
     pub queue_send_timeout: u64,
     #[serde(rename = "compensation_scheduled", default)]
     pub compensation_scheduled: u64,
+    #[serde(rename = "compensation_pending", default)]
+    pub compensation_pending: u64,
     #[serde(rename = "compensation_running", default)]
     pub compensation_running: u64,
     #[serde(rename = "scanner_queued", default)]
@@ -292,6 +426,7 @@ impl ScannerLifecycleTransitionSnapshot {
         self.queue_full = self.queue_full.saturating_add(other.queue_full);
         self.queue_send_timeout = self.queue_send_timeout.saturating_add(other.queue_send_timeout);
         self.compensation_scheduled = self.compensation_scheduled.saturating_add(other.compensation_scheduled);
+        self.compensation_pending = self.compensation_pending.saturating_add(other.compensation_pending);
         self.compensation_running = self.compensation_running.saturating_add(other.compensation_running);
         self.scanner_queued = self.scanner_queued.saturating_add(other.scanner_queued);
         self.scanner_missed = self.scanner_missed.saturating_add(other.scanner_missed);
@@ -422,8 +557,12 @@ pub struct ScannerMetrics {
     pub partial_cycles_by_source: Vec<ScannerSourceCycleSnapshot>,
     #[serde(rename = "pacing_pressure", default)]
     pub pacing_pressure: ScannerPacingPressureSnapshot,
+    #[serde(rename = "lifecycle_expiry", default)]
+    pub lifecycle_expiry: ScannerLifecycleExpirySnapshot,
     #[serde(rename = "lifecycle_transition", default)]
     pub lifecycle_transition: ScannerLifecycleTransitionSnapshot,
+    #[serde(rename = "maintenance_control", default)]
+    pub maintenance_control: ScannerMaintenanceControlSnapshot,
     #[serde(rename = "throttle_idle_mode_enabled", default)]
     pub throttle_idle_mode_enabled: bool,
     #[serde(rename = "throttle_sleep_factor", default)]
@@ -495,7 +634,9 @@ impl ScannerMetrics {
         self.active_scan_paths = self.active_scan_paths.saturating_add(other.active_scan_paths);
         self.oldest_active_path_age_seconds = self.oldest_active_path_age_seconds.max(other.oldest_active_path_age_seconds);
         self.pacing_pressure.merge(&other.pacing_pressure);
+        self.lifecycle_expiry.merge(&other.lifecycle_expiry);
         self.lifecycle_transition.merge(&other.lifecycle_transition);
+        self.maintenance_control.merge(&other.maintenance_control);
         self.current_set_scan_concurrency_limit = self
             .current_set_scan_concurrency_limit
             .saturating_add(other.current_set_scan_concurrency_limit);
@@ -1249,6 +1390,15 @@ mod tests {
             current_cycle_lifecycle_transition_actions: 3,
             last_cycle_lifecycle_expiry_actions: 5,
             last_cycle_lifecycle_transition_actions: 7,
+            lifecycle_expiry: ScannerLifecycleExpirySnapshot {
+                current_queue_capacity: 8,
+                current_queued: 2,
+                current_active: 1,
+                current_workers: 2,
+                queue_missed: 3,
+                scanner_queued: 5,
+                scanner_missed: 2,
+            },
             lifecycle_transition: ScannerLifecycleTransitionSnapshot {
                 current_queue_capacity: 8,
                 current_queued: 2,
@@ -1257,6 +1407,7 @@ mod tests {
                 queue_full: 3,
                 queue_send_timeout: 1,
                 compensation_scheduled: 1,
+                compensation_pending: 2,
                 compensation_running: 1,
                 scanner_queued: 5,
                 scanner_missed: 2,
@@ -1272,6 +1423,15 @@ mod tests {
             current_cycle_lifecycle_transition_actions: 13,
             last_cycle_lifecycle_expiry_actions: 17,
             last_cycle_lifecycle_transition_actions: 19,
+            lifecycle_expiry: ScannerLifecycleExpirySnapshot {
+                current_queue_capacity: 4,
+                current_queued: 3,
+                current_active: 2,
+                current_workers: 1,
+                queue_missed: 2,
+                scanner_queued: 6,
+                scanner_missed: 4,
+            },
             lifecycle_transition: ScannerLifecycleTransitionSnapshot {
                 current_queue_capacity: 4,
                 current_queued: 3,
@@ -1280,6 +1440,7 @@ mod tests {
                 queue_full: 2,
                 queue_send_timeout: 3,
                 compensation_scheduled: 4,
+                compensation_pending: 3,
                 compensation_running: 0,
                 scanner_queued: 6,
                 scanner_missed: 4,
@@ -1289,6 +1450,13 @@ mod tests {
             ..Default::default()
         });
 
+        assert_eq!(scanner.lifecycle_expiry.current_queue_capacity, 12);
+        assert_eq!(scanner.lifecycle_expiry.current_queued, 5);
+        assert_eq!(scanner.lifecycle_expiry.current_active, 3);
+        assert_eq!(scanner.lifecycle_expiry.current_workers, 3);
+        assert_eq!(scanner.lifecycle_expiry.queue_missed, 5);
+        assert_eq!(scanner.lifecycle_expiry.scanner_queued, 11);
+        assert_eq!(scanner.lifecycle_expiry.scanner_missed, 6);
         assert_eq!(scanner.lifecycle_transition.current_queue_capacity, 12);
         assert_eq!(scanner.lifecycle_transition.current_queued, 5);
         assert_eq!(scanner.lifecycle_transition.current_active, 3);
@@ -1296,6 +1464,7 @@ mod tests {
         assert_eq!(scanner.lifecycle_transition.queue_full, 5);
         assert_eq!(scanner.lifecycle_transition.queue_send_timeout, 4);
         assert_eq!(scanner.lifecycle_transition.compensation_scheduled, 5);
+        assert_eq!(scanner.lifecycle_transition.compensation_pending, 5);
         assert_eq!(scanner.lifecycle_transition.compensation_running, 1);
         assert_eq!(scanner.lifecycle_transition.scanner_queued, 11);
         assert_eq!(scanner.lifecycle_transition.scanner_missed, 6);
@@ -1305,6 +1474,87 @@ mod tests {
         assert_eq!(scanner.current_cycle_lifecycle_transition_actions, 16);
         assert_eq!(scanner.last_cycle_lifecycle_expiry_actions, 22);
         assert_eq!(scanner.last_cycle_lifecycle_transition_actions, 26);
+    }
+
+    #[test]
+    fn scanner_metrics_merge_aggregates_maintenance_control_status() {
+        let collected_at = Utc::now();
+        let mut scanner = ScannerMetrics {
+            collected_at,
+            maintenance_control: ScannerMaintenanceControlSnapshot {
+                primary_control: "active_source".to_string(),
+                sources: vec![ScannerMaintenanceSourceSnapshot {
+                    source: "usage".to_string(),
+                    state: "active".to_string(),
+                    reason: "active_work".to_string(),
+                    backlog: 1,
+                    current_checked: 2,
+                    current_queued: 0,
+                    current_missed: 0,
+                    lifetime_missed: 0,
+                    partial_cycles: 0,
+                }],
+            },
+            ..Default::default()
+        };
+
+        scanner.merge(&ScannerMetrics {
+            collected_at: collected_at + chrono::Duration::seconds(1),
+            maintenance_control: ScannerMaintenanceControlSnapshot {
+                primary_control: "blocked_source".to_string(),
+                sources: vec![
+                    ScannerMaintenanceSourceSnapshot {
+                        source: "usage".to_string(),
+                        state: "deferred".to_string(),
+                        reason: "partial_cycle".to_string(),
+                        backlog: 3,
+                        current_checked: 5,
+                        current_queued: 1,
+                        current_missed: 0,
+                        lifetime_missed: 0,
+                        partial_cycles: 2,
+                    },
+                    ScannerMaintenanceSourceSnapshot {
+                        source: "lifecycle".to_string(),
+                        state: "blocked".to_string(),
+                        reason: "missed_work".to_string(),
+                        backlog: 4,
+                        current_checked: 0,
+                        current_queued: 0,
+                        current_missed: 4,
+                        lifetime_missed: 9,
+                        partial_cycles: 1,
+                    },
+                ],
+            },
+            ..Default::default()
+        });
+
+        assert_eq!(scanner.maintenance_control.primary_control, "blocked_source");
+        let lifecycle = scanner
+            .maintenance_control
+            .sources
+            .iter()
+            .find(|source| source.source == "lifecycle")
+            .expect("lifecycle maintenance control should be present");
+        assert_eq!(lifecycle.state, "blocked");
+        assert_eq!(lifecycle.reason, "missed_work");
+        assert_eq!(lifecycle.backlog, 4);
+        assert_eq!(lifecycle.current_missed, 4);
+        assert_eq!(lifecycle.lifetime_missed, 9);
+
+        let usage = scanner
+            .maintenance_control
+            .sources
+            .iter()
+            .find(|source| source.source == "usage")
+            .expect("usage maintenance control should be present");
+        assert_eq!(usage.state, "deferred");
+        assert_eq!(usage.reason, "partial_cycle");
+        assert_eq!(usage.backlog, 4);
+        assert_eq!(usage.current_checked, 7);
+        assert_eq!(usage.current_queued, 1);
+        assert_eq!(usage.partial_cycles, 2);
     }
 
     #[test]
