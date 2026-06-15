@@ -5,18 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-startup-storage-bootstrap`
-- Baseline: `origin/main` at `6508f88d3a5edb428a5d623f927ce384691f0cd4`
+- Branch: `overtrue/arch-startup-storage-runtime`
+- Baseline: `origin/main` at `a19560da419c6d354a805fc127951cc9b56ad887`
 - PR type for this branch: `pure-move`
-- Runtime behavior changes: no external behavior change expected; endpoint
-  parsing, unsupported filesystem policy enforcement, global endpoint/erasure
-  type publication, local disk/prewarm, lock clients, and storage pool logging
-  still run in the same relative order between listen context and HTTP server
-  startup.
-- Rust code changes: add `startup_storage::init_startup_storage_foundation`
-  and use it from binary startup.
+- Runtime behavior changes: no external behavior change expected; ECStore
+  creation, ECStore config initialization, global config retry policy,
+  `StorageReady` publication, and background replication startup still run in
+  the same relative order after HTTP server startup and before KMS startup.
+- Rust code changes: add `startup_storage::init_startup_storage_runtime` and
+  use it from binary startup.
 - CI/script changes: none.
-- Docs changes: record `R-015` startup storage foundation bootstrap progress and
+- Docs changes: record `R-016` startup storage runtime bootstrap progress and
   verification.
 
 ## Phase 0 Tasks
@@ -662,6 +661,25 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     formatting, migration guards, Rust risk scan, branch freshness check, and
     pre-commit quality gate.
 
+- [x] `R-016` Centralize startup storage runtime bootstrap.
+  - Do: move runtime cancellation token creation, ECStore initialization,
+    ECStore config initialization, server-config migration attempt, global
+    config retry loop, `StorageReady` stage publication, and background
+    replication startup behind the `startup_storage` boundary.
+  - Acceptance: storage runtime still starts after HTTP server startup and
+    before KMS startup; ECStore init failure keeps the same structured error log
+    and propagated error; global config init still logs every failed attempt,
+    sleeps between attempts, and becomes fatal after the 16th failed attempt;
+    `StorageReady` is still marked after global config init succeeds and before
+    background replication startup.
+  - Must preserve: cancellation token ownership for later shutdown, endpoint
+    pool clone ownership for ECStore startup, ECStore config init/migration
+    order, retry count/log fields, fatal error string, readiness stage timing,
+    and non-fatal background replication startup behavior.
+  - Verification: focused startup storage tests, binary/lib compile checks,
+    formatting, migration guards, Rust risk scan, branch freshness check, and
+    pre-commit quality gate.
+
 ## Next PRs
 
 1. `pure-move`: continue extracting startup boot wrappers in larger slices while
@@ -673,13 +691,13 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Pure-move slice removes storage foundation details from binary startup behind the existing startup module pattern. |
-| Migration preservation | passed | Endpoint parsing, filesystem policy, global endpoint/erasure publication, local disk/prewarm, lock clients, and pool logging order are preserved. |
+| Quality/architecture | passed | Pure-move slice removes storage runtime details from binary startup behind the existing startup storage boundary. |
+| Migration preservation | passed | HTTP server startup, ECStore creation, config init/migration, global config retry, `StorageReady`, replication startup, and KMS startup order are preserved. |
 | Testing/verification | passed | Focused startup storage tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `6508f88d3a5edb428a5d623f927ce384691f0cd4`:
+Passed on `a19560da419c6d354a805fc127951cc9b56ad887`:
 
 - `cargo test -p rustfs startup_storage --no-fail-fast`: passed.
 - `cargo check -p rustfs --lib`: passed.
@@ -688,24 +706,23 @@ Passed on `6508f88d3a5edb428a5d623f927ce384691f0cd4`:
 - `git diff --check`: passed.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
-- `git rev-list --left-right --count HEAD...origin/main` returned `0 0`
-  before commit.
+- `git rev-list --left-right --count HEAD...origin/main` returned `1 0`
+  after commit and rebase.
 - Added-line Rust risk scan for changed Rust files: no matches.
-- Full-file risk scan for changed Rust files: matches are existing docs example
-  output and existing binary startup alias/stderr/expect usage.
-- `make pre-commit`: all checks passed, including nextest with 6009 passed
+- Full-file risk scan for changed Rust files: matches are existing binary
+  startup stderr/expect usage.
+- `make pre-commit`: all checks passed, including nextest with 6016 passed
   and 111 skipped, plus doctests.
 
 Notes:
 
-- This slice centralizes startup storage foundation without changing startup
-  ordering or endpoint pool ownership.
-- Storage foundation remains after listen context setup and before HTTP server
-  startup.
+- This slice centralizes startup storage runtime without changing startup
+  ordering, shutdown token ownership, or endpoint pool ownership.
+- Storage runtime remains after HTTP server startup and before KMS startup.
 
 ## Handoff Notes
 
-- R-015 is complete.
+- R-016 is complete.
 - Next startup slices can keep using larger pure moves, but must keep startup
   ordering, fatal/non-fatal boundaries, shutdown ownership, and readiness
   ownership explicit in tests.
