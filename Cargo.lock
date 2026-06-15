@@ -1601,9 +1601,9 @@ dependencies = [
 
 [[package]]
 name = "brotli"
-version = "8.0.3"
+version = "8.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8119e4516436f5708bbc474a9d395bf12f1b5395e93a92a56e647ac3388c8610"
+checksum = "5cc91aac060a7a1e25823bdccbfb6af1875b88f17c6daac97894eed8207166b3"
 dependencies = [
  "alloc-no-stdlib",
  "alloc-stdlib",
@@ -10362,12 +10362,12 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.14.0-dev"
-source = "git+https://github.com/rustfs/s3s?rev=cf4c3346ed2554daa7fc6437f9969b076a5137ad#cf4c3346ed2554daa7fc6437f9969b076a5137ad"
+source = "git+https://github.com/rustfs/s3s?rev=c59b62f7badf29fefefec69381d13cd459f44aa8#c59b62f7badf29fefefec69381d13cd459f44aa8"
 dependencies = [
  "arc-swap",
  "arrayvec",
  "async-trait",
- "atoi 2.0.0",
+ "atoi 3.0.0",
  "base64-simd",
  "bytes",
  "bytestring",

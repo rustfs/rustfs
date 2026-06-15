@@ -216,7 +216,7 @@ aws-smithy-http-client = { version = "1.1.13", default-features = false, feature
 aws-smithy-types = { version = "1.5.0" }
 base64 = "0.22.1"
 base64-simd = "0.8.0"
-brotli = "8.0.3"
+brotli = "8.0.4"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 const-str = { version = "1.1.0", features = ["std", "proc"] }
 convert_case = "0.11.0"
@@ -270,7 +270,7 @@ redis = { version = "1.2.3", features = ["connection-manager", "tokio-rustls-com
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.2" }
-s3s = { git = "https://github.com/rustfs/s3s", rev = "cf4c3346ed2554daa7fc6437f9969b076a5137ad", features = ["minio"] }
+s3s = { git = "https://github.com/rustfs/s3s", rev = "c59b62f7badf29fefefec69381d13cd459f44aa8", features = ["minio"] }
 serial_test = "3.5.0"
 shadow-rs = { version = "2.0.0", default-features = false }
 siphasher = "1.0.3"
