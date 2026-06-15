@@ -178,7 +178,7 @@ mod tests {
                 "fn emit_fatal_stderr(context: &str, error: impl std::fmt::Display)",
                 "emit_fatal_stderr(\"Server runtime failed\", e)",
                 "emit_fatal_stderr(\"Command parse failed\", e)",
-                "emit_fatal_stderr(\"Observability initialization failed\", &e)",
+                "emit_fatal_stderr(\"Observability initialization failed\", err)",
             ],
         );
     }

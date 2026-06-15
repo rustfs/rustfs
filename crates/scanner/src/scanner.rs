@@ -140,8 +140,19 @@ fn initial_scanner_delay_for(start_delay_secs: Option<u64>) -> Duration {
         .unwrap_or_else(randomized_cycle_delay)
 }
 
-fn initial_scanner_delay_for_startup(start_delay_secs: Option<u64>, usage_cache_is_cold: bool, has_buckets: bool) -> Duration {
-    if usage_cache_is_cold && has_buckets {
+fn initial_scanner_delay_for_startup(
+    start_delay_secs: Option<u64>,
+    usage_cache_is_cold: bool,
+    has_buckets: bool,
+    has_active_replication: bool,
+) -> Duration {
+    // Skip the startup delay when the cache is cold (first ever scan) OR when active replication
+    // rules exist. In single-disk/Slowest mode the normal inter-cycle delay is 27-33 minutes; if
+    // the node was SIGKILL'd with FAILED-status objects queued, waiting that long leaves them
+    // permanently unhealed until the next full cycle. Replication config is live-read at startup
+    // by configure_scanner_defaults, so this signal is always current regardless of when the
+    // persisted DataUsageInfo was last written.
+    if (usage_cache_is_cold || has_active_replication) && has_buckets {
         Duration::ZERO
     } else {
         initial_scanner_delay_for(start_delay_secs)
@@ -236,7 +247,7 @@ async fn initial_scanner_startup_usage_state(storeapi: &Arc<ECStore>) -> (bool, 
 }
 
 pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
-    configure_scanner_defaults(&storeapi).await;
+    let startup_features = configure_scanner_defaults(&storeapi).await;
     // Force init global sleeper so config is read once at startup.
     let _ = &*SCANNER_SLEEPER;
     if let Err(err) = refresh_scanner_runtime_config_from_global() {
@@ -251,6 +262,7 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
         );
     }
 
+    let replication_active = startup_features.replication;
     let ctx_clone = ctx;
     let storeapi_clone = storeapi;
     tokio::spawn(async move {
@@ -259,15 +271,21 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
             scanner_start_delay().map(|duration| duration.as_secs()),
             usage_cache_is_cold,
             has_buckets,
+            replication_active,
         );
         if sleep_time.is_zero() {
+            let skip_reason = if usage_cache_is_cold {
+                "usage_cache_cold"
+            } else {
+                "replication_active"
+            };
             info!(
                 target: "rustfs::scanner",
                 event = EVENT_SCANNER_CYCLE_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_RUNTIME,
                 state = "startup_delay_skipped",
-                reason = "usage_cache_cold",
+                reason = skip_reason,
                 "Scanner startup delay skipped"
             );
         } else {
@@ -399,7 +417,7 @@ async fn detect_scanner_maintenance_features(storeapi: &Arc<ECStore>) -> Scanner
     features
 }
 
-async fn configure_scanner_defaults(storeapi: &Arc<ECStore>) {
+async fn configure_scanner_defaults(storeapi: &Arc<ECStore>) -> ScannerMaintenanceFeatures {
     if is_erasure_sd().await {
         let features = detect_scanner_maintenance_features(storeapi).await;
         let default_cycle_secs = single_disk_default_cycle_secs(features);
@@ -420,9 +438,11 @@ async fn configure_scanner_defaults(storeapi: &Arc<ECStore>) {
             state = "single_disk_defaults_applied",
             "Scanner defaults applied"
         );
+        features
     } else {
         set_scanner_default_speed(ScannerSpeed::Default);
         set_scanner_default_cycle_secs(None);
+        ScannerMaintenanceFeatures::default()
     }
 }
 
@@ -1185,14 +1205,14 @@ mod tests {
     #[test]
     #[serial]
     fn test_initial_scanner_delay_skips_for_cold_usage_cache_with_buckets() {
-        let delay = initial_scanner_delay_for_startup(Some(120), true, true);
+        let delay = initial_scanner_delay_for_startup(Some(120), true, true, false);
         assert_eq!(delay, Duration::ZERO);
     }
 
     #[test]
     #[serial]
-    fn test_initial_scanner_delay_keeps_configured_delay_for_warm_usage_cache() {
-        let delay = initial_scanner_delay_for_startup(Some(120), false, true);
+    fn test_initial_scanner_delay_keeps_configured_delay_for_warm_usage_cache_no_replication() {
+        let delay = initial_scanner_delay_for_startup(Some(120), false, true, false);
         assert!(delay >= Duration::from_secs(108));
         assert!(delay <= Duration::from_secs(132));
     }
@@ -1200,7 +1220,25 @@ mod tests {
     #[test]
     #[serial]
     fn test_initial_scanner_delay_keeps_configured_delay_without_buckets() {
-        let delay = initial_scanner_delay_for_startup(Some(120), true, false);
+        let delay = initial_scanner_delay_for_startup(Some(120), true, false, false);
+        assert!(delay >= Duration::from_secs(108));
+        assert!(delay <= Duration::from_secs(132));
+    }
+
+    #[test]
+    #[serial]
+    fn test_initial_scanner_delay_skips_for_active_replication_warm_cache() {
+        // Warm cache + active replication rules → skip startup delay so that FAILED-status objects
+        // from a crash are healed on the first cycle, not after a 27-33 min sleep.
+        let delay = initial_scanner_delay_for_startup(Some(120), false, true, true);
+        assert_eq!(delay, Duration::ZERO);
+    }
+
+    #[test]
+    #[serial]
+    fn test_initial_scanner_delay_keeps_delay_for_replication_without_buckets() {
+        // Active replication but no buckets → no objects to scan, keep normal delay.
+        let delay = initial_scanner_delay_for_startup(Some(120), false, false, true);
         assert!(delay >= Duration::from_secs(108));
         assert!(delay <= Duration::from_secs(132));
     }
