@@ -32,6 +32,53 @@ set -euo pipefail
 printf '%s\n' "$*" >>"${AWSCURL_LOG:?}"
 printf 'access-env-present=%s\n' "${AWS_ACCESS_KEY_ID:+yes}" >>"${AWSCURL_LOG:?}"
 printf 'secret-env-present=%s\n' "${AWS_SECRET_ACCESS_KEY:+yes}" >>"${AWSCURL_LOG:?}"
+
+url="${*: -1}"
+if [[ "$url" == *"/rustfs/admin/v3/background-heal/status" ]]; then
+  cat <<'JSON'
+{
+  "healQueueLength": 4,
+  "healActiveTasks": 1,
+  "healOperations": {
+    "queueLength": 4,
+    "activeTasks": 1,
+    "queuedBySource": {
+      "scanner": 2,
+      "admin": 1,
+      "autoHeal": 1,
+      "internal": 0
+    },
+    "activeBySource": {
+      "scanner": 1,
+      "admin": 0,
+      "autoHeal": 0,
+      "internal": 0
+    },
+    "queuedByPriority": {
+      "low": 2,
+      "normal": 1,
+      "high": 1,
+      "urgent": 0
+    },
+    "activeByPriority": {
+      "low": 1,
+      "normal": 0,
+      "high": 0,
+      "urgent": 0
+    }
+  }
+}
+JSON
+  exit 0
+fi
+
+if [[ "$url" == *"/rustfs/admin/v3/metrics?types=1&by-host=true&n=1" ]]; then
+  cat <<'JSON'
+{"node":"node-a","metrics":{"scanner":{"maintenanceControl":{"primaryControl":"active"}}}}
+JSON
+  exit 0
+fi
+
 cat <<'JSON'
 {
   "runtime_config": {
@@ -85,7 +132,7 @@ fi
 if [[ "$1" == "-r" ]]; then
   while [[ $# -gt 0 ]]; do
     if [[ "$1" == "--arg" && "${2:-}" == "ts" ]]; then
-      printf '"%s","active_scans",5,2,"success","","",0,0\n' "$3"
+      printf '"%s","active_scans",5,2,"success","","",0,0,4,1,2,1,1\n' "$3"
       exit 0
     fi
     shift
@@ -106,6 +153,7 @@ RUSTFS_SECRET_KEY=rustfsadmin MC_LOG="$mc_log" AWSCURL_LOG="$awscurl_log" PATH="
   --access-key rustfsadmin \
   --deployment single-disk \
   --workload-label small-object-idle \
+  --metrics-endpoints http://node-a:9000,http://node-b:9000 \
   --samples 2 \
   --interval-secs 0 \
   --out-dir "$OUT_DIR" \
@@ -122,17 +170,35 @@ if [[ "$status_count" != "2" ]]; then
   exit 1
 fi
 
+heal_status_count=$(find "$OUT_DIR/heal" -type f -name 'background-heal-status.*.json' | wc -l | tr -d ' ')
+if [[ "$heal_status_count" != "2" ]]; then
+  echo "Expected 2 background heal status snapshots, got $heal_status_count" >&2
+  exit 1
+fi
+
+metrics_count=$(find "$OUT_DIR/metrics" -type f -name 'admin-metrics.*.ndjson' | wc -l | tr -d ' ')
+if [[ "$metrics_count" != "4" ]]; then
+  echo "Expected 4 distributed admin metrics snapshots, got $metrics_count" >&2
+  exit 1
+fi
+
 test -s "$OUT_DIR/scanner-summary.csv"
 if [[ "$(wc -l <"$OUT_DIR/scanner-summary.csv" | tr -d ' ')" != "3" ]]; then
   echo "Expected scanner summary header plus 2 rows" >&2
   exit 1
 fi
+grep -q 'heal_queue_length,heal_active_tasks,heal_scanner_queued,heal_admin_queued,heal_auto_heal_queued' "$OUT_DIR/scanner-summary.csv"
 
 grep -q '^deployment=single-disk$' "$OUT_DIR/run-metadata.env"
 grep -q '^workload_label=small-object-idle$' "$OUT_DIR/run-metadata.env"
+grep -q '^metrics_endpoints=http://node-a:9000,http://node-b:9000$' "$OUT_DIR/run-metadata.env"
+grep -q '## Scanner Validation Report' "$OUT_DIR/scanner-validation-report.md"
+grep -q 'Distributed admin metrics snapshots: 4' "$OUT_DIR/scanner-validation-report.md"
+grep -q 'Background heal status snapshots: 2' "$OUT_DIR/scanner-validation-report.md"
 grep -q 'admin config get rustfs-local scanner' "$mc_log"
 grep -q 'admin config get rustfs-local heal' "$mc_log"
 grep -q -- '--request GET' "$awscurl_log"
+grep -q -- '--request POST' "$awscurl_log"
 grep -q -- 'access-env-present=yes' "$awscurl_log"
 grep -q -- 'secret-env-present=yes' "$awscurl_log"
 if grep -q -- '--secret_key' "$awscurl_log"; then
@@ -140,6 +206,9 @@ if grep -q -- '--secret_key' "$awscurl_log"; then
   exit 1
 fi
 grep -q -- 'http://127.0.0.1:9000/rustfs/admin/v3/scanner/status' "$awscurl_log"
+grep -q -- 'http://127.0.0.1:9000/rustfs/admin/v3/background-heal/status' "$awscurl_log"
+grep -q -- 'http://node-a:9000/rustfs/admin/v3/metrics?types=1&by-host=true&n=1' "$awscurl_log"
+grep -q -- 'http://node-b:9000/rustfs/admin/v3/metrics?types=1&by-host=true&n=1' "$awscurl_log"
 
 missing_pid_out="$TMP_DIR/out-missing-pid"
 RUSTFS_SECRET_KEY=rustfsadmin MC_LOG="$mc_log" AWSCURL_LOG="$awscurl_log" PATH="$BIN_DIR:$PATH" "$SCRIPT" \
