@@ -19,15 +19,14 @@ use rustfs::init::{
 
 use futures_util::future::join_all;
 use rustfs::capacity::capacity_integration::init_capacity_management;
-use rustfs::license::init_license;
 use rustfs::server::{
     ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, shutdown_event_notifier, start_http_server,
     stop_audit_system, wait_for_shutdown,
 };
 use rustfs::startup_fs_guard::enforce_unsupported_fs_policy;
 use rustfs::startup_iam::{bootstrap_or_defer_iam_init, publish_ready_for_iam_bootstrap};
+use rustfs::startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight};
 use rustfs::startup_protocols::{ProtocolShutdownSenders, init_protocol_shutdown_senders};
-use rustfs::startup_runtime::init_startup_runtime_foundation;
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
@@ -49,12 +48,10 @@ use rustfs_heal::{
     create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
 };
 use rustfs_iam::init_oidc_sys;
-use rustfs_obs::{init_metrics_runtime, init_obs, set_global_guard};
+use rustfs_obs::init_metrics_runtime;
 use rustfs_scanner::init_data_scanner;
 use rustfs_storage_api::BucketOptions;
-use rustfs_utils::{
-    ExternalEnvCompatReport, apply_external_env_compat, get_env_bool_with_aliases, net::parse_and_resolve_address,
-};
+use rustfs_utils::{get_env_bool_with_aliases, net::parse_and_resolve_address};
 use std::io::{Error, Result};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -68,16 +65,12 @@ const LOG_COMPONENT_MAIN: &str = "main";
 const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const LOG_SUBSYSTEM_AUTH: &str = "auth";
 const LOG_SUBSYSTEM_STORAGE: &str = "storage";
-const EVENT_EXTERNAL_ENV_COMPAT_CONFLICT: &str = "external_env_compat_conflict";
-const EVENT_EXTERNAL_ENV_COMPAT_APPLIED: &str = "external_env_compat_applied";
-const EVENT_OBSERVABILITY_GUARD_SET_FAILED: &str = "observability_guard_set_failed";
 const EVENT_DEFAULT_CREDENTIALS_DETECTED: &str = "default_credentials_detected";
 const EVENT_SERVER_CONFIG_SANITIZED: &str = "server_config_sanitized";
 const EVENT_SERVER_STARTING: &str = "server_starting";
 const EVENT_SERVER_RUNTIME_FAILED: &str = "server_runtime_failed";
 const EVENT_ACTION_CREDENTIALS_INITIALIZED: &str = "action_credentials_initialized";
 const EVENT_ACTION_CREDENTIALS_INITIALIZATION_FAILED: &str = "action_credentials_initialization_failed";
-const EVENT_OBSERVABILITY_GUARD_SET: &str = "observability_guard_set";
 const EVENT_ENDPOINT_PARSING_STARTED: &str = "endpoint_parsing_started";
 const EVENT_STARTUP_STORAGE_STAGE: &str = "startup_storage_stage";
 const EVENT_STORAGE_POOL_FORMATTING: &str = "storage_pool_formatting";
@@ -126,20 +119,6 @@ fn main() {
     }
 }
 
-fn bootstrap_external_prefix_compat() -> Result<ExternalEnvCompatReport> {
-    let env_compat_report = apply_external_env_compat();
-    Ok(env_compat_report)
-}
-
-fn format_external_prefix_mappings(report: &ExternalEnvCompatReport) -> String {
-    report
-        .mapped_pairs
-        .iter()
-        .map(|(source_key, rustfs_key)| format!("{source_key}->{rustfs_key}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 fn is_using_default_credentials(config: &rustfs::config::Config) -> bool {
     config.is_using_default_credentials()
 }
@@ -169,49 +148,15 @@ async fn async_main() -> Result<()> {
         rustfs::config::CommandResult::Server(config) => config,
     };
 
-    // Initialize the global config snapshot for info command
-    rustfs::config::init_config_snapshot(&config);
-
-    // Initialize the configuration
-    init_license(config.license.clone());
-
-    // Initialize Observability
-    let guard = match init_obs(Some(config.clone().obs_endpoint)).await {
-        Ok(g) => g,
-        Err(e) => {
+    match init_startup_server_preflight(&config, &env_compat_report).await {
+        Ok(()) => {}
+        Err(StartupServerPreflightError::ObservabilityInit(err)) => {
             // Structured logging is unavailable until observability initializes.
-            emit_fatal_stderr("Observability initialization failed", &e);
+            emit_fatal_stderr("Observability initialization failed", err);
             return Err(Error::other(OBSERVABILITY_INIT_FATAL_ALREADY_REPORTED));
         }
-    };
-
-    // Store in global storage
-    match set_global_guard(guard).map_err(Error::other) {
-        Ok(_) => {
-            debug!(
-                target: "rustfs::main",
-                event = EVENT_OBSERVABILITY_GUARD_SET,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STARTUP,
-                result = "ok",
-                "Stored global observability guard"
-            );
-        }
-        Err(e) => {
-            error!(
-                target: "rustfs::main",
-                event = EVENT_OBSERVABILITY_GUARD_SET_FAILED,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STARTUP,
-                error = %e,
-                "Failed to store global observability guard"
-            );
-            return Err(e);
-        }
+        Err(StartupServerPreflightError::Other(err)) => return Err(err),
     }
-
-    log_external_prefix_compat_report(&env_compat_report);
-    init_startup_runtime_foundation(&config).await?;
 
     // Run parameters
     match run(*config).await {
@@ -724,32 +669,6 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     Ok(())
 }
 
-fn log_external_prefix_compat_report(report: &ExternalEnvCompatReport) {
-    if report.conflict_count() > 0 {
-        warn!(
-            target: "rustfs::main",
-            event = EVENT_EXTERNAL_ENV_COMPAT_CONFLICT,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            conflict_count = report.conflict_count(),
-            conflict_keys = %report.conflict_keys.join(", "),
-            "Detected external-prefix compatibility conflicts; keeping RUSTFS_ values"
-        );
-    }
-
-    if report.mapped_count() > 0 {
-        info!(
-            target: "rustfs::main",
-            event = EVENT_EXTERNAL_ENV_COMPAT_APPLIED,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            mapped_count = report.mapped_count(),
-            mapped_pairs = %format_external_prefix_mappings(report),
-            "Applied external-prefix compatibility mappings"
-        );
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackgroundShutdownStep {
     DataScanner,
@@ -981,27 +900,6 @@ async fn handle_shutdown(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn format_external_prefix_mappings_lists_mapped_pairs() {
-        let report = ExternalEnvCompatReport {
-            mapped_pairs: vec![
-                ("MINIO_ROOT_USER".to_string(), "RUSTFS_ROOT_USER".to_string()),
-                (
-                    "MINIO_NOTIFY_WEBHOOK_ENABLE_PRIMARY".to_string(),
-                    "RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY".to_string(),
-                ),
-            ],
-            conflict_keys: Vec::new(),
-        };
-
-        let formatted = format_external_prefix_mappings(&report);
-
-        assert_eq!(
-            formatted,
-            "MINIO_ROOT_USER->RUSTFS_ROOT_USER, MINIO_NOTIFY_WEBHOOK_ENABLE_PRIMARY->RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY"
-        );
-    }
 
     #[test]
     fn fatal_stderr_message_uses_consistent_prefix_and_context() {
