@@ -40,6 +40,7 @@ Optional:
   --deployment            single-disk | multi-disk | distributed (default: single-disk).
   --workload-label        Free-form workload label written to metadata.
   --metrics-endpoints     Optional comma-separated RustFS endpoints for
+                          per-endpoint background-heal status and
                           /metrics?types=1&by-host=true&n=1 capture.
   --samples               Number of scanner status samples (default: 30).
   --interval-secs         Seconds between samples (default: 60).
@@ -242,7 +243,7 @@ scanner_status_url() {
 }
 
 background_heal_status_url() {
-  printf '%s/rustfs/admin/v3/background-heal/status\n' "${ENDPOINT%/}"
+  printf '%s/rustfs/admin/v3/background-heal/status\n' "${1%/}"
 }
 
 metrics_url() {
@@ -256,6 +257,90 @@ endpoint_label() {
   label="${endpoint#*://}"
   label="${label%%/*}"
   printf '%s' "$label" | tr -c 'A-Za-z0-9._-' '_'
+}
+
+background_heal_status_endpoints() {
+  local endpoint
+  local endpoints=()
+  local emitted=false
+
+  if [[ -n "$METRICS_ENDPOINTS" ]]; then
+    IFS=',' read -r -a endpoints <<<"$METRICS_ENDPOINTS"
+    for endpoint in "${endpoints[@]}"; do
+      if [[ -z "$endpoint" ]]; then
+        continue
+      fi
+      printf '%s\n' "$endpoint"
+      emitted=true
+    done
+  fi
+
+  if [[ "$emitted" != "true" ]]; then
+    printf '%s\n' "$ENDPOINT"
+  fi
+}
+
+write_heal_status_summary() {
+  local summary_file="$1"
+  shift
+
+  "$JQ_BIN" -s '
+    {
+      healOperations: {
+        queueLength: (map(.healOperations.queueLength // .healQueueLength // 0) | add // 0),
+        activeTasks: (map(.healOperations.activeTasks // .healActiveTasks // 0) | add // 0),
+        queuedBySource: {
+          scanner: (map(.healOperations.queuedBySource.scanner // 0) | add // 0),
+          admin: (map(.healOperations.queuedBySource.admin // 0) | add // 0),
+          autoHeal: (map(.healOperations.queuedBySource.autoHeal // 0) | add // 0),
+          internal: (map(.healOperations.queuedBySource.internal // 0) | add // 0)
+        },
+        activeBySource: {
+          scanner: (map(.healOperations.activeBySource.scanner // 0) | add // 0),
+          admin: (map(.healOperations.activeBySource.admin // 0) | add // 0),
+          autoHeal: (map(.healOperations.activeBySource.autoHeal // 0) | add // 0),
+          internal: (map(.healOperations.activeBySource.internal // 0) | add // 0)
+        },
+        queuedByPriority: {
+          low: (map(.healOperations.queuedByPriority.low // 0) | add // 0),
+          normal: (map(.healOperations.queuedByPriority.normal // 0) | add // 0),
+          high: (map(.healOperations.queuedByPriority.high // 0) | add // 0),
+          urgent: (map(.healOperations.queuedByPriority.urgent // 0) | add // 0)
+        },
+        activeByPriority: {
+          low: (map(.healOperations.activeByPriority.low // 0) | add // 0),
+          normal: (map(.healOperations.activeByPriority.normal // 0) | add // 0),
+          high: (map(.healOperations.activeByPriority.high // 0) | add // 0),
+          urgent: (map(.healOperations.activeByPriority.urgent // 0) | add // 0)
+        }
+      }
+    }
+  ' "$@" >"$summary_file"
+}
+
+capture_background_heal_status_sample() {
+  local index="$1"
+  local ts="$2"
+  local summary_file="$3"
+  local endpoint label heal_status_file
+  local heal_status_files=()
+
+  while IFS= read -r endpoint; do
+    label="$(endpoint_label "$endpoint")"
+    heal_status_file="$OUT_DIR/heal/background-heal-status.${label}.${index}.${ts}.json"
+    AWS_ACCESS_KEY_ID="$ACCESS_KEY" \
+    AWS_SECRET_ACCESS_KEY="$SECRET_KEY" \
+    AWS_DEFAULT_REGION="$REGION" \
+    "$AWSCURL_BIN" \
+      --service s3 \
+      --region "$REGION" \
+      --request POST \
+      "$(background_heal_status_url "$endpoint")" \
+      | "$JQ_BIN" . >"$heal_status_file"
+    heal_status_files+=("$heal_status_file")
+  done < <(background_heal_status_endpoints)
+
+  write_heal_status_summary "$summary_file" "${heal_status_files[@]}"
 }
 
 capture_distributed_metrics_sample() {
@@ -292,7 +377,7 @@ capture_status_sample() {
   local index="$1"
   local ts="$2"
   local status_file="$OUT_DIR/status/scanner-status.${index}.${ts}.json"
-  local heal_status_file="$OUT_DIR/heal/background-heal-status.${index}.${ts}.json"
+  local heal_summary_file="$OUT_DIR/heal/background-heal-summary.${index}.${ts}.json"
 
   AWS_ACCESS_KEY_ID="$ACCESS_KEY" \
   AWS_SECRET_ACCESS_KEY="$SECRET_KEY" \
@@ -304,17 +389,9 @@ capture_status_sample() {
     "$(scanner_status_url)" \
     | "$JQ_BIN" . >"$status_file"
 
-  AWS_ACCESS_KEY_ID="$ACCESS_KEY" \
-  AWS_SECRET_ACCESS_KEY="$SECRET_KEY" \
-  AWS_DEFAULT_REGION="$REGION" \
-  "$AWSCURL_BIN" \
-    --service s3 \
-    --region "$REGION" \
-    --request POST \
-    "$(background_heal_status_url)" \
-    | "$JQ_BIN" . >"$heal_status_file"
+  capture_background_heal_status_sample "$index" "$ts" "$heal_summary_file"
 
-  "$JQ_BIN" -r --arg ts "$ts" --slurpfile heal_status "$heal_status_file" '
+  "$JQ_BIN" -r --arg ts "$ts" --slurpfile heal_status "$heal_summary_file" '
     ($heal_status[0] // {}) as $heal |
     [
       $ts,

@@ -129,10 +129,28 @@ if [[ "$1" == "." ]]; then
   exit 0
 fi
 
+if [[ "$1" == "-s" ]]; then
+  cat <<'JSON'
+{
+  "healOperations": {
+    "queueLength": 8,
+    "activeTasks": 2,
+    "queuedBySource": {
+      "scanner": 4,
+      "admin": 2,
+      "autoHeal": 2,
+      "internal": 0
+    }
+  }
+}
+JSON
+  exit 0
+fi
+
 if [[ "$1" == "-r" ]]; then
   while [[ $# -gt 0 ]]; do
     if [[ "$1" == "--arg" && "${2:-}" == "ts" ]]; then
-      printf '"%s","active_scans",5,2,"success","","",0,0,4,1,2,1,1\n' "$3"
+      printf '"%s","active_scans",5,2,"success","","",0,0,8,2,4,2,2\n' "$3"
       exit 0
     fi
     shift
@@ -171,8 +189,8 @@ if [[ "$status_count" != "2" ]]; then
 fi
 
 heal_status_count=$(find "$OUT_DIR/heal" -type f -name 'background-heal-status.*.json' | wc -l | tr -d ' ')
-if [[ "$heal_status_count" != "2" ]]; then
-  echo "Expected 2 background heal status snapshots, got $heal_status_count" >&2
+if [[ "$heal_status_count" != "4" ]]; then
+  echo "Expected 4 background heal status snapshots, got $heal_status_count" >&2
   exit 1
 fi
 
@@ -188,13 +206,14 @@ if [[ "$(wc -l <"$OUT_DIR/scanner-summary.csv" | tr -d ' ')" != "3" ]]; then
   exit 1
 fi
 grep -q 'heal_queue_length,heal_active_tasks,heal_scanner_queued,heal_admin_queued,heal_auto_heal_queued' "$OUT_DIR/scanner-summary.csv"
+grep -q '"active_scans",5,2,"success","","",0,0,8,2,4,2,2' "$OUT_DIR/scanner-summary.csv"
 
 grep -q '^deployment=single-disk$' "$OUT_DIR/run-metadata.env"
 grep -q '^workload_label=small-object-idle$' "$OUT_DIR/run-metadata.env"
 grep -q '^metrics_endpoints=http://node-a:9000,http://node-b:9000$' "$OUT_DIR/run-metadata.env"
 grep -q '## Scanner Validation Report' "$OUT_DIR/scanner-validation-report.md"
 grep -q 'Distributed admin metrics snapshots: 4' "$OUT_DIR/scanner-validation-report.md"
-grep -q 'Background heal status snapshots: 2' "$OUT_DIR/scanner-validation-report.md"
+grep -q 'Background heal status snapshots: 4' "$OUT_DIR/scanner-validation-report.md"
 grep -q 'admin config get rustfs-local scanner' "$mc_log"
 grep -q 'admin config get rustfs-local heal' "$mc_log"
 grep -q -- '--request GET' "$awscurl_log"
@@ -206,7 +225,8 @@ if grep -q -- '--secret_key' "$awscurl_log"; then
   exit 1
 fi
 grep -q -- 'http://127.0.0.1:9000/rustfs/admin/v3/scanner/status' "$awscurl_log"
-grep -q -- 'http://127.0.0.1:9000/rustfs/admin/v3/background-heal/status' "$awscurl_log"
+grep -q -- 'http://node-a:9000/rustfs/admin/v3/background-heal/status' "$awscurl_log"
+grep -q -- 'http://node-b:9000/rustfs/admin/v3/background-heal/status' "$awscurl_log"
 grep -q -- 'http://node-a:9000/rustfs/admin/v3/metrics?types=1&by-host=true&n=1' "$awscurl_log"
 grep -q -- 'http://node-b:9000/rustfs/admin/v3/metrics?types=1&by-host=true&n=1' "$awscurl_log"
 

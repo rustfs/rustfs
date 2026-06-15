@@ -172,9 +172,10 @@ scripts/run_scanner_validation_harness.sh \
   --out-dir artifacts/scanner-validation-distributed
 ```
 
-Each sample stores `/v3/scanner/status`,
-`/v3/background-heal/status`, and one by-host admin metrics response per
-endpoint listed in `--metrics-endpoints`.
+Each sample stores `/v3/scanner/status`, one `/v3/background-heal/status`
+response per endpoint listed in `--metrics-endpoints`, and one by-host admin
+metrics response per listed endpoint. When `--metrics-endpoints` is omitted,
+the harness captures background-heal status only from `--endpoint`.
 
 For distributed runs, capture scanner admin metrics from every node with
 `by-host=true`. The metrics endpoint reports the node that handles the request;
@@ -333,14 +334,16 @@ Do not use a single CPU spike as the conclusion. Compare average and p95 CPU
 over the same observation window.
 
 For heal or bitrot pressure investigations, also capture
-`/v3/background-heal/status` and compare `healOperations.queueLength`,
+`/v3/background-heal/status` from every distributed endpoint and compare
+`healOperations.queueLength`,
 `healOperations.activeTasks`, `healOperations.queuedBySource`,
 `healOperations.activeBySource`, `healOperations.queuedByPriority`, and
 `healOperations.activeByPriority`. These fields distinguish scanner-submitted
 low-priority work from manual admin heal and auto-heal work.
 
 `scanner-summary.csv` includes the heal operation totals needed for quick
-before/after comparison:
+before/after comparison. In distributed runs, these fields are aggregated from
+the background-heal status snapshots captured across `--metrics-endpoints`.
 
 | Field | Why it matters |
 |---|---|
