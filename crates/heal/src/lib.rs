@@ -16,7 +16,10 @@ mod error;
 pub mod heal;
 
 pub use error::{Error, Result};
-pub use heal::{HealManager, HealOptions, HealPriority, HealRequest, HealType, channel::HealChannelProcessor};
+pub use heal::{
+    HealManager, HealOperationsSnapshot, HealOptions, HealPriority, HealPriorityCounts, HealRequest, HealSourceCounts, HealType,
+    channel::HealChannelProcessor,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio_util::sync::CancellationToken;
@@ -138,10 +141,26 @@ pub fn current_heal_queue_length() -> u64 {
     GLOBAL_HEAL_QUEUE_LENGTH.load(Ordering::Relaxed)
 }
 
+pub async fn current_heal_operations_snapshot() -> HealOperationsSnapshot {
+    if let Some(manager) = get_heal_manager() {
+        manager.operations_snapshot().await
+    } else {
+        HealOperationsSnapshot {
+            queue_length: current_heal_queue_length(),
+            active_tasks: current_heal_active_tasks(),
+            ..Default::default()
+        }
+    }
+}
+
+fn usize_to_u64_saturated(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 pub(crate) fn set_heal_active_tasks(count: usize) {
-    GLOBAL_HEAL_ACTIVE_TASKS.store(count as u64, Ordering::Relaxed);
+    GLOBAL_HEAL_ACTIVE_TASKS.store(usize_to_u64_saturated(count), Ordering::Relaxed);
 }
 
 pub(crate) fn set_heal_queue_length(count: usize) {
-    GLOBAL_HEAL_QUEUE_LENGTH.store(count as u64, Ordering::Relaxed);
+    GLOBAL_HEAL_QUEUE_LENGTH.store(usize_to_u64_saturated(count), Ordering::Relaxed);
 }

@@ -309,6 +309,13 @@ Compare these fields between baseline and tuned runs:
 Do not use a single CPU spike as the conclusion. Compare average and p95 CPU
 over the same observation window.
 
+For heal or bitrot pressure investigations, also capture
+`/v3/background-heal/status` and compare `healOperations.queueLength`,
+`healOperations.activeTasks`, `healOperations.queuedBySource`,
+`healOperations.activeBySource`, `healOperations.queuedByPriority`, and
+`healOperations.activeByPriority`. These fields distinguish scanner-submitted
+low-priority work from manual admin heal and auto-heal work.
+
 ## Interpreting Results
 
 A useful tuning result has all of these properties:
