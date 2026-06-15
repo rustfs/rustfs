@@ -18,17 +18,16 @@ use rustfs::init::{
 };
 
 use futures_util::future::join_all;
-use rustfs::capacity::capacity_integration::init_capacity_management;
 use rustfs::server::{
-    ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, shutdown_event_notifier, start_http_server,
-    stop_audit_system, wait_for_shutdown,
+    ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, shutdown_event_notifier, stop_audit_system,
+    wait_for_shutdown,
 };
 use rustfs::startup_fs_guard::enforce_unsupported_fs_policy;
 use rustfs::startup_iam::{bootstrap_or_defer_iam_init, publish_ready_for_iam_bootstrap};
 use rustfs::startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight};
 use rustfs::startup_protocols::{ProtocolShutdownSenders, init_protocol_shutdown_senders};
-use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
-use rustfs_credentials::init_global_action_credentials;
+use rustfs::startup_server::{StartupHttpServers, StartupListenContext, init_startup_http_servers, init_startup_listen_context};
+use rustfs_common::SystemStage;
 use rustfs_ecstore::store::init_lock_clients;
 use rustfs_ecstore::{
     bucket::metadata_sys::init_bucket_metadata_sys,
@@ -36,7 +35,7 @@ use rustfs_ecstore::{
     bucket::replication::{get_global_replication_pool, init_background_replication},
     config as ecconfig,
     endpoints::EndpointServerPools,
-    global::{set_global_rustfs_port, shutdown_background_services},
+    global::shutdown_background_services,
     set_global_endpoints,
     store::ECStore,
     store::init_local_disks,
@@ -51,7 +50,7 @@ use rustfs_iam::init_oidc_sys;
 use rustfs_obs::init_metrics_runtime;
 use rustfs_scanner::init_data_scanner;
 use rustfs_storage_api::BucketOptions;
-use rustfs_utils::{get_env_bool_with_aliases, net::parse_and_resolve_address};
+use rustfs_utils::get_env_bool_with_aliases;
 use std::io::{Error, Result};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -65,12 +64,7 @@ const LOG_COMPONENT_MAIN: &str = "main";
 const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const LOG_SUBSYSTEM_AUTH: &str = "auth";
 const LOG_SUBSYSTEM_STORAGE: &str = "storage";
-const EVENT_DEFAULT_CREDENTIALS_DETECTED: &str = "default_credentials_detected";
-const EVENT_SERVER_CONFIG_SANITIZED: &str = "server_config_sanitized";
-const EVENT_SERVER_STARTING: &str = "server_starting";
 const EVENT_SERVER_RUNTIME_FAILED: &str = "server_runtime_failed";
-const EVENT_ACTION_CREDENTIALS_INITIALIZED: &str = "action_credentials_initialized";
-const EVENT_ACTION_CREDENTIALS_INITIALIZATION_FAILED: &str = "action_credentials_initialization_failed";
 const EVENT_ENDPOINT_PARSING_STARTED: &str = "endpoint_parsing_started";
 const EVENT_STARTUP_STORAGE_STAGE: &str = "startup_storage_stage";
 const EVENT_STORAGE_POOL_FORMATTING: &str = "storage_pool_formatting";
@@ -118,12 +112,6 @@ fn main() {
         std::process::exit(1);
     }
 }
-
-fn is_using_default_credentials(config: &rustfs::config::Config) -> bool {
-    config.is_using_default_credentials()
-}
-
-const DEFAULT_CREDENTIALS_WARNING_MESSAGE: &str = "Detected default root credentials; set RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY to non-default values for production deployments";
 
 async fn async_main() -> Result<()> {
     let env_compat_report = bootstrap_external_prefix_compat()?;
@@ -177,89 +165,11 @@ async fn async_main() -> Result<()> {
 
 #[instrument(skip(config))]
 async fn run(config: rustfs::config::Config) -> Result<()> {
-    debug!(
-        target: "rustfs::main::run",
-        event = EVENT_SERVER_CONFIG_SANITIZED,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        address = %config.address,
-        volume_count = config.volumes.len(),
-        server_domain_count = config.server_domains.len(),
-        console_enable = config.console_enable,
-        console_address = %config.console_address,
-        tls_enabled = config.tls_path.as_deref().is_some_and(|value| !value.trim().is_empty()),
-        kms_enable = config.kms_enable,
-        kms_backend = %config.kms_backend,
-        region = config.region.as_deref().unwrap_or_default(),
-        buffer_profile = %config.buffer_profile,
-        "Loaded sanitized server configuration"
-    );
-    // 1. Initialize global readiness tracker
-    let readiness = Arc::new(GlobalReadiness::new());
-
-    if let Some(region_str) = &config.region {
-        region_str
-            .parse::<s3s::region::Region>()
-            .map(rustfs_ecstore::global::set_global_region)
-            .map_err(|e| Error::other(format!("invalid region '{}': {}", region_str, e)))?;
-    }
-
-    let server_addr = parse_and_resolve_address(config.address.as_str()).map_err(Error::other)?;
-    let server_port = server_addr.port();
-    let server_address = server_addr.to_string();
-
-    if is_using_default_credentials(&config) {
-        warn!(
-            target: "rustfs::main::run",
-            event = EVENT_DEFAULT_CREDENTIALS_DETECTED,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_AUTH,
-            warning = DEFAULT_CREDENTIALS_WARNING_MESSAGE,
-            "{DEFAULT_CREDENTIALS_WARNING_MESSAGE}"
-        );
-    }
-
-    info!(
-        target: "rustfs::main::run",
-        event = EVENT_SERVER_STARTING,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        server_address = %server_address,
-        ip = %server_addr.ip(),
-        port = %server_port,
-        version = %rustfs::version::get_version(),
-        "Starting RustFS server"
-    );
-
-    // Set up AK and SK
-    match init_global_action_credentials(Some(config.access_key.clone()), Some(config.secret_key.clone())) {
-        Ok(_) => {
-            debug!(
-                target: "rustfs::main::run",
-                event = EVENT_ACTION_CREDENTIALS_INITIALIZED,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_AUTH,
-                result = "ok",
-                "Initialized global action credentials"
-            );
-        }
-        Err(e) => {
-            let msg = format!("init global action credentials failed: {e:?}");
-            error!(
-                target: "rustfs::main::run",
-                event = EVENT_ACTION_CREDENTIALS_INITIALIZATION_FAILED,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_AUTH,
-                error = %e,
-                "Failed to initialize global action credentials"
-            );
-            return Err(Error::other(msg));
-        }
-    };
-
-    set_global_rustfs_port(server_port);
-
-    set_global_addr(&config.address).await;
+    let StartupListenContext {
+        readiness,
+        server_addr,
+        server_address,
+    } = init_startup_listen_context(&config).await?;
 
     // For RPC
     info!(
@@ -365,27 +275,11 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
             );
         }
     }
-    // Initialize capacity management system
-    init_capacity_management().await;
-    let state_manager = Arc::new(ServiceStateManager::new());
-    // Update service status to Starting
-    state_manager.update(ServiceState::Starting);
-
-    let s3_shutdown_tx = {
-        let mut s3_config = config.clone();
-        s3_config.console_enable = false;
-        let (s3_shutdown_tx, _) = start_http_server(&s3_config, readiness.clone()).await?;
-        Some(s3_shutdown_tx)
-    };
-
-    let console_shutdown_tx = if config.console_enable && !config.console_address.is_empty() {
-        let mut console_config = config.clone();
-        console_config.address = console_config.console_address.clone();
-        let (console_shutdown_tx, _) = start_http_server(&console_config, readiness.clone()).await?;
-        Some(console_shutdown_tx)
-    } else {
-        None
-    };
+    let StartupHttpServers {
+        state_manager,
+        s3_shutdown_tx,
+        console_shutdown_tx,
+    } = init_startup_http_servers(&config, readiness.clone()).await?;
 
     let ctx = CancellationToken::new();
 
@@ -907,32 +801,6 @@ mod tests {
             format_fatal_stderr_message("Observability initialization failed", "collector unavailable"),
             "[FATAL] Observability initialization failed: collector unavailable"
         );
-    }
-
-    #[test]
-    fn is_using_default_credentials_returns_true_for_default_keys() {
-        let mut config = rustfs::config::Config::new("127.0.0.1:9000", Vec::new());
-        config.console_enable = true;
-        config.console_address = "127.0.0.1:9001".to_string();
-
-        assert!(is_using_default_credentials(&config));
-    }
-
-    #[test]
-    fn is_using_default_credentials_returns_false_for_custom_keys() {
-        let mut config = rustfs::config::Config::new("127.0.0.1:9000", Vec::new());
-        config.access_key = "custom-access-key".to_string();
-        config.secret_key = "custom-secret-key".to_string();
-
-        assert!(!is_using_default_credentials(&config));
-    }
-
-    #[test]
-    fn default_credentials_messages_are_actionable_without_exposing_values() {
-        assert!(DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_config::ENV_RUSTFS_ACCESS_KEY));
-        assert!(DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_config::ENV_RUSTFS_SECRET_KEY));
-        assert!(!DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_credentials::DEFAULT_ACCESS_KEY));
-        assert!(!DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_credentials::DEFAULT_SECRET_KEY));
     }
 
     #[test]
