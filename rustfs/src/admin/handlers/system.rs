@@ -24,7 +24,55 @@ use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
-use tracing::warn;
+use tracing::{error, info, warn};
+
+const LOG_COMPONENT_ADMIN_API: &str = "admin_api";
+const LOG_SUBSYSTEM_SYSTEM_ADMIN: &str = "system_admin";
+const EVENT_ADMIN_REQUEST_REJECTED: &str = "admin_request_rejected";
+const EVENT_ADMIN_REQUEST_FAILED: &str = "admin_request_failed";
+const EVENT_ADMIN_RESPONSE_EMITTED: &str = "admin_response_emitted";
+
+macro_rules! log_system_request_rejected {
+    ($operation:expr, $reason:expr) => {
+        warn!(
+            event = EVENT_ADMIN_REQUEST_REJECTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_SYSTEM_ADMIN,
+            operation = $operation,
+            result = "rejected",
+            reason = $reason,
+            "admin request rejected"
+        );
+    };
+}
+
+macro_rules! log_system_request_failed {
+    ($operation:expr, $reason:expr, $err:expr) => {
+        error!(
+            event = EVENT_ADMIN_REQUEST_FAILED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_SYSTEM_ADMIN,
+            operation = $operation,
+            result = "failed",
+            reason = $reason,
+            error = %$err,
+            "admin request failed"
+        );
+    };
+}
+
+macro_rules! log_system_response_emitted {
+    ($operation:expr) => {
+        info!(
+            event = EVENT_ADMIN_RESPONSE_EMITTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_SYSTEM_ADMIN,
+            operation = $operation,
+            result = "success",
+            "admin response emitted"
+        );
+    };
+}
 
 pub fn register_system_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -71,14 +119,12 @@ pub fn register_system_route(r: &mut S3Router<AdminOperation>) -> std::io::Resul
 
     Ok(())
 }
-
 pub struct ServiceHandle {}
 
 #[async_trait::async_trait]
 impl Operation for ServiceHandle {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle ServiceHandle");
-
+        log_system_request_rejected!("service_handle", "not_implemented");
         Err(s3_error!(NotImplemented))
     }
 }
@@ -89,6 +135,7 @@ pub struct ServerInfoHandler {}
 impl Operation for ServerInfoHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let Some(input_cred) = req.credentials else {
+            log_system_request_rejected!("query_server_info", "missing_credentials");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
@@ -113,11 +160,14 @@ impl Operation for ServerInfoHandler {
             .map_err(S3Error::from)?
             .info;
 
-        let data = serde_json::to_vec(&info)
-            .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse serverInfo failed"))?;
+        let data = serde_json::to_vec(&info).map_err(|e| {
+            log_system_request_failed!("query_server_info", "serialize_server_info_failed", e);
+            S3Error::with_message(S3ErrorCode::InternalError, "parse serverInfo failed")
+        })?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        log_system_response_emitted!("query_server_info");
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
@@ -128,8 +178,7 @@ pub struct InspectDataHandler {}
 #[async_trait::async_trait]
 impl Operation for InspectDataHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle InspectDataHandler");
-
+        log_system_request_rejected!("inspect_data", "not_implemented");
         Err(s3_error!(NotImplemented))
     }
 }
@@ -139,9 +188,8 @@ pub struct StorageInfoHandler {}
 #[async_trait::async_trait]
 impl Operation for StorageInfoHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle StorageInfoHandler");
-
         let Some(input_cred) = req.credentials else {
+            log_system_request_rejected!("query_storage_info", "missing_credentials");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
@@ -162,11 +210,14 @@ impl Operation for StorageInfoHandler {
         let usecase = DefaultAdminUsecase::from_global();
         let info = usecase.execute_query_storage_info().await.map_err(S3Error::from)?;
 
-        let data = serde_json::to_vec(&info)
-            .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "failed to serialize storage info"))?;
+        let data = serde_json::to_vec(&info).map_err(|e| {
+            log_system_request_failed!("query_storage_info", "serialize_storage_info_failed", e);
+            S3Error::with_message(S3ErrorCode::InternalError, "failed to serialize storage info")
+        })?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        log_system_response_emitted!("query_storage_info");
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
@@ -177,9 +228,8 @@ pub struct DataUsageInfoHandler {}
 #[async_trait::async_trait]
 impl Operation for DataUsageInfoHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle DataUsageInfoHandler");
-
         let Some(input_cred) = req.credentials else {
+            log_system_request_rejected!("query_data_usage_info", "missing_credentials");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
@@ -203,11 +253,14 @@ impl Operation for DataUsageInfoHandler {
         let usecase = DefaultAdminUsecase::from_global();
         let info = usecase.execute_query_data_usage_info().await.map_err(S3Error::from)?;
 
-        let data = serde_json::to_vec(&info)
-            .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse DataUsageInfo failed"))?;
+        let data = serde_json::to_vec(&info).map_err(|e| {
+            log_system_request_failed!("query_data_usage_info", "serialize_data_usage_info_failed", e);
+            S3Error::with_message(S3ErrorCode::InternalError, "parse DataUsageInfo failed")
+        })?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        log_system_response_emitted!("query_data_usage_info");
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
