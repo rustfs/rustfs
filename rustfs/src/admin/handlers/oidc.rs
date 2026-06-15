@@ -15,6 +15,7 @@
 use super::sts::create_oidc_sts_credentials;
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::app::context::resolve_object_store_handle;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, MINIO_ADMIN_PREFIX, RemoteAddr};
 use http::StatusCode;
@@ -26,10 +27,10 @@ use rustfs_config::oidc::{
     OIDC_DEFAULT_USERNAME_CLAIM, OIDC_DISPLAY_NAME, OIDC_EMAIL_CLAIM, OIDC_GROUPS_CLAIM, OIDC_HIDE_FROM_UI, OIDC_OTHER_AUDIENCES,
     OIDC_REDIRECT_URI, OIDC_REDIRECT_URI_DYNAMIC, OIDC_ROLE_POLICY, OIDC_ROLES_CLAIM, OIDC_SCOPES, OIDC_USERNAME_CLAIM,
 };
+use rustfs_config::server_config::Config as ServerConfig;
+use rustfs_config::server_config::get_global_server_config;
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::com::{read_config_without_migrate, save_server_config};
-use rustfs_ecstore::config::{Config as ServerConfig, get_global_server_config};
-use rustfs_ecstore::new_object_layer_fn;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::de::DeserializeOwned;
@@ -37,6 +38,10 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tracing::{error, info, warn};
 use url::Url;
+
+const LOG_COMPONENT_ADMIN: &str = "admin";
+const LOG_SUBSYSTEM_OIDC: &str = "oidc";
+const EVENT_ADMIN_OIDC_STATE: &str = "admin_oidc_state";
 
 const OIDC_PUBLIC_PROVIDERS_SUFFIX: &str = "/v3/oidc/providers";
 const OIDC_AUTHORIZE_SUFFIX: &str = "/v3/oidc/authorize/";
@@ -163,7 +168,7 @@ struct OidcValidationResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct OidcConfigUpsertRequest {
     enabled: bool,
     display_name: String,
@@ -209,7 +214,7 @@ impl Default for OidcConfigUpsertRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct OidcConfigValidateRequest {
     provider_id: String,
     enabled: bool,
@@ -447,7 +452,14 @@ impl Operation for OidcAuthorizeHandler {
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("authorize failed: {e}")))?;
 
-        info!("OIDC authorize redirect for provider '{}' to IdP", provider_id);
+        info!(
+            event = EVENT_ADMIN_OIDC_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_OIDC,
+            provider_id = %provider_id,
+            state = "authorize_redirect",
+            "admin oidc state"
+        );
 
         // Return 302 redirect
         let mut resp = S3Response::new((StatusCode::FOUND, Body::empty()));
@@ -485,7 +497,15 @@ impl Operation for OidcCallbackHandler {
         // Check for error response from IdP
         if let Some(error) = extract_query_param(&req.uri, "error") {
             let desc = extract_query_param(&req.uri, "error_description").unwrap_or_default();
-            warn!("OIDC callback received error from IdP: {} - {}", error, desc);
+            warn!(
+                event = EVENT_ADMIN_OIDC_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_OIDC,
+                result = "idp_callback_error",
+                error_code = %error,
+                error_description = %desc,
+                "admin oidc state"
+            );
             return Err(S3Error::with_message(
                 S3ErrorCode::AccessDenied,
                 format!("OIDC authentication failed: {error} - {desc}"),
@@ -499,21 +519,38 @@ impl Operation for OidcCallbackHandler {
         // Exchange authorization code for tokens and extract claims
         let (claims, actual_provider_id, session, id_token) =
             oidc_sys.exchange_code(&state, &code, &redirect_uri).await.map_err(|e| {
-                error!("OIDC code exchange failed: {}", e);
+                error!(
+                    event = EVENT_ADMIN_OIDC_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
+                    result = "code_exchange_failed",
+                    error = %e,
+                    "admin oidc state"
+                );
                 S3Error::with_message(S3ErrorCode::AccessDenied, format!("code exchange failed: {e}"))
             })?;
 
         info!(
-            "OIDC login successful: username='{}', email='{}', sub='{}' (provider: {})",
-            claims.username, claims.email, claims.sub, actual_provider_id
+            event = EVENT_ADMIN_OIDC_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_OIDC,
+            provider_id = %actual_provider_id,
+            state = "authentication_succeeded",
+            "admin oidc state"
         );
 
         // Map claims to policies and groups
         let (policies, groups) = oidc_sys.map_claims_to_policies(&actual_provider_id, &claims);
 
         info!(
-            "OIDC claim mapping: user='{}', policies={:?}, groups={:?}",
-            claims.username, policies, groups
+            event = EVENT_ADMIN_OIDC_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_OIDC,
+            provider_id = %actual_provider_id,
+            policy_count = policies.len(),
+            group_count = groups.len(),
+            state = "claims_mapped",
+            "admin oidc state"
         );
 
         // Generate STS credentials using the shared helper.
@@ -567,7 +604,14 @@ impl Operation for OidcLogoutHandler {
                 Ok(Some(url)) => url,
                 Ok(None) => fallback_location.clone(),
                 Err(err) => {
-                    warn!("OIDC logout fallback triggered: {}", err);
+                    warn!(
+                        event = EVENT_ADMIN_OIDC_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_OIDC,
+                        result = "logout_fallback_triggered",
+                        error = %err,
+                        "admin oidc state"
+                    );
                     fallback_location.clone()
                 }
             },
@@ -748,7 +792,7 @@ fn json_response<T: Serialize>(status: StatusCode, payload: &T) -> S3Result<S3Re
 }
 
 async fn load_server_config_from_store() -> S3Result<ServerConfig> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(s3_error!(InternalError, "storage layer not initialized"));
     };
 
@@ -758,7 +802,7 @@ async fn load_server_config_from_store() -> S3Result<ServerConfig> {
 }
 
 async fn save_server_config_to_store(config: &ServerConfig) -> S3Result<()> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(s3_error!(InternalError, "storage layer not initialized"));
     };
 
@@ -791,13 +835,13 @@ fn oidc_restart_required_from_active_config(config: &ServerConfig, active_config
         != rustfs_iam::oidc::load_effective_oidc_provider_configs(active_config)
 }
 
-fn default_oidc_kvs() -> s3s::S3Result<rustfs_ecstore::config::KVS> {
+fn default_oidc_kvs() -> s3s::S3Result<rustfs_config::server_config::KVS> {
     ServerConfig::new()
         .get_value(IDENTITY_OPENID_SUB_SYS, DEFAULT_DELIMITER)
         .ok_or_else(|| s3_error!(InternalError, "default OIDC configuration missing"))
 }
 
-fn set_kvs_value(kvs: &mut rustfs_ecstore::config::KVS, key: &str, value: String) {
+fn set_kvs_value(kvs: &mut rustfs_config::server_config::KVS, key: &str, value: String) {
     if let Some(existing) = kvs.0.iter_mut().find(|kv| kv.key == key) {
         existing.value = value;
         return;
@@ -1241,6 +1285,26 @@ mod tests {
 
         assert_eq!(config.client_secret.as_deref(), Some("existing-secret"));
         assert_eq!(config.roles_claim, OIDC_DEFAULT_ROLES_CLAIM);
+    }
+
+    #[test]
+    fn test_oidc_config_upsert_request_rejects_unknown_fields() {
+        let err = serde_json::from_str::<OidcConfigUpsertRequest>(
+            r#"{"config_url":"https://example.com/.well-known/openid-configuration","client_id":"client","unexpected_field":true}"#,
+        )
+        .expect_err("unknown upsert field should fail");
+
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn test_oidc_config_validate_request_rejects_unknown_fields() {
+        let err = serde_json::from_str::<OidcConfigValidateRequest>(
+            r#"{"provider_id":"default","config_url":"https://example.com/.well-known/openid-configuration","client_id":"client","unexpected_field":true}"#,
+        )
+        .expect_err("unknown validate field should fail");
+
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::config::Config;
+use rustfs_config::server_config::Config;
 use s3s::{S3Result, s3_error};
 use std::sync::Arc;
 
@@ -29,7 +29,7 @@ pub(crate) async fn load_notification_config_snapshot() -> S3Result<(Arc<rustfs_
 pub(crate) async fn set_notification_target_config(
     subsystem: &str,
     target_name: &str,
-    kvs: rustfs_ecstore::config::KVS,
+    kvs: rustfs_config::server_config::KVS,
 ) -> S3Result<()> {
     let system = get_notification_system()?;
     system

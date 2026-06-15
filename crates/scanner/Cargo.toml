@@ -30,10 +30,10 @@ documentation = "https://docs.rs/rustfs-scanner/latest/rustfs_scanner/"
 workspace = true
 
 [dependencies]
-rustfs-config = { workspace = true }
+rustfs-config = { workspace = true, features = ["server-config-model"] }
 rustfs-common = { workspace = true }
 rustfs-utils = { workspace = true }
-tokio = { workspace = true, features = ["fs","sync","rt","time","io-uring","macros"] }
+tokio = { workspace = true, features = ["fs","sync","rt","time","macros"] }
 tracing = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -46,6 +46,7 @@ rmp-serde = { workspace = true }
 rustfs-filemeta = { workspace = true }
 tokio-util = { workspace = true }
 rustfs-ecstore = { workspace = true }
+rustfs-storage-api = { workspace = true }
 http = { workspace = true }
 rand = { workspace = true }
 s3s = { workspace = true }
@@ -61,3 +62,7 @@ tokio = { workspace = true, features = ["test-util"] }
 
 [lib]
 doctest = false
+
+# io-uring is Linux-only. Scope the feature to Linux targets.
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio = { workspace = true, features = ["io-uring"] }

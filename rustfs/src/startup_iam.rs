@@ -25,6 +25,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
+const LOG_COMPONENT_STARTUP_IAM: &str = "startup_iam";
+const LOG_SUBSYSTEM_BOOTSTRAP: &str = "bootstrap";
+const EVENT_IAM_BOOTSTRAP_RECOVERED: &str = "iam_bootstrap_recovered";
+const EVENT_IAM_BOOTSTRAP_RETRY_FAILED: &str = "iam_bootstrap_retry_failed";
+const EVENT_IAM_READINESS_PUBLISHED: &str = "iam_readiness_published";
+const EVENT_IAM_READINESS_PUBLICATION_FAILED: &str = "iam_readiness_publication_failed";
+const EVENT_IAM_BOOTSTRAP_DEFERRED: &str = "iam_bootstrap_deferred";
+
 const IAM_RETRY_INITIAL_INTERVAL: Duration = Duration::from_secs(5);
 const IAM_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(30);
 /// After this many retries (~5 min at initial interval), escalate log level to ERROR.
@@ -34,6 +42,33 @@ const IAM_RETRY_ESCALATION_THRESHOLD: u64 = 12;
 pub enum IamBootstrapDisposition {
     ReadyInline,
     Deferred,
+}
+
+pub async fn publish_ready_for_iam_bootstrap(
+    disposition: IamBootstrapDisposition,
+    readiness: &GlobalReadiness,
+    state_manager: Option<&ServiceStateManager>,
+) -> Result<bool> {
+    publish_ready_for_iam_bootstrap_with(disposition, || async move {
+        publish_ready_when_runtime_ready(readiness, state_manager).await
+    })
+    .await
+}
+
+async fn publish_ready_for_iam_bootstrap_with<PublishFn, PublishFuture>(
+    disposition: IamBootstrapDisposition,
+    publish_ready: PublishFn,
+) -> Result<bool>
+where
+    PublishFn: FnOnce() -> PublishFuture,
+    PublishFuture: Future<Output = Result<()>>,
+{
+    if disposition == IamBootstrapDisposition::ReadyInline {
+        publish_ready().await?;
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 fn init_app_context_if_needed(store: Arc<ECStore>, kms_interface: Arc<KmsServiceManager>) -> bool {
@@ -137,6 +172,9 @@ async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
             Ok(()) => {
                 let degraded_secs = degraded_since.elapsed().as_secs();
                 info!(
+                    event = EVENT_IAM_BOOTSTRAP_RECOVERED,
+                    component = LOG_COMPONENT_STARTUP_IAM,
+                    subsystem = LOG_SUBSYSTEM_BOOTSTRAP,
                     attempts,
                     degraded_duration_secs = degraded_secs,
                     "IAM bootstrap recovered after startup; publishing IAM readiness"
@@ -147,15 +185,20 @@ async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
                 let next_interval = compute_backoff_interval(attempts + 1, initial_interval, max_interval);
                 if attempts >= IAM_RETRY_ESCALATION_THRESHOLD {
                     error!(
+                        event = EVENT_IAM_BOOTSTRAP_RETRY_FAILED,
+                        component = LOG_COMPONENT_STARTUP_IAM,
+                        subsystem = LOG_SUBSYSTEM_BOOTSTRAP,
                         attempts,
                         next_retry_secs = next_interval.as_secs(),
                         degraded_duration_secs = degraded_since.elapsed().as_secs(),
                         error = %err,
-                        "IAM bootstrap retry failed after {} attempts; service remains degraded",
-                        attempts
+                        "IAM bootstrap retry failed; service remains degraded"
                     );
                 } else {
                     warn!(
+                        event = EVENT_IAM_BOOTSTRAP_RETRY_FAILED,
+                        component = LOG_COMPONENT_STARTUP_IAM,
+                        subsystem = LOG_SUBSYSTEM_BOOTSTRAP,
                         attempts,
                         next_retry_secs = next_interval.as_secs(),
                         error = %err,
@@ -173,6 +216,9 @@ async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
         match finalize_fn().await {
             Ok(()) => {
                 info!(
+                    event = EVENT_IAM_READINESS_PUBLISHED,
+                    component = LOG_COMPONENT_STARTUP_IAM,
+                    subsystem = LOG_SUBSYSTEM_BOOTSTRAP,
                     init_attempts = attempts,
                     finalize_attempts,
                     degraded_duration_secs = degraded_since.elapsed().as_secs(),
@@ -183,6 +229,9 @@ async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
             Err(err) => {
                 let retry_interval = compute_backoff_interval(finalize_attempts, initial_interval, max_interval);
                 warn!(
+                    event = EVENT_IAM_READINESS_PUBLICATION_FAILED,
+                    component = LOG_COMPONENT_STARTUP_IAM,
+                    subsystem = LOG_SUBSYSTEM_BOOTSTRAP,
                     finalize_attempts,
                     retry_secs = retry_interval.as_secs(),
                     error = %err,
@@ -290,6 +339,9 @@ pub async fn bootstrap_or_defer_iam_init(
         Err(err) => {
             let interval = initial_retry_interval();
             warn!(
+                event = EVENT_IAM_BOOTSTRAP_DEFERRED,
+                component = LOG_COMPONENT_STARTUP_IAM,
+                subsystem = LOG_SUBSYSTEM_BOOTSTRAP,
                 error = %err,
                 initial_retry_secs = interval.as_secs(),
                 max_retry_secs = IAM_RETRY_MAX_INTERVAL.as_secs(),
@@ -316,13 +368,14 @@ pub async fn bootstrap_or_defer_iam_init(
 #[cfg(test)]
 mod tests {
     use super::{
-        IAM_RETRY_ESCALATION_THRESHOLD, IAM_RETRY_INITIAL_INTERVAL, IAM_RETRY_MAX_INTERVAL, compute_backoff_interval,
-        run_iam_recovery_loop,
+        IAM_RETRY_ESCALATION_THRESHOLD, IAM_RETRY_INITIAL_INTERVAL, IAM_RETRY_MAX_INTERVAL, IamBootstrapDisposition,
+        compute_backoff_interval, publish_ready_for_iam_bootstrap_with, run_iam_recovery_loop,
     };
+    use rustfs_common::{GlobalReadiness, SystemStage};
     use std::io::Error;
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
 
@@ -349,6 +402,51 @@ mod tests {
         assert_eq!(compute_backoff_interval(4, initial, max), Duration::from_secs(30));
         assert_eq!(compute_backoff_interval(5, initial, max), Duration::from_secs(30));
         assert_eq!(compute_backoff_interval(100, initial, max), Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn ready_inline_bootstrap_publishes_runtime_readiness() {
+        let publish_calls = Arc::new(AtomicUsize::new(0));
+        let publish_calls_for_assert = publish_calls.clone();
+
+        let published = publish_ready_for_iam_bootstrap_with(IamBootstrapDisposition::ReadyInline, move || async move {
+            publish_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+
+        assert!(published.is_ok(), "ready inline publication should succeed");
+        let published = published.unwrap_or(false);
+        assert!(published);
+        assert_eq!(publish_calls_for_assert.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn deferred_bootstrap_skips_runtime_readiness_publication() {
+        let publish_calls = Arc::new(AtomicUsize::new(0));
+        let publish_calls_for_assert = publish_calls.clone();
+
+        let published = publish_ready_for_iam_bootstrap_with(IamBootstrapDisposition::Deferred, move || async move {
+            publish_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+
+        assert!(published.is_ok(), "deferred publication should be a no-op");
+        let published = published.unwrap_or(true);
+        assert!(!published);
+        assert_eq!(publish_calls_for_assert.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn ready_inline_bootstrap_propagates_runtime_readiness_failure() {
+        let err = publish_ready_for_iam_bootstrap_with(IamBootstrapDisposition::ReadyInline, || async {
+            Err(Error::other("runtime readiness failed"))
+        })
+        .await
+        .expect_err("ready inline publication failure should be returned");
+
+        assert_eq!(err.to_string(), "runtime readiness failed");
     }
 
     #[tokio::test(start_paused = true)]
@@ -386,6 +484,51 @@ mod tests {
 
         assert_eq!(init_calls_for_assert.load(Ordering::SeqCst), 1);
         assert_eq!(finalize_calls_for_assert.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_loop_can_publish_iam_and_full_ready_after_degraded_init() {
+        let init_calls = Arc::new(AtomicUsize::new(0));
+        let readiness = Arc::new(GlobalReadiness::new());
+        let observed_iam_ready = Arc::new(AtomicBool::new(false));
+
+        let init_calls_for_assert = init_calls.clone();
+        let readiness_for_finalize = readiness.clone();
+        let observed_iam_ready_for_finalize = observed_iam_ready.clone();
+
+        run_iam_recovery_loop(
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            None,
+            move || {
+                let init_calls = init_calls.clone();
+                Box::pin(async move {
+                    let call = init_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    if call == 1 {
+                        Err(Error::other("degraded init"))
+                    } else {
+                        Ok(())
+                    }
+                })
+            },
+            move || {
+                let readiness = readiness_for_finalize.clone();
+                let observed_iam_ready = observed_iam_ready_for_finalize.clone();
+                Box::pin(async move {
+                    readiness.mark_stage(SystemStage::IamReady);
+                    if matches!(readiness.current_stage(), SystemStage::IamReady) {
+                        observed_iam_ready.store(true, Ordering::SeqCst);
+                    }
+                    readiness.mark_stage(SystemStage::FullReady);
+                    Ok(())
+                })
+            },
+        )
+        .await;
+
+        assert_eq!(init_calls_for_assert.load(Ordering::SeqCst), 2);
+        assert!(observed_iam_ready.load(Ordering::SeqCst));
+        assert!(readiness.is_ready());
     }
 
     #[tokio::test(start_paused = true)]

@@ -28,6 +28,12 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info};
 
+const LOG_COMPONENT_HEAL: &str = "heal";
+const LOG_SUBSYSTEM_CHANNEL: &str = "channel";
+const EVENT_HEAL_CHANNEL_STATE: &str = "heal_channel_state";
+const EVENT_HEAL_CHANNEL_REQUEST: &str = "heal_channel_request";
+const EVENT_HEAL_CHANNEL_RESPONSE: &str = "heal_channel_response";
+
 /// Heal channel processor
 pub struct HealChannelProcessor {
     /// Heal manager
@@ -57,7 +63,14 @@ impl HealChannelProcessor {
 
     /// Start processing heal channel requests
     pub async fn start(&mut self, mut receiver: HealChannelReceiver) -> Result<()> {
-        info!("Starting heal channel processor");
+        info!(
+            target: "rustfs::heal::channel",
+            event = EVENT_HEAL_CHANNEL_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_CHANNEL,
+            state = "started",
+            "Heal channel started"
+        );
 
         loop {
             tokio::select! {
@@ -65,11 +78,26 @@ impl HealChannelProcessor {
                     match command {
                         Some(command) => {
                             if let Err(e) = self.process_command(command).await {
-                                error!("Failed to process heal command: {}", e);
+                                error!(
+                                    target: "rustfs::heal::channel",
+                                    event = EVENT_HEAL_CHANNEL_REQUEST,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_CHANNEL,
+                                    state = "process_failed",
+                                    error = %e,
+                                    "Heal channel processing failed"
+                                );
                             }
                         }
                         None => {
-                            debug!("Heal channel receiver closed, stopping processor");
+                            debug!(
+                                target: "rustfs::heal::channel",
+                                event = EVENT_HEAL_CHANNEL_STATE,
+                                component = LOG_COMPONENT_HEAL,
+                                subsystem = LOG_SUBSYSTEM_CHANNEL,
+                                state = "receiver_closed",
+                                "Heal channel receiver closed"
+                            );
                             break;
                         }
                     }
@@ -77,13 +105,29 @@ impl HealChannelProcessor {
                 response = self.response_receiver.recv() => {
                     if let Some(response) = response {
                         // Handle response if needed
-                        info!("Received heal response for request: {}", response.request_id);
+                        debug!(
+                            target: "rustfs::heal::channel",
+                            event = EVENT_HEAL_CHANNEL_RESPONSE,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_CHANNEL,
+                            request_id = %response.request_id,
+                            success = response.success,
+                            state = "received_local",
+                            "Heal response observed"
+                        );
                     }
                 }
             }
         }
 
-        info!("Heal channel processor stopped");
+        info!(
+            target: "rustfs::heal::channel",
+            event = EVENT_HEAL_CHANNEL_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_CHANNEL,
+            state = "stopped",
+            "Heal channel stopped"
+        );
         Ok(())
     }
 
@@ -110,11 +154,16 @@ impl HealChannelProcessor {
         request: HealChannelRequest,
         response_tx: oneshot::Sender<std::result::Result<HealAdmissionResult, String>>,
     ) -> Result<()> {
-        info!(
-            "Processing heal start request: {} for bucket: {}/{}",
-            request.id,
-            request.bucket,
-            request.object_prefix.as_deref().unwrap_or("")
+        debug!(
+            target: "rustfs::heal::channel",
+            event = EVENT_HEAL_CHANNEL_REQUEST,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_CHANNEL,
+            request_id = %request.id,
+            bucket = %request.bucket,
+            object_prefix = %request.object_prefix.as_deref().unwrap_or(""),
+            state = "start_received",
+            "Heal start received"
         );
 
         // Convert channel request to heal request
@@ -136,10 +185,15 @@ impl HealChannelProcessor {
         // Submit to heal manager
         match self.heal_manager.submit_heal_request(heal_request).await {
             Ok(admission) => {
-                info!(
+                debug!(
+                    target: "rustfs::heal::channel",
+                    event = EVENT_HEAL_CHANNEL_REQUEST,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_CHANNEL,
                     request_id = %request.id,
                     admission = admission.result_label(),
-                    "Heal request admission decision completed"
+                    state = "admission_decided",
+                    "Heal admission decided"
                 );
 
                 let _ = response_tx.send(Ok(admission));
@@ -163,7 +217,16 @@ impl HealChannelProcessor {
             }
             Err(e) => {
                 let error_text = e.to_string();
-                error!("Failed to submit heal request: {} - {}", request.id, error_text);
+                error!(
+                    target: "rustfs::heal::channel",
+                    event = EVENT_HEAL_CHANNEL_REQUEST,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_CHANNEL,
+                    request_id = %request.id,
+                    state = "submit_failed",
+                    error = %error_text,
+                    "Heal start submission failed"
+                );
                 let _ = response_tx.send(Err(error_text.clone()));
 
                 // Send error response
@@ -188,7 +251,16 @@ impl HealChannelProcessor {
         client_token: String,
         response_tx: oneshot::Sender<std::result::Result<HealChannelResponse, String>>,
     ) -> Result<()> {
-        info!("Processing heal query request for path: {}", heal_path);
+        debug!(
+            target: "rustfs::heal::channel",
+            event = EVENT_HEAL_CHANNEL_REQUEST,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_CHANNEL,
+            request_id = %client_token,
+            heal_path = %heal_path,
+            state = "query_received",
+            "Heal query received"
+        );
 
         let (summary, detail, items) = match self.heal_manager.get_task_report_for_path(&heal_path, &client_token).await {
             Ok(HealTaskReport {
@@ -260,7 +332,16 @@ impl HealChannelProcessor {
         client_token: String,
         response_tx: oneshot::Sender<std::result::Result<HealChannelResponse, String>>,
     ) -> Result<()> {
-        info!("Processing heal cancel request for path: {}", heal_path);
+        debug!(
+            target: "rustfs::heal::channel",
+            event = EVENT_HEAL_CHANNEL_REQUEST,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_CHANNEL,
+            request_id = %client_token,
+            heal_path = %heal_path,
+            state = "cancel_received",
+            "Heal cancel received"
+        );
 
         let request_id = if client_token.is_empty() {
             heal_path.clone()
@@ -362,12 +443,29 @@ impl HealChannelProcessor {
     fn publish_response(&self, response: HealChannelResponse) {
         // Try to send to local channel first, but don't block broadcast on failure
         if let Err(e) = self.response_sender.send(response.clone()) {
-            error!("Failed to enqueue heal response locally: {}", e);
+            error!(
+                target: "rustfs::heal::channel",
+                event = EVENT_HEAL_CHANNEL_RESPONSE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_CHANNEL,
+                request_id = %response.request_id,
+                state = "enqueue_local_failed",
+                error = %e,
+                "Heal response local enqueue failed"
+            );
         }
         // Always attempt to broadcast, even if local send failed
         // Use the original response for broadcast; local send uses a clone
         if let Err(e) = publish_heal_response(response) {
-            error!("Failed to broadcast heal response: {}", e);
+            error!(
+                target: "rustfs::heal::channel",
+                event = EVENT_HEAL_CHANNEL_RESPONSE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_CHANNEL,
+                state = "broadcast_failed",
+                error = %e,
+                "Heal response broadcast failed"
+            );
         }
     }
 
@@ -420,13 +518,13 @@ mod tests {
         async fn format_disk(&self, _endpoint: &rustfs_ecstore::disk::endpoint::Endpoint) -> crate::Result<()> {
             Ok(())
         }
-        async fn get_bucket_info(&self, _bucket: &str) -> crate::Result<Option<rustfs_ecstore::store_api::BucketInfo>> {
+        async fn get_bucket_info(&self, _bucket: &str) -> crate::Result<Option<rustfs_storage_api::BucketInfo>> {
             Ok(None)
         }
         async fn heal_bucket_metadata(&self, _bucket: &str) -> crate::Result<()> {
             Ok(())
         }
-        async fn list_buckets(&self) -> crate::Result<Vec<rustfs_ecstore::store_api::BucketInfo>> {
+        async fn list_buckets(&self) -> crate::Result<Vec<rustfs_storage_api::BucketInfo>> {
             Ok(vec![])
         }
         async fn object_exists(&self, _bucket: &str, _object: &str) -> crate::Result<bool> {

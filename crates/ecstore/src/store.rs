@@ -33,8 +33,8 @@ use crate::bucket::utils::check_object_args;
 use crate::bucket::utils::check_put_object_args;
 use crate::bucket::utils::check_put_object_part_args;
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
+use crate::config::get_global_storage_class;
 use crate::config::storageclass;
-use crate::config::{get_global_server_config, get_global_storage_class};
 use crate::disk::endpoint::{Endpoint, EndpointType};
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions};
 use crate::error::{Error, Result};
@@ -67,7 +67,8 @@ use crate::{
     store_api::{
         BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
         HTTPRangeSpec, HealOperations, ListObjectsV2Info, ListOperations, MakeBucketOptions, MultipartOperations,
-        MultipartUploadResult, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
+        MultipartUploadResult, NamespaceLocking, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo,
+        PutObjReader, StorageAPI,
     },
     store_init,
 };
@@ -77,6 +78,7 @@ use lazy_static::lazy_static;
 use rand::RngExt as _;
 use rustfs_common::heal_channel::{HealItemType, HealOpts};
 use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, GLOBAL_RUSTFS_HOST, GLOBAL_RUSTFS_PORT};
+use rustfs_config::server_config::{Config, get_global_server_config, set_global_server_config};
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::{LocalClient, LockClient, NamespaceLockWrapper};
 use rustfs_madmin::heal_commands::HealResultItem;
@@ -214,13 +216,13 @@ impl std::fmt::Debug for ECStore {
 /// remain the single source of truth until the migration is complete.
 impl ECStore {
     /// Get server configuration (delegates to global)
-    pub fn get_server_config(&self) -> Option<crate::config::Config> {
-        crate::config::get_global_server_config()
+    pub fn get_server_config(&self) -> Option<Config> {
+        get_global_server_config()
     }
 
     /// Set server configuration (delegates to global)
-    pub fn set_server_config(&self, cfg: crate::config::Config) {
-        crate::config::set_global_server_config(cfg);
+    pub fn set_server_config(&self, cfg: Config) {
+        set_global_server_config(cfg);
     }
 
     /// Get storage class configuration (delegates to global)
@@ -264,7 +266,7 @@ impl ECStore {
     }
 
     /// Get the server configuration
-    pub fn server_config(&self) -> Option<crate::config::Config> {
+    pub fn server_config(&self) -> Option<Config> {
         get_global_server_config()
     }
 
@@ -702,26 +704,40 @@ impl HealOperations for ECStore {
 }
 
 #[async_trait::async_trait]
-impl StorageAPI for ECStore {
+impl StorageAPI for ECStore {}
+
+#[async_trait::async_trait]
+impl NamespaceLocking for ECStore {
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         self.handle_new_ns_lock(bucket, object).await
     }
+}
+
+#[async_trait::async_trait]
+impl rustfs_storage_api::StorageAdminApi for ECStore {
+    type BackendInfo = rustfs_madmin::BackendInfo;
+    type StorageInfo = rustfs_madmin::StorageInfo;
+    type Disk = DiskStore;
+    type Error = Error;
+
     #[instrument(skip(self))]
-    async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
+    async fn backend_info(&self) -> Self::BackendInfo {
         self.handle_backend_info().await
     }
+
     #[instrument(skip(self))]
-    async fn storage_info(&self) -> rustfs_madmin::StorageInfo {
+    async fn storage_info(&self) -> Self::StorageInfo {
         self.handle_storage_info().await
     }
+
     #[instrument(skip(self))]
-    async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
+    async fn local_storage_info(&self) -> Self::StorageInfo {
         self.handle_local_storage_info().await
     }
 
     #[instrument(skip(self))]
-    async fn get_disks(&self, pool_idx: usize, set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
-        self.handle_get_disks(pool_idx, set_idx).await
+    async fn disk_set_inventory(&self, selector: rustfs_storage_api::DiskSetSelector) -> Result<Vec<Option<Self::Disk>>> {
+        self.handle_get_disks(selector.pool_idx, selector.set_idx).await
     }
 
     #[instrument(skip(self))]

@@ -27,6 +27,31 @@
 //! 7. Stdout worker guard — flushes buffered log lines written to stdout.
 
 use opentelemetry_sdk::{logs::SdkLoggerProvider, metrics::SdkMeterProvider, trace::SdkTracerProvider};
+use tracing::{debug, error};
+
+#[cfg(all(
+    feature = "pyroscope",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+))]
+pub(crate) type ProfilingAgent = pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>;
+#[cfg(not(all(
+    feature = "pyroscope",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+)))]
+pub(crate) type ProfilingAgent = ();
+#[cfg(all(feature = "pyroscope", target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+pub(crate) type MemoryProfilingAgent = pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>;
+#[cfg(not(all(feature = "pyroscope", target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+pub(crate) type MemoryProfilingAgent = ();
+
+const LOG_COMPONENT_OBS: &str = "obs";
+const LOG_SUBSYSTEM_GUARD: &str = "guard";
+const EVENT_OBS_GUARD_SHUTDOWN: &str = "obs_guard_shutdown";
+const STDERR_ERROR_PREFIX: &str = "[ERROR]";
+
+fn format_guard_shutdown_stderr_message(resource: &str, error: impl std::fmt::Display) -> String {
+    format!("{STDERR_ERROR_PREFIX} observability guard shutdown failed: resource={resource} error={error}")
+}
 
 /// RAII guard that owns all active OpenTelemetry providers and the
 /// `tracing_appender` worker guard.
@@ -41,10 +66,8 @@ pub struct OtelGuard {
     pub(crate) meter_provider: Option<SdkMeterProvider>,
     /// Optional logger provider for OTLP log export.
     pub(crate) logger_provider: Option<SdkLoggerProvider>,
-    #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-    pub(crate) profiling_agent: Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>>,
-    #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
-    pub(crate) memory_profiling_agent: Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>>,
+    pub(crate) profiling_agent: Option<ProfilingAgent>,
+    pub(crate) memory_profiling_agent: Option<MemoryProfilingAgent>,
     /// Handle to the background log-cleanup task; aborted on drop.
     pub(crate) cleanup_handle: Option<tokio::task::JoinHandle<()>>,
     /// Worker guard that keeps the non-blocking `tracing_appender` thread
@@ -59,12 +82,10 @@ impl std::fmt::Debug for OtelGuard {
         let mut s = f.debug_struct("OtelGuard");
         s.field("tracer_provider", &self.tracer_provider.is_some())
             .field("meter_provider", &self.meter_provider.is_some())
-            .field("logger_provider", &self.logger_provider.is_some());
-        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-        s.field("profiling_agent", &self.profiling_agent.is_some());
-        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
-        s.field("memory_profiling_agent", &self.memory_profiling_agent.is_some());
-        s.field("cleanup_handle", &self.cleanup_handle.is_some())
+            .field("logger_provider", &self.logger_provider.is_some())
+            .field("profiling_agent", &self.profiling_agent.is_some())
+            .field("memory_profiling_agent", &self.memory_profiling_agent.is_some())
+            .field("cleanup_handle", &self.cleanup_handle.is_some())
             .field("tracing_guard", &self.tracing_guard.is_some())
             .field("stdout_guard", &self.stdout_guard.is_some())
             .finish()
@@ -74,41 +95,90 @@ impl std::fmt::Debug for OtelGuard {
 impl Drop for OtelGuard {
     /// Shut down all telemetry providers in order.
     ///
-    /// Errors during shutdown are printed to `stderr` so they are visible even
-    /// after the tracing subscriber has been torn down.
+    /// Errors are emitted before tracing resources are dropped so shutdown
+    /// diagnostics remain structured and low-noise.
     fn drop(&mut self) {
         if let Some(provider) = self.tracer_provider.take()
             && let Err(err) = provider.shutdown()
         {
-            eprintln!("Tracer shutdown error: {err:?}");
+            if tracing::dispatcher::has_been_set() {
+                error!(
+                    event = EVENT_OBS_GUARD_SHUTDOWN,
+                    component = LOG_COMPONENT_OBS,
+                    subsystem = LOG_SUBSYSTEM_GUARD,
+                    resource = "tracer_provider",
+                    result = "shutdown_failed",
+                    error = %err,
+                    "observability guard shutdown failed"
+                );
+            } else {
+                eprintln!("{}", format_guard_shutdown_stderr_message("tracer_provider", err));
+            }
         }
 
         if let Some(provider) = self.meter_provider.take()
             && let Err(err) = provider.shutdown()
         {
-            eprintln!("Meter shutdown error: {err:?}");
+            if tracing::dispatcher::has_been_set() {
+                error!(
+                    event = EVENT_OBS_GUARD_SHUTDOWN,
+                    component = LOG_COMPONENT_OBS,
+                    subsystem = LOG_SUBSYSTEM_GUARD,
+                    resource = "meter_provider",
+                    result = "shutdown_failed",
+                    error = %err,
+                    "observability guard shutdown failed"
+                );
+            } else {
+                eprintln!("{}", format_guard_shutdown_stderr_message("meter_provider", err));
+            }
         }
 
-        if let Some(provider) = self.logger_provider.take()
-            && let Err(err) = provider.shutdown()
-        {
-            eprintln!("Logger shutdown error: {err:?}");
-        }
-
-        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+        #[cfg(all(
+            feature = "pyroscope",
+            any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+        ))]
         if let Some(agent) = self.profiling_agent.take() {
             match agent.stop() {
-                Err(err) => eprintln!("Profiling agent stop error: {err:?}"),
+                Err(err) => {
+                    if tracing::dispatcher::has_been_set() {
+                        error!(
+                            event = EVENT_OBS_GUARD_SHUTDOWN,
+                            component = LOG_COMPONENT_OBS,
+                            subsystem = LOG_SUBSYSTEM_GUARD,
+                            resource = "profiling_agent",
+                            result = "shutdown_failed",
+                            error = %err,
+                            "observability guard shutdown failed"
+                        );
+                    } else {
+                        eprintln!("{}", format_guard_shutdown_stderr_message("profiling_agent", err));
+                    }
+                }
                 Ok(stopped) => {
                     stopped.shutdown();
                 }
             }
         }
 
-        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+        #[cfg(all(feature = "pyroscope", target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
         if let Some(agent) = self.memory_profiling_agent.take() {
             match agent.stop() {
-                Err(err) => eprintln!("Memory profiling agent stop error: {err:?}"),
+                Err(err) => {
+                    if tracing::dispatcher::has_been_set() {
+                        error!(
+                            event = EVENT_OBS_GUARD_SHUTDOWN,
+                            component = LOG_COMPONENT_OBS,
+                            subsystem = LOG_SUBSYSTEM_GUARD,
+                            resource = "memory_profiling_agent",
+                            result = "shutdown_failed",
+                            error = %err,
+                            "observability guard shutdown failed"
+                        );
+                    } else {
+                        eprintln!("{}", format_guard_shutdown_stderr_message("memory_profiling_agent", err));
+                    }
+                }
                 Ok(stopped) => {
                     stopped.shutdown();
                 }
@@ -116,18 +186,62 @@ impl Drop for OtelGuard {
         }
 
         if let Some(handle) = self.cleanup_handle.take() {
+            debug!(
+                event = EVENT_OBS_GUARD_SHUTDOWN,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_GUARD,
+                resource = "log_cleaner",
+                result = "abort_requested",
+                "observability guard resource shutdown requested"
+            );
             handle.abort();
-            eprintln!("Log cleanup task stopped");
+        }
+
+        if let Some(provider) = self.logger_provider.take()
+            && let Err(err) = provider.shutdown()
+        {
+            // After logger shutdown, the OTLP log bridge is no longer a reliable
+            // sink for its own failure path, so fall back to stderr.
+            // resource = "logger_provider"
+            eprintln!("{}", format_guard_shutdown_stderr_message("logger_provider", err));
         }
 
         if let Some(guard) = self.tracing_guard.take() {
+            debug!(
+                event = EVENT_OBS_GUARD_SHUTDOWN,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_GUARD,
+                resource = "tracing_guard",
+                result = "flush_requested",
+                "observability guard resource flush requested"
+            );
             drop(guard);
-            eprintln!("Tracing guard dropped, flushing logs.");
         }
 
         if let Some(guard) = self.stdout_guard.take() {
+            debug!(
+                event = EVENT_OBS_GUARD_SHUTDOWN,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_GUARD,
+                resource = "stdout_guard",
+                result = "flush_requested",
+                "observability guard resource flush requested"
+            );
             drop(guard);
-            eprintln!("Stdout guard dropped, flushing logs.");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_guard_shutdown_stderr_message_is_actionable() {
+        let message = format_guard_shutdown_stderr_message("logger_provider", "flush failed");
+
+        assert!(message.starts_with(STDERR_ERROR_PREFIX));
+        assert!(message.contains("resource=logger_provider"));
+        assert!(message.contains("error=flush failed"));
     }
 }

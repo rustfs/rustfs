@@ -21,6 +21,7 @@ use rustfs_iam::sys::{
 };
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
 use rustfs_trusted_proxies::ClientInfo;
+use rustfs_utils::MaskedAccessKey;
 use rustfs_utils::http::{AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER};
 use s3s::S3Error;
 use s3s::S3ErrorCode;
@@ -35,7 +36,18 @@ use std::net::SocketAddr;
 use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
+
+const LOG_COMPONENT_AUTH: &str = "auth";
+const LOG_SUBSYSTEM_CREDENTIALS: &str = "credentials";
+const LOG_SUBSYSTEM_KEYSTONE: &str = "keystone";
+const LOG_SUBSYSTEM_REQUEST: &str = "request";
+const EVENT_SECRET_KEY_LOOKUP_FAILED: &str = "secret_key_lookup_failed";
+const EVENT_ACCESS_KEY_VALIDATION_STARTED: &str = "access_key_validation_started";
+const EVENT_KEYSTONE_CREDENTIALS_DETECTED: &str = "keystone_credentials_detected";
+const EVENT_KEYSTONE_CREDENTIALS_VALIDATED: &str = "keystone_credentials_validated";
+const EVENT_KEYSTONE_CONTEXT_MISSING: &str = "keystone_context_missing";
+const EVENT_SESSION_TOKEN_EXTRACTION: &str = "session_token_extraction";
 
 /// Performs constant-time string comparison to prevent timing attacks.
 ///
@@ -133,7 +145,14 @@ impl S3Auth for IAMAuth {
         use rustfs_keystone::KEYSTONE_CREDENTIALS;
 
         if let Ok(Some(creds)) = KEYSTONE_CREDENTIALS.try_with(|c| c.clone()) {
-            debug!("IAMAuth: Keystone credentials found in task-local storage for user {}", creds.parent_user);
+            debug!(
+                event = EVENT_KEYSTONE_CREDENTIALS_DETECTED,
+                component = LOG_COMPONENT_AUTH,
+                subsystem = LOG_SUBSYSTEM_KEYSTONE,
+                principal = %MaskedAccessKey(&creds.parent_user),
+                result = "token_auth",
+                "Keystone task-local credentials detected"
+            );
             // Return empty secret key - Keystone uses token validation, not AWS signatures
             return Ok(SecretKey::from(String::new()));
         }
@@ -146,8 +165,12 @@ impl S3Auth for IAMAuth {
         // Keystone credentials use token authentication, not signature verification
         if access_key.starts_with("keystone:") {
             debug!(
-                "IAMAuth: Keystone access key detected ({}), returning empty secret for token-based auth",
-                access_key
+                event = EVENT_KEYSTONE_CREDENTIALS_DETECTED,
+                component = LOG_COMPONENT_AUTH,
+                subsystem = LOG_SUBSYSTEM_KEYSTONE,
+                access_key = %MaskedAccessKey(access_key),
+                result = "token_auth",
+                "Keystone token-auth access key detected"
             );
             // Return empty secret key - Keystone uses token validation, not AWS signatures
             // The actual credentials are stored in task-local storage by KeystoneAuthMiddleware
@@ -173,15 +196,37 @@ impl S3Auth for IAMAuth {
                     return Ok(SecretKey::from(id.credentials.secret_key));
                 }
                 Ok((None, _)) => {
-                    warn!("get_secret_key failed: no such user, access_key: {access_key}");
+                    warn!(
+                        event = EVENT_SECRET_KEY_LOOKUP_FAILED,
+                        component = LOG_COMPONENT_AUTH,
+                        subsystem = LOG_SUBSYSTEM_CREDENTIALS,
+                        access_key = %MaskedAccessKey(access_key),
+                        reason = "no_such_user",
+                        "Secret key lookup rejected"
+                    );
                 }
                 Err(e) => {
-                    warn!("get_secret_key failed: check_key error, access_key: {access_key}, error: {e:?}");
+                    warn!(
+                        event = EVENT_SECRET_KEY_LOOKUP_FAILED,
+                        component = LOG_COMPONENT_AUTH,
+                        subsystem = LOG_SUBSYSTEM_CREDENTIALS,
+                        access_key = %MaskedAccessKey(access_key),
+                        error = ?e,
+                        reason = "check_key_error",
+                        "Secret key lookup errored"
+                    );
                     return Err(iam_lookup_error_to_s3_error(&e));
                 }
             }
         } else {
-            warn!("get_secret_key failed: iam not initialized, access_key: {access_key}");
+            warn!(
+                event = EVENT_SECRET_KEY_LOOKUP_FAILED,
+                component = LOG_COMPONENT_AUTH,
+                subsystem = LOG_SUBSYSTEM_CREDENTIALS,
+                access_key = %MaskedAccessKey(access_key),
+                reason = "iam_not_initialized",
+                "Secret key lookup skipped"
+            );
         }
 
         Err(s3_error!(
@@ -207,26 +252,38 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
     // Try to get Keystone credentials from task-local storage first
     // Add debug logging for UI authentication tracking
     debug!(
-        "check_key_valid: starting validation - access_key={}, session_token_len={}",
-        access_key,
-        session_token.len()
+        event = EVENT_ACCESS_KEY_VALIDATION_STARTED,
+        component = LOG_COMPONENT_AUTH,
+        subsystem = LOG_SUBSYSTEM_CREDENTIALS,
+        access_key = %MaskedAccessKey(access_key),
+        has_session_token = !session_token.is_empty(),
+        "Access key validation started"
     );
     if let Ok(Some(credentials)) = KEYSTONE_CREDENTIALS.try_with(|creds| creds.clone()) {
-        debug!("check_key_valid: Keystone credentials found in task-local storage");
+        debug!(
+            event = EVENT_KEYSTONE_CREDENTIALS_DETECTED,
+            component = LOG_COMPONENT_AUTH,
+            subsystem = LOG_SUBSYSTEM_KEYSTONE,
+            result = "task_local",
+            "Keystone task-local credentials detected"
+        );
 
         if !auth_keystone::is_keystone_enabled() {
             return Err(s3_error!(InvalidAccessKeyId, "Keystone authentication is not enabled"));
         }
 
-        tracing::info!(
-            "check_key_valid: Retrieved Keystone credentials for user: {} (project: {})",
-            credentials.parent_user,
-            credentials
+        debug!(
+            event = EVENT_KEYSTONE_CREDENTIALS_VALIDATED,
+            component = LOG_COMPONENT_AUTH,
+            subsystem = LOG_SUBSYSTEM_KEYSTONE,
+            principal = %MaskedAccessKey(&credentials.parent_user),
+            has_project_name = credentials
                 .claims
                 .as_ref()
                 .and_then(|c| c.get("keystone_project_name"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
+                .is_some(),
+            "Keystone task-local credentials validated"
         );
 
         // Determine if user is admin (owner-level access)
@@ -245,8 +302,12 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
             .unwrap_or(false);
 
         debug!(
-            "check_key_valid: Keystone user {} has owner permissions: {}",
-            credentials.parent_user, is_owner
+            event = EVENT_KEYSTONE_CREDENTIALS_VALIDATED,
+            component = LOG_COMPONENT_AUTH,
+            subsystem = LOG_SUBSYSTEM_KEYSTONE,
+            principal = %MaskedAccessKey(&credentials.parent_user),
+            is_owner,
+            "Keystone owner permissions evaluated"
         );
 
         return Ok((credentials, is_owner));
@@ -255,8 +316,11 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
     // Legacy check for explicit "keystone:" prefix (for backwards compatibility)
     if access_key.starts_with("keystone:") {
         warn!(
-            "check_key_valid: Keystone access key detected but no credentials in task-local storage. \
-             This indicates middleware was bypassed or not configured."
+            event = EVENT_KEYSTONE_CONTEXT_MISSING,
+            component = LOG_COMPONENT_AUTH,
+            subsystem = LOG_SUBSYSTEM_KEYSTONE,
+            access_key = %MaskedAccessKey(access_key),
+            "Keystone context missing for access key"
         );
 
         if !auth_keystone::is_keystone_enabled() {
@@ -290,16 +354,37 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
 
         if !ok {
             let Some(ref u) = u else {
-                warn!("check_key_valid: user not found for access_key={}", access_key);
+                warn!(
+                    event = EVENT_SECRET_KEY_LOOKUP_FAILED,
+                    component = LOG_COMPONENT_AUTH,
+                    subsystem = LOG_SUBSYSTEM_CREDENTIALS,
+                    access_key = %MaskedAccessKey(access_key),
+                    reason = "user_not_found",
+                    "Access key validation rejected"
+                );
                 return Err(s3_error!(InvalidAccessKeyId, "check key failed"));
             };
 
             if u.credentials.status == "off" {
-                warn!("check_key_valid: account disabled for access_key={}", access_key);
+                warn!(
+                    event = EVENT_SECRET_KEY_LOOKUP_FAILED,
+                    component = LOG_COMPONENT_AUTH,
+                    subsystem = LOG_SUBSYSTEM_CREDENTIALS,
+                    access_key = %MaskedAccessKey(access_key),
+                    reason = "account_disabled",
+                    "Access key validation rejected"
+                );
                 return Err(s3_error!(InvalidRequest, "ErrAccessKeyDisabled"));
             }
 
-            warn!("check_key_valid: validation failed for access_key={}", access_key);
+            warn!(
+                event = EVENT_SECRET_KEY_LOOKUP_FAILED,
+                component = LOG_COMPONENT_AUTH,
+                subsystem = LOG_SUBSYSTEM_CREDENTIALS,
+                access_key = %MaskedAccessKey(access_key),
+                reason = "validation_failed",
+                "Access key validation rejected"
+            );
             return Err(s3_error!(InvalidRequest, "check key failed"));
         }
 
@@ -413,12 +498,13 @@ pub fn get_session_token<'a>(uri: &'a Uri, hds: &'a HeaderMap) -> Option<&'a str
         .map(|v| v.to_str().unwrap_or_default())
         .or_else(|| get_query_param(uri.query().unwrap_or_default(), "x-amz-security-token"));
 
-    // Add debug logging to track session token extraction
-    if token.is_some() {
-        debug!("get_session_token: session token found in request (header or query param)");
-    } else {
-        debug!("get_session_token: no session token found in request headers or query params");
-    }
+    trace!(
+        event = EVENT_SESSION_TOKEN_EXTRACTION,
+        component = LOG_COMPONENT_AUTH,
+        subsystem = LOG_SUBSYSTEM_REQUEST,
+        has_session_token = token.is_some(),
+        "Completed session token extraction"
+    );
 
     token
 }

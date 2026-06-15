@@ -23,13 +23,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use time::macros::offset;
 use time::{self, Duration, OffsetDateTime};
-use tracing::{debug, info};
+use tracing::debug;
 use uuid::Uuid;
 
 use crate::store_api::ObjectInfo;
 
 pub const TRANSITION_COMPLETE: &str = "complete";
 pub const TRANSITION_PENDING: &str = "pending";
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
+const EVENT_LIFECYCLE_EXPIRY_COMPUTED: &str = "lifecycle_expiry_computed";
 const ERR_LIFECYCLE_NO_RULE: &str = "Lifecycle configuration should have at least one rule";
 const ERR_LIFECYCLE_DUPLICATE_ID: &str = "Rule ID must be unique. Found same ID for more than one rule";
 const _ERR_XML_NOT_WELL_FORMED: &str =
@@ -800,7 +803,14 @@ impl LifecycleCalculate for Transition {
 
 pub fn expected_expiry_time(mod_time: OffsetDateTime, days: i32) -> OffsetDateTime {
     if days == 0 {
-        info!("expected_expiry_time: days=0, returning UNIX_EPOCH for immediate expiry");
+        debug!(
+            event = EVENT_LIFECYCLE_EXPIRY_COMPUTED,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+            days,
+            result = "unix_epoch",
+            "Computed immediate lifecycle expiry time"
+        );
         return OffsetDateTime::UNIX_EPOCH; // Return epoch time to ensure immediate expiry
     }
     let t = mod_time

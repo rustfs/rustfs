@@ -16,13 +16,16 @@ use crate::{
     BucketNotificationConfig, Event, EventArgs, LifecycleError, NotificationError, NotificationMetricSnapshot,
     NotificationSystem, NotificationTargetMetricSnapshot,
 };
-use rustfs_ecstore::config::Config;
+use rustfs_config::server_config::Config;
 use rustfs_s3_types::EventName;
 use rustfs_targets::arn::TargetID;
 use std::sync::{Arc, OnceLock};
 use tracing::error;
 
 static NOTIFICATION_SYSTEM: OnceLock<Arc<NotificationSystem>> = OnceLock::new();
+const LOG_COMPONENT_NOTIFY: &str = "notify";
+const LOG_SUBSYSTEM_GLOBAL: &str = "global";
+const EVENT_NOTIFY_GLOBAL_STATE: &str = "notify_global_state";
 
 /// Initialize the global notification system with the given configuration.
 /// This function should only be called once throughout the application life cycle.
@@ -102,7 +105,13 @@ pub mod notifier_global {
             // If the notification system itself cannot be retrieved, it will be returned directly
             Some(sys) => sys,
             None => {
-                error!("Notification system is not initialized.");
+                error!(
+                    event = EVENT_NOTIFY_GLOBAL_STATE,
+                    component = LOG_COMPONENT_NOTIFY,
+                    subsystem = LOG_SUBSYSTEM_GLOBAL,
+                    state = "uninitialized",
+                    "notify global state"
+                );
                 return;
             }
         };

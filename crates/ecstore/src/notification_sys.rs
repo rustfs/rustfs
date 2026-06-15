@@ -12,27 +12,49 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::StorageAPI;
 use crate::admin_server_info::get_commit_id;
 use crate::error::{Error, Result};
 use crate::global::{GLOBAL_BOOT_TIME, get_global_endpoints};
 use crate::metrics_realtime::{CollectMetricsOpts, MetricType};
 use crate::rebalance::RebalSaveOpt;
 use crate::rpc::PeerRestClient;
-use crate::{endpoints::EndpointServerPools, new_object_layer_fn};
+use crate::{endpoints::EndpointServerPools, resolve_object_store_handle};
 use futures::future::join_all;
 use lazy_static::lazy_static;
 use rustfs_madmin::health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConfig, SysErrors, SysServices};
 use rustfs_madmin::metrics::RealtimeMetrics;
 use rustfs_madmin::net::NetInfo;
-use rustfs_madmin::{ItemState, ServerProperties};
+use rustfs_madmin::{ItemState, ServerProperties, StorageInfo};
+use rustfs_storage_api::StorageAdminApi;
 use std::collections::hash_map::DefaultHasher;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 use tokio::time::timeout;
 use tracing::{error, warn};
+
+/// After this many consecutive admin-call failures, mark the peer as offline.
+const CONSECUTIVE_FAILURE_THRESHOLD: u32 = 3;
+
+/// Cached result from the last successful admin call to a peer.
+struct PeerAdminCache {
+    last_storage_info: Option<StorageInfo>,
+    last_server_info: Option<ServerProperties>,
+    storage_failures: u32,
+    server_failures: u32,
+}
+
+impl PeerAdminCache {
+    fn new() -> Self {
+        Self {
+            last_storage_info: None,
+            last_server_info: None,
+            storage_failures: 0,
+            server_failures: 0,
+        }
+    }
+}
 
 lazy_static! {
     pub static ref GLOBAL_NotificationSys: OnceLock<NotificationSys> = OnceLock::new();
@@ -53,14 +75,17 @@ pub struct NotificationSys {
     pub peer_clients: Vec<Option<PeerRestClient>>,
     #[allow(dead_code)]
     pub all_peer_clients: Vec<Option<PeerRestClient>>,
+    peer_admin_caches: Vec<Mutex<PeerAdminCache>>,
 }
 
 impl NotificationSys {
     pub async fn new(eps: EndpointServerPools) -> Self {
         let (peer_clients, all_peer_clients) = PeerRestClient::new_clients(eps).await;
+        let peer_admin_caches = (0..peer_clients.len()).map(|_| Mutex::new(PeerAdminCache::new())).collect();
         Self {
             peer_clients,
             all_peer_clients,
+            peer_admin_caches,
         }
     }
 }
@@ -248,33 +273,33 @@ impl NotificationSys {
         join_all(futures).await
     }
 
-    pub async fn storage_info<S: StorageAPI>(&self, api: &S) -> rustfs_madmin::StorageInfo {
+    pub async fn storage_info<S>(&self, api: &S) -> rustfs_madmin::StorageInfo
+    where
+        S: StorageAdminApi<BackendInfo = rustfs_madmin::BackendInfo, StorageInfo = rustfs_madmin::StorageInfo>,
+    {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         let endpoints = get_global_endpoints();
-        let peer_timeout = Duration::from_secs(2); // Same timeout as server_info
+        let peer_timeout = Duration::from_secs(5);
 
-        for client in self.peer_clients.iter() {
+        for (idx, client) in self.peer_clients.iter().enumerate() {
             let endpoints = endpoints.clone();
+            let cache = self.peer_admin_caches.get(idx);
             futures.push(async move {
                 if let Some(client) = client {
                     let host = client.host.to_string();
-                    // Wrap in timeout to ensure we don't hang on dead peers
                     match timeout(peer_timeout, client.local_storage_info()).await {
-                        Ok(Ok(info)) => Some(info),
+                        Ok(Ok(info)) => {
+                            update_storage_info_cache(cache, &host, &info);
+                            Some(info)
+                        }
                         Ok(Err(err)) => {
                             warn!("peer {} storage_info failed: {}", host, err);
-                            Some(rustfs_madmin::StorageInfo {
-                                disks: get_offline_disks(&host, &endpoints),
-                                ..Default::default()
-                            })
+                            handle_peer_failure(cache, &host, &endpoints)
                         }
                         Err(_) => {
                             warn!("peer {} storage_info timed out after {:?}", host, peer_timeout);
                             client.evict_connection().await;
-                            Some(rustfs_madmin::StorageInfo {
-                                disks: get_offline_disks(&host, &endpoints),
-                                ..Default::default()
-                            })
+                            handle_peer_failure(cache, &host, &endpoints)
                         }
                     }
                 } else {
@@ -285,38 +310,41 @@ impl NotificationSys {
 
         let mut replies = join_all(futures).await;
 
-        replies.push(Some(api.local_storage_info().await));
+        replies.push(Some(StorageAdminApi::local_storage_info(api).await));
 
         let mut disks = Vec::new();
         for info in replies.into_iter().flatten() {
             disks.extend(info.disks);
         }
 
-        let backend = api.backend_info().await;
+        let backend = StorageAdminApi::backend_info(api).await;
         rustfs_madmin::StorageInfo { disks, backend }
     }
 
     pub async fn server_info(&self) -> Vec<ServerProperties> {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         let endpoints = get_global_endpoints();
-        let peer_timeout = Duration::from_secs(2);
+        let peer_timeout = Duration::from_secs(5);
 
-        for client in self.peer_clients.iter() {
+        for (idx, client) in self.peer_clients.iter().enumerate() {
             let endpoints = endpoints.clone();
+            let cache = self.peer_admin_caches.get(idx);
             futures.push(async move {
                 if let Some(client) = client {
                     let host = client.host.to_string();
                     match timeout(peer_timeout, client.server_info()).await {
-                        Ok(Ok(info)) => info,
+                        Ok(Ok(info)) => {
+                            update_server_info_cache(cache, &host, &info);
+                            info
+                        }
                         Ok(Err(err)) => {
                             warn!("peer {} server_info failed: {}", host, err);
-                            // client.server_info handles eviction internally on error, but fallback needed
-                            offline_server_properties(&host, &endpoints)
+                            handle_server_info_failure(cache, &host, &endpoints)
                         }
                         Err(_) => {
                             warn!("peer {} server_info timed out after {:?}", host, peer_timeout);
                             client.evict_connection().await;
-                            offline_server_properties(&host, &endpoints)
+                            handle_server_info_failure(cache, &host, &endpoints)
                         }
                     }
                 } else {
@@ -492,7 +520,7 @@ impl NotificationSys {
 
     pub async fn stop_rebalance(&self) -> Result<()> {
         warn!("notification stop_rebalance start");
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             error!("stop_rebalance: not init");
             return Err(Error::other("stop_rebalance: object layer not initialized"));
         };
@@ -841,6 +869,113 @@ where
     }
 }
 
+/// Handle a peer failure for storage_info: return cached data if available,
+/// or mark offline only after consecutive failures exceed the threshold.
+fn handle_peer_failure(
+    cache: Option<&Mutex<PeerAdminCache>>,
+    host: &str,
+    endpoints: &EndpointServerPools,
+) -> Option<StorageInfo> {
+    let cache = cache?;
+
+    let mut c = match cache.lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => {
+            warn!("peer {host} storage_info cache mutex poisoned");
+            poisoned.into_inner()
+        }
+    };
+    c.storage_failures += 1;
+
+    if let Some(ref cached) = c.last_storage_info
+        && c.storage_failures < CONSECUTIVE_FAILURE_THRESHOLD
+    {
+        return Some(cached.clone());
+    }
+
+    if c.storage_failures >= CONSECUTIVE_FAILURE_THRESHOLD {
+        return Some(StorageInfo {
+            disks: get_offline_disks(host, endpoints),
+            ..Default::default()
+        });
+    }
+
+    None
+}
+
+fn update_storage_info_cache(cache: Option<&Mutex<PeerAdminCache>>, host: &str, info: &StorageInfo) {
+    let Some(cache) = cache else {
+        return;
+    };
+
+    let mut c = match cache.lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => {
+            warn!("peer {host} storage_info cache mutex poisoned");
+            poisoned.into_inner()
+        }
+    };
+    c.last_storage_info = Some(info.clone());
+    c.storage_failures = 0;
+}
+
+/// Handle a peer failure for server_info: return cached data if available,
+/// or mark offline only after consecutive failures exceed the threshold.
+fn handle_server_info_failure(
+    cache: Option<&Mutex<PeerAdminCache>>,
+    host: &str,
+    endpoints: &EndpointServerPools,
+) -> ServerProperties {
+    let Some(cache) = cache else {
+        return initializing_server_properties(host);
+    };
+
+    let mut c = match cache.lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => {
+            warn!("peer {host} server_info cache mutex poisoned");
+            poisoned.into_inner()
+        }
+    };
+    c.server_failures += 1;
+
+    if let Some(ref cached) = c.last_server_info
+        && c.server_failures < CONSECUTIVE_FAILURE_THRESHOLD
+    {
+        return cached.clone();
+    }
+
+    if c.server_failures >= CONSECUTIVE_FAILURE_THRESHOLD {
+        return offline_server_properties(host, endpoints);
+    }
+
+    initializing_server_properties(host)
+}
+
+fn update_server_info_cache(cache: Option<&Mutex<PeerAdminCache>>, host: &str, info: &ServerProperties) {
+    let Some(cache) = cache else {
+        return;
+    };
+
+    let mut c = match cache.lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => {
+            warn!("peer {host} server_info cache mutex poisoned");
+            poisoned.into_inner()
+        }
+    };
+    c.last_server_info = Some(info.clone());
+    c.server_failures = 0;
+}
+
+fn initializing_server_properties(host: &str) -> ServerProperties {
+    ServerProperties {
+        endpoint: host.to_string(),
+        state: ItemState::Initializing.to_string().to_owned(),
+        ..Default::default()
+    }
+}
+
 fn offline_server_properties(host: &str, endpoints: &EndpointServerPools) -> ServerProperties {
     ServerProperties {
         uptime: GLOBAL_BOOT_TIME
@@ -964,6 +1099,7 @@ mod tests {
         let sys = NotificationSys {
             peer_clients: vec![None],
             all_peer_clients: Vec::new(),
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
         };
 
         let err = sys
@@ -982,6 +1118,7 @@ mod tests {
         let sys = NotificationSys {
             peer_clients: vec![None],
             all_peer_clients: Vec::new(),
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
         };
 
         let results = sys.load_transition_tier_config().await;
@@ -989,5 +1126,244 @@ mod tests {
         assert!(results[0].host.is_empty());
         assert!(results[0].err.is_some());
         assert!(results[0].err.as_ref().unwrap().to_string().contains("peer is not reachable"));
+    }
+
+    // --- Tests for handle_peer_failure / handle_server_info_failure caching ---
+
+    #[test]
+    fn handle_peer_failure_first_failure_returns_none_when_no_cache() {
+        let cache = Mutex::new(PeerAdminCache::new());
+        let endpoints = EndpointServerPools::default();
+
+        let result = handle_peer_failure(Some(&cache), "peer-1", &endpoints);
+        assert!(result.is_none());
+        assert_eq!(cache.lock().unwrap().storage_failures, 1);
+    }
+
+    #[test]
+    fn handle_peer_failure_returns_cached_data_on_single_failure() {
+        let cached_info = StorageInfo {
+            disks: vec![rustfs_madmin::Disk {
+                endpoint: "disk-0".to_string(),
+                state: "ok".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let cache = Mutex::new(PeerAdminCache {
+            last_storage_info: Some(cached_info),
+            last_server_info: None,
+            storage_failures: 0,
+            server_failures: 0,
+        });
+        let endpoints = EndpointServerPools::default();
+
+        // First failure: should return cached data
+        let result = handle_peer_failure(Some(&cache), "peer-1", &endpoints);
+        let info = result.unwrap();
+        assert_eq!(info.disks.len(), 1);
+        assert_eq!(info.disks[0].state, "ok");
+        assert_eq!(cache.lock().unwrap().storage_failures, 1);
+    }
+
+    #[test]
+    fn handle_peer_failure_returns_offline_after_threshold_exceeded() {
+        let cached_info = StorageInfo {
+            disks: vec![rustfs_madmin::Disk {
+                endpoint: "disk-0".to_string(),
+                state: "ok".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let cache = Mutex::new(PeerAdminCache {
+            last_storage_info: Some(cached_info),
+            last_server_info: None,
+            storage_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
+            server_failures: 0,
+        });
+        let endpoints = EndpointServerPools::default();
+
+        // This failure pushes us to the threshold => offline
+        let result = handle_peer_failure(Some(&cache), "peer-1", &endpoints);
+        assert!(result.is_some());
+        assert_eq!(cache.lock().unwrap().storage_failures, CONSECUTIVE_FAILURE_THRESHOLD);
+    }
+
+    #[test]
+    fn handle_server_info_failure_returns_cached_on_single_failure() {
+        let cached_props = ServerProperties {
+            endpoint: "peer-1".to_string(),
+            state: "online".to_string(),
+            ..Default::default()
+        };
+
+        let cache = Mutex::new(PeerAdminCache {
+            last_storage_info: None,
+            last_server_info: Some(cached_props),
+            storage_failures: 0,
+            server_failures: 0,
+        });
+        let endpoints = EndpointServerPools::default();
+
+        let result = handle_server_info_failure(Some(&cache), "peer-1", &endpoints);
+        assert_eq!(result.endpoint, "peer-1");
+        assert_eq!(result.state, "online");
+        assert_eq!(cache.lock().unwrap().server_failures, 1);
+    }
+
+    #[test]
+    fn handle_server_info_failure_returns_initializing_before_threshold_without_cache() {
+        let cache = Mutex::new(PeerAdminCache::new());
+        let endpoints = EndpointServerPools::default();
+
+        let result = handle_server_info_failure(Some(&cache), "peer-1", &endpoints);
+        assert_eq!(result.endpoint, "peer-1");
+        assert_eq!(result.state, ItemState::Initializing.to_string());
+        assert!(result.disks.is_empty());
+        assert_eq!(cache.lock().unwrap().server_failures, 1);
+    }
+
+    #[test]
+    fn handle_server_info_failure_returns_offline_after_threshold() {
+        let cached_props = ServerProperties {
+            endpoint: "peer-1".to_string(),
+            state: "online".to_string(),
+            ..Default::default()
+        };
+
+        let cache = Mutex::new(PeerAdminCache {
+            last_storage_info: None,
+            last_server_info: Some(cached_props),
+            storage_failures: 0,
+            server_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
+        });
+        let endpoints = EndpointServerPools::default();
+
+        let result = handle_server_info_failure(Some(&cache), "peer-1", &endpoints);
+        assert_eq!(result.state, ItemState::Offline.to_string());
+        assert_eq!(cache.lock().unwrap().server_failures, CONSECUTIVE_FAILURE_THRESHOLD);
+    }
+
+    #[test]
+    fn success_resets_failure_counters_independently() {
+        let cache = Mutex::new(PeerAdminCache {
+            last_storage_info: None,
+            last_server_info: None,
+            storage_failures: 2,
+            server_failures: 2,
+        });
+
+        {
+            let mut c = cache.lock().unwrap();
+            c.last_storage_info = Some(StorageInfo::default());
+            c.storage_failures = 0;
+        }
+
+        let cache = cache.lock().unwrap();
+        assert_eq!(cache.storage_failures, 0);
+        assert_eq!(cache.server_failures, 2);
+    }
+
+    #[test]
+    fn storage_failures_do_not_affect_server_failures() {
+        let cache = Mutex::new(PeerAdminCache {
+            last_storage_info: Some(StorageInfo::default()),
+            last_server_info: Some(ServerProperties {
+                endpoint: "peer-1".to_string(),
+                state: "online".to_string(),
+                ..Default::default()
+            }),
+            storage_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
+            server_failures: 0,
+        });
+        let endpoints = EndpointServerPools::default();
+
+        let storage_result = handle_peer_failure(Some(&cache), "peer-1", &endpoints);
+        assert!(storage_result.is_some());
+
+        let server_result = handle_server_info_failure(Some(&cache), "peer-1", &endpoints);
+        assert_eq!(server_result.state, "online");
+        assert_eq!(cache.lock().unwrap().server_failures, 1);
+    }
+
+    #[test]
+    fn poisoned_admin_cache_mutex_still_returns_fallbacks() {
+        let storage_cache = Mutex::new(PeerAdminCache::new());
+        let server_cache = Mutex::new(PeerAdminCache::new());
+        let endpoints = EndpointServerPools::default();
+
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = storage_cache.lock().expect("test: poison storage cache mutex");
+            panic!("poison storage cache mutex");
+        });
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = server_cache.lock().expect("test: poison server cache mutex");
+            panic!("poison server cache mutex");
+        });
+
+        let storage_result = handle_peer_failure(Some(&storage_cache), "peer-1", &endpoints);
+        assert!(storage_result.is_none());
+
+        let server_result = handle_server_info_failure(Some(&server_cache), "peer-1", &endpoints);
+        assert_eq!(server_result.endpoint, "peer-1");
+        assert_eq!(server_result.state, ItemState::Initializing.to_string());
+    }
+
+    #[test]
+    fn poisoned_admin_cache_recovers_on_success_and_resets_failures() {
+        let storage_cache = Mutex::new(PeerAdminCache {
+            last_storage_info: None,
+            last_server_info: None,
+            storage_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
+            server_failures: 0,
+        });
+        let server_cache = Mutex::new(PeerAdminCache {
+            last_storage_info: None,
+            last_server_info: None,
+            storage_failures: 0,
+            server_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
+        });
+        let endpoints = EndpointServerPools::default();
+
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = storage_cache.lock().expect("test: poison storage cache mutex");
+            panic!("poison storage cache mutex");
+        });
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = server_cache.lock().expect("test: poison server cache mutex");
+            panic!("poison server cache mutex");
+        });
+
+        update_storage_info_cache(
+            Some(&storage_cache),
+            "peer-1",
+            &StorageInfo {
+                disks: vec![rustfs_madmin::Disk {
+                    endpoint: "disk-0".to_string(),
+                    state: "ok".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        update_server_info_cache(
+            Some(&server_cache),
+            "peer-1",
+            &ServerProperties {
+                endpoint: "peer-1".to_string(),
+                state: "online".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let storage_result = handle_peer_failure(Some(&storage_cache), "peer-1", &endpoints);
+        assert!(storage_result.is_some());
+        assert_eq!(storage_result.unwrap().disks[0].state, "ok");
+
+        let server_result = handle_server_info_failure(Some(&server_cache), "peer-1", &endpoints);
+        assert_eq!(server_result.state, "online");
     }
 }

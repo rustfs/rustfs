@@ -21,6 +21,11 @@ use rustfs_s3_types::EventName;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+const LOG_COMPONENT_NOTIFY: &str = "notify";
+const LOG_SUBSYSTEM_BUCKET_CONFIG: &str = "bucket_config";
+const EVENT_NOTIFY_BUCKET_CONFIG_VALIDATION: &str = "notify_bucket_config_validation";
+const EVENT_NOTIFY_BUCKET_CONFIG_LOADED: &str = "notify_bucket_config_loaded";
+
 #[derive(Clone)]
 pub struct NotifyBucketConfigManager {
     notifier: Arc<EventNotifier>,
@@ -57,24 +62,53 @@ impl NotifyBucketConfigManager {
         if arn_list.is_empty() {
             return Err(NotificationError::Configuration(notify_configuration_hint()));
         }
-        info!("Available ARNs: {:?}", arn_list);
+        debug!(
+            event = EVENT_NOTIFY_BUCKET_CONFIG_VALIDATION,
+            component = LOG_COMPONENT_NOTIFY,
+            subsystem = LOG_SUBSYSTEM_BUCKET_CONFIG,
+            bucket = %bucket,
+            region = %cfg.region,
+            available_arn_count = arn_list.len(),
+            "notify bucket config validation"
+        );
 
         if let Err(e) = cfg.validate(&cfg.region, &arn_list) {
-            debug!("Bucket notification config validation region:{} failed: {}", &cfg.region, e);
+            debug!(
+                event = EVENT_NOTIFY_BUCKET_CONFIG_VALIDATION,
+                component = LOG_COMPONENT_NOTIFY,
+                subsystem = LOG_SUBSYSTEM_BUCKET_CONFIG,
+                bucket = %bucket,
+                region = %cfg.region,
+                error = %e,
+                result = "validation_failed",
+                "notify bucket config validation"
+            );
             if !matches!(e, ParseConfigError::ArnNotFound(_)) {
                 return Err(NotificationError::BucketNotification(e.to_string()));
             }
             warn!(
+                event = EVENT_NOTIFY_BUCKET_CONFIG_VALIDATION,
+                component = LOG_COMPONENT_NOTIFY,
+                subsystem = LOG_SUBSYSTEM_BUCKET_CONFIG,
                 bucket = %bucket,
                 region = %cfg.region,
                 error = %e,
-                "Bucket notification config references missing target ARN; keeping compatibility and loading remaining rules"
+                result = "missing_target_arn",
+                "notify bucket config validation"
             );
         }
 
         self.subscriber_view.apply_bucket_config(bucket, cfg);
         self.rule_engine.set_bucket_rules(bucket, cfg.get_rules_map().clone()).await;
-        info!("Loaded notification config for bucket: {}", bucket);
+        info!(
+            event = EVENT_NOTIFY_BUCKET_CONFIG_LOADED,
+            component = LOG_COMPONENT_NOTIFY,
+            subsystem = LOG_SUBSYSTEM_BUCKET_CONFIG,
+            bucket = %bucket,
+            region = %cfg.region,
+            rule_count = cfg.get_rules_map().inner().len(),
+            "notify bucket config state"
+        );
         Ok(())
     }
 

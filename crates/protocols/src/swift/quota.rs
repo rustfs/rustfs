@@ -70,6 +70,10 @@ use super::{SwiftError, SwiftResult, container};
 use rustfs_credentials::Credentials;
 use tracing::debug;
 
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SWIFT_QUOTA: &str = "swift_quota";
+const EVENT_SWIFT_QUOTA_STATE: &str = "swift_quota_state";
+
 /// Quota configuration for a container
 #[derive(Debug, Clone, Default)]
 pub struct QuotaConfig {
@@ -161,8 +165,16 @@ pub async fn check_upload_quota(
     quota.check_quota(metadata.bytes_used, metadata.object_count, object_size)?;
 
     debug!(
-        "Quota check passed: {}/{:?} bytes, {}/{:?} objects",
-        metadata.bytes_used, quota.quota_bytes, metadata.object_count, quota.quota_count
+        event = EVENT_SWIFT_QUOTA_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SWIFT_QUOTA,
+        state = "check_passed",
+        current_bytes = metadata.bytes_used,
+        quota_bytes = ?quota.quota_bytes,
+        current_count = metadata.object_count,
+        quota_count = ?quota.quota_count,
+        object_size,
+        "swift quota state changed"
     );
 
     Ok(())

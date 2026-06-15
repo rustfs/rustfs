@@ -22,7 +22,7 @@ use crate::{
 use hashbrown::HashMap;
 use metrics::{counter, gauge};
 use rustfs_config::notify::{DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY};
-use rustfs_ecstore::config::{Config, KVS};
+use rustfs_config::server_config::{Config, KVS};
 use rustfs_s3_types::EventName;
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::{ReplayWorkerManager, RuntimeTargetHealthSnapshot, SharedTarget};
@@ -36,6 +36,11 @@ const METRIC_NOTIFICATION_CURRENT_SEND_IN_PROGRESS: &str = "rustfs_notification_
 const METRIC_NOTIFICATION_EVENTS_ERRORS_TOTAL: &str = "rustfs_notification_events_errors_total";
 const METRIC_NOTIFICATION_EVENTS_SENT_TOTAL: &str = "rustfs_notification_events_sent_total";
 const METRIC_NOTIFICATION_EVENTS_SKIPPED_TOTAL: &str = "rustfs_notification_events_skipped_total";
+const LOG_COMPONENT_NOTIFY: &str = "notify";
+const LOG_SUBSYSTEM_INTEGRATION: &str = "integration";
+const EVENT_NOTIFY_SYSTEM_DROP: &str = "notify_system_drop";
+const EVENT_NOTIFY_SYSTEM_SHUTDOWN_METRIC: &str = "notify_system_shutdown_metric";
+const EVENT_NOTIFY_SYSTEM_STATUS_SNAPSHOT: &str = "notify_system_status_snapshot";
 
 #[derive(Clone)]
 pub struct LiveEventBatch {
@@ -362,7 +367,13 @@ impl NotificationSystem {
 impl Drop for NotificationSystem {
     fn drop(&mut self) {
         // Asynchronous operation cannot be used here, but logs can be recorded.
-        info!("Notify the system instance to be destroyed");
+        info!(
+            event = EVENT_NOTIFY_SYSTEM_DROP,
+            component = LOG_COMPONENT_NOTIFY,
+            subsystem = LOG_SUBSYSTEM_INTEGRATION,
+            state = "dropping",
+            "notify system integration state"
+        );
 
         let snapshot = self.snapshot_metrics();
         for (name, value, is_gauge) in [
@@ -376,15 +387,28 @@ impl Drop for NotificationSystem {
             } else {
                 counter!(name).absolute(value);
             }
-            info!("shutdown metric {}={}", name, value);
+            info!(
+                event = EVENT_NOTIFY_SYSTEM_SHUTDOWN_METRIC,
+                component = LOG_COMPONENT_NOTIFY,
+                subsystem = LOG_SUBSYSTEM_INTEGRATION,
+                metric_name = name,
+                metric_value = value,
+                metric_kind = if is_gauge { "gauge" } else { "counter" },
+                "notify system integration state"
+            );
         }
 
         let status = self.get_status();
         for (key, value) in status {
-            info!("key:{}, value:{}", key, value);
+            info!(
+                event = EVENT_NOTIFY_SYSTEM_STATUS_SNAPSHOT,
+                component = LOG_COMPONENT_NOTIFY,
+                subsystem = LOG_SUBSYSTEM_INTEGRATION,
+                status_key = %key,
+                status_value = %value,
+                "notify system integration state"
+            );
         }
-
-        info!("Notification system status at shutdown:");
     }
 }
 

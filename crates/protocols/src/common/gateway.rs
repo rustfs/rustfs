@@ -274,7 +274,17 @@ pub async fn is_authorized(
     let iam_sys = match rustfs_iam::get() {
         Ok(sys) => sys,
         Err(e) => {
-            error!("IAM system unavailable: {}", e);
+            error!(
+                event = "protocol_gateway_authz_state",
+                component = "protocols",
+                subsystem = "gateway",
+                result = "iam_unavailable",
+                action = action.as_str(),
+                bucket = %bucket,
+                object = %object.unwrap_or_default(),
+                error = %e,
+                "protocol gateway authz state changed"
+            );
             return Err(AuthorizationError::IamUnavailable);
         }
     };

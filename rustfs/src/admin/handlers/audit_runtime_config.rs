@@ -13,13 +13,14 @@
 // limitations under the License.
 
 use crate::admin::handlers::target_descriptor::AdminTargetSpec;
+use crate::app::context::resolve_object_store_handle;
 use rustfs_audit::{audit_system, start_audit_system as start_global_audit_system, system::AuditSystemState};
 use rustfs_config::DEFAULT_DELIMITER;
-use rustfs_ecstore::config::Config;
+use rustfs_config::server_config::Config;
 use s3s::{S3Result, s3_error};
 
 pub(crate) async fn load_server_config_from_store() -> S3Result<Config> {
-    let Some(store) = rustfs_ecstore::global::new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Ok(Config::new());
     };
 
@@ -77,7 +78,7 @@ pub(crate) async fn update_audit_config_and_reload<F>(specs: &[AdminTargetSpec],
 where
     F: FnMut(&mut Config) -> bool,
 {
-    let Some(store) = rustfs_ecstore::global::new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(s3_error!(InternalError, "server storage not initialized"));
     };
 
@@ -100,7 +101,7 @@ pub(crate) async fn set_audit_target_config(
     specs: &[AdminTargetSpec],
     subsystem: &str,
     target_name: &str,
-    kvs: rustfs_ecstore::config::KVS,
+    kvs: rustfs_config::server_config::KVS,
 ) -> S3Result<()> {
     update_audit_config_and_reload(specs, |config| {
         config

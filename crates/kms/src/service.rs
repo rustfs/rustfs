@@ -24,7 +24,7 @@ use rand::random;
 use std::collections::HashMap;
 use std::io::Cursor;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tracing::{debug, info};
+use tracing::debug;
 use zeroize::Zeroize;
 
 /// Data key for object encryption
@@ -47,6 +47,26 @@ impl Drop for DataKey {
 /// Service for encrypting and decrypting S3 objects with KMS integration
 pub struct ObjectEncryptionService {
     kms_manager: KmsManager,
+}
+
+fn canonical_bucket_path(bucket: &str, object_key: &str) -> String {
+    let bucket = bucket.trim_matches('/');
+    let object_key = object_key.trim_matches('/');
+    if object_key.is_empty() {
+        bucket.to_string()
+    } else if bucket.is_empty() {
+        object_key.to_string()
+    } else {
+        format!("{bucket}/{object_key}")
+    }
+}
+
+fn request_encryption_context(context: &ObjectEncryptionContext) -> HashMap<String, String> {
+    let mut enc_context = context.encryption_context.clone();
+    enc_context
+        .entry(context.bucket.clone())
+        .or_insert_with(|| canonical_bucket_path(&context.bucket, &context.object_key));
+    enc_context
 }
 
 const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
@@ -178,15 +198,10 @@ impl ObjectEncryptionService {
             .or_else(|| self.kms_manager.get_default_key_id().map(|s| s.as_str()))
             .ok_or_else(|| KmsError::configuration_error("No KMS key ID specified and no default configured"))?;
 
-        // Build encryption context
-        let mut enc_context = context.encryption_context.clone();
-        enc_context.insert("bucket".to_string(), context.bucket.clone());
-        enc_context.insert("object_key".to_string(), context.object_key.clone());
-
         let request = GenerateDataKeyRequest {
             key_id: actual_key_id.to_string(),
             key_spec: KeySpec::Aes256,
-            encryption_context: enc_context,
+            encryption_context: request_encryption_context(context),
         };
 
         let data_key_response = self.kms_manager.generate_data_key(request).await?;
@@ -194,7 +209,7 @@ impl ObjectEncryptionService {
         // Generate a unique random nonce for this data key
         // This ensures each object/part gets a unique base nonce for streaming encryption
         let nonce: [u8; 12] = random();
-        tracing::info!("Generated random nonce for data key: {:02x?}", nonce);
+        tracing::debug!("Generated random nonce for data key");
 
         let data_key = DataKey {
             plaintext_key: data_key_response
@@ -216,10 +231,10 @@ impl ObjectEncryptionService {
     /// # Returns
     /// DataKey with decrypted key
     ///
-    pub async fn decrypt_data_key(&self, encrypted_key: &[u8], _context: &ObjectEncryptionContext) -> Result<DataKey> {
+    pub async fn decrypt_data_key(&self, encrypted_key: &[u8], context: &ObjectEncryptionContext) -> Result<DataKey> {
         let decrypt_request = DecryptRequest {
             ciphertext: encrypted_key.to_vec(),
-            encryption_context: HashMap::new(),
+            encryption_context: request_encryption_context(context),
             grant_tokens: Vec::new(),
         };
 
@@ -287,7 +302,7 @@ impl ObjectEncryptionService {
                 key_id: actual_key_id.to_string(),
             };
             if let Err(KmsError::KeyNotFound { .. }) = self.kms_manager.describe_key(describe_req).await {
-                info!("Auto-creating SSE-S3 key: {}", actual_key_id);
+                debug!(key_id = %actual_key_id, "Auto-creating SSE-S3 key");
                 let create_req = CreateKeyRequest {
                     key_name: Some(actual_key_id.to_string()),
                     key_usage: KeyUsage::EncryptDecrypt,
@@ -349,7 +364,13 @@ impl ObjectEncryptionService {
             encrypted_data_key: data_key.ciphertext_blob,
         };
 
-        info!("Successfully encrypted object {}/{} ({} bytes)", bucket, object_key, original_size);
+        debug!(
+            bucket,
+            object = object_key,
+            original_size,
+            algorithm = %algorithm.as_str(),
+            "Object encrypted"
+        );
 
         Ok(EncryptionResult { ciphertext, metadata })
     }
@@ -414,7 +435,13 @@ impl ObjectEncryptionService {
         // Decrypt the data
         let plaintext = cipher.decrypt(&ciphertext, &metadata.iv, tag, &aad)?;
 
-        info!("Successfully decrypted object {}/{} ({} bytes)", bucket, object_key, plaintext.len());
+        debug!(
+            bucket,
+            object = object_key,
+            plaintext_len = plaintext.len(),
+            algorithm = %metadata.algorithm,
+            "Object decrypted"
+        );
 
         Ok(Box::new(Cursor::new(plaintext)))
     }
@@ -492,7 +519,7 @@ impl ObjectEncryptionService {
             encrypted_data_key: Vec::new(), // Empty for SSE-C
         };
 
-        info!(
+        debug!(
             "Successfully encrypted object {}/{} with SSE-C ({} bytes)",
             bucket, object_key, original_size
         );
@@ -553,7 +580,7 @@ impl ObjectEncryptionService {
         // Decrypt the data
         let plaintext = cipher.decrypt(&ciphertext, &metadata.iv, tag, &aad)?;
 
-        info!(
+        debug!(
             "Successfully decrypted SSE-C object {}/{} ({} bytes)",
             bucket,
             object_key,
@@ -723,7 +750,9 @@ mod tests {
 
     async fn create_test_service() -> (ObjectEncryptionService, TempDir) {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = KmsConfig::local(temp_dir.path().to_path_buf()).with_default_key("test-key".to_string());
+        let config = KmsConfig::local(temp_dir.path().to_path_buf())
+            .with_insecure_development_defaults()
+            .with_default_key("test-key".to_string());
         let backend = Arc::new(
             crate::backends::local::LocalKmsBackend::new(config.clone())
                 .await
@@ -863,5 +892,41 @@ mod tests {
                 .validate_encryption_context(&actual_context, &invalid_expected)
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_data_key_uses_object_encryption_context() {
+        let (service, _temp_dir) = create_test_service().await;
+        service
+            .create_key(CreateKeyRequest {
+                key_name: Some("test-key".to_string()),
+                key_usage: KeyUsage::EncryptDecrypt,
+                description: None,
+                policy: None,
+                tags: HashMap::new(),
+                origin: None,
+            })
+            .await
+            .expect("test key should be created");
+        let create_context = ObjectEncryptionContext::new("bucket".to_string(), "dir/object".to_string())
+            .with_encryption_context("tenant".to_string(), "alpha".to_string());
+        let kms_key = Some("test-key".to_string());
+        let (_data_key, encrypted_key) = service
+            .create_data_key(&kms_key, &create_context)
+            .await
+            .expect("create data key should succeed");
+
+        let wrong_context = ObjectEncryptionContext::new("bucket".to_string(), "dir/object".to_string())
+            .with_encryption_context("tenant".to_string(), "beta".to_string());
+        assert!(
+            service.decrypt_data_key(&encrypted_key, &wrong_context).await.is_err(),
+            "decrypt should reject mismatched KMS context"
+        );
+
+        let decrypted = service
+            .decrypt_data_key(&encrypted_key, &create_context)
+            .await
+            .expect("decrypt should accept matching KMS context");
+        assert_ne!(decrypted.plaintext_key, [0u8; 32]);
     }
 }

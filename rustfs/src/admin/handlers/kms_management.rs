@@ -23,7 +23,7 @@ use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
 use rustfs_kms::{KmsBackend, init_global_kms_service_manager};
-use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_policy::policy::action::{Action, KmsAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
@@ -50,6 +50,18 @@ fn backend_name(backend: &KmsBackend) -> &'static str {
         KmsBackend::VaultKv2 => "vault-kv2",
         KmsBackend::VaultTransit => "vault-transit",
     }
+}
+
+fn kms_service_control_actions() -> Vec<Action> {
+    vec![Action::KmsAction(KmsAction::ServiceControlAction)]
+}
+
+fn kms_configure_actions() -> Vec<Action> {
+    vec![Action::KmsAction(KmsAction::ConfigureAction)]
+}
+
+fn kms_clear_cache_actions() -> Vec<Action> {
+    vec![Action::KmsAction(KmsAction::ClearCacheAction)]
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -158,7 +170,7 @@ impl Operation for KmsStatusHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            kms_service_control_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -220,7 +232,7 @@ impl Operation for KmsConfigHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            kms_configure_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -269,7 +281,7 @@ impl Operation for KmsClearCacheHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            kms_clear_cache_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -299,5 +311,31 @@ impl Operation for KmsClearCacheHandler {
                 Err(s3_error!(InternalError, "failed to clear cache: {}", e))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{kms_clear_cache_actions, kms_configure_actions, kms_service_control_actions};
+    use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
+
+    fn assert_has_action(actions: &[Action], action: Action) {
+        assert!(actions.contains(&action), "expected action list to contain {action:?}");
+    }
+
+    fn assert_lacks_action(actions: &[Action], action: Action) {
+        assert!(!actions.contains(&action), "expected action list not to contain {action:?}");
+    }
+
+    #[test]
+    fn kms_management_auth_actions_use_dedicated_kms_actions() {
+        assert_has_action(&kms_service_control_actions(), Action::KmsAction(KmsAction::ServiceControlAction));
+        assert_has_action(&kms_configure_actions(), Action::KmsAction(KmsAction::ConfigureAction));
+        assert_has_action(&kms_clear_cache_actions(), Action::KmsAction(KmsAction::ClearCacheAction));
+    }
+
+    #[test]
+    fn kms_clear_cache_rejects_server_info_fallback() {
+        assert_lacks_action(&kms_clear_cache_actions(), Action::AdminAction(AdminAction::ServerInfoAdminAction));
     }
 }

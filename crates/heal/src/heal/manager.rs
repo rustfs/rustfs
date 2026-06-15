@@ -37,6 +37,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 const KEEP_HEAL_TASK_STATUS_DURATION: Duration = Duration::from_secs(10 * 60);
+const LOG_COMPONENT_HEAL: &str = "heal";
+const LOG_SUBSYSTEM_DISK_SCANNER: &str = "disk_scanner";
+const LOG_SUBSYSTEM_MANAGER: &str = "manager";
+const EVENT_HEAL_AUTO_SCAN_STATE: &str = "heal_auto_scan_state";
+const EVENT_HEAL_AUTO_SCAN_DISK: &str = "heal_auto_scan_disk";
+const EVENT_HEAL_AUTO_SCAN_ENQUEUE: &str = "heal_auto_scan_enqueue";
+const EVENT_HEAL_MANAGER_STATE: &str = "heal_manager_state";
+const EVENT_HEAL_QUEUE_ADMISSION: &str = "heal_queue_admission";
+const EVENT_HEAL_SCHEDULER_STATE: &str = "heal_scheduler_state";
+const EVENT_HEAL_QUEUE_STATE: &str = "heal_queue_state";
 
 /// Priority queue wrapper for heal requests
 /// Uses BinaryHeap for priority-based ordering while maintaining FIFO for same-priority items
@@ -542,13 +552,27 @@ impl HealManager {
     pub async fn start(&self) -> Result<()> {
         let mut state = self.state.write().await;
         if state.is_running {
-            warn!("HealManager is already running");
+            warn!(
+                target: "rustfs::heal::manager",
+                event = EVENT_HEAL_MANAGER_STATE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_MANAGER,
+                state = "already_running",
+                "Heal manager already running"
+            );
             return Ok(());
         }
         state.is_running = true;
         drop(state);
 
-        info!("Starting HealManager");
+        info!(
+            target: "rustfs::heal::manager",
+            event = EVENT_HEAL_MANAGER_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_MANAGER,
+            state = "starting",
+            "Heal manager starting"
+        );
 
         // start scheduler
         self.start_scheduler().await?;
@@ -556,13 +580,27 @@ impl HealManager {
         // start auto disk scanner to heal unformatted disks
         self.start_auto_disk_scanner().await?;
 
-        info!("HealManager started successfully");
+        info!(
+            target: "rustfs::heal::manager",
+            event = EVENT_HEAL_MANAGER_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_MANAGER,
+            state = "running",
+            "Heal manager started"
+        );
         Ok(())
     }
 
     /// Stop HealManager
     pub async fn stop(&self) -> Result<()> {
-        info!("Stopping HealManager");
+        info!(
+            target: "rustfs::heal::manager",
+            event = EVENT_HEAL_MANAGER_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_MANAGER,
+            state = "stopping",
+            "Heal manager stopping"
+        );
 
         // cancel all tasks
         self.cancel_token.cancel();
@@ -571,7 +609,16 @@ impl HealManager {
         let mut active_heals = self.active_heals.lock().await;
         for task in active_heals.values() {
             if let Err(e) = task.cancel().await {
-                warn!("Failed to cancel task {}: {}", task.id, e);
+                warn!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_MANAGER_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                    state = "task_cancel_failed",
+                    task_id = %task.id,
+                    error = %e,
+                    "Heal active task cancellation failed"
+                );
             }
         }
         active_heals.clear();
@@ -583,7 +630,14 @@ impl HealManager {
         let mut state = self.state.write().await;
         state.is_running = false;
 
-        info!("HealManager stopped successfully");
+        info!(
+            target: "rustfs::heal::manager",
+            event = EVENT_HEAL_MANAGER_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_MANAGER,
+            state = "stopped",
+            "Heal manager stopped"
+        );
         Ok(())
     }
 
@@ -605,14 +659,28 @@ impl HealManager {
 
             match admission {
                 HealAdmissionResult::Merged => {
-                    info!("Heal request already queued (duplicate merged): {}", request.id);
+                    debug!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                        request_id = %request.id,
+                        priority = ?request.priority,
+                        result = "merged_duplicate",
+                        "Heal queue request merged"
+                    );
                 }
                 HealAdmissionResult::Dropped(reason) => {
                     warn!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
                         request_id = %request.id,
                         priority = ?request.priority,
                         reason = reason.as_str(),
-                        "Dropping duplicate heal request due to admission policy"
+                        result = "dropped_duplicate",
+                        "Heal queue request dropped"
                     );
                 }
                 HealAdmissionResult::Accepted | HealAdmissionResult::Full => {}
@@ -628,13 +696,18 @@ impl HealManager {
                 if let Some(displaced) = queue.push_displacing_lower_priority(request) {
                     publish_heal_queue_length(&queue);
                     warn!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
                         request_id = %request_id,
                         priority = ?priority,
                         displaced_request_id = %displaced.id,
                         displaced_priority = ?displaced.priority,
                         queue_len,
                         queue_capacity,
-                        "Admitted heal request by displacing lower-priority queued work"
+                        result = "accepted_by_displacement",
+                        "Heal queue request accepted by displacement"
                     );
                     drop(queue);
                     if config.event_driven_scheduler_enable {
@@ -644,11 +717,16 @@ impl HealManager {
                 }
 
                 warn!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_QUEUE_ADMISSION,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
                     request_id = %request_id,
                     priority = ?priority,
                     queue_len,
                     queue_capacity,
-                    "Heal queue was full and lower-priority work was unavailable for displacement"
+                    result = "full_no_displacement_candidate",
+                    "Heal queue request rejected without displacement"
                 );
                 return Ok(HealAdmissionResult::Full);
             }
@@ -657,21 +735,31 @@ impl HealManager {
             match admission {
                 HealAdmissionResult::Dropped(reason) => {
                     warn!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
                         request_id = %request.id,
                         priority = ?request.priority,
                         queue_len,
                         queue_capacity,
                         reason = reason.as_str(),
-                        "Dropping heal request because the queue is full"
+                        result = "dropped_full",
+                        "Heal queue request dropped"
                     );
                 }
                 HealAdmissionResult::Full => {
                     warn!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
                         request_id = %request.id,
                         priority = ?request.priority,
                         queue_len,
                         queue_capacity,
-                        "Rejecting heal request because the queue is full"
+                        result = "rejected_full",
+                        "Heal queue request rejected"
                     );
                 }
                 HealAdmissionResult::Accepted | HealAdmissionResult::Merged => {}
@@ -683,10 +771,15 @@ impl HealManager {
         let capacity_threshold = (queue_capacity as f64 * 0.8) as usize;
         if queue_len >= capacity_threshold {
             warn!(
-                "Heal queue is {}% full ({}/{}). Consider increasing queue size or processing capacity.",
-                (queue_len * 100) / queue_capacity,
+                target: "rustfs::heal::manager",
+                event = EVENT_HEAL_QUEUE_ADMISSION,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_MANAGER,
                 queue_len,
-                queue_capacity
+                queue_capacity,
+                queue_usage_pct = (queue_len * 100) / queue_capacity,
+                result = "queue_pressure_high",
+                "Heal queue pressure high"
             );
         }
 
@@ -700,20 +793,36 @@ impl HealManager {
         // Log queue statistics periodically (when adding high/urgent priority items)
         if matches!(priority, HealPriority::High | HealPriority::Urgent) {
             let stats = queue.get_priority_stats();
-            info!(
-                "Heal queue stats after adding {:?} priority request: total={}, urgent={}, high={}, normal={}, low={}",
-                priority,
-                queue_len + 1,
-                stats.get(&HealPriority::Urgent).unwrap_or(&0),
-                stats.get(&HealPriority::High).unwrap_or(&0),
-                stats.get(&HealPriority::Normal).unwrap_or(&0),
-                stats.get(&HealPriority::Low).unwrap_or(&0)
+            debug!(
+                target: "rustfs::heal::manager",
+                event = EVENT_HEAL_QUEUE_ADMISSION,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_MANAGER,
+                request_id = %request_id,
+                priority = ?priority,
+                queue_len = queue_len + 1,
+                urgent = *stats.get(&HealPriority::Urgent).unwrap_or(&0),
+                high = *stats.get(&HealPriority::High).unwrap_or(&0),
+                normal = *stats.get(&HealPriority::Normal).unwrap_or(&0),
+                low = *stats.get(&HealPriority::Low).unwrap_or(&0),
+                result = "accepted",
+                "Heal queue snapshot recorded"
             );
         }
 
         drop(queue);
 
-        info!("Submitted heal request: {} with priority: {:?}", request_id, priority);
+        debug!(
+            target: "rustfs::heal::manager",
+            event = EVENT_HEAL_QUEUE_ADMISSION,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_MANAGER,
+            request_id = %request_id,
+            priority = ?priority,
+            queue_len = queue_len + 1,
+            result = "accepted",
+            "Heal queue request accepted"
+        );
         if config.event_driven_scheduler_enable {
             self.notify.notify_one();
         }
@@ -884,7 +993,15 @@ impl HealManager {
                 task.cancel().await?;
                 active_heals.remove(task_id);
                 publish_active_heal_count(&active_heals);
-                info!("Cancelled active heal task: {}", task_id);
+                info!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_MANAGER_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                    task_id,
+                    state = "cancelled_active_task",
+                    "Heal manager cancelled active task"
+                );
                 return Ok(());
             }
         }
@@ -892,7 +1009,15 @@ impl HealManager {
         let mut queue = self.heal_queue.lock().await;
         if queue.remove_request_id(task_id).is_some() {
             publish_heal_queue_length(&queue);
-            info!("Cancelled queued heal task: {}", task_id);
+            info!(
+                target: "rustfs::heal::manager",
+                event = EVENT_HEAL_MANAGER_STATE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_MANAGER,
+                task_id,
+                state = "cancelled_queued_task",
+                "Heal manager cancelled queued task"
+            );
             return Ok(());
         }
 
@@ -938,7 +1063,16 @@ impl HealManager {
             });
         }
 
-        info!("Cancelled {} heal task(s) for path: {}", cancelled, heal_path);
+        info!(
+            target: "rustfs::heal::manager",
+            event = EVENT_HEAL_MANAGER_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_MANAGER,
+            heal_path,
+            cancelled,
+            state = "cancelled_path_tasks",
+            "Heal manager cancelled tasks for path"
+        );
         Ok(cancelled)
     }
 
@@ -979,7 +1113,14 @@ impl HealManager {
                 let event_driven_scheduler_enable = config.read().await.event_driven_scheduler_enable;
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
-                        info!("Heal scheduler received shutdown signal");
+                        info!(
+                            target: "rustfs::heal::manager",
+                            event = EVENT_HEAL_SCHEDULER_STATE,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_MANAGER,
+                            state = "shutdown",
+                            "Heal scheduler stopped"
+                        );
                         break;
                     }
                     _ = notify.notified(), if event_driven_scheduler_enable => {
@@ -1010,15 +1151,34 @@ impl HealManager {
         if duration < Duration::from_secs(10) {
             duration = Duration::from_secs(10);
         }
-        info!("start_auto_disk_scanner: Starting auto disk scanner with interval: {:?}", duration);
+        info!(
+            target: "rustfs::heal::manager",
+            event = EVENT_HEAL_AUTO_SCAN_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+            state = "started",
+            interval = ?duration,
+            "Heal auto disk scanner started"
+        );
 
         tokio::spawn(async move {
             let mut interval = interval(duration);
 
             loop {
+                let mut candidate_count = 0usize;
+                let mut skipped_duplicate_count = 0usize;
+                let mut skipped_invalid_count = 0usize;
+                let mut enqueued_count = 0usize;
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
-                        info!("start_auto_disk_scanner: Auto disk scanner received shutdown signal");
+                        info!(
+                            target: "rustfs::heal::manager",
+                            event = EVENT_HEAL_AUTO_SCAN_STATE,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                            state = "shutdown",
+                            "Heal auto disk scanner stopped"
+                        );
                         break;
                     }
                     _ = interval.tick() => {
@@ -1029,12 +1189,29 @@ impl HealManager {
                                 // detect unformatted disk via get_disk_id()
                                 match disk.get_disk_id().await {
                                     Err(DiskError::UnformattedDisk) => {
-                                        info!("start_auto_disk_scanner: Detected unformatted disk: {}", disk.endpoint());
+                                        candidate_count += 1;
+                                        debug!(
+                                            target: "rustfs::heal::manager",
+                                            event = EVENT_HEAL_AUTO_SCAN_DISK,
+                                            component = LOG_COMPONENT_HEAL,
+                                            subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                            endpoint = %disk.endpoint(),
+                                            disk_state = "unformatted",
+                                            "Heal auto-scan candidate detected"
+                                        );
                                         endpoints.push(disk.endpoint());
                                     }
                                     Err(e) => {
-                                        // Log other errors for debugging
-                                        tracing::warn!("start_auto_disk_scanner: Disk {} check failed: {:?}", disk.endpoint(), e);
+                                        warn!(
+                                            target: "rustfs::heal::manager",
+                                            event = EVENT_HEAL_AUTO_SCAN_DISK,
+                                            component = LOG_COMPONENT_HEAL,
+                                            subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                            endpoint = %disk.endpoint(),
+                                            disk_state = "check_failed",
+                                            error = ?e,
+                                            "Heal auto-scan disk inspection failed"
+                                        );
                                     }
                                     Ok(_) => {
                                         // Disk is formatted, no action needed
@@ -1044,7 +1221,14 @@ impl HealManager {
                         }
 
                         if endpoints.is_empty() {
-                            debug!("start_auto_disk_scanner: No endpoints need healing");
+                            debug!(
+                                target: "rustfs::heal::manager",
+                                event = EVENT_HEAL_AUTO_SCAN_STATE,
+                                component = LOG_COMPONENT_HEAL,
+                                subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                state = "idle",
+                                "Heal auto disk scanner idle"
+                            );
                             continue;
                         }
 
@@ -1052,7 +1236,15 @@ impl HealManager {
                         let buckets = match storage.list_buckets().await {
                             Ok(buckets) => buckets.iter().map(|b| b.name.clone()).collect::<Vec<String>>(),
                             Err(e) => {
-                                error!("start_auto_disk_scanner: Failed to get bucket list for auto healing: {}", e);
+                                error!(
+                                    target: "rustfs::heal::manager",
+                                    event = EVENT_HEAL_AUTO_SCAN_STATE,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                    state = "bucket_list_failed",
+                                    error = %e,
+                                    "Heal auto-scan bucket listing failed"
+                                );
                                 continue;
                             }
                         };
@@ -1062,7 +1254,16 @@ impl HealManager {
                             let Some(set_disk_id) =
                                 crate::heal::utils::format_set_disk_id_from_i32(ep.pool_idx, ep.set_idx)
                             else {
-                                warn!("start_auto_disk_scanner: Skipping endpoint {} without valid pool/set index", ep);
+                                warn!(
+                                    target: "rustfs::heal::manager",
+                                    event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                    endpoint = %ep,
+                                    result = "skipped_invalid_set_disk_id",
+                                    "Heal auto-scan enqueue skipped"
+                                );
+                                skipped_invalid_count += 1;
                                 continue;
                             };
                             // skip if already queued or healing
@@ -1088,7 +1289,17 @@ impl HealManager {
                             }
 
                             if skip {
-                                info!("start_auto_disk_scanner: Skipping auto erasure set heal for endpoint: {} (set_disk_id: {}) because it is already queued or healing", ep, set_disk_id);
+                                skipped_duplicate_count += 1;
+                                debug!(
+                                    target: "rustfs::heal::manager",
+                                    event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                    endpoint = %ep,
+                                    set_disk_id,
+                                    result = "skipped_duplicate",
+                                    "Heal auto-scan duplicate skipped"
+                                );
                                 continue;
                             }
 
@@ -1108,9 +1319,32 @@ impl HealManager {
                                 if config.event_driven_scheduler_enable {
                                     notify.notify_one();
                                 }
-                                info!("start_auto_disk_scanner: Enqueued auto erasure set heal for endpoint: {} (set_disk_id: {})", ep, set_disk_id);
+                                enqueued_count += 1;
+                                debug!(
+                                    target: "rustfs::heal::manager",
+                                    event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                    endpoint = %ep,
+                                    set_disk_id,
+                                    bucket_count = buckets.len(),
+                                    result = "enqueued",
+                                    "Heal auto-scan task enqueued"
+                                );
                             }
                         }
+                        info!(
+                            target: "rustfs::heal::manager",
+                            event = EVENT_HEAL_AUTO_SCAN_STATE,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                            state = "cycle_completed",
+                            candidate_count,
+                            enqueued_count,
+                            skipped_duplicate_count,
+                            skipped_invalid_count,
+                            "Heal auto-scan cycle completed"
+                        );
                     }
                 }
             }
@@ -1191,17 +1425,46 @@ impl HealManager {
 
                 // start heal task
                 tokio::spawn(async move {
-                    info!(
-                        "Starting heal task: {} with priority: {:?}, type: {}, set: {}",
-                        task_id, task_priority, task_type_label_for_spawn, task_set_label_for_spawn
+                    debug!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_SCHEDULER_STATE,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                        task_id,
+                        priority = ?task_priority,
+                        heal_type = %task_type_label_for_spawn,
+                        set = %task_set_label_for_spawn,
+                        state = "task_started",
+                        "Heal scheduler task started"
                     );
                     let result = task.execute().await;
                     match result {
                         Ok(_) => {
-                            info!("Heal task completed successfully: {}", task_id);
+                            debug!(
+                                target: "rustfs::heal::manager",
+                                event = EVENT_HEAL_SCHEDULER_STATE,
+                                component = LOG_COMPONENT_HEAL,
+                                subsystem = LOG_SUBSYSTEM_MANAGER,
+                                task_id,
+                                heal_type = %task_type_label_for_spawn,
+                                set = %task_set_label_for_spawn,
+                                state = "task_completed",
+                                "Heal scheduler task completed"
+                            );
                         }
                         Err(e) => {
-                            error!("Heal task failed: {} - {}", task_id, e);
+                            error!(
+                                target: "rustfs::heal::manager",
+                                event = EVENT_HEAL_SCHEDULER_STATE,
+                                component = LOG_COMPONENT_HEAL,
+                                subsystem = LOG_SUBSYSTEM_MANAGER,
+                                task_id,
+                                heal_type = %task_type_label_for_spawn,
+                                set = %task_set_label_for_spawn,
+                                state = "task_failed",
+                                error = %e,
+                                "Heal scheduler task failed"
+                            );
                         }
                     }
                     let mut active_heals_guard = active_heals_clone.lock().await;
@@ -1249,7 +1512,16 @@ impl HealManager {
         if !queue.is_empty() {
             let remaining = queue.len();
             if remaining > 10 {
-                info!("Heal queue has {} pending requests, {} tasks active", remaining, active_heals_guard.len());
+                info!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_QUEUE_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                    queue_len = remaining,
+                    active_tasks = active_heals_guard.len(),
+                    state = "backlog_high",
+                    "Heal queue backlog high"
+                );
             }
         }
     }
@@ -1353,11 +1625,9 @@ mod tests {
     use crate::heal::storage::HealStorageAPI;
     use crate::heal::task::{HealOptions, HealPriority, HealRequest, HealType};
     use rustfs_common::heal_channel::HealOpts;
-    use rustfs_ecstore::{
-        disk::{DiskStore, endpoint::Endpoint},
-        store_api::BucketInfo,
-    };
+    use rustfs_ecstore::disk::{DiskStore, endpoint::Endpoint};
     use rustfs_madmin::heal_commands::HealResultItem;
+    use rustfs_storage_api::BucketInfo;
 
     struct MockStorage;
 

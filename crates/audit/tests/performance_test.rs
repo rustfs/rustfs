@@ -26,7 +26,7 @@ async fn test_audit_system_startup_performance() {
     let start = Instant::now();
 
     // Create minimal config for testing
-    let config = rustfs_ecstore::config::Config(std::collections::HashMap::new());
+    let config = rustfs_config::server_config::Config(std::collections::HashMap::new());
 
     // System should start quickly even with empty config
     let _result = timeout(Duration::from_secs(5), system.start(config)).await;
@@ -47,12 +47,12 @@ async fn test_concurrent_target_creation() {
     let registry = AuditRegistry::new();
 
     // Create config with multiple webhook instances
-    let mut config = rustfs_ecstore::config::Config(std::collections::HashMap::new());
+    let mut config = rustfs_config::server_config::Config(std::collections::HashMap::new());
     let mut webhook_section = std::collections::HashMap::new();
 
     // Create multiple instances for concurrent creation test
     for i in 1..=5 {
-        let mut kvs = rustfs_ecstore::config::KVS::new();
+        let mut kvs = rustfs_config::server_config::KVS::new();
         kvs.insert("enable".to_string(), "on".to_string());
         kvs.insert("endpoint".to_string(), format!("http://localhost:302{i}/webhook"));
         webhook_section.insert(format!("instance_{i}"), kvs);
@@ -90,7 +90,7 @@ async fn test_audit_log_dispatch_performance() {
     let system = AuditSystem::new();
 
     // Create minimal config
-    let config = rustfs_ecstore::config::Config(HashMap::new());
+    let config = rustfs_config::server_config::Config(HashMap::new());
     let start_result = system.start(config).await;
     if start_result.is_err() {
         println!("AuditSystem failed to start: {start_result:?}");
@@ -186,7 +186,7 @@ async fn test_system_state_transitions() {
     assert_eq!(system.get_state().await, rustfs_audit::system::AuditSystemState::Stopped);
 
     // Start system
-    let config = rustfs_ecstore::config::Config(std::collections::HashMap::new());
+    let config = rustfs_config::server_config::Config(std::collections::HashMap::new());
     let start_result = system.start(config).await;
 
     // Empty config keeps the audit system stopped even when start() succeeds.

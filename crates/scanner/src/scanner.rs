@@ -27,7 +27,8 @@ use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError};
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{
-    CurrentCycle, Metric, Metrics, ScanCyclePartialReason, emit_scan_cycle_complete, emit_scan_cycle_partial, global_metrics,
+    CurrentCycle, Metric, Metrics, ScanCyclePartialReason, ScannerWorkSource, emit_scan_cycle_complete,
+    emit_scan_cycle_partial_with_source, global_metrics,
 };
 use rustfs_config::ScannerSpeed;
 #[cfg(test)]
@@ -36,7 +37,6 @@ use rustfs_config::{
     ENV_SCANNER_CYCLE_MAX_OBJECTS,
 };
 use rustfs_config::{ENV_SCANNER_CYCLE, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS};
-use rustfs_ecstore::StorageAPI as _;
 use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle as _;
 use rustfs_ecstore::bucket::metadata_sys::{get_lifecycle_config, get_replication_config};
 use rustfs_ecstore::bucket::replication::ReplicationConfigurationExt as _;
@@ -45,7 +45,8 @@ use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 use rustfs_ecstore::error::Error as EcstoreError;
 use rustfs_ecstore::global::is_erasure_sd;
 use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
+use rustfs_ecstore::store_api::{BucketOperations, NamespaceLocking as _, ObjectIO};
+use rustfs_storage_api::BucketOptions;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
@@ -53,6 +54,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 const SINGLE_DISK_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
+const LOG_COMPONENT_SCANNER: &str = "scanner";
+const LOG_SUBSYSTEM_RUNTIME: &str = "runtime";
+const LOG_SUBSYSTEM_BACKGROUND_HEAL: &str = "background_heal";
+const EVENT_SCANNER_CYCLE_STATE: &str = "scanner_cycle_state";
+const EVENT_SCANNER_LOCK_STATE: &str = "scanner_lock_state";
+const EVENT_SCANNER_PERSIST_STATE: &str = "scanner_persist_state";
+const EVENT_SCANNER_RUNTIME_CONFIG: &str = "scanner_runtime_config";
+const EVENT_SCANNER_BACKGROUND_HEAL_STATE: &str = "scanner_background_heal_state";
 #[cfg(test)]
 const ENV_SCANNER_START_DELAY_SECS_DEPRECATED: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
 
@@ -77,11 +86,19 @@ fn scanner_cycle_max_duration() -> Option<Duration> {
 }
 
 fn resolve_scanner_runtime_config() -> crate::runtime_config::ScannerRuntimeConfig {
-    let config = rustfs_ecstore::config::get_global_server_config();
+    let config = rustfs_config::server_config::get_global_server_config();
     match lookup_scanner_runtime_config(config.as_ref()) {
         Ok(config) => config,
         Err(err) => {
-            warn!(error = %err, "Failed to resolve scanner runtime config, using last applied config");
+            warn!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_RUNTIME_CONFIG,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                state = "resolve_failed",
+                error = %err,
+                "Scanner runtime config fallback applied"
+            );
             current_scanner_runtime_config()
         }
     }
@@ -93,6 +110,13 @@ fn scan_cycle_partial_reason(reason: Option<ScannerCycleBudgetReason>) -> ScanCy
         Some(ScannerCycleBudgetReason::Objects) => ScanCyclePartialReason::Objects,
         Some(ScannerCycleBudgetReason::Directories) => ScanCyclePartialReason::Directories,
         None => ScanCyclePartialReason::Unknown,
+    }
+}
+
+fn scan_cycle_partial_source(reason: Option<ScannerCycleBudgetReason>) -> Option<ScannerWorkSource> {
+    match reason {
+        Some(ScannerCycleBudgetReason::Objects | ScannerCycleBudgetReason::Directories) => Some(ScannerWorkSource::Usage),
+        Some(ScannerCycleBudgetReason::Runtime) | None => None,
     }
 }
 
@@ -110,29 +134,163 @@ fn randomized_cycle_delay_for(interval: Duration) -> Duration {
     delay.max(Duration::from_secs(1))
 }
 
-fn initial_scanner_delay() -> Duration {
-    initial_scanner_delay_for(scanner_start_delay().map(|duration| duration.as_secs()))
-}
-
 fn initial_scanner_delay_for(start_delay_secs: Option<u64>) -> Duration {
     start_delay_secs
         .map(|secs| randomized_cycle_delay_for(Duration::from_secs(secs)))
         .unwrap_or_else(randomized_cycle_delay)
 }
 
+fn initial_scanner_delay_for_startup(
+    start_delay_secs: Option<u64>,
+    usage_cache_is_cold: bool,
+    has_buckets: bool,
+    has_active_replication: bool,
+) -> Duration {
+    // Skip the startup delay when the cache is cold (first ever scan) OR when active replication
+    // rules exist. In single-disk/Slowest mode the normal inter-cycle delay is 27-33 minutes; if
+    // the node was SIGKILL'd with FAILED-status objects queued, waiting that long leaves them
+    // permanently unhealed until the next full cycle. Replication config is live-read at startup
+    // by configure_scanner_defaults, so this signal is always current regardless of when the
+    // persisted DataUsageInfo was last written.
+    if (usage_cache_is_cold || has_active_replication) && has_buckets {
+        Duration::ZERO
+    } else {
+        initial_scanner_delay_for(start_delay_secs)
+    }
+}
+
+fn data_usage_info_is_cold(info: &DataUsageInfo) -> bool {
+    info.last_update.is_none() || (info.buckets_usage.is_empty() && info.bucket_sizes.is_empty())
+}
+
+async fn read_data_usage_config_for_startup(storeapi: &Arc<ECStore>) -> Result<Option<Vec<u8>>, EcstoreError> {
+    match read_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await {
+        Ok(data) => Ok(Some(data)),
+        Err(EcstoreError::ConfigNotFound) => {
+            let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+            match read_config(storeapi.clone(), backup_path.as_str()).await {
+                Ok(data) => Ok(Some(data)),
+                Err(EcstoreError::ConfigNotFound) => Ok(None),
+                Err(err) => Err(err),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn persisted_usage_cache_is_cold_for_startup(storeapi: &Arc<ECStore>) -> bool {
+    let Some(data) = (match read_data_usage_config_for_startup(storeapi).await {
+        Ok(data) => data,
+        Err(err) => {
+            warn!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                state = "startup_inspect_failed",
+                error = %err,
+                "Scanner startup cache inspection failed"
+            );
+            return false;
+        }
+    }) else {
+        return true;
+    };
+
+    match serde_json::from_slice::<DataUsageInfo>(&data) {
+        Ok(info) => data_usage_info_is_cold(&info),
+        Err(err) => {
+            warn!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                state = "startup_decode_failed",
+                error = %err,
+                "Scanner startup cache decode failed"
+            );
+            true
+        }
+    }
+}
+
+async fn initial_scanner_startup_usage_state(storeapi: &Arc<ECStore>) -> (bool, bool) {
+    let has_buckets = match storeapi
+        .list_bucket(&BucketOptions {
+            no_metadata: true,
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(buckets) => !buckets.is_empty(),
+        Err(err) => {
+            warn!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_RUNTIME_CONFIG,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                state = "startup_bucket_inspect_failed",
+                error = %err,
+                "Scanner startup bucket inspection failed"
+            );
+            false
+        }
+    };
+
+    if !has_buckets {
+        return (false, false);
+    }
+
+    (persisted_usage_cache_is_cold_for_startup(storeapi).await, true)
+}
+
 pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
-    configure_scanner_defaults(&storeapi).await;
+    let startup_features = configure_scanner_defaults(&storeapi).await;
     // Force init global sleeper so config is read once at startup.
     let _ = &*SCANNER_SLEEPER;
     if let Err(err) = refresh_scanner_runtime_config_from_global() {
-        warn!(error = %err, "Failed to apply scanner runtime config at startup");
+        warn!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_RUNTIME_CONFIG,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            state = "startup_apply_failed",
+            error = %err,
+            "Scanner runtime config apply failed at startup"
+        );
     }
 
+    let replication_active = startup_features.replication;
     let ctx_clone = ctx;
     let storeapi_clone = storeapi;
     tokio::spawn(async move {
-        let sleep_time = initial_scanner_delay();
-        tokio::time::sleep(sleep_time).await;
+        let (usage_cache_is_cold, has_buckets) = initial_scanner_startup_usage_state(&storeapi_clone).await;
+        let sleep_time = initial_scanner_delay_for_startup(
+            scanner_start_delay().map(|duration| duration.as_secs()),
+            usage_cache_is_cold,
+            has_buckets,
+            replication_active,
+        );
+        if sleep_time.is_zero() {
+            let skip_reason = if usage_cache_is_cold {
+                "usage_cache_cold"
+            } else {
+                "replication_active"
+            };
+            info!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_CYCLE_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                state = "startup_delay_skipped",
+                reason = skip_reason,
+                "Scanner startup delay skipped"
+            );
+        } else {
+            tokio::time::sleep(sleep_time).await;
+        }
 
         loop {
             if ctx_clone.is_cancelled() {
@@ -140,7 +298,15 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
             }
 
             if let Err(e) = run_data_scanner(ctx_clone.clone(), storeapi_clone.clone()).await {
-                error!("Failed to run data scanner: {e}");
+                error!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_CYCLE_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    state = "run_failed",
+                    error = %e,
+                    "Scanner runtime iteration failed"
+                );
             }
             // Backoff before retrying after lock contention or scanner-level failures.
             // Keep this cancellation-aware so shutdown is not delayed by backoff sleep.
@@ -185,8 +351,13 @@ async fn detect_scanner_maintenance_features(storeapi: &Arc<ECStore>) -> Scanner
         Ok(buckets) => buckets,
         Err(err) => {
             warn!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_RUNTIME_CONFIG,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                state = "maintenance_feature_inspect_failed",
                 error = %err,
-                "Failed to inspect scanner maintenance features; preserving speed-based scanner cycle"
+                "Scanner maintenance feature inspection failed; preserving speed-based cycle"
             );
             features.inspection_failed = true;
             return features;
@@ -202,9 +373,14 @@ async fn detect_scanner_maintenance_features(storeapi: &Arc<ECStore>) -> Scanner
                 Err(EcstoreError::ConfigNotFound) => {}
                 Err(err) => {
                     warn!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_RUNTIME_CONFIG,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
                         bucket = %bucket.name,
+                        state = "lifecycle_inspect_failed",
                         error = %err,
-                        "Failed to inspect bucket lifecycle config; preserving speed-based scanner cycle"
+                        "Scanner lifecycle inspection failed; preserving speed-based cycle"
                     );
                     features.inspection_failed = true;
                 }
@@ -219,9 +395,14 @@ async fn detect_scanner_maintenance_features(storeapi: &Arc<ECStore>) -> Scanner
                 Err(EcstoreError::ConfigNotFound) => {}
                 Err(err) => {
                     warn!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_RUNTIME_CONFIG,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
                         bucket = %bucket.name,
+                        state = "replication_inspect_failed",
                         error = %err,
-                        "Failed to inspect bucket replication config; preserving speed-based scanner cycle"
+                        "Scanner replication inspection failed; preserving speed-based cycle"
                     );
                     features.inspection_failed = true;
                 }
@@ -236,13 +417,17 @@ async fn detect_scanner_maintenance_features(storeapi: &Arc<ECStore>) -> Scanner
     features
 }
 
-async fn configure_scanner_defaults(storeapi: &Arc<ECStore>) {
+async fn configure_scanner_defaults(storeapi: &Arc<ECStore>) -> ScannerMaintenanceFeatures {
     if is_erasure_sd().await {
         let features = detect_scanner_maintenance_features(storeapi).await;
         let default_cycle_secs = single_disk_default_cycle_secs(features);
         set_scanner_default_speed(ScannerSpeed::Slowest);
         set_scanner_default_cycle_secs(default_cycle_secs);
         info!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_RUNTIME_CONFIG,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
             env_speed = ENV_SCANNER_SPEED,
             env_cycle = ENV_SCANNER_CYCLE,
             env_start_delay = ENV_SCANNER_START_DELAY_SECS,
@@ -250,11 +435,14 @@ async fn configure_scanner_defaults(storeapi: &Arc<ECStore>) {
             lifecycle_active = features.lifecycle,
             replication_active = features.replication,
             feature_inspection_failed = features.inspection_failed,
-            "Using slower scanner defaults for single-disk deployments; regular scanner cycles are preserved when maintenance features are active"
+            state = "single_disk_defaults_applied",
+            "Scanner defaults applied"
         );
+        features
     } else {
         set_scanner_default_speed(ScannerSpeed::Default);
         set_scanner_default_cycle_secs(None);
+        ScannerMaintenanceFeatures::default()
     }
 }
 
@@ -386,13 +574,31 @@ pub async fn read_background_heal_info(storeapi: Arc<ECStore>) -> BackgroundHeal
     // Get last healing information
     match read_config(storeapi, &BACKGROUND_HEAL_INFO_PATH).await {
         Ok(buf) => serde_json::from_slice::<BackgroundHealInfo>(&buf).unwrap_or_else(|e| {
-            error!("Failed to unmarshal background heal info from {}: {}", &*BACKGROUND_HEAL_INFO_PATH, e);
+            error!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_BACKGROUND_HEAL_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_BACKGROUND_HEAL,
+                path = %&*BACKGROUND_HEAL_INFO_PATH,
+                state = "decode_failed",
+                error = %e,
+                "Scanner background heal decode failed"
+            );
             BackgroundHealInfo::default()
         }),
         Err(e) => {
             // Only log if it's not a ConfigNotFound error
             if e != EcstoreError::ConfigNotFound {
-                warn!("Failed to read background heal info from {}: {}", &*BACKGROUND_HEAL_INFO_PATH, e);
+                warn!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_BACKGROUND_HEAL_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_BACKGROUND_HEAL,
+                    path = %&*BACKGROUND_HEAL_INFO_PATH,
+                    state = "read_failed",
+                    error = %e,
+                    "Scanner background heal read failed"
+                );
             }
             BackgroundHealInfo::default()
         }
@@ -411,14 +617,32 @@ pub async fn save_background_heal_info(storeapi: Arc<ECStore>, info: BackgroundH
     let data = match serde_json::to_vec(&info) {
         Ok(data) => data,
         Err(e) => {
-            error!("Failed to marshal background heal info: {}", e);
+            error!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_BACKGROUND_HEAL_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_BACKGROUND_HEAL,
+                path = %&*BACKGROUND_HEAL_INFO_PATH,
+                state = "encode_failed",
+                error = %e,
+                "Scanner background heal encode failed"
+            );
             return;
         }
     };
 
     // Save configuration
     if let Err(e) = save_config(storeapi, &BACKGROUND_HEAL_INFO_PATH, data).await {
-        warn!("Failed to save background heal info to {}: {}", &*BACKGROUND_HEAL_INFO_PATH, e);
+        warn!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_BACKGROUND_HEAL_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_BACKGROUND_HEAL,
+            path = %&*BACKGROUND_HEAL_INFO_PATH,
+            state = "save_failed",
+            error = %e,
+            "Scanner background heal save failed"
+        );
     }
 }
 
@@ -439,7 +663,15 @@ async fn mark_scan_cycle_idle(cycle_info: &mut CurrentCycle) {
 async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>, cycle_info: &mut CurrentCycle) {
     let _activity_guard = ScannerActivityGuard::new();
     if let Err(err) = refresh_scanner_runtime_config_from_global() {
-        warn!(error = %err, "Failed to refresh scanner runtime config, using last applied config");
+        warn!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_RUNTIME_CONFIG,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            state = "refresh_failed",
+            error = %err,
+            "Scanner runtime config refresh failed"
+        );
     }
     let configured_cycle_interval = scanner_cycle_interval();
     let configured_bitrot_cycle = scanner_bitrot_cycle();
@@ -451,7 +683,6 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
         cycle_budget_config.max_objects,
         cycle_budget_config.max_directories,
     );
-    info!("Start run data scanner cycle");
     cycle_info.current = cycle_info.next;
     let now = Instant::now();
     cycle_info.started = Utc::now();
@@ -465,6 +696,16 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
         background_heal_info.bitrot_start_cycle,
         background_heal_info.bitrot_start_time,
         configured_bitrot_cycle,
+    );
+    info!(
+        target: "rustfs::scanner",
+        event = EVENT_SCANNER_CYCLE_STATE,
+        component = LOG_COMPONENT_SCANNER,
+        subsystem = LOG_SUBSYSTEM_RUNTIME,
+        cycle = cycle_info.current,
+        scan_mode = ?scan_mode,
+        state = "started",
+        "Scanner cycle started"
     );
     let _scan_mode_guard = ScannerScanModeGuard::new(scan_mode);
     if let Some(new_heal_info) = background_heal_info_for_scan_start(
@@ -498,18 +739,40 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
         global_metrics().finish_scan_cycle_work(cycle_work_start);
         if budget_elapsed {
             warn!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_CYCLE_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                cycle = cycle_info.current,
                 duration = ?now.elapsed(),
                 reason = ?cycle_budget.reason(),
                 max_duration = ?cycle_budget.max_duration(),
                 max_objects = ?cycle_budget.max_objects(),
                 max_directories = ?cycle_budget.max_directories(),
-                "Data scanner cycle stopped after reaching its cycle budget"
+                state = "budget_reached",
+                "Scanner cycle budget reached"
             );
-            emit_scan_cycle_partial(cycle_start.elapsed(), scan_cycle_partial_reason(cycle_budget.reason()));
+            let budget_reason = cycle_budget.reason();
+            emit_scan_cycle_partial_with_source(
+                cycle_start.elapsed(),
+                scan_cycle_partial_reason(budget_reason),
+                scan_cycle_partial_source(budget_reason),
+            );
             mark_scan_cycle_idle(cycle_info).await;
             return;
         }
-        error!(duration = ?now.elapsed(), "Fail run data scanner cycle: {e}");
+        error!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_CYCLE_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            cycle = cycle_info.current,
+            scan_mode = ?scan_mode,
+            state = "failed",
+            duration = ?now.elapsed(),
+            error = %e,
+            "Scanner cycle failed"
+        );
         emit_scan_cycle_complete(false, cycle_start.elapsed());
         if let Some(new_heal_info) = background_heal_info_for_scan_complete(background_heal_info.clone(), scan_mode) {
             save_background_heal_info(storeapi.clone(), new_heal_info).await;
@@ -518,15 +781,26 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
     }
     if cycle_budget.budget_elapsed() && !ctx.is_cancelled() {
         warn!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_CYCLE_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            cycle = cycle_info.current,
             duration = ?now.elapsed(),
             reason = ?cycle_budget.reason(),
             max_duration = ?cycle_budget.max_duration(),
             max_objects = ?cycle_budget.max_objects(),
             max_directories = ?cycle_budget.max_directories(),
-            "Data scanner cycle stopped after reaching its cycle budget"
+            state = "budget_reached",
+            "Scanner cycle budget reached"
         );
         global_metrics().finish_scan_cycle_work(cycle_work_start);
-        emit_scan_cycle_partial(cycle_start.elapsed(), scan_cycle_partial_reason(cycle_budget.reason()));
+        let budget_reason = cycle_budget.reason();
+        emit_scan_cycle_partial_with_source(
+            cycle_start.elapsed(),
+            scan_cycle_partial_reason(budget_reason),
+            scan_cycle_partial_source(budget_reason),
+        );
         mark_scan_cycle_idle(cycle_info).await;
         return;
     }
@@ -542,7 +816,18 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
     cycle_info.cycle_completed.push(Utc::now());
     global_metrics().clear_current_scan_mode();
 
-    info!(duration = ?now.elapsed(), cycles_total=cycle_info.cycle_completed.len(), "Success run data scanner cycle");
+    info!(
+        target: "rustfs::scanner",
+        event = EVENT_SCANNER_CYCLE_STATE,
+        component = LOG_COMPONENT_SCANNER,
+        subsystem = LOG_SUBSYSTEM_RUNTIME,
+        cycle = cycle_info.current,
+        scan_mode = ?scan_mode,
+        state = "completed",
+        duration = ?now.elapsed(),
+        cycles_total = cycle_info.cycle_completed.len(),
+        "Scanner cycle completed"
+    );
 
     retain_recent_cycle_completions(&mut cycle_info.cycle_completed);
     global_metrics().set_cycle(Some(cycle_info.clone())).await;
@@ -554,9 +839,26 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
     buf.extend_from_slice(&cycle_info_buf);
 
     if let Err(e) = save_config(storeapi.clone(), &DATA_USAGE_BLOOM_NAME_PATH, buf).await {
-        error!("Failed to save data usage bloom name to {}: {}", &*DATA_USAGE_BLOOM_NAME_PATH, e);
+        error!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+            state = "failed",
+            error = %e,
+            "Scanner state persistence failed"
+        );
     } else {
-        info!("Data usage bloom name saved successfully");
+        debug!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+            state = "saved",
+            "Scanner state saved"
+        );
     }
 }
 
@@ -565,16 +867,42 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
     let _guard = match storeapi.new_ns_lock(RUSTFS_META_BUCKET, "leader.lock").await {
         Ok(ns_lock) => match ns_lock.get_write_lock_quiet(get_lock_acquire_timeout()).await {
             Ok(guard) => {
-                debug!("run_data_scanner: acquired leader write lock");
+                debug!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_LOCK_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    lock_name = "leader.lock",
+                    state = "acquired",
+                    "Scanner leader lock acquired"
+                );
                 guard
             }
             Err(e) => {
-                debug!("run_data_scanner: other node is running, failed to acquire leader write lock: {:?}", e);
+                debug!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_LOCK_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    lock_name = "leader.lock",
+                    state = "contended",
+                    error = ?e,
+                    "Scanner leader lock contended"
+                );
                 return Ok(());
             }
         },
         Err(e) => {
-            error!("run_data_scanner: failed to create namespace lock: {e}");
+            error!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_LOCK_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                lock_name = "leader.lock",
+                state = "create_failed",
+                error = %e,
+                "Scanner leader lock creation failed"
+            );
             return Ok(());
         }
     };
@@ -588,7 +916,16 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
     } else if buf.len() > 8 {
         cycle_info.next = u64::from_le_bytes(buf[0..8].try_into().unwrap_or_default());
         if let Err(e) = cycle_info.unmarshal(&buf[8..]) {
-            warn!("Failed to unmarshal cycle info: {e}");
+            warn!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                state = "cycle_decode_failed",
+                error = %e,
+                "Scanner cycle state decode failed"
+            );
         }
     }
 
@@ -613,7 +950,14 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
 
     global_metrics().set_cycle(None).await;
 
-    debug!("Data scanner done");
+    debug!(
+        target: "rustfs::scanner",
+        event = EVENT_SCANNER_CYCLE_STATE,
+        component = LOG_COMPONENT_SCANNER,
+        subsystem = LOG_SUBSYSTEM_RUNTIME,
+        state = "stopped",
+        "Scanner runtime stopped"
+    );
 
     Ok(())
 }
@@ -637,7 +981,7 @@ impl Drop for ScannerScanModeGuard {
 #[instrument(skip(ctx, storeapi))]
 pub async fn store_data_usage_in_backend(
     ctx: CancellationToken,
-    storeapi: Arc<ECStore>,
+    storeapi: Arc<impl ObjectIO>,
     mut receiver: mpsc::Receiver<DataUsageInfo>,
 ) {
     let mut attempts = 1u32;
@@ -648,11 +992,39 @@ pub async fn store_data_usage_in_backend(
             break;
         }
 
+        if let Ok(buf) = read_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await
+            && let Ok(existing) = serde_json::from_slice::<DataUsageInfo>(&buf)
+            && let (Some(new_ts), Some(existing_ts)) = (data_usage_info.last_update, existing.last_update)
+            && new_ts <= existing_ts
+        {
+            debug!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                incoming_last_update = ?new_ts,
+                existing_last_update = ?existing_ts,
+                state = "skip_stale_update",
+                "Scanner stale data usage update skipped"
+            );
+            continue;
+        }
+
         // Serialize to JSON
         let data = match serde_json::to_vec(&data_usage_info) {
             Ok(data) => data,
             Err(e) => {
-                error!("Failed to marshal data usage info: {}", e);
+                error!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_PERSIST_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                    state = "encode_failed",
+                    error = %e,
+                    "Scanner data usage encode failed"
+                );
                 continue;
             }
         };
@@ -662,7 +1034,16 @@ pub async fn store_data_usage_in_backend(
             let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
             let done_save = Metrics::time(Metric::SaveUsage);
             if let Err(e) = save_config(storeapi.clone(), &backup_path, data.clone()).await {
-                warn!("Failed to save data usage backup to {}: {}", backup_path, e);
+                warn!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_PERSIST_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    path = %backup_path,
+                    state = "backup_save_failed",
+                    error = %e,
+                    "Scanner data usage backup save failed"
+                );
             }
             done_save();
             attempts = 1;
@@ -671,7 +1052,16 @@ pub async fn store_data_usage_in_backend(
         // Save main configuration
         let done_save = Metrics::time(Metric::SaveUsage);
         if let Err(e) = save_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), data).await {
-            error!("Failed to save data usage info to {}: {e}", DATA_USAGE_OBJ_NAME_PATH.as_str());
+            error!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                state = "save_failed",
+                error = %e,
+                "Scanner data usage save failed"
+            );
         } else {
             rustfs_ecstore::data_usage::replace_bucket_usage_memory_from_info(&data_usage_info).await;
         }
@@ -684,8 +1074,13 @@ pub async fn store_data_usage_in_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_ecstore::store_api::{GetObjectReader, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader};
     use serial_test::serial;
+    use std::collections::HashMap;
+    use std::io::Cursor;
     use temp_env::{with_var, with_var_unset};
+    use tokio::io::AsyncReadExt;
+    use tokio::sync::Mutex;
 
     struct ScannerDefaultSpeedGuard;
 
@@ -714,6 +1109,51 @@ mod tests {
     impl Drop for ScannerDefaultCycleGuard {
         fn drop(&mut self) {
             set_scanner_default_cycle_secs(None);
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct MemoryConfigStore {
+        objects: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    fn memory_config_key(bucket: &str, object: &str) -> String {
+        format!("{bucket}/{object}")
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectIO for MemoryConfigStore {
+        async fn get_object_reader(
+            &self,
+            bucket: &str,
+            object: &str,
+            _range: Option<rustfs_ecstore::store_api::HTTPRangeSpec>,
+            _h: http::HeaderMap,
+            _opts: &ObjectOptions,
+        ) -> rustfs_ecstore::error::Result<GetObjectReader> {
+            let objects = self.objects.lock().await;
+            let data = objects
+                .get(&memory_config_key(bucket, object))
+                .cloned()
+                .ok_or(rustfs_ecstore::error::Error::FileNotFound)?;
+
+            Ok(GetObjectReader {
+                stream: Box::new(Cursor::new(data)),
+                object_info: ObjectInfo::default(),
+            })
+        }
+
+        async fn put_object(
+            &self,
+            bucket: &str,
+            object: &str,
+            data: &mut PutObjReader,
+            _opts: &ObjectOptions,
+        ) -> rustfs_ecstore::error::Result<ObjectInfo> {
+            let mut buf = Vec::new();
+            data.stream.read_to_end(&mut buf).await?;
+            self.objects.lock().await.insert(memory_config_key(bucket, object), buf);
+            Ok(ObjectInfo::default())
         }
     }
 
@@ -760,6 +1200,47 @@ mod tests {
             assert!(delay <= Duration::from_secs(132));
         });
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+    }
+
+    #[test]
+    #[serial]
+    fn test_initial_scanner_delay_skips_for_cold_usage_cache_with_buckets() {
+        let delay = initial_scanner_delay_for_startup(Some(120), true, true, false);
+        assert_eq!(delay, Duration::ZERO);
+    }
+
+    #[test]
+    #[serial]
+    fn test_initial_scanner_delay_keeps_configured_delay_for_warm_usage_cache_no_replication() {
+        let delay = initial_scanner_delay_for_startup(Some(120), false, true, false);
+        assert!(delay >= Duration::from_secs(108));
+        assert!(delay <= Duration::from_secs(132));
+    }
+
+    #[test]
+    #[serial]
+    fn test_initial_scanner_delay_keeps_configured_delay_without_buckets() {
+        let delay = initial_scanner_delay_for_startup(Some(120), true, false, false);
+        assert!(delay >= Duration::from_secs(108));
+        assert!(delay <= Duration::from_secs(132));
+    }
+
+    #[test]
+    #[serial]
+    fn test_initial_scanner_delay_skips_for_active_replication_warm_cache() {
+        // Warm cache + active replication rules → skip startup delay so that FAILED-status objects
+        // from a crash are healed on the first cycle, not after a 27-33 min sleep.
+        let delay = initial_scanner_delay_for_startup(Some(120), false, true, true);
+        assert_eq!(delay, Duration::ZERO);
+    }
+
+    #[test]
+    #[serial]
+    fn test_initial_scanner_delay_keeps_delay_for_replication_without_buckets() {
+        // Active replication but no buckets → no objects to scan, keep normal delay.
+        let delay = initial_scanner_delay_for_startup(Some(120), false, false, true);
+        assert!(delay >= Duration::from_secs(108));
+        assert!(delay <= Duration::from_secs(132));
     }
 
     #[test]
@@ -855,6 +1336,20 @@ mod tests {
         assert_eq!(scan_cycle_partial_reason(None), ScanCyclePartialReason::Unknown);
     }
 
+    #[test]
+    fn test_scan_cycle_partial_source_maps_budget_reason() {
+        assert_eq!(scan_cycle_partial_source(Some(ScannerCycleBudgetReason::Runtime)), None);
+        assert_eq!(
+            scan_cycle_partial_source(Some(ScannerCycleBudgetReason::Objects)),
+            Some(ScannerWorkSource::Usage)
+        );
+        assert_eq!(
+            scan_cycle_partial_source(Some(ScannerCycleBudgetReason::Directories)),
+            Some(ScannerWorkSource::Usage)
+        );
+        assert_eq!(scan_cycle_partial_source(None), None);
+    }
+
     #[tokio::test]
     #[serial]
     async fn test_mark_scan_cycle_idle_clears_published_cycle_state() {
@@ -882,6 +1377,39 @@ mod tests {
         assert_eq!(global_metrics().current_scan_mode(), HealScanMode::Unknown);
 
         global_metrics().set_cycle(None).await;
+    }
+
+    #[tokio::test]
+    async fn test_store_data_usage_in_backend_preserves_newer_snapshot() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let (sender, receiver) = mpsc::channel(2);
+        let ctx = CancellationToken::new();
+
+        let newer = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+            buckets_count: 2,
+            ..Default::default()
+        };
+        let older = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+            buckets_count: 1,
+            ..Default::default()
+        };
+
+        sender.send(newer).await.expect("newer usage snapshot should enqueue");
+        sender.send(older).await.expect("older usage snapshot should enqueue");
+        drop(sender);
+
+        store_data_usage_in_backend(ctx, store.clone(), receiver).await;
+
+        let objects = store.objects.lock().await;
+        let saved = objects
+            .get(&memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()))
+            .expect("data usage config should be saved");
+        let saved = serde_json::from_slice::<DataUsageInfo>(saved).expect("saved usage snapshot should decode");
+
+        assert_eq!(saved.buckets_count, 2);
+        assert_eq!(saved.last_update, Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)));
     }
 
     #[test]

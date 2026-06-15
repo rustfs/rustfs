@@ -98,7 +98,7 @@ impl VaultKmsClient {
         let client =
             VaultClient::new(settings).map_err(|e| KmsError::backend_error(format!("Failed to create Vault client: {e}")))?;
 
-        info!("Successfully connected to Vault at {}", config.address);
+        info!(address = %config.address, "Vault KMS backend connected");
 
         Ok(Self {
             client,
@@ -136,7 +136,7 @@ impl VaultKmsClient {
 
         // If encrypted_key_material is empty, generate and store it (fix for old keys)
         if key_data.encrypted_key_material.is_empty() {
-            warn!("Key {} has empty encrypted_key_material, generating and storing new key material", key_id);
+            warn!(key_id, "Vault KMS key material missing; regenerating");
             let key_material = generate_key_material(&key_data.algorithm)?;
             key_data.encrypted_key_material = self.encrypt_key_material(&key_material).await?;
             // Store the updated key data back to Vault
@@ -147,7 +147,7 @@ impl VaultKmsClient {
         let key_material = match self.decrypt_key_material(&key_data.encrypted_key_material).await {
             Ok(km) => km,
             Err(e) => {
-                warn!("Failed to decrypt key material for key {}: {}, generating new key material", key_id, e);
+                warn!(key_id, error = %e, "Vault KMS key material decrypt failed; regenerating");
                 let new_key_material = generate_key_material(&key_data.algorithm)?;
                 key_data.encrypted_key_material = self.encrypt_key_material(&new_key_material).await?;
                 // Store the updated key data back to Vault
@@ -210,7 +210,7 @@ impl VaultKmsClient {
         // If encrypted_key_material is empty, generate it (this handles the case where
         // an old key was created without proper key material)
         if existing_key_data.encrypted_key_material.is_empty() {
-            warn!("Key {} has empty encrypted_key_material, generating new key material", key_id);
+            warn!(key_id, "Vault KMS key metadata missing encrypted key material");
             let key_material = generate_key_material(&existing_key_data.algorithm)?;
             existing_key_data.encrypted_key_material = self.encrypt_key_material(&key_material).await?;
         }
@@ -316,7 +316,7 @@ impl KmsClient for VaultKmsClient {
 
         let data_key = DataKeyInfo::new(envelope.key_id, 1, Some(plaintext_key), ciphertext, request.key_spec.clone());
 
-        info!("Generated data key for master key: {}", request.master_key_id);
+        debug!(key_id = %request.master_key_id, "Vault KMS data key generated");
         Ok(data_key)
     }
 
@@ -373,7 +373,7 @@ impl KmsClient for VaultKmsClient {
             .decrypt_with_master_key(&envelope.master_key_id, &envelope.encrypted_key, &envelope.nonce)
             .await?;
 
-        info!("Successfully decrypted data");
+        debug!("Vault KMS data decrypted");
         Ok(plaintext)
     }
 
@@ -418,7 +418,7 @@ impl KmsClient for VaultKmsClient {
             created_by: None,
         };
 
-        info!("Successfully created master key: {}", key_id);
+        debug!(key_id, "Vault KMS master key created");
         Ok(master_key)
     }
 
@@ -486,7 +486,7 @@ impl KmsClient for VaultKmsClient {
         key_data.status = KeyStatus::Active;
         self.store_key_data(key_id, &key_data).await?;
 
-        info!("Enabled key: {}", key_id);
+        debug!(key_id, "Vault KMS key enabled");
         Ok(())
     }
 
@@ -497,7 +497,7 @@ impl KmsClient for VaultKmsClient {
         key_data.status = KeyStatus::Disabled;
         self.store_key_data(key_id, &key_data).await?;
 
-        info!("Disabled key: {}", key_id);
+        debug!(key_id, "Vault KMS key disabled");
         Ok(())
     }
 
@@ -513,7 +513,7 @@ impl KmsClient for VaultKmsClient {
         key_data.status = KeyStatus::PendingDeletion;
         self.store_key_data(key_id, &key_data).await?;
 
-        info!("Scheduled key deletion: {}", key_id);
+        debug!(key_id, "Vault KMS key deletion scheduled");
         Ok(())
     }
 
@@ -524,7 +524,7 @@ impl KmsClient for VaultKmsClient {
         key_data.status = KeyStatus::Active;
         self.store_key_data(key_id, &key_data).await?;
 
-        info!("Canceled key deletion: {}", key_id);
+        debug!(key_id, "Vault KMS key deletion canceled");
         Ok(())
     }
 
@@ -553,7 +553,7 @@ impl KmsClient for VaultKmsClient {
             created_by: None,
         };
 
-        info!("Successfully rotated key: {}", key_id);
+        debug!(key_id, "Vault KMS key rotated");
         Ok(master_key)
     }
 
@@ -573,7 +573,7 @@ impl KmsClient for VaultKmsClient {
                     debug!("Vault health check passed - 404 error is expected when no keys exist yet");
                     Ok(())
                 } else {
-                    warn!("Vault health check failed: {}", e);
+                    warn!(error = %e, "Vault KMS health check failed");
                     Err(e)
                 }
             }
@@ -595,6 +595,8 @@ pub struct VaultKmsBackend {
 impl VaultKmsBackend {
     /// Create a new VaultKmsBackend
     pub async fn new(config: KmsConfig) -> Result<Self> {
+        config.validate()?;
+
         let vault_config = match &config.backend_config {
             crate::config::BackendConfig::VaultKv2(vault_config) => (**vault_config).clone(),
             crate::config::BackendConfig::Local(_) | crate::config::BackendConfig::VaultTransit(_) => {

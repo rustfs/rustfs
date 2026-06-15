@@ -116,7 +116,7 @@ chown -R 10001:10001 data logs
 docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
 # Using specific version
-docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-beta.7
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-beta.8
 ```
 
 If you use [podman](https://github.com/containers/podman) instead of docker, you can install the RustFS with the below command
@@ -209,6 +209,12 @@ make help-docker                      # Show all Docker-related commands
 ### 4\. Build with Helm Chart (Option 4) - Cloud Native
 
 Follow the instructions in the [Helm Chart README](https://charts.rustfs.com/) to install RustFS on a Kubernetes cluster.
+
+For scanner pacing, cycle budgets, bitrot cadence, lifecycle transition status,
+and single-node single-disk idle CPU tuning, see
+[Scanner Runtime Controls](docs/operations/scanner-runtime-controls.md). For
+repeatable scanner-pressure validation, see
+[Scanner Benchmark Runbook](docs/operations/scanner-benchmark-runbook.md).
 
 ### 5\. Nix Flake (Option 5)
 

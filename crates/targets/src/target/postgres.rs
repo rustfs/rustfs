@@ -36,7 +36,8 @@ use crate::{
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType, build_queued_payload, open_target_queue_store, persist_queued_payload_to_store,
+        TargetType, build_queued_payload, open_target_queue_store, persist_queued_payload_to_store, redacted_optional_secret,
+        redacted_secret,
     },
 };
 use async_trait::async_trait;
@@ -94,7 +95,7 @@ pub fn parse_postgres_format(value: Option<&str>) -> Result<PostgresFormat, Targ
 }
 
 /// Parsed representation of a PostgreSQL DSN string.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PostgresDsn {
     pub host: String,
     pub port: u16,
@@ -102,6 +103,19 @@ pub struct PostgresDsn {
     pub password: Option<String>,
     pub database: String,
     pub schema: String,
+}
+
+impl fmt::Debug for PostgresDsn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PostgresDsn")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &redacted_optional_secret(self.password.as_deref()))
+            .field("database", &self.database)
+            .field("schema", &self.schema)
+            .finish()
+    }
 }
 
 impl PostgresDsn {
@@ -300,14 +314,7 @@ impl fmt::Debug for PostgresArgs {
             .field("tls_required", &self.tls_required)
             .field("tls_ca", &self.tls_ca)
             .field("tls_client_cert", &self.tls_client_cert)
-            .field(
-                "tls_client_key",
-                if self.tls_client_key.is_empty() {
-                    &""
-                } else {
-                    &"***REDACTED***"
-                },
-            )
+            .field("tls_client_key", &redacted_secret(&self.tls_client_key))
             .field("queue_dir", &self.queue_dir)
             .field("queue_limit", &self.queue_limit)
             .field("target_type", &self.target_type)
@@ -831,6 +838,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::target::REDACTED_SECRET;
 
     fn base_args() -> PostgresArgs {
         PostgresArgs {
@@ -1040,6 +1048,18 @@ mod tests {
         };
         let rendered = format!("{args:?}");
         assert!(!rendered.contains(":***@"));
+    }
+
+    #[test]
+    fn debug_redacts_postgres_dsn_password() {
+        let dsn = PostgresDsn::parse("postgres://postgres:pg-secret@localhost:5432/rustfs_events?search_path=public")
+            .expect("valid DSN");
+
+        let rendered = format!("{dsn:?}");
+
+        assert!(!rendered.contains("pg-secret"));
+        assert!(rendered.contains(REDACTED_SECRET));
+        assert!(rendered.contains("rustfs_events"));
     }
 
     #[test]

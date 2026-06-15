@@ -25,6 +25,12 @@ keywords = ["zip", "compression", "rustfs", "Minio"]
 categories = ["web-programming", "development-tools", "compression"]
 documentation = "https://docs.rs/rustfs-zip/latest/rustfs_zip/"
 
+[lib]
+doctest = false
+
+[[bench]]
+name = "zip_benchmark"
+harness = false
 
 [dependencies]
 async-compression = { workspace = true, features = [
@@ -35,13 +41,20 @@ async-compression = { workspace = true, features = [
     "zstd",
     "xz",
 ] }
-tokio = { workspace = true, features = ["io-uring","fs","io-util","macros"] }
+tokio = { workspace = true, features = ["fs","io-util","macros"] }
 tokio-stream = { workspace = true }
 astral-tokio-tar = { workspace = true }
+thiserror = { workspace = true }
+zip = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["html_reports"] }
+tempfile = { workspace = true }
 
 
 [lints]
 workspace = true
 
-[lib]
-doctest = false
+# io-uring is Linux-only. Scope the feature to Linux targets.
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio = { workspace = true, features = ["io-uring"] }

@@ -24,7 +24,7 @@ use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_kms::{KmsError, init_global_kms_service_manager, types::*};
-use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,12 @@ use std::collections::HashMap;
 use tracing::{error, info};
 use urlencoding;
 
+const LOG_COMPONENT_ADMIN: &str = "admin";
+const LOG_SUBSYSTEM_KMS_KEYS: &str = "kms_keys";
+const EVENT_ADMIN_KMS_KEYS_STATE: &str = "admin_kms_keys_state";
+
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateKmsKeyRequest {
     pub key_usage: Option<KeyUsage>,
     pub description: Option<String>,
@@ -49,6 +54,7 @@ pub struct CreateKmsKeyResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateKeyApiRequest {
     pub key_usage: Option<KeyUsage>,
     pub description: Option<String>,
@@ -74,6 +80,7 @@ pub struct ListKeysApiResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GenerateDataKeyApiRequest {
     pub key_id: String,
     pub key_spec: KeySpec,
@@ -116,6 +123,38 @@ fn kms_service_manager_from_context() -> Option<std::sync::Arc<rustfs_kms::KmsSe
 async fn kms_encryption_service_from_context() -> Option<std::sync::Arc<rustfs_kms::ObjectEncryptionService>> {
     let manager = kms_service_manager_from_context().unwrap_or_else(init_global_kms_service_manager);
     manager.get_encryption_service().await
+}
+
+fn kms_create_key_actions() -> Vec<Action> {
+    // RUSTFS_COMPAT_TODO(S-012): keep legacy KMS create-key grants during KMS policy migration. Remove after KMS admin clients and built-in policies use kms:Configure.
+    vec![
+        Action::KmsAction(KmsAction::ConfigureAction),
+        Action::AdminAction(AdminAction::KMSCreateKeyAdminAction),
+    ]
+}
+
+fn kms_describe_key_actions() -> Vec<Action> {
+    // RUSTFS_COMPAT_TODO(S-012): keep legacy KMS key-status grants during KMS policy migration. Remove after KMS admin clients and built-in policies use kms:DescribeKey.
+    vec![
+        Action::KmsAction(KmsAction::DescribeKeyAction),
+        Action::AdminAction(AdminAction::KMSKeyStatusAdminAction),
+    ]
+}
+
+fn kms_list_keys_actions() -> Vec<Action> {
+    // RUSTFS_COMPAT_TODO(S-012): keep legacy KMS key-status grants during KMS policy migration. Remove after KMS admin clients and built-in policies use kms:ListKeys.
+    vec![
+        Action::KmsAction(KmsAction::ListKeysAction),
+        Action::AdminAction(AdminAction::KMSKeyStatusAdminAction),
+    ]
+}
+
+fn kms_generate_data_key_actions() -> Vec<Action> {
+    vec![Action::KmsAction(KmsAction::GenerateDataKeyAction)]
+}
+
+fn kms_delete_key_actions() -> Vec<Action> {
+    vec![Action::KmsAction(KmsAction::DeleteKeyAction)]
 }
 
 pub fn register_kms_key_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -170,7 +209,7 @@ impl Operation for CreateKeyHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::KMSCreateKeyAdminAction)],
+            kms_create_key_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -192,7 +231,7 @@ impl Operation for CreateKeyHandler {
         };
 
         let Some(service) = kms_encryption_service_from_context().await else {
-            return Err(s3_error!(InternalError, "KMS service not initialized"));
+            return Err(s3_error!(InternalError, "kms service is not initialized"));
         };
 
         // Extract key name from tags if provided
@@ -224,7 +263,15 @@ impl Operation for CreateKeyHandler {
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
             Err(e) => {
-                error!("Failed to create KMS key: {}", e);
+                error!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "create_key",
+                    result = "failed",
+                    error = %e,
+                    "admin kms keys state"
+                );
                 Err(s3_error!(InternalError, "failed to create key: {}", e))
             }
         }
@@ -249,17 +296,17 @@ impl Operation for DescribeKeyHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::KMSKeyStatusAdminAction)],
+            kms_describe_key_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
         let Some(key_id) = extract_key_id(&req.uri) else {
-            return Err(s3_error!(InvalidRequest, "missing keyId parameter"));
+            return Err(s3_error!(InvalidRequest, "missing required parameter: 'keyId'"));
         };
 
         let Some(service) = kms_encryption_service_from_context().await else {
-            return Err(s3_error!(InternalError, "KMS service not initialized"));
+            return Err(s3_error!(InternalError, "kms service is not initialized"));
         };
 
         let request = DescribeKeyRequest { key_id: key_id.clone() };
@@ -279,7 +326,16 @@ impl Operation for DescribeKeyHandler {
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
             Err(e) => {
-                error!("Failed to describe KMS key {}: {}", key_id, e);
+                error!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "describe_key",
+                    key_id = %key_id,
+                    result = "failed",
+                    error = %e,
+                    "admin kms keys state"
+                );
                 Err(s3_error!(InternalError, "failed to describe key: {}", e))
             }
         }
@@ -288,8 +344,21 @@ impl Operation for DescribeKeyHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_key_id;
+    use super::{
+        CancelKmsKeyDeletionRequest, CreateKeyApiRequest, CreateKmsKeyRequest, DeleteKmsKeyRequest, GenerateDataKeyApiRequest,
+        extract_key_id, kms_create_key_actions, kms_delete_key_actions, kms_describe_key_actions, kms_generate_data_key_actions,
+        kms_list_keys_actions,
+    };
     use http::Uri;
+    use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
+
+    fn assert_has_action(actions: &[Action], action: Action) {
+        assert!(actions.contains(&action), "expected action list to contain {action:?}");
+    }
+
+    fn assert_lacks_action(actions: &[Action], action: Action) {
+        assert!(!actions.contains(&action), "expected action list not to contain {action:?}");
+    }
 
     #[test]
     fn test_extract_key_id_supports_minio_aliases() {
@@ -331,6 +400,48 @@ mod tests {
             assert_eq!(extract_key_id(&uri).as_deref(), expected);
         }
     }
+
+    #[test]
+    fn kms_key_auth_actions_use_dedicated_kms_actions() {
+        let create_actions = kms_create_key_actions();
+        assert_has_action(&create_actions, Action::KmsAction(KmsAction::ConfigureAction));
+        assert_has_action(&create_actions, Action::AdminAction(AdminAction::KMSCreateKeyAdminAction));
+
+        let describe_actions = kms_describe_key_actions();
+        assert_has_action(&describe_actions, Action::KmsAction(KmsAction::DescribeKeyAction));
+        assert_has_action(&describe_actions, Action::AdminAction(AdminAction::KMSKeyStatusAdminAction));
+
+        let list_actions = kms_list_keys_actions();
+        assert_has_action(&list_actions, Action::KmsAction(KmsAction::ListKeysAction));
+        assert_has_action(&list_actions, Action::AdminAction(AdminAction::KMSKeyStatusAdminAction));
+    }
+
+    #[test]
+    fn kms_sensitive_key_actions_reject_server_info_fallback() {
+        for actions in [kms_generate_data_key_actions(), kms_delete_key_actions()] {
+            assert_lacks_action(&actions, Action::AdminAction(AdminAction::ServerInfoAdminAction));
+        }
+
+        assert_has_action(&kms_generate_data_key_actions(), Action::KmsAction(KmsAction::GenerateDataKeyAction));
+        assert_has_action(&kms_delete_key_actions(), Action::KmsAction(KmsAction::DeleteKeyAction));
+    }
+
+    #[test]
+    fn kms_key_request_bodies_reject_unknown_fields() {
+        let cases = [
+            serde_json::from_str::<CreateKeyApiRequest>(r#"{"unexpected_field":true}"#).map(|_| ()),
+            serde_json::from_str::<CreateKmsKeyRequest>(r#"{"unexpected_field":true}"#).map(|_| ()),
+            serde_json::from_str::<GenerateDataKeyApiRequest>(r#"{"key_id":"key","key_spec":"Aes256","unexpected_field":true}"#)
+                .map(|_| ()),
+            serde_json::from_str::<DeleteKmsKeyRequest>(r#"{"key_id":"key","unexpected_field":true}"#).map(|_| ()),
+            serde_json::from_str::<CancelKmsKeyDeletionRequest>(r#"{"key_id":"key","unexpected_field":true}"#).map(|_| ()),
+        ];
+
+        for result in cases {
+            let err = result.expect_err("unknown KMS key request field should fail");
+            assert!(err.to_string().contains("unknown field"));
+        }
+    }
 }
 
 /// List KMS keys (legacy endpoint)
@@ -351,7 +462,7 @@ impl Operation for ListKeysHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::KMSKeyStatusAdminAction)],
+            kms_list_keys_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -361,7 +472,7 @@ impl Operation for ListKeysHandler {
         let marker = query_params.get("marker").cloned();
 
         let Some(service) = kms_encryption_service_from_context().await else {
-            return Err(s3_error!(InternalError, "KMS service not initialized"));
+            return Err(s3_error!(InternalError, "kms service is not initialized"));
         };
 
         let request = ListKeysRequest {
@@ -388,7 +499,15 @@ impl Operation for ListKeysHandler {
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
             Err(e) => {
-                error!("Failed to list KMS keys: {}", e);
+                error!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "list_keys",
+                    result = "failed",
+                    error = %e,
+                    "admin kms keys state"
+                );
                 Err(s3_error!(InternalError, "failed to list keys: {}", e))
             }
         }
@@ -413,7 +532,7 @@ impl Operation for GenerateDataKeyHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            kms_generate_data_key_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -454,7 +573,15 @@ impl Operation for GenerateDataKeyHandler {
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
             Err(e) => {
-                error!("Failed to generate data key: {}", e);
+                error!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "generate_data_key",
+                    result = "failed",
+                    error = %e,
+                    "admin kms keys state"
+                );
                 Err(s3_error!(InternalError, "failed to generate data key: {}", e))
             }
         }
@@ -479,7 +606,7 @@ impl Operation for CreateKmsKeyHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::KMSCreateKeyAdminAction)],
+            kms_create_key_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -503,7 +630,7 @@ impl Operation for CreateKmsKeyHandler {
         let Some(service_manager) = kms_service_manager_from_context() else {
             let response = CreateKmsKeyResponse {
                 success: false,
-                message: "KMS service manager not initialized".to_string(),
+                message: "kms service manager is not initialized".to_string(),
                 key_id: "".to_string(),
                 key_metadata: None,
             };
@@ -517,7 +644,7 @@ impl Operation for CreateKmsKeyHandler {
         let Some(manager) = service_manager.get_manager().await else {
             let response = CreateKmsKeyResponse {
                 success: false,
-                message: "KMS service not running".to_string(),
+                message: "kms service is not running".to_string(),
                 key_id: "".to_string(),
                 key_metadata: None,
             };
@@ -543,10 +670,18 @@ impl Operation for CreateKmsKeyHandler {
 
         match manager.create_key(kms_request).await {
             Ok(kms_response) => {
-                info!("Created KMS key: {}", kms_response.key_id);
+                info!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "create_key",
+                    key_id = %kms_response.key_id,
+                    state = "completed",
+                    "admin kms keys state"
+                );
                 let response = CreateKmsKeyResponse {
                     success: true,
-                    message: "Key created successfully".to_string(),
+                    message: "key created successfully".to_string(),
                     key_id: kms_response.key_id,
                     key_metadata: Some(kms_response.key_metadata),
                 };
@@ -560,10 +695,18 @@ impl Operation for CreateKmsKeyHandler {
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
             Err(e) => {
-                error!("Failed to create KMS key: {}", e);
+                error!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "create_key",
+                    result = "failed",
+                    error = %e,
+                    "admin kms keys state"
+                );
                 let response = CreateKmsKeyResponse {
                     success: false,
-                    message: format!("Failed to create key: {e}"),
+                    message: format!("failed to create key: {e}"),
                     key_id: "".to_string(),
                     key_metadata: None,
                 };
@@ -581,6 +724,7 @@ impl Operation for CreateKmsKeyHandler {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteKmsKeyRequest {
     pub key_id: String,
     pub pending_window_in_days: Option<u32>,
@@ -613,7 +757,7 @@ impl Operation for DeleteKmsKeyHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            kms_delete_key_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -629,7 +773,7 @@ impl Operation for DeleteKmsKeyHandler {
             let Some(key_id) = query_params.get("keyId") else {
                 let response = DeleteKmsKeyResponse {
                     success: false,
-                    message: "missing keyId parameter".to_string(),
+                    message: "missing required parameter: 'keyId'".to_string(),
                     key_id: "".to_string(),
                     deletion_date: None,
                 };
@@ -656,7 +800,7 @@ impl Operation for DeleteKmsKeyHandler {
         let Some(service_manager) = kms_service_manager_from_context() else {
             let response = DeleteKmsKeyResponse {
                 success: false,
-                message: "KMS service manager not initialized".to_string(),
+                message: "kms service manager is not initialized".to_string(),
                 key_id: request.key_id,
                 deletion_date: None,
             };
@@ -670,7 +814,7 @@ impl Operation for DeleteKmsKeyHandler {
         let Some(manager) = service_manager.get_manager().await else {
             let response = DeleteKmsKeyResponse {
                 success: false,
-                message: "KMS service not running".to_string(),
+                message: "kms service is not running".to_string(),
                 key_id: request.key_id,
                 deletion_date: None,
             };
@@ -689,10 +833,18 @@ impl Operation for DeleteKmsKeyHandler {
 
         match manager.delete_key(kms_request).await {
             Ok(kms_response) => {
-                info!("Successfully deleted KMS key: {}", kms_response.key_id);
+                info!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "delete_key",
+                    key_id = %kms_response.key_id,
+                    state = "completed",
+                    "admin kms keys state"
+                );
                 let response = DeleteKmsKeyResponse {
                     success: true,
-                    message: "Key deleted successfully".to_string(),
+                    message: "key deleted successfully".to_string(),
                     key_id: kms_response.key_id,
                     deletion_date: kms_response.deletion_date,
                 };
@@ -706,7 +858,16 @@ impl Operation for DeleteKmsKeyHandler {
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
             Err(e) => {
-                error!("Failed to delete KMS key {}: {}", request.key_id, e);
+                error!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "delete_key",
+                    key_id = %request.key_id,
+                    result = "failed",
+                    error = %e,
+                    "admin kms keys state"
+                );
                 let status = match &e {
                     KmsError::KeyNotFound { .. } => StatusCode::NOT_FOUND,
                     KmsError::InvalidOperation { .. } | KmsError::ValidationError { .. } => StatusCode::BAD_REQUEST,
@@ -732,6 +893,7 @@ impl Operation for DeleteKmsKeyHandler {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancelKmsKeyDeletionRequest {
     pub key_id: String,
 }
@@ -762,7 +924,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            kms_delete_key_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -778,7 +940,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
             let Some(key_id) = query_params.get("keyId") else {
                 let response = CancelKmsKeyDeletionResponse {
                     success: false,
-                    message: "missing keyId parameter".to_string(),
+                    message: "missing required parameter: 'keyId'".to_string(),
                     key_id: "".to_string(),
                     key_metadata: None,
                 };
@@ -796,7 +958,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
         let Some(service_manager) = kms_service_manager_from_context() else {
             let response = CancelKmsKeyDeletionResponse {
                 success: false,
-                message: "KMS service manager not initialized".to_string(),
+                message: "kms service manager is not initialized".to_string(),
                 key_id: request.key_id,
                 key_metadata: None,
             };
@@ -810,7 +972,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
         let Some(manager) = service_manager.get_manager().await else {
             let response = CancelKmsKeyDeletionResponse {
                 success: false,
-                message: "KMS service not running".to_string(),
+                message: "kms service is not running".to_string(),
                 key_id: request.key_id,
                 key_metadata: None,
             };
@@ -827,10 +989,18 @@ impl Operation for CancelKmsKeyDeletionHandler {
 
         match manager.cancel_key_deletion(kms_request).await {
             Ok(kms_response) => {
-                info!("Cancelled deletion for KMS key: {}", kms_response.key_id);
+                info!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "cancel_delete_key",
+                    key_id = %kms_response.key_id,
+                    state = "completed",
+                    "admin kms keys state"
+                );
                 let response = CancelKmsKeyDeletionResponse {
                     success: true,
-                    message: "Key deletion cancelled successfully".to_string(),
+                    message: "key deletion cancelled successfully".to_string(),
                     key_id: kms_response.key_id,
                     key_metadata: Some(kms_response.key_metadata),
                 };
@@ -844,7 +1014,16 @@ impl Operation for CancelKmsKeyDeletionHandler {
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
             Err(e) => {
-                error!("Failed to cancel deletion for KMS key {}: {}", request.key_id, e);
+                error!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "cancel_delete_key",
+                    key_id = %request.key_id,
+                    result = "failed",
+                    error = %e,
+                    "admin kms keys state"
+                );
                 let response = CancelKmsKeyDeletionResponse {
                     success: false,
                     message: format!("Failed to cancel key deletion: {e}"),
@@ -891,7 +1070,7 @@ impl Operation for ListKmsKeysHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::KMSKeyStatusAdminAction)],
+            kms_list_keys_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -903,7 +1082,7 @@ impl Operation for ListKmsKeysHandler {
         let Some(service_manager) = kms_service_manager_from_context() else {
             let response = ListKmsKeysResponse {
                 success: false,
-                message: "KMS service manager not initialized".to_string(),
+                message: "kms service manager is not initialized".to_string(),
                 keys: vec![],
                 truncated: false,
                 next_marker: None,
@@ -918,7 +1097,7 @@ impl Operation for ListKmsKeysHandler {
         let Some(manager) = service_manager.get_manager().await else {
             let response = ListKmsKeysResponse {
                 success: false,
-                message: "KMS service not running".to_string(),
+                message: "kms service is not running".to_string(),
                 keys: vec![],
                 truncated: false,
                 next_marker: None,
@@ -939,10 +1118,18 @@ impl Operation for ListKmsKeysHandler {
 
         match manager.list_keys(kms_request).await {
             Ok(kms_response) => {
-                info!("Listed {} KMS keys", kms_response.keys.len());
+                info!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "list_keys",
+                    state = "completed",
+                    key_count = kms_response.keys.len(),
+                    "admin kms keys state"
+                );
                 let response = ListKmsKeysResponse {
                     success: true,
-                    message: "Keys listed successfully".to_string(),
+                    message: "keys listed successfully".to_string(),
                     keys: kms_response.keys,
                     truncated: kms_response.truncated,
                     next_marker: kms_response.next_marker,
@@ -957,10 +1144,18 @@ impl Operation for ListKmsKeysHandler {
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
             Err(e) => {
-                error!("Failed to list KMS keys: {}", e);
+                error!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "list_keys",
+                    result = "failed",
+                    error = %e,
+                    "admin kms keys state"
+                );
                 let response = ListKmsKeysResponse {
                     success: false,
-                    message: format!("Failed to list keys: {e}"),
+                    message: format!("failed to list keys: {e}"),
                     keys: vec![],
                     truncated: false,
                     next_marker: None,
@@ -1003,7 +1198,7 @@ impl Operation for DescribeKmsKeyHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::KMSKeyStatusAdminAction)],
+            kms_describe_key_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -1011,7 +1206,7 @@ impl Operation for DescribeKmsKeyHandler {
         let Some(key_id) = params.get("key_id") else {
             let response = DescribeKmsKeyResponse {
                 success: false,
-                message: "missing keyId parameter".to_string(),
+                message: "missing required parameter: 'keyId'".to_string(),
                 key_metadata: None,
             };
             let data =
@@ -1024,7 +1219,7 @@ impl Operation for DescribeKmsKeyHandler {
         let Some(service_manager) = kms_service_manager_from_context() else {
             let response = DescribeKmsKeyResponse {
                 success: false,
-                message: "KMS service manager not initialized".to_string(),
+                message: "kms service manager is not initialized".to_string(),
                 key_metadata: None,
             };
             let data =
@@ -1037,7 +1232,7 @@ impl Operation for DescribeKmsKeyHandler {
         let Some(manager) = service_manager.get_manager().await else {
             let response = DescribeKmsKeyResponse {
                 success: false,
-                message: "KMS service not running".to_string(),
+                message: "kms service is not running".to_string(),
                 key_metadata: None,
             };
             let data =
@@ -1053,7 +1248,15 @@ impl Operation for DescribeKmsKeyHandler {
 
         match manager.describe_key(kms_request).await {
             Ok(kms_response) => {
-                info!("Described KMS key: {}", key_id);
+                info!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "describe_key",
+                    key_id = %key_id,
+                    state = "completed",
+                    "admin kms keys state"
+                );
                 let response = DescribeKmsKeyResponse {
                     success: true,
                     message: "Key described successfully".to_string(),
@@ -1069,7 +1272,16 @@ impl Operation for DescribeKmsKeyHandler {
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
             Err(e) => {
-                error!("Failed to describe KMS key {}: {}", key_id, e);
+                error!(
+                    event = EVENT_ADMIN_KMS_KEYS_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS_KEYS,
+                    action = "describe_key",
+                    key_id = %key_id,
+                    result = "failed",
+                    error = %e,
+                    "admin kms keys state"
+                );
                 let status = match &e {
                     KmsError::KeyNotFound { .. } => StatusCode::NOT_FOUND,
                     KmsError::InvalidOperation { .. } => StatusCode::BAD_REQUEST,

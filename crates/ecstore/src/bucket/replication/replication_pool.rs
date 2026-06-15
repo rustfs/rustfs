@@ -27,7 +27,7 @@ use crate::bucket::replication::replication_state::ReplicationStats;
 use crate::config::com::read_config;
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::Error as EcstoreError;
-use crate::store_api::ObjectInfo;
+use crate::store_api::{NamespaceLocking, ObjectIO, ObjectInfo};
 use lazy_static::lazy_static;
 use rustfs_filemeta::MrfReplicateEntry;
 use rustfs_filemeta::ReplicateDecision;
@@ -56,7 +56,21 @@ use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
+
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_REPLICATION: &str = "replication";
+const EVENT_REPLICATION_WORKER_RESIZE_SKIPPED: &str = "replication_worker_resize_skipped";
+const EVENT_REPLICATION_WORKER_RESIZED: &str = "replication_worker_resized";
+const EVENT_REPLICATION_BACKPRESSURE: &str = "replication_backpressure";
+const EVENT_REPLICATION_RESYNC_LOAD_SKIPPED: &str = "replication_resync_load_skipped";
+const EVENT_REPLICATION_RESYNC_RECOVERED: &str = "replication_resync_recovered";
+const EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED: &str = "replication_config_lookup_skipped";
+const EVENT_REPLICATION_MRF_QUEUE_OVERFLOW: &str = "replication_mrf_queue_overflow";
+
+fn should_auto_resume_resync(status: ResyncStatusType) -> bool {
+    matches!(status, ResyncStatusType::ResyncPending | ResyncStatusType::ResyncStarted)
+}
 
 // Worker limits
 pub const WORKER_MAX_LIMIT: usize = 500;
@@ -67,6 +81,30 @@ pub const MRF_WORKER_MIN_LIMIT: usize = 2;
 pub const MRF_WORKER_AUTO_DEFAULT: usize = 4;
 pub const LARGE_WORKER_COUNT: usize = 10;
 pub const MIN_LARGE_OBJ_SIZE: i64 = 128 * 1024 * 1024; // 128MiB
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReplicationQueueAdmission {
+    #[default]
+    Skipped,
+    Queued,
+    Missed,
+}
+
+impl ReplicationQueueAdmission {
+    fn merge(&mut self, other: Self) {
+        *self = match (*self, other) {
+            (Self::Missed, _) | (_, Self::Missed) => Self::Missed,
+            (Self::Queued, _) | (_, Self::Queued) => Self::Queued,
+            (Self::Skipped, Self::Skipped) => Self::Skipped,
+        };
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ReplicationHealQueueResult {
+    pub object_info: ReplicateObjectInfo,
+    pub admission: ReplicationQueueAdmission,
+}
 
 /// Priority levels for replication
 #[derive(Debug, Clone, PartialEq)]
@@ -173,7 +211,7 @@ impl Default for ReplicationPoolOpts {
 }
 /// Main replication pool structure
 #[derive(Debug)]
-pub struct ReplicationPool<S: StorageAPI> {
+pub struct ReplicationPool<S: StorageAPI + NamespaceLocking> {
     // Atomic counters for active workers
     active_workers: Arc<AtomicI32>,
     active_lrg_workers: Arc<AtomicI32>,
@@ -213,7 +251,7 @@ pub struct ReplicationPool<S: StorageAPI> {
     resyncer: Arc<ReplicationResyncer>,
 }
 
-impl<S: StorageAPI> ReplicationPool<S> {
+impl<S: StorageAPI + NamespaceLocking> ReplicationPool<S> {
     /// Creates a new replication pool with specified options
     pub async fn new(opts: ReplicationPoolOpts, stats: Arc<ReplicationStats>, storage: Arc<S>) -> Arc<Self> {
         let max_workers = opts.max_workers.unwrap_or(WORKER_MAX_LIMIT);
@@ -334,18 +372,31 @@ impl<S: StorageAPI> ReplicationPool<S> {
         let mut workers = self.workers.write().await;
 
         if (check_old > 0 && workers.len() != check_old) || n == workers.len() || n < 1 {
-            warn!(
-                "resize_workers: skipping resize - check_old_mismatch={}, same_size={}, invalid_n={}",
-                check_old > 0 && workers.len() != check_old,
-                n == workers.len(),
-                n < 1
+            debug!(
+                event = EVENT_REPLICATION_WORKER_RESIZE_SKIPPED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                check_old_mismatch = check_old > 0 && workers.len() != check_old,
+                same_size = n == workers.len(),
+                invalid_target_size = n < 1,
+                current_workers = workers.len(),
+                target_workers = n,
+                "Skipped replication worker resize"
             );
             return;
         }
 
         // Add workers if needed
         if workers.len() < n {
-            info!("resize_workers: adding workers from {} to {}", workers.len(), n);
+            info!(
+                event = EVENT_REPLICATION_WORKER_RESIZED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                action = "increase",
+                from_workers = workers.len(),
+                to_workers = n,
+                "Resized replication workers"
+            );
         }
 
         while workers.len() < n {
@@ -392,7 +443,15 @@ impl<S: StorageAPI> ReplicationPool<S> {
 
         // Remove workers if needed
         if workers.len() > n {
-            warn!("resize_workers: removing workers from {} to {}", workers.len(), n);
+            info!(
+                event = EVENT_REPLICATION_WORKER_RESIZED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                action = "decrease",
+                from_workers = workers.len(),
+                to_workers = n,
+                "Resized replication workers"
+            );
         }
 
         while workers.len() > n {
@@ -513,7 +572,7 @@ impl<S: StorageAPI> ReplicationPool<S> {
     }
 
     /// Queues a replica task
-    pub async fn queue_replica_task(&self, ri: ReplicateObjectInfo) {
+    pub async fn queue_replica_task(&self, ri: ReplicateObjectInfo) -> ReplicationQueueAdmission {
         // If object is large, queue it to a static set of large workers
         if ri.size >= MIN_LARGE_OBJ_SIZE {
             use std::collections::hash_map::DefaultHasher;
@@ -532,7 +591,19 @@ impl<S: StorageAPI> ReplicationPool<S> {
                     && worker.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_err()
                 {
                     // Queue to MRF if worker is busy
-                    let _ = self.mrf_save_tx.try_send(ri.to_mrf_entry());
+                    let admission = if self.mrf_save_tx.try_send(ri.to_mrf_entry()).is_ok() {
+                        ReplicationQueueAdmission::Queued
+                    } else {
+                        warn!(
+                            event = EVENT_REPLICATION_MRF_QUEUE_OVERFLOW,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_REPLICATION,
+                            bucket = %ri.bucket,
+                            object = %ri.name,
+                            "MRF queue full — large-worker replication failure entry dropped and will not be retried"
+                        );
+                        ReplicationQueueAdmission::Missed
+                    };
 
                     // Try to add more workers if possible
                     let max_l_workers = *self.max_l_workers.read().await;
@@ -543,9 +614,12 @@ impl<S: StorageAPI> ReplicationPool<S> {
                         drop(lrg_workers);
                         self.resize_lrg_workers(workers, existing).await;
                     }
+                    return admission;
                 }
+
+                return ReplicationQueueAdmission::Queued;
             }
-            return;
+            return ReplicationQueueAdmission::Missed;
         }
 
         // Handle regular sized objects
@@ -555,90 +629,164 @@ impl<S: StorageAPI> ReplicationPool<S> {
             _ => self.get_worker_ch(&ri.bucket, &ri.name, ri.size).await,
         };
 
-        if let Some(channel) = ch
-            && channel.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_err()
-        {
-            // Queue to MRF if all workers are busy
-            let _ = self.mrf_save_tx.try_send(ri.to_mrf_entry());
+        let Some(channel) = ch else {
+            return ReplicationQueueAdmission::Missed;
+        };
 
-            // Try to scale up workers based on priority
-            let priority = self.priority.read().await.clone();
-            let max_workers = *self.max_workers.read().await;
+        if channel.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_ok() {
+            return ReplicationQueueAdmission::Queued;
+        }
 
-            match priority {
-                ReplicationPriority::Fast => {
-                    // Log warning about unable to keep up
-                    info!("Warning: Unable to keep up with incoming traffic");
+        // Queue to MRF if all workers are busy
+        let admission = if self.mrf_save_tx.try_send(ri.to_mrf_entry()).is_ok() {
+            ReplicationQueueAdmission::Queued
+        } else {
+            warn!(
+                event = EVENT_REPLICATION_MRF_QUEUE_OVERFLOW,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                bucket = %ri.bucket,
+                object = %ri.name,
+                "MRF queue full — replication failure entry dropped and will not be retried"
+            );
+            ReplicationQueueAdmission::Missed
+        };
+
+        // Try to scale up workers based on priority
+        let priority = self.priority.read().await.clone();
+        let max_workers = *self.max_workers.read().await;
+
+        match priority {
+            ReplicationPriority::Fast => {
+                debug!(
+                    event = EVENT_REPLICATION_BACKPRESSURE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    queue_type = "object",
+                    priority = "fast",
+                    recommendation = "none",
+                    "Replication queue is backpressured"
+                );
+            }
+            ReplicationPriority::Slow => {
+                debug!(
+                    event = EVENT_REPLICATION_BACKPRESSURE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    queue_type = "object",
+                    priority = "slow",
+                    recommendation = "set_priority_auto",
+                    "Replication queue is backpressured"
+                );
+            }
+            ReplicationPriority::Auto => {
+                let max_w = std::cmp::min(max_workers, WORKER_MAX_LIMIT);
+                let active_workers = self.active_workers();
+
+                if active_workers < max_w as i32 {
+                    let workers = self.workers.read().await;
+                    let new_count = std::cmp::min(workers.len() + 1, max_w);
+                    let existing = workers.len();
+
+                    drop(workers);
+                    self.resize_workers(new_count, existing).await;
                 }
-                ReplicationPriority::Slow => {
-                    info!("Warning: Unable to keep up with incoming traffic - recommend increasing replication priority to auto");
-                }
-                ReplicationPriority::Auto => {
-                    let max_w = std::cmp::min(max_workers, WORKER_MAX_LIMIT);
-                    let active_workers = self.active_workers();
 
-                    if active_workers < max_w as i32 {
-                        let workers = self.workers.read().await;
-                        let new_count = std::cmp::min(workers.len() + 1, max_w);
-                        let existing = workers.len();
+                let max_mrf_workers = std::cmp::min(max_workers, MRF_WORKER_MAX_LIMIT);
+                let active_mrf = self.active_mrf_workers();
 
-                        drop(workers);
-                        self.resize_workers(new_count, existing).await;
-                    }
+                if active_mrf < max_mrf_workers as i32 {
+                    let current_mrf = self.mrf_worker_size.load(Ordering::SeqCst);
+                    let new_mrf = std::cmp::min(current_mrf + 1, max_mrf_workers as i32);
 
-                    let max_mrf_workers = std::cmp::min(max_workers, MRF_WORKER_MAX_LIMIT);
-                    let active_mrf = self.active_mrf_workers();
-
-                    if active_mrf < max_mrf_workers as i32 {
-                        let current_mrf = self.mrf_worker_size.load(Ordering::SeqCst);
-                        let new_mrf = std::cmp::min(current_mrf + 1, max_mrf_workers as i32);
-
-                        self.resize_failed_workers(new_mrf).await;
-                    }
+                    self.resize_failed_workers(new_mrf).await;
                 }
             }
         }
+
+        admission
     }
 
     /// Queues a replica delete task
-    pub async fn queue_replica_delete_task(&self, doi: DeletedObjectReplicationInfo) {
+    pub async fn queue_replica_delete_task(&self, doi: DeletedObjectReplicationInfo) -> ReplicationQueueAdmission {
         let ch = match doi.op_type {
             ReplicationType::Heal | ReplicationType::ExistingObject => Some(self.mrf_replica_tx.clone()),
             _ => self.get_worker_ch(&doi.bucket, &doi.delete_object.object_name, 0).await,
         };
 
-        if let Some(channel) = ch
-            && channel.try_send(ReplicationOperation::Delete(Box::new(doi.clone()))).is_err()
-        {
-            let _ = self.mrf_save_tx.try_send(doi.to_mrf_entry());
+        let Some(channel) = ch else {
+            return ReplicationQueueAdmission::Missed;
+        };
 
-            let priority = self.priority.read().await.clone();
-            let max_workers = *self.max_workers.read().await;
+        if channel.try_send(ReplicationOperation::Delete(Box::new(doi.clone()))).is_ok() {
+            return ReplicationQueueAdmission::Queued;
+        }
 
-            match priority {
-                ReplicationPriority::Fast => {
-                    info!("Warning: Unable to keep up with incoming deletes");
-                }
-                ReplicationPriority::Slow => {
-                    info!("Warning: Unable to keep up with incoming deletes - recommend increasing replication priority to auto");
-                }
-                ReplicationPriority::Auto => {
-                    let max_w = std::cmp::min(max_workers, WORKER_MAX_LIMIT);
-                    if self.active_workers() < max_w as i32 {
-                        let workers = self.workers.read().await;
-                        let new_count = std::cmp::min(workers.len() + 1, max_w);
-                        let existing = workers.len();
-                        drop(workers);
-                        self.resize_workers(new_count, existing).await;
-                    }
+        let admission = if self.mrf_save_tx.try_send(doi.to_mrf_entry()).is_ok() {
+            ReplicationQueueAdmission::Queued
+        } else {
+            warn!(
+                event = EVENT_REPLICATION_MRF_QUEUE_OVERFLOW,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                bucket = %doi.bucket,
+                object = %doi.delete_object.object_name,
+                "MRF queue full — delete replication failure entry dropped and will not be retried"
+            );
+            ReplicationQueueAdmission::Missed
+        };
+
+        let priority = self.priority.read().await.clone();
+        let max_workers = *self.max_workers.read().await;
+
+        match priority {
+            ReplicationPriority::Fast => {
+                debug!(
+                    event = EVENT_REPLICATION_BACKPRESSURE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    queue_type = "delete",
+                    priority = "fast",
+                    recommendation = "none",
+                    "Replication delete queue is backpressured"
+                );
+            }
+            ReplicationPriority::Slow => {
+                debug!(
+                    event = EVENT_REPLICATION_BACKPRESSURE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    queue_type = "delete",
+                    priority = "slow",
+                    recommendation = "set_priority_auto",
+                    "Replication delete queue is backpressured"
+                );
+            }
+            ReplicationPriority::Auto => {
+                let max_w = std::cmp::min(max_workers, WORKER_MAX_LIMIT);
+                if self.active_workers() < max_w as i32 {
+                    let workers = self.workers.read().await;
+                    let new_count = std::cmp::min(workers.len() + 1, max_w);
+                    let existing = workers.len();
+                    drop(workers);
+                    self.resize_workers(new_count, existing).await;
                 }
             }
         }
+
+        admission
     }
 
     /// Queues an MRF save operation
     async fn queue_mrf_save(&self, entry: MrfReplicateEntry) {
-        let _ = self.mrf_save_tx.try_send(entry);
+        if self.mrf_save_tx.try_send(entry).is_err() {
+            warn!(
+                event = EVENT_REPLICATION_MRF_QUEUE_OVERFLOW,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                "MRF queue full — replication failure entry dropped and will not be retried"
+            );
+        }
     }
 
     /// Starts the MRF processor background task
@@ -874,50 +1022,77 @@ impl<S: StorageAPI> ReplicationPool<S> {
         // Note: Leader lock implementation would be needed here
         // let _lock_guard = global_leader_lock.get_lock().await?;
 
+        let mut recovered_statuses = Vec::new();
+        let mut restart_opts = Vec::new();
+        let mut recovered_bucket_count = 0usize;
+        let mut skipped_failed_target_count = 0usize;
+
         for bucket in buckets {
             let meta = match load_bucket_resync_metadata(bucket, self.storage.clone()).await {
                 Ok(meta) => meta,
                 Err(err) => {
                     if !matches!(err, EcstoreError::VolumeNotFound) {
-                        warn!("Error loading resync metadata for bucket {bucket}: {err:?}");
+                        debug!(
+                            event = EVENT_REPLICATION_RESYNC_LOAD_SKIPPED,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_REPLICATION,
+                            bucket,
+                            error = ?err,
+                            reason = "metadata_load_failed",
+                            "Skipped replication resync metadata load"
+                        );
                     }
                     continue;
                 }
             };
 
-            // Store metadata in resyncer
-            {
-                let mut status_map = self.resyncer.status_map.write().await;
-                status_map.insert(bucket.clone(), meta.clone());
+            if meta.targets_map.is_empty() {
+                continue;
             }
 
-            // Process target statistics
-            let target_stats = meta.clone_tgt_stats();
-            for (arn, stats) in target_stats {
-                match stats.resync_status {
-                    ResyncStatusType::ResyncFailed | ResyncStatusType::ResyncStarted | ResyncStatusType::ResyncPending => {
-                        // Note: This would spawn a resync task in a real implementation
-                        // For now, we just log the resync request
-
-                        let ctx = CancellationToken::new();
-                        let bucket_clone = bucket.clone();
-                        let resync = self.resyncer.clone();
-                        let storage = self.storage.clone();
-                        let opts = ResyncOpts {
-                            bucket: bucket_clone,
-                            arn,
-                            resync_id: stats.resync_id,
-                            resync_before: stats.resync_before_date,
-                        };
-                        tokio::spawn(async move {
-                            resync.register_cancel_token(&opts, ctx.clone()).await;
-                            Box::pin(resync.clone().resync_bucket(ctx, storage, true, opts.clone())).await;
-                            resync.clear_cancel_token(&opts).await;
-                        });
-                    }
-                    _ => {}
+            recovered_bucket_count += 1;
+            for (arn, stats) in &meta.targets_map {
+                if should_auto_resume_resync(stats.resync_status) {
+                    restart_opts.push(ResyncOpts {
+                        bucket: bucket.clone(),
+                        arn: arn.clone(),
+                        resync_id: stats.resync_id.clone(),
+                        resync_before: stats.resync_before_date,
+                    });
+                } else if stats.resync_status == ResyncStatusType::ResyncFailed {
+                    skipped_failed_target_count += 1;
                 }
             }
+
+            recovered_statuses.push((bucket.clone(), meta));
+        }
+
+        if !recovered_statuses.is_empty() {
+            let mut status_map = self.resyncer.status_map.write().await;
+            status_map.extend(recovered_statuses);
+        }
+
+        if !restart_opts.is_empty() || skipped_failed_target_count > 0 {
+            info!(
+                event = EVENT_REPLICATION_RESYNC_RECOVERED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                recovered_buckets = recovered_bucket_count,
+                resumed_targets = restart_opts.len(),
+                skipped_failed_targets = skipped_failed_target_count,
+                "Recovered replication resync state from persisted metadata; failed targets require manual resync restart"
+            );
+        }
+
+        for opts in restart_opts {
+            let ctx = CancellationToken::new();
+            let resync = self.resyncer.clone();
+            let storage = self.storage.clone();
+            tokio::spawn(async move {
+                resync.register_cancel_token(&opts, ctx.clone()).await;
+                Box::pin(resync.clone().resync_bucket(ctx, storage, true, opts.clone())).await;
+                resync.clear_cancel_token(&opts).await;
+            });
         }
 
         Ok(())
@@ -925,7 +1100,7 @@ impl<S: StorageAPI> ReplicationPool<S> {
 }
 
 /// Load bucket resync metadata from disk
-async fn load_bucket_resync_metadata<S: StorageAPI>(
+async fn load_bucket_resync_metadata<S: ObjectIO>(
     bucket: &str,
     obj_api: Arc<S>,
 ) -> Result<BucketReplicationResyncStatus, EcstoreError> {
@@ -959,8 +1134,8 @@ pub trait ReplicationPoolTrait: std::fmt::Debug {
     fn active_workers(&self) -> i32;
     fn active_mrf_workers(&self) -> i32;
     fn active_lrg_workers(&self) -> i32;
-    async fn queue_replica_task(&self, ri: ReplicateObjectInfo);
-    async fn queue_replica_delete_task(&self, ri: DeletedObjectReplicationInfo);
+    async fn queue_replica_task(&self, ri: ReplicateObjectInfo) -> ReplicationQueueAdmission;
+    async fn queue_replica_delete_task(&self, ri: DeletedObjectReplicationInfo) -> ReplicationQueueAdmission;
     async fn resize(&self, priority: ReplicationPriority, max_workers: usize, max_l_workers: usize);
     async fn get_bucket_resync_status(&self, bucket: &str) -> Result<BucketReplicationResyncStatus, EcstoreError>;
     async fn cancel_bucket_resync(&self, opts: ResyncOpts) -> Result<(), EcstoreError>;
@@ -974,7 +1149,7 @@ pub trait ReplicationPoolTrait: std::fmt::Debug {
 
 // Implement the trait for ReplicationPool
 #[async_trait::async_trait]
-impl<S: StorageAPI> ReplicationPoolTrait for ReplicationPool<S> {
+impl<S: StorageAPI + NamespaceLocking> ReplicationPoolTrait for ReplicationPool<S> {
     fn active_workers(&self) -> i32 {
         ReplicationPool::<S>::active_workers(self)
     }
@@ -987,12 +1162,12 @@ impl<S: StorageAPI> ReplicationPoolTrait for ReplicationPool<S> {
         ReplicationPool::<S>::active_lrg_workers(self)
     }
 
-    async fn queue_replica_task(&self, ri: ReplicateObjectInfo) {
-        self.queue_replica_task(ri).await;
+    async fn queue_replica_task(&self, ri: ReplicateObjectInfo) -> ReplicationQueueAdmission {
+        self.queue_replica_task(ri).await
     }
 
-    async fn queue_replica_delete_task(&self, ri: DeletedObjectReplicationInfo) {
-        self.queue_replica_delete_task(ri).await;
+    async fn queue_replica_delete_task(&self, ri: DeletedObjectReplicationInfo) -> ReplicationQueueAdmission {
+        self.queue_replica_delete_task(ri).await
     }
 
     async fn resize(&self, priority: ReplicationPriority, max_workers: usize, max_l_workers: usize) {
@@ -1026,7 +1201,7 @@ lazy_static! {
 }
 
 /// Initializes background replication with the given options
-pub async fn init_background_replication<S: StorageAPI>(storage: Arc<S>) {
+pub async fn init_background_replication<S: StorageAPI + NamespaceLocking>(storage: Arc<S>) {
     let stats = GLOBAL_REPLICATION_STATS
         .get_or_init(|| async {
             let stats = Arc::new(ReplicationStats::new());
@@ -1050,7 +1225,12 @@ pub fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
     GLOBAL_REPLICATION_POOL.get().cloned()
 }
 
-pub async fn schedule_replication<S: StorageAPI>(oi: ObjectInfo, o: Arc<S>, dsc: ReplicateDecision, op_type: ReplicationType) {
+pub async fn schedule_replication<S: StorageAPI + NamespaceLocking>(
+    oi: ObjectInfo,
+    o: Arc<S>,
+    dsc: ReplicateDecision,
+    op_type: ReplicationType,
+) {
     let tgt_statuses = replication_statuses_map(&oi.replication_status_internal.clone().unwrap_or_default());
     let purge_statuses = version_purge_statuses_map(&oi.version_purge_status_internal.clone().unwrap_or_default());
     let tm = get_str(&oi.user_defined, SUFFIX_REPLICATION_TIMESTAMP)
@@ -1093,13 +1273,13 @@ pub async fn schedule_replication<S: StorageAPI>(oi: ObjectInfo, o: Arc<S>, dsc:
     if dsc.is_synchronous() {
         replicate_object(ri, o).await
     } else if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
-        pool.queue_replica_task(ri).await;
+        let _ = pool.queue_replica_task(ri).await;
     }
 }
 
 pub async fn schedule_replication_delete(dv: DeletedObjectReplicationInfo) {
     if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
-        pool.queue_replica_delete_task(dv.clone()).await;
+        let _ = pool.queue_replica_delete_task(dv.clone()).await;
     }
 
     if let (Some(rs), Some(stats)) = (dv.delete_object.replication_state, GLOBAL_REPLICATION_STATS.get()) {
@@ -1128,7 +1308,15 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
     let rcfg = match metadata_sys::get_replication_config(bucket).await {
         Ok((config, _)) => config,
         Err(err) => {
-            warn!("Failed to get replication config for bucket {}: {}", bucket, err);
+            debug!(
+                event = EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                bucket,
+                error = %err,
+                reason = "config_lookup_failed",
+                "Skipped replication heal queue due to missing replication config"
+            );
 
             return;
         }
@@ -1137,7 +1325,15 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
     let tgts = match BucketTargetSys::get().list_bucket_targets(bucket).await {
         Ok(targets) => Some(targets),
         Err(err) => {
-            warn!("Failed to list bucket targets for bucket {}: {}", bucket, err);
+            debug!(
+                event = EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                bucket,
+                error = %err,
+                reason = "target_list_failed",
+                "Skipped bucket target list during replication heal queue setup"
+            );
             None
         }
     };
@@ -1153,23 +1349,32 @@ pub async fn queue_replication_heal_internal(
     oi: ObjectInfo,
     rcfg: ReplicationConfig,
     retry_count: u32,
-) -> ReplicateObjectInfo {
+) -> ReplicationHealQueueResult {
     let mut roi = ReplicateObjectInfo::default();
 
     // ignore modtime zero objects
     if oi.mod_time.is_none() || oi.mod_time == Some(OffsetDateTime::UNIX_EPOCH) {
-        return roi;
+        return ReplicationHealQueueResult {
+            object_info: roi,
+            admission: ReplicationQueueAdmission::Skipped,
+        };
     }
 
     if rcfg.config.is_none() || rcfg.remotes.is_none() {
-        return roi;
+        return ReplicationHealQueueResult {
+            object_info: roi,
+            admission: ReplicationQueueAdmission::Skipped,
+        };
     }
 
     roi = get_heal_replicate_object_info(&oi, &rcfg).await;
     roi.retry_count = retry_count;
 
     if !roi.dsc.replicate_any() {
-        return roi;
+        return ReplicationHealQueueResult {
+            object_info: roi,
+            admission: ReplicationQueueAdmission::Skipped,
+        };
     }
 
     // early return if replication already done, otherwise we need to determine if this
@@ -1178,7 +1383,10 @@ pub async fn queue_replication_heal_internal(
         && roi.version_purge_status.is_empty()
         && !roi.existing_obj_resync.must_resync()
     {
-        return roi;
+        return ReplicationHealQueueResult {
+            object_info: roi,
+            admission: ReplicationQueueAdmission::Skipped,
+        };
     }
 
     if roi.delete_marker || !roi.version_purge_status.is_empty() {
@@ -1210,10 +1418,15 @@ pub async fn queue_replication_heal_internal(
             || roi.version_purge_status == VersionPurgeStatusType::Failed
             || roi.version_purge_status == VersionPurgeStatusType::Pending
         {
-            if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
-                pool.queue_replica_delete_task(dv).await;
-            }
-            return roi;
+            let admission = if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+                pool.queue_replica_delete_task(dv).await
+            } else {
+                ReplicationQueueAdmission::Missed
+            };
+            return ReplicationHealQueueResult {
+                object_info: roi,
+                admission,
+            };
         }
 
         // if replication status is Complete on DeleteMarker and existing object resync required
@@ -1221,11 +1434,17 @@ pub async fn queue_replication_heal_internal(
         if existing_obj_resync.must_resync()
             && (roi.replication_status == ReplicationStatusType::Completed || roi.replication_status.is_empty())
         {
-            queue_replicate_deletes_wrapper(dv, existing_obj_resync).await;
-            return roi;
+            let admission = queue_replicate_deletes_wrapper(dv, existing_obj_resync).await;
+            return ReplicationHealQueueResult {
+                object_info: roi,
+                admission,
+            };
         }
 
-        return roi;
+        return ReplicationHealQueueResult {
+            object_info: roi,
+            admission: ReplicationQueueAdmission::Skipped,
+        };
     }
 
     if roi.existing_obj_resync.must_resync() {
@@ -1235,34 +1454,82 @@ pub async fn queue_replication_heal_internal(
     match roi.replication_status {
         ReplicationStatusType::Pending | ReplicationStatusType::Failed => {
             roi.event_type = REPLICATE_HEAL.to_string();
-            if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
-                pool.queue_replica_task(roi.clone()).await;
-            }
-            return roi;
+            let admission = if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+                pool.queue_replica_task(roi.clone()).await
+            } else {
+                ReplicationQueueAdmission::Missed
+            };
+            return ReplicationHealQueueResult {
+                object_info: roi,
+                admission,
+            };
         }
         _ => {}
     }
 
     if roi.existing_obj_resync.must_resync() {
         roi.event_type = REPLICATE_EXISTING.to_string();
-        if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
-            pool.queue_replica_task(roi.clone()).await;
-        }
+        let admission = if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+            pool.queue_replica_task(roi.clone()).await
+        } else {
+            ReplicationQueueAdmission::Missed
+        };
+        return ReplicationHealQueueResult {
+            object_info: roi,
+            admission,
+        };
     }
 
-    roi
+    ReplicationHealQueueResult {
+        object_info: roi,
+        admission: ReplicationQueueAdmission::Skipped,
+    }
 }
 
 /// Wrapper function for queueing replicate deletes with resync decision
-async fn queue_replicate_deletes_wrapper(doi: DeletedObjectReplicationInfo, existing_obj_resync: ResyncDecision) {
+async fn queue_replicate_deletes_wrapper(
+    doi: DeletedObjectReplicationInfo,
+    existing_obj_resync: ResyncDecision,
+) -> ReplicationQueueAdmission {
+    let mut admission = ReplicationQueueAdmission::Skipped;
     for (k, v) in existing_obj_resync.targets.iter() {
         if v.replicate {
             let mut dv = doi.clone();
             dv.reset_id = v.reset_id.clone();
             dv.target_arn = k.clone();
-            if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
-                pool.queue_replica_delete_task(dv).await;
-            }
+            let target_admission = if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+                pool.queue_replica_delete_task(dv).await
+            } else {
+                ReplicationQueueAdmission::Missed
+            };
+            admission.merge(target_admission);
         }
+    }
+    admission
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replication_queue_admission_combines_target_results() {
+        let mut admission = ReplicationQueueAdmission::Skipped;
+
+        admission.merge(ReplicationQueueAdmission::Queued);
+        assert_eq!(admission, ReplicationQueueAdmission::Queued);
+
+        admission.merge(ReplicationQueueAdmission::Missed);
+        assert_eq!(admission, ReplicationQueueAdmission::Missed);
+    }
+
+    #[test]
+    fn auto_resume_resync_only_for_inflight_states() {
+        assert!(should_auto_resume_resync(ResyncStatusType::ResyncPending));
+        assert!(should_auto_resume_resync(ResyncStatusType::ResyncStarted));
+        assert!(!should_auto_resume_resync(ResyncStatusType::NoResync));
+        assert!(!should_auto_resume_resync(ResyncStatusType::ResyncCanceled));
+        assert!(!should_auto_resume_resync(ResyncStatusType::ResyncCompleted));
+        assert!(!should_auto_resume_resync(ResyncStatusType::ResyncFailed));
     }
 }

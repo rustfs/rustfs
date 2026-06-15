@@ -20,7 +20,7 @@ use crate::bucket::utils::deserialize;
 use crate::config::com::{read_config, save_config};
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::{Error, Result};
-use crate::new_object_layer_fn;
+use crate::resolve_object_store_handle;
 use crate::store::ECStore;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use rustfs_policy::policy::BucketPolicy;
@@ -30,6 +30,7 @@ use s3s::dto::{
     ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration, WebsiteConfiguration,
 };
 use serde::Serializer;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -246,6 +247,28 @@ pub const BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG: &str = "public-access-block.xml";
 pub const BUCKET_ACL_CONFIG: &str = "bucket-acl.json";
 pub const BUCKET_TABLE_CONFIG: &str = "table-bucket.json";
 pub const BUCKET_TABLE_RESERVED_PREFIX: &str = ".rustfs-table";
+pub const BUCKET_TABLE_CATALOG_META_PREFIX: &str = "s3tables/catalog";
+pub const BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX: &str = "table-buckets";
+
+pub fn table_catalog_path_hash(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    let mut output = String::with_capacity(digest.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+pub fn table_bucket_catalog_metadata_prefix(bucket: &str) -> String {
+    format!(
+        "{}/{}/{}",
+        BUCKET_TABLE_CATALOG_META_PREFIX,
+        BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX,
+        table_catalog_path_hash(bucket)
+    )
+}
 
 #[derive(Debug, Clone)]
 pub struct BucketMetadata {
@@ -742,7 +765,7 @@ impl BucketMetadata {
     }
 
     pub async fn save(&mut self) -> Result<()> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(Error::other("errServerNotInitialized"));
         };
 
@@ -776,59 +799,139 @@ impl BucketMetadata {
 
     fn parse_all_configs(&mut self) -> Result<()> {
         if let Err(e) = self.parse_policy_config() {
-            tracing::warn!(bucket = %self.name, config = "policy", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "policy",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.notification_config_xml.is_empty()
             && let Err(e) = deserialize::<NotificationConfiguration>(&self.notification_config_xml)
                 .map(|c| self.notification_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "notification", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "notification",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.lifecycle_config_xml.is_empty()
             && let Err(e) =
                 deserialize::<BucketLifecycleConfiguration>(&self.lifecycle_config_xml).map(|c| self.lifecycle_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "lifecycle", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "lifecycle",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.object_lock_config_xml.is_empty()
             && let Err(e) =
                 deserialize::<ObjectLockConfiguration>(&self.object_lock_config_xml).map(|c| self.object_lock_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "object_lock", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "object_lock",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.versioning_config_xml.is_empty()
             && let Err(e) =
                 deserialize::<VersioningConfiguration>(&self.versioning_config_xml).map(|c| self.versioning_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "versioning", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "versioning",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.encryption_config_xml.is_empty()
             && let Err(e) =
                 deserialize::<ServerSideEncryptionConfiguration>(&self.encryption_config_xml).map(|c| self.sse_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "encryption", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "encryption",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.tagging_config_xml.is_empty()
             && let Err(e) = deserialize::<Tagging>(&self.tagging_config_xml).map(|c| self.tagging_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "tagging", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "tagging",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.quota_config_json.is_empty()
             && let Err(e) = serde_json::from_slice(&self.quota_config_json).map(|c| self.quota_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "quota", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "quota",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.replication_config_xml.is_empty()
             && let Err(e) =
                 deserialize::<ReplicationConfiguration>(&self.replication_config_xml).map(|c| self.replication_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "replication", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "replication",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.bucket_targets_config_json.is_empty() {
             if let Err(e) = serde_json::from_slice::<BucketTargets>(&self.bucket_targets_config_json)
                 .map(|t| self.bucket_target_config = Some(t))
             {
-                tracing::warn!(bucket = %self.name, config = "bucket_targets", error = %e, "parse_all_configs: failed to parse");
+                tracing::warn!(
+                    event = "bucket_metadata_parse_failed",
+                    component = "ecstore",
+                    subsystem = "bucket_metadata",
+                    bucket = %self.name,
+                    config = "bucket_targets",
+                    error = %e,
+                    "Failed to parse bucket metadata config"
+                );
                 self.bucket_target_config = Some(BucketTargets::default());
             }
         } else {
@@ -837,45 +940,96 @@ impl BucketMetadata {
         if !self.cors_config_xml.is_empty()
             && let Err(e) = deserialize::<CORSConfiguration>(&self.cors_config_xml).map(|c| self.cors_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "cors", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "cors",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.logging_config_xml.is_empty()
             && let Err(e) = deserialize::<BucketLoggingStatus>(&self.logging_config_xml).map(|c| self.logging_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "logging", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "logging",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.website_config_xml.is_empty()
             && let Err(e) = deserialize::<WebsiteConfiguration>(&self.website_config_xml).map(|c| self.website_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "website", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "website",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.accelerate_config_xml.is_empty()
             && let Err(e) =
                 deserialize::<AccelerateConfiguration>(&self.accelerate_config_xml).map(|c| self.accelerate_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "accelerate", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "accelerate",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.request_payment_config_xml.is_empty()
             && let Err(e) = deserialize::<RequestPaymentConfiguration>(&self.request_payment_config_xml)
                 .map(|c| self.request_payment_config = Some(c))
         {
             tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
                 bucket = %self.name,
                 config = "request_payment",
                 error = %e,
-                "parse_all_configs: failed to parse"
+                "Failed to parse bucket metadata config"
             );
         }
         if !self.public_access_block_config_xml.is_empty()
             && let Err(e) = deserialize::<PublicAccessBlockConfiguration>(&self.public_access_block_config_xml)
                 .map(|c| self.public_access_block_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "public_access_block", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "public_access_block",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.bucket_acl_config_json.is_empty()
             && let Err(e) = String::from_utf8(self.bucket_acl_config_json.clone()).map(|acl| self.bucket_acl_config = Some(acl))
         {
-            tracing::warn!(bucket = %self.name, config = "bucket_acl", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "bucket_acl",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
 
         Ok(())

@@ -87,6 +87,7 @@ fn parse_http_timestamp(value: &str) -> Option<OffsetDateTime> {
 pub fn build_transition_put_options(storage_class: String, mut metadata: HashMap<String, String>) -> PutObjectOptions {
     let mut opts = PutObjectOptions {
         storage_class,
+        send_content_md5: true,
         legalhold: ObjectLockLegalHoldStatus::from_static(""),
         internal: AdvancedPutOptions {
             replication_status: ReplicationStatus::from_static(""),

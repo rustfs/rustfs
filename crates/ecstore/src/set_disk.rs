@@ -54,7 +54,8 @@ use crate::{
     store_api::{
         BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
         HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectsV2Info, ListOperations, MakeBucketOptions, MultipartInfo,
-        MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOperations, PartInfo, PutObjReader, StorageAPI,
+        MultipartOperations, MultipartUploadResult, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, PartInfo,
+        PutObjReader, StorageAPI,
     },
     store_init::load_format_erasure,
 };
@@ -85,7 +86,6 @@ use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_object_capacity::capacity_scope::{
     CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope,
 };
-use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
@@ -127,8 +127,16 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::error;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 use uuid::Uuid;
+
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_SET_DISK: &str = "set_disk";
+const EVENT_SET_DISK_MULTIPART: &str = "set_disk_multipart";
+const EVENT_SET_DISK_WRITE: &str = "set_disk_write";
+const EVENT_SET_DISK_HEAL: &str = "set_disk_heal";
+
+use crate::rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
 
 pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
@@ -773,6 +781,37 @@ fn delete_file_info_version_id(version_id: Option<Uuid>) -> Option<Uuid> {
     }
 }
 
+fn object_fits_single_block(object_size: i64, block_size: usize) -> bool {
+    match usize::try_from(object_size) {
+        Ok(size) => size > 0 && size <= block_size,
+        Err(_) => false,
+    }
+}
+
+fn should_use_inline_small_fast_path(is_inline_buffer: bool, object_size: i64, block_size: usize) -> bool {
+    is_inline_buffer && object_fits_single_block(object_size, block_size)
+}
+
+fn should_use_single_block_non_inline_fast_path(is_inline_buffer: bool, object_size: i64, block_size: usize) -> bool {
+    !is_inline_buffer && object_fits_single_block(object_size, block_size)
+}
+
+enum SmallWritePath {
+    Inline,
+    SingleBlockNonInline,
+    Pipeline,
+}
+
+fn classify_small_write_path(is_inline_buffer: bool, object_size: i64, block_size: usize) -> SmallWritePath {
+    if should_use_inline_small_fast_path(is_inline_buffer, object_size, block_size) {
+        SmallWritePath::Inline
+    } else if should_use_single_block_non_inline_fast_path(is_inline_buffer, object_size, block_size) {
+        SmallWritePath::SingleBlockNonInline
+    } else {
+        SmallWritePath::Pipeline
+    }
+}
+
 #[async_trait::async_trait]
 impl ObjectIO for SetDisks {
     #[tracing::instrument(level = "debug", skip(self))]
@@ -915,7 +954,16 @@ impl ObjectIO for SetDisks {
             )
             .await
             {
-                error!("get_object_with_fileinfo  {bucket}/{object} err {:?}", e);
+                error!(
+                    event = EVENT_SET_DISK_WRITE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    bucket,
+                    object,
+                    state = "read_pipeline_failed",
+                    error = ?e,
+                    "Set disk object read pipeline failed"
+                );
             };
         });
 
@@ -1032,7 +1080,15 @@ impl ObjectIO for SetDisks {
                             {
                                 Ok(writer) => (Some(writer), None),
                                 Err(err) => {
-                                    warn!("create_bitrot_writer  disk {}, err {:?}, skipping operation", disk.to_string(), err);
+                                    warn!(
+                                        event = EVENT_SET_DISK_WRITE,
+                                        component = LOG_COMPONENT_ECSTORE,
+                                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                                        disk = ?disk,
+                                        state = "bitrot_writer_skipped",
+                                        error = ?err,
+                                        "Set disk bitrot writer skipped"
+                                    );
                                     (None, Some(err))
                                 }
                             }
@@ -1052,7 +1108,18 @@ impl ObjectIO for SetDisks {
 
             let nil_count = errors.iter().filter(|&e| e.is_none()).count();
             if nil_count < write_quorum {
-                error!("not enough disks to write: {:?}", errors);
+                error!(
+                    event = EVENT_SET_DISK_WRITE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    bucket,
+                    object,
+                    write_quorum,
+                    available_writers = nil_count,
+                    state = "write_quorum_unavailable",
+                    error = ?errors,
+                    "Set disk write quorum unavailable"
+                );
                 if let Some(write_err) = reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, write_quorum) {
                     return Err(to_object_err(write_err.into(), vec![bucket, object]));
                 }
@@ -1065,10 +1132,10 @@ impl ObjectIO for SetDisks {
                 HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
             );
 
-            let use_fast_path = is_inline_buffer && data.size() <= fi.erasure.block_size as i64;
+            let write_path = classify_small_write_path(is_inline_buffer, data.size(), fi.erasure.block_size);
 
-            let (reader, w_size) = if use_fast_path {
-                match Arc::new(erasure)
+            let (reader, w_size) = match write_path {
+                SmallWritePath::Inline => match Arc::new(erasure)
                     .encode_inline_small(stream, &mut writers, write_quorum)
                     .await
                 {
@@ -1077,15 +1144,24 @@ impl ObjectIO for SetDisks {
                         error!("encode_inline_small err {:?}", e);
                         return Err(e.into());
                     }
-                }
-            } else {
-                match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
+                },
+                SmallWritePath::SingleBlockNonInline => match Arc::new(erasure)
+                    .encode_single_block_non_inline(stream, &mut writers, write_quorum)
+                    .await
+                {
+                    Ok((r, w)) => (r, w),
+                    Err(e) => {
+                        error!("encode_single_block_non_inline err {:?}", e);
+                        return Err(e.into());
+                    }
+                },
+                SmallWritePath::Pipeline => match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
                     Ok((r, w)) => (r, w),
                     Err(e) => {
                         error!("encode err {:?}", e);
                         return Err(e.into());
                     }
-                }
+                },
             };
 
             let _ = mem::replace(&mut data.stream, reader);
@@ -1094,7 +1170,17 @@ impl ObjectIO for SetDisks {
             // }
 
             if (w_size as i64) < data.size() {
-                warn!("put_object write size < data.size(), w_size={}, data.size={}", w_size, data.size());
+                warn!(
+                    event = EVENT_SET_DISK_WRITE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    bucket,
+                    object,
+                    written_size = w_size,
+                    expected_size = data.size(),
+                    state = "short_write",
+                    "Set disk write produced fewer bytes than expected"
+                );
                 return Err(Error::other(format!(
                     "put_object write size < data.size(), w_size={}, data.size={}",
                     w_size,
@@ -1106,7 +1192,7 @@ impl ObjectIO for SetDisks {
                 insert_str(&mut user_defined, SUFFIX_COMPRESSION_SIZE, w_size.to_string());
             }
 
-            let index_op = data.stream.try_get_index().map(|v| v.clone().into_vec());
+            let index_op = data.stream.try_get_index().map(crate::rio::compression_index_storage_bytes);
 
             //TODO: userDefined
 
@@ -1405,55 +1491,58 @@ impl SetDisks {
         if !pending.is_empty() {
             let cleanup_requests = requests.clone();
             let lockers = self.lockers.clone();
-            let handle = tokio::spawn(async move {
-                let mut late_lock_ids_by_client = vec![Vec::new(); lockers.len()];
-                let mut pending = pending;
-                while let Some(join_result) = pending.join_next().await {
-                    match join_result {
-                        Ok((client_idx, Ok(responses))) => {
-                            for (req_idx, request) in cleanup_requests.iter().enumerate() {
-                                if let Some(response) = responses.get(req_idx)
-                                    && response.success
-                                {
-                                    let lock_id = response
-                                        .lock_info
-                                        .as_ref()
-                                        .map(|lock_info| lock_info.id.clone())
-                                        .unwrap_or_else(|| request.lock_id.clone());
-                                    if let Some(client_locks) = late_lock_ids_by_client.get_mut(client_idx) {
-                                        client_locks.push(lock_id);
+            let handle = tokio::spawn(
+                async move {
+                    let mut late_lock_ids_by_client = vec![Vec::new(); lockers.len()];
+                    let mut pending = pending;
+                    while let Some(join_result) = pending.join_next().await {
+                        match join_result {
+                            Ok((client_idx, Ok(responses))) => {
+                                for (req_idx, request) in cleanup_requests.iter().enumerate() {
+                                    if let Some(response) = responses.get(req_idx)
+                                        && response.success
+                                    {
+                                        let lock_id = response
+                                            .lock_info
+                                            .as_ref()
+                                            .map(|lock_info| lock_info.id.clone())
+                                            .unwrap_or_else(|| request.lock_id.clone());
+                                        if let Some(client_locks) = late_lock_ids_by_client.get_mut(client_idx) {
+                                            client_locks.push(lock_id);
+                                        }
                                     }
                                 }
                             }
-                        }
-                        Ok((_client_idx, Err(err))) => {
-                            tracing::warn!("late distributed delete lock batch request failed: {}", err);
-                        }
-                        Err(err) => {
-                            tracing::warn!("late distributed delete lock batch task join failed: {}", err);
-                        }
-                    }
-                }
-
-                join_all(lockers.iter().cloned().enumerate().filter_map(|(client_idx, client)| {
-                    let lock_ids = late_lock_ids_by_client.get(client_idx).cloned().unwrap_or_default();
-                    if lock_ids.is_empty() {
-                        None
-                    } else {
-                        Some(async move {
-                            if let Err(err) = client.release_locks_batch(&lock_ids).await {
-                                tracing::warn!(
-                                    client_idx,
-                                    lock_count = lock_ids.len(),
-                                    "failed to cleanup late distributed delete locks in batch: {}",
-                                    err
-                                );
+                            Ok((_client_idx, Err(err))) => {
+                                tracing::warn!("late distributed delete lock batch request failed: {}", err);
                             }
-                        })
+                            Err(err) => {
+                                tracing::warn!("late distributed delete lock batch task join failed: {}", err);
+                            }
+                        }
                     }
-                }))
-                .await;
-            });
+
+                    join_all(lockers.iter().cloned().enumerate().filter_map(|(client_idx, client)| {
+                        let lock_ids = late_lock_ids_by_client.get(client_idx).cloned().unwrap_or_default();
+                        if lock_ids.is_empty() {
+                            None
+                        } else {
+                            Some(async move {
+                                if let Err(err) = client.release_locks_batch(&lock_ids).await {
+                                    tracing::warn!(
+                                        client_idx,
+                                        lock_count = lock_ids.len(),
+                                        "failed to cleanup late distributed delete locks in batch: {}",
+                                        err
+                                    );
+                                }
+                            })
+                        }
+                    }))
+                    .await;
+                }
+                .instrument(tracing::Span::current()),
+            );
             drop(handle);
         }
 
@@ -1516,8 +1605,39 @@ impl SetDisks {
     }
 }
 
+impl SetDisks {
+    pub(crate) async fn storage_info_snapshot(&self) -> rustfs_madmin::StorageInfo {
+        let disks = self.get_disks_internal().await;
+
+        get_storage_info(&disks, &self.set_endpoints).await
+    }
+
+    pub(crate) async fn local_storage_info_snapshot(&self) -> rustfs_madmin::StorageInfo {
+        let disks = self.get_disks_internal().await;
+
+        let mut local_disks: Vec<Option<DiskStore>> = Vec::new();
+        let mut local_endpoints = Vec::new();
+
+        for (i, ep) in self.set_endpoints.iter().enumerate() {
+            if ep.is_local {
+                local_disks.push(disks[i].clone());
+                local_endpoints.push(ep.clone());
+            }
+        }
+
+        get_storage_info(&local_disks, &local_endpoints).await
+    }
+
+    pub(crate) async fn disk_inventory(&self) -> Vec<Option<DiskStore>> {
+        self.get_disks_internal().await
+    }
+}
+
 #[async_trait::async_trait]
-impl StorageAPI for SetDisks {
+impl StorageAPI for SetDisks {}
+
+#[async_trait::async_trait]
+impl NamespaceLocking for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         let set_lock = if is_dist_erasure().await {
@@ -1543,43 +1663,6 @@ impl StorageAPI for SetDisks {
         };
 
         Ok(NamespaceLockWrapper::new(set_lock, resource, self.locker_owner.clone()))
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
-        unimplemented!()
-    }
-    #[tracing::instrument(skip(self))]
-    async fn storage_info(&self) -> rustfs_madmin::StorageInfo {
-        let disks = self.get_disks_internal().await;
-
-        get_storage_info(&disks, &self.set_endpoints).await
-    }
-    #[tracing::instrument(skip(self))]
-    async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
-        let disks = self.get_disks_internal().await;
-
-        let mut local_disks: Vec<Option<DiskStore>> = Vec::new();
-        let mut local_endpoints = Vec::new();
-
-        for (i, ep) in self.set_endpoints.iter().enumerate() {
-            if ep.is_local {
-                local_disks.push(disks[i].clone());
-                local_endpoints.push(ep.clone());
-            }
-        }
-
-        get_storage_info(&local_disks, &local_endpoints).await
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn get_disks(&self, _pool_idx: usize, _set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
-        Ok(self.get_disks_internal().await)
-    }
-
-    #[tracing::instrument(skip(self))]
-    fn set_drive_counts(&self) -> Vec<usize> {
-        unimplemented!()
     }
 }
 
@@ -1635,10 +1718,17 @@ impl ObjectOperations for SetDisks {
         src_opts: &ObjectOptions,
         dst_opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
-        // FIXME: TODO:
-
         if !src_info.metadata_only {
-            return Err(StorageError::NotImplemented);
+            if path_join_buf(&[src_bucket, src_object]) != path_join_buf(&[dst_bucket, dst_object]) {
+                return Err(StorageError::NotImplemented);
+            }
+            // Self-copy with a data reader: write tier data back locally (de-tiering).
+            // Handles `mc cp --storage-class STANDARD obj obj` on a transitioned object.
+            if let Some(mut put_reader) = src_info.put_object_reader.take() {
+                return self.put_object(dst_bucket, dst_object, &mut put_reader, dst_opts).await;
+            }
+            // Same-key tiered copy without a pre-fetched reader: fall through to the metadata
+            // path so the caller gets a disk/quorum error rather than NotImplemented.
         }
 
         if path_join_buf(&[src_bucket, src_object]) != path_join_buf(&[dst_bucket, dst_object]) {
@@ -1775,7 +1865,7 @@ impl ObjectOperations for SetDisks {
     }
     #[tracing::instrument(skip(self))]
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
-        let disks = self.get_disks(0, 0).await?;
+        let disks = self.disk_inventory().await;
         let write_quorum = disks.len() / 2 + 1;
 
         let mut futures = Vec::with_capacity(disks.len());
@@ -2151,9 +2241,8 @@ impl ObjectOperations for SetDisks {
                 .await
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
-            if let Ok(disks) = self.get_disks(0, 0).await {
-                record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
-            }
+            let disks = self.disk_inventory().await;
+            record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
 
             let mut oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
             oi.replication_decision = goi.replication_decision;
@@ -2181,9 +2270,8 @@ impl ObjectOperations for SetDisks {
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
-        if let Ok(disks) = self.get_disks(0, 0).await {
-            record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
-        }
+        let disks = self.disk_inventory().await;
+        record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
 
         let mut obj_info = ObjectInfo::from_file_info(&dfi, bucket, object, opts.versioned || opts.version_suspended);
         obj_info.size = goi.size;
@@ -2457,7 +2545,7 @@ impl ObjectOperations for SetDisks {
         let event_name = EventName::LifecycleTransition.as_str();
         let mut should_notify_transition = true;
 
-        let disks = self.get_disks(0, 0).await?;
+        let disks = self.disk_inventory().await;
 
         if let Err(err) = self.delete_object_version(bucket, object, &fi, false).await {
             should_notify_transition = false;
@@ -2935,7 +3023,15 @@ impl MultipartOperations for SetDisks {
                 {
                     Ok(writer) => writer,
                     Err(err) => {
-                        warn!("create_bitrot_writer  disk {}, err {:?}, skipping operation", disk.to_string(), err);
+                        warn!(
+                            event = EVENT_SET_DISK_MULTIPART,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_SET_DISK,
+                            disk = ?disk,
+                            state = "bitrot_writer_skipped",
+                            error = ?err,
+                            "Set disk multipart bitrot writer skipped"
+                        );
                         errors.push(Some(err));
                         writers.push(None);
                         continue;
@@ -2964,12 +3060,34 @@ impl MultipartOperations for SetDisks {
             HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
         );
 
-        let (reader, w_size) = Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?; // TODO: delete temporary directory on error
+        let write_path = classify_small_write_path(false, data.size(), fi.erasure.block_size);
+
+        let (reader, w_size) = match write_path {
+            SmallWritePath::SingleBlockNonInline => {
+                Arc::new(erasure)
+                    .encode_single_block_non_inline(stream, &mut writers, write_quorum)
+                    .await?
+            }
+            SmallWritePath::Inline | SmallWritePath::Pipeline => {
+                Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?
+            }
+        }; // TODO: delete temporary directory on error
 
         let _ = mem::replace(&mut data.stream, reader);
 
         if (w_size as i64) < data.size() {
-            warn!("put_object_part write size < data.size(), w_size={}, data.size={}", w_size, data.size());
+            warn!(
+                event = EVENT_SET_DISK_MULTIPART,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                bucket,
+                object,
+                part_number = part_id,
+                written_size = w_size,
+                expected_size = data.size(),
+                state = "short_write",
+                "Set disk multipart write produced fewer bytes than expected"
+            );
             return Err(Error::other(format!(
                 "put_object_part write size < data.size(), w_size={}, data.size={}",
                 w_size,
@@ -2977,7 +3095,7 @@ impl MultipartOperations for SetDisks {
             )));
         }
 
-        let index_op = data.stream.try_get_index().map(|v| v.clone().into_vec());
+        let index_op = data.stream.try_get_index().map(crate::rio::compression_index_storage_bytes);
 
         let mut etag = data.stream.try_resolve_etag().unwrap_or_default();
 
@@ -3605,7 +3723,17 @@ impl MultipartOperations for SetDisks {
                 );
                 return Err(Error::InvalidPart(p.part_num, "".to_owned(), p.etag.clone().unwrap_or_default()));
             };
-            info!(target:"rustfs_ecstore::set_disk", part_number = p.part_num, part_size = ext_part.size, part_actual_size = ext_part.actual_size, "Completing multipart part");
+            debug!(
+                target:"rustfs_ecstore::set_disk",
+                event = EVENT_SET_DISK_MULTIPART,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                part_number = p.part_num,
+                part_size = ext_part.size,
+                part_actual_size = ext_part.actual_size,
+                state = "part_validated",
+                "Set disk multipart part validated"
+            );
 
             // Normalize ETags by removing quotes before comparison (PR #592 compatibility)
             let client_etag = p.etag.as_ref().map(|e| rustfs_utils::path::trim_etag(e));
@@ -3936,9 +4064,15 @@ impl HealOperations for SetDisks {
         let disks = disks.clone();
         let (_, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false, false).await?;
         if DiskError::is_all_not_found(&errs) {
-            warn!(
-                "heal_object failed, all obj part not found, bucket: {}, obj: {}, version_id: {}",
-                bucket, object, version_id
+            debug!(
+                event = EVENT_SET_DISK_HEAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                bucket,
+                object,
+                version_id,
+                state = "missing_object_skipped",
+                "Set disk heal skipped missing object"
             );
             let err = if !version_id.is_empty() {
                 Error::FileVersionNotFound
@@ -4307,7 +4441,16 @@ async fn disks_with_all_parts(
                     verify_resp = v;
                 }
                 Err(err) => {
-                    info!("verify_file failed: {err:?}, object_name={}, index: {index}", object_name);
+                    debug!(
+                        event = EVENT_SET_DISK_HEAL,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        object = %object_name,
+                        disk_index = index,
+                        state = "verify_failed",
+                        error = ?err,
+                        "Set disk verify_file failed"
+                    );
                     verify_err = Some(err);
                 }
             }
@@ -4317,7 +4460,16 @@ async fn disks_with_all_parts(
                     verify_resp = v;
                 }
                 Err(err) => {
-                    info!("check_parts failed: {err:?}, object_name={}, index: {index}", object_name);
+                    debug!(
+                        event = EVENT_SET_DISK_HEAL,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        object = %object_name,
+                        disk_index = index,
+                        state = "check_parts_failed",
+                        error = ?err,
+                        "Set disk check_parts failed"
+                    );
                     verify_err = Some(err);
                 }
             }
@@ -4727,6 +4879,7 @@ pub fn is_infrequent_access_class(storage_class: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bucket::lifecycle::bucket_lifecycle_ops::TransitionedObject;
     use crate::disk::CHECK_PART_UNKNOWN;
     use crate::disk::CHECK_PART_VOLUME_NOT_FOUND;
     use crate::disk::RUSTFS_META_BUCKET;
@@ -6709,6 +6862,47 @@ mod tests {
     }
 
     #[test]
+    fn put_object_fast_path_selection_prefers_inline_only_when_inline_buffer_and_single_block() {
+        assert!(should_use_inline_small_fast_path(true, 1024, 4096));
+        assert!(!should_use_single_block_non_inline_fast_path(true, 1024, 4096));
+        assert!(matches!(classify_small_write_path(true, 1024, 4096), SmallWritePath::Inline));
+
+        assert!(!should_use_inline_small_fast_path(false, 1024, 4096));
+        assert!(should_use_single_block_non_inline_fast_path(false, 1024, 4096));
+        assert!(matches!(
+            classify_small_write_path(false, 1024, 4096),
+            SmallWritePath::SingleBlockNonInline
+        ));
+    }
+
+    #[test]
+    fn put_object_fast_path_selection_rejects_zero_and_multi_block_payloads() {
+        assert!(!should_use_inline_small_fast_path(true, 0, 4096));
+        assert!(!should_use_single_block_non_inline_fast_path(false, 0, 4096));
+        assert!(matches!(classify_small_write_path(true, 0, 4096), SmallWritePath::Pipeline));
+
+        assert!(!should_use_inline_small_fast_path(true, -1, 4096));
+        assert!(!should_use_single_block_non_inline_fast_path(false, -1, 4096));
+        assert!(matches!(classify_small_write_path(false, -1, 4096), SmallWritePath::Pipeline));
+
+        assert!(!should_use_inline_small_fast_path(true, 8192, 4096));
+        assert!(!should_use_single_block_non_inline_fast_path(false, 8192, 4096));
+        assert!(matches!(classify_small_write_path(false, 8192, 4096), SmallWritePath::Pipeline));
+    }
+
+    #[test]
+    fn put_object_part_fast_path_selection_matches_single_block_non_inline_rules() {
+        assert!(should_use_single_block_non_inline_fast_path(false, 4096, 4096));
+        assert!(should_use_single_block_non_inline_fast_path(false, 2048, 4096));
+        assert!(!should_use_single_block_non_inline_fast_path(false, 4097, 4096));
+        assert!(!should_use_single_block_non_inline_fast_path(false, 0, 4096));
+        assert!(matches!(
+            classify_small_write_path(false, 4096, 4096),
+            SmallWritePath::SingleBlockNonInline
+        ));
+    }
+
+    #[test]
     fn test_is_cold_storage_class() {
         // Test cold storage classes
         assert!(is_cold_storage_class(storageclass::DEEP_ARCHIVE));
@@ -6734,5 +6928,60 @@ mod tests {
         assert!(!is_infrequent_access_class(storageclass::RRS));
         assert!(!is_infrequent_access_class(storageclass::DEEP_ARCHIVE));
         assert!(!is_infrequent_access_class(storageclass::EXPRESS_ONEZONE));
+    }
+
+    // Regression test: `mc cp --storage-class STANDARD` on a tiered object (self-copy) must not
+    // return NotImplemented.  When the source object is tiered (transitioned_object.tier is
+    // non-empty) the usecase layer in object_usecase.rs intentionally leaves metadata_only=false
+    // so that the full copy path is taken.  SetDisks::copy_object must therefore accept a
+    // same-bucket/same-key call even when metadata_only=false.
+    //
+    // Currently this test FAILS because the guard at set_disk.rs:1579 unconditionally rejects
+    // !metadata_only with StorageError::NotImplemented.  Once the fix is applied the test will
+    // pass (or progress further through the copy path before failing on missing disk data).
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn copy_object_tiered_self_copy_does_not_return_not_implemented() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::Erasure).await;
+        let set_disks = make_test_set_disks(vec![Arc::new(LocalClient::with_manager(Arc::new(
+            rustfs_lock::GlobalLockManager::new(),
+        )))])
+        .await;
+
+        // Simulate a tiered object: metadata_only is false (set_disk must handle the full copy),
+        // and transitioned_object.tier is non-empty (the object lives on a remote tier).
+        let mut src_info = ObjectInfo {
+            metadata_only: false,
+            transitioned_object: TransitionedObject {
+                tier: "NEXTCLOUD".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let result = set_disks
+            .copy_object(
+                "bucket",
+                "object",
+                "bucket",
+                "object",
+                &mut src_info,
+                &ObjectOptions::default(),
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        // The copy must not be rejected with NotImplemented.  Any other outcome (Ok or a
+        // different error such as missing-disk / quorum) is acceptable here.
+        if let Err(ref err) = result {
+            assert!(
+                !matches!(err, StorageError::NotImplemented),
+                "tiered self-copy returned NotImplemented — copy_object must handle \
+                 metadata_only=false for same-key copies of tiered objects, got: {err}"
+            );
+        }
     }
 }

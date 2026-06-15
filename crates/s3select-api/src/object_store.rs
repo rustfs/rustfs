@@ -26,7 +26,7 @@ use object_store::{
 use pin_project_lite::pin_project;
 use rustfs_common::DEFAULT_DELIMITER;
 use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
-use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::resolve_object_store_handle;
 use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use rustfs_ecstore::store::ECStore;
 use rustfs_ecstore::store_api::{GetObjectReader, HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectOptions};
@@ -107,7 +107,7 @@ pub struct InvalidScanRange;
 
 impl EcObjectStore {
     pub fn new(input: Arc<SelectObjectContentInput>) -> S3Result<Self> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(s3_error!(InternalError, "ec store not inited"));
         };
 
@@ -1046,7 +1046,10 @@ where
     AsyncTryStream::<Bytes, o_Error, _>::new(|mut y| async move {
         pin_mut!(stream);
         let mut remaining: usize = content_length;
-        while let Some(result) = stream.next().await {
+        while remaining > 0 {
+            let Some(result) = stream.next().await else {
+                break;
+            };
             let mut bytes = result.map_err(|e| o_Error::Generic {
                 store: "",
                 source: Box::new(e),
@@ -1064,12 +1067,12 @@ where
 #[cfg(test)]
 mod test {
     use super::{
-        ConvertStream, SelectScanRange, convert_field_delimiter_stream, extract_json_sub_path_from_expression, find_delimiter,
-        flatten_json_document_to_ndjson, http_range_spec_from_get_range, replace_symbol, scan_range_from_bounds,
+        ConvertStream, SelectScanRange, bytes_stream, convert_field_delimiter_stream, extract_json_sub_path_from_expression,
+        find_delimiter, flatten_json_document_to_ndjson, http_range_spec_from_get_range, replace_symbol, scan_range_from_bounds,
         scan_range_read_start, scan_range_stream, select_read_headers,
     };
     use bytes::Bytes;
-    use futures::{StreamExt, stream};
+    use futures::{StreamExt, TryStreamExt, stream};
     use object_store::GetRange;
     use s3s::dto::{
         CSVInput, CSVOutput, ExpressionType, InputSerialization, OutputSerialization, SelectObjectContentInput,
@@ -1078,6 +1081,10 @@ mod test {
     use s3s::header::{
         X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
         X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use tokio::io::AsyncReadExt;
     use tokio_util::io::StreamReader;
@@ -1283,6 +1290,29 @@ mod test {
             output.extend_from_slice(&bytes.unwrap());
         }
         assert_eq!(output, b"a,");
+    }
+
+    #[tokio::test]
+    async fn test_bytes_stream_stops_at_content_length() {
+        let poll_count = Arc::new(AtomicUsize::new(0));
+        let stream_poll_count = Arc::clone(&poll_count);
+        let source = stream::unfold(0, move |index| {
+            let stream_poll_count = Arc::clone(&stream_poll_count);
+            async move {
+                stream_poll_count.fetch_add(1, Ordering::SeqCst);
+                let bytes = match index {
+                    0 => Bytes::from_static(b"abcd"),
+                    1 => Bytes::from_static(b"efgh"),
+                    _ => return None,
+                };
+                Some((Ok::<_, std::io::Error>(bytes), index + 1))
+            }
+        });
+
+        let chunks: Vec<Bytes> = bytes_stream(source, 4).try_collect().await.unwrap();
+
+        assert_eq!(chunks, vec![Bytes::from_static(b"abcd")]);
+        assert_eq!(poll_count.load(Ordering::SeqCst), 1);
     }
 
     /// A JSON array is split into one NDJSON line per element.

@@ -46,7 +46,7 @@ use rustfs_utils::path::{
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
-use std::io::SeekFrom;
+use std::io::{Error as IoError, SeekFrom};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -66,6 +66,55 @@ const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
 const STALE_TMP_OBJECT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 const RUSTFS_META_TMP_OLD_BUCKET: &str = ".rustfs.sys/tmp-old";
 const STARTUP_CLEANUP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+const ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT: &str = "RUSTFS_BITROT_SIZE_MISMATCH_RETRY_COUNT";
+const ENV_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS: &str = "RUSTFS_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS";
+const DEFAULT_BITROT_SIZE_MISMATCH_RETRY_COUNT: u64 = 2;
+const DEFAULT_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS: u64 = 100;
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_DISK_LOCAL: &str = "disk_local";
+const EVENT_DISK_LOCAL_STARTUP_CLEANUP: &str = "disk_local_startup_cleanup";
+const EVENT_DISK_LOCAL_BACKGROUND_CLEANUP: &str = "disk_local_background_cleanup";
+const EVENT_DISK_LOCAL_SCAN_FAILED: &str = "disk_local_scan_failed";
+const EVENT_DISK_LOCAL_RENAME_REJECTED: &str = "disk_local_rename_rejected";
+const EVENT_DISK_LOCAL_READ_VERSION_FALLBACK: &str = "disk_local_read_version_fallback";
+const EVENT_DISK_LOCAL_DELETE_FAILED: &str = "disk_local_delete_failed";
+const EVENT_DISK_LOCAL_CHECK_PARTS: &str = "disk_local_check_parts";
+const EVENT_DISK_LOCAL_ACCESS_FAILED: &str = "disk_local_access_failed";
+const EVENT_DISK_LOCAL_VOLUME_SETUP_FAILED: &str = "disk_local_volume_setup_failed";
+const EVENT_DISK_LOCAL_FORMAT_DECODE_FAILED: &str = "disk_local_format_decode_failed";
+
+fn log_startup_disk_io_error(stage: &str, path: &Path, err: &IoError) {
+    warn!(
+        event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+        stage,
+        path = %path.display(),
+        error_kind = ?err.kind(),
+        raw_os_error = ?err.raw_os_error(),
+        error = ?err,
+        state = "io_failed",
+        "Disk local startup filesystem operation failed"
+    );
+}
+
+fn log_startup_disk_error(stage: &str, path: &Path, err: &DiskError) {
+    if let DiskError::Io(io_err) = err {
+        log_startup_disk_io_error(stage, path, io_err);
+        return;
+    }
+
+    warn!(
+        event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+        stage,
+        path = %path.display(),
+        error = ?err,
+        state = "failed",
+        "Disk local startup operation failed"
+    );
+}
 
 #[derive(Debug, Clone)]
 pub struct FormatInfo {
@@ -105,6 +154,21 @@ fn record_file_cache_reclaim_success(kind: &'static str, reclaim_len: usize, sta
 
 fn record_file_cache_reclaim_error(kind: &'static str) {
     counter!("rustfs_page_cache_reclaim_requests_total", "kind" => kind.to_string(), "result" => "err".to_string()).increment(1);
+}
+
+fn bitrot_size_mismatch_retry_count() -> usize {
+    rustfs_utils::get_env_u64(ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT, DEFAULT_BITROT_SIZE_MISMATCH_RETRY_COUNT) as usize
+}
+
+fn bitrot_size_mismatch_retry_delay() -> Duration {
+    Duration::from_millis(rustfs_utils::get_env_u64(
+        ENV_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS,
+        DEFAULT_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS,
+    ))
+}
+
+fn is_bitrot_size_mismatch_error(err: &std::io::Error) -> bool {
+    err.to_string().contains("bitrot shard file size mismatch")
 }
 
 impl FileCacheReclaimReader {
@@ -408,10 +472,26 @@ fn resolve_local_disk_root(ep_path: &str) -> Result<PathBuf> {
 
 impl LocalDisk {
     pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Self> {
-        debug!("Creating local disk");
-        let root = resolve_local_disk_root(&ep.get_file_path())?;
+        debug!(
+            event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+            endpoint = %ep,
+            state = "create_started",
+            cleanup,
+            "Local disk creation started"
+        );
+        let endpoint_path = ep.get_file_path();
+        let root = resolve_local_disk_root(&endpoint_path).inspect_err(|err| {
+            log_startup_disk_error("resolve_local_disk_root", Path::new(&endpoint_path), err);
+        })?;
 
-        ensure_data_usage_layout(&root).await.map_err(DiskError::from)?;
+        ensure_data_usage_layout(&root)
+            .await
+            .map_err(DiskError::from)
+            .inspect_err(|err| {
+                log_startup_disk_error("ensure_data_usage_layout", &root, err);
+            })?;
 
         let startup_cleanup_ready = Arc::new(AtomicU32::new(u32::from(!cleanup)));
         let startup_cleanup_notify = Arc::new(Notify::new());
@@ -422,13 +502,31 @@ impl LocalDisk {
         {
             startup_cleanup_ready.store(1, Ordering::Release);
             startup_cleanup_notify.notify_waiters();
-            warn!(root = ?root, error = ?err, "failed to cleanup temporary data during disk startup");
+            warn!(
+                event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                root = ?root,
+                state = "failed",
+                error = ?err,
+                "Local disk startup cleanup failed"
+            );
         }
 
         // Use optimized path resolution instead of absolutize_virtually
         let format_path = root.join(RUSTFS_META_BUCKET).join(super::FORMAT_CONFIG_FILE);
-        debug!("format_path: {:?}", format_path);
-        let (format_data, format_meta) = read_file_exists(&format_path).await?;
+        debug!(
+            event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+            root = ?root,
+            format_path = ?format_path,
+            state = "format_path_resolved",
+            "Local disk format path resolved"
+        );
+        let (format_data, format_meta) = read_file_exists(&format_path).await.inspect_err(|err| {
+            log_startup_disk_error("read_format_json", &format_path, err);
+        })?;
 
         let mut id = None;
         // let mut format_legacy = false;
@@ -465,7 +563,15 @@ impl LocalDisk {
                         {
                             Ok(ids) => ids,
                             Err(err) => {
-                                warn!(root = ?root, error = ?err, "failed to resolve physical device ids for disk root");
+                                warn!(
+                                    event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                                    root = ?root,
+                                    state = "physical_device_id_lookup_failed",
+                                    error = ?err,
+                                    "Disk local startup metadata lookup failed"
+                                );
                                 Vec::new()
                             }
                         };
@@ -521,7 +627,9 @@ impl LocalDisk {
             startup_cleanup_notify,
             exit_signal: None,
         };
-        let (info, _root) = get_disk_info(root).await?;
+        let (info, _root) = get_disk_info(root.clone()).await.inspect_err(|err| {
+            log_startup_disk_error("get_disk_info", &root, err);
+        })?;
         disk.major = info.major;
         disk.minor = info.minor;
         disk.fstype = info.fstype;
@@ -538,14 +646,24 @@ impl LocalDisk {
             disk.rotational = true;
         }
 
-        disk.make_meta_volumes().await?;
+        disk.make_meta_volumes().await.inspect_err(|err| {
+            log_startup_disk_error("make_meta_volumes", &disk.root, err);
+        })?;
 
         let (exit_tx, exit_rx) = tokio::sync::broadcast::channel(1);
         disk.exit_signal = Some(exit_tx);
 
         let root = disk.root.clone();
         tokio::spawn(Self::cleanup_deleted_objects_loop(root, exit_rx));
-        debug!("LocalDisk created: {:?}", disk);
+        debug!(
+            event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+            endpoint = %disk.endpoint,
+            root = ?disk.root,
+            state = "created",
+            "Local disk created"
+        );
         Ok(disk)
     }
 
@@ -556,14 +674,37 @@ impl LocalDisk {
             tokio::select! {
                 _ = interval.tick() => {
                     if let Err(err) = Self::cleanup_deleted_objects(root.clone()).await {
-                        error!("cleanup_deleted_objects error: {:?}", err);
+                        error!(
+                            event = EVENT_DISK_LOCAL_BACKGROUND_CLEANUP,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                            task = "deleted_objects",
+                            state = "failed",
+                            error = ?err,
+                            "Disk local background cleanup failed"
+                        );
                     }
                     if let Err(err) = Self::cleanup_stale_tmp_objects(root.clone()).await {
-                        error!("cleanup_stale_tmp_objects error: {:?}", err);
+                        error!(
+                            event = EVENT_DISK_LOCAL_BACKGROUND_CLEANUP,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                            task = "stale_tmp_objects",
+                            state = "failed",
+                            error = ?err,
+                            "Disk local background cleanup failed"
+                        );
                     }
                 }
                 _ = exit_rx.recv() => {
-                    info!("cleanup_deleted_objects_loop exit");
+                    info!(
+                        event = EVENT_DISK_LOCAL_BACKGROUND_CLEANUP,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        task = "deleted_objects_loop",
+                        state = "stopped",
+                        "Disk local background cleanup loop stopped"
+                    );
                     break;
                 }
             }
@@ -587,16 +728,21 @@ impl LocalDisk {
         let tmp_path = Self::meta_path(root, RUSTFS_META_TMP_BUCKET);
         let tmp_old_path = Self::meta_path(root, RUSTFS_META_TMP_OLD_BUCKET).join(Uuid::new_v4().to_string());
 
-        rename_all(&tmp_path, &tmp_old_path, root).await?;
+        rename_all(&tmp_path, &tmp_old_path, root).await.inspect_err(|err| {
+            log_startup_disk_error("cleanup_tmp_rename_all", &tmp_path, err);
+        })?;
 
-        tokio::fs::create_dir_all(Self::meta_path(root, RUSTFS_META_TMP_DELETED_BUCKET)).await?;
+        let tmp_deleted_path = Self::meta_path(root, RUSTFS_META_TMP_DELETED_BUCKET);
+        tokio::fs::create_dir_all(&tmp_deleted_path).await.inspect_err(|err| {
+            log_startup_disk_io_error("cleanup_tmp_create_deleted_dir", &tmp_deleted_path, err);
+        })?;
 
         let tmp_old_root = Self::meta_path(root, RUSTFS_META_TMP_OLD_BUCKET);
         tokio::spawn(async move {
             if let Err(err) = tokio::fs::remove_dir_all(&tmp_old_root).await
                 && err.kind() != ErrorKind::NotFound
             {
-                warn!(path = ?tmp_old_root, error = ?err, "failed to remove old temporary data");
+                log_startup_disk_io_error("cleanup_tmp_remove_old_dir", &tmp_old_root, &err);
             }
             startup_cleanup_ready.store(1, Ordering::Release);
             startup_cleanup_notify.notify_waiters();
@@ -620,9 +766,13 @@ impl LocalDisk {
             debug!(disk = %self.endpoint, "startup cleanup barrier released before walk_dir");
         } else {
             warn!(
+                event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
                 disk = %self.endpoint,
                 timeout_ms = STARTUP_CLEANUP_WAIT_TIMEOUT.as_millis(),
-                "startup cleanup barrier timed out; continuing walk_dir"
+                state = "timed_out",
+                "Disk local startup cleanup barrier timed out"
             );
         }
     }
@@ -996,7 +1146,15 @@ impl LocalDisk {
                     ErrorKind::NotFound => (),
                     ErrorKind::DirectoryNotEmpty => (),
                     kind => {
-                        warn!("delete_file remove_dir {:?} err {}", &delete_path, kind.to_string());
+                        warn!(
+                            event = EVENT_DISK_LOCAL_DELETE_FAILED,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                            path = ?delete_path,
+                            operation = "remove_dir",
+                            error_kind = %kind,
+                            "Disk local delete failed"
+                        );
                         return Err(Error::other(FileAccessDeniedWithContext {
                             path: delete_path.clone(),
                             source: err,
@@ -1010,7 +1168,15 @@ impl LocalDisk {
             match err.kind() {
                 ErrorKind::NotFound => (),
                 _ => {
-                    warn!("delete_file remove_file {:?}  err {:?}", &delete_path, &err);
+                    warn!(
+                        event = EVENT_DISK_LOCAL_DELETE_FAILED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        path = ?delete_path,
+                        operation = "remove_file",
+                        error = ?err,
+                        "Disk local delete failed"
+                    );
                     return Err(Error::other(FileAccessDeniedWithContext {
                         path: delete_path.clone(),
                         source: err,
@@ -1119,7 +1285,14 @@ impl LocalDisk {
                     && let Err(er) = access(volume_dir.as_ref()).await
                     && er.kind() == ErrorKind::NotFound
                 {
-                    warn!("read_all_data_with_dmtime os err {:?}", &er);
+                    warn!(
+                        event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        reason = "read_all_data_with_dmtime_volume_not_found",
+                        error = ?er,
+                        "Disk local read fallback failed"
+                    );
                     return Err(DiskError::VolumeNotFound);
                 }
 
@@ -1324,16 +1497,46 @@ impl LocalDisk {
         sum: &[u8],
         shard_size: usize,
     ) -> Result<()> {
-        let file = super::fs::open_file(part_path, O_RDONLY).await.map_err(to_file_error)?;
+        let retry_count = bitrot_size_mismatch_retry_count();
+        let retry_delay = bitrot_size_mismatch_retry_delay();
 
-        let meta = file.metadata().await.map_err(to_file_error)?;
-        let file_size = meta.len() as usize;
+        for attempt in 0..=retry_count {
+            let file = super::fs::open_file(part_path, O_RDONLY).await.map_err(to_file_error)?;
+            let meta = file.metadata().await.map_err(to_file_error)?;
+            let file_size = meta.len() as usize;
 
-        bitrot_verify(Box::new(file), file_size, part_size, algo, Bytes::copy_from_slice(sum), shard_size)
+            match bitrot_verify(
+                Box::new(file),
+                file_size,
+                part_size,
+                algo.clone(),
+                Bytes::copy_from_slice(sum),
+                shard_size,
+            )
             .await
-            .map_err(to_file_error)?;
+            {
+                Ok(()) => return Ok(()),
+                Err(err) if attempt < retry_count && is_bitrot_size_mismatch_error(&err) => {
+                    info!(
+                        event = EVENT_DISK_LOCAL_CHECK_PARTS,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        path = %part_path.display(),
+                        expected_size = part_size,
+                        actual_size = file_size,
+                        retry_attempt = attempt + 1,
+                        retry_count,
+                        retry_delay_ms = retry_delay.as_millis(),
+                        state = "bitrot_retry",
+                        "Disk local check_parts state changed"
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                }
+                Err(err) => return Err(to_file_error(err).into()),
+            }
+        }
 
-        Ok(())
+        Err(DiskError::other("bitrot size mismatch retry loop exhausted"))
     }
 
     #[async_recursion::async_recursion]
@@ -1374,7 +1577,15 @@ impl LocalDisk {
             Ok(res) => res,
             Err(e) => {
                 if e != DiskError::VolumeNotFound && e != Error::FileNotFound {
-                    error!("scan list_dir {}, err {:?}", &current, &e);
+                    error!(
+                        event = EVENT_DISK_LOCAL_SCAN_FAILED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        path = %current,
+                        operation = "list_dir",
+                        error = ?e,
+                        "Disk local scan failed"
+                    );
                     return Err(e);
                 }
 
@@ -1521,11 +1732,20 @@ impl LocalDisk {
                 })
                 .await?;
 
+                let scan_path = pop.clone();
                 if opts.recursive
                     && let Err(er) =
                         Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)).await
                 {
-                    error!("scan_dir err {:?}", er);
+                    error!(
+                        event = EVENT_DISK_LOCAL_SCAN_FAILED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        path = %scan_path,
+                        operation = "scan_dir",
+                        error = ?er,
+                        "Disk local scan failed"
+                    );
                 }
             }
 
@@ -1613,11 +1833,20 @@ impl LocalDisk {
             })
             .await?;
 
+            let scan_path = dir.clone();
             if opts.recursive
                 && let Err(er) =
                     Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)).await
             {
-                warn!("scan_dir err {:?}", &er);
+                warn!(
+                    event = EVENT_DISK_LOCAL_SCAN_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    path = %scan_path,
+                    operation = "scan_dir",
+                    error = ?er,
+                    "Disk local recursive scan failed"
+                );
             }
         }
 
@@ -1672,13 +1901,26 @@ async fn read_file_all(path: impl AsRef<Path>) -> Result<(Bytes, Metadata)> {
     let p = path.as_ref();
     let meta = read_file_metadata(&path).await?;
 
-    let data = fs::read(&p).await.map_err(to_file_error)?;
+    let data = fs::read(&p)
+        .await
+        .inspect_err(|err| {
+            log_startup_disk_io_error("read_file_all", p, err);
+        })
+        .map_err(to_file_error)?;
 
     Ok((data.into(), meta))
 }
 
 async fn read_file_metadata(p: impl AsRef<Path>) -> Result<Metadata> {
-    let meta = fs::metadata(&p).await.map_err(to_file_error)?;
+    let path = p.as_ref();
+    let meta = fs::metadata(path)
+        .await
+        .inspect_err(|err| {
+            if err.kind() != ErrorKind::NotFound {
+                log_startup_disk_io_error("read_file_metadata", path, err);
+            }
+        })
+        .map_err(to_file_error)?;
 
     Ok(meta)
 }
@@ -1831,7 +2073,13 @@ impl DiskAPI for LocalDisk {
         let b = fs::read(&self.format_path).await.map_err(to_unformatted_disk_error)?;
 
         let fm = FormatV3::try_from(b.as_slice()).map_err(|e| {
-            warn!("decode format.json  err {:?}", e);
+            warn!(
+                event = EVENT_DISK_LOCAL_FORMAT_DECODE_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                error = ?e,
+                "Disk local format decode failed"
+            );
             DiskError::CorruptedBackend
         })?;
 
@@ -1943,11 +2191,29 @@ impl DiskAPI for LocalDisk {
             if resp.results[i] == CHECK_PART_UNKNOWN
                 && let Some(err) = err
             {
-                error!("verify_file: failed to bitrot verify file: {:?}, error: {:?}", &part_path, &err);
+                error!(
+                    event = EVENT_DISK_LOCAL_CHECK_PARTS,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    path = ?part_path,
+                    part_number = part.number,
+                    state = "bitrot_verify_failed",
+                    error = ?err,
+                    "Disk local check_parts state changed"
+                );
                 if err == DiskError::FileAccessDenied {
                     continue;
                 }
-                info!("part unknown, disk: {}, path: {:?}", self.to_string(), part_path);
+                info!(
+                    event = EVENT_DISK_LOCAL_CHECK_PARTS,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    endpoint = %self.endpoint,
+                    path = ?part_path,
+                    part_number = part.number,
+                    state = "unknown",
+                    "Disk local check_parts state changed"
+                );
             }
         }
 
@@ -2040,7 +2306,15 @@ impl DiskAPI for LocalDisk {
                 .as_str(),
             )?;
 
-            info!("check_parts: part_path: {:?}", &part_path);
+            debug!(
+                event = EVENT_DISK_LOCAL_CHECK_PARTS,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                path = ?part_path,
+                part_number = part.number,
+                state = "checking",
+                "Disk local check_parts state changed"
+            );
 
             match lstat(&part_path).await {
                 Ok(st) => {
@@ -2056,7 +2330,16 @@ impl DiskAPI for LocalDisk {
                     resp.results[i] = CHECK_PART_SUCCESS;
                 }
                 Err(err) => {
-                    info!("check_parts: failed to stat file: {:?}, error: {:?}", &part_path, &err);
+                    debug!(
+                        event = EVENT_DISK_LOCAL_CHECK_PARTS,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        path = ?part_path,
+                        part_number = part.number,
+                        state = "part_stat_failed",
+                        error = ?err,
+                        "Disk local check_parts state changed"
+                    );
 
                     let e: DiskError = to_file_error(err).into();
 
@@ -2070,7 +2353,16 @@ impl DiskAPI for LocalDisk {
                         }
                         resp.results[i] = CHECK_PART_FILE_NOT_FOUND;
                     } else {
-                        error!("check_parts: failed to stat file: {:?}, error: {:?}", &file_path, &e);
+                        error!(
+                            event = EVENT_DISK_LOCAL_CHECK_PARTS,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                            path = ?file_path,
+                            part_number = part.number,
+                            state = "file_stat_failed",
+                            error = ?e,
+                            "Disk local check_parts state changed"
+                        );
                     }
                     continue;
                 }
@@ -2096,8 +2388,13 @@ impl DiskAPI for LocalDisk {
 
         if !src_is_dir && dst_is_dir || src_is_dir && !dst_is_dir {
             warn!(
-                "rename_part src and dst must be both dir or file src_is_dir:{}, dst_is_dir:{}",
-                src_is_dir, dst_is_dir
+                event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                reason = "src_dst_type_mismatch",
+                src_is_dir,
+                dst_is_dir,
+                "Disk local rename rejected"
             );
             return Err(DiskError::FileAccessDenied);
         }
@@ -2121,7 +2418,14 @@ impl DiskAPI for LocalDisk {
             if let Some(meta) = meta_op
                 && !meta.is_dir()
             {
-                warn!("rename_part src is not dir {:?}", &src_file_path);
+                warn!(
+                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    reason = "src_expected_dir_missing",
+                    path = ?src_file_path,
+                    "Disk local rename rejected"
+                );
                 return Err(DiskError::FileAccessDenied);
             }
 
@@ -2129,7 +2433,14 @@ impl DiskAPI for LocalDisk {
         } else {
             let meta = lstat_std(&src_file_path).map_err(|e| -> DiskError { to_file_error(e).into() })?;
             if meta.is_dir() {
-                warn!("rename_part src is dir {:?}", &src_file_path);
+                warn!(
+                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    reason = "src_unexpected_dir",
+                    path = ?src_file_path,
+                    "Disk local rename rejected"
+                );
                 return Err(DiskError::FileAccessDenied);
             }
         }
@@ -2138,7 +2449,14 @@ impl DiskAPI for LocalDisk {
 
         let dst_meta = lstat_std(&dst_file_path).map_err(|e| -> DiskError { to_file_error(e).into() })?;
         if src_is_dir != dst_meta.is_dir() {
-            warn!("rename_part dst type changed after rename {:?}", &dst_file_path);
+            warn!(
+                event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                reason = "dst_type_changed_after_rename",
+                path = ?dst_file_path,
+                "Disk local rename rejected"
+            );
             return Err(DiskError::FileAccessDenied);
         }
 
@@ -2294,10 +2612,16 @@ impl DiskAPI for LocalDisk {
         let end_offset = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
         if meta.len() < end_offset as u64 {
             error!(
-                "read_file_stream: file size is less than offset + length {} + {} = {}",
+                event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                volume,
+                path,
                 offset,
                 length,
-                meta.len()
+                actual_size = meta.len(),
+                reason = "read_file_stream_out_of_bounds",
+                "Disk local read fallback failed"
             );
             return Err(DiskError::FileCorrupt);
         }
@@ -2336,10 +2660,16 @@ impl DiskAPI for LocalDisk {
         let end_offset = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
         if meta.len() < end_offset as u64 {
             error!(
-                "read_file_zero_copy: file size is less than offset + length {} + {} = {}",
+                event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                volume,
+                path,
                 offset,
                 length,
-                meta.len()
+                actual_size = meta.len(),
+                reason = "read_file_zero_copy_out_of_bounds",
+                "Disk local read fallback failed"
             );
             return Err(DiskError::FileCorrupt);
         }
@@ -2570,7 +2900,15 @@ impl DiskAPI for LocalDisk {
         if !skip_access_checks(src_volume)
             && let Err(e) = super::fs::access_std(&src_volume_dir)
         {
-            info!("access checks failed, src_volume_dir: {:?}, err: {}", src_volume_dir, e.to_string());
+            info!(
+                event = EVENT_DISK_LOCAL_ACCESS_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                path = ?src_volume_dir,
+                operation = "rename_data_src_access",
+                error = %e,
+                "Disk local access check failed"
+            );
             return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
         }
 
@@ -2578,7 +2916,15 @@ impl DiskAPI for LocalDisk {
         if !skip_access_checks(dst_volume)
             && let Err(e) = super::fs::access_std(&dst_volume_dir)
         {
-            info!("access checks failed, dst_volume_dir: {:?}, err: {}", dst_volume_dir, e.to_string());
+            info!(
+                event = EVENT_DISK_LOCAL_ACCESS_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                path = ?dst_volume_dir,
+                operation = "rename_data_dst_access",
+                error = %e,
+                "Disk local access check failed"
+            );
             return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
         }
 
@@ -2669,8 +3015,14 @@ impl DiskAPI for LocalDisk {
             {
                 let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
                 info!(
-                    "rename all failed src_data_path: {:?}, dst_data_path: {:?}, err: {:?}",
-                    src_data_path, dst_data_path, err
+                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    reason = "rename_all_data_path_failed",
+                    src_path = ?src_data_path,
+                    dst_path = ?dst_data_path,
+                    error = ?err,
+                    "Disk local rename flow failed"
                 );
                 return Err(err);
             }
@@ -2679,7 +3031,16 @@ impl DiskAPI for LocalDisk {
                 if let Some((_, dst_data_path)) = has_data_dir_path.as_ref() {
                     let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
                 }
-                info!("rename all failed err: {:?}", err);
+                info!(
+                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    reason = "rename_all_metadata_failed",
+                    src_path = ?src_file_path,
+                    dst_path = ?dst_file_path,
+                    error = ?err,
+                    "Disk local rename flow failed"
+                );
                 return Err(err);
             }
 
@@ -2695,7 +3056,14 @@ impl DiskAPI for LocalDisk {
                     )
                     .await
             {
-                info!("write_all_private failed err: {:?}", err);
+                info!(
+                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    reason = "write_old_metadata_failed",
+                    error = ?err,
+                    "Disk local rename flow failed"
+                );
                 return Err(err);
             }
 
@@ -2806,7 +3174,15 @@ impl DiskAPI for LocalDisk {
             if let Err(e) = self.make_volume(vol).await
                 && e != DiskError::VolumeExists
             {
-                error!("local disk make volumes failed: {e}");
+                error!(
+                    event = EVENT_DISK_LOCAL_VOLUME_SETUP_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    volume = vol,
+                    operation = "make_volumes",
+                    error = %e,
+                    "Disk local volume setup failed"
+                );
                 return Err(e);
             }
             // TODO: health check
@@ -2827,7 +3203,15 @@ impl DiskAPI for LocalDisk {
                 os::make_dir_all(&volume_dir, self.root.as_path()).await?;
                 return Ok(());
             }
-            error!("local disk make volume failed: {e}");
+            error!(
+                event = EVENT_DISK_LOCAL_VOLUME_SETUP_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                volume,
+                operation = "make_volume",
+                error = %e,
+                "Disk local volume setup failed"
+            );
             return Err(to_volume_error(e).into());
         }
 
@@ -3034,7 +3418,15 @@ impl DiskAPI for LocalDisk {
                 let part_path = self.get_object_path(volume, part_path.as_str())?;
 
                 let data = self.read_all_data(volume, volume_dir, part_path.clone()).await.map_err(|e| {
-                    warn!("read_version read_all_data {:?} failed: {e}", part_path);
+                    warn!(
+                        event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        path = ?part_path,
+                        reason = "inline_data_read_failed",
+                        error = %e,
+                        "Disk local read_version fallback failed"
+                    );
                     e
                 })?;
                 fi.data = Some(Bytes::from(data));
@@ -3194,7 +3586,13 @@ impl DiskAPI for LocalDisk {
                     res.mod_time = match meta.modified() {
                         Ok(md) => Some(OffsetDateTime::from(md)),
                         Err(_) => {
-                            warn!("Not supported modified on this platform");
+                            warn!(
+                                event = EVENT_DISK_LOCAL_FORMAT_DECODE_FAILED,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                                reason = "modified_time_unsupported",
+                                "Disk local modified time is unsupported on this platform"
+                            );
                             None
                         }
                     };
@@ -3299,7 +3697,9 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInf
     let drive_path = drive_path.to_string_lossy().to_string();
     check_path_length(&drive_path)?;
 
-    let disk_info = get_info(&drive_path)?;
+    let disk_info = get_info(&drive_path).inspect_err(|err| {
+        log_startup_disk_io_error("get_disk_info_stat", Path::new(&drive_path), err);
+    })?;
     let root_drive = if !*GLOBAL_IsErasureSD.read().await {
         let root_disk_threshold = *GLOBAL_RootDiskThreshold.read().await;
         if root_disk_threshold > 0 {
@@ -4392,5 +4792,11 @@ mod test {
                 assert!(!should_reclaim_file_cache_after_read(1024));
             });
         });
+    }
+
+    #[test]
+    fn test_is_bitrot_size_mismatch_error_only_matches_target_message() {
+        assert!(is_bitrot_size_mismatch_error(&std::io::Error::other("bitrot shard file size mismatch")));
+        assert!(!is_bitrot_size_mismatch_error(&std::io::Error::other("bitrot hash mismatch")));
     }
 }

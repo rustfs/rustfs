@@ -34,6 +34,7 @@ pub mod metrics_realtime;
 pub mod notification_sys;
 pub mod pools;
 pub mod rebalance;
+pub mod rio;
 pub mod rpc;
 pub mod set_disk;
 mod sets;
@@ -53,10 +54,19 @@ mod pools_test;
 mod store_test;
 pub mod tier;
 
-pub use global::new_object_layer_fn;
 pub use global::set_global_endpoints;
 pub use global::update_erasure_type;
 pub use global::{get_global_lock_client, get_global_lock_clients, set_global_lock_client, set_global_lock_clients};
+pub use global::{new_object_layer_fn, resolve_object_store_handle, set_object_store_resolver};
 
 pub use global::GLOBAL_Endpoints;
 pub use store_api::StorageAPI;
+
+#[cfg(test)]
+mod rio_tests {
+    #[test]
+    fn uses_expected_rio_backend() {
+        let expected = if cfg!(feature = "rio-v2") { "rio-v2" } else { "legacy-rio" };
+        assert_eq!(crate::rio::backend_name(), expected);
+    }
+}

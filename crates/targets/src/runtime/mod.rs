@@ -13,6 +13,8 @@
 // limitations under the License.
 
 pub mod adapter;
+pub mod ops_diagnostics;
+pub mod s3_hooks;
 pub mod sidecar;
 pub mod sidecar_protocol;
 pub mod tls;

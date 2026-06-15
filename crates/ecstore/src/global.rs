@@ -171,6 +171,21 @@ pub fn new_object_layer_fn() -> Option<Arc<ECStore>> {
     GLOBAL_OBJECT_API.get().cloned()
 }
 
+pub type ObjectStoreResolver = dyn Fn() -> Option<Arc<ECStore>> + Send + Sync + 'static;
+
+static GLOBAL_OBJECT_STORE_RESOLVER: OnceLock<Arc<ObjectStoreResolver>> = OnceLock::new();
+
+pub fn set_object_store_resolver(resolver: Arc<ObjectStoreResolver>) -> bool {
+    GLOBAL_OBJECT_STORE_RESOLVER.set(resolver).is_ok()
+}
+
+pub fn resolve_object_store_handle() -> Option<Arc<ECStore>> {
+    GLOBAL_OBJECT_STORE_RESOLVER
+        .get()
+        .and_then(|resolver| resolver())
+        .or_else(new_object_layer_fn)
+}
+
 /// Set the global object layer
 ///
 /// # Arguments

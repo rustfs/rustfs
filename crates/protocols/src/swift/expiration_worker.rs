@@ -57,6 +57,14 @@ use tokio::sync::RwLock;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SWIFT_EXPIRATION: &str = "swift_expiration_worker";
+const EVENT_SWIFT_EXPIRATION_WORKER_STATE: &str = "swift_expiration_worker_state";
+const EVENT_SWIFT_EXPIRATION_OBJECT_TRACKING: &str = "swift_expiration_object_tracking";
+const EVENT_SWIFT_EXPIRATION_ITERATION_SUMMARY: &str = "swift_expiration_iteration_summary";
+const EVENT_SWIFT_EXPIRATION_DELETE_STATE: &str = "swift_expiration_delete_state";
+const EVENT_SWIFT_EXPIRATION_SCAN_STATE: &str = "swift_expiration_scan_state";
+
 /// Configuration for expiration worker
 #[derive(Debug, Clone)]
 pub struct ExpirationWorkerConfig {
@@ -156,15 +164,29 @@ impl ExpirationWorker {
     pub async fn start(&self) {
         let mut running = self.running.write().await;
         if *running {
-            warn!("Expiration worker already running");
+            warn!(
+                event = EVENT_SWIFT_EXPIRATION_WORKER_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SWIFT_EXPIRATION,
+                result = "already_running",
+                worker_id = self.config.worker_id,
+                max_workers = self.config.max_workers,
+                "swift expiration worker state changed"
+            );
             return;
         }
         *running = true;
         drop(running);
 
         info!(
-            "Starting expiration worker (scan_interval={}s, worker_id={}/{})",
-            self.config.scan_interval_secs, self.config.worker_id, self.config.max_workers
+            event = EVENT_SWIFT_EXPIRATION_WORKER_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_EXPIRATION,
+            state = "started",
+            scan_interval_secs = self.config.scan_interval_secs,
+            worker_id = self.config.worker_id,
+            max_workers = self.config.max_workers,
+            "swift expiration worker state changed"
         );
 
         let config = self.config.clone();
@@ -180,13 +202,28 @@ impl ExpirationWorker {
 
                 // Check if still running
                 if !*running.read().await {
-                    info!("Expiration worker stopped");
+                    info!(
+                        event = EVENT_SWIFT_EXPIRATION_WORKER_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SWIFT_EXPIRATION,
+                        state = "stopped",
+                        worker_id = config.worker_id,
+                        "swift expiration worker state changed"
+                    );
                     break;
                 }
 
                 // Run cleanup iteration
                 if let Err(e) = Self::cleanup_iteration(&config, &priority_queue, &metrics).await {
-                    error!("Expiration cleanup iteration failed: {}", e);
+                    error!(
+                        event = EVENT_SWIFT_EXPIRATION_ITERATION_SUMMARY,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SWIFT_EXPIRATION,
+                        result = "error",
+                        worker_id = config.worker_id,
+                        error = %e,
+                        "swift expiration iteration summary"
+                    );
                     metrics.write().await.error_count += 1;
                 }
             }
@@ -197,7 +234,14 @@ impl ExpirationWorker {
     pub async fn stop(&self) {
         let mut running = self.running.write().await;
         *running = false;
-        info!("Stopping expiration worker");
+        info!(
+            event = EVENT_SWIFT_EXPIRATION_WORKER_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_EXPIRATION,
+            state = "stopping",
+            worker_id = self.config.worker_id,
+            "swift expiration worker state changed"
+        );
     }
 
     /// Get current metrics
@@ -213,7 +257,17 @@ impl ExpirationWorker {
 
         // Check if this worker should handle this object (distributed hashing)
         if !self.should_handle_object(&path) {
-            debug!("Skipping object {} (handled by different worker)", path);
+            debug!(
+                event = EVENT_SWIFT_EXPIRATION_OBJECT_TRACKING,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SWIFT_EXPIRATION,
+                state = "skipped",
+                reason = "assigned_to_other_worker",
+                path = %path,
+                worker_id = self.config.worker_id,
+                max_workers = self.config.max_workers,
+                "swift expiration object tracking changed"
+            );
             return;
         }
 
@@ -225,7 +279,16 @@ impl ExpirationWorker {
         let mut queue = self.priority_queue.write().await;
         queue.push(Reverse(entry));
 
-        debug!("Tracking object {} for expiration at {}", path, expires_at);
+        debug!(
+            event = EVENT_SWIFT_EXPIRATION_OBJECT_TRACKING,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_EXPIRATION,
+            state = "tracked",
+            path = %path,
+            expires_at,
+            worker_id = self.config.worker_id,
+            "swift expiration object tracking changed"
+        );
     }
 
     /// Remove object from expiration tracking
@@ -238,7 +301,15 @@ impl ExpirationWorker {
         // the cleanup iteration to skip objects that no longer exist.
         // This is acceptable because the queue size is bounded and cleanup is periodic.
 
-        debug!("Untracking object {} from expiration", path);
+        debug!(
+            event = EVENT_SWIFT_EXPIRATION_OBJECT_TRACKING,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_EXPIRATION,
+            state = "untracked",
+            path = %path,
+            worker_id = self.config.worker_id,
+            "swift expiration object tracking changed"
+        );
     }
 
     /// Check if this worker should handle the given object (consistent hashing)
@@ -273,7 +344,15 @@ impl ExpirationWorker {
         let start_time = SystemTime::now();
         let now = start_time.duration_since(UNIX_EPOCH).unwrap().as_secs();
 
-        info!("Starting expiration cleanup iteration (worker_id={})", config.worker_id);
+        debug!(
+            event = EVENT_SWIFT_EXPIRATION_ITERATION_SUMMARY,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_EXPIRATION,
+            state = "started",
+            worker_id = config.worker_id,
+            batch_size = config.batch_size,
+            "swift expiration iteration summary"
+        );
 
         let mut deleted_count = 0;
         let mut scanned_count = 0;
@@ -313,7 +392,15 @@ impl ExpirationWorker {
             // Parse path: "account/container/object"
             let parts: Vec<&str> = entry.path.splitn(3, '/').collect();
             if parts.len() != 3 {
-                warn!("Invalid expiration entry path: {}", entry.path);
+                warn!(
+                    event = EVENT_SWIFT_EXPIRATION_DELETE_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SWIFT_EXPIRATION,
+                    result = "invalid_path",
+                    path = %entry.path,
+                    worker_id = config.worker_id,
+                    "swift expiration delete state changed"
+                );
                 continue;
             }
 
@@ -323,13 +410,42 @@ impl ExpirationWorker {
             match Self::delete_expired_object(account, container, object, entry.expires_at).await {
                 Ok(true) => {
                     deleted_count += 1;
-                    info!("Deleted expired object: {}", entry.path);
+                    debug!(
+                        event = EVENT_SWIFT_EXPIRATION_DELETE_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SWIFT_EXPIRATION,
+                        result = "deleted",
+                        path = %entry.path,
+                        expires_at = entry.expires_at,
+                        worker_id = config.worker_id,
+                        "swift expiration delete state changed"
+                    );
                 }
                 Ok(false) => {
-                    debug!("Object {} no longer exists or expiration removed", entry.path);
+                    debug!(
+                        event = EVENT_SWIFT_EXPIRATION_DELETE_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SWIFT_EXPIRATION,
+                        result = "not_deleted",
+                        reason = "missing_or_expiration_removed",
+                        path = %entry.path,
+                        expires_at = entry.expires_at,
+                        worker_id = config.worker_id,
+                        "swift expiration delete state changed"
+                    );
                 }
                 Err(e) => {
-                    error!("Failed to delete expired object {}: {}", entry.path, e);
+                    error!(
+                        event = EVENT_SWIFT_EXPIRATION_DELETE_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SWIFT_EXPIRATION,
+                        result = "delete_failed",
+                        path = %entry.path,
+                        expires_at = entry.expires_at,
+                        worker_id = config.worker_id,
+                        error = %e,
+                        "swift expiration delete state changed"
+                    );
                     metrics.write().await.error_count += 1;
                 }
             }
@@ -345,8 +461,17 @@ impl ExpirationWorker {
         m.queue_size = priority_queue.read().await.len();
 
         info!(
-            "Expiration cleanup iteration complete: scanned={}, deleted={}, duration={}ms, queue_size={}",
-            scanned_count, deleted_count, m.last_scan_duration_ms, m.queue_size
+            event = EVENT_SWIFT_EXPIRATION_ITERATION_SUMMARY,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_EXPIRATION,
+            state = "completed",
+            worker_id = config.worker_id,
+            scanned_count,
+            deleted_count,
+            duration_ms = m.last_scan_duration_ms,
+            queue_size = m.queue_size,
+            error_count = m.error_count,
+            "swift expiration iteration summary"
         );
 
         Ok(())
@@ -368,8 +493,15 @@ impl ExpirationWorker {
 
         // For now, we'll log the deletion
         debug!(
-            "Would delete expired object: {}/{}/{} (expires_at={})",
-            account, container, object, expected_expires_at
+            event = EVENT_SWIFT_EXPIRATION_DELETE_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_EXPIRATION,
+            state = "delete_candidate",
+            account = %account,
+            container = %container,
+            object = %object,
+            expires_at = expected_expires_at,
+            "swift expiration delete state changed"
         );
 
         // TODO: Integrate with actual object storage
@@ -390,13 +522,28 @@ impl ExpirationWorker {
     /// This is used for initial population or recovery after restart.
     /// In production, objects should be tracked incrementally via track_object().
     pub async fn scan_all_objects(&self) -> SwiftResult<()> {
-        info!("Starting full scan of objects with expiration (worker_id={})", self.config.worker_id);
+        info!(
+            event = EVENT_SWIFT_EXPIRATION_SCAN_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_EXPIRATION,
+            state = "started",
+            worker_id = self.config.worker_id,
+            max_workers = self.config.max_workers,
+            "swift expiration scan state changed"
+        );
 
         // TODO: This would integrate with the storage layer to list all objects
         // For each object with X-Delete-At metadata, call track_object()
 
         // Placeholder implementation
-        warn!("Full object scan not yet implemented - requires storage layer integration");
+        warn!(
+            event = EVENT_SWIFT_EXPIRATION_SCAN_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_EXPIRATION,
+            result = "unimplemented",
+            worker_id = self.config.worker_id,
+            "swift expiration scan state changed"
+        );
 
         Ok(())
     }

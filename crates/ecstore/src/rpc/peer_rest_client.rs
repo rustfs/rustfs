@@ -52,7 +52,7 @@ use tokio::{net::TcpStream, time::Duration};
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
-use tracing::warn;
+use tracing::{Instrument, warn};
 
 pub const PEER_RESTSIGNAL: &str = "signal";
 pub const PEER_RESTSUB_SYS: &str = "sub-sys";
@@ -78,6 +78,16 @@ pub struct PeerRestClient {
 }
 
 impl PeerRestClient {
+    fn recovery_monitor_span(grid_host: &str) -> tracing::Span {
+        tracing::info_span!(
+            "recovery-monitor",
+            component = "ecstore",
+            subsystem = "peer_rest_client",
+            kind = "peer_rest",
+            grid_host = %grid_host
+        )
+    }
+
     pub fn new(host: XHost, grid_host: String) -> Self {
         Self {
             host,
@@ -172,28 +182,47 @@ impl PeerRestClient {
         let grid_host = self.grid_host.clone();
         let offline = Arc::clone(&self.offline);
         let recovery_running = Arc::clone(&self.recovery_running);
-        tokio::spawn(async move {
-            let mut delay = get_drive_active_check_interval();
-            let connect_timeout = get_drive_active_check_timeout();
+        let span = Self::recovery_monitor_span(&grid_host);
+        tokio::spawn(
+            async move {
+                let mut delay = get_drive_active_check_interval();
+                let connect_timeout = get_drive_active_check_timeout();
 
-            for _ in 0..PEER_REST_RECOVERY_MAX_ATTEMPTS {
-                tokio::time::sleep(delay).await;
-                if Self::perform_connectivity_check(&grid_host, connect_timeout).await.is_ok() {
-                    offline.store(false, Ordering::Release);
-                    recovery_running.store(false, Ordering::Release);
-                    return;
+                for _ in 0..PEER_REST_RECOVERY_MAX_ATTEMPTS {
+                    tokio::time::sleep(delay).await;
+                    if Self::perform_connectivity_check(&grid_host, connect_timeout).await.is_ok() {
+                        offline.store(false, Ordering::Release);
+                        recovery_running.store(false, Ordering::Release);
+                        return;
+                    }
+
+                    delay = std::cmp::min(delay.saturating_mul(2), PEER_REST_RECOVERY_MAX_BACKOFF);
                 }
 
-                delay = std::cmp::min(delay.saturating_mul(2), PEER_REST_RECOVERY_MAX_BACKOFF);
+                warn!(
+                    grid_host = %grid_host,
+                    attempts = PEER_REST_RECOVERY_MAX_ATTEMPTS,
+                    "peer recovery monitor reached max attempts; will retry on next request"
+                );
+                recovery_running.store(false, Ordering::Release);
             }
+            .instrument(span),
+        );
+    }
 
-            warn!(
-                grid_host = %grid_host,
-                attempts = PEER_REST_RECOVERY_MAX_ATTEMPTS,
-                "peer recovery monitor reached max attempts; will retry on next request"
-            );
-            recovery_running.store(false, Ordering::Release);
-        });
+    #[cfg(test)]
+    fn spawn_recovery_monitor_log_probe_for_test(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let grid_host = self.grid_host.clone();
+        let span = Self::recovery_monitor_span(&grid_host);
+        tokio::spawn(
+            async move {
+                warn!(grid_host = %grid_host, "peer recovery monitor log probe");
+                let _ = tx.send(());
+            }
+            .instrument(span),
+        );
+        rx
     }
 
     async fn perform_connectivity_check(addr: &str, timeout_duration: Duration) -> Result<()> {
@@ -956,6 +985,58 @@ impl PeerRestClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::{Registry, fmt::MakeWriter, layer::SubscriberExt};
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct CapturedLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CapturedLogs {
+        fn lines(&self) -> Vec<Value> {
+            let buffer = self
+                .buffer
+                .lock()
+                .expect("captured logs mutex should not be poisoned")
+                .clone();
+            String::from_utf8(buffer)
+                .expect("captured logs should be valid UTF-8")
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).expect("captured log line should be valid JSON"))
+                .collect()
+        }
+    }
+
+    impl Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("captured logs mutex should not be poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
 
     fn test_peer_client() -> PeerRestClient {
         PeerRestClient::new(
@@ -1010,5 +1091,41 @@ mod tests {
 
         assert!(matches!(err, Error::VolumeNotFound));
         assert!(!client.offline.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_rest_recovery_probe_logs_keep_request_id_span_context() {
+        let logs = CapturedLogs::default();
+        let subscriber = Registry::default().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .without_time()
+                .json()
+                .flatten_event(true)
+                .with_current_span(true)
+                .with_span_list(true),
+        );
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let client = test_peer_client();
+        let span = tracing::info_span!("request-span", request_id = "req-peer-rest");
+        let _entered = span.enter();
+        let done = client.spawn_recovery_monitor_log_probe_for_test();
+        done.await.expect("recovery monitor probe should signal completion");
+
+        let log = logs
+            .lines()
+            .into_iter()
+            .find(|value| value.get("message").and_then(Value::as_str) == Some("peer recovery monitor log probe"))
+            .expect("expected peer recovery monitor probe log");
+
+        assert_eq!(log["span"]["name"], Value::String("recovery-monitor".to_string()));
+        assert_eq!(log["span"]["kind"], Value::String("peer_rest".to_string()));
+        let spans = log["spans"].as_array().expect("spans should be present");
+        assert!(spans.iter().any(|span| {
+            span.get("name").and_then(Value::as_str) == Some("request-span")
+                && span.get("request_id").and_then(Value::as_str) == Some("req-peer-rest")
+        }));
     }
 }

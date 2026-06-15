@@ -69,10 +69,7 @@ impl SetDisks {
             "File info read complete"
         );
         if DiskError::is_all_not_found(&errs) {
-            warn!(
-                "heal_object failed, all obj part not found, bucket: {}, obj: {}, version_id: {}",
-                bucket, object, version_id
-            );
+            debug!(bucket, object, version_id, "heal_object skipped missing object");
             let err = if !version_id.is_empty() {
                 DiskError::FileVersionNotFound
             } else {

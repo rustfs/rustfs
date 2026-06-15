@@ -22,10 +22,11 @@ use metrics::counter;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::policy_sys::PolicySys;
 use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found};
-use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::resolve_object_store_handle;
+use rustfs_ecstore::store::ECStore;
 use rustfs_ecstore::store_api::BucketOperations;
 use rustfs_iam::error::Error as IamError;
-use rustfs_policy::policy::action::{Action, S3Action};
+use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
 use rustfs_policy::policy::{
     Args, BucketPolicy, BucketPolicyArgs, bucket_policy_needs_existing_object_tag_for_args,
     bucket_policy_uses_existing_object_tag_conditions,
@@ -501,6 +502,8 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         };
 
         if iam_allowed {
+            authorize_table_data_plane_if_needed(action, bucket.as_str(), object.as_str(), cred, is_owner, &conditions, claims)
+                .await?;
             return Ok(());
         }
 
@@ -516,6 +519,8 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         .await;
 
         if policy_allowed_fallback {
+            authorize_table_data_plane_if_needed(action, bucket.as_str(), object.as_str(), cred, is_owner, &conditions, claims)
+                .await?;
             return Ok(());
         }
 
@@ -664,6 +669,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             .await;
 
             if policy_allowed {
+                deny_anonymous_table_data_plane_if_needed(action, bucket.as_str(), object.as_str()).await?;
                 // RestrictPublicBuckets: when true, deny public access even if bucket policy allows it.
                 match metadata_sys::get_public_access_block_config(bucket_name).await {
                     Ok((config, _)) => {
@@ -737,6 +743,146 @@ fn complete_multipart_upload_authorize_action() -> Action {
 
 fn list_parts_authorize_action() -> Action {
     Action::S3Action(S3Action::ListMultipartUploadPartsAction)
+}
+
+fn table_data_plane_admin_action(action: Action) -> Option<AdminAction> {
+    match action {
+        Action::S3Action(
+            S3Action::GetObjectAction
+            | S3Action::GetObjectAclAction
+            | S3Action::GetObjectVersionAction
+            | S3Action::GetObjectAttributesAction
+            | S3Action::GetObjectVersionAttributesAction
+            | S3Action::GetObjectTaggingAction
+            | S3Action::GetObjectVersionTaggingAction
+            | S3Action::GetObjectRetentionAction
+            | S3Action::GetObjectLegalHoldAction
+            | S3Action::GetObjectVersionForReplicationAction,
+        ) => Some(AdminAction::GetTableMetadataAction),
+        Action::S3Action(
+            S3Action::PutObjectAction
+            | S3Action::PutObjectAclAction
+            | S3Action::DeleteObjectAction
+            | S3Action::DeleteObjectVersionAction
+            | S3Action::PutObjectTaggingAction
+            | S3Action::PutObjectVersionTaggingAction
+            | S3Action::DeleteObjectTaggingAction
+            | S3Action::DeleteObjectVersionTaggingAction
+            | S3Action::PutObjectRetentionAction
+            | S3Action::PutObjectLegalHoldAction
+            | S3Action::BypassGovernanceRetentionAction
+            | S3Action::AbortMultipartUploadAction
+            | S3Action::ListMultipartUploadPartsAction
+            | S3Action::RestoreObjectAction
+            | S3Action::ReplicateObjectAction
+            | S3Action::ReplicateDeleteAction
+            | S3Action::ReplicateTagsAction
+            | S3Action::PutObjectFanOutAction,
+        ) => Some(AdminAction::SetTableMetadataAction),
+        _ => None,
+    }
+}
+
+fn table_catalog_store_for_data_plane() -> S3Result<crate::table_catalog::EcStoreTableCatalogStore<ECStore>> {
+    let store = resolve_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
+    let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new(store);
+    Ok(crate::table_catalog::ObjectTableCatalogStore::new(backend))
+}
+
+async fn table_data_plane_resource_for_request(
+    bucket: &str,
+    object: &str,
+) -> S3Result<Option<crate::table_catalog::TableDataPlaneResource>> {
+    if bucket.is_empty() || object.is_empty() {
+        return Ok(None);
+    }
+
+    match metadata_sys::get(bucket).await {
+        Ok(metadata) if metadata.table_bucket_enabled() => {}
+        Ok(_) | Err(StorageError::ConfigNotFound) => return Ok(None),
+        Err(err) if is_err_bucket_not_found(&err) => return Ok(None),
+        Err(err) => {
+            tracing::warn!(
+                bucket = %bucket,
+                error = %err,
+                "failed to load bucket metadata while authorizing table data-plane access"
+            );
+            return Err(s3_error!(AccessDenied, "Access Denied"));
+        }
+    }
+
+    let store = table_catalog_store_for_data_plane()?;
+    crate::table_catalog::table_data_plane_resource_for_object(&store, bucket, object)
+        .await
+        .map_err(|err| {
+            tracing::warn!(
+                bucket = %bucket,
+                object = %object,
+                error = %err,
+                "failed to resolve table data-plane resource"
+            );
+            s3_error!(AccessDenied, "Access Denied")
+        })
+}
+
+async fn authorize_table_data_plane_if_needed(
+    action: Action,
+    bucket: &str,
+    object: &str,
+    cred: &rustfs_credentials::Credentials,
+    is_owner: bool,
+    conditions: &HashMap<String, Vec<String>>,
+    claims: &HashMap<String, serde_json::Value>,
+) -> S3Result<()> {
+    let Some(admin_action) = table_data_plane_admin_action(action) else {
+        return Ok(());
+    };
+    let Some(resource) = table_data_plane_resource_for_request(bucket, object).await? else {
+        return Ok(());
+    };
+    let Ok(iam_store) = rustfs_iam::get() else {
+        return Err(s3_error!(InternalError, "iam not init"));
+    };
+
+    let resource_object = resource.catalog_resource_object();
+    let allowed = iam_store
+        .is_allowed(&Args {
+            account: &cred.access_key,
+            groups: &cred.groups,
+            action: Action::AdminAction(admin_action),
+            bucket: resource.table_bucket.as_str(),
+            conditions,
+            is_owner,
+            object: resource_object.as_str(),
+            claims,
+            deny_only: false,
+        })
+        .await;
+    if allowed {
+        return Ok(());
+    }
+
+    tracing::debug!(
+        bucket = %bucket,
+        object = %object,
+        table_bucket = %resource.table_bucket,
+        table_namespace = %resource.namespace,
+        table = %resource.table,
+        table_id = %resource.table_id,
+        ?admin_action,
+        "table data-plane access denied by table resource policy"
+    );
+    Err(s3_error!(AccessDenied, "Access Denied"))
+}
+
+async fn deny_anonymous_table_data_plane_if_needed(action: Action, bucket: &str, object: &str) -> S3Result<()> {
+    if table_data_plane_admin_action(action).is_none() {
+        return Ok(());
+    }
+    if table_data_plane_resource_for_request(bucket, object).await?.is_some() {
+        return Err(s3_error!(AccessDenied, "Access Denied"));
+    }
+    Ok(())
 }
 
 fn validate_post_object_success_controls(input: &PostObjectInput) -> S3Result<()> {
@@ -1037,7 +1183,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_object(&self, req: &mut S3Request<DeleteObjectInput>) -> S3Result<()> {
-        if let Some(store) = new_object_layer_fn()
+        if let Some(store) = resolve_object_store_handle()
             && let Err(err) = store.get_bucket_info(&req.input.bucket, &Default::default()).await
             && is_err_bucket_not_found(&err)
         {
@@ -1952,6 +2098,31 @@ mod tests {
     #[test]
     fn list_parts_uses_list_multipart_upload_parts_action() {
         assert_eq!(list_parts_authorize_action(), Action::S3Action(S3Action::ListMultipartUploadPartsAction));
+    }
+
+    #[test]
+    fn table_data_plane_admin_action_maps_s3_object_operations() {
+        assert_eq!(
+            table_data_plane_admin_action(Action::S3Action(S3Action::GetObjectAction)),
+            Some(rustfs_policy::policy::action::AdminAction::GetTableMetadataAction)
+        );
+        assert_eq!(
+            table_data_plane_admin_action(Action::S3Action(S3Action::PutObjectAction)),
+            Some(rustfs_policy::policy::action::AdminAction::SetTableMetadataAction)
+        );
+        assert_eq!(
+            table_data_plane_admin_action(Action::S3Action(S3Action::PutObjectTaggingAction)),
+            Some(rustfs_policy::policy::action::AdminAction::SetTableMetadataAction)
+        );
+        assert_eq!(
+            table_data_plane_admin_action(Action::S3Action(S3Action::DeleteObjectAction)),
+            Some(rustfs_policy::policy::action::AdminAction::SetTableMetadataAction)
+        );
+        assert_eq!(
+            table_data_plane_admin_action(Action::S3Action(S3Action::GetObjectTaggingAction)),
+            Some(rustfs_policy::policy::action::AdminAction::GetTableMetadataAction)
+        );
+        assert_eq!(table_data_plane_admin_action(Action::S3Action(S3Action::ListBucketAction)), None);
     }
 
     #[test]

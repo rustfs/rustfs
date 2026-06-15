@@ -30,7 +30,7 @@ workspace = true
 [dependencies]
 # Core dependencies
 async-trait = { workspace = true }
-tokio = { workspace = true, features = ["full","io-uring"] }
+tokio = { workspace = true, features = ["full"] }
 uuid = { workspace = true, features = ["serde"] }
 jiff = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -57,6 +57,7 @@ moka = { workspace = true, features = ["future"] }
 md5 = { workspace = true }
 arc-swap = { workspace = true }
 rustfs-utils = { workspace = true }
+rustfs-security-governance = { workspace = true }
 
 # HTTP client for Vault
 reqwest = { workspace = true }
@@ -68,3 +69,7 @@ temp-env = { workspace = true }
 
 [features]
 default = []
+
+# io-uring is Linux-only. Scope the feature to Linux targets.
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio = { workspace = true, features = ["io-uring"] }

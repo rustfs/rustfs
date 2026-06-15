@@ -28,6 +28,7 @@ use rustfs_config::notify::{
     NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_REDIS_DEFAULT_CHANNEL, NOTIFY_REDIS_KEYS,
     NOTIFY_REDIS_SUB_SYS, NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
+use rustfs_config::server_config::KVS;
 use rustfs_config::{
     AUDIT_DEFAULT_DIR, EVENT_DEFAULT_DIR,
     audit::{
@@ -35,7 +36,6 @@ use rustfs_config::{
         AUDIT_POSTGRES_SUB_SYS, AUDIT_PULSAR_SUB_SYS, AUDIT_REDIS_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS,
     },
 };
-use rustfs_ecstore::config::KVS;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 

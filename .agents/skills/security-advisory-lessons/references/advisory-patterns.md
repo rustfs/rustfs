@@ -20,6 +20,8 @@ Update this file only when an advisory adds or changes a reusable lesson, affect
 - `GHSA-mm2q-qcmx-gw4w`: `ListServiceAccount` used `UpdateServiceAccountAdminAction`, while update lacked target ownership checks. Lesson: exact action constants and ownership checks are both required; information disclosure can chain into secret rotation and takeover.
 - `GHSA-vcwh-pff9-64cc`: `ImportIam` checked `ExportIAMAction` for an import/write operation. Lesson: every admin handler must authorize the action it actually performs.
 - `GHSA-jqmc-mg33-v45g` and `GHSA-8784-9m7f-c6p6`: `/profile/cpu` and `/profile/memory` were whitelisted from auth and allowed expensive diagnostics plus path disclosure. Lesson: profiling/debug endpoints need admin auth, opt-in, rate limits, and non-sensitive responses.
+- `GHSA-f5cv-v44x-2xgf`: `/rustfs/admin/v3/metrics` accepted any authenticated IAM user and skipped admin authorization. Lesson: read-only metrics and diagnostic admin endpoints still require an operation-specific admin action check.
+- `GHSA-796f-j7xp-hwf4`: `/rustfs/admin/v3/list-remote-targets` checked only that credentials existed and leaked replication target credentials. Lesson: replication target reads are privileged admin operations, and stored remote credentials require strict authz plus response redaction review.
 - `GHSA-xp32-gxq2-3v52`: console license metadata endpoint was public and exposed subject and expiration fields. Lesson: management metadata endpoints should require admin auth or return only coarse public status.
 
 ### IAM import, service accounts, and privilege boundaries
@@ -33,6 +35,11 @@ Update this file only when an advisory adds or changes a reusable lesson, affect
 - `GHSA-mx42-j6wv-px98`: `UploadPartCopy` missed source authorization and allowed cross-bucket object exfiltration. Lesson: multipart copy must enforce the same source and destination contract as `CopyObject`.
 - `GHSA-wfxj-ph3v-7mjf`: `UploadPartCopy` checked source and destination independently but missed destination copy-source policy constraints. Lesson: source read and destination write checks are not sufficient when policy constrains allowed copy sources.
 - `GHSA-w5fh-f8xh-5x3p`: presigned POST accepted uploads without enforcing signed policy conditions. Lesson: parse and enforce all POST policy constraints server-side, including size, key prefix, and content type.
+
+### Protocol frontends and IAM parity
+
+- `GHSA-3g29-xff2-92vp`: FTP `RETR` and `SIZE`/`MDTM` read paths authenticated the user but skipped IAM before calling storage. Lesson: non-HTTP protocol frontends must enforce the same per-operation authorization as the S3 API before backend access.
+- `GHSA-g3vq-vv42-f647`: FTPS `MKD` called `create_bucket` without checking `s3:CreateBucket`. Lesson: protocol command handlers need action-specific checks even when sibling handlers already authorize correctly.
 
 ### Filesystem paths and object key traversal
 
@@ -84,6 +91,7 @@ Use these targeted searches when a diff touches security-sensitive code:
 
 ```bash
 rg -n "validate_admin_request|check_permissions|AdminAction::|deny_only|is_allowed" rustfs crates
+rg -n "authorize_operation|FtpsDriver|SftpDriver|RETR|MKD|SIZE|MDTM|CreateBucket|GetObject|HeadObject" crates/protocols rustfs
 rg -n "UploadPartCopy|upload_part_copy|CompleteMultipart|PostObject|content-length-range|starts-with" rustfs crates
 rg -n "normalize_extract_entry_key|Snowball|auto-extract|PathBuf::join|canonicalize|\\.\\.|x-forwarded-for|x-real-ip|SourceIp" rustfs crates
 rg -n "DEFAULT_SECRET|DEFAULT_ACCESS|TEST_PRIVATE_KEY|rustfs rpc|RUSTFS_RPC_SECRET" rustfs crates
@@ -96,6 +104,7 @@ rg -n "deny_unknown_fields|serde.default|as u32|as usize|as i32" rustfs crates
 ## Minimum Regression Test Expectations
 
 - Authz fixes: include unauthenticated, valid low-privilege, wrong-action, correct-action, owner, non-owner, and root/admin cases as applicable.
+- Protocol frontend authz fixes: include denied `RETR`, `SIZE`/`MDTM`, `MKD`, bucket probe, and sibling allowed-operation cases, and assert denied paths do not reach the storage backend.
 - IAM fixes: include import/update/list service-account cases with attacker-controlled parent, claims, access key, secret key, and policy.
 - Copy/upload fixes: include cross-bucket, cross-user, source-denied, destination-denied, copy-source-condition, and multipart completion cases.
 - Path fixes: include encoded traversal, absolute path, nested traversal, archive entries with `..`, valid object keys that resemble traversal text but should be rejected, and canonical bucket/prefix boundary checks.

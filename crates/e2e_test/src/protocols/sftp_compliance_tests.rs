@@ -123,7 +123,6 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use russh::client;
 use russh_sftp::client::{Config, SftpSession};
 use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
-#[cfg(target_os = "linux")]
 use rustfs_config::ENV_SFTP_IDLE_TIMEOUT;
 use rustfs_config::{
     ENV_CONSOLE_ENABLE, ENV_RUSTFS_ADDRESS, ENV_SFTP_ADDRESS, ENV_SFTP_ENABLE, ENV_SFTP_HOST_KEY_DIR, ENV_SFTP_PART_SIZE,
@@ -134,7 +133,6 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
-#[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
@@ -143,7 +141,6 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWri
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::process::{Child, Command};
-#[cfg(target_os = "linux")]
 use tokio::time::sleep;
 use tokio::time::timeout;
 use tracing::info;
@@ -412,13 +409,11 @@ fn capture_server_stdout(child: &mut Child) -> Arc<tokio::sync::Mutex<Vec<String
 /// lifecycle cases (CMPTST-24, CMPTST-25, CMPTST-26) read both fields
 /// to assert the watchdog killed silent sessions on the expected path.
 #[derive(Default)]
-#[cfg(target_os = "linux")]
 struct SessionCounters {
     entered: AtomicUsize,
     finished: AtomicUsize,
 }
 
-#[cfg(target_os = "linux")]
 impl SessionCounters {
     fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -432,7 +427,6 @@ impl SessionCounters {
 /// increments the matching counter for every server-side session
 /// lifecycle event. The task ends when stdout closes (i.e. when the
 /// child is killed at teardown).
-#[cfg(target_os = "linux")]
 fn watch_session_lifecycle_events(child: &mut Child, counters: Arc<SessionCounters>) {
     let Some(stdout) = child.stdout.take() else {
         return;
@@ -2093,7 +2087,6 @@ pub(crate) mod cmptst_25 {
 }
 
 // CMPTST-26: healthy idle session past the watchdog fast-kill threshold stays alive.
-#[cfg(target_os = "linux")]
 pub(crate) mod cmptst_26 {
     use super::*;
 
@@ -2108,20 +2101,21 @@ pub(crate) mod cmptst_26 {
     // Idle timeout for the spawned server. 300 s sits well above the
     // wait window so russh's own inactivity_timeout cannot kill during
     // the test. The contract: a healthy idle session past the
-    // watchdog's fast-kill threshold MUST stay alive because the procfs
-    // probe sees ESTABLISHED and the decision function returns
-    // Decision::Quiet.
+    // watchdog's fast-kill threshold MUST stay alive. On Linux the
+    // procfs probe sees ESTABLISHED and the decision function returns
+    // Decision::Quiet. On non-Linux targets the fallback watchdog only
+    // cancels at the far larger fallback ceiling, so the session
+    // survives the wait window.
     const IDLE_TIMEOUT_SECS: u64 = 300;
 
-    // Wait window. Must exceed
-    // WEDGE_FAST_KILL_SILENCE_SECS (30) + WEDGE_WATCHDOG_TICK_SECS (15)
-    // = 45 s of worst-case watchdog detection latency, plus a 15 s
-    // grace. Sits well below WEDGE_FALLBACK_KILL_SILENCE_SECS (1800)
-    // so the fallback path does not fire either.
-    // 90 s instead of 60 s. The case asserts the watchdog does NOT
-    // false-kill, so a longer wait strengthens the assertion: if the
-    // procfs ESTABLISHED discriminator is broken, more wait windows
-    // give it more chances to fire.
+    // Wait window. Must exceed the worst-case watchdog detection
+    // latency on Linux: WEDGE_FAST_KILL_SILENCE_SECS (30) plus one to
+    // two WEDGE_WATCHDOG_TICK_SECS ticks (15 each), so 45 to 60 s. Sits
+    // well below WEDGE_FALLBACK_KILL_SILENCE_SECS (1800) so the fallback
+    // path does not fire either. 90 s instead of 60 s: the case asserts
+    // the watchdog does NOT false-kill, so a longer wait strengthens the
+    // assertion. On Linux, if the procfs ESTABLISHED discriminator is
+    // broken, more wait windows give it more chances to fire.
     const IDLE_WAIT_SECS: u64 = 90;
 
     pub(crate) async fn run_healthy_idle_session_above_fast_threshold() -> Result<()> {
@@ -2229,7 +2223,10 @@ pub(crate) mod cmptst_26 {
         result
     }
 
-    #[cfg(target_os = "linux")]
+    // Excluded on Windows. Ambient operating-system traffic can inflate
+    // the session counter and false-positive this healthy-idle assertion.
+    // Linux and macOS run it.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn regression() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         crate::common::init_logging();

@@ -31,13 +31,12 @@ use rustfs_ecstore::{
     get_global_lock_client,
     global::GLOBAL_TierConfigMgr,
     metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics},
-    new_object_layer_fn,
+    resolve_object_store_handle,
     rpc::{
         LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG,
         SERVICE_SIGNAL_RELOAD_DYNAMIC,
     },
     store::{all_local_disk_path, find_local_disk_by_ref},
-    store_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions, StorageAPI},
 };
 use rustfs_filemeta::{FileInfo, MetacacheReader};
 use rustfs_iam::{get_global_iam_sys, store::UserType};
@@ -50,6 +49,7 @@ use rustfs_protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{node_service_server::NodeService as Node, *},
 };
+use rustfs_storage_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions};
 use serde::Deserialize;
 use std::{collections::HashMap, io::Cursor, pin::Pin, sync::Arc};
 use tokio::spawn;
@@ -57,6 +57,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, warn};
+
+const LOG_COMPONENT_STORAGE: &str = "storage";
+const LOG_SUBSYSTEM_RPC: &str = "rpc";
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
@@ -110,17 +113,25 @@ impl NodeService {
 #[tonic::async_trait]
 impl Node for NodeService {
     async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
-        debug!("PING");
-
         let ping_req = request.into_inner();
         if ping_req.body.is_empty() {
-            debug!("ping_req received empty body; treating request as liveness probe");
+            debug!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_RPC,
+                event = "ping_request",
+                request_type = "liveness_probe",
+                "RPC ping request received"
+            );
         } else {
             let ping_body = flatbuffers::root::<PingBody>(&ping_req.body);
             if let Err(e) = ping_body {
-                warn!("invalid ping request body: {}", e);
-            } else {
-                info!("ping_req:body(flatbuffer): {:?}", ping_body);
+                warn!(
+                    component = LOG_COMPONENT_STORAGE,
+                    subsystem = LOG_SUBSYSTEM_RPC,
+                    event = "ping_request_decode_failed",
+                    error = %e,
+                    "Failed to decode RPC ping request body"
+                );
             }
         }
 
@@ -196,7 +207,6 @@ impl Node for NodeService {
 
     type WriteStreamStream = ResponseStream<WriteResponse>;
     async fn write_stream(&self, request: Request<Streaming<WriteRequest>>) -> Result<Response<Self::WriteStreamStream>, Status> {
-        info!("write_stream");
         let _ = request;
 
         Err(unimplemented_rpc("write_stream"))
@@ -204,7 +214,6 @@ impl Node for NodeService {
 
     type ReadAtStream = ResponseStream<ReadAtResponse>;
     async fn read_at(&self, _request: Request<Streaming<ReadAtRequest>>) -> Result<Response<Self::ReadAtStream>, Status> {
-        info!("read_at");
         Err(unimplemented_rpc("read_at"))
     }
 
@@ -214,7 +223,6 @@ impl Node for NodeService {
 
     type WalkDirStream = ResponseStream<WalkDirResponse>;
     async fn walk_dir(&self, request: Request<WalkDirRequest>) -> Result<Response<Self::WalkDirStream>, Status> {
-        info!("walk_dir");
         let request = request.into_inner();
         let (tx, rx) = mpsc::channel(128);
         if let Some(disk) = self.find_disk(&request.disk).await {
@@ -229,7 +237,13 @@ impl Node for NodeService {
                 let (rd, mut wr) = tokio::io::duplex(64);
                 let job1 = spawn(async move {
                     if let Err(err) = disk.walk_dir(opts, &mut wr).await {
-                        error!("walk_dir failed: {err:?}");
+                        error!(
+                            component = LOG_COMPONENT_STORAGE,
+                            subsystem = LOG_SUBSYSTEM_RPC,
+                            event = "walk_dir_failed",
+                            error = ?err,
+                            "walk_dir RPC failed"
+                        );
                     }
                 });
                 let job2 = spawn(async move {
@@ -250,7 +264,13 @@ impl Node for NodeService {
                                                 .await
                                                 .is_err()
                                             {
-                                                warn!("walk_dir stream receiver dropped while sending meta cache entry");
+                                                warn!(
+                                                    component = LOG_COMPONENT_STORAGE,
+                                                    subsystem = LOG_SUBSYSTEM_RPC,
+                                                    event = "walk_dir_stream_closed",
+                                                    stage = "entry_send",
+                                                    "walk_dir stream receiver dropped"
+                                                );
                                                 break;
                                             }
                                         }
@@ -264,7 +284,13 @@ impl Node for NodeService {
                                                 .await
                                                 .is_err()
                                             {
-                                                warn!("walk_dir stream receiver dropped while sending serialization error");
+                                                warn!(
+                                                    component = LOG_COMPONENT_STORAGE,
+                                                    subsystem = LOG_SUBSYSTEM_RPC,
+                                                    event = "walk_dir_stream_closed",
+                                                    stage = "serialization_error_send",
+                                                    "walk_dir stream receiver dropped"
+                                                );
                                                 break;
                                             }
                                         }
@@ -298,7 +324,13 @@ impl Node for NodeService {
                                     break;
                                 }
 
-                                warn!("walk_dir metacache read error: {err:?}");
+                                warn!(
+                                    component = LOG_COMPONENT_STORAGE,
+                                    subsystem = LOG_SUBSYSTEM_RPC,
+                                    event = "walk_dir_metacache_read_failed",
+                                    error = ?err,
+                                    "walk_dir metacache read failed"
+                                );
 
                                 let _ = tx
                                     .send(Ok(WalkDirResponse {
@@ -781,7 +813,7 @@ impl Node for NodeService {
         &self,
         _request: Request<ReloadSiteReplicationConfigRequest>,
     ) -> Result<Response<ReloadSiteReplicationConfigResponse>, Status> {
-        let Some(_store) = new_object_layer_fn() else {
+        let Some(_store) = resolve_object_store_handle() else {
             return Ok(Response::new(ReloadSiteReplicationConfigResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -870,7 +902,7 @@ impl Node for NodeService {
         &self,
         _request: Request<ReloadPoolMetaRequest>,
     ) -> Result<Response<ReloadPoolMetaResponse>, Status> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Ok(Response::new(ReloadPoolMetaResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -889,7 +921,7 @@ impl Node for NodeService {
     }
 
     async fn stop_rebalance(&self, _request: Request<StopRebalanceRequest>) -> Result<Response<StopRebalanceResponse>, Status> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Ok(Response::new(StopRebalanceResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -903,12 +935,12 @@ impl Node for NodeService {
         }))
     }
 
-    #[tracing::instrument(skip_all)]
+    #[tracing::instrument(skip_all, fields(start_rebalance))]
     async fn load_rebalance_meta(
         &self,
         request: Request<LoadRebalanceMetaRequest>,
     ) -> Result<Response<LoadRebalanceMetaResponse>, Status> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Ok(Response::new(LoadRebalanceMetaResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -917,21 +949,21 @@ impl Node for NodeService {
 
         let LoadRebalanceMetaRequest { start_rebalance } = request.into_inner();
 
-        warn!("handle LoadRebalanceMetaRequest");
+        info!("handling load_rebalance_meta request");
 
         store.load_rebalance_meta().await.map_err(|err| {
-            error!("load_rebalance_meta err {:?}", err);
+            error!(error = ?err, "load_rebalance_meta failed");
             Status::internal(err.to_string())
         })?;
 
-        warn!("load_rebalance_meta success");
+        info!("load_rebalance_meta completed");
 
         if start_rebalance {
-            warn!("start rebalance");
+            info!(start_rebalance, "spawning background rebalance task");
             let store = store.clone();
             spawn(async move {
                 if let Some(message) = background_rebalance_start_error_message(store.start_rebalance().await) {
-                    error!("{message}");
+                    error!(error = %message, "background rebalance start failed");
                 }
             });
         }
@@ -946,7 +978,7 @@ impl Node for NodeService {
         &self,
         _request: Request<LoadTransitionTierConfigRequest>,
     ) -> Result<Response<LoadTransitionTierConfigResponse>, Status> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Ok(Response::new(LoadTransitionTierConfigResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),

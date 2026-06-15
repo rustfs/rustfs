@@ -24,8 +24,9 @@ use rustfs_ecstore::bucket::metadata_sys::get_replication_config;
 use rustfs_ecstore::bucket::object_lock::objectlock_sys;
 use rustfs_ecstore::bucket::replication::ReplicationConfigurationExt;
 use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketOperations, BucketOptions, ObjectInfo, ObjectToDelete};
+use rustfs_ecstore::resolve_object_store_handle;
+use rustfs_ecstore::store_api::{BucketOperations, ObjectInfo, ObjectToDelete};
+use rustfs_storage_api::BucketOptions;
 use rustfs_targets::EventName;
 use rustfs_targets::arn::{TargetID, TargetIDError};
 use rustfs_utils::http::{
@@ -46,6 +47,10 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use time::{format_description::FormatItem, macros::format_description};
 use tracing::{debug, warn};
+
+const LOG_COMPONENT_STORAGE: &str = "storage";
+const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
+const LOG_SUBSYSTEM_OBJECT_KEY: &str = "object_key";
 
 pub const RFC1123: &[FormatItem<'_>] =
     format_description!("[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT");
@@ -148,7 +153,14 @@ pub(crate) async fn apply_bucket_default_lock_retention(
             if err == StorageError::ConfigNotFound {
                 None
             } else {
-                warn!("get_object_lock_config err {:?}", err);
+                warn!(
+                    component = LOG_COMPONENT_STORAGE,
+                    subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
+                    event = "object_lock_config_load_failed",
+                    bucket = %bucket,
+                    error = ?err,
+                    "Failed to load bucket object lock configuration"
+                );
                 return Err(S3Error::with_message(
                     S3ErrorCode::InternalError,
                     "Failed to load Object Lock configuration".to_string(),
@@ -292,7 +304,14 @@ pub(crate) fn validate_object_key(key: &str, operation: &str) -> S3Result<()> {
 
     // Log debug info for keys with special characters to help diagnose encoding issues
     if key.contains([' ', '+', '%']) {
-        debug!("{} object with special characters in key: {:?}", operation, key);
+        debug!(
+            component = LOG_COMPONENT_STORAGE,
+            subsystem = LOG_SUBSYSTEM_OBJECT_KEY,
+            event = "object_key_special_characters",
+            operation,
+            key = ?key,
+            "Object key contains special characters"
+        );
     }
 
     Ok(())
@@ -422,7 +441,14 @@ pub(crate) async fn validate_bucket_object_lock_enabled(bucket: &str) -> S3Resul
                     "Bucket is missing ObjectLockConfiguration".to_string(),
                 ));
             }
-            warn!("get_object_lock_config err {:?}", err);
+            warn!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
+                event = "object_lock_config_load_failed",
+                bucket = %bucket,
+                error = ?err,
+                "Failed to load bucket object lock configuration"
+            );
             return Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
                 "Failed to get bucket ObjectLockConfiguration".to_string(),
@@ -713,7 +739,7 @@ pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelet
 
 /// Helper function to get store and validate bucket exists
 pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<rustfs_ecstore::store::ECStore>> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 

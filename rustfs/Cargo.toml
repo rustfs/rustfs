@@ -54,6 +54,7 @@ io-scheduler-debug = []  # Enable debug information in I/O scheduler
 tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, for debugging only)
 full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp"]
 manual-test-runners = []
+rio-v2 = ["rustfs-ecstore/rio-v2"]
 
 [lints]
 workspace = true
@@ -63,7 +64,7 @@ workspace = true
 rustfs-heal = { workspace = true }
 rustfs-audit = { workspace = true }
 rustfs-common = { workspace = true }
-rustfs-config = { workspace = true, features = ["constants", "notify"] }
+rustfs-config = { workspace = true, features = ["constants", "notify", "server-config-model"] }
 rustfs-crypto = { workspace = true }
 rustfs-credentials = { workspace = true }
 rustfs-ecstore = { workspace = true }
@@ -81,10 +82,13 @@ rustfs-protos = { workspace = true }
 rustfs-rio.workspace = true
 rustfs-s3-types = { workspace = true }
 rustfs-s3-ops = { workspace = true }
+rustfs-security-governance = { workspace = true }
 rustfs-data-usage = { workspace = true }
 rustfs-s3select-api = { workspace = true }
 rustfs-s3select-query = { workspace = true }
+rustfs-extension-schema = { workspace = true }
 rustfs-targets = { workspace = true }
+rustfs-storage-api = { workspace = true }
 rustfs-tls-runtime = { workspace = true }
 rustfs-trusted-proxies = { workspace = true }
 rustfs-utils = { workspace = true, features = ["full"] }
@@ -100,6 +104,7 @@ tempfile = { workspace = true }
 async-trait = { workspace = true }
 axum.workspace = true
 futures.workspace = true
+futures-lite.workspace = true
 futures-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
@@ -108,7 +113,7 @@ http-body.workspace = true
 http-body-util.workspace = true
 reqwest = { workspace = true }
 socket2 = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util", "io-uring"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util"] }
 tokio-rustls = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 tokio-stream.workspace = true
@@ -137,7 +142,9 @@ time = { workspace = true, features = ["parsing", "formatting", "serde"] }
 astral-tokio-tar = { workspace = true }
 atoi = { workspace = true }
 atomic_enum = { workspace = true }
+async_zip = { workspace = true }
 base64 = { workspace = true }
+hmac = { workspace = true }
 sha2 = { workspace = true }
 base64-simd.workspace = true
 clap = { workspace = true }
@@ -172,6 +179,8 @@ hashbrown = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
+# io-uring is Linux-only. Scope the feature to Linux targets.
+tokio = { workspace = true, features = ["io-uring"] }
 
 [target.'cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))'.dependencies]
 mimalloc = { workspace = true }

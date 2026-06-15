@@ -19,7 +19,13 @@ use rustfs_ecstore::store::ECStore;
 use std::sync::{Arc, OnceLock};
 use store::object::ObjectStore;
 use sys::IamSys;
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
+
+const LOG_COMPONENT_IAM: &str = "iam";
+const LOG_SUBSYSTEM_RUNTIME: &str = "runtime";
+const LOG_SUBSYSTEM_OIDC: &str = "oidc";
+const EVENT_IAM_STATE: &str = "iam_state";
+const EVENT_OIDC_STATE: &str = "oidc_state";
 
 pub mod cache;
 pub mod error;
@@ -37,11 +43,23 @@ static OIDC_SYS: OnceLock<Arc<OidcSys>> = OnceLock::new();
 #[instrument(skip(ecstore))]
 pub async fn init_iam_sys(ecstore: Arc<ECStore>) -> Result<()> {
     if IAM_SYS.get().is_some() {
-        info!("IAM system already initialized, skipping.");
+        info!(
+            event = EVENT_IAM_STATE,
+            component = LOG_COMPONENT_IAM,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            state = "already_initialized",
+            "IAM runtime already initialized"
+        );
         return Ok(());
     }
 
-    info!("Starting IAM system initialization sequence...");
+    info!(
+        event = EVENT_IAM_STATE,
+        component = LOG_COMPONENT_IAM,
+        subsystem = LOG_SUBSYSTEM_RUNTIME,
+        state = "starting",
+        "IAM runtime starting"
+    );
 
     // 1. Create the persistent storage adapter
     let storage_adapter = ObjectStore::new(ecstore);
@@ -55,11 +73,23 @@ pub async fn init_iam_sys(ecstore: Arc<ECStore>) -> Result<()> {
 
     // 4. Securely set the global singleton
     if IAM_SYS.set(iam_instance).is_err() {
-        error!("Critical: Race condition detected during IAM initialization!");
+        error!(
+            event = EVENT_IAM_STATE,
+            component = LOG_COMPONENT_IAM,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            state = "singleton_set_failed",
+            "IAM runtime singleton set failed"
+        );
         return Err(Error::IamSysAlreadyInitialized);
     }
 
-    info!("IAM system initialization completed successfully.");
+    info!(
+        event = EVENT_IAM_STATE,
+        component = LOG_COMPONENT_IAM,
+        subsystem = LOG_SUBSYSTEM_RUNTIME,
+        state = "ready",
+        "IAM runtime ready"
+    );
     Ok(())
 }
 
@@ -84,29 +114,67 @@ pub fn get_global_iam_sys() -> Option<Arc<IamSys<ObjectStore>>> {
 /// Initialize the global OIDC system. Non-fatal if no OIDC providers are configured.
 pub async fn init_oidc_sys() -> Result<()> {
     if OIDC_SYS.get().is_some() {
-        info!("OIDC system already initialized, skipping.");
+        debug!(
+            event = EVENT_OIDC_STATE,
+            component = LOG_COMPONENT_IAM,
+            subsystem = LOG_SUBSYSTEM_OIDC,
+            state = "already_initialized",
+            "OIDC runtime already initialized"
+        );
         return Ok(());
     }
 
-    info!("Starting OIDC system initialization...");
+    debug!(
+        event = EVENT_OIDC_STATE,
+        component = LOG_COMPONENT_IAM,
+        subsystem = LOG_SUBSYSTEM_OIDC,
+        state = "starting",
+        "OIDC runtime starting"
+    );
 
     let oidc_sys = match OidcSys::new().await {
         Ok(sys) => {
             if sys.has_providers() {
-                info!("OIDC system initialized with {} provider(s)", sys.list_providers().len());
+                debug!(
+                    event = EVENT_OIDC_STATE,
+                    component = LOG_COMPONENT_IAM,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
+                    provider_count = sys.list_providers().len(),
+                    state = "ready",
+                    "OIDC runtime ready"
+                );
             } else {
-                info!("No OIDC providers configured");
+                debug!(
+                    event = EVENT_OIDC_STATE,
+                    component = LOG_COMPONENT_IAM,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
+                    state = "empty",
+                    "OIDC runtime has no providers"
+                );
             }
             sys
         }
         Err(e) => {
-            warn!("OIDC initialization failed (non-fatal): {}", e);
+            warn!(
+                event = EVENT_OIDC_STATE,
+                component = LOG_COMPONENT_IAM,
+                subsystem = LOG_SUBSYSTEM_OIDC,
+                state = "init_failed_non_fatal",
+                error = %e,
+                "OIDC runtime initialization failed"
+            );
             OidcSys::empty().map_err(Error::StringError)?
         }
     };
 
     if OIDC_SYS.set(Arc::new(oidc_sys)).is_err() {
-        warn!("Race condition during OIDC initialization (non-fatal)");
+        warn!(
+            event = EVENT_OIDC_STATE,
+            component = LOG_COMPONENT_IAM,
+            subsystem = LOG_SUBSYSTEM_OIDC,
+            state = "singleton_set_race",
+            "OIDC runtime singleton set raced"
+        );
     }
 
     Ok(())

@@ -37,6 +37,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use tracing::{debug, error, info, warn};
 
+const LOG_COMPONENT_OBS: &str = "obs";
+const LOG_SUBSYSTEM_LOG_CLEANER: &str = "log_cleaner";
+const EVENT_LOG_CLEANER_STATE: &str = "log_cleaner_state";
+
 #[derive(Debug)]
 struct CompressionTaskResult {
     /// Original file metadata so successful workers can be deleted later.
@@ -108,7 +112,14 @@ impl LogCleaner {
     /// Perform one full cleanup pass.
     pub fn cleanup(&self) -> Result<(usize, u64), std::io::Error> {
         if !self.log_dir.exists() {
-            debug!("Log directory does not exist: {:?}", self.log_dir);
+            debug!(
+                event = EVENT_LOG_CLEANER_STATE,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_LOG_CLEANER,
+                state = "log_dir_missing",
+                log_dir = ?self.log_dir,
+                "log cleaner state changed"
+            );
             return Ok((0, 0));
         }
 
@@ -134,10 +145,14 @@ impl LogCleaner {
             let total_size: u64 = logs.iter().map(|f| f.size).sum();
 
             info!(
-                "Found {} regular log files, total size: {} bytes ({:.2} MB)",
-                logs.len(),
-                total_size,
-                total_size as f64 / 1024.0 / 1024.0
+                event = EVENT_LOG_CLEANER_STATE,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_LOG_CLEANER,
+                state = "scan_completed",
+                regular_log_files = logs.len(),
+                total_bytes = total_size,
+                total_megabytes = total_size as f64 / 1024.0 / 1024.0,
+                "log cleaner state changed"
             );
 
             // Select the oldest files first, then additionally trim any files
@@ -167,10 +182,14 @@ impl LogCleaner {
             counter!(METRIC_LOG_CLEANER_DELETED_FILES_TOTAL).increment(total_deleted as u64);
             counter!(METRIC_LOG_CLEANER_FREED_BYTES_TOTAL).increment(total_freed);
             info!(
-                "Cleanup completed: deleted {} files, freed {} bytes ({:.2} MB)",
-                total_deleted,
-                total_freed,
-                total_freed as f64 / 1024.0 / 1024.0
+                event = EVENT_LOG_CLEANER_STATE,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_LOG_CLEANER,
+                state = "cleanup_completed",
+                deleted_files = total_deleted,
+                freed_bytes = total_freed,
+                freed_megabytes = total_freed as f64 / 1024.0 / 1024.0,
+                "log cleaner state changed"
             );
         }
 
@@ -324,17 +343,21 @@ impl LogCleaner {
                         let compressed = match compress_file(&file.path, &options) {
                             Ok(output) => {
                                 debug!(
+                                    event = EVENT_LOG_CLEANER_STATE,
+                                    component = LOG_COMPONENT_OBS,
+                                    subsystem = LOG_SUBSYSTEM_LOG_CLEANER,
                                     file = ?file.path,
                                     archive = ?output.archive_path,
                                     algorithm = %output.algorithm_used,
                                     input_bytes = output.input_bytes,
                                     output_bytes = output.output_bytes,
-                                    "parallel compression done"
+                                    state = "parallel_compression_done",
+                                    "log cleaner state changed"
                                 );
                                 true
                             }
                             Err(err) => {
-                                warn!(file = ?file.path, error = %err, "parallel compression failed");
+                                warn!(event = EVENT_LOG_CLEANER_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, file = ?file.path, error = %err, result = "parallel_compression_failed", "log cleaner state changed");
                                 false
                             }
                         };
@@ -350,7 +373,14 @@ impl LogCleaner {
 
         // Any worker panic triggers deterministic fallback behavior.
         if scope_result.is_err() {
-            warn!("parallel compression worker panicked, falling back to serial path");
+            warn!(
+                event = EVENT_LOG_CLEANER_STATE,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_LOG_CLEANER,
+                result = "parallel_worker_panicked",
+                fallback = "serial",
+                "log cleaner state changed"
+            );
             return self.serial_compress_and_delete(files);
         }
 
@@ -376,6 +406,9 @@ impl LogCleaner {
         gauge!(METRIC_LOG_CLEANER_STEAL_SUCCESS_RATE).set(success_rate);
 
         info!(
+            event = EVENT_LOG_CLEANER_STATE,
+            component = LOG_COMPONENT_OBS,
+            subsystem = LOG_SUBSYSTEM_LOG_CLEANER,
             workers = worker_count,
             algorithm = %self.compression_algorithm,
             deleted,
@@ -384,7 +417,8 @@ impl LogCleaner {
             steal_attempts = attempts,
             steal_successes = successes,
             steal_success_rate = success_rate,
-            "parallel cleanup finished"
+            state = "parallel_cleanup_finished",
+            "log cleaner state changed"
         );
 
         Ok((deleted, freed))
@@ -441,17 +475,21 @@ impl LogCleaner {
                 match compress_file(&file.path, &options) {
                     Ok(output) => {
                         debug!(
+                            event = EVENT_LOG_CLEANER_STATE,
+                            component = LOG_COMPONENT_OBS,
+                            subsystem = LOG_SUBSYSTEM_LOG_CLEANER,
                             file = ?file.path,
                             archive = ?output.archive_path,
                             algorithm = %output.algorithm_used,
                             input_bytes = output.input_bytes,
                             output_bytes = output.output_bytes,
-                            "serial compression done"
+                            state = "serial_compression_done",
+                            "log cleaner state changed"
                         );
                         deletable.push(file.clone());
                     }
                     Err(err) => {
-                        warn!(file = ?file.path, error = %err, "serial compression failed, source kept");
+                        warn!(event = EVENT_LOG_CLEANER_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, file = ?file.path, error = %err, result = "serial_compression_failed", "log cleaner state changed");
                     }
                 }
             }
@@ -523,7 +561,7 @@ impl LogCleaner {
 
         for f in files {
             if self.dry_run {
-                info!("[DRY RUN] Would delete: {:?} ({} bytes)", f.path, f.size);
+                info!(event = EVENT_LOG_CLEANER_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, state = "dry_run_delete", file = ?f.path, bytes = f.size, "log cleaner state changed");
                 deleted += 1;
                 freed += f.size;
                 continue;
@@ -533,10 +571,10 @@ impl LogCleaner {
                 Ok(()) => {
                     deleted += 1;
                     freed += f.size;
-                    debug!("Deleted: {:?}", f.path);
+                    debug!(event = EVENT_LOG_CLEANER_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, state = "deleted", file = ?f.path, bytes = f.size, "log cleaner state changed");
                 }
                 Err(e) => {
-                    error!("Failed to delete {:?}: {}", f.path, e);
+                    error!(event = EVENT_LOG_CLEANER_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, result = "delete_failed", file = ?f.path, error = %e, "log cleaner state changed");
                 }
             }
         }

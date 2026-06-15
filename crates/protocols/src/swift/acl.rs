@@ -60,6 +60,10 @@ use super::{SwiftError, SwiftResult};
 use std::fmt;
 use tracing::debug;
 
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SWIFT_ACL: &str = "swift_acl";
+const EVENT_SWIFT_ACL_DECISION: &str = "swift_acl_decision";
+
 /// Container ACL configuration
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ContainerAcl {
@@ -228,14 +232,22 @@ impl ContainerAcl {
         for grant in &self.read {
             match grant {
                 AclGrant::PublicRead => {
-                    debug!("Read access granted: public read enabled");
+                    debug!(
+                        event = EVENT_SWIFT_ACL_DECISION,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SWIFT_ACL,
+                        action = "read",
+                        result = "granted",
+                        reason = "public_read",
+                        "swift acl decision"
+                    );
                     return true;
                 }
                 AclGrant::PublicReadReferrer(pattern) => {
                     if let Some(ref_header) = referrer
                         && Self::matches_referrer_pattern(ref_header, pattern)
                     {
-                        debug!("Read access granted: referrer matches pattern {}", pattern);
+                        debug!(event = EVENT_SWIFT_ACL_DECISION, component = LOG_COMPONENT_PROTOCOLS, subsystem = LOG_SUBSYSTEM_SWIFT_ACL, action = "read", result = "granted", reason = "referrer_match", pattern = %pattern, "swift acl decision");
                         return true;
                     }
                 }
@@ -243,7 +255,7 @@ impl ContainerAcl {
                     if let Some(req_account) = request_account
                         && req_account == account
                     {
-                        debug!("Read access granted: account {} matches", account);
+                        debug!(event = EVENT_SWIFT_ACL_DECISION, component = LOG_COMPONENT_PROTOCOLS, subsystem = LOG_SUBSYSTEM_SWIFT_ACL, action = "read", result = "granted", reason = "account_match", account = %account, "swift acl decision");
                         return true;
                     }
                 }
@@ -255,14 +267,22 @@ impl ContainerAcl {
                         && req_account == account
                         && req_user == grant_user
                     {
-                        debug!("Read access granted: user {}:{} matches", account, grant_user);
+                        debug!(event = EVENT_SWIFT_ACL_DECISION, component = LOG_COMPONENT_PROTOCOLS, subsystem = LOG_SUBSYSTEM_SWIFT_ACL, action = "read", result = "granted", reason = "user_match", account = %account, user = %grant_user, "swift acl decision");
                         return true;
                     }
                 }
             }
         }
 
-        debug!("Read access denied: no matching ACL grant");
+        debug!(
+            event = EVENT_SWIFT_ACL_DECISION,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_ACL,
+            action = "read",
+            result = "denied",
+            reason = "no_matching_grant",
+            "swift acl decision"
+        );
         false
     }
 
@@ -288,7 +308,7 @@ impl ContainerAcl {
                 }
                 AclGrant::Account(account) => {
                     if request_account == account {
-                        debug!("Write access granted: account {} matches", account);
+                        debug!(event = EVENT_SWIFT_ACL_DECISION, component = LOG_COMPONENT_PROTOCOLS, subsystem = LOG_SUBSYSTEM_SWIFT_ACL, action = "write", result = "granted", reason = "account_match", account = %account, "swift acl decision");
                         return true;
                     }
                 }
@@ -300,14 +320,22 @@ impl ContainerAcl {
                         && request_account == account
                         && req_user == grant_user
                     {
-                        debug!("Write access granted: user {}:{} matches", account, grant_user);
+                        debug!(event = EVENT_SWIFT_ACL_DECISION, component = LOG_COMPONENT_PROTOCOLS, subsystem = LOG_SUBSYSTEM_SWIFT_ACL, action = "write", result = "granted", reason = "user_match", account = %account, user = %grant_user, "swift acl decision");
                         return true;
                     }
                 }
             }
         }
 
-        debug!("Write access denied: no matching ACL grant");
+        debug!(
+            event = EVENT_SWIFT_ACL_DECISION,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_ACL,
+            action = "write",
+            result = "denied",
+            reason = "no_matching_grant",
+            "swift acl decision"
+        );
         false
     }
 

@@ -20,7 +20,20 @@ use rustfs_targets::{
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+
+const LOG_COMPONENT_AUDIT: &str = "audit";
+const LOG_SUBSYSTEM_PIPELINE: &str = "pipeline";
+const EVENT_AUDIT_DISPATCH_SKIPPED: &str = "audit_dispatch_skipped";
+const EVENT_AUDIT_DISPATCH_FAILED: &str = "audit_dispatch_failed";
+const EVENT_AUDIT_BATCH_DISPATCH_SKIPPED: &str = "audit_batch_dispatch_skipped";
+const EVENT_AUDIT_BATCH_DISPATCH_FAILED: &str = "audit_batch_dispatch_failed";
+const EVENT_AUDIT_BATCH_DISPATCH_COMPLETED: &str = "audit_batch_dispatch_completed";
+const EVENT_AUDIT_TARGET_STATE_CHANGED: &str = "audit_target_state_changed";
+const EVENT_AUDIT_REPLAY_DELIVERED: &str = "audit_replay_delivered";
+const EVENT_AUDIT_REPLAY_RETRY_SCHEDULED: &str = "audit_replay_retry_scheduled";
+const EVENT_AUDIT_REPLAY_DROPPED: &str = "audit_replay_dropped";
+const EVENT_AUDIT_REPLAY_STREAM_STATUS: &str = "audit_replay_stream_status";
 
 #[derive(Clone)]
 pub struct AuditPipeline {
@@ -40,7 +53,13 @@ impl AuditPipeline {
             let targets = registry.list_target_values();
 
             if targets.is_empty() {
-                warn!("No audit targets configured for dispatch");
+                debug!(
+                    event = EVENT_AUDIT_DISPATCH_SKIPPED,
+                    component = LOG_COMPONENT_AUDIT,
+                    subsystem = LOG_SUBSYSTEM_PIPELINE,
+                    reason = "no_targets_configured",
+                    "Skipped audit dispatch"
+                );
                 return Ok(());
             }
 
@@ -77,7 +96,14 @@ impl AuditPipeline {
                     observability::record_target_success();
                 }
                 Err(e) => {
-                    error!(target_id = %target_key, error = %e, "Failed to dispatch audit log to target");
+                    error!(
+                        event = EVENT_AUDIT_DISPATCH_FAILED,
+                        component = LOG_COMPONENT_AUDIT,
+                        subsystem = LOG_SUBSYSTEM_PIPELINE,
+                        target_id = %target_key,
+                        error = %e,
+                        "Failed to dispatch audit event"
+                    );
                     errors.push(e);
                     observability::record_target_failure();
                 }
@@ -91,9 +117,13 @@ impl AuditPipeline {
         } else {
             observability::record_audit_failure(dispatch_time);
             warn!(
+                event = EVENT_AUDIT_DISPATCH_FAILED,
+                component = LOG_COMPONENT_AUDIT,
+                subsystem = LOG_SUBSYSTEM_PIPELINE,
                 error_count = errors.len(),
                 success_count = success_count,
-                "Some audit targets failed to receive log entry"
+                duration_ms = dispatch_time.as_millis() as u64,
+                "Some audit targets failed to receive audit event"
             );
         }
 
@@ -108,7 +138,14 @@ impl AuditPipeline {
             let targets = registry.list_target_values();
 
             if targets.is_empty() {
-                warn!("No audit targets configured for batch dispatch");
+                debug!(
+                    event = EVENT_AUDIT_BATCH_DISPATCH_SKIPPED,
+                    component = LOG_COMPONENT_AUDIT,
+                    subsystem = LOG_SUBSYSTEM_PIPELINE,
+                    entry_count = entries.len(),
+                    reason = "no_targets_configured",
+                    "Skipped audit batch dispatch"
+                );
                 return Ok(());
             }
 
@@ -142,21 +179,31 @@ impl AuditPipeline {
         let results = futures::future::join_all(tasks).await;
         let mut total_success = 0;
         let mut total_errors = 0;
-        for (_target_id, success_count, errors) in results {
+        for (target_id, success_count, errors) in results {
             total_success += success_count;
             total_errors += errors.len();
             for e in errors {
-                error!("Batch dispatch error: {:?}", e);
+                error!(
+                    event = EVENT_AUDIT_BATCH_DISPATCH_FAILED,
+                    component = LOG_COMPONENT_AUDIT,
+                    subsystem = LOG_SUBSYSTEM_PIPELINE,
+                    target_id = %target_id,
+                    error = ?e,
+                    "Audit batch dispatch failed"
+                );
             }
         }
 
         let dispatch_time = start_time.elapsed();
-        info!(
-            "Batch dispatched {} entries, success: {}, errors: {}, time: {:?}",
-            entries.len(),
-            total_success,
-            total_errors,
-            dispatch_time
+        debug!(
+            event = EVENT_AUDIT_BATCH_DISPATCH_COMPLETED,
+            component = LOG_COMPONENT_AUDIT,
+            subsystem = LOG_SUBSYSTEM_PIPELINE,
+            entry_count = entries.len(),
+            success_count = total_success,
+            error_count = total_errors,
+            duration_ms = dispatch_time.as_millis() as u64,
+            "Completed audit batch dispatch"
         );
 
         Ok(())
@@ -213,7 +260,14 @@ impl AuditRuntimeView {
     pub async fn enable_target(&self, target_id: &str) -> AuditResult<()> {
         let registry = self.registry.lock().await;
         if registry.get_target(target_id).is_some() {
-            info!(target_id = %target_id, "Target enabled");
+            info!(
+                event = EVENT_AUDIT_TARGET_STATE_CHANGED,
+                component = LOG_COMPONENT_AUDIT,
+                subsystem = LOG_SUBSYSTEM_PIPELINE,
+                target_id = %target_id,
+                state = "enabled",
+                "audit target state"
+            );
             Ok(())
         } else {
             Err(crate::AuditError::Configuration(format!("Target not found: {target_id}"), None))
@@ -223,7 +277,14 @@ impl AuditRuntimeView {
     pub async fn disable_target(&self, target_id: &str) -> AuditResult<()> {
         let registry = self.registry.lock().await;
         if registry.get_target(target_id).is_some() {
-            info!(target_id = %target_id, "Target disabled");
+            info!(
+                event = EVENT_AUDIT_TARGET_STATE_CHANGED,
+                component = LOG_COMPONENT_AUDIT,
+                subsystem = LOG_SUBSYSTEM_PIPELINE,
+                target_id = %target_id,
+                state = "disabled",
+                "audit target state"
+            );
             Ok(())
         } else {
             Err(crate::AuditError::Configuration(format!("Target not found: {target_id}"), None))
@@ -233,7 +294,14 @@ impl AuditRuntimeView {
     pub async fn remove_target(&self, target_id: &str) -> AuditResult<()> {
         let mut registry = self.registry.lock().await;
         if registry.remove_target(target_id).await.is_some() {
-            info!(target_id = %target_id, "Target removed");
+            info!(
+                event = EVENT_AUDIT_TARGET_STATE_CHANGED,
+                component = LOG_COMPONENT_AUDIT,
+                subsystem = LOG_SUBSYSTEM_PIPELINE,
+                target_id = %target_id,
+                state = "removed",
+                "audit target state"
+            );
             Ok(())
         } else {
             Err(crate::AuditError::Configuration(format!("Target not found: {target_id}"), None))
@@ -249,7 +317,14 @@ impl AuditRuntimeView {
         let mut registry = self.registry.lock().await;
         let _ = registry.remove_target(&target_id).await;
         registry.add_shared_target(target_id.clone(), shared_target);
-        info!(target_id = %target_id, "Target upserted");
+        info!(
+            event = EVENT_AUDIT_TARGET_STATE_CHANGED,
+            component = LOG_COMPONENT_AUDIT,
+            subsystem = LOG_SUBSYSTEM_PIPELINE,
+            target_id = %target_id,
+            state = "upserted",
+            "audit target state"
+        );
         Ok(())
     }
 }
@@ -268,43 +343,111 @@ impl AuditRuntimeFacade {
                 Box::pin(async move {
                     match event {
                         ReplayEvent::Delivered { key, target } => {
-                            info!("Successfully sent audit entry, target: {}, key: {}", target.id(), key.to_string());
+                            debug!(
+                                event = EVENT_AUDIT_REPLAY_DELIVERED,
+                                component = LOG_COMPONENT_AUDIT,
+                                subsystem = LOG_SUBSYSTEM_PIPELINE,
+                                target_id = %target.id(),
+                                replay_key = %key,
+                                "audit replay delivery"
+                            );
                             observability::record_target_success();
                         }
                         ReplayEvent::RetryableError { error, target, .. } => match error {
                             rustfs_targets::TargetError::NotConnected => {
-                                warn!("Target {} not connected, retrying...", target.id());
+                                debug!(
+                                    event = EVENT_AUDIT_REPLAY_RETRY_SCHEDULED,
+                                    component = LOG_COMPONENT_AUDIT,
+                                    subsystem = LOG_SUBSYSTEM_PIPELINE,
+                                    target_id = %target.id(),
+                                    reason = "not_connected",
+                                    "audit replay delivery"
+                                );
                             }
                             rustfs_targets::TargetError::Timeout(_) => {
-                                warn!("Timeout sending to target {}, retrying...", target.id());
+                                debug!(
+                                    event = EVENT_AUDIT_REPLAY_RETRY_SCHEDULED,
+                                    component = LOG_COMPONENT_AUDIT,
+                                    subsystem = LOG_SUBSYSTEM_PIPELINE,
+                                    target_id = %target.id(),
+                                    reason = "timeout",
+                                    "audit replay delivery"
+                                );
                             }
                             _ => {}
                         },
                         ReplayEvent::Dropped { reason, target, .. } => {
-                            warn!("Dropped queued payload for target {}: {}", target.id(), reason);
+                            warn!(
+                                event = EVENT_AUDIT_REPLAY_DROPPED,
+                                component = LOG_COMPONENT_AUDIT,
+                                subsystem = LOG_SUBSYSTEM_PIPELINE,
+                                target_id = %target.id(),
+                                reason = %reason,
+                                "audit replay delivery"
+                            );
                             observability::record_target_failure();
                         }
                         ReplayEvent::PermanentFailure { error, target, .. } => {
-                            error!("Permanent error for target {}: {}", target.id(), error);
+                            error!(
+                                event = EVENT_AUDIT_REPLAY_DROPPED,
+                                component = LOG_COMPONENT_AUDIT,
+                                subsystem = LOG_SUBSYSTEM_PIPELINE,
+                                target_id = %target.id(),
+                                error = %error,
+                                reason = "permanent_failure",
+                                "audit replay delivery"
+                            );
                             target.record_final_failure();
                             observability::record_target_failure();
                         }
                         ReplayEvent::RetryExhausted { key, target } => {
-                            warn!("Max retries exceeded for key {}, target: {}, skipping", key.to_string(), target.id());
+                            warn!(
+                                event = EVENT_AUDIT_REPLAY_DROPPED,
+                                component = LOG_COMPONENT_AUDIT,
+                                subsystem = LOG_SUBSYSTEM_PIPELINE,
+                                target_id = %target.id(),
+                                replay_key = %key,
+                                reason = "retry_exhausted",
+                                "audit replay delivery"
+                            );
                             target.record_final_failure();
                             observability::record_target_failure();
                         }
                         ReplayEvent::UnreadableEntry { key, error, target } => {
-                            warn!("Skipping unreadable audit store entry {} for target {}: {}", key, target.id(), error);
+                            warn!(
+                                event = EVENT_AUDIT_REPLAY_DROPPED,
+                                component = LOG_COMPONENT_AUDIT,
+                                subsystem = LOG_SUBSYSTEM_PIPELINE,
+                                target_id = %target.id(),
+                                replay_key = %key,
+                                error = %error,
+                                reason = "unreadable_entry",
+                                "audit replay delivery"
+                            );
                         }
                     }
                 })
             }),
             Arc::new(|target_id, has_replay| {
                 if has_replay {
-                    info!(target_id = %target_id, "Audit stream processing started");
+                    info!(
+                        event = EVENT_AUDIT_REPLAY_STREAM_STATUS,
+                        component = LOG_COMPONENT_AUDIT,
+                        subsystem = LOG_SUBSYSTEM_PIPELINE,
+                        target_id = %target_id,
+                        replay_enabled = true,
+                        "audit replay stream"
+                    );
                 } else {
-                    info!(target_id = %target_id, "No store configured, skip audit stream processing");
+                    debug!(
+                        event = EVENT_AUDIT_REPLAY_STREAM_STATUS,
+                        component = LOG_COMPONENT_AUDIT,
+                        subsystem = LOG_SUBSYSTEM_PIPELINE,
+                        target_id = %target_id,
+                        replay_enabled = false,
+                        reason = "no_store_configured",
+                        "audit replay stream"
+                    );
                 }
             }),
             None,

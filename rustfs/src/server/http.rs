@@ -19,11 +19,12 @@ use crate::auth_keystone;
 use crate::config;
 use crate::server::{
     ReadinessGateLayer, RemoteAddr, ShutdownHandle,
-    compress::{CompressionConfig, PathAwareCompressionPredicate, PathCategoryInjectionLayer},
+    compress::{HttpCompressionConfig, PathAwareHttpCompressionPredicate, PathCategoryInjectionLayer},
     hybrid::hybrid,
     layer::{
         BodylessStatusFixLayer, ConditionalCorsLayer, EmptyBodyContentLengthCompatLayer, HeadRequestBodyFixLayer,
-        ObjectAttributesEtagFixLayer, PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer, S3ErrorMessageCompatLayer,
+        ObjectAttributesEtagFixLayer, PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer, RequestLoggingLayer,
+        S3ErrorMessageCompatLayer, VirtualHostStyleHintLayer, redact_sensitive_uri_query,
     },
     tls_material::{
         TlsAcceptorHolder, TlsHandshakeFailureKind, build_acceptor_from_loaded, load_tls_material, spawn_reload_loop,
@@ -66,7 +67,7 @@ use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
-use tracing::{Span, debug, error, info, instrument, warn};
+use tracing::{Span, debug, error, info, instrument, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 const LABEL_HTTP_METHOD: &str = "method";
@@ -79,6 +80,25 @@ const METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL: &str = "rustfs_http_server_re
 const METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES: &str = "rustfs_http_server_request_body_size_bytes";
 const METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL: &str = "rustfs_http_server_response_body_bytes_total";
 const METRIC_HTTP_SERVER_RESPONSE_BODY_SIZE_BYTES: &str = "rustfs_http_server_response_body_size_bytes";
+const LOG_COMPONENT_SERVER: &str = "server";
+const LOG_SUBSYSTEM_HTTP: &str = "http";
+const LOG_SUBSYSTEM_TRANSPORT: &str = "transport";
+const LOG_SUBSYSTEM_TLS: &str = "tls";
+const LOG_SUBSYSTEM_STARTUP: &str = "startup";
+const EVENT_TLS_HANDSHAKE_FAILED: &str = "tls_handshake_failed";
+const EVENT_HTTP_TRANSPORT_CLOSED: &str = "http_transport_closed";
+const EVENT_HTTP_TRANSPORT_FAILED: &str = "http_transport_failed";
+const EVENT_SOCKET_FALLBACK: &str = "socket_fallback";
+const EVENT_HTTP_BIND_FAILED: &str = "http_bind_failed";
+const EVENT_HTTP_STARTUP_ENDPOINTS: &str = "http_startup_endpoints";
+const EVENT_HTTP_HOST_ROUTING: &str = "http_host_routing";
+const EVENT_HTTP_COMPRESSION_STATE: &str = "http_compression_state";
+const EVENT_HTTP_TRANSPORT_PARAMETERS: &str = "http_transport_parameters";
+const EVENT_HTTP_ACCEPT_LOOP_STATE: &str = "http_accept_loop_state";
+const EVENT_HTTP_CONNECTION_DRAIN: &str = "http_connection_drain";
+const EVENT_PEER_ADDR_UNAVAILABLE: &str = "peer_addr_unavailable";
+const EVENT_RPC_SIGNATURE_VERIFICATION_FAILED: &str = "rpc_signature_verification_failed";
+const EVENT_GRPC_TRACE_CONTEXT_PROPAGATION_FAILED: &str = "grpc_trace_context_propagation_failed";
 
 static ACTIVE_HTTP_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
@@ -108,6 +128,78 @@ fn status_class_label(status: http::StatusCode) -> &'static str {
         5 => "5xx",
         _ => "unknown",
     }
+}
+
+#[inline]
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn log_tls_handshake_failure(peer_addr: &str, kind: TlsHandshakeFailureKind, err: &dyn std::fmt::Display) {
+    match kind {
+        TlsHandshakeFailureKind::UnexpectedEof => {
+            debug!(
+                event = EVENT_TLS_HANDSHAKE_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_TLS,
+                peer_addr = %peer_addr,
+                failure_type = kind.as_str(),
+                error = %err,
+                result = "client_disconnect",
+                "TLS handshake failed"
+            );
+        }
+        TlsHandshakeFailureKind::ProtocolVersion | TlsHandshakeFailureKind::Certificate | TlsHandshakeFailureKind::Alert => {
+            warn!(
+                event = EVENT_TLS_HANDSHAKE_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_TLS,
+                peer_addr = %peer_addr,
+                failure_type = kind.as_str(),
+                error = %err,
+                result = "client_error",
+                "TLS handshake failed"
+            );
+        }
+        TlsHandshakeFailureKind::Unknown => {
+            error!(
+                event = EVENT_TLS_HANDSHAKE_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_TLS,
+                peer_addr = %peer_addr,
+                failure_type = kind.as_str(),
+                error = %err,
+                result = "transport_error",
+                "TLS handshake failed"
+            );
+        }
+    }
+}
+
+fn log_transport_closed(peer_addr: &str, error_kind: &str, error_message: &str, result: &str) {
+    debug!(
+        event = EVENT_HTTP_TRANSPORT_CLOSED,
+        component = LOG_COMPONENT_SERVER,
+        subsystem = LOG_SUBSYSTEM_TRANSPORT,
+        peer_addr = %peer_addr,
+        error_kind,
+        error = %error_message,
+        result,
+        "HTTP transport closed"
+    );
+}
+
+fn log_transport_failed(peer_addr: &str, error_kind: &str, error_message: &str) {
+    warn!(
+        event = EVENT_HTTP_TRANSPORT_FAILED,
+        component = LOG_COMPONENT_SERVER,
+        subsystem = LOG_SUBSYSTEM_TRANSPORT,
+        peer_addr = %peer_addr,
+        error_kind,
+        error = %error_message,
+        result = "transport_error",
+        "HTTP transport failed"
+    );
 }
 
 #[inline]
@@ -143,7 +235,15 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
         ) {
             Ok(s) => s,
             Err(e) => {
-                warn!("Failed to create socket for {:?}: {}, falling back to IPv4", server_addr, e);
+                warn!(
+                    event = EVENT_SOCKET_FALLBACK,
+                    component = LOG_COMPONENT_SERVER,
+                    subsystem = LOG_SUBSYSTEM_STARTUP,
+                    from_addr = %server_addr,
+                    fallback = "ipv4",
+                    error = %e,
+                    "Socket creation fell back to IPv4"
+                );
                 let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
                 server_addr = ipv4_addr;
                 socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?
@@ -155,7 +255,15 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
         if server_addr.is_ipv6()
             && let Err(e) = socket.set_only_v6(false)
         {
-            warn!("Failed to set IPV6_V6ONLY=false, attempting IPv4 fallback: {}", e);
+            warn!(
+                event = EVENT_SOCKET_FALLBACK,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                from_addr = %server_addr,
+                fallback = "ipv4",
+                error = %e,
+                "Dual-stack socket setup fell back to IPv4"
+            );
             let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
             server_addr = ipv4_addr;
             socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
@@ -178,7 +286,14 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
             // 2. Enable SO_REUSEPORT for better multi-core scalability on supported platforms
             #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
             if let Err(e) = socket.set_reuse_port(true) {
-                debug!("Failed to set SO_REUSEPORT: {}", e);
+                debug!(
+                    event = "socket_option_unavailable",
+                    component = LOG_COMPONENT_SERVER,
+                    subsystem = LOG_SUBSYSTEM_STARTUP,
+                    option = "SO_REUSEPORT",
+                    error = %e,
+                    "Socket option is unavailable"
+                );
             }
 
             // 3. Set system-level TCP KeepAlive to protect long connections
@@ -195,7 +310,14 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
 
         // Attempt bind; if bind fails for IPv6, try IPv4 fallback once more.
         if let Err(bind_err) = socket.bind(&server_addr.into()) {
-            warn!("Failed to bind to {}: {}.", server_addr, bind_err);
+            warn!(
+                event = EVENT_HTTP_BIND_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                bind_addr = %server_addr,
+                error = %bind_err,
+                "HTTP listener bind failed"
+            );
             if server_addr.is_ipv6() {
                 // Try IPv4 fallback
                 let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
@@ -256,7 +378,13 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
     let local_ip = match rustfs_utils::get_local_ip() {
         Some(ip) => ip,
         None => {
-            warn!("Unable to obtain local IP address, using fallback IP: {}", local_addr.ip());
+            warn!(
+                event = "local_ip_fallback",
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                fallback_ip = %local_addr.ip(),
+                "Falling back to listener IP for startup endpoint logging"
+            );
             local_addr.ip()
         }
     };
@@ -277,18 +405,36 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
 
         info!(
             target: "rustfs::console::startup",
-            "Console WebUI available at: {protocol}://{local_ip_str}:{local_port}/rustfs/console/index.html"
+            event = EVENT_HTTP_STARTUP_ENDPOINTS,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            service = "console",
+            endpoint = %format!("{protocol}://{local_ip_str}:{local_port}/rustfs/console/index.html"),
+            "Startup endpoint available"
         );
         info!(
             target: "rustfs::console::startup",
-            "Console WebUI (localhost): {protocol}://127.0.0.1:{local_port}/rustfs/console/index.html",
-
+            event = EVENT_HTTP_STARTUP_ENDPOINTS,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            service = "console_localhost",
+            endpoint = %format!("{protocol}://127.0.0.1:{local_port}/rustfs/console/index.html"),
+            "Startup endpoint available"
         );
     } else {
-        info!(target: "rustfs::main::startup", "RustFS API: {api_endpoints}  {localhost_endpoint}");
-        info!(target: "rustfs::main::startup", "RustFS Start Time: {now_time}");
-        info!(target: "rustfs::main::startup","For more information, visit https://rustfs.com/docs/");
-        info!(target: "rustfs::main::startup", "To enable the console, restart the server with --console-enable and a valid --console-address.");
+        info!(
+            target: "rustfs::main::startup",
+            event = EVENT_HTTP_STARTUP_ENDPOINTS,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            service = "s3_api",
+            api_endpoint = %api_endpoints,
+            localhost_endpoint = %localhost_endpoint,
+            started_at = %now_time,
+            console_enabled = false,
+            docs_url = "https://rustfs.com/docs/",
+            "Startup endpoints ready"
+        );
     }
 
     // Setup S3 service
@@ -319,7 +465,15 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
                 }
             }
 
-            info!("virtual-hosted-style requests are enabled use domain_name {:?}", &domain_sets);
+            info!(
+                event = EVENT_HTTP_HOST_ROUTING,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_HTTP,
+                state = "enabled",
+                domain_count = domain_sets.len(),
+                domains = ?domain_sets,
+                "Virtual-hosted-style routing configured"
+            );
             b.set_host(MultiDomain::new(domain_sets).map_err(Error::other)?);
         }
 
@@ -329,17 +483,30 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
     // Create shutdown channel
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
     // Create compression configuration from environment variables
-    let compression_config = CompressionConfig::from_env();
+    let compression_config = HttpCompressionConfig::from_env();
     if compression_config.enabled {
         info!(
-            "HTTP response compression enabled: extensions={:?}, mime_patterns={:?}, min_size={} bytes",
-            compression_config.extensions, compression_config.mime_patterns, compression_config.min_size
+            event = EVENT_HTTP_COMPRESSION_STATE,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_HTTP,
+            state = "enabled",
+            extensions = ?compression_config.extensions,
+            mime_patterns = ?compression_config.mime_patterns,
+            min_size_bytes = compression_config.min_size,
+            "HTTP response compression state changed"
         );
     } else {
-        debug!("HTTP response compression is disabled");
+        debug!(
+            event = EVENT_HTTP_COMPRESSION_STATE,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_HTTP,
+            state = "disabled",
+            "HTTP response compression state changed"
+        );
     }
 
     let is_console = config.console_enable;
+    let server_domains_configured = !config.server_domains.is_empty();
     let task_handle = tokio::spawn(async move {
         // Note: CORS layer is removed from global middleware stack
         // - S3 API CORS is handled by bucket-level CORS configuration in apply_cors_headers()
@@ -380,18 +547,19 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
             rustfs_utils::get_env_usize(rustfs_config::ENV_HTTP1_MAX_BUF_SIZE, rustfs_config::DEFAULT_HTTP1_MAX_BUF_SIZE);
 
         info!(
-            "HTTP transport parameters: h2_stream_window={}, h2_conn_window={}, h2_max_frame={}, \
-             h2_max_header_list={}, h2_max_concurrent_streams={}, h2_keepalive_interval={}s, \
-             h2_keepalive_timeout={}s, http1_header_timeout={}s, http1_max_buf={}",
+            event = EVENT_HTTP_TRANSPORT_PARAMETERS,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_TRANSPORT,
             h2_stream_window,
             h2_conn_window,
             h2_max_frame_size,
             h2_max_header_list_size,
             h2_max_concurrent_streams,
-            h2_keep_alive_interval,
-            h2_keep_alive_timeout,
-            http1_header_read_timeout,
+            h2_keep_alive_interval_secs = h2_keep_alive_interval,
+            h2_keep_alive_timeout_secs = h2_keep_alive_timeout,
+            http1_header_read_timeout_secs = http1_header_read_timeout,
             http1_max_buf_size,
+            "HTTP transport parameters configured"
         );
 
         let mut conn_builder = ConnBuilder::new(TokioExecutor::new());
@@ -420,10 +588,16 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
 
         let http_server = Arc::new(conn_builder);
         let graceful = GracefulShutdown::new();
-        debug!("graceful initiated");
+        debug!(
+            event = EVENT_HTTP_ACCEPT_LOOP_STATE,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_TRANSPORT,
+            state = "started",
+            "HTTP accept loop started"
+        );
 
         loop {
-            debug!("Waiting for new connection...");
+            trace!("Waiting for new connection");
             let (socket, _) = {
                 #[cfg(unix)]
                 {
@@ -431,12 +605,25 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
                         res = listener.accept() => match res {
                             Ok(conn) => conn,
                             Err(err) => {
-                                error!("error accepting connection: {err}");
+                                error!(
+                                    event = EVENT_HTTP_ACCEPT_LOOP_STATE,
+                                    component = LOG_COMPONENT_SERVER,
+                                    subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                                    state = "accept_failed",
+                                    error = %err,
+                                    "HTTP accept loop state changed"
+                                );
                                 continue;
                             }
                         },
                         _ = shutdown_rx.recv() => {
-                            info!("Shutdown signal received in worker thread");
+                            info!(
+                                event = EVENT_HTTP_ACCEPT_LOOP_STATE,
+                                component = LOG_COMPONENT_SERVER,
+                                subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                                state = "shutdown_signal_received",
+                                "HTTP accept loop state changed"
+                            );
                             break;
                         }
                     }
@@ -447,12 +634,25 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
                         res = listener.accept() => match res {
                             Ok(conn) => conn,
                             Err(err) => {
-                                error!("error accepting connection: {err}");
+                                error!(
+                                    event = EVENT_HTTP_ACCEPT_LOOP_STATE,
+                                    component = LOG_COMPONENT_SERVER,
+                                    subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                                    state = "accept_failed",
+                                    error = %err,
+                                    "HTTP accept loop state changed"
+                                );
                                 continue;
                             }
                         },
                         _ = shutdown_rx.recv() => {
-                            info!("Shutdown signal received in worker thread");
+                            info!(
+                                event = EVENT_HTTP_ACCEPT_LOOP_STATE,
+                                component = LOG_COMPONENT_SERVER,
+                                subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                                state = "shutdown_signal_received",
+                                "HTTP accept loop state changed"
+                            );
                             break;
                         }
                     }
@@ -491,6 +691,7 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
                 s3_service: s3_service.clone(),
                 compression_config: compression_config.clone(),
                 is_console,
+                server_domains_configured,
                 readiness: readiness.clone(),
                 keystone_auth: auth_keystone::get_keystone_auth(),
                 trusted_proxy_layer: rustfs_trusted_proxies::is_enabled().then(|| rustfs_trusted_proxies::layer().clone()),
@@ -501,14 +702,35 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
 
         let active_connections = graceful.count();
         if active_connections > 0 {
-            info!(active_connections, "Draining active HTTP connections before shutdown");
+            info!(
+                event = EVENT_HTTP_CONNECTION_DRAIN,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                state = "draining",
+                active_connections,
+                "HTTP connection drain started"
+            );
         }
         tokio::select! {
             () = graceful.shutdown() => {
-                debug!("Gracefully shutdown!");
+                debug!(
+                    event = EVENT_HTTP_CONNECTION_DRAIN,
+                    component = LOG_COMPONENT_SERVER,
+                    subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                    state = "completed",
+                    "HTTP connection drain completed"
+                );
             },
             () = tokio::time::sleep(Duration::from_secs(10)) => {
-                warn!(active_connections, "Timed out waiting for HTTP connections to drain during shutdown");
+                warn!(
+                    event = EVENT_HTTP_CONNECTION_DRAIN,
+                    component = LOG_COMPONENT_SERVER,
+                    subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                    state = "timeout",
+                    active_connections,
+                    timeout_secs = 10,
+                    "HTTP connection drain timed out"
+                );
             }
         }
     });
@@ -520,8 +742,10 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
 struct ConnectionContext {
     http_server: Arc<ConnBuilder<TokioExecutor>>,
     s3_service: S3Service,
-    compression_config: CompressionConfig,
+    compression_config: HttpCompressionConfig,
     is_console: bool,
+    /// Whether `RUSTFS_SERVER_DOMAINS` is configured (i.e. s3s virtual-hosted-style routing is active).
+    server_domains_configured: bool,
     readiness: Arc<GlobalReadiness>,
     /// Pre-computed Keystone auth provider (avoids per-connection OnceLock read).
     keystone_auth: Option<Arc<rustfs_keystone::KeystoneAuthProvider>>,
@@ -623,6 +847,7 @@ fn process_connection(
             s3_service,
             compression_config,
             is_console,
+            server_domains_configured,
             readiness,
             keystone_auth,
             trusted_proxy_layer,
@@ -646,6 +871,9 @@ fn process_connection(
             Ok(addr) => Some(RemoteAddr(addr)),
             Err(e) => {
                 warn!(
+                    event = EVENT_PEER_ADDR_UNAVAILABLE,
+                    component = LOG_COMPONENT_SERVER,
+                    subsystem = LOG_SUBSYSTEM_HTTP,
                     error = %e,
                     "Failed to obtain peer address; policy evaluation may fall back to a default source IP"
                 );
@@ -665,17 +893,19 @@ fn process_connection(
         //  7. CatchPanicLayer                        — panic → 500
         //  8. ReadinessGateLayer                     — blocks until ready
         //  9. KeystoneAuthLayer                      — X-Auth-Token validation
-        // 10. TraceLayer                             — request/response tracing + metrics
-        // 11. PropagateRequestIdLayer                — X-Request-ID → response
-        // 12. CompressionLayer                       — response compression (whitelist, path-aware)
-        // 13. PathCategoryInjectionLayer             — injects path category for compression predicate
-        // 14. S3ErrorMessageCompatLayer              — missing S3 error message compatibility
-        // 15. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
-        // 16. ConditionalCorsLayer                   — S3 API CORS
-        // 17. RedirectLayer                          — console redirect (conditional)
-        // 18. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
-        // 19. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
-        // 20. PublicHealthEndpointLayer              — handles public health before s3s host parsing
+        // 10. TraceLayer                             — request span creation + metrics
+        // 11. RequestLoggingLayer                    — single completion event per request
+        // 12. PropagateRequestIdLayer                — X-Request-ID → response
+        // 13. CompressionLayer                       — response compression (whitelist, path-aware)
+        // 14. PathCategoryInjectionLayer             — injects path category for compression predicate
+        // 15. S3ErrorMessageCompatLayer              — missing S3 error message compatibility
+        // 16. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
+        // 17. ConditionalCorsLayer                   — S3 API CORS
+        // 18. RedirectLayer                          — console redirect (conditional)
+        // 19. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
+        // 20. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
+        // 21. PublicHealthEndpointLayer              — handles public health before s3s host parsing
+        // 22. VirtualHostStyleHintLayer              — actionable error for unroutable virtual-hosted-style (conditional)
         // ─────────────────────────────────────────────────────────────
         let hybrid_service = ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
@@ -705,10 +935,15 @@ fn process_connection(
             .layer(
                 TraceLayer::new_for_http()
                     .make_span_with(|request: &HttpRequest<_>| {
-                        let request_id = request
-                            .headers()
-                            .get(http::header::HeaderName::from_static("x-request-id"))
-                            .and_then(|v| v.to_str().ok())
+                        let request_context = request.extensions().get::<crate::storage::request_context::RequestContext>();
+                        let request_id = request_context
+                            .map(|ctx| ctx.request_id.as_str())
+                            .unwrap_or("unknown");
+                        let trace_id = request_context
+                            .and_then(|ctx| ctx.trace_id.as_deref())
+                            .unwrap_or("unknown");
+                        let span_id = request_context
+                            .and_then(|ctx| ctx.span_id.as_deref())
                             .unwrap_or("unknown");
 
                         let parent_context = global::get_text_map_propagator(|propagator| {
@@ -718,38 +953,49 @@ fn process_connection(
                         // Log trace context extraction for debugging distributed tracing
                         if parent_context.has_active_span() {
                             let span_ref = parent_context.span();
-                            debug!(
+                            trace!(
                                 otel_trace_id = %span_ref.span_context().trace_id(),
                                 otel_parent_span_id = %span_ref.span_context().span_id(),
                                 sampled = span_ref.span_context().is_sampled(),
                                 "Extracted trace context from incoming request headers"
                             );
                         } else {
-                            debug!("No trace context found in request headers, will create root span");
+                            trace!("No trace context found in request headers, will create root span");
                         }
                         // Extract real client IP from trusted proxy middleware if available
                         let client_info = request.extensions().get::<ClientInfo>();
-                        let real_ip = client_info
+                        let peer_addr = client_info
                             .map(|info| info.real_ip.to_string())
+                            .or_else(|| request.extensions().get::<RemoteAddr>().map(|addr| addr.0.to_string()))
                             .unwrap_or_else(|| "unknown".to_string());
 
                         let span = tracing::info_span!("http-request",
                             request_id = %request_id,
+                            trace_id = %trace_id,
+                            span_id = %span_id,
                             status_code = tracing::field::Empty,
                             method = %request.method(),
-                            real_ip = %real_ip,
-                            uri = %request.uri(),
+                            peer_addr = %peer_addr,
+                            uri = %redact_sensitive_uri_query(request.uri()),
                             version = ?request.version(),
+                            user_agent = tracing::field::Empty,
+                            content_type = tracing::field::Empty,
+                            content_length = tracing::field::Empty,
                         );
                         if span.is_disabled() {
                             return span;
                         }
                         if let Err(e) = span.set_parent(parent_context) {
-                            warn!("Failed to propagate tracing context: `{:?}`", e);
+                            debug!(component = LOG_COMPONENT_SERVER, subsystem = LOG_SUBSYSTEM_HTTP, error = ?e, "Failed to propagate tracing context");
                         }
                         for (header_name, header_value) in request.headers() {
-                            if header_name == "user-agent" || header_name == "content-type" || header_name == "content-length" {
-                                span.record(header_name.as_str(), header_value.to_str().unwrap_or("invalid"));
+                            let value = header_value.to_str().unwrap_or("invalid");
+                            if header_name == "user-agent" {
+                                span.record("user_agent", value);
+                            } else if header_name == "content-type" {
+                                span.record("content_type", value);
+                            } else if header_name == "content-length" {
+                                span.record("content_length", value);
                             }
                         }
 
@@ -757,7 +1003,7 @@ fn process_connection(
                     })
                     .on_request(|request: &HttpRequest<_>, span: &Span| {
                         let _enter = span.enter();
-                        debug!("http started method: {}, url path: {}", request.method(), request.uri().path());
+                        trace!("HTTP request started");
                         let method = request_method_label(request.method());
                         record_active_http_requests(1);
                         counter!(
@@ -803,14 +1049,13 @@ fn process_connection(
                             )
                             .record(len as f64);
                         }
-                        debug!("http response generated in {:?}", latency)
                     })
                     .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
                         counter!(METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL).increment(chunk.len() as u64);
                         #[cfg(feature = "tracing-chunk-debug")]
                         {
                             let _enter = span.enter();
-                            debug!("http body sending {} bytes in {:?}", chunk.len(), latency);
+                            debug!(chunk_bytes = chunk.len(), duration_ms = duration_ms(latency), "HTTP response body chunk sent");
                         }
                         #[cfg(not(feature = "tracing-chunk-debug"))]
                         {
@@ -821,7 +1066,7 @@ fn process_connection(
                         #[cfg(feature = "tracing-chunk-debug")]
                         {
                             let _enter = span.enter();
-                            debug!("http stream closed after {:?}", stream_duration);
+                            debug!(duration_ms = duration_ms(stream_duration), "HTTP response stream closed");
                         }
                         #[cfg(not(feature = "tracing-chunk-debug"))]
                         {
@@ -836,13 +1081,14 @@ fn process_connection(
                             LABEL_HTTP_STATUS_CLASS => "transport"
                         )
                         .increment(1);
-                        debug!("http request failure error: {:?} in {:?}", _error, latency)
+                        trace!(error = ?_error, duration_ms = duration_ms(latency), "HTTP request failure captured by trace layer");
                     }),
             )
+            .layer(RequestLoggingLayer)
             .layer(PropagateRequestIdLayer::x_request_id())
             // Compress responses based on whitelist configuration
             // Only compresses when enabled and matches configured extensions/MIME types
-            .layer(CompressionLayer::new().compress_when(PathAwareCompressionPredicate::new(compression_config)))
+            .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config)))
             .layer(PathCategoryInjectionLayer)
             .layer(S3ErrorMessageCompatLayer)
             .layer(ObjectAttributesEtagFixLayer)
@@ -866,13 +1112,18 @@ fn process_connection(
             // buckets before custom routes. Handle them here so SERVER_DOMAINS
             // cannot turn /health into an S3 bucket request.
             .layer(PublicHealthEndpointLayer)
+            // Virtual-hosted-style S3 requests (the AWS SDK / Terraform default) cannot be
+            // routed when no server domain is configured: s3s parses them path-style and
+            // returns an opaque 501. When RUSTFS_SERVER_DOMAINS is unset, return an actionable
+            // error pointing at the fix. Inert (not installed) once domains are configured.
+            .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
             .service(service);
 
         let hybrid_service = TowerToHyperService::new(hybrid_service);
 
         // Decide whether to handle HTTPS or HTTP connections based on the existence of TLS Acceptor
         if let Some(holder) = tls_acceptor {
-            debug!("TLS handshake start");
+            trace!("TLS handshake start");
             let peer_addr = socket
                 .peer_addr()
                 .ok()
@@ -880,7 +1131,7 @@ fn process_connection(
             let acceptor = holder.get();
             match acceptor.accept(socket).await {
                 Ok(tls_socket) => {
-                    debug!("TLS handshake successful");
+                    trace!("TLS handshake successful");
                     let stream = TokioIo::new(tls_socket);
                     let conn = http_server.serve_connection(stream, hybrid_service);
                     if let Err(err) = graceful.watch(conn).await {
@@ -890,25 +1141,9 @@ fn process_connection(
                 Err(err) => {
                     let err_str = err.to_string();
                     let kind = TlsHandshakeFailureKind::classify(&err_str);
-                    match kind {
-                        TlsHandshakeFailureKind::UnexpectedEof => {
-                            warn!(peer_addr = %peer_addr, "TLS handshake failed (unexpected EOF). If this client needs HTTP, it should connect to the HTTP port instead");
-                        }
-                        TlsHandshakeFailureKind::ProtocolVersion => {
-                            error!(peer_addr = %peer_addr, "TLS handshake failed (protocol version mismatch): {}", err);
-                        }
-                        TlsHandshakeFailureKind::Certificate => {
-                            error!(peer_addr = %peer_addr, "TLS handshake failed (certificate issue): {}", err);
-                        }
-                        TlsHandshakeFailureKind::Alert => {
-                            error!(peer_addr = %peer_addr, "TLS handshake failed (alert): {}", err);
-                        }
-                        TlsHandshakeFailureKind::Unknown => {
-                            error!(peer_addr = %peer_addr, "TLS handshake failed: {}", err);
-                        }
-                    }
+                    log_tls_handshake_failure(&peer_addr, kind, &err);
                     counter!("rustfs_tls_handshake_failures", &[("failure_type", kind.as_str())]).increment(1);
-                    debug!(
+                    trace!(
                         peer_addr = %peer_addr,
                         error_type = %std::any::type_name_of_val(&err),
                         error_details = %err,
@@ -918,68 +1153,98 @@ fn process_connection(
                     return;
                 }
             }
-            debug!("TLS handshake success");
+            trace!("TLS handshake success");
         } else {
-            debug!("Http handshake start");
+            trace!("HTTP connection handling start");
             let peer_addr = socket.peer_addr().ok().map(|addr| addr.to_string());
             let stream = TokioIo::new(socket);
             let conn = http_server.serve_connection(stream, hybrid_service);
             if let Err(err) = graceful.watch(conn).await {
                 handle_connection_error(peer_addr.as_deref(), &*err);
             }
-            debug!("Http handshake success");
+            trace!("HTTP connection handling finished");
         };
     });
 }
 
 /// Handles connection errors by logging them with appropriate severity
 fn handle_connection_error(peer_addr: Option<&str>, err: &(dyn std::error::Error + 'static)) {
+    let peer_addr = peer_addr.unwrap_or("unknown");
     let s = err.to_string();
     if s.contains("connection reset") || s.contains("broken pipe") {
-        warn!(
-            peer_addr = %peer_addr.unwrap_or("unknown"),
-            "The connection was reset by the peer or broken pipe: {}", s
-        );
-        // Ignore common non-fatal errors
+        log_transport_closed(peer_addr, "connection_reset", &s, "client_disconnect");
         return;
     }
 
     if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
         if hyper_err.is_incomplete_message() {
-            warn!(
-                peer_addr = %peer_addr.unwrap_or("unknown"),
-                "The HTTP connection is closed prematurely and the message is not completed:{}", hyper_err
-            );
+            log_transport_closed(peer_addr, "incomplete_message", &hyper_err.to_string(), "client_disconnect");
         } else if hyper_err.is_closed() {
-            warn!(peer_addr = %peer_addr.unwrap_or("unknown"), "The HTTP connection is closed:{}", hyper_err);
+            log_transport_closed(peer_addr, "connection_closed", &hyper_err.to_string(), "client_disconnect");
         } else if hyper_err.is_parse() {
-            error!(peer_addr = %peer_addr.unwrap_or("unknown"), "HTTP message parsing failed:{}", hyper_err);
+            log_transport_failed(peer_addr, "parse_failure", &hyper_err.to_string());
         } else if hyper_err.is_user() {
-            error!(peer_addr = %peer_addr.unwrap_or("unknown"), "HTTP user-custom error:{}", hyper_err);
+            error!(
+                event = EVENT_HTTP_TRANSPORT_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                peer_addr = %peer_addr,
+                error_kind = "service_error",
+                error = %hyper_err,
+                result = "transport_error",
+                "HTTP transport failed"
+            );
         } else if hyper_err.is_canceled() {
-            warn!(
-                peer_addr = %peer_addr.unwrap_or("unknown"),
-                "The HTTP connection is canceled:{}", hyper_err
-            );
+            log_transport_closed(peer_addr, "canceled", &hyper_err.to_string(), "client_disconnect");
         } else if format!("{:?}", hyper_err).contains("HeaderTimeout") {
-            info!(
-                peer_addr = %peer_addr.unwrap_or("unknown"),
-                "The HTTP connection timed out while reading request headers (HeaderTimeout): {}", hyper_err
-            );
+            log_transport_closed(peer_addr, "header_timeout", &hyper_err.to_string(), "client_timeout");
         } else {
-            error!(peer_addr = %peer_addr.unwrap_or("unknown"), "Unknown hyper error:{:?}", hyper_err);
+            error!(
+                event = EVENT_HTTP_TRANSPORT_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                peer_addr = %peer_addr,
+                error_kind = "hyper_error",
+                error = ?hyper_err,
+                result = "transport_error",
+                "HTTP transport failed"
+            );
         }
     } else if let Some(io_err) = err.downcast_ref::<Error>() {
-        error!(peer_addr = %peer_addr.unwrap_or("unknown"), "Unknown connection IO error:{}", io_err);
+        error!(
+            event = EVENT_HTTP_TRANSPORT_FAILED,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_TRANSPORT,
+            peer_addr = %peer_addr,
+            error_kind = "io_error",
+            error = %io_err,
+            result = "transport_error",
+            "HTTP transport failed"
+        );
     } else {
-        error!(peer_addr = %peer_addr.unwrap_or("unknown"), "Unknown connection error type:{:?}", err);
+        error!(
+            event = EVENT_HTTP_TRANSPORT_FAILED,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_TRANSPORT,
+            peer_addr = %peer_addr,
+            error_kind = "unknown_error",
+            error = ?err,
+            result = "transport_error",
+            "HTTP transport failed"
+        );
     }
 }
 
 #[allow(clippy::result_large_err)]
 fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
     verify_rpc_signature(TONIC_RPC_PREFIX, &Method::GET, req.metadata().as_ref()).map_err(|e| {
-        error!("RPC signature verification failed: {}", e);
+        error!(
+            event = EVENT_RPC_SIGNATURE_VERIFICATION_FAILED,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_HTTP,
+            error = %e,
+            "RPC signature verification failed"
+        );
         Status::unauthenticated("No valid auth token")
     })?;
 
@@ -994,7 +1259,13 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             "Extracted trace context from incoming gRPC metadata"
         );
         if let Err(e) = tracing::Span::current().set_parent(parent_context) {
-            warn!("Failed to propagate tracing context from gRPC metadata: `{:?}`", e);
+            warn!(
+                event = EVENT_GRPC_TRACE_CONTEXT_PROPAGATION_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_HTTP,
+                error = ?e,
+                "Failed to propagate tracing context from gRPC metadata"
+            );
         }
     }
     Ok(req)
@@ -1097,8 +1368,8 @@ mod tests {
         };
 
         /// Number of middleware layers in the canonical stack order (see http.rs).
-        /// Layers 1-2 are per-connection (AddExtension), 3-15 are stateless.
-        pub const MIDDLEWARE_LAYER_COUNT: usize = 15;
+        /// Layers 1-2 are per-connection (AddExtension), 3-21 are stateless.
+        pub const MIDDLEWARE_LAYER_COUNT: usize = 21;
 
         /// Current HTTP/2 defaults (from rustfs_config).
         pub const H2_INITIAL_STREAM_WINDOW_SIZE: u32 = DEFAULT_H2_INITIAL_STREAM_WINDOW_SIZE;
@@ -1139,7 +1410,7 @@ mod tests {
 
     #[test]
     fn test_baseline_middleware_count() {
-        assert_eq!(baseline::MIDDLEWARE_LAYER_COUNT, 15);
+        assert_eq!(baseline::MIDDLEWARE_LAYER_COUNT, 21);
     }
 
     #[test]

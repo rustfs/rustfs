@@ -29,12 +29,11 @@ pub use rustfs_data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, hash_path,
 };
 use rustfs_ecstore::{
-    StorageAPI,
     bucket::{lifecycle::lifecycle::TRANSITION_COMPLETE, replication::ReplicationConfig},
     config::{com::save_config, storageclass},
     disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
     error::{Error, Result as StorageResult, StorageError},
-    store_api::{ObjectInfo, ObjectOptions},
+    store_api::{ObjectIO, ObjectInfo, ObjectOptions},
 };
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use tokio::time::{Duration, Instant, sleep, timeout};
@@ -55,6 +54,10 @@ const METRIC_CACHE_SAVE_ATTEMPT_TOTAL: &str = "rustfs_scanner_cache_save_attempt
 const METRIC_CACHE_SAVE_TIMEOUT_TOTAL: &str = "rustfs_scanner_cache_save_timeout_total";
 const METRIC_CACHE_SAVE_RETRY_TOTAL: &str = "rustfs_scanner_cache_save_retry_total";
 const METRIC_CACHE_SAVE_DURATION_SECONDS: &str = "rustfs_scanner_cache_save_duration_seconds";
+const LOG_COMPONENT_SCANNER: &str = "scanner";
+const LOG_SUBSYSTEM_CACHE: &str = "cache";
+const EVENT_SCANNER_CACHE_LOAD_STATE: &str = "scanner_cache_load_state";
+const EVENT_SCANNER_CACHE_SAVE_STATE: &str = "scanner_cache_save_state";
 static CACHE_SAVE_METRICS_ONCE: Once = Once::new();
 
 pub const DATA_USAGE_SCAN_CHECKPOINT_VERSION: u16 = 1;
@@ -613,7 +616,7 @@ impl DataUsageCache {
     /// Only backend errors are returned as errors.
     /// The loader is optimistic and has no locking, but tries 5 times before giving up.
     /// If the object is not found, a nil error with empty data usage cache is returned.
-    pub async fn load<S: StorageAPI>(&mut self, store: Arc<S>, name: &str) -> StorageResult<()> {
+    pub async fn load<S: ObjectIO>(&mut self, store: Arc<S>, name: &str) -> StorageResult<()> {
         // By default, empty data usage cache
         *self = DataUsageCache::default();
 
@@ -652,14 +655,23 @@ impl DataUsageCache {
         }
 
         if retries == 5 {
-            warn!("maximum retry reached to load the data usage cache `{}`", name);
+            warn!(
+                target: "rustfs::scanner::data_usage",
+                event = EVENT_SCANNER_CACHE_LOAD_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_CACHE,
+                cache_name = %name,
+                retries,
+                state = "max_retries_reached",
+                "Scanner cache load reached retry limit"
+            );
         }
 
         Ok(())
     }
     // Inner load function that attempts to load from a specific path
     // Returns (should_retry, cache_option, error_option)
-    async fn try_load_inner<S: StorageAPI>(
+    async fn try_load_inner<S: ObjectIO>(
         store: Arc<S>,
         load_name: &str,
         timeout_duration: Duration,
@@ -854,7 +866,7 @@ impl DataUsageCache {
         Err(last_err.unwrap_or_else(|| StorageError::other("Failed to save data usage cache".to_string())))
     }
 
-    async fn save_path_with_retry<S: StorageAPI>(
+    async fn save_path_with_retry<S: ObjectIO>(
         store: Arc<S>,
         path: &str,
         buf: &[u8],
@@ -877,7 +889,7 @@ impl DataUsageCache {
         .await
     }
 
-    pub async fn save<S: StorageAPI>(&self, store: Arc<S>, name: &str) -> StorageResult<()> {
+    pub async fn save<S: ObjectIO>(&self, store: Arc<S>, name: &str) -> StorageResult<()> {
         let mut buf = Vec::new();
         self.serialize(&mut rmp_serde::Serializer::new(&mut buf))?;
         let timeout_duration = Self::cache_save_timeout();
@@ -892,7 +904,17 @@ impl DataUsageCache {
             Self::save_path_with_retry(store, &backup_path, &buf, backup_timeout_duration, DATA_USAGE_CACHE_BACKUP_SAVE_RETRIES)
                 .await
         {
-            warn!("Failed to save data usage cache backup: {e}");
+            warn!(
+                target: "rustfs::scanner::data_usage",
+                event = EVENT_SCANNER_CACHE_SAVE_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_CACHE,
+                cache_name = %name,
+                backup_path = %backup_path,
+                state = "backup_save_failed",
+                error = %e,
+                "Scanner cache backup save failed"
+            );
         }
         Ok(())
     }

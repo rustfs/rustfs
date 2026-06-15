@@ -32,15 +32,18 @@ workspace = true
 
 [features]
 default = []
+rio-v2 = ["dep:rustfs-rio-v2"]
 
 [dependencies]
 rustfs-filemeta.workspace = true
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-rio.workspace = true
+rustfs-rio-v2 = { workspace = true, optional = true }
 rustfs-signer.workspace = true
+rustfs-storage-api.workspace = true
 rustfs-tls-runtime.workspace = true
 rustfs-checksums.workspace = true
-rustfs-config = { workspace = true, features = ["constants", "notify", "audit"] }
+rustfs-config = { workspace = true, features = ["constants", "notify", "audit", "server-config-model"] }
 rustfs-credentials = { workspace = true }
 rustfs-common.workspace = true
 rustfs-policy.workspace = true
@@ -93,7 +96,7 @@ hyper-util.workspace = true
 hyper-rustls.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
-tokio = { workspace = true, features = ["io-util", "sync", "signal","io-uring"] }
+tokio = { workspace = true, features = ["io-util", "sync", "signal"] }
 tonic.workspace = true
 xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
 tower.workspace = true
@@ -134,7 +137,7 @@ metrics = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 criterion = { workspace = true, features = ["html_reports"] }
 temp-env = { workspace = true, features = ["async_closure"] }
-tracing-subscriber = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["json"] }
 serial_test = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 
@@ -153,5 +156,13 @@ harness = false
 name = "rename_data_meta_benchmark"
 harness = false
 
+[[bench]]
+name = "single_block_non_inline_benchmark"
+harness = false
+
 [lib]
 doctest = false
+
+# io-uring is Linux-only. Scope the feature to Linux targets.
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio = { workspace = true, features = ["io-uring"] }

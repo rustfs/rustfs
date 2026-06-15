@@ -22,6 +22,10 @@ use russh_sftp::server::StatusReply;
 use s3s::{S3Error, S3ErrorCode};
 use std::{any::Any, fmt::Display};
 
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SFTP_ERRORS: &str = "sftp_errors";
+const EVENT_SFTP_ERROR_MAPPING: &str = "sftp_error_mapping";
+
 /// Error type for SFTP operations. Converts to StatusCode for the wire.
 #[derive(Debug)]
 pub struct SftpError(pub(super) StatusCode);
@@ -111,7 +115,7 @@ pub(super) fn s3_error_to_sftp<E: Display + 'static>(op: &str, err: E) -> SftpEr
         BackendErrorKind::PermissionDenied => StatusCode::PermissionDenied,
         BackendErrorKind::NoSuchUpload | BackendErrorKind::Other => StatusCode::Failure,
     };
-    tracing::warn!(op = %op, err = %msg, "SFTP backend error");
+    tracing::warn!(event = EVENT_SFTP_ERROR_MAPPING, component = LOG_COMPONENT_PROTOCOLS, subsystem = LOG_SUBSYSTEM_SFTP_ERRORS, op = %op, err = %msg, mapped_status = ?code, "sftp error mapping");
     SftpError::code(code)
 }
 
@@ -128,10 +132,14 @@ pub(super) fn auth_err() -> SftpError {
 /// deny.
 pub(super) fn auth_err_unreachable(op: &str, bucket: &str, key: Option<&str>) -> SftpError {
     tracing::warn!(
+        event = EVENT_SFTP_ERROR_MAPPING,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SFTP_ERRORS,
         op = op,
         bucket = %bucket,
         key = key.unwrap_or("-"),
-        "SFTP authorisation rejected because the IAM system was unreachable"
+        result = "iam_unreachable",
+        "sftp error mapping"
     );
     SftpError::code(StatusCode::Failure)
 }

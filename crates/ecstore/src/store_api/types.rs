@@ -1,30 +1,5 @@
 use super::*;
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct MakeBucketOptions {
-    pub lock_enabled: bool,
-    pub versioning_enabled: bool,
-    pub force_create: bool,                 // Create buckets even if they are already created.
-    pub created_at: Option<OffsetDateTime>, // only for site replication
-    pub no_lock: bool,
-}
-
-#[derive(Debug, Default, Clone, PartialEq)]
-pub enum SRBucketDeleteOp {
-    #[default]
-    NoOp,
-    MarkDelete,
-    Purge,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct DeleteBucketOptions {
-    pub no_lock: bool,
-    pub no_recreate: bool,
-    pub force: bool, // Force deletion
-    pub srdelete_op: SRBucketDeleteOp,
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct HTTPPreconditions {
     pub if_match: Option<String>,
@@ -225,22 +200,6 @@ fn is_modified_since(mod_time: &OffsetDateTime, given_time: &OffsetDateTime) -> 
     mod_secs > given_secs
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct BucketOptions {
-    pub deleted: bool, // true only when site replication is enabled
-    pub cached: bool, // true only when we are requesting a cached response instead of hitting the disk for example ListBuckets() call.
-    pub no_metadata: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct BucketInfo {
-    pub name: String,
-    pub created: Option<OffsetDateTime>,
-    pub deleted: Option<OffsetDateTime>,
-    pub versioning: bool,
-    pub object_locking: bool,
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct MultipartUploadResult {
     pub upload_id: String,
@@ -369,13 +328,18 @@ impl ObjectInfo {
     }
 
     pub fn is_compressed_ok(&self) -> Result<(CompressionAlgorithm, bool)> {
+        let (algorithm, _, compressed) = self.compression_read_plan()?;
+        Ok((algorithm, compressed))
+    }
+
+    pub fn compression_read_plan(&self) -> Result<(CompressionAlgorithm, crate::rio::ReadCompressionBackend, bool)> {
         let scheme = rustfs_utils::http::get_str(&self.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
 
         if let Some(scheme) = scheme {
-            let algorithm = CompressionAlgorithm::from_str(&scheme)?;
-            Ok((algorithm, true))
+            let (algorithm, backend) = crate::rio::compression_scheme_to_read_plan(&scheme)?;
+            Ok((algorithm, backend, true))
         } else {
-            Ok((CompressionAlgorithm::None, false))
+            Ok((CompressionAlgorithm::None, crate::rio::ReadCompressionBackend::Legacy, false))
         }
     }
 
@@ -388,13 +352,18 @@ impl ObjectInfo {
         use rustfs_utils::http::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
 
         self.user_defined.keys().any(|key| {
-            let key = key.to_lowercase();
-            key.starts_with("x-minio-encryption-")
+            let lower = key.to_ascii_lowercase();
+            lower.starts_with("x-minio-encryption-")
+                || lower.starts_with("x-minio-internal-server-side-encryption-")
                 || matches!(
-                    key.as_str(),
-                    "x-rustfs-encryption-key"
+                    lower.as_str(),
+                    "x-minio-internal-encrypted-multipart"
+                        | "x-rustfs-encryption-key"
                         | "x-rustfs-encryption-algorithm"
                         | "x-rustfs-encryption-iv"
+                        | "x-rustfs-encryption-key-id"
+                        | "x-rustfs-encryption-context"
+                        | "x-rustfs-encryption-tag"
                         | "x-amz-server-side-encryption-aws-kms-key-id"
                         | SSEC_ALGORITHM_HEADER
                         | SSEC_KEY_HEADER
@@ -405,10 +374,17 @@ impl ObjectInfo {
     }
 
     pub fn encryption_original_size(&self) -> std::io::Result<Option<i64>> {
+        let actual_size = rustfs_utils::http::get_str(&self.user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE);
         if let Some(size_str) = self
             .user_defined
             .get("x-rustfs-encryption-original-size")
-            .or_else(|| self.user_defined.get("x-amz-server-side-encryption-customer-original-size"))
+            .map(String::as_str)
+            .or_else(|| {
+                self.user_defined
+                    .get("x-amz-server-side-encryption-customer-original-size")
+                    .map(String::as_str)
+            })
+            .or(actual_size.as_deref())
             && !size_str.is_empty()
         {
             let size = size_str

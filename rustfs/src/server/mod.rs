@@ -41,7 +41,9 @@ pub use service_state::ShutdownSignal;
 pub use service_state::wait_for_shutdown;
 
 // Items only used within the library crate (admin handlers, server/http.rs, etc.).
+pub(crate) use http::HeaderMapCarrier;
 pub(crate) use http::active_http_requests;
+pub(crate) use layer::RequestContextLayer;
 pub(crate) use module_switch::{
     ModuleSwitchSnapshot, ModuleSwitchSource, PersistedModuleSwitches, current_module_switch_snapshot,
     refresh_persisted_module_switches_from_store, save_persisted_module_switches_to_store, validate_module_switch_update,
@@ -49,7 +51,8 @@ pub(crate) use module_switch::{
 pub(crate) use prefix::{
     ADMIN_PREFIX, CONSOLE_PREFIX, FAVICON_PATH, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, LICENSE,
     MINIO_ADMIN_PREFIX, MINIO_ADMIN_V3_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX,
-    TABLE_CATALOG_PREFIX, TONIC_PREFIX, VERSION, has_path_prefix, is_admin_path,
+    TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX, TONIC_PREFIX, VERSION, has_path_prefix, is_admin_path,
+    is_table_catalog_path,
 };
 pub(crate) use readiness::DependencyReadiness;
 pub(crate) use readiness::DependencyReadinessReport;

@@ -17,7 +17,9 @@
 use crate::bucket::metadata::BUCKET_METADATA_FILE;
 use crate::bucket::replication::{decode_resync_file, encode_resync_file};
 use crate::disk::{BUCKET_META_PREFIX, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
-use crate::store_api::{BucketOptions, ObjectOptions, PutObjReader, StorageAPI};
+use crate::store_api::{
+    BucketOperations, BucketOptions, ListOperations, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader,
+};
 use http::HeaderMap;
 use rustfs_policy::auth::UserIdentity;
 use rustfs_policy::policy::PolicyDoc;
@@ -176,7 +178,10 @@ fn normalize_bucket_meta_blob(path: &str, data: &[u8]) -> std::result::Result<Op
 /// Uses list_bucket (from disk volumes) to get bucket names, since list_objects_v2 on the legacy
 /// meta bucket may not work (legacy format differs from object layer expectations).
 /// Skips buckets that already exist in RustFS (idempotent).
-pub async fn try_migrate_bucket_metadata<S: StorageAPI>(store: Arc<S>) {
+pub async fn try_migrate_bucket_metadata<S>(store: Arc<S>)
+where
+    S: BucketOperations + ObjectIO + ObjectOperations,
+{
     let buckets_list = match store
         .list_bucket(&BucketOptions {
             no_metadata: true,
@@ -218,13 +223,10 @@ pub async fn try_migrate_bucket_metadata<S: StorageAPI>(store: Arc<S>) {
     }
 }
 
-async fn migrate_one_if_missing<S: StorageAPI>(
-    store: Arc<S>,
-    opts: &ObjectOptions,
-    headers: &HeaderMap,
-    path: &str,
-    label: &str,
-) {
+async fn migrate_one_if_missing<S>(store: Arc<S>, opts: &ObjectOptions, headers: &HeaderMap, path: &str, label: &str)
+where
+    S: ObjectIO + ObjectOperations,
+{
     if store
         .get_object_info(RUSTFS_META_BUCKET, path, &ObjectOptions::default())
         .await
@@ -275,7 +277,10 @@ async fn migrate_one_if_missing<S: StorageAPI>(
 /// Lists all objects under the IAM prefix in the source, copies each to the target if not present.
 /// Skips objects that already exist in RustFS (idempotent).
 /// If list_objects_v2 on the legacy bucket fails (e.g. format differs), migration is skipped.
-pub async fn try_migrate_iam_config<S: StorageAPI>(store: Arc<S>) {
+pub async fn try_migrate_iam_config<S>(store: Arc<S>)
+where
+    S: ListOperations + ObjectIO + ObjectOperations,
+{
     let opts = ObjectOptions {
         max_parity: true,
         no_lock: true,

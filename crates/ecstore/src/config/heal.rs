@@ -13,8 +13,19 @@
 // limitations under the License.
 
 use crate::error::{Error, Result};
+use rustfs_config::server_config::{KV, KVS};
+use rustfs_config::{DEFAULT_HEAL_BITROT_CYCLE_SECS, HEAL_BITROT_CYCLE};
 use rustfs_utils::string::parse_bool;
+use std::sync::LazyLock;
 use std::time::Duration;
+
+pub static DEFAULT_KVS: LazyLock<KVS> = LazyLock::new(|| {
+    KVS(vec![KV {
+        key: HEAL_BITROT_CYCLE.to_owned(),
+        value: DEFAULT_HEAL_BITROT_CYCLE_SECS.to_string(),
+        hidden_if_empty: false,
+    }])
+});
 
 #[derive(Debug, Default)]
 pub struct Config {

@@ -15,22 +15,22 @@
 use crate::admin::console::is_console_path;
 use crate::admin::handlers::health::{HealthProbe, build_health_response_parts};
 use crate::error::ApiError;
+use crate::server::RemoteAddr;
 use crate::server::cors;
 use crate::server::hybrid::HybridBody;
 use crate::server::{
     ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX,
-    MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, TABLE_CATALOG_PREFIX, active_http_requests,
-    collect_dependency_readiness_report, has_path_prefix, is_admin_path,
+    MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, active_http_requests, collect_dependency_readiness_report,
+    has_path_prefix, is_admin_path, is_table_catalog_path,
 };
 use crate::storage::apply_cors_headers;
-use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
+use crate::storage::request_context::{RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers};
 use bytes::Bytes;
-use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode};
+use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode, Uri};
 use http_body::Body;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
-use opentelemetry::global;
-use opentelemetry::trace::TraceContextExt;
+use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::get_env_opt_str;
 use rustfs_utils::http::headers::AMZ_REQUEST_ID;
 use s3s::S3ErrorCode;
@@ -40,30 +40,63 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 use tower::{Layer, Service};
-use tracing::debug;
+use tracing::{debug, error, info};
+use url::form_urlencoded;
 
-/// A carrier that adapts [`HeaderMap`] for OpenTelemetry trace context propagation.
-struct HeaderMapCarrier<'a>(&'a HeaderMap);
+const HTTP_REQUEST_COMPLETED_EVENT: &str = "http_request_completed";
+const HTTP_REQUEST_FAILED_EVENT: &str = "http_request_failed";
+const LOG_COMPONENT_SERVER: &str = "server";
+const LOG_SUBSYSTEM_HTTP: &str = "http";
+const REDACTED_QUERY_VALUE: &str = "redacted";
+const OBJECT_ZIP_DOWNLOADS_PATH: &str = "/v3/object-zip-downloads/";
 
-impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrier<'a> {
-    fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(key).and_then(|v| v.to_str().ok())
+pub(crate) fn redact_sensitive_uri_query(uri: &http::Uri) -> String {
+    let path = uri.path();
+    if !is_object_zip_download_path(path) {
+        return uri.to_string();
     }
 
-    fn keys(&self) -> Vec<&str> {
-        self.0.keys().map(|k| k.as_str()).collect()
+    let Some(query) = uri.query() else {
+        return uri.to_string();
+    };
+
+    let mut redacted_token = false;
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        if key == "token" {
+            redacted_token = true;
+            serializer.append_pair(&key, REDACTED_QUERY_VALUE);
+        } else {
+            serializer.append_pair(&key, &value);
+        }
     }
 
-    fn get_all(&self, key: &str) -> Option<Vec<&str>> {
-        let headers = self
-            .0
-            .get_all(key)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .collect::<Vec<_>>();
-
-        if headers.is_empty() { None } else { Some(headers) }
+    if !redacted_token {
+        return uri.to_string();
     }
+
+    let redacted_query = serializer.finish();
+    let path_and_query = if redacted_query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{redacted_query}")
+    };
+    let mut parts = uri.clone().into_parts();
+    match path_and_query.parse() {
+        Ok(path_and_query) => {
+            parts.path_and_query = Some(path_and_query);
+            http::Uri::from_parts(parts)
+                .map(|uri| uri.to_string())
+                .unwrap_or_else(|_| uri.to_string())
+        }
+        Err(_) => uri.to_string(),
+    }
+}
+
+fn is_object_zip_download_path(path: &str) -> bool {
+    (path.starts_with(ADMIN_PREFIX) || path.starts_with(MINIO_ADMIN_PREFIX))
+        && path.contains(OBJECT_ZIP_DOWNLOADS_PATH)
+        && path.ends_with(".zip")
 }
 
 /// Tower middleware layer that creates a canonical [`RequestContext`] from HTTP headers
@@ -72,8 +105,8 @@ impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrier<'a> {
 /// This layer must be placed after `SetRequestIdLayer` in the middleware stack,
 /// as it reads the `x-request-id` header that `SetRequestIdLayer` generates.
 ///
-/// Additionally, it sets the `x-amz-request-id` request header for S3 compatibility
-/// if not already present.
+/// Additionally, it preserves any upstream `x-amz-request-id` in the separate
+/// `RequestContext.x_amz_request_id` field without mutating signed request headers.
 #[derive(Clone, Default)]
 pub struct RequestContextLayer;
 
@@ -106,23 +139,12 @@ where
     fn call(&mut self, mut req: HttpRequest<B>) -> Self::Future {
         let request_id = extract_request_id_from_headers(req.headers());
 
-        // Extract OpenTelemetry trace/span context from incoming headers
-        let parent_cx = global::get_text_map_propagator(|propagator| propagator.extract(&HeaderMapCarrier(req.headers())));
-        let span_ref = parent_cx.span();
-        let span_context = span_ref.span_context();
-        let trace_id = if span_context.is_valid() {
-            Some(span_context.trace_id().to_string())
-        } else {
-            None
-        };
-        let span_id = if span_context.is_valid() {
-            Some(span_context.span_id().to_string())
-        } else {
-            None
-        };
+        let (trace_id, span_id) = extract_trace_context_ids_from_headers(req.headers())
+            .map(|(trace_id, span_id)| (Some(trace_id), Some(span_id)))
+            .unwrap_or((None, None));
 
-        // Preserve the upstream x-amz-request-id if present (S3 client forwarding),
-        // otherwise fall back to the canonical request_id.
+        // Preserve the upstream x-amz-request-id if present as the S3 compatibility alias;
+        // otherwise mirror the canonical internal request_id.
         let x_amz_request_id = req
             .headers()
             .get(AMZ_REQUEST_ID)
@@ -131,7 +153,7 @@ where
             .unwrap_or_else(|| request_id.clone());
 
         let ctx = RequestContext {
-            request_id: request_id.clone(),
+            request_id,
             x_amz_request_id,
             trace_id,
             span_id,
@@ -140,15 +162,175 @@ where
 
         req.extensions_mut().insert(ctx);
 
-        // Set x-amz-request-id for S3 compatibility downstream
-        if !req.headers().contains_key(AMZ_REQUEST_ID)
-            && let Ok(val) = HeaderValue::from_str(&request_id)
-        {
-            req.headers_mut()
-                .insert(http::header::HeaderName::from_static(AMZ_REQUEST_ID), val);
-        }
-
         self.inner.call(req)
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct RequestLoggingLayer;
+
+impl<S> Layer<S> for RequestLoggingLayer {
+    type Service = RequestLoggingService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RequestLoggingService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct RequestLoggingService<S> {
+    inner: S,
+}
+
+#[derive(Clone, Debug)]
+struct RequestLogContext {
+    request_id: String,
+    trace_id: Option<String>,
+    span_id: Option<String>,
+    peer_addr: String,
+    method: String,
+    uri: String,
+    request_started_at: Option<RequestContext>,
+    fallback_start: Instant,
+}
+
+impl RequestLogContext {
+    fn from_request<B>(req: &HttpRequest<B>) -> Self {
+        let request_context = req.extensions().get::<RequestContext>().cloned();
+        let request_id = request_context
+            .as_ref()
+            .map(|ctx| ctx.request_id.clone())
+            .unwrap_or_else(|| extract_request_id_from_headers(req.headers()));
+        let peer_addr = req
+            .extensions()
+            .get::<ClientInfo>()
+            .map(|info| info.real_ip.to_string())
+            .or_else(|| req.extensions().get::<RemoteAddr>().map(|addr| addr.0.to_string()))
+            .unwrap_or_else(|| "unknown".to_string());
+
+        Self {
+            request_id,
+            trace_id: request_context.as_ref().and_then(|ctx| ctx.trace_id.clone()),
+            span_id: request_context.as_ref().and_then(|ctx| ctx.span_id.clone()),
+            peer_addr,
+            method: req.method().to_string(),
+            uri: redact_sensitive_uri_query(req.uri()),
+            request_started_at: request_context,
+            fallback_start: Instant::now(),
+        }
+    }
+
+    fn duration_ms(&self) -> u64 {
+        self.request_started_at
+            .as_ref()
+            .map(RequestContext::duration_ms)
+            .unwrap_or_else(|| self.fallback_start.elapsed().as_millis().try_into().unwrap_or(u64::MAX))
+    }
+
+    fn result_label(status: StatusCode) -> &'static str {
+        if status.is_server_error() {
+            "server_error"
+        } else if status.is_client_error() {
+            "client_error"
+        } else if status.is_redirection() {
+            "redirect"
+        } else {
+            "success"
+        }
+    }
+
+    fn log_response<ResBody>(&self, response: &Response<ResBody>) {
+        let duration_ms = self.duration_ms();
+        let status = response.status();
+        let status_code = status.as_u16();
+        let result = Self::result_label(status);
+        let trace_id = self.trace_id.as_deref().unwrap_or("unknown");
+        let span_id = self.span_id.as_deref().unwrap_or("unknown");
+
+        if status.is_server_error() {
+            error!(
+                event = HTTP_REQUEST_COMPLETED_EVENT,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_HTTP,
+                request_id = %self.request_id,
+                trace_id = %trace_id,
+                span_id = %span_id,
+                peer_addr = %self.peer_addr,
+                method = %self.method,
+                uri = %self.uri,
+                status_code,
+                duration_ms,
+                result,
+                "HTTP request completed"
+            );
+        } else {
+            info!(
+                event = HTTP_REQUEST_COMPLETED_EVENT,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_HTTP,
+                request_id = %self.request_id,
+                trace_id = %trace_id,
+                span_id = %span_id,
+                peer_addr = %self.peer_addr,
+                method = %self.method,
+                uri = %self.uri,
+                status_code,
+                duration_ms,
+                result,
+                "HTTP request completed"
+            );
+        }
+    }
+
+    fn log_failure<E>(&self, error: &E)
+    where
+        E: std::fmt::Display,
+    {
+        error!(
+            event = HTTP_REQUEST_FAILED_EVENT,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_HTTP,
+            request_id = %self.request_id,
+            trace_id = %self.trace_id.as_deref().unwrap_or("unknown"),
+            span_id = %self.span_id.as_deref().unwrap_or("unknown"),
+            peer_addr = %self.peer_addr,
+            method = %self.method,
+            uri = %self.uri,
+            duration_ms = self.duration_ms(),
+            result = "service_error",
+            error = %error,
+            "HTTP request failed before a response was produced"
+        );
+    }
+}
+
+impl<S, B, ResBody> Service<HttpRequest<B>> for RequestLoggingService<S>
+where
+    S: Service<HttpRequest<B>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: std::fmt::Display + Send + 'static,
+    B: Send + 'static,
+{
+    type Response = Response<ResBody>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: HttpRequest<B>) -> Self::Future {
+        let context = RequestLogContext::from_request(&req);
+        let mut inner = self.inner.clone();
+
+        Box::pin(async move {
+            let result = inner.call(req).await;
+            match &result {
+                Ok(response) => context.log_response(response),
+                Err(error) => context.log_failure(error),
+            }
+            result
+        })
     }
 }
 
@@ -309,10 +491,12 @@ fn is_empty_body_admin_path(method: &Method, uri: &http::Uri) -> bool {
                 path,
                 "/minio/admin/v3/rebalance/start"
                     | "/minio/admin/v3/rebalance/stop"
+                    | "/minio/admin/v3/background-heal/status"
                     | "/minio/admin/v3/pools/decommission"
                     | "/minio/admin/v3/pools/cancel"
                     | "/rustfs/admin/v3/rebalance/start"
                     | "/rustfs/admin/v3/rebalance/stop"
+                    | "/rustfs/admin/v3/background-heal/status"
                     | "/rustfs/admin/v3/pools/decommission"
                     | "/rustfs/admin/v3/pools/cancel"
             ) || is_heal_status_query(path, uri.query())
@@ -771,6 +955,164 @@ where
     }
 }
 
+/// Structured-log event emitted when a virtual-hosted-style request cannot be
+/// routed because no server domain is configured.
+const VIRTUAL_HOST_STYLE_UNROUTABLE_EVENT: &str = "virtual_host_style_unroutable";
+
+/// Detects S3 requests that can only be virtual-hosted-style yet cannot be routed
+/// because no server domain is configured (`RUSTFS_SERVER_DOMAINS` unset).
+///
+/// Without a configured domain, s3s parses every request as path-style, so a
+/// virtual-hosted-style `PUT /` (the AWS SDK / Terraform default for `CreateBucket`)
+/// arrives with an empty bucket and fails with an opaque `501 NotImplemented`.
+///
+/// Only the service root (`/`) with a method that has no path-style equivalent
+/// (`PUT`/`DELETE`) and a DNS-style host (not an IP/socket address, and dotted like
+/// `bucket.example.com`) is matched. The host is read from the `Host` header
+/// (HTTP/1.1) or the request URI authority (HTTP/2 `:authority`). Such requests
+/// already fail today, so returning a clearer error never changes the outcome of a
+/// routable request. Returns the request host (without port) when matched.
+fn unroutable_virtual_host_target(method: &Method, uri: &Uri, headers: &HeaderMap) -> Option<String> {
+    if *method != Method::PUT && *method != Method::DELETE {
+        return None;
+    }
+    if uri.path() != "/" {
+        return None;
+    }
+
+    // `Host` is set for HTTP/1.1; HTTP/2 carries the host in the URI authority.
+    let raw_authority = match headers.get(http::header::HOST).and_then(|value| value.to_str().ok()) {
+        Some(value) => value,
+        None => uri.authority().map(|authority| authority.as_str())?,
+    };
+    if raw_authority.is_empty() {
+        return None;
+    }
+    // IP / socket-address hosts always use path-style addressing in s3s.
+    if rustfs_utils::is_socket_addr(raw_authority) {
+        return None;
+    }
+    // Parse as an Authority to split host/port robustly (e.g. bracketed IPv6) rather
+    // than slicing on `:`.
+    let authority = raw_authority.parse::<http::uri::Authority>().ok()?;
+    let host = authority.host();
+    // Require a dotted DNS name (the shape of a virtual-hosted bucket subdomain).
+    if !host.contains('.') || host.starts_with('.') || host.ends_with('.') {
+        return None;
+    }
+
+    Some(host.to_owned())
+}
+
+fn xml_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn build_virtual_host_hint_response<RestBody, GrpcBody>(
+    version: http::Version,
+    host: &str,
+    resource: &str,
+) -> Response<HybridBody<RestBody, GrpcBody>>
+where
+    RestBody: From<Bytes>,
+{
+    let message = format!(
+        "Virtual-hosted-style request for host '{host}' could not be routed because no server domain is \
+         configured. Set RUSTFS_SERVER_DOMAINS to the S3 endpoint domain your buckets are addressed under \
+         (for example RUSTFS_SERVER_DOMAINS=s3.example.com, so that bucket.s3.example.com routes to bucket \
+         'bucket'), or configure your S3 client to use path-style addressing (AWS SDK: force_path_style=true; \
+         Terraform aws provider: s3_use_path_style = true)."
+    );
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <Error><Code>NotImplemented</Code><Message>{message}</Message><Resource>{resource}</Resource></Error>",
+        message = xml_escape(&message),
+        resource = xml_escape(resource),
+    );
+
+    let mut builder = Response::builder()
+        .status(StatusCode::NOT_IMPLEMENTED)
+        .header(http::header::CONTENT_TYPE, "application/xml");
+    // This short-circuit path does not drain the request body. For HTTP/1.x, signal
+    // connection close so an undrained body cannot disrupt keep-alive reuse. `Connection`
+    // is a forbidden header in HTTP/2+, so it is only set for HTTP/1.x.
+    if !matches!(version, http::Version::HTTP_2 | http::Version::HTTP_3) {
+        builder = builder.header(http::header::CONNECTION, "close");
+    }
+    builder
+        .body(HybridBody::Rest {
+            rest_body: RestBody::from(Bytes::from(body)),
+        })
+        .expect("failed to build virtual-host hint response")
+}
+
+/// Returns an actionable error for virtual-hosted-style S3 requests that cannot be
+/// routed because `RUSTFS_SERVER_DOMAINS` is not configured. See
+/// [`unroutable_virtual_host_target`]. The layer is only installed when no server
+/// domain is configured, so it is a pure pass-through for every routable request.
+#[derive(Clone)]
+pub struct VirtualHostStyleHintLayer;
+
+impl<S> Layer<S> for VirtualHostStyleHintLayer {
+    type Service = VirtualHostStyleHintService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        VirtualHostStyleHintService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct VirtualHostStyleHintService<S> {
+    inner: S,
+}
+
+impl<S, ReqBody, RestBody, GrpcBody> Service<HttpRequest<ReqBody>> for VirtualHostStyleHintService<S>
+where
+    S: Service<HttpRequest<ReqBody>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    ReqBody: Send + 'static,
+    RestBody: From<Bytes> + Send + 'static,
+    GrpcBody: Send + 'static,
+{
+    type Response = Response<HybridBody<RestBody, GrpcBody>>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
+        if let Some(host) = unroutable_virtual_host_target(req.method(), req.uri(), req.headers()) {
+            let resource = req.uri().path().to_owned();
+            let version = req.version();
+            debug!(
+                event = VIRTUAL_HOST_STYLE_UNROUTABLE_EVENT,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_HTTP,
+                host = %host,
+                method = %req.method(),
+                "Rejected virtual-hosted-style request: no server domain configured (set RUSTFS_SERVER_DOMAINS or use path-style)"
+            );
+            return Box::pin(async move { Ok(build_virtual_host_hint_response(version, &host, &resource)) });
+        }
+
+        let mut inner = self.inner.clone();
+        Box::pin(async move { inner.call(req).await })
+    }
+}
+
 fn is_bodyless_status(status: StatusCode) -> bool {
     status.is_informational()
         || status == StatusCode::NO_CONTENT
@@ -864,7 +1206,7 @@ fn is_object_attributes_request(req: &HttpRequest<Incoming>) -> bool {
         || has_path_prefix(path, MINIO_ADMIN_PREFIX)
         || has_path_prefix(path, RUSTFS_ADMIN_PREFIX)
         || has_path_prefix(path, MINIO_ADMIN_V3_PREFIX)
-        || has_path_prefix(path, TABLE_CATALOG_PREFIX)
+        || is_table_catalog_path(path)
         || has_path_prefix(path, CONSOLE_PREFIX)
         || has_path_prefix(path, RPC_PREFIX)
     {
@@ -909,7 +1251,7 @@ impl ConditionalCorsLayer {
         // Exclude Admin, Console, RPC, and configured special paths
         !has_path_prefix(path, ADMIN_PREFIX)
             && !has_path_prefix(path, MINIO_ADMIN_PREFIX)
-            && !has_path_prefix(path, TABLE_CATALOG_PREFIX)
+            && !is_table_catalog_path(path)
             && !has_path_prefix(path, RPC_PREFIX)
             && !is_console_path(path)
             && !Self::EXCLUDED_EXACT_PATHS.contains(&path)
@@ -1145,16 +1487,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::{FAVICON_PATH, LICENSE, VERSION};
+    use crate::server::{FAVICON_PATH, LICENSE, RemoteAddr, VERSION};
     use futures::future::{Ready, ready};
     use http::Request;
     use http_body_util::BodyExt;
     use http_body_util::Full;
+    use opentelemetry::global;
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
     use serial_test::serial;
     use std::convert::Infallible;
+    use std::io::{self, Write};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use temp_env::{async_with_vars, with_var};
+    use tracing_subscriber::{Registry, fmt::MakeWriter, layer::SubscriberExt};
 
     #[derive(Clone, Debug)]
     struct CaptureService;
@@ -1264,6 +1610,160 @@ mod tests {
             assert!(body.windows(br#""status":"#.len()).any(|window| window == br#""status":"#));
         })
         .await;
+    }
+
+    #[test]
+    fn unroutable_virtual_host_target_matches_service_root_writes() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::HOST, HeaderValue::from_static("my-bucket.s3.example.com"));
+        assert_eq!(
+            unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/"), &headers),
+            Some("my-bucket.s3.example.com".to_owned())
+        );
+        assert_eq!(
+            unroutable_virtual_host_target(&Method::DELETE, &Uri::from_static("/"), &headers),
+            Some("my-bucket.s3.example.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn unroutable_virtual_host_target_strips_port() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::HOST, HeaderValue::from_static("bucket.localhost:9000"));
+        assert_eq!(
+            unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/"), &headers),
+            Some("bucket.localhost".to_owned())
+        );
+    }
+
+    #[test]
+    fn unroutable_virtual_host_target_uses_uri_authority_when_host_header_absent() {
+        // HTTP/2 clients carry the host in the URI authority (`:authority`) rather than a Host header.
+        let uri = Uri::from_static("https://my-bucket.s3.example.com/");
+        assert_eq!(
+            unroutable_virtual_host_target(&Method::PUT, &uri, &HeaderMap::new()),
+            Some("my-bucket.s3.example.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn unroutable_virtual_host_target_ignores_non_matching_requests() {
+        let mut vhost = HeaderMap::new();
+        vhost.insert(http::header::HOST, HeaderValue::from_static("bucket.s3.example.com"));
+        // Path-style request carries the bucket in the path.
+        assert_eq!(unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/bucket"), &vhost), None);
+        // GET / is ListBuckets, a valid path-style service call.
+        assert_eq!(unroutable_virtual_host_target(&Method::GET, &Uri::from_static("/"), &vhost), None);
+
+        // IP / socket-address hosts always use path-style addressing.
+        let mut ip = HeaderMap::new();
+        ip.insert(http::header::HOST, HeaderValue::from_static("127.0.0.1:9000"));
+        assert_eq!(unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/"), &ip), None);
+
+        // Bracketed IPv6 authority (with port) is a socket address, not a bucket subdomain.
+        let mut ipv6 = HeaderMap::new();
+        ipv6.insert(http::header::HOST, HeaderValue::from_static("[::1]:9000"));
+        assert_eq!(unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/"), &ipv6), None);
+
+        // Bare single-label hosts are not virtual-hosted bucket subdomains.
+        let mut bare = HeaderMap::new();
+        bare.insert(http::header::HOST, HeaderValue::from_static("localhost:9000"));
+        assert_eq!(unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/"), &bare), None);
+
+        // Trailing-dot FQDN is not matched (avoids suggesting a domain with a trailing dot).
+        let mut fqdn = HeaderMap::new();
+        fqdn.insert(http::header::HOST, HeaderValue::from_static("bucket.example.com."));
+        assert_eq!(unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/"), &fqdn), None);
+
+        // Missing Host header and no URI authority.
+        assert_eq!(
+            unroutable_virtual_host_target(&Method::PUT, &Uri::from_static("/"), &HeaderMap::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn build_virtual_host_hint_response_is_actionable() {
+        let response: Response<HybridBody<Full<Bytes>, Full<Bytes>>> =
+            build_virtual_host_hint_response(http::Version::HTTP_11, "my-bucket.s3.example.com", "/");
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/xml")
+        );
+        // HTTP/1.x error responses close the connection (the request body is not drained).
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONNECTION)
+                .and_then(|value| value.to_str().ok()),
+            Some("close")
+        );
+
+        // `Connection` is forbidden in HTTP/2, so it must not be set there.
+        let h2_response: Response<HybridBody<Full<Bytes>, Full<Bytes>>> =
+            build_virtual_host_hint_response(http::Version::HTTP_2, "my-bucket.s3.example.com", "/");
+        assert!(h2_response.headers().get(http::header::CONNECTION).is_none());
+    }
+
+    #[tokio::test]
+    async fn virtual_host_style_hint_layer_short_circuits_unroutable_put() {
+        let inner = CountingHybridService::default();
+        let calls = inner.calls();
+        let mut service = VirtualHostStyleHintLayer.layer(inner);
+
+        let response = service
+            .call(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/")
+                    .header(http::header::HOST, "my-bucket.s3.example.com")
+                    .body(Full::<Bytes>::from(Bytes::new()))
+                    .expect("request"),
+            )
+            .await
+            .expect("hint response");
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONNECTION)
+                .and_then(|value| value.to_str().ok()),
+            Some("close")
+        );
+
+        let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
+        let body = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(body.contains("RUSTFS_SERVER_DOMAINS=s3.example.com"));
+        assert!(body.contains("s3_use_path_style"));
+    }
+
+    #[tokio::test]
+    async fn virtual_host_style_hint_layer_passes_through_path_style() {
+        let inner = CountingHybridService::default();
+        let calls = inner.calls();
+        let mut service = VirtualHostStyleHintLayer.layer(inner);
+
+        let response = service
+            .call(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/my-bucket")
+                    .header(http::header::HOST, "s3.example.com")
+                    .body(Full::<Bytes>::from(Bytes::new()))
+                    .expect("request"),
+            )
+            .await
+            .expect("inner response");
+
+        // Path-style request reaches the inner service unchanged.
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1674,6 +2174,28 @@ mod tests {
     }
 
     #[test]
+    fn admin_background_heal_status_without_content_length_is_normalized() {
+        let paths = [
+            format!("{MINIO_ADMIN_V3_PREFIX}/background-heal/status"),
+            format!("{ADMIN_PREFIX}/v3/background-heal/status"),
+        ];
+
+        for path in paths {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(path.clone())
+                .header(http::header::TRANSFER_ENCODING, "chunked")
+                .body(())
+                .expect("request");
+
+            assert!(
+                should_force_zero_content_length_for_empty_body_route(&request),
+                "{path} should force Content-Length: 0"
+            );
+        }
+    }
+
+    #[test]
     fn admin_heal_start_without_status_token_is_not_normalized() {
         let request = Request::builder()
             .method(Method::POST)
@@ -1960,7 +2482,11 @@ mod tests {
         assert!(ConditionalCorsLayer::is_s3_path("/"));
         assert!(!ConditionalCorsLayer::is_s3_path("/rustfs/admin/v3/info"));
         assert!(!ConditionalCorsLayer::is_s3_path("/minio/admin/v3/info"));
-        assert!(!ConditionalCorsLayer::is_s3_path(&format!("{TABLE_CATALOG_PREFIX}/config")));
+        assert!(!ConditionalCorsLayer::is_s3_path(&format!(
+            "{}/config",
+            crate::server::TABLE_CATALOG_PREFIX
+        )));
+        assert!(!ConditionalCorsLayer::is_s3_path("/_iceberg/v1/config"));
         assert!(ConditionalCorsLayer::is_s3_path("/minio/adminx/object"));
         assert!(!ConditionalCorsLayer::is_s3_path("/health"));
         assert!(!ConditionalCorsLayer::is_s3_path("/health/ready"));
@@ -2029,7 +2555,7 @@ mod tests {
     }
 
     #[test]
-    fn request_context_layer_populates_context_and_s3_request_id_from_x_request_id() {
+    fn request_context_layer_populates_context_without_mutating_signed_headers() {
         let mut service = RequestContextLayer.layer(CaptureService);
         let request = Request::builder()
             .uri("/bucket/object")
@@ -2047,7 +2573,7 @@ mod tests {
         assert_eq!(context.x_amz_request_id, "req-123");
         assert!(context.trace_id.is_none());
         assert!(context.span_id.is_none());
-        assert_eq!(request.headers().get(AMZ_REQUEST_ID).unwrap(), "req-123");
+        assert!(request.headers().get(AMZ_REQUEST_ID).is_none());
     }
 
     #[test]
@@ -2069,6 +2595,29 @@ mod tests {
         assert_eq!(context.request_id, "req-123");
         assert_eq!(context.x_amz_request_id, "amz-456");
         assert_eq!(request.headers().get(AMZ_REQUEST_ID).unwrap(), "amz-456");
+    }
+
+    #[test]
+    fn request_context_layer_extracts_trace_context_from_traceparent_header() {
+        global::set_text_map_propagator(TraceContextPropagator::new());
+
+        let mut service = RequestContextLayer.layer(CaptureService);
+        let request = Request::builder()
+            .uri("/bucket/object")
+            .header("x-request-id", "req-trace-123")
+            .header("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+            .body(())
+            .expect("request");
+
+        let request = service.call(request).into_inner().expect("service call should succeed");
+        let context = request
+            .extensions()
+            .get::<RequestContext>()
+            .expect("request context should be present");
+
+        assert_eq!(context.request_id, "req-trace-123");
+        assert_eq!(context.trace_id.as_deref(), Some("4bf92f3577b34da6a3ce929d0e0e4736"));
+        assert_eq!(context.span_id.as_deref(), Some("00f067aa0ba902b7"));
     }
 
     #[tokio::test]
@@ -2374,5 +2923,235 @@ mod tests {
             "https://allowed.example"
         );
         assert_eq!(response_headers.get(cors::response::ACCESS_CONTROL_ALLOW_METHODS).unwrap(), "GET");
+    }
+
+    #[derive(Clone)]
+    struct StatusService {
+        status: StatusCode,
+    }
+
+    impl StatusService {
+        fn new(status: StatusCode) -> Self {
+            Self { status }
+        }
+    }
+
+    impl<B> Service<Request<B>> for StatusService {
+        type Response = Response<Full<Bytes>>;
+        type Error = Infallible;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<B>) -> Self::Future {
+            ready(Ok(Response::builder()
+                .status(self.status)
+                .body(Full::from(Bytes::new()))
+                .expect("response")))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct SharedWriterGuard {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for SharedWriterGuard {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buffer.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for SharedWriter {
+        type Writer = SharedWriterGuard;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            SharedWriterGuard {
+                buffer: self.buffer.clone(),
+            }
+        }
+    }
+
+    #[test]
+    fn request_log_context_classifies_statuses() {
+        assert_eq!(RequestLogContext::result_label(StatusCode::OK), "success");
+        assert_eq!(RequestLogContext::result_label(StatusCode::TEMPORARY_REDIRECT), "redirect");
+        assert_eq!(RequestLogContext::result_label(StatusCode::BAD_REQUEST), "client_error");
+        assert_eq!(RequestLogContext::result_label(StatusCode::INTERNAL_SERVER_ERROR), "server_error");
+    }
+
+    #[test]
+    fn request_log_context_prefers_request_context_and_remote_addr_extensions() {
+        let mut request = Request::builder()
+            .method(Method::PUT)
+            .uri("/bucket/object.txt")
+            .body(())
+            .expect("request");
+        request.extensions_mut().insert(RequestContext {
+            request_id: "req-ctx".to_string(),
+            x_amz_request_id: "amz-ctx".to_string(),
+            trace_id: Some("trace-123".to_string()),
+            span_id: Some("span-456".to_string()),
+            start_time: Instant::now(),
+        });
+        request
+            .extensions_mut()
+            .insert(RemoteAddr("127.0.0.1:9000".parse().expect("socket addr")));
+
+        let context = RequestLogContext::from_request(&request);
+
+        assert_eq!(context.request_id, "req-ctx");
+        assert_eq!(context.trace_id.as_deref(), Some("trace-123"));
+        assert_eq!(context.span_id.as_deref(), Some("span-456"));
+        assert_eq!(context.peer_addr, "127.0.0.1:9000");
+        assert_eq!(context.method, "PUT");
+        assert_eq!(context.uri, "/bucket/object.txt");
+    }
+
+    #[test]
+    fn request_log_context_redacts_object_zip_download_tokens() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/rustfs/admin/v3/object-zip-downloads/download-id.zip?token=secret-token&part=1")
+            .body(())
+            .expect("request");
+
+        let context = RequestLogContext::from_request(&request);
+
+        assert_eq!(context.uri, "/rustfs/admin/v3/object-zip-downloads/download-id.zip?token=redacted&part=1");
+        assert!(!context.uri.contains("secret-token"));
+    }
+
+    #[test]
+    fn request_log_context_redacts_object_zip_download_tokens_for_minio_admin_prefix() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/minio/admin/v3/object-zip-downloads/download-id.zip?token=secret-token&part=1")
+            .body(())
+            .expect("request");
+
+        let context = RequestLogContext::from_request(&request);
+
+        assert_eq!(context.uri, "/minio/admin/v3/object-zip-downloads/download-id.zip?token=redacted&part=1");
+        assert!(!context.uri.contains("secret-token"));
+    }
+
+    #[test]
+    fn redact_sensitive_uri_query_preserves_non_zip_download_uris() {
+        let uri: http::Uri = "/rustfs/admin/v3/users?token=not-a-download-token".parse().expect("uri");
+
+        assert_eq!(redact_sensitive_uri_query(&uri), "/rustfs/admin/v3/users?token=not-a-download-token");
+    }
+
+    #[test]
+    fn request_logging_layer_emits_single_completion_event_with_standard_fields() {
+        let writer = SharedWriter::default();
+        let captured = writer.buffer.clone();
+        let subscriber = Registry::default().with(
+            tracing_subscriber::fmt::layer()
+                .without_time()
+                .with_target(false)
+                .with_level(false)
+                .with_ansi(false)
+                .with_writer(writer),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut service = tower::ServiceBuilder::new()
+                .layer(RequestContextLayer)
+                .layer(RequestLoggingLayer)
+                .service(StatusService::new(StatusCode::OK));
+
+            let mut request: Request<Full<Bytes>> = Request::builder()
+                .method(Method::GET)
+                .uri("/bucket/object.txt")
+                .header("x-request-id", "req-123")
+                .body(Full::from(Bytes::new()))
+                .expect("request");
+            request
+                .extensions_mut()
+                .insert(RemoteAddr("127.0.0.1:9000".parse().expect("socket addr")));
+
+            let response = futures::executor::block_on(service.call(request)).expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+
+        let output = String::from_utf8(captured.lock().expect("captured logs").clone()).expect("utf8 logs");
+        assert_eq!(output.matches("HTTP request completed").count(), 1, "{output}");
+        assert!(output.contains("event"), "{output}");
+        assert!(output.contains("http_request_completed"), "{output}");
+        assert!(output.contains("component"), "{output}");
+        assert!(output.contains("server"), "{output}");
+        assert!(output.contains("subsystem"), "{output}");
+        assert!(output.contains("http"), "{output}");
+        assert!(output.contains("request_id"), "{output}");
+        assert!(output.contains("req-123"), "{output}");
+        assert!(output.contains("peer_addr"), "{output}");
+        assert!(output.contains("127.0.0.1:9000"), "{output}");
+        assert!(output.contains("method"), "{output}");
+        assert!(output.contains("GET"), "{output}");
+        assert!(output.contains("uri"), "{output}");
+        assert!(output.contains("/bucket/object.txt"), "{output}");
+        assert!(output.contains("status_code"), "{output}");
+        assert!(output.contains("200"), "{output}");
+        assert!(output.contains("result"), "{output}");
+        assert!(output.contains("success"), "{output}");
+        assert!(output.contains("duration_ms"), "{output}");
+    }
+
+    #[test]
+    fn request_logging_layer_uses_request_context_trace_fields() {
+        let writer = SharedWriter::default();
+        let captured = writer.buffer.clone();
+        let subscriber = Registry::default().with(
+            tracing_subscriber::fmt::layer()
+                .without_time()
+                .with_target(false)
+                .with_level(false)
+                .with_ansi(false)
+                .with_writer(writer),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut service = RequestLoggingLayer.layer(StatusService::new(StatusCode::INTERNAL_SERVER_ERROR));
+
+            let mut request = Request::builder()
+                .method(Method::GET)
+                .uri("/bucket/object.txt")
+                .body(())
+                .expect("request");
+            request.extensions_mut().insert(RequestContext {
+                request_id: "req-ctx".to_string(),
+                x_amz_request_id: "amz-ctx".to_string(),
+                trace_id: Some("trace-ctx".to_string()),
+                span_id: Some("span-ctx".to_string()),
+                start_time: Instant::now(),
+            });
+            request
+                .extensions_mut()
+                .insert(RemoteAddr("127.0.0.1:9000".parse().expect("socket addr")));
+
+            let response = futures::executor::block_on(service.call(request)).expect("response");
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        });
+
+        let output = String::from_utf8(captured.lock().expect("captured logs").clone()).expect("utf8 logs");
+        assert!(output.contains("http_request_completed"), "{output}");
+        assert!(output.contains("req-ctx"), "{output}");
+        assert!(output.contains("trace-ctx"), "{output}");
+        assert!(output.contains("span-ctx"), "{output}");
+        assert!(output.contains("500"), "{output}");
+        assert!(output.contains("server_error"), "{output}");
     }
 }

@@ -14,7 +14,9 @@
 
 //! Object application use-case contracts.
 
-use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
+use crate::app::context::{
+    AppContext, default_notify_interface, get_global_app_context, resolve_object_store_handle_for_context,
+};
 use crate::config::RustFSBufferConfig;
 use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
 use crate::error::ApiError;
@@ -31,7 +33,10 @@ use crate::storage::options::{
 };
 use crate::storage::request_context::spawn_traced;
 use crate::storage::s3_api::multipart::parse_list_parts_params;
-use crate::storage::sse::{SSEType, build_ssec_read_headers, encryption_material_to_metadata, map_get_object_reader_error};
+use crate::storage::sse::{
+    SSEType, build_ssec_read_headers, encryption_material_to_metadata, extract_ssekms_context_from_headers,
+    map_get_object_reader_error,
+};
 use crate::storage::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
 use crate::storage::*;
 use crate::table_catalog;
@@ -66,14 +71,15 @@ use rustfs_ecstore::bucket::{
     versioning_sys::BucketVersioningSys,
 };
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
-use rustfs_ecstore::compress::{MIN_COMPRESSIBLE_SIZE, is_compressible};
+use rustfs_ecstore::compress::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
 use rustfs_ecstore::config::storageclass;
 use rustfs_ecstore::disk::{error::DiskError, error_reduce::is_all_buckets_not_found};
 use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
-use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::rio::{DynReader, HashReader, WritePlan, wrap_reader};
 use rustfs_ecstore::set_disk::{get_lock_acquire_timeout, is_valid_storage_class};
+use rustfs_ecstore::store::ECStore;
 use rustfs_ecstore::store_api::{
-    HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader, StorageAPI,
+    HTTPRangeSpec, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader,
 };
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateTargetDecision, ReplicationState, ReplicationStatusType,
@@ -84,7 +90,6 @@ use rustfs_io_metrics;
 use rustfs_lock::NamespaceLockGuard;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_rio::{CompressReader, DynReader, EncryptReader, HashReader, wrap_reader};
 use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_for_post_object};
 use rustfs_s3select_api::object_store::bytes_stream;
 use rustfs_targets::{
@@ -123,7 +128,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::RwLock;
 use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
 const ACCEPT_RANGES_BYTES: &str = "bytes";
@@ -723,11 +728,11 @@ fn copy_namespace_lock_error(bucket: &str, object: &str, mode: &'static str, err
             required,
             achieved,
         },
-        other => StorageError::other(format!("Failed to acquire {mode} lock on {bucket}/{object}: {other}")),
+        other => StorageError::Lock(other),
     }
 }
 
-async fn acquire_self_copy_namespace_lock<S: StorageAPI + ?Sized>(
+async fn acquire_self_copy_namespace_lock<S: NamespaceLocking + ?Sized>(
     store: &S,
     bucket: &str,
     object: &str,
@@ -1116,15 +1121,18 @@ fn is_post_object_sse_kms_requested(input: &PutObjectInput, headers: &HeaderMap)
 
 async fn resolve_put_object_expiration(bucket: &str, obj_info: &ObjectInfo) -> Option<String> {
     let Ok((lifecycle_config, _)) = metadata_sys::get_lifecycle_config(bucket).await else {
-        debug!("resolve_put_object_expiration: lifecycle config not found for bucket {bucket}");
+        debug!(bucket, state = "config_missing", "PUT object expiration config missing");
         return None;
     };
 
     let obj_opts = lifecycle::ObjectOpts::from_object_info(obj_info);
     let event = lifecycle_config.predict_expiration(&obj_opts).await;
     debug!(
-        "resolve_put_object_expiration: bucket={bucket}, action={:?}, rule_id={}, due={:?}",
-        event.action, event.rule_id, event.due
+        bucket,
+        action = ?event.action,
+        rule_id = %event.rule_id,
+        due = ?event.due,
+        "PUT object expiration resolved"
     );
     build_put_object_expiration_header(&event)
 }
@@ -1150,6 +1158,10 @@ impl DefaultObjectUsecase {
         self.context.as_ref().and_then(|context| context.bucket_metadata().handle())
     }
 
+    fn object_store(&self) -> Option<Arc<ECStore>> {
+        resolve_object_store_handle_for_context(self.context.as_deref())
+    }
+
     fn base_buffer_size(&self) -> usize {
         self.context
             .clone()
@@ -1173,7 +1185,7 @@ impl DefaultObjectUsecase {
                 ),
             )),
             Err(e) => {
-                warn!("Quota check failed for bucket {bucket}: {e}, allowing operation");
+                warn!(bucket, error = %e, state = "checker_failed", "Bucket quota check degraded to allow");
                 Ok(())
             }
             _ => Ok(()),
@@ -1193,10 +1205,28 @@ impl DefaultObjectUsecase {
     where
         R: AsyncRead + Send + Sync + 'static,
     {
-        Some(StreamingBlob::wrap(bytes_stream(
-            ReaderStream::with_capacity(reader, optimal_buffer_size),
-            response_content_length as usize,
-        )))
+        let expected = response_content_length.max(0) as usize;
+        #[cfg(feature = "tracing-chunk-debug")]
+        let stream = {
+            let mut emitted = 0usize;
+            ReaderStream::with_capacity(reader, optimal_buffer_size).inspect(move |item| match item {
+                Ok(bytes) => {
+                    emitted += bytes.len();
+                    tracing::debug!(emitted, expected, chunk_len = bytes.len(), "GetObject ReaderStream emitted bytes");
+                }
+                Err(err) => {
+                    tracing::error!(
+                        emitted,
+                        expected,
+                        error = %err,
+                        "GetObject ReaderStream returned error"
+                    );
+                }
+            })
+        };
+        #[cfg(not(feature = "tracing-chunk-debug"))]
+        let stream = ReaderStream::with_capacity(reader, optimal_buffer_size);
+        Some(StreamingBlob::wrap(bytes_stream(stream, expected)))
     }
 
     fn init_get_object_bootstrap(bucket: &str, key: &str, request_id: &str) -> S3Result<GetObjectBootstrap> {
@@ -1398,7 +1428,7 @@ impl DefaultObjectUsecase {
             match ContentType::from_str(content_type) {
                 Ok(res) => Some(res),
                 Err(err) => {
-                    error!("parse content-type err {} {:?}", content_type, err);
+                    error!(content_type, error = ?err, "GET object content-type parse failed");
                     None
                 }
             }
@@ -1595,7 +1625,7 @@ impl DefaultObjectUsecase {
         {
             let (decrypted_checksums, _is_multipart) =
                 info.decrypt_checksums(part_number.unwrap_or(0), headers).map_err(|e| {
-                    error!("decrypt_checksums error: {}", e);
+                    error!(error = %e, "GetObject checksum decryption failed");
                     ApiError::from(e)
                 })?;
 
@@ -1638,25 +1668,22 @@ impl DefaultObjectUsecase {
             if should_buffer_encrypted_object {
                 let mut buf = Vec::with_capacity(response_content_length as usize);
                 if let Err(e) = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
-                    error!("Failed to read decrypted object into memory: {}", e);
+                    error!(error = %e, "GetObject decrypted object buffering failed");
                     return Err(ApiError::from(StorageError::other(format!("Failed to read decrypted object: {e}"))).into());
                 }
 
                 if buf.len() != response_content_length as usize {
                     warn!(
-                        "Encrypted object size mismatch during read: expected={} actual={}",
-                        response_content_length,
-                        buf.len()
+                        expected = response_content_length,
+                        actual = buf.len(),
+                        "Encrypted object size mismatch during read"
                     );
                 }
 
                 return Ok(Self::build_memory_blob(buf, response_content_length, optimal_buffer_size));
             }
 
-            info!(
-                "Encrypted object: Using unlimited stream for decryption with buffer size {}",
-                optimal_buffer_size
-            );
+            debug!(buffer_size = optimal_buffer_size, "Encrypted object uses streaming decrypt path");
             return Ok(Self::build_reader_blob(final_stream, response_content_length, optimal_buffer_size));
         }
 
@@ -1669,16 +1696,16 @@ impl DefaultObjectUsecase {
                 Ok(_) => {
                     if buf.len() != response_content_length as usize {
                         warn!(
-                            "Object size mismatch during seek support read: expected={} actual={}",
-                            response_content_length,
-                            buf.len()
+                            expected = response_content_length,
+                            actual = buf.len(),
+                            "Object size mismatch during seek-support read"
                         );
                     }
 
                     return Ok(Self::build_memory_blob(buf, response_content_length, optimal_buffer_size));
                 }
                 Err(e) => {
-                    error!("Failed to read object into memory for seek support: {}", e);
+                    error!(error = %e, "GetObject seek-support buffering failed");
                 }
             }
         }
@@ -1801,19 +1828,22 @@ impl DefaultObjectUsecase {
 
         let store = get_validated_store(&bucket).await?;
 
-        // TDD: Get bucket default encryption configuration
         let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
-        debug!("TDD: bucket_sse_config={:?}", bucket_sse_config);
+        debug!(
+            target: "rustfs::app::object_usecase",
+            component = "app",
+            subsystem = "object",
+            event = "bucket_sse_config_lookup",
+            bucket = %bucket,
+            found = bucket_sse_config.is_some(),
+            "Bucket SSE configuration lookup completed"
+        );
 
-        // TDD: Determine effective encryption configuration (request overrides bucket default)
         let original_sse = server_side_encryption.clone();
         let mut effective_sse = server_side_encryption.or_else(|| {
             bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-                debug!("TDD: Processing bucket SSE config: {:?}", config);
                 config.rules.first().and_then(|rule| {
-                    debug!("TDD: Processing SSE rule: {:?}", rule);
                     rule.apply_server_side_encryption_by_default.as_ref().map(|sse| {
-                        debug!("TDD: Found SSE default: {:?}", sse);
                         match sse.sse_algorithm.as_str() {
                             "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
                             "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
@@ -1823,7 +1853,16 @@ impl DefaultObjectUsecase {
                 })
             })
         });
-        debug!("TDD: effective_sse={:?} (original={:?})", effective_sse, original_sse);
+        debug!(
+            target: "rustfs::app::object_usecase",
+            component = "app",
+            subsystem = "object",
+            event = "effective_sse_resolved",
+            bucket = %bucket,
+            requested = ?original_sse,
+            effective = ?effective_sse,
+            "Resolved effective SSE configuration"
+        );
 
         let mut effective_kms_key_id = ssekms_key_id.or_else(|| {
             bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
@@ -1839,6 +1878,7 @@ impl DefaultObjectUsecase {
         validate_sse_headers_for_write(
             effective_sse.as_ref(),
             effective_kms_key_id.as_ref(),
+            extract_ssekms_context_from_headers(&req.headers)?.as_ref(),
             sse_customer_algorithm.as_ref(),
             sse_customer_key.as_ref(),
             sse_customer_key_md5.as_ref(),
@@ -1906,9 +1946,15 @@ impl DefaultObjectUsecase {
 
         let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
 
-        let mut reader = if is_compressible(&req.headers, &key) && size > MIN_COMPRESSIBLE_SIZE as i64 {
+        let should_compress = is_disk_compressible(&req.headers, &key) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64;
+        let mut write_plan = WritePlan::new();
+        let mut reader = if should_compress {
             let algorithm = CompressionAlgorithm::default();
-            insert_str(&mut metadata, SUFFIX_COMPRESSION, algorithm.to_string());
+            insert_str(
+                &mut metadata,
+                SUFFIX_COMPRESSION,
+                rustfs_ecstore::rio::compression_metadata_value(algorithm),
+            );
             insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
             let mut hrd =
@@ -1919,12 +1965,16 @@ impl DefaultObjectUsecase {
             }
 
             opts.want_checksum = hrd.checksum();
-            insert_str(&mut opts.user_defined, SUFFIX_COMPRESSION, algorithm.to_string());
+            insert_str(
+                &mut opts.user_defined,
+                SUFFIX_COMPRESSION,
+                rustfs_ecstore::rio::compression_metadata_value(algorithm),
+            );
             insert_str(&mut opts.user_defined, SUFFIX_ACTUAL_SIZE, size.to_string());
 
             size = HashReader::SIZE_PRESERVE_LAYER;
-            HashReader::from_reader(CompressReader::new(hrd, algorithm), size, actual_size, None, None, false)
-                .map_err(ApiError::from)?
+            write_plan = write_plan.with_compression(algorithm);
+            hrd
         } else {
             HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
         };
@@ -1938,6 +1988,7 @@ impl DefaultObjectUsecase {
         }
 
         let mut helper = OperationHelper::new(&req, event_name, S3Operation::PutObject);
+        let ssekms_context = extract_ssekms_context_from_headers(&req.headers)?;
 
         // Apply encryption using unified SSE API.
         let encryption_request = EncryptionRequest {
@@ -1945,6 +1996,7 @@ impl DefaultObjectUsecase {
             key: &key,
             server_side_encryption: effective_sse.clone(),
             ssekms_key_id: effective_kms_key_id.clone(),
+            ssekms_context,
             sse_customer_algorithm: sse_customer_algorithm.clone(),
             sse_customer_key,
             sse_customer_key_md5: sse_customer_key_md5.clone(),
@@ -1964,14 +2016,14 @@ impl DefaultObjectUsecase {
             effective_sse = Some(material.server_side_encryption.clone());
             effective_kms_key_id = material.kms_key_id.clone();
 
-            let encrypted_reader = EncryptReader::new(reader, material.key_bytes, material.base_nonce);
-            reader = HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
-                .map_err(ApiError::from)?;
+            write_plan = write_plan.with_encryption(material.write_encryption(None));
 
             let encryption_metadata = encryption_material_to_metadata(&material);
             metadata.extend(encryption_metadata.clone());
             opts.user_defined.extend(encryption_metadata);
         }
+
+        reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;
 
         let mut reader = PutObjReader::new(reader);
 
@@ -2455,7 +2507,7 @@ impl DefaultObjectUsecase {
             ..
         } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -2694,6 +2746,7 @@ impl DefaultObjectUsecase {
             object_lock_legal_hold_status,
             object_lock_mode,
             object_lock_retain_until_date,
+            storage_class,
             ..
         } = req.input.clone();
         let (src_bucket, src_key, version_id) = match copy_source {
@@ -2706,18 +2759,26 @@ impl DefaultObjectUsecase {
             } => (bucket.to_string(), key.to_string(), version_id.map(|v| v.to_string())),
         };
 
+        if let Some(ref sc) = storage_class
+            && !is_valid_storage_class(sc.as_str())
+        {
+            return Err(s3_error!(InvalidStorageClass));
+        }
+
         // Validate both source and destination keys
         validate_object_key(&src_key, "COPY (source)")?;
         validate_object_key(&key, "COPY (dest)")?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
-        // AWS S3 allows self-copy when metadata directive is REPLACE (used to update metadata in-place).
-        // Reject only when the directive is not REPLACE.
+        // AWS S3 allows self-copy when metadata directive is REPLACE (used to update metadata in-place),
+        // or when an explicit storage class change is requested.
+        // Reject only when neither condition applies.
         if metadata_directive.as_ref().map(|d| d.as_str()) != Some(MetadataDirective::REPLACE)
+            && storage_class.is_none()
             && src_bucket == bucket
             && src_key == key
         {
-            error!("Rejected self-copy operation: bucket={}, key={}", bucket, key);
+            error!(bucket, key, "Rejected self-copy operation");
             return Err(s3_error!(
                 InvalidRequest,
                 "Cannot copy an object to itself. Source and destination must be different."
@@ -2743,7 +2804,7 @@ impl DefaultObjectUsecase {
 
         let cp_src_dst_same = path_join_buf(&[&src_bucket, &src_key]) == path_join_buf(&[&bucket, &key]);
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -2839,7 +2900,7 @@ impl DefaultObjectUsecase {
             return Err(s3_error!(PreconditionFailed));
         }
 
-        if cp_src_dst_same {
+        if cp_src_dst_same && src_info.transitioned_object.tier.is_empty() {
             src_info.metadata_only = true;
         }
 
@@ -2848,16 +2909,25 @@ impl DefaultObjectUsecase {
 
         strip_managed_encryption_metadata(&mut user_defined);
 
+        if let Some(ref sc) = storage_class {
+            src_info.storage_class = Some(sc.as_str().to_string());
+            user_defined.insert(AMZ_STORAGE_CLASS.to_string(), sc.as_str().to_string());
+        }
+
         let actual_size = src_info.get_actual_size().map_err(ApiError::from)?;
 
-        let mut length = actual_size;
+        let length = actual_size;
 
         let mut compress_metadata = HashMap::new();
 
-        let should_compress = is_compressible(&req.headers, &key) && actual_size > MIN_COMPRESSIBLE_SIZE as i64;
+        let should_compress = is_disk_compressible(&req.headers, &key) && actual_size > MIN_DISK_COMPRESSIBLE_SIZE as i64;
 
         if should_compress {
-            insert_str(&mut compress_metadata, SUFFIX_COMPRESSION, CompressionAlgorithm::default().to_string());
+            insert_str(
+                &mut compress_metadata,
+                SUFFIX_COMPRESSION,
+                rustfs_ecstore::rio::compression_metadata_value(CompressionAlgorithm::default()),
+            );
             insert_str(&mut compress_metadata, SUFFIX_ACTUAL_SIZE, actual_size.to_string());
         } else {
             remove_str(&mut user_defined, SUFFIX_COMPRESSION);
@@ -2893,18 +2963,12 @@ impl DefaultObjectUsecase {
         }
         apply_bucket_default_lock_retention(&bucket, &mut user_defined, has_explicit_object_lock_retention).await?;
 
+        let mut write_plan = WritePlan::new();
         let mut reader = if should_compress {
+            let algorithm = CompressionAlgorithm::default();
             let hrd = HashReader::from_stream(gr.stream, length, actual_size, None, None, false).map_err(ApiError::from)?;
-            length = HashReader::SIZE_PRESERVE_LAYER;
-            HashReader::from_reader(
-                CompressReader::new(hrd, CompressionAlgorithm::default()),
-                length,
-                actual_size,
-                None,
-                None,
-                false,
-            )
-            .map_err(ApiError::from)?
+            write_plan = write_plan.with_compression(algorithm);
+            hrd
         } else {
             HashReader::from_stream(gr.stream, length, actual_size, None, None, false).map_err(ApiError::from)?
         };
@@ -2914,6 +2978,7 @@ impl DefaultObjectUsecase {
             key: &key,
             server_side_encryption: effective_sse.clone(),
             ssekms_key_id: effective_kms_key_id.clone(),
+            ssekms_context: extract_ssekms_context_from_headers(&req.headers)?,
             sse_customer_algorithm: sse_customer_algorithm.clone(),
             sse_customer_key,
             sse_customer_key_md5: sse_customer_key_md5.clone(),
@@ -2924,12 +2989,12 @@ impl DefaultObjectUsecase {
             effective_sse = Some(material.server_side_encryption.clone());
             effective_kms_key_id = material.kms_key_id.clone();
 
-            let encrypted_reader = EncryptReader::new(reader, material.key_bytes, material.base_nonce);
-            reader = HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
-                .map_err(ApiError::from)?;
+            write_plan = write_plan.with_encryption(material.write_encryption(None));
 
             user_defined.extend(encryption_material_to_metadata(&material));
         }
+
+        reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;
 
         src_info.put_object_reader = Some(PutObjReader::new(reader));
 
@@ -3027,7 +3092,7 @@ impl DefaultObjectUsecase {
         )
         .await;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -3380,7 +3445,7 @@ impl DefaultObjectUsecase {
             // }
         }
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -3599,7 +3664,7 @@ impl DefaultObjectUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
         // Modification Points: Explicitly handles get_object_info errors, distinguishing between object absence and other errors
@@ -3612,7 +3677,7 @@ impl DefaultObjectUsecase {
                         let has_children = match probe_prefix_has_children(store, &bucket, &key, false).await {
                             Ok(has_children) => has_children,
                             Err(e) => {
-                                error!("Failed to probe children for prefix (bucket: {}, key: {}): {}", bucket, key, e);
+                                error!(bucket, key, error = %e, "Failed to probe children for prefix");
                                 false
                             }
                         };
@@ -3684,7 +3749,7 @@ impl DefaultObjectUsecase {
                 match ContentType::from_str(content_type) {
                     Ok(res) => Some(res),
                     Err(err) => {
-                        error!("parse content-type err {} {:?}", &content_type, err);
+                        error!(content_type = %content_type, error = ?err, "Archive content-type parse failed");
                         //
                         None
                     }
@@ -3698,7 +3763,7 @@ impl DefaultObjectUsecase {
         // TODO: range download
 
         let content_length = info.get_actual_size().map_err(|e| {
-            error!("get_actual_size error: {}", e);
+            error!(error = %e, "Failed to resolve actual object size");
             ApiError::from(e)
         })?;
 
@@ -3814,7 +3879,7 @@ impl DefaultObjectUsecase {
             if let Ok(header_value) = tag_count.to_string().parse::<HeaderValue>() {
                 response.headers.insert(header_name, header_value);
             } else {
-                warn!("Failed to parse x-amz-tagging-count header value, skipping");
+                warn!("Failed to parse x-amz-tagging-count header; skipping");
             }
         }
         if let Some(retain_date) = metadata_map
@@ -3903,7 +3968,7 @@ impl DefaultObjectUsecase {
             S3Error::with_message(S3ErrorCode::Custom("ErrValidRestoreObject".into()), "restore request is required")
         })?;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -4060,7 +4125,7 @@ impl DefaultObjectUsecase {
                     err.to_string()
                 );
             } else {
-                info!("successfully restored transitioned object: {}/{}", bucket_clone, object_clone);
+                debug!(bucket = %bucket_clone, object = %object_clone, "Transitioned object restored");
             }
         });
 
@@ -4168,6 +4233,7 @@ impl DefaultObjectUsecase {
         validate_sse_headers_for_write(
             effective_sse.as_ref(),
             effective_kms_key_id.as_ref(),
+            extract_ssekms_context_from_headers(&req.headers)?.as_ref(),
             sse_customer_algorithm.as_ref(),
             sse_customer_key.as_ref(),
             sse_customer_key_md5.as_ref(),
@@ -4234,17 +4300,17 @@ impl DefaultObjectUsecase {
         let decoder = CompressionFormat::from_extension(&ext)
             .get_decoder(ExtractArchiveEtagReader::new(archive_reader, archive_etag.clone()))
             .map_err(|e| {
-                error!("get_decoder err {:?}", e);
+                error!(error = ?e, "Archive decoder creation failed");
                 s3_error!(InvalidArgument, "get_decoder err")
             })?;
 
         let mut ar = Archive::new(decoder);
         let mut entries = ar.entries().map_err(|e| {
-            error!("get entries err {:?}", e);
+            error!(error = ?e, "Archive entry listing failed");
             s3_error!(InvalidArgument, "get entries err")
         })?;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -4269,10 +4335,10 @@ impl DefaultObjectUsecase {
                 Ok(f) => f,
                 Err(e) => {
                     if extract_options.ignore_errors {
-                        warn!("Skipping archive entry because read failed and ignore-errors is enabled: {e}");
+                        warn!(error = %e, "Archive entry read skipped due to ignore-errors");
                         continue;
                     }
-                    error!("Failed to read archive entry: {}", e);
+                    error!(error = %e, "Archive entry read failed");
                     return Err(s3_error!(InvalidArgument, "Failed to read archive entry: {:?}", e));
                 }
             };
@@ -4281,7 +4347,7 @@ impl DefaultObjectUsecase {
                 Ok(path) => path,
                 Err(e) => {
                     if extract_options.ignore_errors {
-                        warn!("Skipping archive entry because path decode failed and ignore-errors is enabled: {e}");
+                        warn!(error = %e, "Archive path decode skipped due to ignore-errors");
                         continue;
                     }
                     return Err(s3_error!(InvalidArgument, "Failed to decode archive entry path"));
@@ -4293,7 +4359,7 @@ impl DefaultObjectUsecase {
                 Ok(fpath) => fpath,
                 Err(err) => {
                     if extract_options.ignore_errors {
-                        warn!("Skipping archive entry because path is unsafe and ignore-errors is enabled: {err}");
+                        warn!(error = %err, "Unsafe archive path skipped due to ignore-errors");
                         continue;
                     }
                     return Err(err);
@@ -4363,26 +4429,25 @@ impl DefaultObjectUsecase {
 
             let actual_size = size;
 
-            let should_compress = !is_dir && is_compressible(&HeaderMap::new(), &fpath) && size > MIN_COMPRESSIBLE_SIZE as i64;
+            let should_compress =
+                !is_dir && is_disk_compressible(&HeaderMap::new(), &fpath) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64;
 
+            let mut write_plan = WritePlan::new();
             let mut hrd = if is_dir {
                 HashReader::from_stream(std::io::Cursor::new(Vec::new()), size, actual_size, None, None, false)
                     .map_err(ApiError::from)?
             } else if should_compress {
-                insert_str(&mut metadata, SUFFIX_COMPRESSION, CompressionAlgorithm::default().to_string());
+                let algorithm = CompressionAlgorithm::default();
+                insert_str(
+                    &mut metadata,
+                    SUFFIX_COMPRESSION,
+                    rustfs_ecstore::rio::compression_metadata_value(algorithm),
+                );
                 insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
                 let hrd = HashReader::from_stream(f, size, actual_size, None, None, false).map_err(ApiError::from)?;
-                size = HashReader::SIZE_PRESERVE_LAYER;
-                HashReader::from_reader(
-                    CompressReader::new(hrd, CompressionAlgorithm::default()),
-                    size,
-                    actual_size,
-                    None,
-                    None,
-                    false,
-                )
-                .map_err(ApiError::from)?
+                write_plan = write_plan.with_compression(algorithm);
+                hrd
             } else {
                 HashReader::from_stream(f, size, actual_size, None, None, false).map_err(ApiError::from)?
             };
@@ -4399,6 +4464,7 @@ impl DefaultObjectUsecase {
                 key: &fpath,
                 server_side_encryption: effective_sse.clone(),
                 ssekms_key_id: effective_kms_key_id.clone(),
+                ssekms_context: extract_ssekms_context_from_headers(&req.headers)?,
                 sse_customer_algorithm: sse_customer_algorithm.clone(),
                 sse_customer_key: sse_customer_key.clone(),
                 sse_customer_key_md5: sse_customer_key_md5.clone(),
@@ -4409,14 +4475,13 @@ impl DefaultObjectUsecase {
                 effective_sse = Some(material.server_side_encryption.clone());
                 effective_kms_key_id = material.kms_key_id.clone();
 
-                let encrypted_reader = EncryptReader::new(hrd, material.key_bytes, material.base_nonce);
-                hrd = HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
-                    .map_err(ApiError::from)?;
+                write_plan = write_plan.with_encryption(material.write_encryption(None));
 
                 let encryption_metadata = encryption_material_to_metadata(&material);
                 metadata.extend(encryption_metadata.clone());
                 opts.user_defined.extend(encryption_metadata);
             }
+            hrd = write_plan.apply(hrd, actual_size).map_err(ApiError::from)?;
             opts.user_defined.extend(metadata);
             let mut reader = PutObjReader::new(hrd);
 
@@ -4424,7 +4489,7 @@ impl DefaultObjectUsecase {
                 Ok(info) => info,
                 Err(e) => {
                     if extract_options.ignore_errors {
-                        warn!("Skipping archive entry because object write failed and ignore-errors is enabled: {e}");
+                        warn!(error = %e, "Archive object write skipped due to ignore-errors");
                         continue;
                     }
                     return Err(ApiError::from(e).into());
@@ -5255,6 +5320,74 @@ mod tests {
 
         let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn execute_copy_object_rejects_invalid_storage_class() {
+        let input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: "src-bucket".into(),
+                key: "src-key".into(),
+                version_id: None,
+            })
+            .bucket("dst-bucket".to_string())
+            .key("dst-key".to_string())
+            .storage_class(Some(StorageClass::from_static("INVALID")))
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultObjectUsecase::without_context();
+
+        let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
+    }
+
+    #[tokio::test]
+    async fn execute_copy_object_allows_self_copy_with_storage_class_change() {
+        let input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: "test-bucket".into(),
+                key: "test-key".into(),
+                version_id: None,
+            })
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .storage_class(Some(StorageClass::from_static(storageclass::STANDARD_IA)))
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultObjectUsecase::without_context();
+
+        let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
+        // Self-copy with explicit storage class change must pass the self-copy guard.
+        assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn execute_copy_object_allows_tiered_self_copy_with_storage_class_change() {
+        let input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: "test-bucket".into(),
+                key: "test-key".into(),
+                version_id: None,
+            })
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .storage_class(Some(StorageClass::from_static(storageclass::STANDARD)))
+            .metadata_directive(Some(MetadataDirective::from_static(MetadataDirective::REPLACE)))
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultObjectUsecase::without_context();
+
+        let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
+        // Tiered self-copy with STANDARD storage class must pass all validation checks.
+        // The call fails at store init (no store in unit tests), not at validation.
+        assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_ne!(err.code(), &S3ErrorCode::NotImplemented);
     }
 
     #[tokio::test]

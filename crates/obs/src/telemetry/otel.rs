@@ -40,8 +40,8 @@ use crate::cleaner::types::FileMatchMode;
 use crate::config::OtelConfig;
 use crate::global::set_observability_metric_enabled;
 use crate::telemetry::filter::build_env_filter;
-use crate::telemetry::guard::OtelGuard;
-use crate::telemetry::local::spawn_cleanup_task;
+use crate::telemetry::guard::{MemoryProfilingAgent, OtelGuard, ProfilingAgent};
+use crate::telemetry::local::{build_json_log_layer, spawn_cleanup_task};
 use crate::telemetry::recorder::Recorder;
 use crate::telemetry::resource::build_resource;
 use crate::telemetry::rolling::{RollingAppender, Rotation};
@@ -68,12 +68,7 @@ use std::{fs, io::IsTerminal, time::Duration};
 use tracing::info;
 use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
-use tracing_subscriber::{
-    Layer,
-    fmt::{format::FmtSpan, time::LocalTime},
-    layer::SubscriberExt,
-    util::SubscriberInitExt,
-};
+use tracing_subscriber::{Layer, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Initialize the full OpenTelemetry HTTP pipeline (traces + metrics + logs).
 ///
@@ -164,10 +159,7 @@ pub(super) fn init_observability_http(
     // ── Meter provider (HTTP) ─────────────────────────────────────────────────
     let meter_provider = build_meter_provider(&metric_ep, config, res.clone(), &service_name, use_stdout)?;
 
-    #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
     let profiling_agent = init_profiler(config);
-
-    #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
     let memory_profiling_agent = init_memory_profiler(config);
 
     // ── Logger Logic ──────────────────────────────────────────────────────────
@@ -234,20 +226,7 @@ pub(super) fn init_observability_http(
                 RollingAppender::new(log_directory, log_filename.to_string(), rotation, max_single_file_size, match_mode)?;
 
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-            let file_layer = tracing_subscriber::fmt::layer()
-                .with_timer(LocalTime::rfc_3339())
-                .with_target(true)
-                .with_ansi(false)
-                .with_thread_names(true)
-                .with_thread_ids(true)
-                .with_file(true)
-                .with_line_number(true)
-                .with_writer(non_blocking)
-                .json()
-                .with_current_span(true)
-                .with_span_list(true)
-                .with_span_events(span_events.clone())
-                .with_filter(build_env_filter(logger_level, None));
+            let file_layer = build_json_log_layer(non_blocking, false, span_events.clone());
             let cleanup_handle = spawn_cleanup_task(config, log_directory, log_filename, keep_files);
             Ok((file_layer, guard, cleanup_handle, rotation_str))
         })();
@@ -259,8 +238,17 @@ pub(super) fn init_observability_http(
                 cleanup_handle = Some(new_cleanup_handle);
 
                 info!(
-                    "Init file logging at '{}', rotation: {}, keep {} files",
-                    log_directory, rotation_str, keep_files
+                    backend = "local",
+                    sink = "file",
+                    output_format = "json",
+                    log_directory,
+                    rotation = %rotation_str,
+                    keep_files,
+                    stdout_mirror_enabled = config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED)
+                        || !is_production,
+                    logger_level,
+                    is_production,
+                    "Initialized local logging fallback for observability"
                 );
             }
             Err(error) if crate::telemetry::local::should_fallback_to_stdout(&error) => {
@@ -282,26 +270,16 @@ pub(super) fn init_observability_http(
     if force_stdout_logging || config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) || !is_production {
         let (stdout_nb, stdout_g) = tracing_appender::non_blocking(std::io::stdout());
         stdout_guard = Some(stdout_g);
-        stdout_layer_opt = Some(
-            tracing_subscriber::fmt::layer()
-                .with_timer(LocalTime::rfc_3339())
-                .with_target(true)
-                .with_ansi(std::io::stdout().is_terminal())
-                .with_thread_names(true)
-                .with_thread_ids(true)
-                .with_file(true)
-                .with_line_number(true)
-                .with_writer(stdout_nb)
-                .with_span_events(span_events)
-                .with_filter(build_env_filter(logger_level, None)),
-        );
+        stdout_layer_opt = Some(build_json_log_layer(stdout_nb, std::io::stdout().is_terminal(), span_events));
     }
+    let local_file_fallback_enabled = file_layer_opt.is_some();
+    let stdout_mirror_enabled = stdout_guard.is_some();
     let filter = build_env_filter(logger_level, None);
     tracing_subscriber::registry()
         .with(filter)
         .with(ErrorLayer::default())
-        .with(file_layer_opt) // File
-        .with(stdout_layer_opt) // Stdout (only if file logging enabled it)
+        .with(file_layer_opt)
+        .with(stdout_layer_opt)
         .with(tracer_layer)
         .with(otel_bridge)
         .with(metrics_layer)
@@ -309,17 +287,23 @@ pub(super) fn init_observability_http(
 
     counter!("rustfs_start_total").increment(1);
     info!(
-        "Init observability (HTTP): trace='{}', metric='{}', log='{}'",
-        trace_ep, metric_ep, log_ep
+        backend = "otlp_http",
+        trace_endpoint = %trace_ep,
+        metric_endpoint = %metric_ep,
+        log_endpoint = %log_ep,
+        local_file_fallback_enabled,
+        stdout_mirror_enabled,
+        output_format = "json",
+        logger_level,
+        is_production,
+        "Initialized observability"
     );
 
     Ok(OtelGuard {
         tracer_provider,
         meter_provider,
         logger_provider,
-        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
         profiling_agent,
-        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
         memory_profiling_agent,
         tracing_guard,
         stdout_guard,
@@ -496,8 +480,11 @@ fn build_logger_provider(
 /// Returns `None` when profiling export is disabled, when no usable
 /// profiling endpoint is configured, or when building or starting the agent
 /// fails.
-#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>> {
+#[cfg(all(
+    feature = "pyroscope",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+))]
+fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
     use pyroscope::backend::{BackendConfig, PprofConfig, pprof_backend};
     use pyroscope::pyroscope::PyroscopeAgentBuilder;
     use rustfs_config::VERSION;
@@ -534,6 +521,14 @@ fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyrosc
     }
 }
 
+#[cfg(not(all(
+    feature = "pyroscope",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+)))]
+fn init_profiler(_config: &OtelConfig) -> Option<ProfilingAgent> {
+    None
+}
+
 /// Initialise a Pyroscope agent for continuous **memory** profiling via jemalloc.
 ///
 /// This is only available on `linux + gnu + x86_64` where tikv-jemallocator
@@ -541,8 +536,8 @@ fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyrosc
 ///
 /// Returns `None` when profiling export is disabled, the endpoint is missing,
 /// jemalloc profiling is not activated, or the agent fails to build/start.
-#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
-fn init_memory_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>> {
+#[cfg(all(feature = "pyroscope", target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+fn init_memory_profiler(config: &OtelConfig) -> Option<MemoryProfilingAgent> {
     use pyroscope::backend::jemalloc_backend;
     use pyroscope::pyroscope::PyroscopeAgentBuilder;
     use rustfs_config::VERSION;
@@ -586,6 +581,11 @@ fn init_memory_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent
             None
         }
     }
+}
+
+#[cfg(not(all(feature = "pyroscope", target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+fn init_memory_profiler(_config: &OtelConfig) -> Option<MemoryProfilingAgent> {
+    None
 }
 
 /// Create a stdout periodic metrics reader for the given interval.

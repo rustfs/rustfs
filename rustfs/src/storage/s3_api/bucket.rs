@@ -15,7 +15,8 @@
 use crate::storage::s3_api::common::rustfs_owner;
 use percent_encoding::percent_decode_str;
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
-use rustfs_ecstore::store_api::{BucketInfo, ListObjectVersionsInfo, ListObjectsV2Info};
+use rustfs_ecstore::store_api::{ListObjectVersionsInfo, ListObjectsV2Info};
+use rustfs_storage_api::BucketInfo;
 use s3s::dto::{
     Bucket, CommonPrefix, DeleteMarkerEntry, EncodingType, ListBucketsOutput, ListObjectVersionsOutput, ListObjectsOutput,
     ListObjectsV2Output, Object, ObjectStorageClass, ObjectVersion, ObjectVersionStorageClass, Timestamp,
@@ -387,7 +388,8 @@ mod tests {
         build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
     };
     use crate::storage::s3_api::common::rustfs_owner;
-    use rustfs_ecstore::store_api::{BucketInfo, ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo};
+    use rustfs_ecstore::store_api::{ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo};
+    use rustfs_storage_api::BucketInfo;
     use s3s::S3ErrorCode;
     use s3s::dto::{CommonPrefix, EncodingType, ListObjectsV2Output, Object};
     use time::OffsetDateTime;

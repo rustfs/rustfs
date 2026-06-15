@@ -13,10 +13,13 @@
 // limitations under the License.
 
 use crate::manifest::{
-    TargetPluginDistributionManifest, TargetPluginExternalRuntimeContract, TargetPluginManifest, TargetPluginRuntimeTransport,
+    TargetPluginDistributionManifest, TargetPluginExternalRuntimeContract, TargetPluginManifest, TargetPluginMarketplaceManifest,
+    TargetPluginPackaging, TargetPluginRuntimeTransport,
 };
+use crate::runtime::sidecar::{SidecarRuntimePolicy, SidecarRuntimeSafetyChecks};
 use crate::runtime::sidecar_protocol::SIDECAR_RUNTIME_PROTOCOL_VERSION;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use url::Url;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,12 +166,166 @@ pub fn runtime_state_from_status_label(status: &str) -> TargetPluginRuntimeState
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetPluginExternalAction {
+    Install,
+    Enable,
+    Disable,
+    Rollback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TargetPluginExternalActionDecision {
+    pub action: TargetPluginExternalAction,
+    pub plugin_id: String,
+    pub installation: TargetPluginInstallation,
+    pub operational_state: TargetPluginOperationalState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetPluginExternalFlowGate {
+    pub enabled: bool,
+    pub install_policy: TargetPluginInstallPolicy,
+    pub runtime_policy: SidecarRuntimePolicy,
+    pub runtime_safety_checks: SidecarRuntimeSafetyChecks,
+    pub circuit_breaker_closed: bool,
+}
+
+impl Default for TargetPluginExternalFlowGate {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            install_policy: TargetPluginInstallPolicy::default(),
+            runtime_policy: SidecarRuntimePolicy::default(),
+            runtime_safety_checks: SidecarRuntimeSafetyChecks {
+                sandboxed: false,
+                provenance_verified: false,
+                queue_depth: 0,
+            },
+            circuit_breaker_closed: false,
+        }
+    }
+}
+
+impl TargetPluginExternalFlowGate {
+    pub fn verified(runtime_policy: SidecarRuntimePolicy, runtime_safety_checks: SidecarRuntimeSafetyChecks) -> Self {
+        Self {
+            enabled: true,
+            install_policy: TargetPluginInstallPolicy::default(),
+            runtime_policy,
+            runtime_safety_checks,
+            circuit_breaker_closed: true,
+        }
+    }
+
+    pub fn status(&self) -> TargetPluginExternalFlowGateStatus {
+        TargetPluginExternalFlowGateStatus {
+            enabled: self.enabled,
+            install_requires_signature: self.install_policy.require_signature,
+            install_requires_provenance: self.install_policy.require_provenance,
+            runtime_allows_external_sidecars: self.runtime_policy.allow_external_sidecars,
+            runtime_requires_sandbox: self.runtime_policy.require_sandbox,
+            runtime_requires_provenance: self.runtime_policy.require_provenance,
+            circuit_breaker_closed: self.circuit_breaker_closed,
+            max_queue_depth: self.runtime_policy.max_queue_depth,
+            failure_threshold: self.runtime_policy.failure_threshold(),
+            redacts_error_details: self.runtime_policy.redact_error_details,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TargetPluginExternalFlowGateStatus {
+    pub enabled: bool,
+    pub install_requires_signature: bool,
+    pub install_requires_provenance: bool,
+    pub runtime_allows_external_sidecars: bool,
+    pub runtime_requires_sandbox: bool,
+    pub runtime_requires_provenance: bool,
+    pub circuit_breaker_closed: bool,
+    pub max_queue_depth: usize,
+    pub failure_threshold: usize,
+    pub redacts_error_details: bool,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum TargetPluginExternalActionError {
+    #[error("external plugin flow is disabled")]
+    ExternalFlowDisabled,
+
+    #[error("plugin {plugin_id} is not an external plugin")]
+    NotExternalPlugin { plugin_id: String },
+
+    #[error("plugin {plugin_id} is not installed")]
+    NotInstalled { plugin_id: String },
+
+    #[error("plugin {plugin_id} has no previous revision for rollback")]
+    MissingPreviousRevision { plugin_id: String },
+
+    #[error("external plugin install policy denied action: {reason}")]
+    InstallPolicyDenied { reason: String },
+
+    #[error("external plugin runtime policy denied action: {reason}")]
+    RuntimePolicyDenied { reason: String },
+
+    #[error("external plugin circuit breaker is open")]
+    CircuitBreakerOpen,
+
+    #[error("external plugin {plugin_id} has no installable artifact")]
+    MissingArtifact { plugin_id: String },
+}
+
+pub fn plan_external_target_plugin_action(
+    manifest: &TargetPluginMarketplaceManifest,
+    action: TargetPluginExternalAction,
+    installation: &TargetPluginInstallation,
+    gate: &TargetPluginExternalFlowGate,
+) -> Result<TargetPluginExternalActionDecision, TargetPluginExternalActionError> {
+    validate_external_action_subject(manifest)?;
+    validate_external_action_gate(gate)?;
+
+    match action {
+        TargetPluginExternalAction::Install => plan_external_install(manifest, action, gate),
+        TargetPluginExternalAction::Enable => {
+            require_installed(manifest.plugin_id, installation)?;
+            Ok(TargetPluginExternalActionDecision {
+                action,
+                plugin_id: manifest.plugin_id.to_string(),
+                installation: installation.clone(),
+                operational_state: TargetPluginOperationalState {
+                    install_state: TargetPluginInstallState::Installed,
+                    enable_state: TargetPluginEnableState::Enabled,
+                    runtime_state: TargetPluginRuntimeState::Running,
+                },
+            })
+        }
+        TargetPluginExternalAction::Disable => {
+            require_installed(manifest.plugin_id, installation)?;
+            Ok(TargetPluginExternalActionDecision {
+                action,
+                plugin_id: manifest.plugin_id.to_string(),
+                installation: installation.clone(),
+                operational_state: TargetPluginOperationalState {
+                    install_state: TargetPluginInstallState::Installed,
+                    enable_state: TargetPluginEnableState::Disabled,
+                    runtime_state: TargetPluginRuntimeState::Offline,
+                },
+            })
+        }
+        TargetPluginExternalAction::Rollback => plan_external_rollback(manifest, action, installation),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetPluginInstallPolicy {
     pub allowed_providers: Vec<String>,
     pub allowed_download_hosts: Vec<String>,
     pub require_https: bool,
     pub require_signature: bool,
+    pub require_provenance: bool,
 }
 
 impl Default for TargetPluginInstallPolicy {
@@ -177,7 +334,8 @@ impl Default for TargetPluginInstallPolicy {
             allowed_providers: vec!["rustfs".to_string(), "rustfs-labs".to_string()],
             allowed_download_hosts: vec!["plugins.example.test".to_string()],
             require_https: true,
-            require_signature: false,
+            require_signature: true,
+            require_provenance: true,
         }
     }
 }
@@ -199,12 +357,6 @@ pub fn validate_external_plugin_installation(
             "sidecar runtime protocol mismatch: expected {}, got {}",
             SIDECAR_RUNTIME_PROTOCOL_VERSION, runtime_contract.protocol_version
         ));
-    }
-
-    if policy.require_signature {
-        return Err(
-            "signature verification is required by install policy but manifests do not expose signatures yet".to_string(),
-        );
     }
 
     let distribution = distribution.ok_or_else(|| "external plugin is missing distribution metadata".to_string())?;
@@ -236,6 +388,138 @@ pub fn validate_external_plugin_installation(
                 artifact.artifact_id, artifact.digest_sha256
             ));
         }
+        if policy.require_signature && artifact.signature_uri.is_empty() {
+            return Err(format!("artifact {} must declare a signature uri", artifact.artifact_id));
+        }
+        if policy.require_provenance && artifact.provenance_uri.is_empty() {
+            return Err(format!("artifact {} must declare a provenance uri", artifact.artifact_id));
+        }
+        validate_artifact_uri("signature", artifact.artifact_id, artifact.signature_uri, policy)?;
+        validate_artifact_uri("provenance", artifact.artifact_id, artifact.provenance_uri, policy)?;
+    }
+
+    Ok(())
+}
+
+fn validate_external_action_subject(manifest: &TargetPluginMarketplaceManifest) -> Result<(), TargetPluginExternalActionError> {
+    if manifest.packaging != TargetPluginPackaging::External {
+        return Err(TargetPluginExternalActionError::NotExternalPlugin {
+            plugin_id: manifest.plugin_id.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_external_action_gate(gate: &TargetPluginExternalFlowGate) -> Result<(), TargetPluginExternalActionError> {
+    if !gate.enabled {
+        return Err(TargetPluginExternalActionError::ExternalFlowDisabled);
+    }
+    if !gate.circuit_breaker_closed {
+        return Err(TargetPluginExternalActionError::CircuitBreakerOpen);
+    }
+    gate.runtime_policy
+        .validate_activation(&gate.runtime_safety_checks)
+        .map_err(|reason| TargetPluginExternalActionError::RuntimePolicyDenied {
+            reason: reason.to_string(),
+        })
+}
+
+fn plan_external_install(
+    manifest: &TargetPluginMarketplaceManifest,
+    action: TargetPluginExternalAction,
+    gate: &TargetPluginExternalFlowGate,
+) -> Result<TargetPluginExternalActionDecision, TargetPluginExternalActionError> {
+    let install_manifest = TargetPluginManifest {
+        plugin_id: manifest.plugin_id,
+        display_name: manifest.display_name,
+        provider: manifest.provider,
+        version: manifest.version,
+        target_type: manifest.target_type,
+        supported_domains: manifest.supported_domains,
+        secret_fields: manifest.secret_fields,
+    };
+    validate_external_plugin_installation(
+        &install_manifest,
+        &manifest.runtime_contract,
+        manifest.distribution,
+        &gate.install_policy,
+    )
+    .map_err(|reason| TargetPluginExternalActionError::InstallPolicyDenied { reason })?;
+
+    let artifact = manifest
+        .distribution
+        .and_then(|distribution| distribution.artifacts.first())
+        .ok_or_else(|| TargetPluginExternalActionError::MissingArtifact {
+            plugin_id: manifest.plugin_id.to_string(),
+        })?;
+
+    Ok(TargetPluginExternalActionDecision {
+        action,
+        plugin_id: manifest.plugin_id.to_string(),
+        installation: external_target_plugin_installation(manifest.version, artifact.digest_sha256, artifact.artifact_id, None),
+        operational_state: TargetPluginOperationalState {
+            install_state: TargetPluginInstallState::Installed,
+            enable_state: TargetPluginEnableState::Disabled,
+            runtime_state: TargetPluginRuntimeState::Offline,
+        },
+    })
+}
+
+fn require_installed(plugin_id: &str, installation: &TargetPluginInstallation) -> Result<(), TargetPluginExternalActionError> {
+    if installation.install_state != TargetPluginInstallState::Installed || installation.current_revision.is_none() {
+        return Err(TargetPluginExternalActionError::NotInstalled {
+            plugin_id: plugin_id.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn plan_external_rollback(
+    manifest: &TargetPluginMarketplaceManifest,
+    action: TargetPluginExternalAction,
+    installation: &TargetPluginInstallation,
+) -> Result<TargetPluginExternalActionDecision, TargetPluginExternalActionError> {
+    require_installed(manifest.plugin_id, installation)?;
+
+    let Some(current) = installation.current_revision.clone() else {
+        return Err(TargetPluginExternalActionError::NotInstalled {
+            plugin_id: manifest.plugin_id.to_string(),
+        });
+    };
+    let Some(previous) = installation.previous_revision.clone() else {
+        return Err(TargetPluginExternalActionError::MissingPreviousRevision {
+            plugin_id: manifest.plugin_id.to_string(),
+        });
+    };
+
+    Ok(TargetPluginExternalActionDecision {
+        action,
+        plugin_id: manifest.plugin_id.to_string(),
+        installation: rollback_target_plugin_installation(current, previous),
+        operational_state: TargetPluginOperationalState {
+            install_state: TargetPluginInstallState::Installed,
+            enable_state: TargetPluginEnableState::Disabled,
+            runtime_state: TargetPluginRuntimeState::Offline,
+        },
+    })
+}
+
+fn validate_artifact_uri(label: &str, artifact_id: &str, uri: &str, policy: &TargetPluginInstallPolicy) -> Result<(), String> {
+    if uri.is_empty() {
+        return Ok(());
+    }
+
+    let parsed_uri = Url::parse(uri).map_err(|err| format!("invalid artifact {label} uri {uri}: {err}"))?;
+    if policy.require_https && parsed_uri.scheme() != "https" {
+        return Err(format!("artifact {artifact_id} must use https {label} uri, got {uri}"));
+    }
+    let host = parsed_uri
+        .host_str()
+        .ok_or_else(|| format!("artifact {artifact_id} {label} uri has no host"))?;
+    if !policy.allowed_download_hosts.iter().any(|allowed| allowed == host) {
+        return Err(format!("artifact {artifact_id} {label} host {host} is not allowed"));
     }
 
     Ok(())
@@ -244,15 +528,19 @@ pub fn validate_external_plugin_installation(
 #[cfg(test)]
 mod tests {
     use super::{
-        TargetPluginEnableState, TargetPluginInstallPolicy, TargetPluginInstallState, TargetPluginRevision,
+        TargetPluginEnableState, TargetPluginExternalAction, TargetPluginExternalActionError, TargetPluginExternalFlowGate,
+        TargetPluginInstallPolicy, TargetPluginInstallState, TargetPluginInstallation, TargetPluginRevision,
         TargetPluginRuntimeState, builtin_target_plugin_installation, builtin_target_plugin_operational_state,
-        external_target_plugin_installation, failed_external_target_plugin_installation, rollback_target_plugin_installation,
-        runtime_state_from_status_label, validate_external_plugin_installation,
+        external_target_plugin_installation, failed_external_target_plugin_installation, plan_external_target_plugin_action,
+        rollback_target_plugin_installation, runtime_state_from_status_label, validate_external_plugin_installation,
     };
+    use crate::catalog::example_external_webhook_plugin;
     use crate::manifest::{
         TargetPluginArtifactManifest, TargetPluginDistributionManifest, TargetPluginExternalRuntimeContract,
-        TargetPluginManifest, TargetPluginRuntimeTransport, builtin_target_manifest,
+        TargetPluginManifest, TargetPluginRuntimeTransport, builtin_target_manifest, builtin_target_marketplace_manifest,
     };
+    use crate::{SidecarRuntimePolicy, SidecarRuntimeSafetyChecks};
+    use std::time::Duration;
 
     #[test]
     fn builtin_installation_maps_to_virtual_installed_revision() {
@@ -354,6 +642,209 @@ mod tests {
     }
 
     #[test]
+    fn external_action_gate_is_disabled_by_default() {
+        let example = example_external_webhook_plugin();
+        let gate = TargetPluginExternalFlowGate::default();
+
+        let result = plan_external_target_plugin_action(
+            &example.manifest,
+            TargetPluginExternalAction::Install,
+            &TargetPluginInstallation {
+                install_state: TargetPluginInstallState::NotInstalled,
+                current_revision: None,
+                previous_revision: None,
+                validation_error: None,
+            },
+            &gate,
+        );
+
+        assert_eq!(result, Err(TargetPluginExternalActionError::ExternalFlowDisabled));
+        assert!(!gate.status().enabled);
+        assert!(gate.status().install_requires_signature);
+        assert!(gate.status().install_requires_provenance);
+    }
+
+    #[test]
+    fn external_action_rejects_builtin_manifest() {
+        let gate = TargetPluginExternalFlowGate::verified(
+            SidecarRuntimePolicy::verified_external(16, Duration::from_secs(5), 3),
+            SidecarRuntimeSafetyChecks::verified(0),
+        );
+
+        let result = plan_external_target_plugin_action(
+            &builtin_target_marketplace_manifest("webhook"),
+            TargetPluginExternalAction::Install,
+            &TargetPluginInstallation {
+                install_state: TargetPluginInstallState::NotInstalled,
+                current_revision: None,
+                previous_revision: None,
+                validation_error: None,
+            },
+            &gate,
+        );
+
+        assert_eq!(
+            result,
+            Err(TargetPluginExternalActionError::NotExternalPlugin {
+                plugin_id: "builtin:webhook".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn external_action_install_requires_signature_and_provenance() {
+        const MISSING_PROVENANCE_ARTIFACTS: &[TargetPluginArtifactManifest] = &[TargetPluginArtifactManifest {
+            artifact_id: "sidecar-linux-amd64",
+            target_triple: "x86_64-unknown-linux-gnu",
+            download_uri: "https://plugins.example.test/webhook-sidecar.tar.zst",
+            digest_sha256: "0123456789abcdef0123456789abcdef",
+            signature_uri: "https://plugins.example.test/webhook-sidecar.tar.zst.sig",
+            provenance_uri: "",
+            size_bytes: 8192,
+        }];
+
+        let mut example = example_external_webhook_plugin();
+        example.manifest.distribution = Some(TargetPluginDistributionManifest {
+            artifacts: MISSING_PROVENANCE_ARTIFACTS,
+        });
+        let gate = TargetPluginExternalFlowGate::verified(
+            SidecarRuntimePolicy::verified_external(16, Duration::from_secs(5), 3),
+            SidecarRuntimeSafetyChecks::verified(0),
+        );
+
+        let result = plan_external_target_plugin_action(
+            &example.manifest,
+            TargetPluginExternalAction::Install,
+            &TargetPluginInstallation {
+                install_state: TargetPluginInstallState::NotInstalled,
+                current_revision: None,
+                previous_revision: None,
+                validation_error: None,
+            },
+            &gate,
+        );
+
+        assert_eq!(
+            result,
+            Err(TargetPluginExternalActionError::InstallPolicyDenied {
+                reason: "artifact sidecar-linux-amd64 must declare a provenance uri".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn external_action_enable_requires_sandbox_and_provenance() {
+        let example = example_external_webhook_plugin();
+        let gate = TargetPluginExternalFlowGate::verified(
+            SidecarRuntimePolicy::verified_external(16, Duration::from_secs(5), 3),
+            SidecarRuntimeSafetyChecks {
+                sandboxed: false,
+                provenance_verified: true,
+                queue_depth: 0,
+            },
+        );
+
+        let result = plan_external_target_plugin_action(
+            &example.manifest,
+            TargetPluginExternalAction::Enable,
+            &example.installation,
+            &gate,
+        );
+
+        assert_eq!(
+            result,
+            Err(TargetPluginExternalActionError::RuntimePolicyDenied {
+                reason: "sidecar runtime requires sandbox isolation".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn external_action_enable_requires_closed_circuit_breaker() {
+        let example = example_external_webhook_plugin();
+        let mut gate = TargetPluginExternalFlowGate::verified(
+            SidecarRuntimePolicy::verified_external(16, Duration::from_secs(5), 3),
+            SidecarRuntimeSafetyChecks::verified(0),
+        );
+        gate.circuit_breaker_closed = false;
+
+        let result = plan_external_target_plugin_action(
+            &example.manifest,
+            TargetPluginExternalAction::Enable,
+            &example.installation,
+            &gate,
+        );
+
+        assert_eq!(result, Err(TargetPluginExternalActionError::CircuitBreakerOpen));
+    }
+
+    #[test]
+    fn external_actions_plan_install_disable_and_rollback_without_execution() {
+        let example = example_external_webhook_plugin();
+        let gate = TargetPluginExternalFlowGate::verified(
+            SidecarRuntimePolicy::verified_external(16, Duration::from_secs(5), 3),
+            SidecarRuntimeSafetyChecks::verified(0),
+        );
+
+        let install = plan_external_target_plugin_action(
+            &example.manifest,
+            TargetPluginExternalAction::Install,
+            &TargetPluginInstallation {
+                install_state: TargetPluginInstallState::NotInstalled,
+                current_revision: None,
+                previous_revision: None,
+                validation_error: None,
+            },
+            &gate,
+        )
+        .expect("verified external install action should plan");
+        assert_eq!(install.installation.install_state, TargetPluginInstallState::Installed);
+        assert_eq!(install.operational_state.enable_state, TargetPluginEnableState::Disabled);
+        assert_eq!(install.operational_state.runtime_state, TargetPluginRuntimeState::Offline);
+
+        let disable = plan_external_target_plugin_action(
+            &example.manifest,
+            TargetPluginExternalAction::Disable,
+            &example.installation,
+            &gate,
+        )
+        .expect("verified external disable action should plan");
+        assert_eq!(disable.operational_state.enable_state, TargetPluginEnableState::Disabled);
+        assert_eq!(disable.operational_state.runtime_state, TargetPluginRuntimeState::Offline);
+
+        let current = TargetPluginRevision {
+            version: "2.0.0".to_string(),
+            digest_sha256: Some("new-digest".to_string()),
+            source: "external".to_string(),
+            installed_at: Some("2026-05-13T12:05:00Z".to_string()),
+            artifact_id: Some("sidecar-linux-amd64-v2".to_string()),
+        };
+        let previous = TargetPluginRevision {
+            version: "1.9.0".to_string(),
+            digest_sha256: Some("old-digest".to_string()),
+            source: "external".to_string(),
+            installed_at: Some("2026-05-13T11:55:00Z".to_string()),
+            artifact_id: Some("sidecar-linux-amd64-v1".to_string()),
+        };
+        let rollback = plan_external_target_plugin_action(
+            &example.manifest,
+            TargetPluginExternalAction::Rollback,
+            &TargetPluginInstallation {
+                install_state: TargetPluginInstallState::Installed,
+                current_revision: Some(current.clone()),
+                previous_revision: Some(previous.clone()),
+                validation_error: None,
+            },
+            &gate,
+        )
+        .expect("verified external rollback action should plan");
+
+        assert_eq!(rollback.installation.current_revision, Some(previous));
+        assert_eq!(rollback.installation.previous_revision, Some(current));
+        assert_eq!(rollback.operational_state.enable_state, TargetPluginEnableState::Disabled);
+    }
+
+    #[test]
     fn validate_external_installation_accepts_allowed_https_artifact() {
         let manifest = TargetPluginManifest {
             plugin_id: "external:webhook-sidecar",
@@ -370,6 +861,8 @@ mod tests {
                 target_triple: "x86_64-unknown-linux-gnu",
                 download_uri: "https://plugins.example.test/webhook-sidecar.tar.zst",
                 digest_sha256: "0123456789abcdef0123456789abcdef",
+                signature_uri: "https://plugins.example.test/webhook-sidecar.tar.zst.sig",
+                provenance_uri: "https://plugins.example.test/webhook-sidecar.tar.zst.intoto.jsonl",
                 size_bytes: 8192,
             }],
         };
@@ -413,6 +906,8 @@ mod tests {
                     target_triple: "x86_64-unknown-linux-gnu",
                     download_uri: "https://plugins.example.test/webhook-sidecar.tar.zst",
                     digest_sha256: "0123456789abcdef0123456789abcdef",
+                    signature_uri: "https://plugins.example.test/webhook-sidecar.tar.zst.sig",
+                    provenance_uri: "https://plugins.example.test/webhook-sidecar.tar.zst.intoto.jsonl",
                     size_bytes: 8192,
                 }],
             }),
@@ -420,5 +915,83 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_external_installation_rejects_missing_artifact_signature() {
+        let manifest = TargetPluginManifest {
+            plugin_id: "external:webhook-sidecar",
+            display_name: "Webhook Sidecar",
+            provider: "rustfs-labs",
+            version: "1.0.0",
+            target_type: "webhook",
+            supported_domains: &[],
+            secret_fields: &[],
+        };
+        let policy = TargetPluginInstallPolicy::default();
+
+        let result = validate_external_plugin_installation(
+            &manifest,
+            &TargetPluginExternalRuntimeContract {
+                protocol_version: crate::SIDECAR_RUNTIME_PROTOCOL_VERSION,
+                transport: TargetPluginRuntimeTransport::Grpc,
+            },
+            Some(TargetPluginDistributionManifest {
+                artifacts: &[TargetPluginArtifactManifest {
+                    artifact_id: "sidecar-linux-amd64",
+                    target_triple: "x86_64-unknown-linux-gnu",
+                    download_uri: "https://plugins.example.test/webhook-sidecar.tar.zst",
+                    digest_sha256: "0123456789abcdef0123456789abcdef",
+                    signature_uri: "",
+                    provenance_uri: "https://plugins.example.test/webhook-sidecar.intoto.jsonl",
+                    size_bytes: 8192,
+                }],
+            }),
+            &policy,
+        );
+
+        assert_eq!(
+            result.as_ref().map_err(String::as_str),
+            Err("artifact sidecar-linux-amd64 must declare a signature uri")
+        );
+    }
+
+    #[test]
+    fn validate_external_installation_rejects_missing_artifact_provenance() {
+        let manifest = TargetPluginManifest {
+            plugin_id: "external:webhook-sidecar",
+            display_name: "Webhook Sidecar",
+            provider: "rustfs-labs",
+            version: "1.0.0",
+            target_type: "webhook",
+            supported_domains: &[],
+            secret_fields: &[],
+        };
+        let policy = TargetPluginInstallPolicy::default();
+
+        let result = validate_external_plugin_installation(
+            &manifest,
+            &TargetPluginExternalRuntimeContract {
+                protocol_version: crate::SIDECAR_RUNTIME_PROTOCOL_VERSION,
+                transport: TargetPluginRuntimeTransport::Grpc,
+            },
+            Some(TargetPluginDistributionManifest {
+                artifacts: &[TargetPluginArtifactManifest {
+                    artifact_id: "sidecar-linux-amd64",
+                    target_triple: "x86_64-unknown-linux-gnu",
+                    download_uri: "https://plugins.example.test/webhook-sidecar.tar.zst",
+                    digest_sha256: "0123456789abcdef0123456789abcdef",
+                    signature_uri: "https://plugins.example.test/webhook-sidecar.sig",
+                    provenance_uri: "",
+                    size_bytes: 8192,
+                }],
+            }),
+            &policy,
+        );
+
+        assert_eq!(
+            result.as_ref().map_err(String::as_str),
+            Err("artifact sidecar-linux-amd64 must declare a provenance uri")
+        );
     }
 }

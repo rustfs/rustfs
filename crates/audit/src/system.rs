@@ -16,11 +16,16 @@ use crate::{
     AuditEntry, AuditError, AuditRegistry, AuditResult, observability,
     pipeline::{AuditPipeline, AuditRuntimeFacade, AuditRuntimeView},
 };
-use rustfs_ecstore::config::Config;
+use rustfs_config::server_config::Config;
 use rustfs_targets::{ReplayWorkerManager, Target};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+
+const LOG_COMPONENT_AUDIT: &str = "audit";
+const LOG_SUBSYSTEM_SYSTEM: &str = "system";
+const EVENT_AUDIT_SYSTEM_STATE: &str = "audit_system_state";
+const EVENT_AUDIT_CONFIG_RELOADED: &str = "audit_config_reloaded";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuditTargetMetricSnapshot {
@@ -104,12 +109,19 @@ impl AuditSystem {
         final_state: AuditSystemState,
     ) -> AuditResult<()> {
         if targets.is_empty() {
-            info!("No enabled audit targets found, keeping audit system stopped");
+            debug_audit_state("stopped", Some("no_enabled_targets"), None, 0);
             self.clear_runtime_targets().await?;
             return Ok(());
         }
 
-        info!(target_count = targets.len(), "Created audit targets successfully");
+        info!(
+            event = EVENT_AUDIT_SYSTEM_STATE,
+            component = LOG_COMPONENT_AUDIT,
+            subsystem = LOG_SUBSYSTEM_SYSTEM,
+            state = "targets_created",
+            target_count = targets.len(),
+            "audit system state"
+        );
 
         let activation = self.runtime_facade().activate_targets_with_replay(targets).await;
         self.runtime_facade().replace_targets(activation).await?;
@@ -134,7 +146,7 @@ impl AuditSystem {
                 return Err(AuditError::AlreadyInitialized);
             }
             AuditSystemState::Starting => {
-                warn!("Audit system is already starting");
+                warn_audit_state("starting", Some("already_starting"));
                 return Ok(());
             }
             _ => {}
@@ -142,7 +154,13 @@ impl AuditSystem {
 
         drop(state);
 
-        info!("Starting audit system");
+        info!(
+            event = EVENT_AUDIT_SYSTEM_STATE,
+            component = LOG_COMPONENT_AUDIT,
+            subsystem = LOG_SUBSYSTEM_SYSTEM,
+            state = "starting",
+            "audit system state"
+        );
 
         // Record system start
         observability::record_system_start();
@@ -161,11 +179,19 @@ impl AuditSystem {
                 }
 
                 self.commit_runtime_targets(targets, AuditSystemState::Running).await?;
-                info!("Audit system started successfully");
+                info_audit_state("running", None, None);
                 Ok(())
             }
             Err(e) => {
-                error!(error = %e, "Failed to create audit targets");
+                error!(
+                    event = EVENT_AUDIT_SYSTEM_STATE,
+                    component = LOG_COMPONENT_AUDIT,
+                    subsystem = LOG_SUBSYSTEM_SYSTEM,
+                    state = "stopped",
+                    reason = "target_creation_failed",
+                    error = %e,
+                    "Failed to create audit targets"
+                );
                 let mut state = self.state.write().await;
                 *state = AuditSystemState::Stopped;
                 Err(e)
@@ -183,11 +209,11 @@ impl AuditSystem {
         match *state {
             AuditSystemState::Running => {
                 *state = AuditSystemState::Paused;
-                info!("Audit system paused");
+                info_audit_state("paused", None, None);
                 Ok(())
             }
             AuditSystemState::Paused => {
-                warn!("Audit system is already paused");
+                warn_audit_state("paused", Some("already_paused"));
                 Ok(())
             }
             _ => Err(AuditError::Configuration("Cannot pause audit system in current state".to_string(), None)),
@@ -204,11 +230,11 @@ impl AuditSystem {
         match *state {
             AuditSystemState::Paused => {
                 *state = AuditSystemState::Running;
-                info!("Audit system resumed");
+                info_audit_state("running", Some("resumed"), None);
                 Ok(())
             }
             AuditSystemState::Running => {
-                warn!("Audit system is already running");
+                warn_audit_state("running", Some("already_running"));
                 Ok(())
             }
             _ => Err(AuditError::Configuration("Cannot resume audit system in current state".to_string(), None)),
@@ -224,11 +250,11 @@ impl AuditSystem {
 
         match *state {
             AuditSystemState::Stopped => {
-                warn!("Audit system is already stopped");
+                warn_audit_state("stopped", Some("already_stopped"));
                 return Ok(());
             }
             AuditSystemState::Stopping => {
-                warn!("Audit system is already stopping");
+                warn_audit_state("stopping", Some("already_stopping"));
                 return Ok(());
             }
             _ => {}
@@ -237,18 +263,32 @@ impl AuditSystem {
         *state = AuditSystemState::Stopping;
         drop(state);
 
-        info!("Stopping audit system");
+        info!(
+            event = EVENT_AUDIT_SYSTEM_STATE,
+            component = LOG_COMPONENT_AUDIT,
+            subsystem = LOG_SUBSYSTEM_SYSTEM,
+            state = "stopping",
+            "audit system state"
+        );
 
         // Stop all stream tasks first
         if let Err(e) = self.clear_runtime_targets().await {
-            error!(error = %e, "Failed to close some audit targets");
+            error!(
+                event = EVENT_AUDIT_SYSTEM_STATE,
+                component = LOG_COMPONENT_AUDIT,
+                subsystem = LOG_SUBSYSTEM_SYSTEM,
+                state = "stopping",
+                reason = "target_shutdown_failed",
+                error = %e,
+                "Failed to close some audit targets"
+            );
         }
 
         // Clear configuration
         let mut config_guard = self.config.write().await;
         *config_guard = None;
 
-        info!("Audit system stopped");
+        info_audit_state("stopped", None, None);
         Ok(())
     }
 
@@ -396,7 +436,13 @@ impl AuditSystem {
     /// # Returns
     /// * `AuditResult<()>` - Result indicating success or failure
     pub async fn reload_config(&self, new_config: Config) -> AuditResult<()> {
-        info!("Reloading audit system configuration");
+        info!(
+            event = EVENT_AUDIT_CONFIG_RELOADED,
+            component = LOG_COMPONENT_AUDIT,
+            subsystem = LOG_SUBSYSTEM_SYSTEM,
+            state = "reloading",
+            "audit config reload"
+        );
 
         observability::record_config_reload();
 
@@ -414,11 +460,24 @@ impl AuditSystem {
         match self.create_targets_from_config(&new_config).await {
             Ok(targets) => {
                 self.commit_runtime_targets(targets, final_state).await?;
-                info!("Audit configuration reloaded successfully");
+                info!(
+                    event = EVENT_AUDIT_CONFIG_RELOADED,
+                    component = LOG_COMPONENT_AUDIT,
+                    subsystem = LOG_SUBSYSTEM_SYSTEM,
+                    state = "reloaded",
+                    "audit config reload"
+                );
                 Ok(())
             }
             Err(e) => {
-                error!(error = %e, "Failed to reload audit configuration");
+                error!(
+                    event = EVENT_AUDIT_CONFIG_RELOADED,
+                    component = LOG_COMPONENT_AUDIT,
+                    subsystem = LOG_SUBSYSTEM_SYSTEM,
+                    state = "reload_failed",
+                    error = %e,
+                    "Failed to reload audit configuration"
+                );
                 Err(e)
             }
         }
@@ -444,6 +503,42 @@ impl AuditSystem {
     pub async fn reset_metrics(&self) {
         observability::reset_metrics().await;
     }
+}
+
+fn info_audit_state(state: &str, reason: Option<&str>, target_count: Option<usize>) {
+    info!(
+        event = EVENT_AUDIT_SYSTEM_STATE,
+        component = LOG_COMPONENT_AUDIT,
+        subsystem = LOG_SUBSYSTEM_SYSTEM,
+        state,
+        reason = reason.unwrap_or_default(),
+        target_count = target_count.unwrap_or_default(),
+        "audit system state"
+    );
+}
+
+fn debug_audit_state(state: &str, reason: Option<&str>, error: Option<&str>, target_count: usize) {
+    debug!(
+        event = EVENT_AUDIT_SYSTEM_STATE,
+        component = LOG_COMPONENT_AUDIT,
+        subsystem = LOG_SUBSYSTEM_SYSTEM,
+        state,
+        reason = reason.unwrap_or_default(),
+        error = error.unwrap_or_default(),
+        target_count,
+        "audit system state"
+    );
+}
+
+fn warn_audit_state(state: &str, reason: Option<&str>) {
+    warn!(
+        event = EVENT_AUDIT_SYSTEM_STATE,
+        component = LOG_COMPONENT_AUDIT,
+        subsystem = LOG_SUBSYSTEM_SYSTEM,
+        state,
+        reason = reason.unwrap_or_default(),
+        "audit system state"
+    );
 }
 
 #[cfg(test)]
@@ -537,7 +632,7 @@ mod tests {
         }
 
         system
-            .reload_config(rustfs_ecstore::config::Config(HashMap::new()))
+            .reload_config(rustfs_config::server_config::Config(HashMap::new()))
             .await
             .expect("reload with empty config should succeed");
 
@@ -545,6 +640,6 @@ mod tests {
         assert!(system.list_targets().await.is_empty());
         assert_eq!(system.runtime_status_snapshot().await, ReplayWorkerManager::new().snapshot(0));
         assert_eq!(close_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(*system.config.read().await, Some(rustfs_ecstore::config::Config(HashMap::new())));
+        assert_eq!(*system.config.read().await, Some(rustfs_config::server_config::Config(HashMap::new())));
     }
 }

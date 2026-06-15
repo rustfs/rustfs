@@ -19,6 +19,7 @@ use crate::admin::service::config::{
     validate_server_config,
 };
 use crate::admin::utils::{encode_compatible_admin_payload, is_compat_admin_request, read_compatible_admin_body};
+use crate::app::context::resolve_object_store_handle;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
@@ -48,27 +49,30 @@ use rustfs_config::oidc::{
     OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_CONFIG_URL, OIDC_DISPLAY_NAME, OIDC_EMAIL_CLAIM, OIDC_GROUPS_CLAIM,
     OIDC_REDIRECT_URI, OIDC_REDIRECT_URI_DYNAMIC, OIDC_ROLE_POLICY, OIDC_SCOPES, OIDC_USERNAME_CLAIM,
 };
+use rustfs_config::server_config::{
+    Config as ServerConfig, DEFAULT_KVS, KV, KVS, get_global_server_config, set_global_server_config,
+};
 use rustfs_config::{
     COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, ENV_SCANNER_ALERT_EXCESS_FOLDERS,
     ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE, ENV_SCANNER_ALERT_EXCESS_VERSIONS, ENV_SCANNER_BITROT_CYCLE_SECS,
     ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, ENV_SCANNER_CYCLE, ENV_SCANNER_CYCLE_MAX_DIRECTORIES,
-    ENV_SCANNER_CYCLE_MAX_DURATION_SECS, ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_IDLE_MODE,
-    ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS,
-    ENV_SCANNER_YIELD_EVERY_N_OBJECTS, MAX_ADMIN_REQUEST_BODY_SIZE, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD,
-    MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, SCANNER_ALERT_EXCESS_FOLDERS,
+    ENV_SCANNER_CYCLE_MAX_DURATION_SECS, ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_DELAY, ENV_SCANNER_IDLE_MODE,
+    ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, ENV_SCANNER_MAX_WAIT_SECS, ENV_SCANNER_SPEED,
+    ENV_SCANNER_START_DELAY_SECS, ENV_SCANNER_YIELD_EVERY_N_OBJECTS, HEAL_BITROT_CYCLE, HEAL_SUB_SYS,
+    MAX_ADMIN_REQUEST_BODY_SIZE, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR,
+    MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, SCANNER_ALERT_EXCESS_FOLDERS,
     SCANNER_ALERT_EXCESS_VERSION_SIZE, SCANNER_ALERT_EXCESS_VERSIONS, SCANNER_BITROT_CYCLE, SCANNER_CACHE_SAVE_TIMEOUT,
-    SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION, SCANNER_CYCLE_MAX_OBJECTS, SCANNER_IDLE_MODE,
-    SCANNER_MAX_CONCURRENT_DISK_SCANS, SCANNER_MAX_CONCURRENT_SET_SCANS, SCANNER_SPEED, SCANNER_START_DELAY, SCANNER_SUB_SYS,
-    SCANNER_YIELD_EVERY_N_OBJECTS, WEBHOOK_AUTH_TOKEN, WEBHOOK_BATCH_SIZE, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY,
-    WEBHOOK_ENDPOINT, WEBHOOK_HTTP_TIMEOUT, WEBHOOK_MAX_RETRY, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT, WEBHOOK_RETRY_INTERVAL,
+    SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION, SCANNER_CYCLE_MAX_OBJECTS, SCANNER_DELAY,
+    SCANNER_IDLE_MODE, SCANNER_MAX_CONCURRENT_DISK_SCANS, SCANNER_MAX_CONCURRENT_SET_SCANS, SCANNER_MAX_WAIT, SCANNER_SPEED,
+    SCANNER_START_DELAY, SCANNER_SUB_SYS, SCANNER_YIELD_EVERY_N_OBJECTS, WEBHOOK_AUTH_TOKEN, WEBHOOK_BATCH_SIZE,
+    WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_HTTP_TIMEOUT, WEBHOOK_MAX_RETRY, WEBHOOK_QUEUE_DIR,
+    WEBHOOK_QUEUE_LIMIT, WEBHOOK_RETRY_INTERVAL,
 };
 use rustfs_credentials::Credentials;
 use rustfs_ecstore::config::com::STORAGE_CLASS_SUB_SYS;
 use rustfs_ecstore::config::com::{delete_config, read_config, read_config_without_migrate, save_config, save_server_config};
 use rustfs_ecstore::config::storageclass::{INLINE_BLOCK_ENV, OPTIMIZE_ENV, RRS_ENV, STANDARD_ENV};
-use rustfs_ecstore::config::{Config as ServerConfig, DEFAULT_KVS, KV, KVS, get_global_server_config, set_global_server_config};
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
-use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::ListOperations;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
@@ -192,6 +196,18 @@ const SCANNER_HELP_KEYS: &[HelpKeyMetadata] = &[
         optional: true,
     },
     HelpKeyMetadata {
+        key: SCANNER_DELAY,
+        type_name: "float",
+        description: "override scanner sleep multiplier derived from speed",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: SCANNER_MAX_WAIT,
+        type_name: "seconds",
+        description: "override scanner maximum sleep duration derived from speed",
+        optional: true,
+    },
+    HelpKeyMetadata {
         key: SCANNER_CYCLE,
         type_name: "seconds",
         description: "override scanner cycle interval in seconds",
@@ -276,6 +292,13 @@ const SCANNER_HELP_KEYS: &[HelpKeyMetadata] = &[
         optional: true,
     },
 ];
+
+const HEAL_HELP_KEYS: &[HelpKeyMetadata] = &[HelpKeyMetadata {
+    key: HEAL_BITROT_CYCLE,
+    type_name: "seconds|off",
+    description: "set scanner-driven periodic deep bitrot scan cycle, 0 scans deeply every cycle, off disables periodic deep scans",
+    optional: true,
+}];
 
 const OIDC_HELP_KEYS: &[HelpKeyMetadata] = &[
     HelpKeyMetadata {
@@ -531,6 +554,12 @@ const HELP_SUBSYSTEMS: &[HelpSubSystemMetadata] = &[
         keys: SCANNER_HELP_KEYS,
     },
     HelpSubSystemMetadata {
+        key: HEAL_SUB_SYS,
+        description: "configure heal and scanner-driven bitrot behavior",
+        multiple_targets: false,
+        keys: HEAL_HELP_KEYS,
+    },
+    HelpSubSystemMetadata {
         key: IDENTITY_OPENID_SUB_SYS,
         description: "enable OpenID SSO support",
         multiple_targets: true,
@@ -681,7 +710,7 @@ fn success_response(config_applied: bool) -> S3Result<S3Response<(StatusCode, Bo
 }
 
 fn object_store() -> S3Result<std::sync::Arc<rustfs_ecstore::store::ECStore>> {
-    new_object_layer_fn().ok_or_else(|| s3_error!(InternalError, "server storage not initialized"))
+    resolve_object_store_handle().ok_or_else(|| s3_error!(InternalError, "server storage not initialized"))
 }
 
 async fn load_server_config_from_store() -> S3Result<ServerConfig> {
@@ -1308,6 +1337,8 @@ fn env_help_key(sub_system: &str, key: &str) -> String {
         (STORAGE_CLASS_SUB_SYS, "optimize") => OPTIMIZE_ENV.to_string(),
         (STORAGE_CLASS_SUB_SYS, "inline_block") => INLINE_BLOCK_ENV.to_string(),
         (SCANNER_SUB_SYS, SCANNER_SPEED) => ENV_SCANNER_SPEED.to_string(),
+        (SCANNER_SUB_SYS, SCANNER_DELAY) => ENV_SCANNER_DELAY.to_string(),
+        (SCANNER_SUB_SYS, SCANNER_MAX_WAIT) => ENV_SCANNER_MAX_WAIT_SECS.to_string(),
         (SCANNER_SUB_SYS, SCANNER_CYCLE) => ENV_SCANNER_CYCLE.to_string(),
         (SCANNER_SUB_SYS, SCANNER_START_DELAY) => ENV_SCANNER_START_DELAY_SECS.to_string(),
         (SCANNER_SUB_SYS, SCANNER_CYCLE_MAX_DURATION) => ENV_SCANNER_CYCLE_MAX_DURATION_SECS.to_string(),
@@ -1322,6 +1353,7 @@ fn env_help_key(sub_system: &str, key: &str) -> String {
         (SCANNER_SUB_SYS, SCANNER_ALERT_EXCESS_VERSIONS) => ENV_SCANNER_ALERT_EXCESS_VERSIONS.to_string(),
         (SCANNER_SUB_SYS, SCANNER_ALERT_EXCESS_VERSION_SIZE) => ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE.to_string(),
         (SCANNER_SUB_SYS, SCANNER_ALERT_EXCESS_FOLDERS) => ENV_SCANNER_ALERT_EXCESS_FOLDERS.to_string(),
+        (HEAL_SUB_SYS, HEAL_BITROT_CYCLE) => ENV_SCANNER_BITROT_CYCLE_SECS.to_string(),
         (IDENTITY_OPENID_SUB_SYS, ENABLE_KEY) => ENV_IDENTITY_OPENID_ENABLE.to_string(),
         (IDENTITY_OPENID_SUB_SYS, OIDC_CONFIG_URL) => ENV_IDENTITY_OPENID_CONFIG_URL.to_string(),
         (IDENTITY_OPENID_SUB_SYS, OIDC_CLIENT_ID) => ENV_IDENTITY_OPENID_CLIENT_ID.to_string(),
@@ -1515,6 +1547,7 @@ async fn apply_and_signal_dynamic_subsystems(config: &ServerConfig) {
         AUDIT_WEBHOOK_SUB_SYS,
         AUDIT_MQTT_SUB_SYS,
         SCANNER_SUB_SYS,
+        HEAL_SUB_SYS,
     ] {
         if apply_dynamic_config_for_subsystem(config, sub_system).await.unwrap_or(false) {
             signal_dynamic_config_reload(sub_system).await;
@@ -1796,6 +1829,28 @@ mod tests {
     }
 
     #[test]
+    fn validate_config_directives_accepts_notify_kafka_sasl_keys() {
+        let directives = parse_config_directives(
+            r#"notify_kafka sasl_enable="on" sasl_mechanism="SCRAM-SHA-512" sasl_username="user" sasl_password="secret""#,
+            false,
+        )
+        .expect("parse notify kafka sasl directives");
+
+        validate_config_directives(&directives).expect("notify kafka SASL keys should be accepted");
+    }
+
+    #[test]
+    fn validate_config_directives_accepts_audit_kafka_sasl_keys() {
+        let directives = parse_config_directives(
+            r#"audit_kafka sasl_enable="on" sasl_mechanism="SCRAM-SHA-512" sasl_username="user" sasl_password="secret""#,
+            false,
+        )
+        .expect("parse audit kafka sasl directives");
+
+        validate_config_directives(&directives).expect("audit kafka SASL keys should be accepted");
+    }
+
+    #[test]
     fn set_get_and_delete_config_kv_round_trip() {
         let mut config = ServerConfig::new();
         let directives = parse_config_directives(
@@ -1950,6 +2005,44 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
         assert_eq!(response.keys_help.len(), 1);
         assert_eq!(response.keys_help[0].key, "start_delay");
         assert!(response.keys_help[0].description.contains("cycle"));
+    }
+
+    #[test]
+    fn validate_config_directives_accepts_scanner_pacing_keys() {
+        let input = format!("{SCANNER_SUB_SYS} {SCANNER_DELAY}=\"3.5\" {SCANNER_MAX_WAIT}=\"7\"");
+        let directives = parse_config_directives(&input, false).expect("parse scanner pacing directive");
+
+        validate_config_directives(&directives).expect("scanner pacing keys should be supported");
+    }
+
+    #[test]
+    fn build_help_response_reports_scanner_delay() {
+        let response = build_help_response(Some(SCANNER_SUB_SYS), Some(SCANNER_DELAY), false).expect("scanner help response");
+
+        assert_eq!(response.sub_sys, SCANNER_SUB_SYS);
+        assert_eq!(response.keys_help.len(), 1);
+        assert_eq!(response.keys_help[0].key, SCANNER_DELAY);
+        assert_eq!(response.keys_help[0].type_name, "float");
+        assert!(response.keys_help[0].description.contains("multiplier"));
+    }
+
+    #[test]
+    fn validate_config_directives_accepts_heal_bitrot_cycle() {
+        let input = format!("{HEAL_SUB_SYS} {HEAL_BITROT_CYCLE}=\"off\"");
+        let directives = parse_config_directives(&input, false).expect("parse heal directive");
+
+        validate_config_directives(&directives).expect("heal bitrot_cycle should be a supported config key");
+    }
+
+    #[test]
+    fn build_help_response_reports_heal_bitrot_cycle() {
+        let response = build_help_response(Some(HEAL_SUB_SYS), Some(HEAL_BITROT_CYCLE), false).expect("heal help response");
+
+        assert_eq!(response.sub_sys, HEAL_SUB_SYS);
+        assert!(!response.multiple_targets);
+        assert_eq!(response.keys_help.len(), 1);
+        assert_eq!(response.keys_help[0].key, HEAL_BITROT_CYCLE);
+        assert!(response.keys_help[0].description.contains("scanner"));
     }
 
     #[test]

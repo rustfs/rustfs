@@ -32,10 +32,18 @@ use crate::common::gateway::S3Action;
 use bytes::Bytes;
 use futures_util::stream;
 use russh_sftp::protocol::{FileAttributes, Handle, OpenFlags, StatusCode};
+use rustfs_utils::MaskedAccessKey;
 use s3s::dto::{
     AbortMultipartUploadInput, CompleteMultipartUploadInput, CompletedMultipartUpload, CompletedPart as S3CompletedPart,
     CopySource, CreateMultipartUploadInput, PutObjectInput, StreamingBlob, UploadPartCopyInput, UploadPartInput,
 };
+
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SFTP_WRITE: &str = "sftp_write";
+const EVENT_SFTP_WRITE_STATE: &str = "sftp_write_state";
+const EVENT_SFTP_MULTIPART_STATE: &str = "sftp_multipart_state";
+const EVENT_SFTP_ABORT_STATE: &str = "sftp_abort_state";
+const EVENT_SFTP_MULTIPART_COPY_STATE: &str = "sftp_multipart_copy_state";
 
 /// Running byte count for a write handle's current phase. Buffering is
 /// part_buffer.len(). Streaming is (parts_done * part_size) +
@@ -62,7 +70,13 @@ pub(super) fn write_dispatch_byte_count(phase: &WritePhase, part_size: u64, satu
                 (Some(value), _) => Ok(value),
                 (None, true) => Ok(u64::MAX),
                 (None, false) => {
-                    tracing::warn!("SFTP write running total overflowed u64");
+                    tracing::warn!(
+                        event = EVENT_SFTP_WRITE_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
+                        result = "byte_count_overflow",
+                        "SFTP write byte-count overflow"
+                    );
                     Err(SftpError::code(StatusCode::Failure))
                 }
             }
@@ -71,7 +85,13 @@ pub(super) fn write_dispatch_byte_count(phase: &WritePhase, part_size: u64, satu
             if saturating {
                 Ok(0)
             } else {
-                tracing::warn!("SFTP write rejected: handle already poisoned by earlier upload failure");
+                tracing::warn!(
+                    event = EVENT_SFTP_WRITE_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
+                    result = "handle_poisoned",
+                    "SFTP write handle poisoned"
+                );
                 Err(SftpError::code(StatusCode::Failure))
             }
         }
@@ -90,7 +110,13 @@ pub(super) fn write_dispatch_append_bytes(phase: &mut WritePhase, data: &[u8]) -
             Ok(())
         }
         WritePhase::Failed { .. } => {
-            tracing::error!("SFTP write_dispatch_append_bytes reached a Failed handle, internal invariant broken");
+            tracing::error!(
+                event = EVENT_SFTP_WRITE_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
+                result = "append_on_failed_handle",
+                "SFTP write append rejected on failed handle"
+            );
             Err(SftpError::code(StatusCode::Failure))
         }
     }
@@ -335,10 +361,14 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             if attempt > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(COMMIT_WRITE_BACKOFF_MS[attempt - 1])).await;
                 tracing::warn!(
+                    event = EVENT_SFTP_WRITE_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
                     bucket = %sanitise_control_bytes(bucket),
                     key = %sanitise_control_bytes(key),
                     attempt = attempt,
-                    "retrying commit_write put_object after retryable backend error",
+                    state = "retrying_put_object",
+                    "SFTP put_object retry scheduled",
                 );
             }
 
@@ -378,9 +408,13 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         // that proof, log and surface Failure rather than panicking
         // the session task.
         tracing::error!(
+            event = EVENT_SFTP_WRITE_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
             bucket = %sanitise_control_bytes(bucket),
             key = %sanitise_control_bytes(key),
-            "commit_write retry loop fell through without returning",
+            result = "retry_loop_fell_through",
+            "SFTP put_object retry loop fell through",
         );
         Err(SftpError::code(StatusCode::Failure))
     }
@@ -418,7 +452,15 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             .await?;
 
         let e_tag = out.e_tag.ok_or_else(|| {
-            tracing::warn!(upload_id = %upload_id, part_number = part_number, "UploadPart returned no ETag");
+            tracing::warn!(
+                event = EVENT_SFTP_MULTIPART_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
+                upload_id = %upload_id,
+                part_number = part_number,
+                result = "etag_missing",
+                "SFTP multipart part missing etag"
+            );
             SftpError::code(StatusCode::Failure)
         })?;
 
@@ -495,9 +537,13 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
 
         let upload_id = out.upload_id.ok_or_else(|| {
             tracing::warn!(
+                event = EVENT_SFTP_MULTIPART_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
                 bucket = %sanitise_control_bytes(bucket),
                 key = %sanitise_control_bytes(key),
-                "CreateMultipartUpload returned no upload_id"
+                result = "upload_id_missing",
+                "SFTP multipart upload missing upload_id"
             );
             SftpError::code(StatusCode::Failure)
         })?;
@@ -595,7 +641,15 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
 
         let current_len = write_dispatch_byte_count(phase, part_size, false)?;
         if offset != current_len {
-            tracing::warn!(offset = offset, buffered = current_len, "SFTP write rejected: non-sequential offset");
+            tracing::warn!(
+                event = EVENT_SFTP_WRITE_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
+                offset,
+                buffered = current_len,
+                result = "non_sequential_offset",
+                "sftp write state changed"
+            );
             return Err(SftpError::code(StatusCode::Failure));
         }
 
@@ -650,7 +704,11 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             WritePhase::Buffering { part_buffer } => std::mem::take(part_buffer),
             _ => {
                 tracing::error!(
-                    "SFTP write_dispatch_begin_streaming lost Buffering phase between check and extract, internal invariant broken"
+                    event = EVENT_SFTP_MULTIPART_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
+                    result = "buffering_phase_lost",
+                    "SFTP multipart buffering phase lost"
                 );
                 return Err(SftpError::code(StatusCode::Failure));
             }
@@ -707,10 +765,14 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             } => {
                 if *next_part_number > S3_MAX_MULTIPART_PARTS {
                     tracing::warn!(
+                        event = EVENT_SFTP_MULTIPART_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
                         bucket = %bucket,
                         key = %key,
                         limit = S3_MAX_MULTIPART_PARTS,
-                        "SFTP write would exceed the S3 multipart parts limit",
+                        result = "parts_limit_exceeded",
+                        "SFTP multipart parts limit exceeded",
                     );
                     let upload_id_for_fail = upload_id.clone();
                     let abort_authorized_for_fail = *abort_authorized;
@@ -724,7 +786,13 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                 (upload_id.clone(), *abort_authorized, *next_part_number, drained)
             }
             _ => {
-                tracing::error!("SFTP write_dispatch_flush_one_part called without Streaming phase, internal invariant broken");
+                tracing::error!(
+                    event = EVENT_SFTP_MULTIPART_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
+                    result = "flush_without_streaming",
+                    "SFTP multipart flush requested without streaming state"
+                );
                 return Err(SftpError::code(StatusCode::Failure));
             }
         };
@@ -745,7 +813,11 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                 }
                 _ => {
                     tracing::error!(
-                        "SFTP write_dispatch_flush_one_part post-upload arm without Streaming phase, internal invariant broken"
+                        event = EVENT_SFTP_MULTIPART_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
+                        result = "post_upload_phase_missing",
+                        "SFTP multipart post-upload phase missing"
                     );
                     Err(SftpError::code(StatusCode::Failure))
                 }
@@ -806,22 +878,30 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         if abort_authorized {
             if let Err(abort_err) = self.abort_upload_with_auth(bucket, key, upload_id).await {
                 tracing::warn!(
+                    event = EVENT_SFTP_ABORT_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
                     bucket = %bucket,
                     key = %key,
                     upload_id = %upload_id,
                     err = ?abort_err,
-                    "abort after {context} also failed; S3 lifecycle must clean up",
                     context = context,
+                    result = "abort_failed",
+                    "SFTP multipart abort failed",
                 );
             }
         } else {
             tracing::warn!(
+                event = EVENT_SFTP_ABORT_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
                 bucket = %bucket,
                 key = %key,
                 upload_id = %upload_id,
-                access_key = %self.access_key(),
-                "skipped abort at close ({context}): principal lacks s3:AbortMultipartUpload, bucket lifecycle rules must reclaim parts",
+                access_key = %MaskedAccessKey(self.access_key()),
                 context = context,
+                result = "abort_skipped_unauthorized",
+                "SFTP multipart abort skipped by policy",
             );
         }
     }
@@ -871,11 +951,15 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         if !part_buffer.is_empty() {
             if next_part_number > S3_MAX_MULTIPART_PARTS {
                 tracing::warn!(
+                    event = EVENT_SFTP_MULTIPART_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
                     bucket = %bucket,
                     key = %key,
                     upload_id = %upload_id,
                     limit = S3_MAX_MULTIPART_PARTS,
-                    "SFTP close rejected: trailing part would exceed S3 multipart parts limit",
+                    result = "final_part_limit_exceeded",
+                    "SFTP multipart final-part limit exceeded",
                 );
                 self.close_abort_or_skip(bucket, key, &upload_id, abort_authorized, "parts-limit breach")
                     .await;
@@ -932,11 +1016,15 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             let target = needed.max(configured).max(S3_MIN_PART_SIZE);
             if target > S3_MAX_PART_SIZE {
                 tracing::warn!(
+                    event = EVENT_SFTP_MULTIPART_COPY_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
                     bucket = %dst_bucket,
                     key = %sanitise_control_bytes(dst_key),
                     content_length,
                     target,
-                    "multipart copy refused: per-part size exceeds S3_MAX_PART_SIZE"
+                    result = "part_size_exceeded",
+                    "sftp multipart copy state changed"
                 );
                 return Err(SftpError::code(StatusCode::Failure));
             }
@@ -986,9 +1074,13 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
 
                 let e_tag = out.copy_part_result.and_then(|r| r.e_tag).ok_or_else(|| {
                     tracing::warn!(
+                        event = EVENT_SFTP_MULTIPART_COPY_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_SFTP_WRITE,
                         upload_id = %mp.upload_id,
                         part_number = part_number,
-                        "UploadPartCopy returned no ETag"
+                        result = "etag_missing",
+                        "SFTP multipart copy part missing etag"
                     );
                     SftpError::code(StatusCode::Failure)
                 })?;

@@ -26,19 +26,21 @@ use openidconnect::{
 };
 use reqwest::Client;
 use rustfs_config::oidc::*;
+use rustfs_config::server_config::get_global_server_config;
+use rustfs_config::server_config::{Config as ServerConfig, KVS};
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
-use rustfs_ecstore::config::{Config as ServerConfig, KVS, get_global_server_config};
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::{LazyLock, Mutex, MutexGuard, RwLock};
 use std::time::{Duration as StdDuration, Instant};
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, warn};
 use url::Url;
 
 const OIDC_JWKS_REFRESH_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
@@ -74,7 +76,7 @@ fn lock_oidc_plugin_authn_metrics<'a, T>(mutex: &'a Mutex<T>, metric: &'static s
     match mutex.lock() {
         Ok(guard) => guard,
         Err(err) => {
-            warn!("recovering poisoned OIDC plugin authn metrics lock: {}", metric);
+            warn!(metric, "Recovering poisoned OIDC authn metrics lock");
             err.into_inner()
         }
     }
@@ -275,8 +277,14 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
 
 // ---- Public types (unchanged API) ----
 
+const REDACTED_SECRET: &str = "***redacted***";
+
+fn redacted_optional_secret(value: Option<&str>) -> &'static str {
+    value.filter(|secret| !secret.is_empty()).map_or("", |_| REDACTED_SECRET)
+}
+
 /// Parsed configuration for a single OIDC provider.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OidcProviderConfig {
     pub id: String,
     pub enabled: bool,
@@ -296,6 +304,31 @@ pub struct OidcProviderConfig {
     pub email_claim: String,
     pub username_claim: String,
     pub hide_from_ui: bool,
+}
+
+impl fmt::Debug for OidcProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OidcProviderConfig")
+            .field("id", &self.id)
+            .field("enabled", &self.enabled)
+            .field("config_url", &self.config_url)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &redacted_optional_secret(self.client_secret.as_deref()))
+            .field("scopes", &self.scopes)
+            .field("other_audiences", &self.other_audiences)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("redirect_uri_dynamic", &self.redirect_uri_dynamic)
+            .field("claim_name", &self.claim_name)
+            .field("claim_prefix", &self.claim_prefix)
+            .field("role_policy", &self.role_policy)
+            .field("display_name", &self.display_name)
+            .field("groups_claim", &self.groups_claim)
+            .field("roles_claim", &self.roles_claim)
+            .field("email_claim", &self.email_claim)
+            .field("username_claim", &self.username_claim)
+            .field("hide_from_ui", &self.hide_from_ui)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -384,18 +417,18 @@ impl OidcSys {
         for sourced_config in parsed_configs {
             let config = sourced_config.config;
             if !config.enabled {
-                info!("OIDC provider '{}' is disabled, skipping", config.id);
+                debug!(provider = %config.id, "OIDC provider disabled");
                 continue;
             }
 
             match Self::discover_provider(&config, &http_client).await {
                 Ok(state) => {
-                    info!("OIDC provider '{}' discovered successfully", config.id);
+                    debug!(provider = %config.id, "OIDC provider discovered");
                     provider_states.insert(config.id.clone(), state);
                     configs.insert(config.id.clone(), config);
                 }
                 Err(e) => {
-                    error!("Failed to discover OIDC provider '{}': {}", config.id, e);
+                    error!(provider = %config.id, error = %e, "OIDC provider discovery failed");
                 }
             }
         }
@@ -1835,17 +1868,17 @@ mod tests {
     fn test_parse_persisted_provider_config() {
         let mut cfg = ServerConfig::new();
         let mut kvs = KVS(vec![
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: ENABLE_KEY.to_string(),
                 value: EnableState::Off.to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: OIDC_CONFIG_URL.to_string(),
                 value: String::new(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: OIDC_CLIENT_ID.to_string(),
                 value: String::new(),
                 hidden_if_empty: false,
@@ -1876,17 +1909,17 @@ mod tests {
     fn test_parse_persisted_provider_config_omitted_roles_claim_is_empty() {
         let mut cfg = ServerConfig::new();
         let mut kvs = KVS(vec![
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: ENABLE_KEY.to_string(),
                 value: EnableState::Off.to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: OIDC_CONFIG_URL.to_string(),
                 value: String::new(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: OIDC_CLIENT_ID.to_string(),
                 value: String::new(),
                 hidden_if_empty: false,
@@ -1976,6 +2009,24 @@ mod tests {
             username_claim: "preferred_username".to_string(),
             hide_from_ui: false,
         }
+    }
+
+    #[test]
+    fn test_oidc_provider_config_debug_redacts_client_secret() {
+        let config = OidcProviderConfig {
+            client_secret: Some("oidc-client-secret".to_string()),
+            ..test_config("default")
+        };
+        let sourced = SourcedOidcProviderConfig {
+            config,
+            source: OidcProviderConfigSource::Persisted,
+        };
+
+        let rendered = format!("{sourced:?}");
+
+        assert!(!rendered.contains("oidc-client-secret"));
+        assert!(rendered.contains(REDACTED_SECRET));
+        assert!(rendered.contains("client-id"));
     }
 
     #[test]
@@ -2075,17 +2126,17 @@ mod tests {
     fn test_parse_persisted_hide_from_ui_off_is_false() {
         let mut cfg = ServerConfig::new();
         let mut kvs = KVS(vec![
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: ENABLE_KEY.to_string(),
                 value: EnableState::On.to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: OIDC_CONFIG_URL.to_string(),
                 value: "https://example.com/.well-known/openid-configuration".to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: OIDC_CLIENT_ID.to_string(),
                 value: "console".to_string(),
                 hidden_if_empty: false,
@@ -2107,17 +2158,17 @@ mod tests {
     fn test_parse_persisted_hide_from_ui_missing_defaults_false() {
         let mut cfg = ServerConfig::new();
         let kvs = KVS(vec![
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: ENABLE_KEY.to_string(),
                 value: EnableState::On.to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: OIDC_CONFIG_URL.to_string(),
                 value: "https://example.com/.well-known/openid-configuration".to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: OIDC_CLIENT_ID.to_string(),
                 value: "console".to_string(),
                 hidden_if_empty: false,
@@ -2138,17 +2189,17 @@ mod tests {
     fn test_parse_persisted_hide_from_ui() {
         let mut cfg = ServerConfig::new();
         let mut kvs = KVS(vec![
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: ENABLE_KEY.to_string(),
                 value: EnableState::On.to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: OIDC_CONFIG_URL.to_string(),
                 value: "https://example.com/.well-known/openid-configuration".to_string(),
                 hidden_if_empty: false,
             },
-            rustfs_ecstore::config::KV {
+            rustfs_config::server_config::KV {
                 key: OIDC_CLIENT_ID.to_string(),
                 value: "console".to_string(),
                 hidden_if_empty: false,

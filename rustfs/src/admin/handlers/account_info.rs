@@ -14,6 +14,7 @@
 
 use crate::admin::auth::authenticate_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::app::context::resolve_object_store_handle;
 use crate::auth::get_condition_values;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use http::{HeaderMap, HeaderValue};
@@ -21,11 +22,11 @@ use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_credentials::get_global_action_cred;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketOperations, BucketOptions, StorageAPI};
+use rustfs_ecstore::store_api::BucketOperations;
 use rustfs_policy::policy::BucketPolicy;
 use rustfs_policy::policy::default::DEFAULT_POLICIES;
 use rustfs_policy::policy::{Args, action::Action, action::S3Action};
+use rustfs_storage_api::{BucketOptions, StorageAdminApi};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
@@ -60,7 +61,7 @@ fn resolve_bucket_access(can_list_bucket: bool, can_get_bucket_location: bool, c
 #[async_trait::async_trait]
 impl Operation for AccountInfoHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -187,7 +188,7 @@ impl Operation for AccountInfoHandler {
 
         let mut account_info = rustfs_madmin::AccountInfo {
             account_name,
-            server: store.backend_info().await,
+            server: StorageAdminApi::backend_info(store.as_ref()).await,
             policy: serde_json::Value::String(policy_str),
             ..Default::default()
         };

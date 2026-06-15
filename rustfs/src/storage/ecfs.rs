@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::app::bucket_usecase::DefaultBucketUsecase;
+use crate::app::context::resolve_object_store_handle;
 use crate::app::multipart_usecase::DefaultMultipartUsecase;
 use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::error::ApiError;
@@ -39,11 +40,11 @@ use rustfs_ecstore::{
         versioning_sys::BucketVersioningSys,
     },
     error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
-    new_object_layer_fn,
-    store_api::{BucketOperations, BucketOptions, ObjectLockRetentionOptions, ObjectOperations, ObjectOptions},
+    store_api::{BucketOperations, ObjectLockRetentionOptions, ObjectOperations, ObjectOptions},
 };
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
+use rustfs_storage_api::BucketOptions;
 use rustfs_targets::EventName;
 use rustfs_utils::http::headers::{
     AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
@@ -51,8 +52,13 @@ use rustfs_utils::http::headers::{
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use std::fmt::Debug;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
+
+const LOG_COMPONENT_STORAGE: &str = "storage";
+const LOG_SUBSYSTEM_OBJECT: &str = "object";
+const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
+const LOG_SUBSYSTEM_TAGGING: &str = "tagging";
 
 #[derive(Debug, Clone)]
 pub struct FS {
@@ -99,7 +105,7 @@ impl FS {
         object: &str,
         version_id: Option<&str>,
     ) -> S3Result<std::collections::HashMap<String, Vec<String>>> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Ok(std::collections::HashMap::new());
         };
         let opts = ObjectOptions {
@@ -343,7 +349,7 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteBucketWebsiteInput>,
     ) -> S3Result<S3Response<DeleteBucketWebsiteOutput>> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
 
@@ -392,8 +398,14 @@ impl S3 for FS {
 
         validate_table_catalog_object_mutation(&bucket, &object).await?;
 
-        let Some(store) = new_object_layer_fn() else {
-            error!("Store not initialized");
+        let Some(store) = resolve_object_store_handle() else {
+            error!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_TAGGING,
+                event = "object_tagging_store_uninitialized",
+                operation = "delete",
+                "Object tagging operation failed because storage is not initialized"
+            );
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -406,7 +418,15 @@ impl S3 for FS {
         let delete_tags_result = store.delete_object_tags(&bucket, &object, &opts).await;
         Self::record_replication_tagging_metric(&bucket, &object, "DeleteObjectTagging", delete_tags_result.is_err()).await;
         delete_tags_result.map_err(|e| {
-            error!("Failed to delete object tags: {}", e);
+            error!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_TAGGING,
+                event = "object_tagging_delete_failed",
+                bucket = %bucket,
+                object = %object,
+                error = %e,
+                "Failed to delete object tags"
+            );
             ApiError::from(e)
         })?;
 
@@ -459,7 +479,7 @@ impl S3 for FS {
         record_s3_op(S3Operation::GetBucketAcl, &req.input.bucket);
         let GetBucketAclInput { bucket, .. } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -475,7 +495,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketAccelerateConfigurationInput>,
     ) -> S3Result<S3Response<GetBucketAccelerateConfigurationOutput>> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
 
@@ -565,7 +585,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketRequestPaymentInput>,
     ) -> S3Result<S3Response<GetBucketRequestPaymentOutput>> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
 
@@ -613,7 +633,7 @@ impl S3 for FS {
     }
 
     async fn get_bucket_website(&self, req: S3Request<GetBucketWebsiteInput>) -> S3Result<S3Response<GetBucketWebsiteOutput>> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
 
@@ -651,7 +671,7 @@ impl S3 for FS {
             bucket, key, version_id, ..
         } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -681,7 +701,7 @@ impl S3 for FS {
             bucket, key, version_id, ..
         } = req.input.clone();
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -697,7 +717,15 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let object_info = store.get_object_info(&bucket, &key, &opts).await.map_err(|e| {
-            error!("get_object_info failed, {}", e.to_string());
+            error!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_OBJECT,
+                event = "object_info_load_failed",
+                bucket = %bucket,
+                object = %key,
+                error = %e,
+                "Failed to load object info"
+            );
             s3_error!(InternalError, "{}", e.to_string())
         })?;
 
@@ -734,7 +762,7 @@ impl S3 for FS {
         record_s3_op(S3Operation::GetObjectLockConfiguration, &req.input.bucket);
         let GetObjectLockConfigurationInput { bucket, .. } = req.input;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -752,7 +780,14 @@ impl S3 for FS {
                         "Object Lock configuration does not exist for this bucket".to_string(),
                     ));
                 }
-                warn!("get_object_lock_config err {:?}", err);
+                warn!(
+                    component = LOG_COMPONENT_STORAGE,
+                    subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
+                    event = "object_lock_config_load_failed",
+                    bucket = %bucket,
+                    error = ?err,
+                    "Failed to load bucket object lock configuration"
+                );
                 return Err(S3Error::with_message(
                     S3ErrorCode::InternalError,
                     "Failed to load Object Lock configuration".to_string(),
@@ -775,7 +810,7 @@ impl S3 for FS {
             bucket, key, version_id, ..
         } = req.input.clone();
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -786,7 +821,15 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let object_info = store.get_object_info(&bucket, &key, &opts).await.map_err(|e| {
-            error!("get_object_info failed, {}", e.to_string());
+            error!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_OBJECT,
+                event = "object_info_load_failed",
+                bucket = %bucket,
+                object = %key,
+                error = %e,
+                "Failed to load object info"
+            );
             s3_error!(InternalError, "{}", e.to_string())
         })?;
 
@@ -819,10 +862,16 @@ impl S3 for FS {
         let bucket = req.input.bucket.as_str();
         let object = req.input.key.as_str();
 
-        info!("Starting get_object_tagging for bucket: {}, object: {}", bucket, object);
-
-        let Some(store) = new_object_layer_fn() else {
-            error!("Store not initialized");
+        let Some(store) = resolve_object_store_handle() else {
+            error!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_TAGGING,
+                event = "object_tagging_store_uninitialized",
+                operation = "get",
+                bucket = %bucket,
+                object = %object,
+                "Object tagging operation failed because storage is not initialized"
+            );
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -836,15 +885,39 @@ impl S3 for FS {
         Self::record_replication_tagging_metric(bucket, object, "GetObjectTagging", tags_result.is_err()).await;
         let tags = tags_result.map_err(|e| {
             if is_err_object_not_found(&e) {
-                error!("Object not found: {}", e);
+                debug!(
+                    component = LOG_COMPONENT_STORAGE,
+                    subsystem = LOG_SUBSYSTEM_TAGGING,
+                    event = "object_tagging_not_found",
+                    bucket = %bucket,
+                    object = %object,
+                    error = %e,
+                    "Object tags not found"
+                );
                 return s3_error!(NoSuchKey);
             }
-            error!("Failed to get object tags: {}", e);
+            error!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_TAGGING,
+                event = "object_tagging_get_failed",
+                bucket = %bucket,
+                object = %object,
+                error = %e,
+                "Failed to load object tags"
+            );
             ApiError::from(e).into()
         })?;
 
         let tag_set = decode_tags(tags.as_str());
-        debug!("Decoded tag set: {:?}", tag_set);
+        debug!(
+            component = LOG_COMPONENT_STORAGE,
+            subsystem = LOG_SUBSYSTEM_TAGGING,
+            event = "object_tagging_decoded",
+            bucket = %bucket,
+            object = %object,
+            tag_count = tag_set.len(),
+            "Decoded object tags"
+        );
 
         counter!("rustfs_get_object_tagging_success").increment(1);
         let duration = start_time.elapsed();
@@ -947,7 +1020,7 @@ impl S3 for FS {
         } = req.input;
         record_s3_op(S3Operation::PutBucketAcl, &bucket);
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -970,7 +1043,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketAccelerateConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketAccelerateConfigurationOutput>> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
         store
@@ -995,7 +1068,7 @@ impl S3 for FS {
 
     async fn get_bucket_logging(&self, req: S3Request<GetBucketLoggingInput>) -> S3Result<S3Response<GetBucketLoggingOutput>> {
         record_s3_op(S3Operation::GetBucketLogging, &req.input.bucket);
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
         store
@@ -1014,7 +1087,7 @@ impl S3 for FS {
 
     async fn put_bucket_logging(&self, req: S3Request<PutBucketLoggingInput>) -> S3Result<S3Response<PutBucketLoggingOutput>> {
         record_s3_op(S3Operation::PutBucketLogging, &req.input.bucket);
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
         store
@@ -1073,7 +1146,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketRequestPaymentInput>,
     ) -> S3Result<S3Response<PutBucketRequestPaymentOutput>> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
         store
@@ -1115,7 +1188,7 @@ impl S3 for FS {
     }
 
     async fn put_bucket_website(&self, req: S3Request<PutBucketWebsiteInput>) -> S3Result<S3Response<PutBucketWebsiteOutput>> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
         store
@@ -1145,7 +1218,7 @@ impl S3 for FS {
         let key = &req.input.key;
         let version_id = req.input.version_id.clone();
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1187,7 +1260,7 @@ impl S3 for FS {
 
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1240,7 +1313,7 @@ impl S3 for FS {
 
         let Some(input_cfg) = object_lock_configuration else { return Err(s3_error!(InvalidArgument)) };
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1311,7 +1384,7 @@ impl S3 for FS {
 
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1389,7 +1462,7 @@ impl S3 for FS {
 
         crate::storage::s3_api::tagging::validate_object_tag_set(&tagging.tag_set)?;
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 

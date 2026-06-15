@@ -25,7 +25,11 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use tokio::sync::{Mutex, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+
+const LOG_COMPONENT_KMS: &str = "kms";
+const LOG_SUBSYSTEM_SERVICE: &str = "service";
+const EVENT_KMS_SERVICE_STATE: &str = "kms_service_state";
 
 /// KMS service status
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -92,6 +96,8 @@ impl KmsServiceManager {
 
     /// Configure KMS with new configuration
     pub async fn configure(&self, new_config: KmsConfig) -> Result<()> {
+        new_config.validate()?;
+
         // Update configuration
         {
             let mut config = self.config.write().await;
@@ -104,7 +110,13 @@ impl KmsServiceManager {
             *status = KmsServiceStatus::Configured;
         }
 
-        info!("KMS configuration updated successfully");
+        debug!(
+            event = EVENT_KMS_SERVICE_STATE,
+            component = LOG_COMPONENT_KMS,
+            subsystem = LOG_SUBSYSTEM_SERVICE,
+            state = "configured",
+            "KMS service configured"
+        );
         Ok(())
     }
 
@@ -130,7 +142,14 @@ impl KmsServiceManager {
             }
         };
 
-        info!("Starting KMS service with backend: {:?}", config.backend);
+        info!(
+            event = EVENT_KMS_SERVICE_STATE,
+            component = LOG_COMPONENT_KMS,
+            subsystem = LOG_SUBSYSTEM_SERVICE,
+            backend = ?config.backend,
+            state = "starting",
+            "KMS service starting"
+        );
 
         match self.create_service_version(&config).await {
             Ok(service_version) => {
@@ -144,7 +163,13 @@ impl KmsServiceManager {
                     *status = KmsServiceStatus::Running;
                 }
 
-                info!("KMS service started successfully");
+                debug!(
+                    event = EVENT_KMS_SERVICE_STATE,
+                    component = LOG_COMPONENT_KMS,
+                    subsystem = LOG_SUBSYSTEM_SERVICE,
+                    state = "running",
+                    "KMS service running"
+                );
                 Ok(())
             }
             Err(e) => {
@@ -168,7 +193,13 @@ impl KmsServiceManager {
 
     /// Internal stop implementation (called within lifecycle mutex)
     async fn stop_internal(&self) -> Result<()> {
-        info!("Stopping KMS service");
+        debug!(
+            event = EVENT_KMS_SERVICE_STATE,
+            component = LOG_COMPONENT_KMS,
+            subsystem = LOG_SUBSYSTEM_SERVICE,
+            state = "stopping",
+            "KMS service stopping"
+        );
 
         // Atomically clear current service version (lock-free, instant)
         // Note: Existing Arc references will keep the service alive until operations complete
@@ -182,7 +213,13 @@ impl KmsServiceManager {
             }
         }
 
-        info!("KMS service stopped successfully (existing operations may continue)");
+        debug!(
+            event = EVENT_KMS_SERVICE_STATE,
+            component = LOG_COMPONENT_KMS,
+            subsystem = LOG_SUBSYSTEM_SERVICE,
+            state = "configured",
+            "KMS service stopped"
+        );
         Ok(())
     }
 
@@ -199,7 +236,14 @@ impl KmsServiceManager {
     pub async fn reconfigure(&self, new_config: KmsConfig) -> Result<()> {
         let _guard = self.lifecycle_mutex.lock().await;
 
-        info!("Reconfiguring KMS service (zero-downtime)");
+        debug!(
+            event = EVENT_KMS_SERVICE_STATE,
+            component = LOG_COMPONENT_KMS,
+            subsystem = LOG_SUBSYSTEM_SERVICE,
+            state = "reconfiguring",
+            "KMS service reconfiguring"
+        );
+        new_config.validate()?;
 
         // Configure with new config
         {
@@ -227,13 +271,22 @@ impl KmsServiceManager {
 
                 if let Some(old_ver) = old_version {
                     info!(
-                        "KMS service reconfigured successfully: version {} -> {} (old service will be cleaned up when operations complete)",
-                        old_ver, new_service_version.version
+                        event = EVENT_KMS_SERVICE_STATE,
+                        component = LOG_COMPONENT_KMS,
+                        subsystem = LOG_SUBSYSTEM_SERVICE,
+                        old_version = old_ver,
+                        new_version = new_service_version.version,
+                        state = "running",
+                        "KMS service reconfigured"
                     );
                 } else {
                     info!(
-                        "KMS service reconfigured successfully: version {} (service started)",
-                        new_service_version.version
+                        event = EVENT_KMS_SERVICE_STATE,
+                        component = LOG_COMPONENT_KMS,
+                        subsystem = LOG_SUBSYSTEM_SERVICE,
+                        new_version = new_service_version.version,
+                        state = "running",
+                        "KMS service started from reconfigure"
                     );
                 }
                 Ok(())
@@ -307,6 +360,8 @@ impl KmsServiceManager {
     ///
     /// This creates a new backend, manager, and service, and assigns it a new version number.
     async fn create_service_version(&self, config: &KmsConfig) -> Result<ServiceVersion> {
+        config.validate()?;
+
         // Increment version counter
         let version = self.version_counter.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -370,4 +425,23 @@ pub fn get_global_kms_service_manager() -> Option<Arc<KmsServiceManager>> {
 pub async fn get_global_encryption_service() -> Option<Arc<ObjectEncryptionService>> {
     let manager = get_global_kms_service_manager().unwrap_or_else(init_global_kms_service_manager);
     manager.get_encryption_service().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn configure_rejects_insecure_development_defaults_before_state_update() {
+        let manager = KmsServiceManager::new();
+
+        let error = manager
+            .configure(KmsConfig::default())
+            .await
+            .expect_err("unsafe local defaults should fail validation");
+
+        assert!(error.to_string().contains(crate::config::ENV_KMS_ALLOW_INSECURE_DEV_DEFAULTS));
+        assert_eq!(manager.get_status().await, KmsServiceStatus::NotConfigured);
+        assert!(manager.get_config().await.is_none());
+    }
 }

@@ -1,4 +1,5 @@
 {{- $logDir := .Values.config.rustfs.obs_log_directory }}
+{{- $logDirEnabled := ne $logDir "" }}
 
 {{- if .Values.mode.standalone.enabled }}
 apiVersion: apps/v1
@@ -63,6 +64,7 @@ spec:
       tolerations:
         {{- toYaml .Values.tolerations | nindent 8 }}
       {{- end }}
+      priorityClassName: {{ .Values.priorityClassName }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       initContainers:
@@ -75,13 +77,18 @@ spec:
             - sh
             - -c
             - |
-              mkdir -p /data /mnt/rustfs/logs
+              mkdir -p /data
+              {{- if $logDirEnabled }}
+              mkdir -p /mnt/rustfs/logs
               chmod 755 /mnt/rustfs/logs
+              {{- end }}
           volumeMounts:
             - name: data
               mountPath: /data
+            {{- if $logDirEnabled }}
             - name: logs
               mountPath: /mnt/rustfs
+            {{- end }}
       containers:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.rustfs.repository }}:{{ .Values.image.rustfs.tag | default .Chart.AppVersion }}"
@@ -130,9 +137,11 @@ spec:
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+            {{- if $logDirEnabled }}
             - name: logs
               mountPath: {{ $logDir }}
               subPath: logs
+            {{- end }}
             - name: data
               mountPath: /data
       volumes:
@@ -161,6 +170,7 @@ spec:
               - key: ca.crt
                 path: client_ca.crt
       {{- end }}
+      {{- if $logDirEnabled }}
         - name: logs
           persistentVolumeClaim:
             {{- if .Values.mode.standalone.existingClaim.logsClaim }}
@@ -168,6 +178,7 @@ spec:
             {{- else }}
             claimName: {{ include "rustfs.fullname" $ }}-logs
             {{- end }}
+      {{- end }}
         - name: data
           persistentVolumeClaim:
             {{- if .Values.mode.standalone.existingClaim.dataClaim }}

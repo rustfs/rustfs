@@ -125,6 +125,9 @@ pub struct Config {
     /// KMS key directory for local backend
     pub kms_key_dir: Option<String>,
 
+    /// Master key for local KMS key-file encryption
+    pub kms_local_master_key: Option<String>,
+
     /// Vault address for vault backend
     pub kms_vault_address: Option<String>,
 
@@ -136,6 +139,9 @@ pub struct Config {
 
     /// Default KMS key ID for encryption
     pub kms_default_key_id: Option<String>,
+
+    /// Allow development-only insecure KMS defaults
+    pub kms_allow_insecure_dev_defaults: bool,
 
     /// Disable adaptive buffer sizing with workload profiles
     pub buffer_profile_disable: bool,
@@ -165,10 +171,12 @@ impl Config {
             kms_enable: false,
             kms_backend: "local".to_string(),
             kms_key_dir: None,
+            kms_local_master_key: None,
             kms_vault_address: None,
             kms_vault_token: None,
             kms_vault_mount_path: None,
             kms_default_key_id: None,
+            kms_allow_insecure_dev_defaults: false,
             buffer_profile_disable: false,
             buffer_profile: "GeneralPurpose".to_string(),
         }
@@ -197,10 +205,12 @@ impl Config {
             kms_enable,
             kms_backend,
             kms_key_dir,
+            kms_local_master_key,
             kms_vault_address,
             kms_vault_token,
             kms_vault_mount_path,
             kms_default_key_id,
+            kms_allow_insecure_dev_defaults,
             buffer_profile_disable,
             buffer_profile,
         } = opt;
@@ -238,10 +248,12 @@ impl Config {
             kms_enable,
             kms_backend,
             kms_key_dir,
+            kms_local_master_key,
             kms_vault_address,
             kms_vault_token,
             kms_vault_mount_path,
             kms_default_key_id,
+            kms_allow_insecure_dev_defaults,
             buffer_profile_disable,
             buffer_profile,
         })
@@ -279,10 +291,12 @@ impl std::fmt::Debug for Config {
             .field("kms_enable", &self.kms_enable)
             .field("kms_backend", &self.kms_backend)
             .field("kms_key_dir", &self.kms_key_dir)
+            .field("kms_local_master_key", &Masked(self.kms_local_master_key.as_deref()))
             .field("kms_vault_address", &self.kms_vault_address)
             .field("kms_vault_token", &Masked(self.kms_vault_token.as_deref()))
             .field("kms_vault_mount_path", &self.kms_vault_mount_path)
             .field("kms_default_key_id", &self.kms_default_key_id)
+            .field("kms_allow_insecure_dev_defaults", &self.kms_allow_insecure_dev_defaults)
             .field("buffer_profile_disable", &self.buffer_profile_disable)
             .field("buffer_profile", &self.buffer_profile)
             .finish()

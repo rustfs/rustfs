@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Statement {
-    #[serde(rename = "Sid", default)]
+    #[serde(rename = "Sid", default, skip_serializing_if = "ID::is_empty")]
     pub sid: ID,
     #[serde(rename = "Effect")]
     pub effect: Effect,
@@ -36,7 +36,7 @@ pub struct Statement {
     pub resources: ResourceSet,
     #[serde(rename = "NotResource", default, skip_serializing_if = "ResourceSet::is_empty")]
     pub not_resources: ResourceSet,
-    #[serde(rename = "Condition", default)]
+    #[serde(rename = "Condition", default, skip_serializing_if = "Functions::is_empty")]
     pub conditions: Functions,
 }
 
@@ -89,6 +89,18 @@ enum ActionFamily {
 }
 
 impl Statement {
+    fn skips_resource_match_for_args(&self, args: &Args<'_>) -> bool {
+        if self.is_sts() {
+            return true;
+        }
+
+        if !self.is_admin() {
+            return false;
+        }
+
+        !matches!(args.action, Action::AdminAction(action) if action.is_table_resource_scoped())
+    }
+
     fn is_kms(&self) -> bool {
         for act in self.actions.iter() {
             if matches!(act, Action::KmsAction(_)) {
@@ -139,7 +151,7 @@ impl Statement {
             }
         }
 
-        let family_count = saw_s3 as u8 + saw_admin as u8 + saw_sts as u8 + saw_kms as u8;
+        let family_count = u8::from(saw_s3) + u8::from(saw_admin) + u8::from(saw_sts) + u8::from(saw_kms);
 
         if family_count != 1 {
             return Some(ActionFamily::Mixed);
@@ -188,8 +200,7 @@ impl Statement {
                 .resources
                 .is_match_with_resolver(&resource, args.conditions, Some(resolver))
                 .await
-            && !self.is_admin()
-            && !self.is_sts()
+            && !self.skips_resource_match_for_args(args)
         {
             return false;
         }
@@ -199,8 +210,7 @@ impl Statement {
                 .not_resources
                 .is_match_with_resolver(&resource, args.conditions, Some(resolver))
                 .await
-            && !self.is_admin()
-            && !self.is_sts()
+            && !self.skips_resource_match_for_args(args)
         {
             return false;
         }

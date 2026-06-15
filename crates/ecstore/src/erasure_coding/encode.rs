@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use crate::disk::error::Error;
-use crate::disk::error_reduce::count_errs;
-use crate::disk::error_reduce::{OBJECT_OP_IGNORED_ERRS, reduce_write_quorum_errs};
+use crate::disk::error_reduce::{
+    OBJECT_OP_IGNORED_ERRS, WriteQuorumFailureSummary, build_write_quorum_failure_summary, reduce_write_quorum_errs,
+};
 use crate::erasure_coding::BitrotWriterWrapper;
 use crate::erasure_coding::Erasure;
 use bytes::Bytes;
@@ -48,6 +49,28 @@ async fn drain_queued_inflight_bytes(rx: &mut mpsc::Receiver<Vec<Bytes>>) {
     while let Some(block) = rx.recv().await {
         rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_block_bytes(&block));
     }
+}
+
+fn dominant_error_summary_label(summary: &WriteQuorumFailureSummary) -> &'static str {
+    summary.dominant_error_label
+}
+
+fn format_write_quorum_failure(summary: &WriteQuorumFailureSummary) -> String {
+    format!(
+        "erasure write quorum (required={}, achieved={}, failed={}, total={}, offline-disks={}/{}, retryable-failures={}, dominant-error={})",
+        summary.required,
+        summary.achieved,
+        summary.failed,
+        summary.total,
+        summary.offline_disks,
+        summary.total,
+        summary.retryable_failures,
+        dominant_error_summary_label(summary)
+    )
+}
+
+fn quorum_dominant_error_metric_label(summary: &WriteQuorumFailureSummary) -> &'static str {
+    dominant_error_summary_label(summary)
 }
 
 pub(crate) struct MultiWriter<'a> {
@@ -109,25 +132,18 @@ impl<'a> MultiWriter<'a> {
         }
 
         if let Some(write_err) = reduce_write_quorum_errs(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum) {
-            error!(
-                "reduce_write_quorum_errs: {:?}, offline-disks={}/{}, errs={:?}",
-                write_err,
-                count_errs(&self.errs, &Error::DiskNotFound),
-                self.writers.len(),
-                self.errs
-            );
-            return Err(std::io::Error::other(format!(
-                "Failed to write data: {} (offline-disks={}/{})",
-                write_err,
-                count_errs(&self.errs, &Error::DiskNotFound),
-                self.writers.len()
-            )));
+            let summary = build_write_quorum_failure_summary(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum);
+            let summary_text = format_write_quorum_failure(&summary);
+            rustfs_io_metrics::internode_metrics::global_internode_metrics()
+                .record_erasure_write_quorum_failure("write", quorum_dominant_error_metric_label(&summary));
+            error!("reduce_write_quorum_errs: {:?}, {}, errs={:?}", write_err, summary_text, self.errs);
+            return Err(std::io::Error::other(format!("Failed to write data: {summary_text}")));
         }
 
+        let summary = build_write_quorum_failure_summary(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum);
         Err(std::io::Error::other(format!(
-            "Failed to write data:  (offline-disks={}/{}): {}",
-            count_errs(&self.errs, &Error::DiskNotFound),
-            self.writers.len(),
+            "Failed to write data: {}: {}",
+            format_write_quorum_failure(&summary),
             self.errs
                 .iter()
                 .map(|e| e.as_ref().map_or_else(|| "<nil>".to_string(), |e| e.to_string()))
@@ -171,25 +187,21 @@ impl<'a> MultiWriter<'a> {
         }
 
         if let Some(write_err) = reduce_write_quorum_errs(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum) {
+            let summary = build_write_quorum_failure_summary(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum);
+            let summary_text = format_write_quorum_failure(&summary);
+            rustfs_io_metrics::internode_metrics::global_internode_metrics()
+                .record_erasure_write_quorum_failure("shutdown", quorum_dominant_error_metric_label(&summary));
             error!(
-                "reduce_write_quorum_errs during shutdown: {:?}, offline-disks={}/{}, errs={:?}",
-                write_err,
-                count_errs(&self.errs, &Error::DiskNotFound),
-                self.writers.len(),
-                self.errs
+                "reduce_write_quorum_errs during shutdown: {:?}, {}, errs={:?}",
+                write_err, summary_text, self.errs
             );
-            return Err(std::io::Error::other(format!(
-                "Failed to shutdown writers: {} (offline-disks={}/{})",
-                write_err,
-                count_errs(&self.errs, &Error::DiskNotFound),
-                self.writers.len()
-            )));
+            return Err(std::io::Error::other(format!("Failed to shutdown writers: {summary_text}")));
         }
 
+        let summary = build_write_quorum_failure_summary(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum);
         Err(std::io::Error::other(format!(
-            "Failed to shutdown writers: (offline-disks={}/{}): {}",
-            count_errs(&self.errs, &Error::DiskNotFound),
-            self.writers.len(),
+            "Failed to shutdown writers: {}: {}",
+            format_write_quorum_failure(&summary),
             self.errs
                 .iter()
                 .map(|e| e.as_ref().map_or_else(|| "<nil>".to_string(), |e| e.to_string()))
@@ -200,6 +212,49 @@ impl<'a> MultiWriter<'a> {
 }
 
 impl Erasure {
+    async fn encode_small_direct<R>(
+        self: Arc<Self>,
+        mut reader: R,
+        writers: &mut [Option<BitrotWriterWrapper>],
+        quorum: usize,
+        require_single_block: bool,
+    ) -> std::io::Result<(R, usize)>
+    where
+        R: AsyncRead + Send + Sync + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = Vec::with_capacity(self.block_size);
+        let total = if require_single_block {
+            let read_limit = self
+                .block_size
+                .checked_add(1)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "erasure block_size is too large"))?;
+            let read_limit = u64::try_from(read_limit)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "erasure block_size exceeds u64"))?;
+            (&mut reader).take(read_limit).read_to_end(&mut buf).await?
+        } else {
+            reader.read_to_end(&mut buf).await?
+        };
+
+        if total == 0 {
+            return Ok((reader, 0));
+        }
+
+        if require_single_block && total > self.block_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "single-block non-inline fast path expects total <= block_size",
+            ));
+        }
+
+        let shards = self.encode_data_owned(buf)?;
+        let mut mw = MultiWriter::new(writers, quorum);
+        mw.write(shards).await?;
+        mw.shutdown().await?;
+        Ok((reader, total))
+    }
+
     pub async fn encode<R>(
         self: Arc<Self>,
         mut reader: R,
@@ -307,27 +362,28 @@ impl Erasure {
     /// Reads all data, encodes directly, writes shards sequentially.
     pub async fn encode_inline_small<R>(
         self: Arc<Self>,
-        mut reader: R,
+        reader: R,
         writers: &mut [Option<BitrotWriterWrapper>],
         quorum: usize,
     ) -> std::io::Result<(R, usize)>
     where
         R: AsyncRead + Send + Sync + Unpin,
     {
-        use tokio::io::AsyncReadExt;
+        self.encode_small_direct(reader, writers, quorum, false).await
+    }
 
-        let mut buf = Vec::with_capacity(self.block_size);
-        let total = reader.read_to_end(&mut buf).await?;
-
-        if total == 0 {
-            return Ok((reader, 0));
-        }
-
-        let shards = self.encode_data(&buf)?;
-        let mut mw = MultiWriter::new(writers, quorum);
-        mw.write(shards).await?;
-        mw.shutdown().await?;
-        Ok((reader, total))
+    /// Fast path for single-block non-inline objects: avoids the producer/consumer
+    /// pipeline in `encode()` while keeping the same writer/quorum/shutdown semantics.
+    pub async fn encode_single_block_non_inline<R>(
+        self: Arc<Self>,
+        reader: R,
+        writers: &mut [Option<BitrotWriterWrapper>],
+        quorum: usize,
+    ) -> std::io::Result<(R, usize)>
+    where
+        R: AsyncRead + Send + Sync + Unpin,
+    {
+        self.encode_small_direct(reader, writers, quorum, true).await
     }
 }
 
@@ -491,11 +547,103 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn encode_single_block_non_inline_payload_writes_all_shards() {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
+        const BLOCK_SIZE: usize = 64;
+
+        let committed: Vec<Arc<Mutex<Vec<u8>>>> = (0..TOTAL_SHARDS).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+
+        let mut writers: Vec<Option<BitrotWriterWrapper>> = committed
+            .iter()
+            .map(|c| {
+                Some(BitrotWriterWrapper::new(
+                    CustomWriter::new_tokio_writer(DeferredCommitWriter::new(c.clone())),
+                    BLOCK_SIZE / DATA_SHARDS,
+                    HashAlgorithm::HighwayHash256S,
+                ))
+            })
+            .collect();
+
+        let payload = b"hello single block";
+        let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(payload.to_vec()));
+        let (_reader, total) = erasure
+            .encode_single_block_non_inline(reader, &mut writers, DATA_SHARDS)
+            .await
+            .unwrap();
+
+        assert_eq!(total, payload.len());
+        for (i, c) in committed.iter().enumerate() {
+            assert!(!c.lock().unwrap().is_empty(), "shard {i} should have received data");
+        }
+    }
+
+    #[tokio::test]
+    async fn encode_single_block_non_inline_rejects_multi_block_payload() {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
+        const BLOCK_SIZE: usize = 64;
+
+        let committed: Vec<Arc<Mutex<Vec<u8>>>> = (0..TOTAL_SHARDS).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+
+        let mut writers: Vec<Option<BitrotWriterWrapper>> = committed
+            .iter()
+            .map(|c| {
+                Some(BitrotWriterWrapper::new(
+                    CustomWriter::new_tokio_writer(DeferredCommitWriter::new(c.clone())),
+                    BLOCK_SIZE / DATA_SHARDS,
+                    HashAlgorithm::HighwayHash256S,
+                ))
+            })
+            .collect();
+
+        let payload = vec![1u8; BLOCK_SIZE + 1];
+        let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(payload));
+        let err = erasure
+            .encode_single_block_non_inline(reader, &mut writers, DATA_SHARDS)
+            .await
+            .expect_err("single-block fast path must reject oversized readers");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("single-block non-inline fast path"));
+        for c in committed {
+            assert!(c.lock().unwrap().is_empty());
+        }
+    }
+
     #[test]
     fn encode_channel_capacity_never_returns_zero() {
         assert_eq!(encode_channel_capacity(0, 1024), 1);
         assert_eq!(encode_channel_capacity(4096, 0), 1);
         assert_eq!(encode_channel_capacity(4096, 1024), 1);
+    }
+
+    #[test]
+    fn write_quorum_failure_summary_uses_stable_dominant_error_label() {
+        let err = Error::from(rustfs_rio::new_test_internode_http_io_error(
+            rustfs_rio::InternodeHttpErrorKind::ConnectionReset,
+        ));
+        let summary = WriteQuorumFailureSummary {
+            required: 2,
+            achieved: 0,
+            failed: 2,
+            total: 2,
+            offline_disks: 0,
+            ignored_failures: 0,
+            retryable_failures: 2,
+            dominant_error: Some(err),
+            dominant_error_label: "connection_reset",
+        };
+        let text = format_write_quorum_failure(&summary);
+
+        assert!(text.contains("dominant-error=connection_reset"));
+        assert!(!text.contains("/rustfs/rpc/put_file_stream"));
+        assert!(!text.contains("PUT "));
     }
 
     #[test]

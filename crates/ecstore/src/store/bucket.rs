@@ -13,7 +13,10 @@
 // limitations under the License.
 
 use super::*;
-use crate::bucket::{metadata::BUCKET_TABLE_RESERVED_PREFIX, utils::is_meta_bucketname};
+use crate::bucket::{
+    metadata::{BUCKET_TABLE_RESERVED_PREFIX, table_bucket_catalog_metadata_prefix},
+    utils::is_meta_bucketname,
+};
 use crate::global::get_global_bucket_monitor;
 use crate::set_disk::get_lock_acquire_timeout;
 
@@ -56,6 +59,13 @@ async fn validate_table_bucket_delete_guard(bucket: &str) -> Result<()> {
     Ok(())
 }
 
+fn bucket_delete_metadata_cleanup_prefixes(bucket: &str) -> [String; 2] {
+    [
+        table_bucket_catalog_metadata_prefix(bucket),
+        format!("{BUCKET_META_PREFIX}/{bucket}"),
+    ]
+}
+
 impl ECStore {
     #[instrument(skip(self))]
     pub(super) async fn handle_make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
@@ -81,7 +91,7 @@ impl ECStore {
                                 achieved,
                             }
                         }
-                        other => StorageError::other(format!("make_bucket: failed to acquire write lock on {bucket}: {other}")),
+                        other => StorageError::Lock(other),
                     })?,
             )
         } else {
@@ -90,6 +100,19 @@ impl ECStore {
 
         if let Err(err) = self.peer_sys.make_bucket(bucket, opts).await {
             let err = to_object_err(err.into(), vec![bucket]);
+            if is_err_bucket_exists(&err)
+                && let Err(heal_err) = self
+                    .handle_heal_bucket(
+                        bucket,
+                        &HealOpts {
+                            recreate: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            {
+                warn!("best-effort bucket heal after BucketExists failed: {heal_err}");
+            }
             if !is_err_bucket_exists(&err) {
                 error!("make bucket failed: {err}");
                 let _ = self
@@ -185,7 +208,7 @@ impl ECStore {
                                 achieved,
                             }
                         }
-                        other => StorageError::other(format!("delete_bucket: failed to acquire write lock on {bucket}: {other}")),
+                        other => StorageError::Lock(other),
                     })?,
             )
         } else {
@@ -229,9 +252,11 @@ impl ECStore {
 
         // TODO: replication opts.srdelete_op
 
-        // Delete the metadata
-        self.delete_all(RUSTFS_META_BUCKET, format!("{BUCKET_META_PREFIX}/{bucket}").as_str())
-            .await?;
+        // Delete internal metadata after the bucket is gone so stale catalog records cannot be reused
+        // if the same bucket name is created again.
+        for prefix in bucket_delete_metadata_cleanup_prefixes(bucket) {
+            self.delete_all(RUSTFS_META_BUCKET, prefix.as_str()).await?;
+        }
         if let Some(monitor) = get_global_bucket_monitor() {
             monitor.delete_bucket(bucket);
         }
@@ -241,7 +266,10 @@ impl ECStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{should_override_created_from_metadata, validate_table_bucket_delete_allowed};
+    use super::{
+        bucket_delete_metadata_cleanup_prefixes, should_override_created_from_metadata, validate_table_bucket_delete_allowed,
+    };
+    use crate::bucket::metadata::table_bucket_catalog_metadata_prefix;
     use crate::error::StorageError;
     use time::OffsetDateTime;
 
@@ -263,5 +291,13 @@ mod tests {
         assert!(matches!(err, StorageError::BucketNotEmpty(bucket) if bucket == "table-bucket"));
         assert!(validate_table_bucket_delete_allowed("table-bucket", true, false).is_ok());
         assert!(validate_table_bucket_delete_allowed("regular-bucket", false, true).is_ok());
+    }
+
+    #[test]
+    fn bucket_delete_metadata_cleanup_removes_internal_table_catalog_prefix() {
+        let prefixes = bucket_delete_metadata_cleanup_prefixes("analytics");
+
+        assert!(prefixes.contains(&table_bucket_catalog_metadata_prefix("analytics")));
+        assert!(prefixes.contains(&"buckets/analytics".to_string()));
     }
 }

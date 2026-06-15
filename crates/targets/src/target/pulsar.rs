@@ -24,7 +24,7 @@ use crate::{
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
         TargetTlsState, TargetType, build_queued_payload_with_records, build_target_tls_fingerprint, open_target_queue_store,
-        persist_queued_payload_to_store,
+        persist_queued_payload_to_store, redacted_secret,
     },
 };
 use async_trait::async_trait;
@@ -32,6 +32,7 @@ use pulsar::{Authentication, Producer, Pulsar, TokioExecutor};
 use rustfs_tls_runtime::load_cert_bundle_der_bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -39,7 +40,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, instrument};
 use url::Url;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PulsarArgs {
     pub enable: bool,
     pub broker: String,
@@ -53,6 +54,25 @@ pub struct PulsarArgs {
     pub queue_dir: String,
     pub queue_limit: u64,
     pub target_type: TargetType,
+}
+
+impl fmt::Debug for PulsarArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PulsarArgs")
+            .field("enable", &self.enable)
+            .field("broker", &self.broker)
+            .field("topic", &self.topic)
+            .field("auth_token", &redacted_secret(&self.auth_token))
+            .field("username", &self.username)
+            .field("password", &redacted_secret(&self.password))
+            .field("tls_ca", &self.tls_ca)
+            .field("tls_allow_insecure", &self.tls_allow_insecure)
+            .field("tls_hostname_verification", &self.tls_hostname_verification)
+            .field("queue_dir", &self.queue_dir)
+            .field("queue_limit", &self.queue_limit)
+            .field("target_type", &self.target_type)
+            .finish()
+    }
 }
 
 impl PulsarArgs {
@@ -463,6 +483,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::target::REDACTED_SECRET;
 
     fn base_args() -> PulsarArgs {
         PulsarArgs {
@@ -479,6 +500,22 @@ mod tests {
             queue_limit: 0,
             target_type: TargetType::NotifyEvent,
         }
+    }
+
+    #[test]
+    fn debug_redacts_pulsar_secret_fields() {
+        let args = PulsarArgs {
+            auth_token: "pulsar-token".to_string(),
+            password: "pulsar-password".to_string(),
+            ..base_args()
+        };
+
+        let rendered = format!("{args:?}");
+
+        assert!(!rendered.contains("pulsar-token"));
+        assert!(!rendered.contains("pulsar-password"));
+        assert!(rendered.contains(REDACTED_SECRET));
+        assert!(rendered.contains("persistent://public/default/rustfs-events"));
     }
 
     #[test]

@@ -16,6 +16,7 @@ use crate::admin::auth::validate_admin_request;
 use crate::admin::handlers::site_replication::site_replication_peer_deployment_id_for_endpoint;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::utils::read_compatible_admin_body;
+use crate::app::context::resolve_object_store_handle;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
@@ -33,9 +34,9 @@ use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
 use rustfs_ecstore::bucket::target::BucketTarget;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::global::global_rustfs_port;
-use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
+use rustfs_ecstore::store_api::BucketOperations;
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_storage_api::BucketOptions;
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
@@ -135,7 +136,7 @@ impl Operation for GetReplicationMetricsHandler {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         }
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -193,7 +194,7 @@ impl Operation for SetRemoteTargetHandler {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         }
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -318,11 +319,9 @@ pub struct ListRemoteTargetHandler {}
 #[async_trait::async_trait]
 impl Operation for ListRemoteTargetHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        validate_replication_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
+
         let queries = extract_query_params(&req.uri);
-        let Some(_cred) = req.credentials else {
-            error!("credentials null");
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
-        };
 
         if let Some(bucket) = queries.get("bucket") {
             if bucket.is_empty() {
@@ -330,7 +329,7 @@ impl Operation for ListRemoteTargetHandler {
                 return Err(s3_error!(InvalidRequest, "bucket is required"));
             }
 
-            let Some(store) = new_object_layer_fn() else {
+            let Some(store) = resolve_object_store_handle() else {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not initialized".to_string()));
             };
 
@@ -390,7 +389,7 @@ impl Operation for RemoveRemoteTargetHandler {
             return Err(s3_error!(InvalidRequest, "arn is required"));
         };
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not initialized".to_string()));
         };
 

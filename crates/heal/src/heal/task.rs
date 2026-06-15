@@ -16,6 +16,10 @@ use crate::heal::{ErasureSetHealer, progress::HealProgress, storage::HealStorage
 use crate::{Error, Result};
 use metrics::{counter, histogram};
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
+use rustfs_ecstore::{
+    data_usage::DATA_USAGE_CACHE_NAME,
+    disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
+};
 use rustfs_madmin::heal_commands::HealResultItem;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -24,8 +28,27 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+const LOG_COMPONENT_HEAL: &str = "heal";
+const LOG_SUBSYSTEM_TASK: &str = "task";
+const LOG_SUBSYSTEM_OBJECT: &str = "object";
+const EVENT_HEAL_TASK_STATE: &str = "heal_task_state";
+const EVENT_HEAL_OBJECT_STAGE: &str = "heal_object_stage";
+const EVENT_HEAL_OBJECT_MISSING: &str = "heal_object_missing";
+const EVENT_HEAL_OBJECT_RESULT: &str = "heal_object_result";
+const EVENT_HEAL_OBJECT_CLEANUP: &str = "heal_object_cleanup";
+const EVENT_HEAL_BUCKET_STAGE: &str = "heal_bucket_stage";
+const EVENT_HEAL_BUCKET_RESULT: &str = "heal_bucket_result";
+const EVENT_HEAL_METADATA_STAGE: &str = "heal_metadata_stage";
+const EVENT_HEAL_METADATA_RESULT: &str = "heal_metadata_result";
+const EVENT_HEAL_MRF_STAGE: &str = "heal_mrf_stage";
+const EVENT_HEAL_MRF_RESULT: &str = "heal_mrf_result";
+const EVENT_HEAL_EC_DECODE_STAGE: &str = "heal_ec_decode_stage";
+const EVENT_HEAL_EC_DECODE_RESULT: &str = "heal_ec_decode_result";
+const EVENT_HEAL_ERASURE_SET_STAGE: &str = "heal_erasure_set_stage";
+const EVENT_HEAL_ERASURE_SET_RESULT: &str = "heal_erasure_set_result";
 
 /// Heal type
 #[derive(Debug, Clone)]
@@ -50,6 +73,19 @@ pub enum HealType {
         object: String,
         version_id: Option<String>,
     },
+}
+
+impl HealType {
+    fn log_kind(&self) -> &'static str {
+        match self {
+            Self::Object { .. } => "object",
+            Self::Bucket { .. } => "bucket",
+            Self::ErasureSet { .. } => "erasure_set",
+            Self::Metadata { .. } => "metadata",
+            Self::MRF { .. } => "mrf",
+            Self::ECDecode { .. } => "ec_decode",
+        }
+    }
 }
 
 /// Heal priority
@@ -310,14 +346,64 @@ impl HealTask {
 
     async fn skip_due_to_transient_object_exists(&self, bucket: &str, object: &str, err: &Error) -> Result<()> {
         warn!(
-            "Skipping heal for {}/{} due to transient object existence check error: {}",
-            bucket, object, err
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_OBJECT_RESULT,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_OBJECT,
+            task_id = %self.id,
+            bucket,
+            object,
+            result = "transient_skip",
+            error = %err,
+            "Heal object skipped due to transient existence check error"
         );
 
         let mut progress = self.progress.write().await;
         progress.set_current_object(Some(format!("skipped: {bucket}/{object}")));
         progress.update_progress(0, 1, 0, 0);
         Ok(())
+    }
+
+    fn is_data_usage_cache_object(bucket: &str, object: &str) -> bool {
+        bucket == RUSTFS_META_BUCKET
+            && object
+                .strip_prefix(BUCKET_META_PREFIX)
+                .and_then(|suffix| suffix.strip_prefix('/'))
+                .is_some_and(|name| name.contains(DATA_USAGE_CACHE_NAME))
+    }
+
+    fn is_transient_lock_or_timeout_error(err: &Error) -> bool {
+        let message = err.to_string().to_ascii_lowercase();
+        message.contains("lock acquisition timeout")
+            || message.contains("lock acquisition failed")
+            || message.contains("timed out")
+            || message.contains("deadline has elapsed")
+    }
+
+    fn should_skip_data_usage_cache_heal_error(bucket: &str, object: &str, err: &Error) -> bool {
+        Self::is_data_usage_cache_object(bucket, object) && Self::is_transient_lock_or_timeout_error(err)
+    }
+
+    async fn skip_data_usage_cache_heal_error(&self, bucket: &str, object: &str, err: &Error) -> bool {
+        if !Self::should_skip_data_usage_cache_heal_error(bucket, object, err) {
+            return false;
+        }
+
+        warn!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_OBJECT_RESULT,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_OBJECT,
+            task_id = %self.id,
+            bucket,
+            object,
+            result = "data_usage_cache_transient_skip",
+            error = %err,
+            "Heal object skipped for data usage cache after transient error"
+        );
+        let mut progress = self.progress.write().await;
+        progress.update_progress(3, 3, 0, 0);
+        true
     }
 
     #[tracing::instrument(skip(self), fields(task_id = %self.id, heal_type = ?self.heal_type))]
@@ -350,7 +436,17 @@ impl HealTask {
         )
         .increment(1);
 
-        info!("Task started");
+        info!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_TASK_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            heal_type = self.heal_type.log_kind(),
+            state = "started",
+            queue_delay = ?queue_delay,
+            "Heal task started"
+        );
 
         let result = match &self.heal_type {
             HealType::Object {
@@ -380,22 +476,59 @@ impl HealTask {
             Ok(_) => {
                 let mut status = self.status.write().await;
                 *status = HealTaskStatus::Completed;
-                info!("Task completed successfully");
+                info!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_TASK_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
+                    heal_type = self.heal_type.log_kind(),
+                    state = "completed",
+                    "Heal task completed"
+                );
             }
             Err(Error::TaskCancelled) => {
                 let mut status = self.status.write().await;
                 *status = HealTaskStatus::Cancelled;
-                info!("Heal task was cancelled: {}", self.id);
+                info!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_TASK_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
+                    heal_type = self.heal_type.log_kind(),
+                    state = "cancelled",
+                    "Heal task cancelled"
+                );
             }
             Err(Error::TaskTimeout) => {
                 let mut status = self.status.write().await;
                 *status = HealTaskStatus::Timeout;
-                warn!("Heal task timed out: {}", self.id);
+                warn!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_TASK_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
+                    heal_type = self.heal_type.log_kind(),
+                    state = "timed_out",
+                    "Heal task timed out"
+                );
             }
             Err(e) => {
                 let mut status = self.status.write().await;
                 *status = HealTaskStatus::Failed { error: e.to_string() };
-                error!("Heal task failed: {} with error: {}", self.id, e);
+                error!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_TASK_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
+                    heal_type = self.heal_type.log_kind(),
+                    state = "failed",
+                    error = %e,
+                    "Heal task failed"
+                );
             }
         }
 
@@ -406,7 +539,17 @@ impl HealTask {
         self.cancel_token.cancel();
         let mut status = self.status.write().await;
         *status = HealTaskStatus::Cancelled;
-        info!("Heal task cancelled: {}", self.id);
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_TASK_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            heal_type = self.heal_type.log_kind(),
+            state = "cancelled",
+            source = "manual",
+            "Heal task cancellation requested"
+        );
         Ok(())
     }
 
@@ -429,7 +572,18 @@ impl HealTask {
     // specific heal implementation method
     #[tracing::instrument(skip(self), fields(bucket = %bucket, object = %object, version_id = ?version_id))]
     async fn heal_object(&self, bucket: &str, object: &str, version_id: Option<&str>) -> Result<()> {
-        info!("Starting object heal workflow");
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_OBJECT_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_OBJECT,
+            task_id = %self.id,
+            bucket,
+            object,
+            version_id = ?version_id,
+            stage = "start",
+            "Heal object started"
+        );
 
         // update progress
         {
@@ -439,7 +593,17 @@ impl HealTask {
         }
 
         // Step 1: Check if object exists and get metadata
-        warn!("Step 1: Checking object existence and metadata");
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_OBJECT_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_OBJECT,
+            task_id = %self.id,
+            bucket,
+            object,
+            stage = "check_existence",
+            "Heal object stage entered"
+        );
         self.check_control_flags().await?;
         let object_exists = match self.await_with_control(self.storage.object_exists(bucket, object)).await {
             Ok(exists) => exists,
@@ -449,9 +613,29 @@ impl HealTask {
             Err(err) => return Err(err),
         };
         if !object_exists {
-            warn!("Object does not exist: {}/{}", bucket, object);
+            warn!(
+                target: "rustfs::heal::task",
+                event = EVENT_HEAL_OBJECT_MISSING,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_OBJECT,
+                task_id = %self.id,
+                bucket,
+                object,
+                recreate_missing = self.options.recreate_missing,
+                "Heal target object is missing"
+            );
             if self.options.recreate_missing {
-                info!("Attempting to recreate missing object: {}/{}", bucket, object);
+                debug!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_OBJECT_STAGE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_OBJECT,
+                    task_id = %self.id,
+                    bucket,
+                    object,
+                    stage = "recreate_missing",
+                    "Heal object recreate requested"
+                );
                 return self.recreate_missing_object(bucket, object, version_id).await;
             } else {
                 return Err(Error::TaskExecutionFailed {
@@ -466,7 +650,20 @@ impl HealTask {
         }
 
         // Step 2: directly call ecstore to perform heal
-        info!("Step 2: Performing heal using ecstore");
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_OBJECT_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_OBJECT,
+            task_id = %self.id,
+            bucket,
+            object,
+            stage = "heal_with_ecstore",
+            dry_run = self.options.dry_run,
+            remove_corrupted = self.options.remove_corrupted,
+            update_parity = self.options.update_parity,
+            "Heal object stage entered"
+        );
         let heal_opts = HealOpts {
             recursive: self.options.recursive,
             dry_run: self.options.dry_run,
@@ -486,12 +683,23 @@ impl HealTask {
         match heal_result {
             Ok((result, error)) => {
                 if let Some(e) = error {
+                    if self.skip_data_usage_cache_heal_error(bucket, object, &e).await {
+                        return Ok(());
+                    }
+
                     // Check if this is a "File not found" error during delete operations
                     let error_msg = format!("{e}");
                     if error_msg.contains("File not found") || error_msg.contains("not found") {
-                        info!(
-                            "Object {}/{} not found during heal - likely deleted intentionally, treating as successful",
-                            bucket, object
+                        debug!(
+                            target: "rustfs::heal::task",
+                            event = EVENT_HEAL_OBJECT_RESULT,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_OBJECT,
+                            task_id = %self.id,
+                            bucket,
+                            object,
+                            result = "treated_as_deleted",
+                            "Heal missing object treated as deleted"
                         );
                         {
                             let mut progress = self.progress.write().await;
@@ -500,16 +708,47 @@ impl HealTask {
                         return Ok(());
                     }
 
-                    error!("Heal operation failed: {}/{} - {}", bucket, object, e);
+                    error!(
+                        target: "rustfs::heal::task",
+                        event = EVENT_HEAL_OBJECT_RESULT,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_OBJECT,
+                        task_id = %self.id,
+                        bucket,
+                        object,
+                        result = "failed",
+                        error = %e,
+                        "Heal object operation failed"
+                    );
 
                     // If heal failed and remove_corrupted is enabled, delete the corrupted object
                     if self.options.remove_corrupted {
-                        info!("Removing corrupted object: {}/{}", bucket, object);
+                        debug!(
+                            target: "rustfs::heal::task",
+                            event = EVENT_HEAL_OBJECT_CLEANUP,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_OBJECT,
+                            task_id = %self.id,
+                            bucket,
+                            object,
+                            action = "delete_corrupted_object",
+                            dry_run = self.options.dry_run,
+                            "Heal object cleanup requested"
+                        );
                         if !self.options.dry_run {
                             self.await_with_control(self.storage.delete_object(bucket, object)).await?;
-                            info!("Successfully deleted corrupted object: {}/{}", bucket, object);
-                        } else {
-                            info!("Dry run mode - would delete corrupted object: {}/{}", bucket, object);
+                            debug!(
+                                target: "rustfs::heal::task",
+                                event = EVENT_HEAL_OBJECT_CLEANUP,
+                                component = LOG_COMPONENT_HEAL,
+                                subsystem = LOG_SUBSYSTEM_OBJECT,
+                                task_id = %self.id,
+                                bucket,
+                                object,
+                                action = "delete_corrupted_object",
+                                result = "deleted",
+                                "Heal corrupted object deleted"
+                            );
                         }
                     }
 
@@ -524,12 +763,30 @@ impl HealTask {
                 }
 
                 // Step 3: Verify heal result
-                info!("Step 3: Verifying heal result");
+                debug!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_OBJECT_STAGE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_OBJECT,
+                    task_id = %self.id,
+                    bucket,
+                    object,
+                    stage = "verify_result",
+                    "Heal object stage entered"
+                );
                 let object_size = result.object_size as u64;
-                info!(
+                debug!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_OBJECT_RESULT,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_OBJECT,
+                    task_id = %self.id,
+                    bucket,
+                    object,
                     object_size = object_size,
                     drives_healed = result.after.drives.len(),
-                    "Heal completed successfully"
+                    result = "ok",
+                    "Heal object repaired"
                 );
 
                 {
@@ -542,12 +799,23 @@ impl HealTask {
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
+                if self.skip_data_usage_cache_heal_error(bucket, object, &e).await {
+                    return Ok(());
+                }
+
                 // Check if this is a "File not found" error during delete operations
                 let error_msg = format!("{e}");
                 if error_msg.contains("File not found") || error_msg.contains("not found") {
-                    info!(
-                        "Object {}/{} not found during heal - likely deleted intentionally, treating as successful",
-                        bucket, object
+                    debug!(
+                        target: "rustfs::heal::task",
+                        event = EVENT_HEAL_OBJECT_RESULT,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_OBJECT,
+                        task_id = %self.id,
+                        bucket,
+                        object,
+                        result = "treated_as_deleted",
+                        "Heal missing object treated as deleted"
                     );
                     {
                         let mut progress = self.progress.write().await;
@@ -556,16 +824,47 @@ impl HealTask {
                     return Ok(());
                 }
 
-                error!("Heal operation failed: {}/{} - {}", bucket, object, e);
+                error!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_OBJECT_RESULT,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_OBJECT,
+                    task_id = %self.id,
+                    bucket,
+                    object,
+                    result = "failed",
+                    error = %e,
+                    "Heal object operation failed"
+                );
 
                 // If heal failed and remove_corrupted is enabled, delete the corrupted object
                 if self.options.remove_corrupted {
-                    info!("Removing corrupted object: {}/{}", bucket, object);
+                    debug!(
+                        target: "rustfs::heal::task",
+                        event = EVENT_HEAL_OBJECT_CLEANUP,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_OBJECT,
+                        task_id = %self.id,
+                        bucket,
+                        object,
+                        action = "delete_corrupted_object",
+                        dry_run = self.options.dry_run,
+                        "Heal object cleanup requested"
+                    );
                     if !self.options.dry_run {
                         self.await_with_control(self.storage.delete_object(bucket, object)).await?;
-                        info!("Successfully deleted corrupted object: {}/{}", bucket, object);
-                    } else {
-                        info!("Dry run mode - would delete corrupted object: {}/{}", bucket, object);
+                        debug!(
+                            target: "rustfs::heal::task",
+                            event = EVENT_HEAL_OBJECT_CLEANUP,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_OBJECT,
+                            task_id = %self.id,
+                            bucket,
+                            object,
+                            action = "delete_corrupted_object",
+                            result = "deleted",
+                            "Heal corrupted object deleted"
+                        );
                     }
                 }
 
@@ -583,7 +882,18 @@ impl HealTask {
 
     /// Recreate missing object (for EC decode scenarios)
     async fn recreate_missing_object(&self, bucket: &str, object: &str, version_id: Option<&str>) -> Result<()> {
-        info!("Attempting to recreate missing object: {}/{}", bucket, object);
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_OBJECT_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_OBJECT,
+            task_id = %self.id,
+            bucket,
+            object,
+            version_id = ?version_id,
+            stage = "recreate_missing",
+            "Heal object recreate started"
+        );
 
         // Use ecstore's heal_object with recreate option
         let heal_opts = HealOpts {
@@ -604,14 +914,36 @@ impl HealTask {
         {
             Ok((result, error)) => {
                 if let Some(e) = error {
-                    error!("Failed to recreate missing object: {}/{} - {}", bucket, object, e);
+                    error!(
+                        target: "rustfs::heal::task",
+                        event = EVENT_HEAL_OBJECT_RESULT,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_OBJECT,
+                        task_id = %self.id,
+                        bucket,
+                        object,
+                        result = "recreate_failed",
+                        error = %e,
+                        "Heal object recovery failed"
+                    );
                     return Err(Error::TaskExecutionFailed {
                         message: format!("Failed to recreate missing object {bucket}/{object}: {e}"),
                     });
                 }
 
                 let object_size = result.object_size as u64;
-                info!("Successfully recreated missing object: {}/{} ({} bytes)", bucket, object, object_size);
+                debug!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_OBJECT_RESULT,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_OBJECT,
+                    task_id = %self.id,
+                    bucket,
+                    object,
+                    object_size,
+                    result = "recreated",
+                    "Heal object recreated"
+                );
 
                 {
                     let mut progress = self.progress.write().await;
@@ -623,7 +955,18 @@ impl HealTask {
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
-                error!("Failed to recreate missing object: {}/{} - {}", bucket, object, e);
+                error!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_OBJECT_RESULT,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_OBJECT,
+                    task_id = %self.id,
+                    bucket,
+                    object,
+                    result = "recreate_failed",
+                    error = %e,
+                    "Heal object recovery failed"
+                );
                 Err(Error::TaskExecutionFailed {
                     message: format!("Failed to recreate missing object {bucket}/{object}: {e}"),
                 })
@@ -632,7 +975,17 @@ impl HealTask {
     }
 
     async fn heal_bucket(&self, bucket: &str) -> Result<()> {
-        info!("Healing bucket: {}", bucket);
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_BUCKET_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            bucket,
+            stage = "start",
+            recursive = self.options.recursive,
+            "Heal bucket started"
+        );
 
         // update progress
         {
@@ -642,11 +995,29 @@ impl HealTask {
         }
 
         // Step 1: Check if bucket exists
-        info!("Step 1: Checking bucket existence");
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_BUCKET_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            bucket,
+            stage = "check_existence",
+            "Heal bucket stage entered"
+        );
         self.check_control_flags().await?;
         let bucket_exists = self.await_with_control(self.storage.get_bucket_info(bucket)).await?.is_some();
         if !bucket_exists {
-            warn!("Bucket does not exist: {}", bucket);
+            warn!(
+                target: "rustfs::heal::task",
+                event = EVENT_HEAL_BUCKET_RESULT,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_TASK,
+                task_id = %self.id,
+                bucket,
+                result = "missing",
+                "Heal bucket failed because the bucket does not exist"
+            );
             return Err(Error::TaskExecutionFailed {
                 message: format!("Bucket not found: {bucket}"),
             });
@@ -658,7 +1029,17 @@ impl HealTask {
         }
 
         // Step 2: Perform bucket heal using ecstore
-        info!("Step 2: Performing bucket heal using ecstore");
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_BUCKET_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            bucket,
+            stage = "heal_with_ecstore",
+            dry_run = self.options.dry_run,
+            "Heal bucket stage entered"
+        );
         let heal_opts = HealOpts {
             recursive: self.options.recursive,
             dry_run: self.options.dry_run,
@@ -679,7 +1060,18 @@ impl HealTask {
 
         match heal_result {
             Ok(result) => {
-                info!("Bucket heal completed successfully: {} ({} drives)", bucket, result.after.drives.len());
+                debug!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_BUCKET_RESULT,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
+                    bucket,
+                    drives_healed = result.after.drives.len(),
+                    recursive = self.options.recursive,
+                    result = "ok",
+                    "Heal bucket completed"
+                );
                 self.record_result_item(result).await;
 
                 if self.options.recursive {
@@ -695,7 +1087,17 @@ impl HealTask {
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
-                error!("Bucket heal failed: {} - {}", bucket, e);
+                error!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_BUCKET_RESULT,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
+                    bucket,
+                    result = "failed",
+                    error = %e,
+                    "Heal bucket failed"
+                );
                 {
                     let mut progress = self.progress.write().await;
                     progress.update_progress(3, 3, 0, 0);
@@ -758,17 +1160,80 @@ impl HealTask {
                             self.record_result_item(result).await;
                         }
                         Ok((_, Some(err))) => {
-                            failed += 1;
-                            warn!("Failed to heal object {}/{}: {}", bucket, object, err);
+                            if Self::should_skip_data_usage_cache_heal_error(bucket, &object, &err) {
+                                warn!(
+                                    target: "rustfs::heal::task",
+                                    event = EVENT_HEAL_BUCKET_RESULT,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_TASK,
+                                    task_id = %self.id,
+                                    bucket,
+                                    object = %object,
+                                    result = "transient_skip",
+                                    error = %err,
+                                    "Heal bucket object repair skipped due to transient error"
+                                );
+                            } else {
+                                failed += 1;
+                                warn!(
+                                    target: "rustfs::heal::task",
+                                    event = EVENT_HEAL_BUCKET_RESULT,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_TASK,
+                                    task_id = %self.id,
+                                    bucket,
+                                    object = %object,
+                                    result = "object_failed",
+                                    error = %err,
+                                    "Heal bucket object repair failed"
+                                );
+                            }
                         }
                         Err(err) => {
-                            failed += 1;
-                            warn!("Failed to heal object {}/{}: {}", bucket, object, err);
+                            if Self::should_skip_data_usage_cache_heal_error(bucket, &object, &err) {
+                                warn!(
+                                    target: "rustfs::heal::task",
+                                    event = EVENT_HEAL_BUCKET_RESULT,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_TASK,
+                                    task_id = %self.id,
+                                    bucket,
+                                    object = %object,
+                                    result = "transient_skip",
+                                    error = %err,
+                                    "Heal bucket object repair skipped due to transient error"
+                                );
+                            } else {
+                                failed += 1;
+                                warn!(
+                                    target: "rustfs::heal::task",
+                                    event = EVENT_HEAL_BUCKET_RESULT,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_TASK,
+                                    task_id = %self.id,
+                                    bucket,
+                                    object = %object,
+                                    result = "object_failed",
+                                    error = %err,
+                                    "Heal bucket object repair failed"
+                                );
+                            }
                         }
                     },
                     Err(err) => {
                         failed += 1;
-                        warn!("Failed to check object {}/{} before heal: {}", bucket, object, err);
+                        warn!(
+                            target: "rustfs::heal::task",
+                            event = EVENT_HEAL_BUCKET_RESULT,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_TASK,
+                            task_id = %self.id,
+                            bucket,
+                            object = %object,
+                            result = "precheck_failed",
+                            error = %err,
+                            "Heal bucket object precheck failed"
+                        );
                     }
                 }
 
@@ -784,7 +1249,16 @@ impl HealTask {
 
             continuation_token = next_token;
             if continuation_token.is_none() {
-                warn!("List is truncated but no continuation token was returned for bucket {}", bucket);
+                warn!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_BUCKET_RESULT,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
+                    bucket,
+                    result = "missing_continuation_token",
+                    "Heal bucket listing truncated without continuation token"
+                );
                 break;
             }
         }
@@ -795,12 +1269,35 @@ impl HealTask {
             });
         }
 
-        info!("Recursive bucket heal completed for {}: {} scanned, {} healed", bucket, scanned, healed);
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_BUCKET_RESULT,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            bucket,
+            scanned,
+            healed,
+            failed,
+            bytes_processed = bytes,
+            result = "recursive_ok",
+            "Heal bucket recursive pass completed"
+        );
         Ok(())
     }
 
     async fn heal_metadata(&self, bucket: &str, object: &str) -> Result<()> {
-        info!("Healing metadata: {}/{}", bucket, object);
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_METADATA_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            bucket,
+            object,
+            stage = "start",
+            "Heal metadata started"
+        );
 
         // update progress
         {
@@ -810,7 +1307,17 @@ impl HealTask {
         }
 
         // Step 1: Check if object exists
-        info!("Step 1: Checking object existence");
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_METADATA_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            bucket,
+            object,
+            stage = "check_existence",
+            "Heal metadata stage entered"
+        );
         self.check_control_flags().await?;
         let object_exists = match self.await_with_control(self.storage.object_exists(bucket, object)).await {
             Ok(exists) => exists,
@@ -820,7 +1327,17 @@ impl HealTask {
             Err(err) => return Err(err),
         };
         if !object_exists {
-            warn!("Object does not exist: {}/{}", bucket, object);
+            warn!(
+                target: "rustfs::heal::task",
+                event = EVENT_HEAL_METADATA_RESULT,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_TASK,
+                task_id = %self.id,
+                bucket,
+                object,
+                result = "missing",
+                "Heal metadata failed because object is missing"
+            );
             return Err(Error::TaskExecutionFailed {
                 message: format!("Object not found: {bucket}/{object}"),
             });
@@ -832,7 +1349,17 @@ impl HealTask {
         }
 
         // Step 2: Perform metadata heal using ecstore
-        info!("Step 2: Performing metadata heal using ecstore");
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_METADATA_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            bucket,
+            object,
+            stage = "heal_with_ecstore",
+            "Heal metadata stage entered"
+        );
         let heal_opts = HealOpts {
             recursive: false,
             dry_run: self.options.dry_run,
@@ -852,7 +1379,18 @@ impl HealTask {
         match heal_result {
             Ok((result, error)) => {
                 if let Some(e) = error {
-                    error!("Metadata heal failed: {}/{} - {}", bucket, object, e);
+                    error!(
+                        target: "rustfs::heal::task",
+                        event = EVENT_HEAL_METADATA_RESULT,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_TASK,
+                        task_id = %self.id,
+                        bucket,
+                        object,
+                        result = "failed",
+                        error = %e,
+                        "Heal metadata failed"
+                    );
                     {
                         let mut progress = self.progress.write().await;
                         progress.update_progress(3, 3, 0, 0);
@@ -862,11 +1400,17 @@ impl HealTask {
                     });
                 }
 
-                info!(
-                    "Metadata heal completed successfully: {}/{} ({} drives)",
+                debug!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_METADATA_RESULT,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
                     bucket,
                     object,
-                    result.after.drives.len()
+                    drives_healed = result.after.drives.len(),
+                    result = "ok",
+                    "Heal metadata repaired"
                 );
 
                 {
@@ -879,7 +1423,18 @@ impl HealTask {
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
-                error!("Metadata heal failed: {}/{} - {}", bucket, object, e);
+                error!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_METADATA_RESULT,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
+                    bucket,
+                    object,
+                    result = "failed",
+                    error = %e,
+                    "Heal metadata failed"
+                );
                 {
                     let mut progress = self.progress.write().await;
                     progress.update_progress(3, 3, 0, 0);
@@ -892,7 +1447,16 @@ impl HealTask {
     }
 
     async fn heal_mrf(&self, meta_path: &str) -> Result<()> {
-        info!("Healing MRF: {}", meta_path);
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_MRF_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            meta_path,
+            stage = "start",
+            "Heal MRF started"
+        );
 
         // update progress
         {
@@ -913,7 +1477,18 @@ impl HealTask {
         let object = parts[1..].join("/");
 
         // Step 1: Perform MRF heal using ecstore
-        info!("Step 1: Performing MRF heal using ecstore");
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_MRF_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            meta_path,
+            bucket,
+            object = %object,
+            stage = "heal_with_ecstore",
+            "Heal MRF stage entered"
+        );
         let heal_opts = HealOpts {
             recursive: true,
             dry_run: self.options.dry_run,
@@ -933,7 +1508,19 @@ impl HealTask {
         match heal_result {
             Ok((result, error)) => {
                 if let Some(e) = error {
-                    error!("MRF heal failed: {} - {}", meta_path, e);
+                    error!(
+                        target: "rustfs::heal::task",
+                        event = EVENT_HEAL_MRF_RESULT,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_TASK,
+                        task_id = %self.id,
+                        meta_path,
+                        bucket,
+                        object = %object,
+                        result = "failed",
+                        error = %e,
+                        "Heal MRF failed"
+                    );
                     {
                         let mut progress = self.progress.write().await;
                         progress.update_progress(2, 2, 0, 0);
@@ -943,7 +1530,19 @@ impl HealTask {
                     });
                 }
 
-                info!("MRF heal completed successfully: {} ({} drives)", meta_path, result.after.drives.len());
+                debug!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_MRF_RESULT,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
+                    meta_path,
+                    bucket,
+                    object = %object,
+                    drives_healed = result.after.drives.len(),
+                    result = "ok",
+                    "Heal MRF repaired"
+                );
 
                 {
                     let mut progress = self.progress.write().await;
@@ -955,7 +1554,19 @@ impl HealTask {
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
-                error!("MRF heal failed: {} - {}", meta_path, e);
+                error!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_MRF_RESULT,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
+                    meta_path,
+                    bucket,
+                    object = %object,
+                    result = "failed",
+                    error = %e,
+                    "Heal MRF failed"
+                );
                 {
                     let mut progress = self.progress.write().await;
                     progress.update_progress(2, 2, 0, 0);
@@ -968,7 +1579,18 @@ impl HealTask {
     }
 
     async fn heal_ec_decode(&self, bucket: &str, object: &str, version_id: Option<&str>) -> Result<()> {
-        info!("Healing EC decode: {}/{}", bucket, object);
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_EC_DECODE_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            bucket,
+            object,
+            version_id = ?version_id,
+            stage = "start",
+            "Heal EC decode started"
+        );
 
         // update progress
         {
@@ -978,7 +1600,17 @@ impl HealTask {
         }
 
         // Step 1: Check if object exists
-        info!("Step 1: Checking object existence");
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_EC_DECODE_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            bucket,
+            object,
+            stage = "check_existence",
+            "Heal EC decode stage entered"
+        );
         self.check_control_flags().await?;
         let object_exists = match self.await_with_control(self.storage.object_exists(bucket, object)).await {
             Ok(exists) => exists,
@@ -988,7 +1620,17 @@ impl HealTask {
             Err(err) => return Err(err),
         };
         if !object_exists {
-            warn!("Object does not exist: {}/{}", bucket, object);
+            warn!(
+                target: "rustfs::heal::task",
+                event = EVENT_HEAL_EC_DECODE_RESULT,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_TASK,
+                task_id = %self.id,
+                bucket,
+                object,
+                result = "missing",
+                "Heal EC decode failed because object is missing"
+            );
             return Err(Error::TaskExecutionFailed {
                 message: format!("Object not found: {bucket}/{object}"),
             });
@@ -1000,7 +1642,17 @@ impl HealTask {
         }
 
         // Step 2: Perform EC decode heal using ecstore
-        info!("Step 2: Performing EC decode heal using ecstore");
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_EC_DECODE_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            bucket,
+            object,
+            stage = "heal_with_ecstore",
+            "Heal EC decode stage entered"
+        );
         let heal_opts = HealOpts {
             recursive: false,
             dry_run: self.options.dry_run,
@@ -1020,7 +1672,18 @@ impl HealTask {
         match heal_result {
             Ok((result, error)) => {
                 if let Some(e) = error {
-                    error!("EC decode heal failed: {}/{} - {}", bucket, object, e);
+                    error!(
+                        target: "rustfs::heal::task",
+                        event = EVENT_HEAL_EC_DECODE_RESULT,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_TASK,
+                        task_id = %self.id,
+                        bucket,
+                        object,
+                        result = "failed",
+                        error = %e,
+                        "Heal EC decode failed"
+                    );
                     {
                         let mut progress = self.progress.write().await;
                         progress.update_progress(3, 3, 0, 0);
@@ -1031,12 +1694,18 @@ impl HealTask {
                 }
 
                 let object_size = result.object_size as u64;
-                info!(
-                    "EC decode heal completed successfully: {}/{} ({} bytes, {} drives)",
+                debug!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_EC_DECODE_RESULT,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
                     bucket,
                     object,
                     object_size,
-                    result.after.drives.len()
+                    drives_healed = result.after.drives.len(),
+                    result = "ok",
+                    "Heal EC decode repaired"
                 );
 
                 {
@@ -1049,7 +1718,18 @@ impl HealTask {
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
-                error!("EC decode heal failed: {}/{} - {}", bucket, object, e);
+                error!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_EC_DECODE_RESULT,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
+                    bucket,
+                    object,
+                    result = "failed",
+                    error = %e,
+                    "Heal EC decode failed"
+                );
                 {
                     let mut progress = self.progress.write().await;
                     progress.update_progress(3, 3, 0, 0);
@@ -1062,7 +1742,17 @@ impl HealTask {
     }
 
     async fn heal_erasure_set(&self, buckets: Vec<String>, set_disk_id: String) -> Result<()> {
-        info!("Healing Erasure Set: {} ({} buckets)", set_disk_id, buckets.len());
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_ERASURE_SET_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            set_disk_id,
+            bucket_count = buckets.len(),
+            stage = "start",
+            "Heal erasure set started"
+        );
 
         // update progress
         {
@@ -1072,7 +1762,16 @@ impl HealTask {
         }
 
         let buckets = if buckets.is_empty() {
-            info!("No buckets specified, listing all buckets");
+            debug!(
+                target: "rustfs::heal::task",
+                event = EVENT_HEAL_ERASURE_SET_STAGE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_TASK,
+                task_id = %self.id,
+                set_disk_id,
+                stage = "list_buckets",
+                "Heal erasure set bucket list resolved"
+            );
             let bucket_infos = self.await_with_control(self.storage.list_buckets()).await?;
             bucket_infos.into_iter().map(|info| info.name).collect()
         } else {
@@ -1080,13 +1779,32 @@ impl HealTask {
         };
 
         // Step 1: Perform disk format heal using ecstore
-        info!("Step 1: Performing disk format heal using ecstore");
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_ERASURE_SET_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            set_disk_id,
+            stage = "heal_format",
+            "Heal erasure set stage entered"
+        );
         let format_result = self.await_with_control(self.storage.heal_format(self.options.dry_run)).await;
 
         match format_result {
             Ok((result, error)) => {
                 if let Some(e) = error {
-                    error!("Disk format heal failed: {} - {}", set_disk_id, e);
+                    error!(
+                        target: "rustfs::heal::task",
+                        event = EVENT_HEAL_ERASURE_SET_RESULT,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_TASK,
+                        task_id = %self.id,
+                        set_disk_id,
+                        result = "format_failed",
+                        error = %e,
+                        "Heal erasure set failed"
+                    );
                     {
                         let mut progress = self.progress.write().await;
                         progress.update_progress(4, 4, 0, 0);
@@ -1096,16 +1814,32 @@ impl HealTask {
                     });
                 }
 
-                info!(
-                    "Disk format heal completed successfully: {} ({} drives)",
+                debug!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_ERASURE_SET_RESULT,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
                     set_disk_id,
-                    result.after.drives.len()
+                    drives_healed = result.after.drives.len(),
+                    result = "format_ok",
+                    "Heal erasure set format repaired"
                 );
             }
             Err(Error::TaskCancelled) => return Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => return Err(Error::TaskTimeout),
             Err(e) => {
-                error!("Disk format heal failed: {} - {}", set_disk_id, e);
+                error!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_ERASURE_SET_RESULT,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
+                    set_disk_id,
+                    result = "format_failed",
+                    error = %e,
+                    "Heal erasure set failed"
+                );
                 {
                     let mut progress = self.progress.write().await;
                     progress.update_progress(4, 4, 0, 0);
@@ -1122,7 +1856,16 @@ impl HealTask {
         }
 
         // Step 2: Get disk for resume functionality
-        info!("Step 2: Getting disk for resume functionality");
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_ERASURE_SET_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            set_disk_id,
+            stage = "resolve_resume_disk",
+            "Heal erasure set stage entered"
+        );
         let disk = self
             .await_with_control(self.storage.get_disk_for_resume(&set_disk_id))
             .await?;
@@ -1161,13 +1904,33 @@ impl HealTask {
                     if matches!(err, Error::TaskCancelled | Error::TaskTimeout) {
                         return Err(err);
                     }
-                    info!("Bucket heal failed: {}", err.to_string());
+                    warn!(
+                        target: "rustfs::heal::task",
+                        event = EVENT_HEAL_ERASURE_SET_RESULT,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_TASK,
+                        task_id = %self.id,
+                        set_disk_id,
+                        bucket,
+                        result = "bucket_failed",
+                        error = %err,
+                        "Heal erasure set bucket prepass failed"
+                    );
                 }
             }
         }
 
         // Create erasure set healer with resume support
-        info!("Creating erasure set healer with resume support");
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_ERASURE_SET_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            set_disk_id,
+            stage = "build_resumable_healer",
+            "Heal erasure set stage entered"
+        );
         let heal_opts = HealOpts {
             recursive: self.options.recursive,
             dry_run: self.options.dry_run,
@@ -1188,7 +1951,16 @@ impl HealTask {
         }
 
         // Step 4: Execute erasure set heal with resume
-        info!("Step 4: Executing erasure set heal with resume");
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_ERASURE_SET_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            set_disk_id,
+            stage = "execute_resumable_heal",
+            "Heal erasure set stage entered"
+        );
         let result = erasure_healer.heal_erasure_set(&buckets, &set_disk_id).await;
 
         {
@@ -1198,13 +1970,33 @@ impl HealTask {
 
         match result {
             Ok(_) => {
-                info!("Erasure set heal completed successfully: {} ({} buckets)", set_disk_id, buckets.len());
+                debug!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_ERASURE_SET_RESULT,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
+                    set_disk_id,
+                    bucket_count = buckets.len(),
+                    result = "ok",
+                    "Heal erasure set repaired"
+                );
                 Ok(())
             }
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
-                error!("Erasure set heal failed: {} - {}", set_disk_id, e);
+                error!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_ERASURE_SET_RESULT,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
+                    set_disk_id,
+                    result = "failed",
+                    error = %e,
+                    "Heal erasure set failed"
+                );
                 Err(Error::TaskExecutionFailed {
                     message: format!("Failed to heal erasure set {set_disk_id}: {e}"),
                 })
@@ -1229,10 +2021,12 @@ mod tests {
     use super::*;
     use crate::heal::storage::DiskStatus;
     use rustfs_ecstore::{
-        disk::{DiskStore, endpoint::Endpoint},
-        store_api::{BucketInfo, ObjectInfo},
+        data_usage::DATA_USAGE_CACHE_NAME,
+        disk::{BUCKET_META_PREFIX, DiskStore, RUSTFS_META_BUCKET, endpoint::Endpoint},
+        store_api::ObjectInfo,
     };
     use rustfs_madmin::heal_commands::HealResultItem;
+    use rustfs_storage_api::BucketInfo;
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -1306,13 +2100,21 @@ mod tests {
 
         async fn heal_object(
             &self,
-            _bucket: &str,
+            bucket: &str,
             object: &str,
             _version_id: Option<&str>,
             opts: &HealOpts,
         ) -> Result<(HealResultItem, Option<Error>)> {
             self.healed_objects.lock().unwrap().push(object.to_string());
             self.object_heal_opts.lock().unwrap().push(*opts);
+            if bucket == RUSTFS_META_BUCKET && object == format!("{BUCKET_META_PREFIX}/{DATA_USAGE_CACHE_NAME}") {
+                return Ok((
+                    HealResultItem::default(),
+                    Some(Error::other(
+                        "Lock error: Lock acquisition timeout for resource '.rustfs.sys/buckets/.usage-cache.bin@latest' after 5s",
+                    )),
+                ));
+            }
             Ok((
                 HealResultItem {
                     object_size: 1,
@@ -1337,14 +2139,22 @@ mod tests {
 
         async fn list_objects_for_heal_page(
             &self,
-            _bucket: &str,
+            bucket: &str,
             _prefix: &str,
             continuation_token: Option<&str>,
         ) -> Result<(Vec<String>, Option<String>, bool)> {
             let mut listed = self.listed.lock().unwrap();
             if continuation_token.is_none() && !*listed {
                 *listed = true;
-                Ok((vec!["object-a".to_string(), "object-b".to_string()], None, false))
+                let objects = if bucket == RUSTFS_META_BUCKET {
+                    vec![
+                        format!("{BUCKET_META_PREFIX}/{DATA_USAGE_CACHE_NAME}"),
+                        format!("{BUCKET_META_PREFIX}/bucket-metadata.bin"),
+                    ]
+                } else {
+                    vec!["object-a".to_string(), "object-b".to_string()]
+                };
+                Ok((objects, None, false))
             } else {
                 Ok((Vec::new(), None, false))
             }
@@ -1421,5 +2231,56 @@ mod tests {
         assert!(object_opts.iter().all(|opts| opts.remove));
         assert!(object_opts.iter().all(|opts| opts.recreate));
         assert!(object_opts.iter().all(|opts| opts.scan_mode == HealScanMode::Deep));
+    }
+
+    #[tokio::test]
+    async fn test_data_usage_cache_lock_timeout_does_not_fail_object_heal() {
+        let storage = Arc::new(MockStorage::default());
+        let request = HealRequest::new(
+            HealType::Object {
+                bucket: RUSTFS_META_BUCKET.to_string(),
+                object: format!("{BUCKET_META_PREFIX}/{DATA_USAGE_CACHE_NAME}"),
+                version_id: None,
+            },
+            HealOptions {
+                recreate_missing: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage);
+
+        task.execute()
+            .await
+            .expect("data usage cache lock timeout should be skipped during heal");
+
+        assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
+    }
+
+    #[tokio::test]
+    async fn test_data_usage_cache_lock_timeout_does_not_fail_recursive_bucket_heal() {
+        let storage = Arc::new(MockStorage::default());
+        let request = HealRequest::new(
+            HealType::Bucket {
+                bucket: RUSTFS_META_BUCKET.to_string(),
+            },
+            HealOptions {
+                recursive: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage);
+
+        task.execute()
+            .await
+            .expect("recursive bucket heal should skip transient data usage cache lock timeouts");
+
+        assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
+        let progress = task.get_progress().await;
+        assert_eq!(progress.objects_scanned, 2);
+        assert_eq!(progress.objects_failed, 0);
     }
 }

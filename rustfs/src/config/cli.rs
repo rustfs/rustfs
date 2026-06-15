@@ -72,6 +72,14 @@ pub fn preprocess_args_for_legacy(args: Vec<String>) -> Vec<String> {
     if KNOWN_SUBCOMMANDS.contains(&first.as_str()) {
         return args;
     }
+    // Preserve the traditional `rustfs help` entry point without exposing
+    // Clap's generated `help` subcommand in the top-level command list.
+    if first == "help" {
+        let mut out = vec![args[0].clone()];
+        out.extend(args[2..].iter().cloned());
+        out.push("--help".to_string());
+        return out;
+    }
     // If first arg is --info, treat it as info subcommand
     if first == "--info" {
         let mut out = vec![args[0].clone(), "info".to_string()];
@@ -91,6 +99,7 @@ pub fn preprocess_args_for_legacy(args: Vec<String>) -> Vec<String> {
 /// Main CLI parser
 #[derive(Parser, Clone)]
 #[command(name = "rustfs", version = SHORT_VERSION, long_version = LONG_VERSION)]
+#[command(disable_help_subcommand = true)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -180,7 +189,13 @@ pub struct ServerOpts {
     )]
     pub address: String,
 
-    /// Domain name used for virtual-hosted-style requests.
+    /// Domain name(s) for virtual-hosted-style S3 requests (comma-separated).
+    ///
+    /// Required for clients that default to virtual-hosted-style addressing
+    /// (AWS SDK, Terraform/Pulumi, etc.), e.g. `RUSTFS_SERVER_DOMAINS=s3.example.com`
+    /// so that `bucket.s3.example.com` is routed to bucket `bucket`. When unset, only
+    /// path-style addressing is supported (configure clients with
+    /// `s3_use_path_style = true` / `force_path_style=true`).
     #[arg(
         long,
         env = "RUSTFS_SERVER_DOMAINS",
@@ -254,6 +269,10 @@ pub struct ServerOpts {
     #[arg(long, env = "RUSTFS_KMS_KEY_DIR")]
     pub kms_key_dir: Option<String>,
 
+    /// Master key for local KMS key-file encryption
+    #[arg(long, env = "RUSTFS_KMS_LOCAL_MASTER_KEY")]
+    pub kms_local_master_key: Option<String>,
+
     /// Vault address for vault backend
     #[arg(long, env = "RUSTFS_KMS_VAULT_ADDRESS")]
     pub kms_vault_address: Option<String>,
@@ -269,6 +288,10 @@ pub struct ServerOpts {
     /// Default KMS key ID for encryption
     #[arg(long, env = "RUSTFS_KMS_DEFAULT_KEY_ID")]
     pub kms_default_key_id: Option<String>,
+
+    /// Allow development-only insecure KMS defaults
+    #[arg(long, default_value_t = false, env = "RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS")]
+    pub kms_allow_insecure_dev_defaults: bool,
 
     /// Disable adaptive buffer sizing with workload profiles
     /// Set this flag to use legacy fixed-size buffer behavior from PR #869
@@ -316,11 +339,33 @@ pub fn default_server_opts() -> ServerOpts {
         kms_enable: false,
         kms_backend: "local".to_string(),
         kms_key_dir: None,
+        kms_local_master_key: None,
         kms_vault_address: None,
         kms_vault_token: None,
         kms_vault_mount_path: None,
         kms_default_key_id: None,
+        kms_allow_insecure_dev_defaults: false,
         buffer_profile_disable: false,
         buffer_profile: "GeneralPurpose".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, preprocess_args_for_legacy};
+    use clap::Parser;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn preprocess_help_command_displays_top_level_help() {
+        let args = preprocess_args_for_legacy(vec!["rustfs".to_string(), "help".to_string()]);
+
+        assert_eq!(args, vec!["rustfs".to_string(), "--help".to_string()]);
+
+        let err = match Cli::try_parse_from(args) {
+            Ok(_) => panic!("rustfs help should display help"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
     }
 }

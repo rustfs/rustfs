@@ -73,6 +73,10 @@ use rustfs_credentials::Credentials;
 use s3s::Body;
 use tracing::debug;
 
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SWIFT_STATICWEB: &str = "swift_staticweb";
+const EVENT_SWIFT_STATICWEB_STATE: &str = "swift_staticweb_state";
+
 /// Static website configuration for a container
 #[derive(Debug, Clone, Default)]
 pub struct StaticWebConfig {
@@ -376,14 +380,33 @@ pub async fn handle_static_web_get(
         return Err(SwiftError::InternalServerError("Static web not enabled for this container".to_string()));
     }
 
-    debug!("Static web request: container={}, path={}, config={:?}", container, path, config);
+    debug!(
+        event = EVENT_SWIFT_STATICWEB_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SWIFT_STATICWEB,
+        state = "requested",
+        container = %container,
+        path = %path,
+        listings_enabled = config.listings_enabled(),
+        index_document = config.index_document().unwrap_or_default(),
+        error_document = config.error_document().unwrap_or_default(),
+        "swift staticweb state changed"
+    );
 
     // Resolve path
     let (object_path, _is_index, is_listing) = resolve_path(path, &config);
 
     if is_listing {
         // Generate directory listing
-        debug!("Generating directory listing for path: {}", object_path);
+        debug!(
+            event = EVENT_SWIFT_STATICWEB_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_STATICWEB,
+            state = "listing_generated",
+            container = %container,
+            path = %object_path,
+            "swift staticweb state changed"
+        );
 
         // List objects with prefix
         let prefix = if object_path.is_empty() {
@@ -419,7 +442,15 @@ pub async fn handle_static_web_get(
     }
 
     // Try to serve the object
-    debug!("Attempting to serve object: {}", object_path);
+    debug!(
+        event = EVENT_SWIFT_STATICWEB_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SWIFT_STATICWEB,
+        state = "serving_object",
+        container = %container,
+        path = %object_path,
+        "swift staticweb state changed"
+    );
 
     match object::get_object(account, container, &object_path, credentials, None).await {
         Ok(reader) => {
@@ -446,7 +477,16 @@ pub async fn handle_static_web_get(
         Err(SwiftError::NotFound(_)) => {
             // Object not found - try to serve error document
             if let Some(error_doc) = config.error_document() {
-                debug!("Serving error document: {}", error_doc);
+                debug!(
+                    event = EVENT_SWIFT_STATICWEB_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SWIFT_STATICWEB,
+                    state = "serving_error_document",
+                    container = %container,
+                    path = %object_path,
+                    error_document = %error_doc,
+                    "swift staticweb state changed"
+                );
 
                 match object::get_object(account, container, error_doc, credentials, None).await {
                     Ok(reader) => {
@@ -470,7 +510,15 @@ pub async fn handle_static_web_get(
                     }
                     Err(_) => {
                         // Error document also not found - return standard 404
-                        debug!("Error document not found, returning standard 404");
+                        debug!(
+                            event = EVENT_SWIFT_STATICWEB_STATE,
+                            component = LOG_COMPONENT_PROTOCOLS,
+                            subsystem = LOG_SUBSYSTEM_SWIFT_STATICWEB,
+                            result = "error_document_missing",
+                            container = %container,
+                            error_document = %error_doc,
+                            "swift staticweb state changed"
+                        );
                     }
                 }
             }

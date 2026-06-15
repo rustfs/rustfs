@@ -39,6 +39,10 @@ use rustfs_utils::get_env_usize;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
+const LOG_COMPONENT_OBS: &str = "obs";
+const LOG_SUBSYSTEM_DIAL9: &str = "dial9";
+const EVENT_DIAL9_STATE: &str = "dial9_state";
+
 /// Configuration for dial9 Tokio telemetry.
 #[derive(Debug, Clone)]
 pub struct Dial9Config {
@@ -131,25 +135,51 @@ impl Dial9SessionGuard {
     /// Returns `Ok(None)` if dial9 is disabled.
     pub async fn new(config: Dial9Config) -> Result<Option<Self>, TelemetryError> {
         if !config.enabled {
-            info!("Dial9 telemetry disabled");
+            info!(
+                event = EVENT_DIAL9_STATE,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_DIAL9,
+                state = "disabled",
+                "dial9 state changed"
+            );
             return Ok(None);
         }
 
         info!(
+            event = EVENT_DIAL9_STATE,
+            component = LOG_COMPONENT_OBS,
+            subsystem = LOG_SUBSYSTEM_DIAL9,
+            state = "validating",
             output_dir = %config.output_dir,
             file_prefix = %config.file_prefix,
             sampling_rate = config.sampling_rate,
-            "Validating dial9 telemetry configuration"
+            "dial9 state changed"
         );
 
         // Only create directory; writer will be created in build_traced_runtime
         if let Err(e) = tokio::fs::create_dir_all(&config.output_dir).await {
-            warn!("Failed to create dial9 output directory '{}': {}", config.output_dir, e);
-            warn!("Continuing without dial9 telemetry");
+            warn!(
+                event = EVENT_DIAL9_STATE,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_DIAL9,
+                result = "output_dir_create_failed",
+                output_dir = %config.output_dir,
+                error = %e,
+                fallback = "disabled",
+                "dial9 state changed"
+            );
             return Ok(None);
         }
 
-        info!("Dial9 telemetry configuration validated successfully");
+        info!(
+            event = EVENT_DIAL9_STATE,
+            component = LOG_COMPONENT_OBS,
+            subsystem = LOG_SUBSYSTEM_DIAL9,
+            state = "validated",
+            output_dir = %config.output_dir,
+            file_prefix = %config.file_prefix,
+            "dial9 state changed"
+        );
 
         Ok(Some(Self { _guard: None, config }))
     }
@@ -168,7 +198,13 @@ impl Dial9SessionGuard {
     /// Flush any pending telemetry data.
     pub async fn shutdown(&self) {
         if let Some(_guard) = &self._guard {
-            info!("Dial9 telemetry data will be flushed on drop");
+            info!(
+                event = EVENT_DIAL9_STATE,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_DIAL9,
+                state = "shutdown_requested",
+                "dial9 state"
+            );
             // TelemetryGuard handles flushing automatically when dropped
         }
     }
@@ -178,7 +214,13 @@ impl Drop for Dial9SessionGuard {
     fn drop(&mut self) {
         if let Some(_guard) = &self._guard {
             // TelemetryGuard flushes automatically when dropped
-            info!("Dial9 telemetry guard dropped, data flushed");
+            info!(
+                event = EVENT_DIAL9_STATE,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_DIAL9,
+                state = "flushed",
+                "dial9 state"
+            );
         }
     }
 }

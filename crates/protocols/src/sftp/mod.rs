@@ -31,8 +31,11 @@
 //!   or more S3 calls on the supplied storage backend.
 //! - lifecycle: per-session activity record, the registry the accept loop
 //!   walks, and the kernel TCP-state probe used by the watchdog.
-//! - wedge_watchdog: per-session liveness watchdog that observes both the
-//!   SFTP-handler activity stamp and the TCP socket state.
+//! - wedge_watchdog and fallback_watchdog: the per-session liveness
+//!   watchdog. On target_os = "linux" wedge_watchdog observes both the
+//!   SFTP-handler activity stamp and the TCP socket state. On other
+//!   targets fallback_watchdog provides a silence-only backstop without
+//!   the TCP-state probe.
 //! - read_cache: per-handle in-memory read-ahead cache with a process-wide
 //!   memory ceiling.
 //!
@@ -49,14 +52,13 @@
 //! and read throughput:
 //!
 //! - Session-liveness watchdog. Every accepted connection runs under a
-//!   per-session watchdog that observes the SFTP-handler activity stamp
-//!   and the kernel TCP state for the connection. Sessions that fall
-//!   silent at the SFTP layer while the kernel reports CLOSE_WAIT are
-//!   canceled on a bounded schedule. The watchdog backstops resource
-//!   accumulation regardless of which layer stalled. On Linux the
-//!   detection latency is on the order of 45 seconds; on non-Linux
-//!   targets the watchdog falls back to an inactivity ceiling on the
-//!   order of 30 minutes.
+//!   per-session watchdog. On Linux the watchdog observes both the
+//!   SFTP-handler activity stamp and the kernel TCP state for the
+//!   connection. Sessions silent at the SFTP layer while the kernel
+//!   reports CLOSE_WAIT are cancelled in approximately 45 to 60
+//!   seconds. On non-Linux targets the watchdog observes only the
+//!   activity stamp and cancels at an inactivity ceiling on the order
+//!   of 30 minutes.
 //!
 //! - Per-handle read cache. Each open File handle holds an in-memory
 //!   buffer. On a cache miss the driver fetches a configurable byte
@@ -79,8 +81,10 @@
 //! handler dispatch type. SftpError is the error type returned by SFTP
 //! operations.
 //!
-//! Platform support. Host-key permission enforcement uses Unix mode bits.
-//! On non-Unix targets SftpConfig::load_host_keys returns
+//! Platform support. On Unix the host-key loader enforces owner-only mode
+//! bits. On Windows it loads host keys without a mode check and trusts the
+//! operator-managed NTFS ACLs on the key directory. On targets that are
+//! neither Unix nor Windows, SftpConfig::load_host_keys returns
 //! SftpInitError::UnsupportedPlatform and the SFTP listener does not start.
 //!
 //! Peer-initiated signal requests on an open SFTP channel are intercepted
@@ -95,11 +99,14 @@ mod attrs;
 mod dir;
 mod driver;
 mod errors;
+#[cfg(not(target_os = "linux"))]
+mod fallback_watchdog;
 mod lifecycle;
 mod paths;
 mod read;
 mod read_cache;
 mod state;
+#[cfg(target_os = "linux")]
 mod wedge_watchdog;
 mod write;
 

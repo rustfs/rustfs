@@ -793,10 +793,10 @@ pub async fn load_data_usage_cache(store: &crate::set_disk::SetDisks, name: &str
 pub async fn save_data_usage_cache(cache: &DataUsageCache, name: &str) -> crate::error::Result<()> {
     use crate::config::com::save_config;
     use crate::disk::BUCKET_META_PREFIX;
-    use crate::new_object_layer_fn;
+    use crate::resolve_object_store_handle;
     use std::path::Path;
 
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(Error::other("errServerNotInitialized"));
     };
     let buf = cache.marshal_msg().map_err(Error::other)?;
