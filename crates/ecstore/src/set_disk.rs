@@ -55,7 +55,7 @@ use crate::{
         BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
         HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectsV2Info, ListOperations, MakeBucketOptions, MultipartInfo,
         MultipartOperations, MultipartUploadResult, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, PartInfo,
-        PutObjReader, StorageAPI,
+        PutObjReader,
     },
     store_init::load_format_erasure,
 };
@@ -1632,9 +1632,6 @@ impl SetDisks {
         self.get_disks_internal().await
     }
 }
-
-#[async_trait::async_trait]
-impl StorageAPI for SetDisks {}
 
 #[async_trait::async_trait]
 impl NamespaceLocking for SetDisks {
