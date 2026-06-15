@@ -67,6 +67,8 @@ const TABLE_MARKER_FILE: &str = "table.json";
 const CURRENT_POINTER_FILE: &str = "current.json";
 const LIFECYCLE_FILE: &str = "lifecycle.json";
 const METADATA_DIR: &str = "metadata";
+const DATA_DIR: &str = "data";
+const DELETE_DIR: &str = "delete";
 const TABLE_BUCKET_ENTRY_FILE: &str = "table-bucket.json";
 const NAMESPACE_ENTRY_FILE: &str = "namespace-entry.json";
 const TABLE_ENTRY_FILE: &str = "table-entry.json";
@@ -380,6 +382,14 @@ pub(crate) struct TableMetadataMaintenanceJob {
     #[serde(default)]
     pub deleted_metadata_file_count: usize,
     #[serde(default)]
+    pub planned_object_file_count: usize,
+    #[serde(default)]
+    pub cleanup_candidate_object_count: usize,
+    #[serde(default)]
+    pub deletable_object_count: usize,
+    #[serde(default)]
+    pub deleted_object_count: usize,
+    #[serde(default)]
     pub quarantined_object_count: usize,
 }
 
@@ -390,8 +400,14 @@ pub(crate) struct TableMetadataMaintenanceReport {
     pub retained_metadata_locations: Vec<String>,
     pub cleanup_candidate_locations: Vec<String>,
     pub deletable_metadata_locations: Vec<String>,
+    #[serde(default, rename = "cleanup-object-candidate-locations")]
+    pub cleanup_object_candidate_locations: Vec<String>,
+    #[serde(default, rename = "deletable-object-locations")]
+    pub deletable_object_locations: Vec<String>,
     #[serde(default)]
     pub object_reports: Vec<TableMetadataMaintenanceObjectReport>,
+    #[serde(default, rename = "object-cleanup-reports")]
+    pub object_cleanup_reports: Vec<TableMetadataMaintenanceObjectCleanupReport>,
     #[serde(default)]
     pub referenced_object_reports: Vec<TableMetadataMaintenanceReferencedObjectReport>,
     #[serde(default, rename = "reachability-graph")]
@@ -589,7 +605,11 @@ pub(crate) enum TableMetadataMaintenanceReason {
     SafetyWindowSatisfied,
     DeletedByMaintenance,
     ManifestList,
+    ManifestFile,
+    DataFile,
+    DeleteFile,
     UnsupportedManifestAvro,
+    UnreadableMetadata,
     QuarantineEnabled,
     RetryScheduled,
 }
@@ -607,6 +627,14 @@ pub(crate) enum TableMetadataMaintenanceObjectKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TableMetadataMaintenanceObjectReport {
     pub metadata_location: String,
+    pub state: TableMetadataMaintenanceObjectState,
+    pub reasons: Vec<TableMetadataMaintenanceReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TableMetadataMaintenanceObjectCleanupReport {
+    pub object_location: String,
+    pub object_kind: TableMetadataMaintenanceObjectKind,
     pub state: TableMetadataMaintenanceObjectState,
     pub reasons: Vec<TableMetadataMaintenanceReason>,
 }
@@ -1826,13 +1854,20 @@ where
                 cleanup_candidate_count: 0,
                 deletable_metadata_file_count: 0,
                 deleted_metadata_file_count: 0,
+                planned_object_file_count: 0,
+                cleanup_candidate_object_count: 0,
+                deletable_object_count: 0,
+                deleted_object_count: 0,
                 quarantined_object_count: 0,
             },
             current_metadata_location,
             retained_metadata_locations: Vec::new(),
             cleanup_candidate_locations: Vec::new(),
             deletable_metadata_locations: Vec::new(),
+            cleanup_object_candidate_locations: Vec::new(),
+            deletable_object_locations: Vec::new(),
             object_reports: Vec::new(),
+            object_cleanup_reports: Vec::new(),
             referenced_object_reports: Vec::new(),
             reachability_graph: TableMaintenanceReachabilityGraphReport::default(),
             snapshot_expiration: None,
@@ -2202,12 +2237,33 @@ where
                 );
             }
         }
+        let warehouse_object_prefix = table_warehouse_object_prefix(&entry).ok();
         let current_metadata_location = entry.metadata_location;
         let retained_metadata_locations = retained.into_iter().collect::<Vec<_>>();
         let object_reports = metadata_maintenance_object_reports(maintenance_reasons);
-        let referenced_object_reports = metadata_maintenance_referenced_object_reports(&current_metadata);
+        let referenced_object_reports = metadata_maintenance_referenced_object_reports(
+            &self.backend,
+            table_bucket,
+            &namespace,
+            &table,
+            warehouse_object_prefix.as_deref(),
+            &current_metadata,
+            &retained_metadata_locations,
+        )
+        .await?;
         let reachability_graph =
             metadata_maintenance_reachability_graph_report(planned_metadata_file_count, &referenced_object_reports);
+        let (planned_object_file_count, cleanup_object_candidate_locations, deletable_object_locations, object_cleanup_reports) =
+            metadata_maintenance_object_cleanup_reports(
+                &self.backend,
+                table_bucket,
+                &namespace,
+                &table,
+                warehouse_object_prefix.as_deref(),
+                &referenced_object_reports,
+                now,
+            )
+            .await?;
 
         Ok(TableMetadataMaintenanceReport {
             job: TableMetadataMaintenanceJob {
@@ -2241,13 +2297,20 @@ where
                 cleanup_candidate_count: cleanup_candidate_locations.len(),
                 deletable_metadata_file_count: deletable_metadata_locations.len(),
                 deleted_metadata_file_count: 0,
+                planned_object_file_count,
+                cleanup_candidate_object_count: cleanup_object_candidate_locations.len(),
+                deletable_object_count: deletable_object_locations.len(),
+                deleted_object_count: 0,
                 quarantined_object_count: 0,
             },
             current_metadata_location,
             retained_metadata_locations,
             cleanup_candidate_locations,
             deletable_metadata_locations,
+            cleanup_object_candidate_locations,
+            deletable_object_locations,
             object_reports,
+            object_cleanup_reports,
             referenced_object_reports,
             reachability_graph,
             snapshot_expiration: None,
@@ -2403,6 +2466,7 @@ where
                 "current metadata location changed before maintenance delete".to_string(),
             ));
         }
+        let warehouse_object_prefix = table_warehouse_object_prefix(&entry).ok();
 
         let Some(current_metadata_object) = self.backend.read_object(table_bucket, &entry.metadata_location).await? else {
             return Err(TableCatalogStoreError::NotFound(format!(
@@ -2467,6 +2531,66 @@ where
         for metadata_location in &cleanup_candidate_locations {
             self.backend.delete_object(table_bucket, metadata_location).await?;
         }
+
+        let referenced_object_reports = metadata_maintenance_referenced_object_reports(
+            &self.backend,
+            table_bucket,
+            &namespace,
+            &table,
+            warehouse_object_prefix.as_deref(),
+            &current_metadata,
+            &report.retained_metadata_locations,
+        )
+        .await?;
+        let referenced_object_locations = if referenced_object_reports
+            .iter()
+            .any(|report| report.state == TableMetadataMaintenanceObjectState::ManualReviewRequired)
+        {
+            BTreeSet::new()
+        } else {
+            referenced_object_reports
+                .iter()
+                .filter_map(|report| table_catalog_object_key_from_location(table_bucket, &report.object_location))
+                .collect::<BTreeSet<_>>()
+        };
+        let planned_deletable_object_locations = report.deletable_object_locations.iter().cloned().collect::<BTreeSet<_>>();
+        let mut cleanup_object_candidate_locations = BTreeSet::new();
+        if !referenced_object_reports
+            .iter()
+            .any(|report| report.state == TableMetadataMaintenanceObjectState::ManualReviewRequired)
+        {
+            for object_location in &report.cleanup_object_candidate_locations {
+                if table_maintenance_object_kind(&namespace, &table, warehouse_object_prefix.as_deref(), object_location)
+                    .is_none()
+                {
+                    return Err(TableCatalogStoreError::Invalid(format!(
+                        "cleanup object candidate {object_location} must be inside table metadata, data, or delete directories"
+                    )));
+                }
+                if referenced_object_locations.contains(object_location.as_str()) {
+                    return Err(TableCatalogStoreError::Conflict(format!(
+                        "cleanup object candidate {object_location} is retained by current metadata"
+                    )));
+                }
+                let Some(candidate_object) = self.backend.read_object(table_bucket, object_location).await? else {
+                    continue;
+                };
+                if !planned_deletable_object_locations.contains(object_location.as_str()) {
+                    continue;
+                }
+                if !metadata_candidate_is_past_safety_window(candidate_object.mod_time, now) {
+                    continue;
+                }
+                cleanup_object_candidate_locations.insert(object_location.clone());
+            }
+        }
+
+        let cleanup_object_candidate_locations = cleanup_object_candidate_locations.into_iter().collect::<Vec<_>>();
+        let deleted_object_locations = cleanup_object_candidate_locations.iter().cloned().collect::<BTreeSet<_>>();
+        for object_location in &cleanup_object_candidate_locations {
+            self.backend.delete_object(table_bucket, object_location).await?;
+        }
+
         let retained_metadata_locations = protected.into_iter().collect::<Vec<_>>();
         let mut job = report.job;
         job.operation = TableMetadataMaintenanceOperation::Delete;
@@ -2476,9 +2600,13 @@ where
         job.cleanup_candidate_count = cleanup_candidate_count;
         job.deletable_metadata_file_count = planned_deletable_locations.len();
         job.deleted_metadata_file_count = cleanup_candidate_locations.len();
+        job.cleanup_candidate_object_count = report.cleanup_object_candidate_locations.len();
+        job.deletable_object_count = planned_deletable_object_locations.len();
+        job.deleted_object_count = cleanup_object_candidate_locations.len();
         let mut object_reports = report.object_reports;
         mark_deleted_metadata_object_reports(&mut object_reports, &deleted_locations);
-        let referenced_object_reports = report.referenced_object_reports;
+        let mut object_cleanup_reports = report.object_cleanup_reports;
+        mark_deleted_object_cleanup_reports(&mut object_cleanup_reports, &deleted_object_locations);
 
         Ok(TableMetadataMaintenanceReport {
             job,
@@ -2486,7 +2614,10 @@ where
             retained_metadata_locations,
             cleanup_candidate_locations: cleanup_candidate_locations.clone(),
             deletable_metadata_locations: cleanup_candidate_locations,
+            cleanup_object_candidate_locations: cleanup_object_candidate_locations.clone(),
+            deletable_object_locations: cleanup_object_candidate_locations,
             object_reports,
+            object_cleanup_reports,
             referenced_object_reports,
             reachability_graph: report.reachability_graph,
             snapshot_expiration: report.snapshot_expiration,
@@ -3140,31 +3271,524 @@ fn metadata_maintenance_object_reports(
         .collect()
 }
 
-fn metadata_maintenance_referenced_object_reports(
+#[derive(Debug, Clone)]
+struct TableMetadataMaintenanceReferencedObjectAccumulator {
+    object_kind: TableMetadataMaintenanceObjectKind,
+    state: TableMetadataMaintenanceObjectState,
+    reasons: BTreeSet<TableMetadataMaintenanceReason>,
+}
+
+fn insert_referenced_object_report(
+    reports: &mut BTreeMap<String, TableMetadataMaintenanceReferencedObjectAccumulator>,
+    object_location: String,
+    object_kind: TableMetadataMaintenanceObjectKind,
+    state: TableMetadataMaintenanceObjectState,
+    reason: TableMetadataMaintenanceReason,
+) {
+    let report = reports
+        .entry(object_location)
+        .or_insert_with(|| TableMetadataMaintenanceReferencedObjectAccumulator {
+            object_kind,
+            state: TableMetadataMaintenanceObjectState::Retained,
+            reasons: BTreeSet::new(),
+        });
+    if state == TableMetadataMaintenanceObjectState::ManualReviewRequired {
+        report.state = TableMetadataMaintenanceObjectState::ManualReviewRequired;
+    }
+    report.reasons.insert(reason);
+}
+
+async fn metadata_maintenance_referenced_object_reports<B>(
+    backend: &B,
+    table_bucket: &str,
+    namespace: &Namespace,
+    table: &IdentifierSegment,
+    warehouse_object_prefix: Option<&str>,
     current_metadata: &serde_json::Value,
-) -> Vec<TableMetadataMaintenanceReferencedObjectReport> {
-    let mut reasons_by_location = BTreeMap::<String, BTreeSet<TableMetadataMaintenanceReason>>::new();
-    if let Some(snapshots) = current_metadata.get("snapshots").and_then(serde_json::Value::as_array) {
-        for snapshot in snapshots {
-            let Some(manifest_list) = snapshot.get("manifest-list").and_then(serde_json::Value::as_str) else {
+    retained_metadata_locations: &[String],
+) -> TableCatalogStoreResult<Vec<TableMetadataMaintenanceReferencedObjectReport>>
+where
+    B: TableCatalogObjectBackend,
+{
+    let mut reports = BTreeMap::<String, TableMetadataMaintenanceReferencedObjectAccumulator>::new();
+    metadata_maintenance_referenced_object_reports_for_metadata(
+        backend,
+        table_bucket,
+        namespace,
+        table,
+        warehouse_object_prefix,
+        current_metadata,
+        &mut reports,
+    )
+    .await?;
+
+    for metadata_location in retained_metadata_locations {
+        let Some(metadata_object) = backend.read_object(table_bucket, metadata_location).await? else {
+            insert_referenced_object_report(
+                &mut reports,
+                metadata_location.clone(),
+                TableMetadataMaintenanceObjectKind::MetadataFile,
+                TableMetadataMaintenanceObjectState::ManualReviewRequired,
+                TableMetadataMaintenanceReason::UnreadableMetadata,
+            );
+            continue;
+        };
+        let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&metadata_object.data) else {
+            insert_referenced_object_report(
+                &mut reports,
+                metadata_location.clone(),
+                TableMetadataMaintenanceObjectKind::MetadataFile,
+                TableMetadataMaintenanceObjectState::ManualReviewRequired,
+                TableMetadataMaintenanceReason::UnreadableMetadata,
+            );
+            continue;
+        };
+        if !metadata.is_object() {
+            insert_referenced_object_report(
+                &mut reports,
+                metadata_location.clone(),
+                TableMetadataMaintenanceObjectKind::MetadataFile,
+                TableMetadataMaintenanceObjectState::ManualReviewRequired,
+                TableMetadataMaintenanceReason::UnreadableMetadata,
+            );
+            continue;
+        }
+        metadata_maintenance_referenced_object_reports_for_metadata(
+            backend,
+            table_bucket,
+            namespace,
+            table,
+            warehouse_object_prefix,
+            &metadata,
+            &mut reports,
+        )
+        .await?;
+    }
+
+    Ok(reports
+        .into_iter()
+        .map(|(object_location, report)| TableMetadataMaintenanceReferencedObjectReport {
+            object_location,
+            object_kind: report.object_kind,
+            state: report.state,
+            reasons: report.reasons.into_iter().collect(),
+        })
+        .collect())
+}
+
+async fn metadata_maintenance_referenced_object_reports_for_metadata<B>(
+    backend: &B,
+    table_bucket: &str,
+    namespace: &Namespace,
+    table: &IdentifierSegment,
+    warehouse_object_prefix: Option<&str>,
+    metadata: &serde_json::Value,
+    reports: &mut BTreeMap<String, TableMetadataMaintenanceReferencedObjectAccumulator>,
+) -> TableCatalogStoreResult<()>
+where
+    B: TableCatalogObjectBackend,
+{
+    let Some(snapshots) = metadata.get("snapshots").and_then(serde_json::Value::as_array) else {
+        return Ok(());
+    };
+
+    for snapshot in snapshots {
+        if let Some(manifest_list_location) = snapshot.get("manifest-list").and_then(serde_json::Value::as_str) {
+            metadata_maintenance_referenced_manifest_list(
+                backend,
+                table_bucket,
+                namespace,
+                table,
+                warehouse_object_prefix,
+                manifest_list_location,
+                reports,
+            )
+            .await?;
+            continue;
+        }
+
+        let Some(manifests) = snapshot.get("manifests").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for manifest in manifests {
+            let Some(manifest_location) = manifest.as_str() else {
+                insert_referenced_object_report(
+                    reports,
+                    "snapshots[].manifests".to_string(),
+                    TableMetadataMaintenanceObjectKind::ManifestFile,
+                    TableMetadataMaintenanceObjectState::ManualReviewRequired,
+                    TableMetadataMaintenanceReason::UnsupportedManifestAvro,
+                );
                 continue;
             };
-            reasons_by_location.entry(manifest_list.to_string()).or_default().extend([
-                TableMetadataMaintenanceReason::ManifestList,
-                TableMetadataMaintenanceReason::UnsupportedManifestAvro,
-            ]);
+            metadata_maintenance_referenced_manifest_file(
+                backend,
+                table_bucket,
+                namespace,
+                table,
+                warehouse_object_prefix,
+                manifest_location,
+                reports,
+            )
+            .await?;
         }
     }
 
-    reasons_by_location
-        .into_iter()
-        .map(|(object_location, reasons)| TableMetadataMaintenanceReferencedObjectReport {
-            object_location,
-            object_kind: TableMetadataMaintenanceObjectKind::ManifestList,
-            state: TableMetadataMaintenanceObjectState::ManualReviewRequired,
-            reasons: reasons.into_iter().collect(),
-        })
-        .collect()
+    Ok(())
+}
+
+async fn metadata_maintenance_referenced_manifest_list<B>(
+    backend: &B,
+    table_bucket: &str,
+    namespace: &Namespace,
+    table: &IdentifierSegment,
+    warehouse_object_prefix: Option<&str>,
+    manifest_list_location: &str,
+    reports: &mut BTreeMap<String, TableMetadataMaintenanceReferencedObjectAccumulator>,
+) -> TableCatalogStoreResult<()>
+where
+    B: TableCatalogObjectBackend,
+{
+    let Some(manifest_list_key) = table_catalog_object_key_from_location(table_bucket, manifest_list_location) else {
+        insert_referenced_object_report(
+            reports,
+            manifest_list_location.to_string(),
+            TableMetadataMaintenanceObjectKind::ManifestList,
+            TableMetadataMaintenanceObjectState::ManualReviewRequired,
+            TableMetadataMaintenanceReason::UnsupportedManifestAvro,
+        );
+        return Ok(());
+    };
+    if table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &manifest_list_key)
+        != Some(TableMetadataMaintenanceObjectKind::ManifestList)
+    {
+        insert_referenced_object_report(
+            reports,
+            manifest_list_key,
+            TableMetadataMaintenanceObjectKind::ManifestList,
+            TableMetadataMaintenanceObjectState::ManualReviewRequired,
+            TableMetadataMaintenanceReason::UnsupportedManifestAvro,
+        );
+        return Ok(());
+    }
+    insert_referenced_object_report(
+        reports,
+        manifest_list_key.clone(),
+        TableMetadataMaintenanceObjectKind::ManifestList,
+        TableMetadataMaintenanceObjectState::Retained,
+        TableMetadataMaintenanceReason::ManifestList,
+    );
+
+    let Some(manifest_list_object) = backend.read_object(table_bucket, &manifest_list_key).await? else {
+        mark_referenced_object_manual_review(
+            reports,
+            &manifest_list_key,
+            TableMetadataMaintenanceReason::UnsupportedManifestAvro,
+        );
+        return Ok(());
+    };
+    let Ok(manifest_paths) = manifest_paths_from_manifest_list_avro(&manifest_list_object.data) else {
+        mark_referenced_object_manual_review(
+            reports,
+            &manifest_list_key,
+            TableMetadataMaintenanceReason::UnsupportedManifestAvro,
+        );
+        return Ok(());
+    };
+    for manifest_location in manifest_paths {
+        metadata_maintenance_referenced_manifest_file(
+            backend,
+            table_bucket,
+            namespace,
+            table,
+            warehouse_object_prefix,
+            &manifest_location,
+            reports,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn metadata_maintenance_referenced_manifest_file<B>(
+    backend: &B,
+    table_bucket: &str,
+    namespace: &Namespace,
+    table: &IdentifierSegment,
+    warehouse_object_prefix: Option<&str>,
+    manifest_location: &str,
+    reports: &mut BTreeMap<String, TableMetadataMaintenanceReferencedObjectAccumulator>,
+) -> TableCatalogStoreResult<()>
+where
+    B: TableCatalogObjectBackend,
+{
+    let Some(manifest_key) = table_catalog_object_key_from_location(table_bucket, manifest_location) else {
+        insert_referenced_object_report(
+            reports,
+            manifest_location.to_string(),
+            TableMetadataMaintenanceObjectKind::ManifestFile,
+            TableMetadataMaintenanceObjectState::ManualReviewRequired,
+            TableMetadataMaintenanceReason::UnsupportedManifestAvro,
+        );
+        return Ok(());
+    };
+    if table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &manifest_key)
+        != Some(TableMetadataMaintenanceObjectKind::ManifestFile)
+    {
+        insert_referenced_object_report(
+            reports,
+            manifest_key,
+            TableMetadataMaintenanceObjectKind::ManifestFile,
+            TableMetadataMaintenanceObjectState::ManualReviewRequired,
+            TableMetadataMaintenanceReason::UnsupportedManifestAvro,
+        );
+        return Ok(());
+    }
+    insert_referenced_object_report(
+        reports,
+        manifest_key.clone(),
+        TableMetadataMaintenanceObjectKind::ManifestFile,
+        TableMetadataMaintenanceObjectState::Retained,
+        TableMetadataMaintenanceReason::ManifestFile,
+    );
+
+    let Some(manifest_object) = backend.read_object(table_bucket, &manifest_key).await? else {
+        mark_referenced_object_manual_review(reports, &manifest_key, TableMetadataMaintenanceReason::UnsupportedManifestAvro);
+        return Ok(());
+    };
+    let Ok(file_references) = file_references_from_manifest_avro(&manifest_object.data) else {
+        mark_referenced_object_manual_review(reports, &manifest_key, TableMetadataMaintenanceReason::UnsupportedManifestAvro);
+        return Ok(());
+    };
+    for (file_location, object_kind) in file_references {
+        let Some(file_key) = table_catalog_object_key_from_location(table_bucket, &file_location) else {
+            insert_referenced_object_report(
+                reports,
+                file_location,
+                object_kind,
+                TableMetadataMaintenanceObjectState::ManualReviewRequired,
+                TableMetadataMaintenanceReason::UnsupportedManifestAvro,
+            );
+            continue;
+        };
+        if table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &file_key) != Some(object_kind.clone()) {
+            insert_referenced_object_report(
+                reports,
+                file_key,
+                object_kind,
+                TableMetadataMaintenanceObjectState::ManualReviewRequired,
+                TableMetadataMaintenanceReason::UnsupportedManifestAvro,
+            );
+            continue;
+        }
+        insert_referenced_object_report(
+            reports,
+            file_key,
+            object_kind.clone(),
+            TableMetadataMaintenanceObjectState::Retained,
+            table_metadata_maintenance_reason_for_object_kind(&object_kind),
+        );
+    }
+
+    Ok(())
+}
+
+fn mark_referenced_object_manual_review(
+    reports: &mut BTreeMap<String, TableMetadataMaintenanceReferencedObjectAccumulator>,
+    object_location: &str,
+    reason: TableMetadataMaintenanceReason,
+) {
+    if let Some(report) = reports.get_mut(object_location) {
+        report.state = TableMetadataMaintenanceObjectState::ManualReviewRequired;
+        report.reasons.insert(reason);
+    }
+}
+
+fn manifest_paths_from_manifest_list_avro(data: &[u8]) -> TableCatalogStoreResult<Vec<String>> {
+    let reader = apache_avro::Reader::new(data)
+        .map_err(|err| TableCatalogStoreError::Invalid(format!("failed to read manifest list Avro: {err}")))?;
+    let mut manifest_paths = Vec::new();
+    for value in reader {
+        let value =
+            value.map_err(|err| TableCatalogStoreError::Invalid(format!("failed to read manifest list record: {err}")))?;
+        let manifest_path = avro_record_field(&value, "manifest_path")
+            .and_then(avro_string_value)
+            .ok_or_else(|| TableCatalogStoreError::Invalid("manifest list entry missing manifest_path".to_string()))?;
+        manifest_paths.push(manifest_path.to_string());
+    }
+    Ok(manifest_paths)
+}
+
+fn file_references_from_manifest_avro(data: &[u8]) -> TableCatalogStoreResult<Vec<(String, TableMetadataMaintenanceObjectKind)>> {
+    let reader = apache_avro::Reader::new(data)
+        .map_err(|err| TableCatalogStoreError::Invalid(format!("failed to read manifest Avro: {err}")))?;
+    let mut files = Vec::new();
+    for value in reader {
+        let value = value.map_err(|err| TableCatalogStoreError::Invalid(format!("failed to read manifest record: {err}")))?;
+        let data_file = avro_record_field(&value, "data_file")
+            .ok_or_else(|| TableCatalogStoreError::Invalid("manifest entry missing data_file".to_string()))?;
+        let file_path = avro_record_field(data_file, "file_path")
+            .and_then(avro_string_value)
+            .ok_or_else(|| TableCatalogStoreError::Invalid("manifest data file missing file_path".to_string()))?;
+        let content = avro_record_field(data_file, "content")
+            .and_then(avro_i32_value)
+            .ok_or_else(|| TableCatalogStoreError::Invalid("manifest data file missing content".to_string()))?;
+        let object_kind = match content {
+            0 => TableMetadataMaintenanceObjectKind::DataFile,
+            1 | 2 => TableMetadataMaintenanceObjectKind::DeleteFile,
+            _ => continue,
+        };
+        files.push((file_path.to_string(), object_kind));
+    }
+    Ok(files)
+}
+
+fn avro_record_field<'a>(value: &'a apache_avro::types::Value, name: &str) -> Option<&'a apache_avro::types::Value> {
+    let value = avro_non_union_value(value);
+    let apache_avro::types::Value::Record(fields) = value else {
+        return None;
+    };
+    fields
+        .iter()
+        .find_map(|(field_name, field_value)| (field_name == name).then_some(avro_non_union_value(field_value)))
+}
+
+fn avro_non_union_value(value: &apache_avro::types::Value) -> &apache_avro::types::Value {
+    match value {
+        apache_avro::types::Value::Union(_, inner) => avro_non_union_value(inner),
+        value => value,
+    }
+}
+
+fn avro_string_value(value: &apache_avro::types::Value) -> Option<&str> {
+    match avro_non_union_value(value) {
+        apache_avro::types::Value::String(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn avro_i32_value(value: &apache_avro::types::Value) -> Option<i32> {
+    match avro_non_union_value(value) {
+        apache_avro::types::Value::Int(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn table_catalog_object_key_from_location(table_bucket: &str, location: &str) -> Option<String> {
+    let object = if let Some(location) = location.strip_prefix("s3://") {
+        let (bucket, object) = location.split_once('/')?;
+        if bucket != table_bucket {
+            return None;
+        }
+        object
+    } else {
+        location
+    };
+
+    if object.is_empty()
+        || object.starts_with('/')
+        || object.contains("..")
+        || object.contains('\\')
+        || object.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return None;
+    }
+
+    Some(object.to_string())
+}
+
+fn table_maintenance_object_kind(
+    namespace: &Namespace,
+    table: &IdentifierSegment,
+    warehouse_object_prefix: Option<&str>,
+    object_location: &str,
+) -> Option<TableMetadataMaintenanceObjectKind> {
+    let metadata_prefix = format!("{}/", default_table_metadata_dir_path(namespace, table));
+    if let Some(kind) = table_maintenance_metadata_object_kind(&metadata_prefix, object_location) {
+        return Some(kind);
+    }
+
+    let data_prefix = format!("{}/", default_table_data_dir_path(namespace, table));
+    if object_location
+        .strip_prefix(&data_prefix)
+        .is_some_and(is_valid_table_maintenance_nested_object)
+    {
+        return Some(TableMetadataMaintenanceObjectKind::DataFile);
+    }
+
+    let delete_prefix = format!("{}/", default_table_delete_dir_path(namespace, table));
+    if object_location
+        .strip_prefix(&delete_prefix)
+        .is_some_and(is_valid_table_maintenance_nested_object)
+    {
+        return Some(TableMetadataMaintenanceObjectKind::DeleteFile);
+    }
+
+    if let Some(warehouse_object_prefix) = warehouse_object_prefix {
+        let metadata_prefix = format!("{warehouse_object_prefix}{METADATA_DIR}/");
+        if let Some(kind) = table_maintenance_metadata_object_kind(&metadata_prefix, object_location) {
+            return Some(kind);
+        }
+
+        let data_prefix = format!("{warehouse_object_prefix}{DATA_DIR}/");
+        if object_location
+            .strip_prefix(&data_prefix)
+            .is_some_and(is_valid_table_maintenance_nested_object)
+        {
+            return Some(TableMetadataMaintenanceObjectKind::DataFile);
+        }
+
+        let delete_prefix = format!("{warehouse_object_prefix}{DELETE_DIR}/");
+        if object_location
+            .strip_prefix(&delete_prefix)
+            .is_some_and(is_valid_table_maintenance_nested_object)
+        {
+            return Some(TableMetadataMaintenanceObjectKind::DeleteFile);
+        }
+    }
+
+    None
+}
+
+fn table_maintenance_metadata_object_kind(
+    metadata_prefix: &str,
+    object_location: &str,
+) -> Option<TableMetadataMaintenanceObjectKind> {
+    let file_name = object_location.strip_prefix(metadata_prefix)?;
+    if file_name.is_empty()
+        || file_name.contains('/')
+        || file_name.contains('\\')
+        || file_name.contains("..")
+        || file_name.bytes().any(|byte| byte.is_ascii_control())
+        || !file_name.ends_with(".avro")
+    {
+        return None;
+    }
+    if file_name.starts_with("snap-") {
+        return Some(TableMetadataMaintenanceObjectKind::ManifestList);
+    }
+    Some(TableMetadataMaintenanceObjectKind::ManifestFile)
+}
+
+fn is_valid_table_maintenance_nested_object(suffix: &str) -> bool {
+    !suffix.is_empty()
+        && !suffix.starts_with('/')
+        && !suffix.contains("..")
+        && !suffix.contains('\\')
+        && !suffix.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn table_metadata_maintenance_reason_for_object_kind(
+    object_kind: &TableMetadataMaintenanceObjectKind,
+) -> TableMetadataMaintenanceReason {
+    match object_kind {
+        TableMetadataMaintenanceObjectKind::MetadataFile => TableMetadataMaintenanceReason::CurrentMetadata,
+        TableMetadataMaintenanceObjectKind::ManifestList => TableMetadataMaintenanceReason::ManifestList,
+        TableMetadataMaintenanceObjectKind::ManifestFile => TableMetadataMaintenanceReason::ManifestFile,
+        TableMetadataMaintenanceObjectKind::DataFile => TableMetadataMaintenanceReason::DataFile,
+        TableMetadataMaintenanceObjectKind::DeleteFile => TableMetadataMaintenanceReason::DeleteFile,
+    }
 }
 
 fn metadata_maintenance_reachability_graph_report(
@@ -3194,10 +3818,14 @@ fn metadata_maintenance_reachability_graph_report(
     let mut reasons = BTreeSet::from([TableMaintenanceReachabilityGraphReason::MetadataJsonParsed]);
     if manifest_list_count > 0 {
         reasons.insert(TableMaintenanceReachabilityGraphReason::ManifestListAvroReferenced);
+    }
+    if referenced_object_reports.iter().any(|report| {
+        report
+            .reasons
+            .contains(&TableMetadataMaintenanceReason::UnsupportedManifestAvro)
+    }) {
         reasons.insert(TableMaintenanceReachabilityGraphReason::ManifestAvroReaderUnavailable);
     }
-    reasons.insert(TableMaintenanceReachabilityGraphReason::DataFileCleanupDeferred);
-    reasons.insert(TableMaintenanceReachabilityGraphReason::DeleteFileCleanupDeferred);
 
     TableMaintenanceReachabilityGraphReport {
         status: if manual_review_count == 0 {
@@ -3215,12 +3843,160 @@ fn metadata_maintenance_reachability_graph_report(
     }
 }
 
+async fn metadata_maintenance_object_cleanup_reports<B>(
+    backend: &B,
+    table_bucket: &str,
+    namespace: &Namespace,
+    table: &IdentifierSegment,
+    warehouse_object_prefix: Option<&str>,
+    referenced_object_reports: &[TableMetadataMaintenanceReferencedObjectReport],
+    now: OffsetDateTime,
+) -> TableCatalogStoreResult<(usize, Vec<String>, Vec<String>, Vec<TableMetadataMaintenanceObjectCleanupReport>)>
+where
+    B: TableCatalogObjectBackend,
+{
+    let scanned_objects =
+        table_maintenance_cleanup_objects(backend, table_bucket, namespace, table, warehouse_object_prefix).await?;
+    if referenced_object_reports
+        .iter()
+        .any(|report| report.state == TableMetadataMaintenanceObjectState::ManualReviewRequired)
+    {
+        return Ok((scanned_objects.len(), Vec::new(), Vec::new(), Vec::new()));
+    }
+
+    let referenced_locations = referenced_object_reports
+        .iter()
+        .filter_map(|report| table_catalog_object_key_from_location(table_bucket, &report.object_location))
+        .collect::<BTreeSet<_>>();
+    let mut cleanup_candidate_locations = Vec::new();
+    let mut deletable_object_locations = Vec::new();
+    let mut cleanup_reports = Vec::new();
+
+    for (object_location, object_kind) in scanned_objects {
+        if referenced_locations.contains(&object_location) {
+            continue;
+        }
+        let mut reasons = BTreeSet::from([
+            table_metadata_maintenance_reason_for_object_kind(&object_kind),
+            TableMetadataMaintenanceReason::NoCurrentReachability,
+        ]);
+        let state = match backend.read_object(table_bucket, &object_location).await? {
+            Some(object) if metadata_candidate_is_past_safety_window(object.mod_time, now) => {
+                reasons.insert(TableMetadataMaintenanceReason::SafetyWindowSatisfied);
+                cleanup_candidate_locations.push(object_location.clone());
+                deletable_object_locations.push(object_location.clone());
+                TableMetadataMaintenanceObjectState::Deletable
+            }
+            _ => {
+                reasons.insert(TableMetadataMaintenanceReason::SafetyWindowPending);
+                cleanup_candidate_locations.push(object_location.clone());
+                TableMetadataMaintenanceObjectState::PendingSafetyWindow
+            }
+        };
+        cleanup_reports.push(TableMetadataMaintenanceObjectCleanupReport {
+            object_location,
+            object_kind,
+            state,
+            reasons: reasons.into_iter().collect(),
+        });
+    }
+
+    Ok((
+        referenced_locations.len() + cleanup_reports.len(),
+        cleanup_candidate_locations,
+        deletable_object_locations,
+        cleanup_reports,
+    ))
+}
+
+async fn table_maintenance_cleanup_objects<B>(
+    backend: &B,
+    table_bucket: &str,
+    namespace: &Namespace,
+    table: &IdentifierSegment,
+    warehouse_object_prefix: Option<&str>,
+) -> TableCatalogStoreResult<BTreeMap<String, TableMetadataMaintenanceObjectKind>>
+where
+    B: TableCatalogObjectBackend,
+{
+    let mut objects = BTreeMap::new();
+    let mut metadata_prefixes = vec![format!("{}/", default_table_metadata_dir_path(namespace, table))];
+    let mut data_prefixes = vec![format!("{}/", default_table_data_dir_path(namespace, table))];
+    let mut delete_prefixes = vec![format!("{}/", default_table_delete_dir_path(namespace, table))];
+    if let Some(warehouse_object_prefix) = warehouse_object_prefix {
+        metadata_prefixes.push(format!("{warehouse_object_prefix}{METADATA_DIR}/"));
+        data_prefixes.push(format!("{warehouse_object_prefix}{DATA_DIR}/"));
+        delete_prefixes.push(format!("{warehouse_object_prefix}{DELETE_DIR}/"));
+    }
+    metadata_prefixes.sort();
+    metadata_prefixes.dedup();
+    data_prefixes.sort();
+    data_prefixes.dedup();
+    delete_prefixes.sort();
+    delete_prefixes.dedup();
+
+    for metadata_prefix in metadata_prefixes {
+        for object in backend.list_objects(table_bucket, &metadata_prefix).await? {
+            if let Some(kind) = table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &object)
+                && matches!(
+                    kind,
+                    TableMetadataMaintenanceObjectKind::ManifestList | TableMetadataMaintenanceObjectKind::ManifestFile
+                )
+            {
+                objects.insert(object, kind);
+            }
+        }
+    }
+
+    for data_prefix in data_prefixes {
+        for object in backend.list_objects(table_bucket, &data_prefix).await? {
+            if table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &object)
+                == Some(TableMetadataMaintenanceObjectKind::DataFile)
+            {
+                objects.insert(object, TableMetadataMaintenanceObjectKind::DataFile);
+            }
+        }
+    }
+
+    for delete_prefix in delete_prefixes {
+        for object in backend.list_objects(table_bucket, &delete_prefix).await? {
+            if table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &object)
+                == Some(TableMetadataMaintenanceObjectKind::DeleteFile)
+            {
+                objects.insert(object, TableMetadataMaintenanceObjectKind::DeleteFile);
+            }
+        }
+    }
+
+    Ok(objects)
+}
+
 fn mark_deleted_metadata_object_reports(
     object_reports: &mut [TableMetadataMaintenanceObjectReport],
     deleted_locations: &BTreeSet<String>,
 ) {
     for object_report in object_reports {
         if !deleted_locations.contains(&object_report.metadata_location) {
+            continue;
+        }
+        object_report.state = TableMetadataMaintenanceObjectState::Deleted;
+        if !object_report
+            .reasons
+            .contains(&TableMetadataMaintenanceReason::DeletedByMaintenance)
+        {
+            object_report
+                .reasons
+                .push(TableMetadataMaintenanceReason::DeletedByMaintenance);
+        }
+    }
+}
+
+fn mark_deleted_object_cleanup_reports(
+    object_reports: &mut [TableMetadataMaintenanceObjectCleanupReport],
+    deleted_locations: &BTreeSet<String>,
+) {
+    for object_report in object_reports {
+        if !deleted_locations.contains(&object_report.object_location) {
             continue;
         }
         object_report.state = TableMetadataMaintenanceObjectState::Deleted;
@@ -4375,6 +5151,14 @@ pub(crate) fn default_table_metadata_dir_path(namespace: &Namespace, table: &Ide
     format!("{}{}/{}", default_table_root_prefix(namespace), table.as_str(), METADATA_DIR)
 }
 
+pub(crate) fn default_table_data_dir_path(namespace: &Namespace, table: &IdentifierSegment) -> String {
+    format!("{}{}/{}", default_table_root_prefix(namespace), table.as_str(), DATA_DIR)
+}
+
+pub(crate) fn default_table_delete_dir_path(namespace: &Namespace, table: &IdentifierSegment) -> String {
+    format!("{}{}/{}", default_table_root_prefix(namespace), table.as_str(), DELETE_DIR)
+}
+
 pub(crate) fn default_table_metadata_file_path(
     namespace: &Namespace,
     table: &IdentifierSegment,
@@ -4938,6 +5722,80 @@ mod tests {
             .iter()
             .find(|snapshot| snapshot.snapshot_id == Some(snapshot_id))
             .expect("compaction planning report should include the snapshot")
+    }
+
+    fn object_cleanup_report<'a>(
+        report: &'a TableMetadataMaintenanceReport,
+        object_location: &str,
+    ) -> &'a TableMetadataMaintenanceObjectCleanupReport {
+        report
+            .object_cleanup_reports
+            .iter()
+            .find(|object| object.object_location == object_location)
+            .expect("metadata maintenance object cleanup report should exist")
+    }
+
+    fn manifest_list_avro_bytes(manifest_paths: &[&str]) -> Vec<u8> {
+        let schema = apache_avro::Schema::parse_str(
+            r#"
+            {
+              "type": "record",
+              "name": "manifest_file",
+              "fields": [
+                {"name": "manifest_path", "type": "string"}
+              ]
+            }
+            "#,
+        )
+        .expect("manifest list avro schema should parse");
+        let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+        for manifest_path in manifest_paths {
+            writer
+                .append(apache_avro::types::Value::Record(vec![(
+                    "manifest_path".to_string(),
+                    apache_avro::types::Value::String((*manifest_path).to_string()),
+                )]))
+                .expect("manifest list record should append");
+        }
+        writer.into_inner().expect("manifest list avro bytes should flush")
+    }
+
+    fn manifest_avro_bytes(files: &[(&str, i32)]) -> Vec<u8> {
+        let schema = apache_avro::Schema::parse_str(
+            r#"
+            {
+              "type": "record",
+              "name": "manifest_entry",
+              "fields": [
+                {
+                  "name": "data_file",
+                  "type": {
+                    "type": "record",
+                    "name": "data_file",
+                    "fields": [
+                      {"name": "content", "type": "int"},
+                      {"name": "file_path", "type": "string"}
+                    ]
+                  }
+                }
+              ]
+            }
+            "#,
+        )
+        .expect("manifest avro schema should parse");
+        let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+        for (file_path, content) in files {
+            writer
+                .append(apache_avro::types::Value::Record(vec![(
+                    "data_file".to_string(),
+                    apache_avro::types::Value::Record(vec![
+                        ("content".to_string(), apache_avro::types::Value::Int(*content)),
+                        ("file_path".to_string(), apache_avro::types::Value::String((*file_path).to_string())),
+                    ]),
+                )]))
+                .expect("manifest record should append");
+        }
+        writer.into_inner().expect("manifest avro bytes should flush")
     }
 
     #[async_trait::async_trait]
@@ -6217,6 +7075,412 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn maintenance_reachability_expands_manifest_avro_references() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let metadata_dir = default_table_metadata_dir_path(&namespace, &table);
+        let table_root = format!("{}{}/", default_table_root_prefix(&namespace), table.as_str());
+        let manifest_list = format!("{metadata_dir}/snap-10.avro");
+        let manifest = format!("{metadata_dir}/manifest-10.avro");
+        let data_file = format!("{table_root}data/part-00001.parquet");
+        let delete_file = format!("{table_root}delete/pos-00001.parquet");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[&manifest]))
+            .await;
+        backend
+            .seed_object(bucket, &manifest, manifest_avro_bytes(&[(&data_file, 0), (&delete_file, 1)]))
+            .await;
+        backend.seed_object(bucket, &data_file, b"data".to_vec()).await;
+        backend.seed_object(bucket, &delete_file, b"delete".to_vec()).await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "metadata-log": [],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 10,
+                            "manifest-list": manifest_list
+                        }
+                    ],
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 10,
+                            "type": "branch"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let report = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .expect("metadata maintenance dry-run should succeed");
+
+        assert_eq!(report.reachability_graph.status, TableMaintenanceReachabilityGraphStatus::Complete);
+        assert_eq!(report.reachability_graph.manifest_list_count, 1);
+        assert_eq!(report.reachability_graph.manifest_file_count, 1);
+        assert_eq!(report.reachability_graph.data_file_count, 1);
+        assert_eq!(report.reachability_graph.delete_file_count, 1);
+        assert_eq!(report.reachability_graph.manual_review_count, 0);
+        assert!(
+            !report
+                .reachability_graph
+                .reasons
+                .contains(&TableMaintenanceReachabilityGraphReason::ManifestAvroReaderUnavailable)
+        );
+        for (location, kind) in [
+            (&manifest_list, TableMetadataMaintenanceObjectKind::ManifestList),
+            (&manifest, TableMetadataMaintenanceObjectKind::ManifestFile),
+            (&data_file, TableMetadataMaintenanceObjectKind::DataFile),
+            (&delete_file, TableMetadataMaintenanceObjectKind::DeleteFile),
+        ] {
+            let referenced = report
+                .referenced_object_reports
+                .iter()
+                .find(|object| object.object_location == *location)
+                .expect("referenced object should be reported");
+            assert_eq!(referenced.object_kind, kind);
+            assert_eq!(referenced.state, TableMetadataMaintenanceObjectState::Retained);
+        }
+        assert!(report.cleanup_object_candidate_locations.is_empty());
+        assert!(report.deletable_object_locations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn maintenance_reachability_treats_v1_snapshot_manifests_as_reachable() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let metadata_dir = default_table_metadata_dir_path(&namespace, &table);
+        let data_dir = default_table_data_dir_path(&namespace, &table);
+        let manifest = format!("{metadata_dir}/manifest-10.avro");
+        let data_file = format!("{data_dir}/part-00001.parquet");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &manifest, manifest_avro_bytes(&[(&data_file, 0)]))
+            .await;
+        backend.seed_object(bucket, &data_file, b"data".to_vec()).await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "metadata-log": [],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 10,
+                            "manifests": [manifest]
+                        }
+                    ],
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 10,
+                            "type": "branch"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let report = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .expect("metadata maintenance dry-run should succeed");
+
+        assert_eq!(report.reachability_graph.status, TableMaintenanceReachabilityGraphStatus::Complete);
+        assert_eq!(report.reachability_graph.manifest_file_count, 1);
+        assert_eq!(report.reachability_graph.data_file_count, 1);
+        assert!(report.cleanup_object_candidate_locations.is_empty());
+        assert!(report.deletable_object_locations.is_empty());
+        for location in [&manifest, &data_file] {
+            let referenced = report
+                .referenced_object_reports
+                .iter()
+                .find(|object| object.object_location == *location)
+                .expect("v1 manifest reference should be retained");
+            assert_eq!(referenced.state, TableMetadataMaintenanceObjectState::Retained);
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_reachability_uses_table_warehouse_object_paths() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let manifest_list = "tables/table-id/metadata/snap-10.avro".to_string();
+        let manifest = "tables/table-id/metadata/manifest-10.avro".to_string();
+        let data_file = "tables/table-id/data/part-00001.parquet".to_string();
+        let orphan_data = "tables/table-id/data/orphan.parquet".to_string();
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[&manifest]))
+            .await;
+        backend
+            .seed_object(bucket, &manifest, manifest_avro_bytes(&[(&data_file, 0)]))
+            .await;
+        backend.seed_object(bucket, &data_file, b"data".to_vec()).await;
+        backend.seed_object(bucket, &orphan_data, b"orphan".to_vec()).await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "metadata-log": [],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 10,
+                            "manifest-list": format!("s3://{bucket}/{manifest_list}")
+                        }
+                    ],
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 10,
+                            "type": "branch"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let report = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .expect("metadata maintenance dry-run should succeed");
+
+        assert_eq!(report.reachability_graph.status, TableMaintenanceReachabilityGraphStatus::Complete);
+        assert!(report.referenced_object_reports.iter().any(
+            |object| object.object_location == manifest_list && object.state == TableMetadataMaintenanceObjectState::Retained
+        ));
+        assert!(
+            report.referenced_object_reports.iter().any(
+                |object| object.object_location == data_file && object.state == TableMetadataMaintenanceObjectState::Retained
+            )
+        );
+        assert_eq!(report.cleanup_object_candidate_locations, vec![orphan_data.clone()]);
+        assert_eq!(report.deletable_object_locations, vec![orphan_data]);
+    }
+
+    #[tokio::test]
+    async fn maintenance_reachability_fails_closed_when_retained_metadata_is_unreadable() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let old = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let orphan_data = format!("{}/orphan.parquet", default_table_data_dir_path(&namespace, &table));
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend.seed_object(bucket, &old, b"not-json".to_vec()).await;
+        backend.seed_object(bucket, &orphan_data, b"orphan".to_vec()).await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "metadata-log": [
+                        {
+                            "timestamp-ms": 1,
+                            "metadata-file": old
+                        }
+                    ],
+                    "snapshots": []
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let report = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .expect("metadata maintenance dry-run should succeed");
+
+        assert_eq!(
+            report.reachability_graph.status,
+            TableMaintenanceReachabilityGraphStatus::ManualReviewRequired
+        );
+        assert!(report.cleanup_object_candidate_locations.is_empty());
+        assert!(report.deletable_object_locations.is_empty());
+        let retained_metadata = report
+            .referenced_object_reports
+            .iter()
+            .find(|object| object.object_location == old)
+            .expect("unreadable retained metadata should be reported");
+        assert_eq!(retained_metadata.object_kind, TableMetadataMaintenanceObjectKind::MetadataFile);
+        assert_eq!(retained_metadata.state, TableMetadataMaintenanceObjectState::ManualReviewRequired);
+        assert!(
+            retained_metadata
+                .reasons
+                .contains(&TableMetadataMaintenanceReason::UnreadableMetadata)
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_dry_run_reports_unreachable_manifest_data_and_delete_candidates() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let metadata_dir = default_table_metadata_dir_path(&namespace, &table);
+        let table_root = format!("{}{}/", default_table_root_prefix(&namespace), table.as_str());
+        let manifest_list = format!("{metadata_dir}/snap-10.avro");
+        let manifest = format!("{metadata_dir}/manifest-10.avro");
+        let data_file = format!("{table_root}data/part-00001.parquet");
+        let orphan_manifest = format!("{metadata_dir}/manifest-orphan.avro");
+        let orphan_data = format!("{table_root}data/orphan.parquet");
+        let orphan_delete = format!("{table_root}delete/orphan-delete.parquet");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[&manifest]))
+            .await;
+        backend
+            .seed_object(bucket, &manifest, manifest_avro_bytes(&[(&data_file, 0)]))
+            .await;
+        backend.seed_object(bucket, &data_file, b"data".to_vec()).await;
+        backend.seed_object(bucket, &orphan_manifest, manifest_avro_bytes(&[])).await;
+        backend.seed_object(bucket, &orphan_data, b"orphan-data".to_vec()).await;
+        backend.seed_object(bucket, &orphan_delete, b"orphan-delete".to_vec()).await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "metadata-log": [],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 10,
+                            "manifest-list": manifest_list
+                        }
+                    ],
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 10,
+                            "type": "branch"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let report = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .expect("metadata maintenance dry-run should succeed");
+        let candidates = report
+            .cleanup_object_candidate_locations
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let deletable = report.deletable_object_locations.iter().cloned().collect::<BTreeSet<_>>();
+        let expected = BTreeSet::from([orphan_data.clone(), orphan_delete.clone(), orphan_manifest.clone()]);
+
+        assert_eq!(candidates, expected);
+        assert_eq!(deletable, expected);
+        assert_eq!(
+            object_cleanup_report(&report, &orphan_manifest).object_kind,
+            TableMetadataMaintenanceObjectKind::ManifestFile
+        );
+        assert_eq!(
+            object_cleanup_report(&report, &orphan_data).object_kind,
+            TableMetadataMaintenanceObjectKind::DataFile
+        );
+        assert_eq!(
+            object_cleanup_report(&report, &orphan_delete).object_kind,
+            TableMetadataMaintenanceObjectKind::DeleteFile
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_delete_removes_only_planned_unreachable_table_objects() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let metadata_dir = default_table_metadata_dir_path(&namespace, &table);
+        let table_root = format!("{}{}/", default_table_root_prefix(&namespace), table.as_str());
+        let manifest_list = format!("{metadata_dir}/snap-10.avro");
+        let manifest = format!("{metadata_dir}/manifest-10.avro");
+        let data_file = format!("{table_root}data/part-00001.parquet");
+        let orphan_manifest = format!("{metadata_dir}/manifest-orphan.avro");
+        let orphan_data = format!("{table_root}data/orphan.parquet");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[&manifest]))
+            .await;
+        backend
+            .seed_object(bucket, &manifest, manifest_avro_bytes(&[(&data_file, 0)]))
+            .await;
+        backend.seed_object(bucket, &data_file, b"data".to_vec()).await;
+        backend.seed_object(bucket, &orphan_manifest, manifest_avro_bytes(&[])).await;
+        backend.seed_object(bucket, &orphan_data, b"orphan-data".to_vec()).await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "metadata-log": [],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 10,
+                            "manifest-list": manifest_list
+                        }
+                    ],
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 10,
+                            "type": "branch"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let deleted = store
+            .delete_table_metadata_maintenance_candidates(bucket, "sales", "orders", 0)
+            .await
+            .expect("maintenance delete should succeed");
+
+        assert_eq!(
+            deleted.deletable_object_locations.iter().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([orphan_data.clone(), orphan_manifest.clone()])
+        );
+        assert!(backend.object_exists(bucket, &manifest_list).await.unwrap());
+        assert!(backend.object_exists(bucket, &manifest).await.unwrap());
+        assert!(backend.object_exists(bucket, &data_file).await.unwrap());
+        assert!(!backend.object_exists(bucket, &orphan_manifest).await.unwrap());
+        assert!(!backend.object_exists(bucket, &orphan_data).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn maintenance_dry_run_keeps_metadata_log_references() {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend.clone());
@@ -6724,12 +7988,18 @@ mod tests {
                             "timestamp-ms": 1,
                             "metadata-file": retained
                         }
+                    ],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 1,
+                            "manifest-list": manifest
+                        }
                     ]
                 }))
                 .unwrap(),
             )
             .await;
-        backend.seed_object(bucket, &manifest, b"manifest".to_vec()).await;
+        backend.seed_object(bucket, &manifest, manifest_list_avro_bytes(&[])).await;
 
         let report = store
             .delete_table_metadata_maintenance_candidates(bucket, "sales", "orders", 0)
@@ -6737,6 +8007,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.cleanup_candidate_locations, vec![old.clone()]);
+        assert!(report.cleanup_object_candidate_locations.is_empty());
         assert!(!backend.object_exists(bucket, &old).await.unwrap());
         assert!(backend.object_exists(bucket, &retained).await.unwrap());
         assert!(backend.object_exists(bucket, &current).await.unwrap());

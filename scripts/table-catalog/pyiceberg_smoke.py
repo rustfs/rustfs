@@ -140,9 +140,9 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
     },
     {
         "capability": "manifest-data-reachability-cleanup",
-        "status": "fail-closed-reporting",
+        "status": "conservative-cleanup-supported",
         "roadmap_area": "reachability-cleanup",
-        "expected_behavior": "metadata maintenance reports expose reachability graph status and referenced manifest-list objects, but cleanup must not delete manifest, data, or delete files",
+        "expected_behavior": "metadata maintenance reads manifest-list and manifest Avro references, reports retained manifest/data/delete objects, and deletes only unreferenced table objects that pass the safety window",
     },
     {
         "capability": "snapshot-expiration",
@@ -154,7 +154,7 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
         "capability": "compaction-rewrite",
         "status": "planning-only",
         "roadmap_area": "snapshot-maintenance",
-        "expected_behavior": "compaction planning fails closed when manifest Avro reading is required; no data file rewrite or automatic compaction is claimed",
+        "expected_behavior": "compaction planning fails closed until data file rewrite support is implemented; no data file rewrite or automatic compaction is claimed",
     },
     {
         "capability": "iceberg-views",

@@ -5,12 +5,12 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-namespace-consumer-cleanup`
-- Baseline: `origin/main` at `307d788da1954ddaeac8a55d5040a7ce7d1a213f`
+- Branch: `overtrue/arch-storage-namespace-lock-large-cleanup`
+- Baseline: `origin/main` at `49c0f131205035d125271bb5b87db5b0f5bc2a6d`
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: no external behavior change expected.
-- Rust code changes: narrow the table catalog object backend and rebalance
-  metadata merge-save helper from full `StorageAPI` bounds to their actual
+- Rust code changes: narrow replication pool, resync, delete replication, and
+  object replication storage bounds away from full `StorageAPI` to their actual
   object I/O, object operation, list, and namespace-lock capabilities.
 - CI/script changes: none.
 - Docs changes: record the current `API-012` consumer cleanup slice and its
@@ -459,9 +459,14 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     namespace locking directly on ECStore storage types, and remove the
     temporary namespace-lock compatibility method from the full storage trait
     and cleanup register entry.
-  - Current cleanup slice: narrow remaining table catalog backend and rebalance
-    metadata helper consumers away from full `StorageAPI` where they only need
-    object I/O, object operations, list operations, and namespace locking.
+  - Completed cleanup slice: `rustfs/rustfs#3477` narrowed remaining table
+    catalog backend and rebalance metadata helper consumers away from full
+    `StorageAPI` where they only need object I/O, object operations, list
+    operations, and namespace locking.
+  - Current cleanup slice: narrow replication pool, resync leader-lock, delete
+    replication, object replication, and multipart replication helpers away
+    from full `StorageAPI` where they only need object I/O, object operations,
+    list operations, and namespace locking.
   - Acceptance: table catalog object backend contracts express the actual
     object read/write, metadata/delete, list, and namespace-lock capabilities
     they need; namespace-lock consumers depend on `NamespaceLocking` instead of
@@ -754,16 +759,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Trait bounds now express the actual object I/O, object operation, list, and namespace-lock capabilities without adding abstractions or changing method bodies. |
-| Migration preservation | passed | Lock acquisition, table catalog object paths, optimistic preconditions, pagination, missing-object handling, and rebalance metadata save semantics are unchanged. |
-| Testing/verification | passed | Focused table catalog and rebalance tests, compile check, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Replication consumers now depend on a local replication storage capability boundary plus object-I/O-only helper bounds, without changing replication method bodies. |
+| Migration preservation | passed | Resync leader locks, per-object replication locks, delete replication, object reader flow, multipart upload flow, MRF recovery, and replication scheduling semantics are unchanged. |
+| Testing/verification | passed | Focused replication tests, storage API compatibility test, compile checks, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `307d788da1954ddaeac8a55d5040a7ce7d1a213f`:
+Passed on `49c0f131205035d125271bb5b87db5b0f5bc2a6d`:
 
-- `cargo test -p rustfs table_catalog --no-fail-fast`: passed.
-- `cargo test -p rustfs-ecstore rebalance --no-fail-fast`: passed.
+- `cargo check -p rustfs-ecstore`: passed.
+- `cargo test -p rustfs-ecstore bucket::replication --no-fail-fast`: passed.
+- `cargo test -p rustfs-ecstore --test storage_api_compat_test --no-fail-fast`:
+  passed.
 - `cargo check -p rustfs -p rustfs-ecstore`: passed.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
@@ -776,16 +783,17 @@ Passed on `307d788da1954ddaeac8a55d5040a7ce7d1a213f`:
 
 Notes:
 
-- This slice keeps the existing table catalog and rebalance method bodies
-  unchanged while narrowing the generic storage capabilities they require.
-- Table catalog storage still depends on object metadata, object writes,
-  listing, and namespace locking; rebalance metadata merge-save only needs
-  object I/O plus namespace locking.
+- This slice keeps the existing replication method bodies unchanged while
+  narrowing the generic storage capabilities they require.
+- Replication storage still depends on object I/O, object metadata/delete
+  operations, bucket walking, and namespace locking; multipart replication
+  helpers only need object reader access to stream source ranges.
 - The slice does not remove the full storage facade or move traits across crate
   boundaries.
 
 ## Handoff Notes
 
-- API-012 cleanup is locally verified and current with `origin/main`.
+- API-012 replication storage cleanup is locally verified and current with
+  `origin/main`.
 - Remaining namespace-lock cleanup can continue by migrating other consumers
   that no longer need the full storage facade.

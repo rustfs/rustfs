@@ -148,6 +148,33 @@ Use these counters to decide whether scan progress is limited by scanner pacing
 or by a downstream subsystem such as lifecycle transition, replication repair,
 or heal admission.
 
+## Reading Heal Operations
+
+The background heal status route is:
+
+```text
+POST /v3/background-heal/status
+```
+
+It reports scanner-driven bitrot state together with heal queue execution
+state. `healQueueLength` and `healActiveTasks` keep the legacy totals.
+`healOperations` adds the same totals split by request source and priority:
+
+| Field | Meaning |
+|---|---|
+| `queueLength` | Total queued heal requests. |
+| `activeTasks` | Total running heal tasks. |
+| `queuedBySource` | Queued requests split into `scanner`, `admin`, `autoHeal`, and `internal`. |
+| `activeBySource` | Running tasks split into `scanner`, `admin`, `autoHeal`, and `internal`. |
+| `queuedByPriority` | Queued requests split into `low`, `normal`, `high`, and `urgent`. |
+| `activeByPriority` | Running tasks split into `low`, `normal`, `high`, and `urgent`. |
+
+Use this route when `metrics.source_work` shows `heal` or `bitrot` queued or
+missed work. Scanner-originated object checks should appear under
+`scanner/low` for opportunistic work, while manual admin heal should appear
+under `admin/high`. If scanner work grows but admin work remains blocked, treat
+that as heal queue pressure rather than scanner pacing pressure.
+
 ## Reading Replication Repair
 
 `metrics.replication_repair`, `metrics.current_cycle_replication_repair`, and

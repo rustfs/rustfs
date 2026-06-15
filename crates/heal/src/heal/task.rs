@@ -15,7 +15,7 @@
 use crate::heal::{ErasureSetHealer, progress::HealProgress, storage::HealStorageAPI};
 use crate::{Error, Result};
 use metrics::{counter, histogram};
-use rustfs_common::heal_channel::{HealOpts, HealScanMode};
+use rustfs_common::heal_channel::{HealOpts, HealRequestSource, HealScanMode};
 use rustfs_ecstore::{
     data_usage::DATA_USAGE_CACHE_NAME,
     disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
@@ -169,6 +169,8 @@ pub struct HealRequest {
     pub options: HealOptions,
     /// Priority
     pub priority: HealPriority,
+    /// Origin of the request for operational status.
+    pub source: HealRequestSource,
     /// Whether this request should bypass queue admission dedup/full policies.
     pub force_start: bool,
     /// Created time
@@ -185,6 +187,7 @@ impl HealRequest {
             heal_type,
             options,
             priority,
+            source: HealRequestSource::Internal,
             force_start: false,
             created_at: now,
             enqueued_at: now,
@@ -232,6 +235,10 @@ pub struct HealTask {
     pub heal_type: HealType,
     /// Heal options
     pub options: HealOptions,
+    /// Priority inherited from the request
+    pub priority: HealPriority,
+    /// Origin inherited from the request
+    pub source: HealRequestSource,
     /// Task status
     pub status: Arc<RwLock<HealTaskStatus>>,
     /// Progress tracking
@@ -260,6 +267,8 @@ impl HealTask {
             id: request.id,
             heal_type: request.heal_type,
             options: request.options,
+            priority: request.priority,
+            source: request.source,
             status: Arc::new(RwLock::new(HealTaskStatus::Pending)),
             progress: Arc::new(RwLock::new(HealProgress::new())),
             result_items: Arc::new(RwLock::new(Vec::new())),

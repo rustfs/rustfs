@@ -265,6 +265,27 @@ impl HealAdmissionResult {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealRequestSource {
+    #[default]
+    Internal,
+    Admin,
+    Scanner,
+    AutoHeal,
+}
+
+impl HealRequestSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Internal => "internal",
+            Self::Admin => "admin",
+            Self::Scanner => "scanner",
+            Self::AutoHeal => "auto_heal",
+        }
+    }
+}
+
 /// Heal channel command type
 #[derive(Debug)]
 pub enum HealChannelCommand {
@@ -322,6 +343,8 @@ pub struct HealChannelRequest {
     pub dry_run: Option<bool>,
     /// Timeout in seconds (optional)
     pub timeout_seconds: Option<u64>,
+    /// Origin of the request for operational status and queue accounting
+    pub source: HealRequestSource,
 }
 
 /// Heal response from ahm to admin
@@ -484,6 +507,7 @@ pub fn create_heal_request(
         recursive: None,
         dry_run: None,
         timeout_seconds: None,
+        source: HealRequestSource::Internal,
         disk: None,
     }
 }
@@ -641,6 +665,7 @@ pub async fn send_heal_disk(set_disk_id: String, priority: Option<HealChannelPri
         recursive: None,
         dry_run: None,
         timeout_seconds: None,
+        source: HealRequestSource::AutoHeal,
     };
     send_heal_request(req).await
 }
@@ -648,6 +673,17 @@ pub async fn send_heal_disk(set_disk_id: String, priority: Option<HealChannelPri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heal_request_source_labels_are_stable() {
+        assert_eq!(HealRequestSource::Scanner.as_str(), "scanner");
+        assert_eq!(HealRequestSource::Admin.as_str(), "admin");
+        assert_eq!(HealRequestSource::AutoHeal.as_str(), "auto_heal");
+        assert_eq!(HealRequestSource::Internal.as_str(), "internal");
+
+        let request = HealChannelRequest::default();
+        assert_eq!(request.source, HealRequestSource::Internal);
+    }
 
     #[test]
     fn heal_admission_result_labels_are_stable() {

@@ -32,7 +32,7 @@ use crate::scanner_io::{SCANNER_SKIP_FILE_ERROR, ScannerIODisk as _};
 use crate::sleeper::DynamicSleeper;
 use metrics::{counter, describe_counter};
 use rustfs_common::heal_channel::{
-    HEAL_DELETE_DANGLING, HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealScanMode,
+    HEAL_DELETE_DANGLING, HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealRequestSource, HealScanMode,
     send_heal_request_with_admission,
 };
 use rustfs_common::metrics::{
@@ -448,6 +448,7 @@ fn build_bucket_heal_request(bucket: String, priority: HealChannelPriority) -> H
     HealChannelRequest {
         bucket,
         priority,
+        source: HealRequestSource::Scanner,
         ..Default::default()
     }
 }
@@ -466,6 +467,7 @@ fn build_object_heal_request(
         priority,
         scan_mode: Some(scan_mode),
         remove_corrupted: Some(HEAL_DELETE_DANGLING),
+        source: HealRequestSource::Scanner,
         ..Default::default()
     }
 }
@@ -3078,6 +3080,7 @@ mod tests {
         assert!(request.object_version_id.is_none());
         assert_eq!(request.scan_mode, Some(HealScanMode::Deep));
         assert_eq!(request.priority, HealChannelPriority::Low);
+        assert_eq!(request.source, HealRequestSource::Scanner);
         assert_eq!(request.remove_corrupted, Some(HEAL_DELETE_DANGLING));
     }
 
