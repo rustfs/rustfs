@@ -1071,7 +1071,11 @@ impl ECStore {
                         continue;
                     }
 
-                    let fvs = match entry.file_info_versions(&bucket_clone) {
+                    let fvs = match if opts.include_free_versions {
+                        entry.file_info_versions_with_free_versions(&bucket_clone)
+                    } else {
+                        entry.file_info_versions(&bucket_clone)
+                    } {
                         Ok(res) => res,
                         Err(err) => {
                             let item = ObjectInfoOrErr {
@@ -1114,6 +1118,36 @@ impl ECStore {
 
                             if let Err(err) = result.send(item).await {
                                 error!("walk result send err {:?}", err);
+                            }
+                        }
+                    }
+
+                    if opts.include_free_versions {
+                        for fi in fvs.free_versions.iter() {
+                            if let Some(filter) = opts.filter {
+                                if filter(fi) {
+                                    let item = ObjectInfoOrErr {
+                                        item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
+                                            if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
+                                        })),
+                                        err: None,
+                                    };
+
+                                    if let Err(err) = result.send(item).await {
+                                        error!("walk result send err {:?}", err);
+                                    }
+                                }
+                            } else {
+                                let item = ObjectInfoOrErr {
+                                    item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
+                                        if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
+                                    })),
+                                    err: None,
+                                };
+
+                                if let Err(err) = result.send(item).await {
+                                    error!("walk result send err {:?}", err);
+                                }
                             }
                         }
                     }

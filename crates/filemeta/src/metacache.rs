@@ -191,6 +191,27 @@ impl MetaCacheEntry {
         fm.into_file_info_versions(bucket, self.name.as_str(), false)
     }
 
+    pub fn file_info_versions_with_free_versions(&self, bucket: &str) -> Result<FileInfoVersions> {
+        if self.is_dir() {
+            return Ok(FileInfoVersions {
+                volume: bucket.to_string(),
+                name: self.name.clone(),
+                versions: vec![FileInfo {
+                    volume: bucket.to_string(),
+                    name: self.name.clone(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+        }
+
+        let mut fm = FileMeta::new();
+        fm.unmarshal_msg(&self.metadata)?;
+        // `get_file_info_versions(..., false)` is the existing path that
+        // separates persisted tier free-version records into `free_versions`.
+        fm.get_file_info_versions(bucket, self.name.as_str(), false)
+    }
+
     pub fn matches(&self, other: Option<&MetaCacheEntry>, strict: bool) -> (Option<MetaCacheEntry>, bool) {
         if other.is_none() {
             return (None, false);
@@ -899,7 +920,7 @@ impl<T: Clone + Debug + Send + Sync + 'static> Cache<T> {
 mod tests {
     use super::*;
     use crate::test_data::create_real_xlmeta;
-    use crate::{FileMetaVersion, MetaDeleteMarker};
+    use crate::{FileMetaVersion, MetaDeleteMarker, TRANSITION_COMPLETE};
     use std::collections::HashMap;
     use std::io::Cursor;
     use std::sync::{
@@ -935,6 +956,196 @@ mod tests {
         let nobjs = r.read_all().await.unwrap();
 
         assert_eq!(objs, nobjs);
+    }
+
+    #[test]
+    fn file_info_versions_with_free_versions_includes_persisted_tier_cleanup_records() {
+        let version_id = Uuid::new_v4();
+        let remote_version_id = Uuid::new_v4();
+        let free_version_id = Uuid::new_v4();
+        let mut fm = FileMeta::new();
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version_id: Some(remote_version_id),
+            transition_tier: "WARM".to_string(),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        })
+        .expect("transitioned version should be added");
+
+        let mut delete_fi = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        delete_fi.set_tier_free_version_id(&free_version_id.to_string());
+        fm.delete_version(&delete_fi)
+            .expect("transitioned delete should create free-version metadata");
+
+        let entry = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: fm.marshal_msg().expect("metadata should marshal"),
+            ..Default::default()
+        };
+
+        let normal = entry.file_info_versions("bucket").expect("normal versions should parse");
+        assert!(normal.free_versions.is_empty());
+
+        let with_free = entry
+            .file_info_versions_with_free_versions("bucket")
+            .expect("versions with free versions should parse");
+        assert_eq!(with_free.free_versions.len(), 1);
+        assert!(with_free.free_versions[0].tier_free_version());
+        assert_eq!(with_free.free_versions[0].transitioned_objname, "remote/object");
+        assert_eq!(with_free.free_versions[0].transition_tier, "WARM");
+        assert_eq!(with_free.free_versions[0].transition_version_id, Some(remote_version_id));
+    }
+
+    #[test]
+    fn transitioned_delete_persists_recoverable_free_version_after_metadata_roundtrip() {
+        let version_id = Uuid::new_v4();
+        let remote_version_id = Uuid::new_v4();
+        let free_version_id = Uuid::new_v4();
+        let mut fm = FileMeta::new();
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version_id: Some(remote_version_id),
+            transition_tier: "WARM".to_string(),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        })
+        .expect("transitioned version should be added");
+
+        let mut delete_fi = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        delete_fi.set_tier_free_version_id(&free_version_id.to_string());
+
+        fm.delete_version(&delete_fi)
+            .expect("transitioned delete should persist free-version metadata");
+        let encoded = fm.marshal_msg().expect("metadata should marshal");
+        let mut decoded = FileMeta::new();
+        decoded
+            .unmarshal_msg(&encoded)
+            .expect("metadata should survive process restart roundtrip");
+
+        let versions = decoded
+            .get_file_info_versions("bucket", "object", false)
+            .expect("versions with free versions should parse");
+
+        assert!(versions.versions.is_empty());
+        assert_eq!(versions.free_versions.len(), 1);
+        let free_version = &versions.free_versions[0];
+        assert_eq!(free_version.version_id, Some(free_version_id));
+        assert!(free_version.tier_free_version());
+        assert_eq!(free_version.transitioned_objname, "remote/object");
+        assert_eq!(free_version.transition_version_id, Some(remote_version_id));
+        assert_eq!(free_version.transition_tier, "WARM");
+    }
+
+    #[test]
+    fn skip_tier_free_version_does_not_persist_cleanup_record() {
+        let version_id = Uuid::new_v4();
+        let mut fm = FileMeta::new();
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version_id: Some(Uuid::new_v4()),
+            transition_tier: "WARM".to_string(),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        })
+        .expect("transitioned version should be added");
+
+        let mut delete_fi = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        delete_fi.set_tier_free_version_id(&Uuid::new_v4().to_string());
+        delete_fi.set_skip_tier_free_version();
+
+        fm.delete_version(&delete_fi)
+            .expect("transitioned delete with skip flag should remove the local version");
+        let versions = fm
+            .get_file_info_versions("bucket", "object", false)
+            .expect("versions should parse after skipped cleanup");
+
+        assert!(versions.free_versions.is_empty());
+        assert_eq!(versions.versions.len(), 1);
+        assert!(versions.versions[0].deleted);
+        assert!(!versions.versions[0].tier_free_version());
+    }
+
+    #[test]
+    fn worker_style_free_version_delete_removes_persisted_cleanup_record() {
+        let version_id = Uuid::new_v4();
+        let remote_version_id = Uuid::new_v4();
+        let free_version_id = Uuid::new_v4();
+        let mut fm = FileMeta::new();
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version_id: Some(remote_version_id),
+            transition_tier: "WARM".to_string(),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        })
+        .expect("transitioned version should be added");
+
+        let mut delete_fi = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        delete_fi.set_tier_free_version_id(&free_version_id.to_string());
+        fm.delete_version(&delete_fi)
+            .expect("transitioned delete should persist free-version metadata");
+
+        let mut free_delete_fi = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(free_version_id),
+            deleted: true,
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        free_delete_fi.set_tier_free_version();
+
+        fm.delete_version(&free_delete_fi)
+            .expect("worker-style free-version delete should remove the cleanup record");
+        let versions = fm
+            .get_file_info_versions("bucket", "object", false)
+            .expect("versions should parse after free-version cleanup");
+
+        assert!(versions.free_versions.is_empty());
+        assert_eq!(versions.versions.len(), 1);
+        assert!(versions.versions[0].deleted);
+        assert!(!versions.versions[0].tier_free_version());
     }
 
     #[test]
