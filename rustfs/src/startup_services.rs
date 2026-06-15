@@ -18,10 +18,14 @@ use crate::{
         add_bucket_notification_configuration, init_auto_tuner, init_buffer_profile_system, init_kms_system, init_update_check,
         print_server_info,
     },
-    server::{ServiceStateManager, init_event_notifier, start_audit_system},
-    startup_iam::{IamBootstrapDisposition, bootstrap_or_defer_iam_init},
+    server::{
+        ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
+        start_audit_system, stop_audit_system, wait_for_shutdown,
+    },
+    startup_iam::{IamBootstrapDisposition, bootstrap_or_defer_iam_init, publish_ready_for_iam_bootstrap},
     startup_protocols::{ProtocolShutdownSenders, init_protocol_shutdown_senders},
 };
+use futures_util::future::join_all;
 use rustfs_audit::AuditResult;
 use rustfs_common::GlobalReadiness;
 use rustfs_ecstore::{
@@ -31,13 +35,17 @@ use rustfs_ecstore::{
         replication::get_global_replication_pool,
     },
     endpoints::EndpointServerPools,
+    global::shutdown_background_services,
     notification_sys::new_global_notification_sys,
     store::ECStore,
     store_api::BucketOperations,
 };
-use rustfs_heal::{create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager};
+use rustfs_heal::{
+    create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
+};
 use rustfs_iam::init_oidc_sys;
 use rustfs_obs::init_metrics_runtime;
+use rustfs_scanner::init_data_scanner;
 use rustfs_storage_api::BucketOptions;
 use rustfs_utils::get_env_bool_with_aliases;
 use std::{
@@ -56,17 +64,35 @@ const LOG_COMPONENT_MAIN: &str = "main";
 const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const LOG_SUBSYSTEM_AUTH: &str = "auth";
 const EVENT_AUDIT_SYSTEM_STATE: &str = "audit_system_state";
+const EVENT_PROTOCOL_SYSTEM_STATE: &str = "protocol_system_state";
 const EVENT_DEADLOCK_DETECTOR_STATE: &str = "deadlock_detector_state";
 const EVENT_KEYSTONE_AUTH_INITIALIZED: &str = "keystone_auth_initialized";
 const EVENT_KEYSTONE_AUTH_INITIALIZATION_FAILED: &str = "keystone_auth_initialization_failed";
 const EVENT_OIDC_INITIALIZATION_FAILED: &str = "oidc_initialization_failed";
 const EVENT_NOTIFICATION_SYSTEM_INITIALIZATION_FAILED: &str = "notification_system_initialization_failed";
 const EVENT_BACKGROUND_SERVICES_CONFIGURED: &str = "background_services_configured";
+const EVENT_SERVER_READY: &str = "server_ready";
+const EVENT_SHUTDOWN_SIGNAL_RECEIVED: &str = "shutdown_signal_received";
+const EVENT_BACKGROUND_SERVICE_SHUTDOWN: &str = "background_service_shutdown";
+const EVENT_EVENT_NOTIFIER_SHUTDOWN: &str = "event_notifier_shutdown";
+const EVENT_PROFILING_SHUTDOWN: &str = "profiling_shutdown";
+const EVENT_SERVER_SHUTDOWN_STATE: &str = "server_shutdown_state";
 
 pub struct StartupServiceRuntime {
     pub protocol_shutdowns: ProtocolShutdownSenders,
     pub iam_bootstrap: IamBootstrapDisposition,
     pub enable_scanner: bool,
+}
+
+pub struct StartupRuntimeLifecycle {
+    pub server_address: String,
+    pub state_manager: Arc<ServiceStateManager>,
+    pub s3_shutdown_tx: Option<ShutdownHandle>,
+    pub console_shutdown_tx: Option<ShutdownHandle>,
+    pub service_runtime: StartupServiceRuntime,
+    pub store: Arc<ECStore>,
+    pub shutdown_token: CancellationToken,
+    pub readiness: Arc<GlobalReadiness>,
 }
 
 pub async fn init_startup_runtime_services(
@@ -97,6 +123,64 @@ pub async fn init_startup_runtime_services(
         iam_bootstrap,
         enable_scanner,
     })
+}
+
+pub async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifecycle) -> Result<()> {
+    let StartupRuntimeLifecycle {
+        server_address,
+        state_manager,
+        s3_shutdown_tx,
+        console_shutdown_tx,
+        service_runtime,
+        store,
+        shutdown_token,
+        readiness,
+    } = lifecycle;
+    let StartupServiceRuntime {
+        protocol_shutdowns,
+        iam_bootstrap,
+        enable_scanner,
+    } = service_runtime;
+
+    info!(
+        target: "rustfs::main::run",
+        event = EVENT_SERVER_READY,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        version = %crate::version::get_version(),
+        server_address = %server_address,
+        started_at = %jiff::Zoned::now(),
+        iam_bootstrap = ?iam_bootstrap,
+        "RustFS server ready"
+    );
+    publish_ready_for_iam_bootstrap(iam_bootstrap, readiness.as_ref(), Some(state_manager.as_ref())).await?;
+    rustfs_common::set_global_init_time_now().await;
+
+    if enable_scanner {
+        init_data_scanner(shutdown_token.clone(), store).await;
+    }
+
+    let shutdown_signal = wait_for_shutdown().await;
+    handle_shutdown(
+        &state_manager,
+        shutdown_signal,
+        s3_shutdown_tx,
+        console_shutdown_tx,
+        protocol_shutdowns,
+        shutdown_token,
+    )
+    .await;
+
+    info!(
+        target: "rustfs::main::run",
+        event = EVENT_SERVER_SHUTDOWN_STATE,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        state = ?state_manager.current_state(),
+        result = "stopped",
+        "RustFS server stopped"
+    );
+    Ok(())
 }
 
 async fn init_audit_runtime() {
@@ -278,6 +362,223 @@ async fn init_observability_runtime(ctx: CancellationToken) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundShutdownStep {
+    DataScanner,
+    Ahm,
+}
+
+fn background_shutdown_steps(enable_scanner: bool, enable_heal: bool) -> Vec<BackgroundShutdownStep> {
+    let mut steps = Vec::with_capacity(2);
+    if enable_scanner {
+        steps.push(BackgroundShutdownStep::DataScanner);
+    }
+    if enable_heal || enable_scanner {
+        steps.push(BackgroundShutdownStep::Ahm);
+    }
+    steps
+}
+
+async fn handle_shutdown(
+    state_manager: &ServiceStateManager,
+    shutdown_signal: ShutdownSignal,
+    s3_shutdown_handle: Option<ShutdownHandle>,
+    console_shutdown_handle: Option<ShutdownHandle>,
+    protocols: ProtocolShutdownSenders,
+    ctx: CancellationToken,
+) {
+    let ProtocolShutdownSenders {
+        ftp: ftp_shutdown_tx,
+        ftps: ftps_shutdown_tx,
+        webdav: webdav_shutdown_tx,
+        sftp: sftp_shutdown_tx,
+    } = protocols;
+    ctx.cancel();
+
+    info!(
+        target: "rustfs::main::handle_shutdown",
+        event = EVENT_SHUTDOWN_SIGNAL_RECEIVED,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        signal = shutdown_signal.log_label(),
+        "Shutdown signal received"
+    );
+    state_manager.update(ServiceState::Stopping);
+
+    let enable_scanner = get_env_bool_with_aliases(ENV_SCANNER_ENABLED, &[ENV_SCANNER_ENABLED_DEPRECATED], true);
+    let enable_heal = get_env_bool_with_aliases(ENV_HEAL_ENABLED, &[ENV_HEAL_ENABLED_DEPRECATED], true);
+
+    let background_steps = background_shutdown_steps(enable_scanner, enable_heal);
+    for step in &background_steps {
+        match step {
+            BackgroundShutdownStep::DataScanner => {
+                info!(
+                    target: "rustfs::main::handle_shutdown",
+                    event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+                    component = LOG_COMPONENT_MAIN,
+                    subsystem = LOG_SUBSYSTEM_STARTUP,
+                    service = "data_scanner",
+                    state = "stopping",
+                    "Background service shutdown started"
+                );
+                shutdown_background_services();
+            }
+            BackgroundShutdownStep::Ahm => {
+                info!(
+                    target: "rustfs::main::handle_shutdown",
+                    event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+                    component = LOG_COMPONENT_MAIN,
+                    subsystem = LOG_SUBSYSTEM_STARTUP,
+                    service = "ahm",
+                    state = "stopping",
+                    "Background service shutdown started"
+                );
+                shutdown_ahm_services();
+            }
+        }
+    }
+
+    if background_steps.is_empty() {
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            service = "ahm",
+            state = "skipped",
+            reason = "disabled",
+            "Background service shutdown skipped"
+        );
+    }
+
+    let mut protocol_shutdowns = Vec::new();
+    if let Some(ftp_shutdown_tx) = ftp_shutdown_tx {
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            event = EVENT_PROTOCOL_SYSTEM_STATE,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            protocol = "ftp",
+            state = "stopping",
+            "Protocol runtime stopping"
+        );
+        protocol_shutdowns.push(ftp_shutdown_tx.shutdown());
+    }
+
+    if let Some(ftps_shutdown_tx) = ftps_shutdown_tx {
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            event = EVENT_PROTOCOL_SYSTEM_STATE,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            protocol = "ftps",
+            state = "stopping",
+            "Protocol runtime stopping"
+        );
+        protocol_shutdowns.push(ftps_shutdown_tx.shutdown());
+    }
+
+    if let Some(webdav_shutdown_tx) = webdav_shutdown_tx {
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            event = EVENT_PROTOCOL_SYSTEM_STATE,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            protocol = "webdav",
+            state = "stopping",
+            "Protocol runtime stopping"
+        );
+        protocol_shutdowns.push(webdav_shutdown_tx.shutdown());
+    }
+
+    if let Some(sftp_shutdown_tx) = sftp_shutdown_tx {
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            event = EVENT_PROTOCOL_SYSTEM_STATE,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            protocol = "sftp",
+            state = "stopping",
+            "Protocol runtime stopping"
+        );
+        protocol_shutdowns.push(sftp_shutdown_tx.shutdown());
+    }
+
+    info!(
+        target: "rustfs::main::handle_shutdown",
+        event = EVENT_EVENT_NOTIFIER_SHUTDOWN,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        state = "stopping",
+        "Event notifier shutdown started"
+    );
+    shutdown_event_notifier().await;
+
+    info!(
+        target: "rustfs::main::handle_shutdown",
+        event = EVENT_AUDIT_SYSTEM_STATE,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        state = "stopping",
+        "Audit runtime stopping"
+    );
+    match stop_audit_system().await {
+        Ok(_) => info!(
+            target: "rustfs::main::handle_shutdown",
+            event = EVENT_AUDIT_SYSTEM_STATE,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            state = "stopped",
+            "Audit runtime stopped"
+        ),
+        Err(e) => error!(
+            target: "rustfs::main::handle_shutdown",
+            event = EVENT_AUDIT_SYSTEM_STATE,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            state = "stop_failed",
+            error = %e,
+            "Audit runtime failed to stop"
+        ),
+    }
+
+    info!(
+        target: "rustfs::main::handle_shutdown",
+        event = EVENT_PROFILING_SHUTDOWN,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        state = "stopping",
+        "Profiling shutdown started"
+    );
+    crate::profiling::shutdown_profiling();
+
+    info!(
+        target: "rustfs::main::handle_shutdown",
+        event = EVENT_SERVER_SHUTDOWN_STATE,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        state = "stopping",
+        "RustFS server stopping"
+    );
+    if let Some(s3_shutdown_handle) = s3_shutdown_handle {
+        s3_shutdown_handle.shutdown().await;
+    }
+    if let Some(console_shutdown_handle) = console_shutdown_handle {
+        console_shutdown_handle.shutdown().await;
+    }
+    join_all(protocol_shutdowns).await;
+
+    state_manager.update(ServiceState::Stopped);
+    info!(
+        target: "rustfs::main::handle_shutdown",
+        event = EVENT_SERVER_SHUTDOWN_STATE,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        state = "stopped",
+        "RustFS server stopped"
+    );
+}
+
 pub async fn init_event_notifier_and_audit() -> AuditResult<()> {
     init_event_notifier_and_audit_with(init_event_notifier, start_audit_system).await
 }
@@ -310,7 +611,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{init_event_notifier_and_audit_with, init_notification_system_with};
+    use super::{
+        BackgroundShutdownStep, background_shutdown_steps, init_event_notifier_and_audit_with, init_notification_system_with,
+    };
     use rustfs_audit::AuditError;
     use std::sync::{Arc, Mutex};
 
@@ -362,5 +665,19 @@ mod tests {
         let result = init_notification_system_with(|| async { Err(rustfs_ecstore::error::Error::FaultyDisk) }).await;
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn background_shutdown_plan_keeps_scanner_before_ahm() {
+        assert_eq!(
+            background_shutdown_steps(true, true),
+            vec![BackgroundShutdownStep::DataScanner, BackgroundShutdownStep::Ahm]
+        );
+        assert_eq!(
+            background_shutdown_steps(true, false),
+            vec![BackgroundShutdownStep::DataScanner, BackgroundShutdownStep::Ahm]
+        );
+        assert_eq!(background_shutdown_steps(false, true), vec![BackgroundShutdownStep::Ahm]);
+        assert!(background_shutdown_steps(false, false).is_empty());
     }
 }

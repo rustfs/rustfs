@@ -5,18 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-startup-runtime-services`
-- Baseline: `origin/main` at `3e723a2476692051cac1eab2cc31984c62063130`
+- Branch: `overtrue/arch-startup-ready-shutdown-runtime`
+- Baseline: `origin/main` at `e26eea7f3a5ef6c272a322a47f58f5a10cb2342b0`
 - PR type for this branch: `pure-move`
-- Runtime behavior changes: no external behavior change expected; KMS, optional
-  protocols, diagnostics services, bucket metadata migration, IAM bootstrap,
-  auth integrations, notification runtime, heal/scanner setup, and metrics
-  initialization still run in the same relative order after storage runtime and
-  before the server-ready log.
-- Rust code changes: add `startup_services::init_startup_runtime_services` and
+- Runtime behavior changes: no external behavior change expected; server-ready
+  publication, global init time, scanner start, shutdown wait, and shutdown
+  ordering still run in the same relative order after runtime services.
+- Rust code changes: add `startup_services::run_startup_runtime_lifecycle` and
   use it from binary startup.
 - CI/script changes: none.
-- Docs changes: record `R-017` startup runtime service bootstrap progress and
+- Docs changes: record `R-018` startup runtime lifecycle progress and
   verification.
 
 ## Phase 0 Tasks
@@ -704,10 +702,29 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     formatting, migration guards, Rust risk scan, branch freshness check, and
     pre-commit quality gate.
 
+- [x] `R-018` Centralize startup ready, scanner, and shutdown lifecycle.
+  - Do: move server-ready logging, IAM readiness publication, global init time,
+    scanner start, shutdown signal wait, background shutdown ordering, protocol
+    shutdown, notifier/audit/profiling shutdown, HTTP shutdown, and final stopped
+    state logging behind the `startup_services` boundary.
+  - Acceptance: `main.rs` still initializes listen/storage/runtime services in
+    the same order, then delegates lifecycle completion; `startup_services`
+    owns the shutdown handles, runtime token, readiness handle, store, and
+    service runtime needed for ready/scanner/shutdown orchestration.
+  - Must preserve: server-ready log fields, inline/deferred IAM readiness
+    behavior, global init time timing, scanner start timing, shutdown signal log,
+    runtime token cancellation before service-specific shutdown, scanner before
+    AHM shutdown order, protocol shutdown order, notifier/audit/profiling
+    shutdown order, HTTP shutdown order, stopped service state, and final stopped
+    logs.
+  - Verification: focused startup services tests, binary/lib compile checks,
+    formatting, migration guards, Rust risk scan, branch freshness check, and
+    pre-commit quality gate.
+
 ## Next PRs
 
-1. `pure-move`: continue extracting startup ready/scanner/shutdown wrappers while
-   preserving startup order, readiness ownership, and shutdown ownership.
+1. `pure-move`: continue collapsing remaining binary startup glue around command
+   dispatch and server bootstrap without changing fatal stderr behavior.
 2. `ci-gate`: finish `G-006` public re-export and storage trait coverage checks
    before the remaining cleanup slices.
 
@@ -715,13 +732,13 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Pure-move slice removes runtime service details from binary startup behind the existing startup services boundary. |
-| Migration preservation | passed | Storage runtime, KMS, optional protocols, diagnostics, bucket metadata, IAM, auth, notification, heal/scanner, metrics, and server-ready order are preserved. |
+| Quality/architecture | passed | Pure-move slice removes ready/scanner/shutdown lifecycle details from binary startup behind the existing startup services boundary. |
+| Migration preservation | passed | Server-ready publication, scanner start, shutdown wait, background/protocol/notifier/audit/profiling/HTTP shutdown order, and stopped state are preserved. |
 | Testing/verification | passed | Focused startup services tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `3e723a2476692051cac1eab2cc31984c62063130`:
+Passed on `e26eea7f3a5ef6c272a322a47f58f5a10cb2342b0`:
 
 - `cargo test -p rustfs startup_services --no-fail-fast`: passed.
 - `cargo check -p rustfs --lib`: passed.
@@ -740,14 +757,15 @@ Passed on `3e723a2476692051cac1eab2cc31984c62063130`:
 
 Notes:
 
-- This slice centralizes startup runtime services without changing startup
-  ordering, shutdown token ownership, readiness ownership, or endpoint pool
+- This slice centralizes startup lifecycle completion without changing startup
+  ordering, shutdown token ownership, readiness ownership, or shutdown handle
   ownership.
-- Runtime services remain after storage runtime and before the server-ready log.
+- Ready publication and scanner start remain after runtime services; shutdown
+  wait remains after scanner start.
 
 ## Handoff Notes
 
-- R-017 is implemented, locally verified, and current with `origin/main`.
+- R-018 is implemented, locally verified, and current with `origin/main`.
 - Next startup slices can keep using larger pure moves, but must keep startup
-  ordering, fatal/non-fatal boundaries, shutdown ownership, and readiness
-  ownership explicit in tests and review notes.
+  ordering, fatal/non-fatal boundaries, shutdown ownership, readiness ownership,
+  and fatal stderr behavior explicit in tests and review notes.

@@ -44,9 +44,9 @@ new startup semantics.
 | `RUN-019` | `rustfs/src/startup_services.rs` | Add bucket notification config and initialize notification system. | Adds bucket notification configuration and publishes the global notification system. | Notification config add is non-fatal in this path; global notification init is fatal on error. | None |
 | `RUN-020` | `rustfs/src/startup_services.rs` | Create AHM cancellation token and initialize heal manager when scanner or heal is enabled. | Creates AHM cancellation token and starts heal manager for heal/scanner workflows. | Heal manager init is fatal when enabled. | None |
 | `RUN-021` | `rustfs/src/startup_services.rs` | Print server info, init update check, allocator reclaim, metrics, memory observability, and auto-tuner. | Starts informational/update/memory/metrics background tasks when enabled. | Non-fatal in this path. | None |
-| `RUN-022` | `rustfs/src/main.rs:599` | Log successful startup and publish full readiness for inline IAM. | Logs version/address, checks runtime readiness, marks `FullReady`, and sets service state to `Ready` when IAM was ready inline. | Fatal if runtime readiness is not reached within the startup wait. | Marks `FullReady` only for inline IAM here |
-| `RUN-023` | `rustfs/src/main.rs:609` | Publish global init time and start data scanner when enabled. | Sets global init time and starts scanner after the successful-startup log. | Scanner start is non-fatal in this path. | Full readiness may already be published or may await deferred IAM recovery |
-| `RUN-024` | `rustfs/src/main.rs:616` | Wait for shutdown signal. | Blocks the main task until a shutdown signal is received. | Non-fatal. | Runtime remains in its current readiness state |
+| `RUN-022` | `rustfs/src/startup_services.rs` and `rustfs/src/startup_iam.rs` | Log successful startup and publish full readiness for inline IAM. | Logs version/address, checks runtime readiness, marks `FullReady`, and sets service state to `Ready` when IAM was ready inline. | Fatal if runtime readiness is not reached within the startup wait. | Marks `FullReady` only for inline IAM here |
+| `RUN-023` | `rustfs/src/startup_services.rs` | Publish global init time and start data scanner when enabled. | Sets global init time and starts scanner after the successful-startup log. | Scanner start is non-fatal in this path. | Full readiness may already be published or may await deferred IAM recovery |
+| `RUN-024` | `rustfs/src/startup_services.rs` | Wait for shutdown signal. | Blocks the main task until a shutdown signal is received. | Non-fatal. | Runtime remains in its current readiness state |
 
 ## Deferred IAM Readiness
 
@@ -68,11 +68,11 @@ new startup semantics.
 
 | Step | Source | Current action | Side effects | Fatal boundary | Ready stage |
 |---|---|---|---|---|---|
-| `STOP-001` | `rustfs/src/main.rs:647` | Cancel runtime token and move service state to `Stopping`. | Notifies cancellation-aware background tasks. | Non-fatal. | Service state moves to `Stopping`; readiness stages are not cleared here |
-| `STOP-002` | `rustfs/src/main.rs:675` | Stop scanner/background services and AHM services according to enable flags. | Calls ECStore background shutdown and heal/scanner shutdown helpers. | Non-fatal in this path. | No readiness-stage change |
-| `STOP-003` | `rustfs/src/main.rs:699` | Signal optional FTP/FTPS/WebDAV/SFTP protocol servers. | Collects protocol shutdown futures. | Non-fatal in this path. | No readiness-stage change |
-| `STOP-004` | `rustfs/src/main.rs:735` | Stop event notifier, audit system, and profiling tasks. | Stops notifier and profiling tasks; audit stop failures are logged. | Non-fatal in this path. | No readiness-stage change |
-| `STOP-005` | `rustfs/src/main.rs:763` | Stop S3 and console HTTP servers, wait for protocol shutdowns, then mark service state `Stopped`. | HTTP shutdown happens after notifier/audit/profiling shutdown in current order. | Join failures are logged by shutdown handles; this path does not return errors. | Service state moves to `Stopped`; readiness stages are not cleared here |
+| `STOP-001` | `rustfs/src/startup_services.rs` | Cancel runtime token and move service state to `Stopping`. | Notifies cancellation-aware background tasks. | Non-fatal. | Service state moves to `Stopping`; readiness stages are not cleared here |
+| `STOP-002` | `rustfs/src/startup_services.rs` | Stop scanner/background services and AHM services according to enable flags. | Calls ECStore background shutdown and heal/scanner shutdown helpers. | Non-fatal in this path. | No readiness-stage change |
+| `STOP-003` | `rustfs/src/startup_services.rs` | Signal optional FTP/FTPS/WebDAV/SFTP protocol servers. | Collects protocol shutdown futures. | Non-fatal in this path. | No readiness-stage change |
+| `STOP-004` | `rustfs/src/startup_services.rs` | Stop event notifier, audit system, and profiling tasks. | Stops notifier and profiling tasks; audit stop failures are logged. | Non-fatal in this path. | No readiness-stage change |
+| `STOP-005` | `rustfs/src/startup_services.rs` | Stop S3 and console HTTP servers, wait for protocol shutdowns, then mark service state `Stopped`. | HTTP shutdown happens after notifier/audit/profiling shutdown in current order. | Join failures are logged by shutdown handles; this path does not return errors. | Service state moves to `Stopped`; readiness stages are not cleared here |
 
 ## Migration Rules
 
