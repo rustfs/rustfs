@@ -7,8 +7,9 @@ new startup semantics.
 ## Scope
 
 - Baseline commit: `ae9d25879d72bc8977f08e61062c022e2142483b`
-- Entry points covered: `rustfs/src/main.rs::main`, `async_main`, `run`, and
-  `handle_shutdown`
+- Entry points covered: `rustfs/src/main.rs::main`,
+  `rustfs/src/startup_entrypoint.rs::{run_process, async_main, run}`, and
+  startup lifecycle helpers
 - Related migration task: `G-007`
 - Out of scope for this baseline: embedded startup, admin route-action matrix,
   and any runtime/lifecycle code movement
@@ -17,22 +18,22 @@ new startup semantics.
 
 | Step | Source | Current action | Side effects | Fatal boundary | Ready stage |
 |---|---|---|---|---|---|
-| `BOOT-001` | `rustfs/src/main.rs:84` | Apply external-prefix environment compatibility before the Tokio runtime is created. | Copies supported external env aliases into canonical `RUSTFS_*` process env keys and prints warnings or info to stderr. | Non-fatal; failure is logged to stderr and startup continues. | None |
-| `BOOT-002` | `rustfs/src/main.rs:89` | Build the Tokio runtime. | Installs runtime configuration and any runtime telemetry guard created by the runtime builder. | Fatal through `expect`; process exits if the runtime cannot be built. | None |
-| `BOOT-003` | `rustfs/src/main.rs:139` | Parse CLI command and dispatch non-server commands. | `info` and `tls` commands execute and return without server startup. | Command parse exits process with code 1; TLS command errors propagate. | None |
-| `BOOT-004` | `rustfs/src/main.rs:167` | Initialize config snapshot and license state. | Publishes config snapshot for later readers and initializes runtime license state. | License init is non-fallible in this path. | None |
-| `BOOT-005` | `rustfs/src/main.rs:173` | Initialize observability and store the global guard. | Initializes tracing/observability, stores the guard globally, and logs license/runtime telemetry status. | Fatal if observability init or guard publication fails. | None |
-| `BOOT-006` | `rustfs/src/main.rs:208` | Log startup logo, initialize profiling, trusted proxies, rustls provider, and outbound TLS material. | Starts optional profiling tasks, trusted proxy config, default rustls provider, outbound TLS global state, TLS generation metric, and TLS metrics when enabled. | Profiling/proxy/provider setup is non-fatal; configured TLS material load is fatal on error. | None |
-| `RUN-001` | `rustfs/src/main.rs:256` | Enter `run` and create `GlobalReadiness`. | Allocates the readiness tracker shared with HTTP readiness gates. | Non-fatal. | Initial readiness state is not ready |
-| `RUN-002` | `rustfs/src/main.rs:261` | Parse and publish the configured region. | Updates ECStore global region when configured. | Fatal if the configured region is invalid. | None |
-| `RUN-003` | `rustfs/src/main.rs:268` | Resolve server address and warn on default credentials. | Computes server port/address and emits production credential warning when defaults are used. | Address parse is fatal; default credentials warning is non-fatal. | None |
-| `RUN-004` | `rustfs/src/main.rs:286` | Initialize global action credentials. | Publishes root/action credentials used by auth paths. | Fatal if global credentials cannot be initialized. | None |
-| `RUN-005` | `rustfs/src/main.rs:298` | Publish server port and address. | Updates global RustFS port and global address. | Non-fatal in this path. | None |
-| `RUN-006` | `rustfs/src/main.rs:302` | Build endpoint pools and enforce unsupported filesystem policy. | Derives pool/set/disk layout from configured volumes and validates unsupported filesystem policy. | Fatal on endpoint build or unsupported filesystem policy error. | None |
-| `RUN-007` | `rustfs/src/main.rs:308` | Publish endpoints and erasure type. | Updates global endpoints and erasure type. | Non-fatal in this path. | None |
-| `RUN-008` | `rustfs/src/main.rs:311` | Initialize local disks, prewarm local disk id map, and initialize lock clients. | Opens local disk state, primes disk id lookup, and creates global lock clients. | Local disk init is fatal; prewarm and lock-client setup are non-fatal in this path. | None |
-| `RUN-009` | `rustfs/src/main.rs:350` | Initialize capacity management and service state manager. | Starts capacity management and moves service state to `Starting`. | Non-fatal in this path. | None |
-| `RUN-010` | `rustfs/src/main.rs:356` | Start S3 HTTP listener and optional console listener before storage is ready. | Starts HTTP servers with readiness gates; console listener starts only when enabled and configured. | Fatal if a configured listener cannot start. | Requests remain gated until full readiness except probe/admin/console/rpc/tonic/table-catalog exempt paths |
+| `BOOT-001` | `rustfs/src/startup_entrypoint.rs` | Apply external-prefix environment compatibility during async startup before command parsing. | Copies supported external env aliases into canonical `RUSTFS_*` process env keys and prints warnings or info to stderr. | Non-fatal; failure is logged to stderr and startup continues. | None |
+| `BOOT-002` | `rustfs/src/main.rs` and `rustfs/src/startup_entrypoint.rs` | Call the startup entrypoint and build the Tokio runtime. | Installs runtime configuration and any runtime telemetry guard created by the runtime builder. | Fatal through `expect`; process exits if the runtime cannot be built. | None |
+| `BOOT-003` | `rustfs/src/startup_entrypoint.rs` | Parse CLI command and dispatch non-server commands. | `info` and `tls` commands execute and return without server startup. | Command parse exits process with code 1; TLS command errors propagate. | None |
+| `BOOT-004` | `rustfs/src/startup_preflight.rs` | Initialize config snapshot and license state. | Publishes config snapshot for later readers and initializes runtime license state. | License init is non-fallible in this path. | None |
+| `BOOT-005` | `rustfs/src/startup_preflight.rs` | Initialize observability and store the global guard. | Initializes tracing/observability, stores the guard globally, and logs license/runtime telemetry status. | Fatal if observability init or guard publication fails. | None |
+| `BOOT-006` | `rustfs/src/startup_runtime.rs` | Log startup logo, initialize profiling, trusted proxies, rustls provider, and outbound TLS material. | Starts optional profiling tasks, trusted proxy config, default rustls provider, outbound TLS global state, TLS generation metric, and TLS metrics when enabled. | Profiling/proxy/provider setup is non-fatal; configured TLS material load is fatal on error. | None |
+| `RUN-001` | `rustfs/src/startup_server.rs` | Enter startup run orchestration and create `GlobalReadiness`. | Allocates the readiness tracker shared with HTTP readiness gates. | Non-fatal. | Initial readiness state is not ready |
+| `RUN-002` | `rustfs/src/startup_server.rs` | Parse and publish the configured region. | Updates ECStore global region when configured. | Fatal if the configured region is invalid. | None |
+| `RUN-003` | `rustfs/src/startup_server.rs` | Resolve server address and warn on default credentials. | Computes server port/address and emits production credential warning when defaults are used. | Address parse is fatal; default credentials warning is non-fatal. | None |
+| `RUN-004` | `rustfs/src/startup_server.rs` | Initialize global action credentials. | Publishes root/action credentials used by auth paths. | Fatal if global credentials cannot be initialized. | None |
+| `RUN-005` | `rustfs/src/startup_server.rs` | Publish server port and address. | Updates global RustFS port and global address. | Non-fatal in this path. | None |
+| `RUN-006` | `rustfs/src/startup_storage.rs` | Build endpoint pools and enforce unsupported filesystem policy. | Derives pool/set/disk layout from configured volumes and validates unsupported filesystem policy. | Fatal on endpoint build or unsupported filesystem policy error. | None |
+| `RUN-007` | `rustfs/src/startup_storage.rs` | Publish endpoints and erasure type. | Updates global endpoints and erasure type. | Non-fatal in this path. | None |
+| `RUN-008` | `rustfs/src/startup_storage.rs` | Initialize local disks, prewarm local disk id map, and initialize lock clients. | Opens local disk state, primes disk id lookup, and creates global lock clients. | Local disk init is fatal; prewarm and lock-client setup are non-fatal in this path. | None |
+| `RUN-009` | `rustfs/src/startup_server.rs` | Initialize capacity management and service state manager. | Starts capacity management and moves service state to `Starting`. | Non-fatal in this path. | None |
+| `RUN-010` | `rustfs/src/startup_server.rs` | Start S3 HTTP listener and optional console listener before storage is ready. | Starts HTTP servers with readiness gates; console listener starts only when enabled and configured. | Fatal if a configured listener cannot start. | Requests remain gated until full readiness except probe/admin/console/rpc/tonic/table-catalog exempt paths |
 | `RUN-011` | `rustfs/src/startup_storage.rs` | Create cancellation token and initialize `ECStore`. | Creates the runtime cancellation token and storage engine. | Fatal if `ECStore::new` fails. | None |
 | `RUN-012` | `rustfs/src/startup_storage.rs` | Initialize ECStore config and global config system. | Initializes ECStore config, attempts server-config migration, then retries global config init up to 15 times. | Migration attempt is non-fatal in this path; global config init becomes fatal after retries. | Marks the `GlobalReadiness` `StorageReady` stage after global config init succeeds; later runtime readiness still rechecks storage, IAM, and lock quorum before `FullReady` |
 | `RUN-013` | `rustfs/src/startup_storage.rs` and `rustfs/src/startup_services.rs` | Start replication and KMS systems. | Starts background replication pool, then initializes KMS from startup services. | Replication init is non-fatal in this path; KMS init is fatal on error. | `StorageReady` stage is already marked; dynamic runtime storage readiness is still checked before `FullReady` |

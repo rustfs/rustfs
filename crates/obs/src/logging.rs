@@ -160,19 +160,21 @@ mod tests {
 
     #[test]
     fn startup_runtime_logging_does_not_dump_full_config_debug_output() {
-        let path = workspace_root().join("rustfs/src/main.rs");
-        let source = fs::read_to_string(&path).unwrap_or_else(|err| panic!("failed to read {}: {}", path.display(), err));
-        assert!(
-            !source.contains("debug!(\"config: {:?}\", &config)"),
-            "found forbidden full config debug output in {}",
-            path.display()
-        );
+        for relative_path in ["rustfs/src/main.rs", "rustfs/src/startup_entrypoint.rs"] {
+            let path = workspace_root().join(relative_path);
+            let source = fs::read_to_string(&path).unwrap_or_else(|err| panic!("failed to read {}: {}", path.display(), err));
+            assert!(
+                !source.contains("debug!(\"config: {:?}\", &config)"),
+                "found forbidden full config debug output in {}",
+                path.display()
+            );
+        }
     }
 
     #[test]
     fn startup_fatal_stderr_uses_single_formatter_for_pre_observability_failures() {
         assert_source_contains(
-            "rustfs/src/main.rs",
+            "rustfs/src/startup_entrypoint.rs",
             &[
                 "fn format_fatal_stderr_message(context: &str, error: impl std::fmt::Display) -> String",
                 "fn emit_fatal_stderr(context: &str, error: impl std::fmt::Display)",
