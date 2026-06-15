@@ -10362,12 +10362,12 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.14.0-dev"
-source = "git+https://github.com/rustfs/s3s?rev=cf4c3346ed2554daa7fc6437f9969b076a5137ad#cf4c3346ed2554daa7fc6437f9969b076a5137ad"
+source = "git+https://github.com/rustfs/s3s?rev=c59b62f7badf29fefefec69381d13cd459f44aa8#c59b62f7badf29fefefec69381d13cd459f44aa8"
 dependencies = [
  "arc-swap",
  "arrayvec",
  "async-trait",
- "atoi 2.0.0",
+ "atoi 3.0.0",
  "base64-simd",
  "bytes",
  "bytestring",
