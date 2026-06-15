@@ -160,6 +160,7 @@ tower = { version = "0.5.3", features = ["timeout"] }
 tower-http = { version = "0.6.11", features = ["cors"] }
 
 # Serialization and Data Formats
+apache-avro = "0.21.0"
 bytes = { version = "1.11.1", features = ["serde"] }
 bytesize = "2.4.0"
 byteorder = "1.5.0"
