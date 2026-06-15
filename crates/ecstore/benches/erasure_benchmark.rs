@@ -391,19 +391,30 @@ fn bench_streaming_decode(c: &mut Criterion) {
             );
 
             group.bench_function(BenchmarkId::new("decode", name), |b| {
-                b.iter(|| {
-                    rt.block_on(async {
-                        let readers: Vec<Option<BitrotReader<Cursor<&[u8]>>>> = shard_bufs
+                b.iter_batched(
+                    || {
+                        // Setup (untimed): construct fresh per-shard readers
+                        // positioned at the object start. Reader/UUID construction
+                        // is kept out of the timed path so the measurement reflects
+                        // the per-stripe decode hot path.
+                        shard_bufs
                             .iter()
                             .map(|buf| {
                                 Some(BitrotReader::new(Cursor::new(buf.as_slice()), shard_size, hash_algo.clone(), skip_verify))
                             })
-                            .collect();
-                        let mut sink = tokio::io::sink();
-                        let (written, err) = erasure.decode(black_box(&mut sink), readers, 0, total_len, total_len).await;
-                        black_box((written, err));
-                    });
-                });
+                            .collect::<Vec<Option<BitrotReader<Cursor<&[u8]>>>>>()
+                    },
+                    |readers| {
+                        rt.block_on(async {
+                            let mut sink = tokio::io::sink();
+                            let (written, err) = erasure.decode(black_box(&mut sink), readers, 0, total_len, total_len).await;
+                            assert!(err.is_none(), "decode failed: {err:?}");
+                            assert_eq!(written, total_len, "decode wrote {written} of {total_len} bytes");
+                            black_box(written);
+                        });
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
             });
             group.finish();
         }

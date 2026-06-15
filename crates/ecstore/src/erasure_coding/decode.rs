@@ -97,8 +97,10 @@ where
         let mut futures = Vec::with_capacity(self.total_shards);
         let reader_iter: std::slice::IterMut<'_, Option<BitrotReader<R>>> = self.readers.iter_mut();
         for (i, reader) in reader_iter.enumerate() {
-            let recycled_buf = recycled[i].take();
             let future = if let Some(reader) = reader {
+                // Only claim a recycled buffer when a shard will actually be read
+                // into it; missing shards are reconstructed by `decode_data`.
+                let recycled_buf = recycled[i].take();
                 Box::pin(async move {
                     let mut buf = recycled_buf.unwrap_or_default();
                     buf.resize(shard_size, 0);
