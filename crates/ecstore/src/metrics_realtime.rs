@@ -19,6 +19,7 @@ use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_madmin::metrics::{
     DiskIOStats, DiskMetric, LastMinute as MadminLastMinute, NetDevLine, NetMetrics, RPCMetrics, RealtimeMetrics,
     ScannerCheckpointReport as MadminScannerCheckpointReport,
+    ScannerLifecycleExpirySnapshot as MadminScannerLifecycleExpirySnapshot,
     ScannerLifecycleTransitionSnapshot as MadminScannerLifecycleTransitionSnapshot,
     ScannerMaintenanceControlSnapshot as MadminScannerMaintenanceControlSnapshot,
     ScannerMaintenanceSourceSnapshot as MadminScannerMaintenanceSourceSnapshot, ScannerMetrics as MadminScannerMetrics,
@@ -179,6 +180,15 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
             scanner_missed: metrics.lifecycle_transition.scanner_missed,
             completed: metrics.lifecycle_transition.completed,
             failed: metrics.lifecycle_transition.failed,
+        },
+        lifecycle_expiry: MadminScannerLifecycleExpirySnapshot {
+            current_queue_capacity: metrics.lifecycle_expiry.current_queue_capacity,
+            current_queued: metrics.lifecycle_expiry.current_queued,
+            current_active: metrics.lifecycle_expiry.current_active,
+            current_workers: metrics.lifecycle_expiry.current_workers,
+            queue_missed: metrics.lifecycle_expiry.queue_missed,
+            scanner_queued: metrics.lifecycle_expiry.scanner_queued,
+            scanner_missed: metrics.lifecycle_expiry.scanner_missed,
         },
         maintenance_control: MadminScannerMaintenanceControlSnapshot {
             primary_control: metrics.maintenance_control.primary_control,
@@ -567,6 +577,15 @@ mod test {
             current_cycle_lifecycle_transition_actions: 3,
             last_cycle_lifecycle_expiry_actions: 5,
             last_cycle_lifecycle_transition_actions: 7,
+            lifecycle_expiry: rustfs_common::metrics::ScannerLifecycleExpirySnapshot {
+                current_queue_capacity: 16,
+                current_queued: 5,
+                current_active: 2,
+                current_workers: 4,
+                queue_missed: 3,
+                scanner_queued: 6,
+                scanner_missed: 2,
+            },
             lifecycle_transition: rustfs_common::metrics::ScannerLifecycleTransitionSnapshot {
                 current_queue_capacity: 16,
                 current_queued: 5,
@@ -585,6 +604,13 @@ mod test {
             ..Default::default()
         });
 
+        assert_eq!(scanner.lifecycle_expiry.current_queue_capacity, 16);
+        assert_eq!(scanner.lifecycle_expiry.current_queued, 5);
+        assert_eq!(scanner.lifecycle_expiry.current_active, 2);
+        assert_eq!(scanner.lifecycle_expiry.current_workers, 4);
+        assert_eq!(scanner.lifecycle_expiry.queue_missed, 3);
+        assert_eq!(scanner.lifecycle_expiry.scanner_queued, 6);
+        assert_eq!(scanner.lifecycle_expiry.scanner_missed, 2);
         assert_eq!(scanner.lifecycle_transition.current_queue_capacity, 16);
         assert_eq!(scanner.lifecycle_transition.current_queued, 5);
         assert_eq!(scanner.lifecycle_transition.current_active, 2);

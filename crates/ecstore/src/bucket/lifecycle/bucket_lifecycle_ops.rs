@@ -45,7 +45,9 @@ use futures::Future;
 use http::HeaderMap;
 use lazy_static::lazy_static;
 use rustfs_common::heal_channel::rep_has_active_rules;
-use rustfs_common::metrics::{IlmAction, Metrics, ScannerLifecycleTransitionStateUpdate, global_metrics};
+use rustfs_common::metrics::{
+    IlmAction, Metrics, ScannerLifecycleExpiryStateUpdate, ScannerLifecycleTransitionStateUpdate, global_metrics,
+};
 use rustfs_config::{
     DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
     DEFAULT_TRANSITION_WORKERS_CAP, ENV_TRANSITION_QUEUE_CAPACITY, ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS, ENV_TRANSITION_WORKERS,
@@ -110,6 +112,7 @@ const ENV_STALE_UPLOADS_CLEANUP_INTERVAL: &str = "RUSTFS_API_STALE_UPLOADS_CLEAN
 const DEFAULT_STALE_UPLOADS_EXPIRY: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 const DEFAULT_STALE_UPLOADS_CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(6 * 60 * 60);
 const DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS: i64 = 5;
+const EXPIRY_WORKER_QUEUE_CAPACITY: usize = 1000;
 
 lazy_static! {
     pub static ref GLOBAL_ExpiryState: Arc<RwLock<ExpiryState>> = ExpiryState::new();
@@ -157,7 +160,7 @@ fn is_immediate_transition_source(src: &LcEventSrc) -> bool {
 
 fn record_scanner_lifecycle_enqueue_result(src: &LcEventSrc, count: u64, queued: bool) {
     if matches!(src, LcEventSrc::Scanner) {
-        global_metrics().record_scanner_ilm_enqueue_result(count, queued);
+        global_metrics().record_scanner_expiry_enqueue_result(count, queued);
     }
 }
 
@@ -261,6 +264,8 @@ struct ExpiryStats {
     missed_expiry_tasks: AtomicI64,
     missed_freevers_tasks: AtomicI64,
     missed_tier_journal_tasks: AtomicI64,
+    pending_tasks: AtomicI64,
+    active_tasks: AtomicI64,
     workers: AtomicI64,
 }
 
@@ -278,8 +283,90 @@ impl ExpiryStats {
         self.missed_tier_journal_tasks.load(Ordering::SeqCst)
     }
 
+    pub fn pending_tasks(&self) -> i64 {
+        self.pending_tasks.load(Ordering::SeqCst)
+    }
+
+    pub fn active_tasks(&self) -> i64 {
+        self.active_tasks.load(Ordering::SeqCst)
+    }
+
     fn num_workers(&self) -> i64 {
         self.workers.load(Ordering::SeqCst)
+    }
+
+    fn add_nonnegative(counter: &AtomicI64, delta: i64) {
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_add(delta).max(0)));
+    }
+
+    fn increment_missed_expiry_tasks(&self) {
+        Self::add_nonnegative(&self.missed_expiry_tasks, 1);
+    }
+
+    fn increment_missed_freevers_tasks(&self) {
+        Self::add_nonnegative(&self.missed_freevers_tasks, 1);
+    }
+
+    fn increment_missed_tier_journal_tasks(&self) {
+        Self::add_nonnegative(&self.missed_tier_journal_tasks, 1);
+    }
+
+    fn increment_pending_tasks(&self) {
+        Self::add_nonnegative(&self.pending_tasks, 1);
+    }
+
+    fn decrement_pending_tasks(&self) {
+        Self::add_nonnegative(&self.pending_tasks, -1);
+    }
+
+    fn increment_active_tasks(&self) {
+        Self::add_nonnegative(&self.active_tasks, 1);
+    }
+
+    fn decrement_active_tasks(&self) {
+        Self::add_nonnegative(&self.active_tasks, -1);
+    }
+
+    fn increment_workers(&self) {
+        Self::add_nonnegative(&self.workers, 1);
+    }
+
+    fn decrement_workers(&self) {
+        Self::add_nonnegative(&self.workers, -1);
+    }
+
+    fn scanner_expiry_state_update(&self) -> ScannerLifecycleExpiryStateUpdate {
+        let workers = nonnegative_i64_to_u64(self.num_workers());
+        ScannerLifecycleExpiryStateUpdate {
+            queue_capacity: workers.saturating_mul(usize_to_u64_saturated(EXPIRY_WORKER_QUEUE_CAPACITY)),
+            queued: nonnegative_i64_to_u64(self.pending_tasks()),
+            active: nonnegative_i64_to_u64(self.active_tasks()),
+            workers,
+            queue_missed: nonnegative_i64_to_u64(self.missed_tasks()),
+        }
+    }
+
+    fn record_scanner_expiry_state(&self) {
+        global_metrics().record_scanner_lifecycle_expiry_state(self.scanner_expiry_state_update());
+    }
+}
+
+struct ExpiryActiveTask {
+    stats: Arc<ExpiryStats>,
+}
+
+impl ExpiryActiveTask {
+    fn begin(stats: Arc<ExpiryStats>) -> Self {
+        stats.increment_active_tasks();
+        stats.record_scanner_expiry_state();
+        Self { stats }
+    }
+}
+
+impl Drop for ExpiryActiveTask {
+    fn drop(&mut self) {
+        self.stats.decrement_active_tasks();
+        self.stats.record_scanner_expiry_state();
     }
 }
 
@@ -334,7 +421,7 @@ impl ExpiryOp for NewerNoncurrentTask {
 pub struct ExpiryState {
     tasks_tx: Vec<Sender<Option<ExpiryOpType>>>,
     tasks_rx: Vec<Arc<tokio::sync::Mutex<Receiver<Option<ExpiryOpType>>>>>,
-    stats: Option<ExpiryStats>,
+    stats: Arc<ExpiryStats>,
 }
 
 impl ExpiryState {
@@ -343,41 +430,36 @@ impl ExpiryState {
         Arc::new(RwLock::new(Self {
             tasks_tx: vec![],
             tasks_rx: vec![],
-            stats: Some(ExpiryStats {
+            stats: Arc::new(ExpiryStats {
                 missed_expiry_tasks: AtomicI64::new(0),
                 missed_freevers_tasks: AtomicI64::new(0),
                 missed_tier_journal_tasks: AtomicI64::new(0),
+                pending_tasks: AtomicI64::new(0),
+                active_tasks: AtomicI64::new(0),
                 workers: AtomicI64::new(0),
             }),
         }))
     }
 
-    pub async fn pending_tasks(&self) -> usize {
-        let rxs = &self.tasks_rx;
-        if rxs.is_empty() {
-            return 0;
-        }
-        let mut tasks = 0;
-        for rx in rxs.iter() {
-            tasks += rx.lock().await.len();
-        }
-        tasks
+    pub fn pending_tasks(&self) -> usize {
+        usize::try_from(self.stats.pending_tasks().max(0)).unwrap_or(usize::MAX)
     }
 
     pub async fn enqueue_tier_journal_entry(&mut self, je: &Jentry) -> Result<(), std::io::Error> {
         let wrkr = self.get_worker_ch(je.op_hash());
         if wrkr.is_none() {
-            *self.stats.as_mut().expect("stats lock").missed_tier_journal_tasks.get_mut() += 1;
+            self.stats.increment_missed_tier_journal_tasks();
+            self.stats.record_scanner_expiry_state();
             return Ok(());
         }
         let wrkr = wrkr.expect("worker channel should exist after None check");
-        select! {
-            //_ -> GlobalContext.Done() => ()
-            _ = wrkr.send(Some(Box::new(je.clone()))) => (),
-            else => {
-                *self.stats.as_mut().expect("stats lock").missed_tier_journal_tasks.get_mut() += 1;
-            }
+        let queued = wrkr.send(Some(Box::new(je.clone()))).await.is_ok();
+        if queued {
+            self.stats.increment_pending_tasks();
+        } else {
+            self.stats.increment_missed_tier_journal_tasks();
         }
+        self.stats.record_scanner_expiry_state();
         Ok(())
     }
 
@@ -385,17 +467,18 @@ impl ExpiryState {
         let task = FreeVersionTask(oi);
         let wrkr = self.get_worker_ch(task.op_hash());
         if wrkr.is_none() {
-            *self.stats.as_mut().expect("stats lock").missed_freevers_tasks.get_mut() += 1;
+            self.stats.increment_missed_freevers_tasks();
+            self.stats.record_scanner_expiry_state();
             return;
         }
         let wrkr = wrkr.expect("worker channel should exist after None check");
-        select! {
-            //_ -> GlobalContext.Done() => {}
-            _ = wrkr.send(Some(Box::new(task))) => (),
-            else => {
-                *self.stats.as_mut().expect("stats lock").missed_freevers_tasks.get_mut() += 1;
-            }
+        let queued = wrkr.send(Some(Box::new(task))).await.is_ok();
+        if queued {
+            self.stats.increment_pending_tasks();
+        } else {
+            self.stats.increment_missed_freevers_tasks();
         }
+        self.stats.record_scanner_expiry_state();
     }
 
     pub async fn enqueue_by_days(&mut self, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) -> bool {
@@ -406,16 +489,20 @@ impl ExpiryState {
         };
         let wrkr = self.get_worker_ch(task.op_hash());
         if wrkr.is_none() {
-            *self.stats.as_mut().expect("stats lock").missed_expiry_tasks.get_mut() += 1;
+            self.stats.increment_missed_expiry_tasks();
             record_scanner_lifecycle_enqueue_result(src, 1, false);
+            self.stats.record_scanner_expiry_state();
             return false;
         }
         let wrkr = wrkr.expect("worker channel should exist after None check");
         let queued = wrkr.send(Some(Box::new(task))).await.is_ok();
-        if !queued {
-            *self.stats.as_mut().expect("stats lock").missed_expiry_tasks.get_mut() += 1;
+        if queued {
+            self.stats.increment_pending_tasks();
+        } else {
+            self.stats.increment_missed_expiry_tasks();
         }
         record_scanner_lifecycle_enqueue_result(src, 1, queued);
+        self.stats.record_scanner_expiry_state();
         queued
     }
 
@@ -438,16 +525,20 @@ impl ExpiryState {
         };
         let wrkr = self.get_worker_ch(task.op_hash());
         if wrkr.is_none() {
-            *self.stats.as_mut().expect("stats lock").missed_expiry_tasks.get_mut() += 1;
+            self.stats.increment_missed_expiry_tasks();
             record_scanner_lifecycle_enqueue_result(src, version_count, false);
+            self.stats.record_scanner_expiry_state();
             return false;
         }
         let wrkr = wrkr.expect("worker channel should exist after None check");
         let queued = wrkr.send(Some(Box::new(task))).await.is_ok();
-        if !queued {
-            *self.stats.as_mut().expect("stats lock").missed_expiry_tasks.get_mut() += 1;
+        if queued {
+            self.stats.increment_pending_tasks();
+        } else {
+            self.stats.increment_missed_expiry_tasks();
         }
         record_scanner_lifecycle_enqueue_result(src, version_count, queued);
+        self.stats.record_scanner_expiry_state();
         queued
     }
 
@@ -459,7 +550,8 @@ impl ExpiryState {
     }
 
     pub fn increment_missed_tier_journal_tasks(&mut self) {
-        *self.stats.as_mut().expect("stats lock").missed_tier_journal_tasks.get_mut() += 1;
+        self.stats.increment_missed_tier_journal_tasks();
+        self.stats.record_scanner_expiry_state();
     }
 
     pub async fn resize_workers(n: usize, api: Arc<ECStore>) {
@@ -470,16 +562,17 @@ impl ExpiryState {
         let mut state = GLOBAL_ExpiryState.write().await;
 
         while state.tasks_tx.len() < n {
-            let (tx, rx) = mpsc::channel(1000);
+            let (tx, rx) = mpsc::channel(EXPIRY_WORKER_QUEUE_CAPACITY);
             let api = api.clone();
             let rx = Arc::new(tokio::sync::Mutex::new(rx));
+            let stats = Arc::clone(&state.stats);
             state.tasks_tx.push(tx);
             state.tasks_rx.push(rx.clone());
-            *state.stats.as_mut().expect("stats lock").workers.get_mut() += 1;
+            state.stats.increment_workers();
             tokio::spawn(async move {
                 let mut rx = rx.lock().await;
                 //let mut expiry_state = GLOBAL_ExpiryState.read().await;
-                ExpiryState::worker(&mut rx, api).await;
+                ExpiryState::worker(&mut rx, api, stats).await;
             });
         }
 
@@ -489,12 +582,13 @@ impl ExpiryState {
             worker.send(None).await.unwrap_or(());
             state.tasks_tx.remove(l - 1);
             state.tasks_rx.remove(l - 1);
-            *state.stats.as_mut().expect("stats lock").workers.get_mut() -= 1;
+            state.stats.decrement_workers();
             l -= 1;
         }
+        state.stats.record_scanner_expiry_state();
     }
 
-    pub async fn worker(rx: &mut Receiver<Option<ExpiryOpType>>, api: Arc<ECStore>) {
+    async fn worker(rx: &mut Receiver<Option<ExpiryOpType>>, api: Arc<ECStore>, stats: Arc<ExpiryStats>) {
         let cancel_token = crate::global::get_background_services_cancel_token().unwrap_or_else(|| {
             static FALLBACK: std::sync::OnceLock<tokio_util::sync::CancellationToken> = std::sync::OnceLock::new();
             FALLBACK.get_or_init(tokio_util::sync::CancellationToken::new)
@@ -525,6 +619,8 @@ impl ExpiryState {
                         return;
                     }
                     let v = v.expect("received None after None check");
+                    stats.decrement_pending_tasks();
+                    let _active_task = ExpiryActiveTask::begin(Arc::clone(&stats));
                     if v.as_any().is::<ExpiryTask>() {
                         let v = v.as_any().downcast_ref::<ExpiryTask>().expect("ExpiryTask downcast failed");
                         //debug!("lifecycle expiry worker received task: {:?}", v.obj_info);
@@ -2663,8 +2759,13 @@ mod tests {
         let queued = state.enqueue_by_days(&object, &event, &LcEventSrc::Scanner).await;
 
         assert!(!queued);
-        let stats = state.stats.as_ref().expect("expiry stats should exist");
-        assert_eq!(stats.missed_tasks(), 1);
+        assert_eq!(state.stats.missed_tasks(), 1);
+        let expiry = global_metrics().report().await.lifecycle_expiry;
+        assert_eq!(expiry.current_queue_capacity, 0);
+        assert_eq!(expiry.current_queued, 0);
+        assert_eq!(expiry.current_active, 0);
+        assert_eq!(expiry.current_workers, 0);
+        assert_eq!(expiry.queue_missed, 1);
     }
 
     #[tokio::test]
