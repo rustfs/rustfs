@@ -40,7 +40,7 @@ use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::{
     set_disk::get_lock_acquire_timeout,
-    store_api::{HTTPPreconditions, NamespaceLocking, ObjectOptions, PutObjReader, StorageAPI},
+    store_api::{HTTPPreconditions, ListOperations, NamespaceLocking, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use time::{Duration, OffsetDateTime};
@@ -2688,7 +2688,7 @@ impl<S> Clone for EcStoreTableCatalogObjectBackend<S> {
 
 impl<S> EcStoreTableCatalogObjectBackend<S>
 where
-    S: StorageAPI + NamespaceLocking,
+    S: ObjectIO + ObjectOperations + ListOperations + NamespaceLocking,
 {
     pub fn new(store: Arc<S>) -> Self {
         Self { store }
@@ -2700,7 +2700,7 @@ pub(crate) type EcStoreTableCatalogStore<S> = ObjectTableCatalogStore<EcStoreTab
 #[async_trait::async_trait]
 impl<S> TableCatalogObjectBackend for EcStoreTableCatalogObjectBackend<S>
 where
-    S: StorageAPI + NamespaceLocking,
+    S: ObjectIO + ObjectOperations + ListOperations + NamespaceLocking,
 {
     async fn read_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
         self.read_object_with_options(bucket, object, ObjectOptions::default()).await
@@ -2799,7 +2799,7 @@ where
 
 impl<S> EcStoreTableCatalogObjectBackend<S>
 where
-    S: StorageAPI + NamespaceLocking,
+    S: ObjectIO + ObjectOperations + ListOperations + NamespaceLocking,
 {
     async fn read_object_with_options(
         &self,

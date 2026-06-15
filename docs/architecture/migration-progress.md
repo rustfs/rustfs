@@ -5,18 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-loss-prevention-guards`
-- Baseline: `origin/main` at `dd6b4c35ad2c24be432c32645ce17e2d312eac78`
-- PR type for this branch: `ci-gate`
+- Branch: `overtrue/arch-storage-namespace-consumer-cleanup`
+- Baseline: `origin/main` at `307d788da1954ddaeac8a55d5040a7ce7d1a213f`
+- PR type for this branch: `consumer-migration`
 - Runtime behavior changes: no external behavior change expected.
-- Rust code changes: split lifecycle transition compensation bucket
-  reservation from background backfill spawning so the dedupe unit test does
-  not launch an actual compensation task on shared test state.
-- CI/script changes: extend `scripts/check_architecture_migration_rules.sh` to
-  guard public storage-api re-exports, StorageAPI operation-group coverage,
-  NamespaceLocking separation, and ECStore compatibility tests.
-- Docs changes: record `G-006` completion and document the guarded
-  loss-prevention coverage in `crate-boundaries.md`.
+- Rust code changes: narrow the table catalog object backend and rebalance
+  metadata merge-save helper from full `StorageAPI` bounds to their actual
+  object I/O, object operation, list, and namespace-lock capabilities.
+- CI/script changes: none.
+- Docs changes: record the current `API-012` consumer cleanup slice and its
+  verification state.
 
 ## Phase 0 Tasks
 
@@ -461,6 +459,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     namespace locking directly on ECStore storage types, and remove the
     temporary namespace-lock compatibility method from the full storage trait
     and cleanup register entry.
+  - Current cleanup slice: narrow remaining table catalog backend and rebalance
+    metadata helper consumers away from full `StorageAPI` where they only need
+    object I/O, object operations, list operations, and namespace locking.
   - Acceptance: table catalog object backend contracts express the actual
     object read/write, metadata/delete, list, and namespace-lock capabilities
     they need; namespace-lock consumers depend on `NamespaceLocking` instead of
@@ -753,43 +754,38 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | CI-gate slice extends the existing migration rule script instead of adding a parallel guard system. |
-| Migration preservation | passed | Guards fail on public storage-api re-export drift, StorageAPI operation-group drift, NamespaceLocking collapse, or missing ECStore compatibility tests without changing runtime behavior. |
-| Testing/verification | passed | Script syntax, migration/layer guards, lifecycle compensation dedupe test, ECStore compatibility test, compile check, formatting, diff hygiene, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Trait bounds now express the actual object I/O, object operation, list, and namespace-lock capabilities without adding abstractions or changing method bodies. |
+| Migration preservation | passed | Lock acquisition, table catalog object paths, optimistic preconditions, pagination, missing-object handling, and rebalance metadata save semantics are unchanged. |
+| Testing/verification | passed | Focused table catalog and rebalance tests, compile check, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `dd6b4c35ad2c24be432c32645ce17e2d312eac78`:
+Passed on `307d788da1954ddaeac8a55d5040a7ce7d1a213f`:
 
-- `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+- `cargo test -p rustfs table_catalog --no-fail-fast`: passed.
+- `cargo test -p rustfs-ecstore rebalance --no-fail-fast`: passed.
+- `cargo check -p rustfs -p rustfs-ecstore`: passed.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
-- `cargo test -p rustfs-ecstore --test storage_api_compat_test --no-fail-fast`:
-  passed.
-- `cargo test -p rustfs-ecstore bucket::lifecycle::bucket_lifecycle_ops::tests::reserve_bucket_compensation_deduplicates_same_bucket --no-fail-fast`:
-  passed.
-- `cargo check -p rustfs-ecstore`: passed.
 - `cargo fmt --all --check`: passed.
 - `git diff --check`: passed.
 - Rust risk scan: no new production `unwrap`/`expect`, lossy casts, string
-  errors, public boxed errors, or production `println`/`eprintln`.
+  errors, public boxed errors, production `println`/`eprintln`, or relaxed
+  atomics in added Rust lines.
 - `make pre-commit`: passed.
-- `git rev-list --left-right --count HEAD...origin/main`: returned `1 0`
-  after commit.
 
 Notes:
 
-- This slice completes the `G-006` loss-prevention follow-up with script-level
-  checks for the public re-export and storage trait coverage called out in the
-  migration checklist.
-- The script reads existing source/test surfaces and does not introduce a new
-  runtime behavior path.
-- The lifecycle compensation dedupe test now covers reservation directly,
-  avoiding a spawned backfill task that can inherit shared object-store test
-  state during the full pre-commit run.
+- This slice keeps the existing table catalog and rebalance method bodies
+  unchanged while narrowing the generic storage capabilities they require.
+- Table catalog storage still depends on object metadata, object writes,
+  listing, and namespace locking; rebalance metadata merge-save only needs
+  object I/O plus namespace locking.
+- The slice does not remove the full storage facade or move traits across crate
+  boundaries.
 
 ## Handoff Notes
 
-- G-006 is implemented, locally verified, and current with `origin/main`.
-- Larger cleanup slices can now rely on migration rules to catch accidental
-  public storage-api re-export drift and storage trait coverage loss.
+- API-012 cleanup is locally verified and current with `origin/main`.
+- Remaining namespace-lock cleanup can continue by migrating other consumers
+  that no longer need the full storage facade.
