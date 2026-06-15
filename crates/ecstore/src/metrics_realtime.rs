@@ -19,7 +19,9 @@ use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_madmin::metrics::{
     DiskIOStats, DiskMetric, LastMinute as MadminLastMinute, NetDevLine, NetMetrics, RPCMetrics, RealtimeMetrics,
     ScannerCheckpointReport as MadminScannerCheckpointReport,
-    ScannerLifecycleTransitionSnapshot as MadminScannerLifecycleTransitionSnapshot, ScannerMetrics as MadminScannerMetrics,
+    ScannerLifecycleTransitionSnapshot as MadminScannerLifecycleTransitionSnapshot,
+    ScannerMaintenanceControlSnapshot as MadminScannerMaintenanceControlSnapshot,
+    ScannerMaintenanceSourceSnapshot as MadminScannerMaintenanceSourceSnapshot, ScannerMetrics as MadminScannerMetrics,
     ScannerPacingPressureSnapshot as MadminScannerPacingPressureSnapshot,
     ScannerSourceCycleSnapshot as MadminScannerSourceCycleSnapshot, ScannerSourceWorkSnapshot as MadminScannerSourceWorkSnapshot,
     TimedAction as MadminTimedAction,
@@ -176,6 +178,25 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
             scanner_missed: metrics.lifecycle_transition.scanner_missed,
             completed: metrics.lifecycle_transition.completed,
             failed: metrics.lifecycle_transition.failed,
+        },
+        maintenance_control: MadminScannerMaintenanceControlSnapshot {
+            primary_control: metrics.maintenance_control.primary_control,
+            sources: metrics
+                .maintenance_control
+                .sources
+                .into_iter()
+                .map(|source| MadminScannerMaintenanceSourceSnapshot {
+                    source: source.source,
+                    state: source.state,
+                    reason: source.reason,
+                    backlog: source.backlog,
+                    current_checked: source.current_checked,
+                    current_queued: source.current_queued,
+                    current_missed: source.current_missed,
+                    lifetime_missed: source.lifetime_missed,
+                    partial_cycles: source.partial_cycles,
+                })
+                .collect(),
         },
         partial_cycles_by_source: metrics
             .partial_cycles_by_source
@@ -578,6 +599,43 @@ mod test {
         assert_eq!(scanner.current_cycle_lifecycle_transition_actions, 3);
         assert_eq!(scanner.last_cycle_lifecycle_expiry_actions, 5);
         assert_eq!(scanner.last_cycle_lifecycle_transition_actions, 7);
+    }
+
+    #[test]
+    fn scanner_metrics_mapping_preserves_maintenance_control_status() {
+        let scanner = to_madmin_scanner_metrics(rustfs_common::metrics::ScannerMetricsReport {
+            maintenance_control: rustfs_common::metrics::ScannerMaintenanceControlSnapshot {
+                primary_control: "blocked_source".to_string(),
+                sources: vec![rustfs_common::metrics::ScannerMaintenanceSourceSnapshot {
+                    source: "lifecycle".to_string(),
+                    state: "blocked".to_string(),
+                    reason: "missed_work".to_string(),
+                    backlog: 4,
+                    current_checked: 2,
+                    current_queued: 1,
+                    current_missed: 3,
+                    lifetime_missed: 8,
+                    partial_cycles: 5,
+                }],
+            },
+            ..Default::default()
+        });
+
+        assert_eq!(scanner.maintenance_control.primary_control, "blocked_source");
+        let lifecycle = scanner
+            .maintenance_control
+            .sources
+            .iter()
+            .find(|source| source.source == "lifecycle")
+            .expect("lifecycle maintenance control should be mapped");
+        assert_eq!(lifecycle.state, "blocked");
+        assert_eq!(lifecycle.reason, "missed_work");
+        assert_eq!(lifecycle.backlog, 4);
+        assert_eq!(lifecycle.current_checked, 2);
+        assert_eq!(lifecycle.current_queued, 1);
+        assert_eq!(lifecycle.current_missed, 3);
+        assert_eq!(lifecycle.lifetime_missed, 8);
+        assert_eq!(lifecycle.partial_cycles, 5);
     }
 
     #[test]

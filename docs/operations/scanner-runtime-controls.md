@@ -97,6 +97,7 @@ metrics.pacing_pressure.primary_pressure
 metrics.pacing_pressure.last_cycle_budget_limited
 metrics.lifecycle_transition.current_queued
 metrics.lifecycle_transition.scanner_missed
+metrics.maintenance_control.primary_control
 metrics.source_work
 metrics.scan_checkpoint
 ```
@@ -146,6 +147,43 @@ Use these counters to decide whether scan progress is limited by scanner pacing
 or by a downstream subsystem such as lifecycle transition, replication repair,
 or heal admission.
 
+## Reading Maintenance Control
+
+`metrics.maintenance_control` derives a source-level control snapshot from
+scanner pacing, partial-cycle state, source work, and lifecycle transition
+queue state. It does not change scanner scheduling by itself; it explains why a
+source is moving, deferred, or blocked.
+
+`metrics.maintenance_control.primary_control` summarizes the highest-priority
+source state:
+
+| Value | Meaning |
+|---|---|
+| `blocked_source` | At least one maintenance source found work that could not be admitted or is blocked by a downstream queue. |
+| `deferred_source` | At least one source was deferred by a partial scanner cycle or budget-limited pass. |
+| `active_source` | At least one source has current-cycle work or queued downstream work. |
+| `pacing_pressure` | No source-specific state dominated, but scanner pacing pressure is still visible. |
+| `none` | No source-level maintenance control pressure was observed. |
+
+Each `metrics.maintenance_control.sources[]` entry has:
+
+| Field | Meaning |
+|---|---|
+| `source` | Scanner source such as `usage`, `lifecycle`, `bucket_replication`, `site_replication`, `heal`, `bitrot`, or `alerts`. |
+| `state` | `idle`, `active`, `deferred`, or `blocked`. |
+| `reason` | Derived reason such as `active_work`, `queued_work`, `partial_cycle`, `missed_work`, `transition_queue_backlog`, or `transition_queue_full`. |
+| `backlog` | Current source-level backlog estimate from queued or missed work. |
+| `current_checked` | Current-cycle checked work for this source. |
+| `current_queued` | Current-cycle queued work for this source. |
+| `current_missed` | Current-cycle work that could not be admitted. |
+| `lifetime_missed` | Lifetime missed work counter for context. |
+| `partial_cycles` | Partial cycles attributed to this source. |
+
+Use this snapshot before changing scanner controls. For example,
+`blocked_source` with `lifecycle/missed_work` points at downstream lifecycle
+admission, while `deferred_source` with `usage/partial_cycle` points at scanner
+cycle budgets.
+
 ## Reading Distributed Metrics
 
 `/rustfs/admin/v3/scanner/status` and `/rustfs/admin/v3/metrics` report the
@@ -169,11 +207,12 @@ done
 ```
 
 The `aggregated.scanner` payload preserves the same scanner progress,
-checkpoint, pacing, source work, and lifecycle transition fields used by the
-local scanner status, but only for the node that returned the response. The
-`by_host.*.scanner` payload keeps that node's host view. Compare the per-node
-artifacts externally to find old active paths, partial checkpoints, pacing
-pressure, or downstream queue admission problems across the deployment.
+checkpoint, pacing, source work, maintenance control, and lifecycle transition
+fields used by the local scanner status, but only for the node that returned
+the response. The `by_host.*.scanner` payload keeps that node's host view.
+Compare the per-node artifacts externally to find old active paths, partial
+checkpoints, pacing pressure, source-level control pressure, or downstream
+queue admission problems across the deployment.
 
 ## Reading Lifecycle Transition Status
 
@@ -206,21 +245,23 @@ sustained CPU usage while the scanner is enabled:
 
 1. Read `/v3/scanner/status`.
 2. Check `metrics.pacing_pressure.primary_pressure`.
-3. Check `runtime_config.delay`, `runtime_config.max_wait_seconds`, and
+3. Check `metrics.maintenance_control.primary_control` and source entries
+   before changing runtime controls.
+4. Check `runtime_config.delay`, `runtime_config.max_wait_seconds`, and
    `runtime_config.cycle_interval_seconds` to confirm the active values and
    their sources.
-4. Check `metrics.current_cycle_objects_scanned`,
+5. Check `metrics.current_cycle_objects_scanned`,
    `metrics.current_cycle_directories_scanned`, and active paths to confirm the
    scanner is the active work.
-5. If `primary_pressure` is `throttle_pause` and pause ratios are low, raise
+6. If `primary_pressure` is `throttle_pause` and pause ratios are low, raise
    `scanner.delay` first.
-6. If individual sleeps are too short, raise `scanner.max_wait`.
-7. If each scan cycle finishes but starts too often, raise `scanner.cycle`.
-8. If scans must be broken into bounded chunks, set one of the cycle budgets:
+7. If individual sleeps are too short, raise `scanner.max_wait`.
+8. If each scan cycle finishes but starts too often, raise `scanner.cycle`.
+9. If scans must be broken into bounded chunks, set one of the cycle budgets:
    `scanner.cycle_max_duration`, `scanner.cycle_max_objects`, or
    `scanner.cycle_max_directories`.
-9. Recheck `pacing_pressure`, source work, and lifecycle transition status after
-   one or more scanner cycles.
+10. Recheck `pacing_pressure`, `maintenance_control`, source work, and
+    lifecycle transition status after one or more scanner cycles.
 
 Do not rely only on a longer cycle interval if lifecycle, replication, heal, or
 bitrot work must keep moving. Use source work and transition status to confirm
