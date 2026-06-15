@@ -320,6 +320,14 @@ impl Erasure {
             written += n;
 
             // Hand this stripe's buffers back so the next `read` reuses them.
+            // Only retain slots with an active reader; missing shards are always
+            // re-allocated by `decode_data`, so retaining their buffers here would
+            // hold memory that `read` can never reuse.
+            for (i, r) in reader.readers.iter().enumerate() {
+                if r.is_none() {
+                    shards[i] = None;
+                }
+            }
             reader.recycled = shards;
         }
 

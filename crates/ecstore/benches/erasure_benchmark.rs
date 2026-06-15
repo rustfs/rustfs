@@ -390,26 +390,37 @@ fn bench_streaming_decode(c: &mut Criterion) {
                 verify
             );
 
+            // Validate decode once per config (untimed) so a regression in
+            // success or output length fails the benchmark without putting
+            // assertions inside the measured loop.
+            {
+                let readers: Vec<Option<BitrotReader<Cursor<&[u8]>>>> = shard_bufs
+                    .iter()
+                    .map(|buf| Some(BitrotReader::new(Cursor::new(buf.as_slice()), shard_size, hash_algo.clone(), skip_verify)))
+                    .collect();
+                let mut sink = tokio::io::sink();
+                let (written, err) = rt.block_on(erasure.decode(&mut sink, readers, 0, total_len, total_len));
+                assert!(err.is_none(), "decode failed: {err:?}");
+                assert_eq!(written, total_len, "decode wrote {written} of {total_len} bytes");
+            }
+
             group.bench_function(BenchmarkId::new("decode", name), |b| {
                 b.iter_batched(
                     || {
-                        // Setup (untimed): construct fresh per-shard readers
-                        // positioned at the object start. Reader/UUID construction
-                        // is kept out of the timed path so the measurement reflects
-                        // the per-stripe decode hot path.
-                        shard_bufs
+                        // Setup (untimed): per-shard readers positioned at the
+                        // object start, plus the no-op sink, so reader/UUID and
+                        // sink construction stay out of the timed decode path.
+                        let readers: Vec<Option<BitrotReader<Cursor<&[u8]>>>> = shard_bufs
                             .iter()
                             .map(|buf| {
                                 Some(BitrotReader::new(Cursor::new(buf.as_slice()), shard_size, hash_algo.clone(), skip_verify))
                             })
-                            .collect::<Vec<Option<BitrotReader<Cursor<&[u8]>>>>>()
+                            .collect();
+                        (readers, tokio::io::sink())
                     },
-                    |readers| {
+                    |(readers, mut sink)| {
                         rt.block_on(async {
-                            let mut sink = tokio::io::sink();
-                            let (written, err) = erasure.decode(black_box(&mut sink), readers, 0, total_len, total_len).await;
-                            assert!(err.is_none(), "decode failed: {err:?}");
-                            assert_eq!(written, total_len, "decode wrote {written} of {total_len} bytes");
+                            let (written, _err) = erasure.decode(black_box(&mut sink), readers, 0, total_len, total_len).await;
                             black_box(written);
                         });
                     },
