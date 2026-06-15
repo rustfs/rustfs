@@ -27,6 +27,11 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 
+use bytes::Bytes;
+use datafusion::{
+    arrow::datatypes::SchemaRef,
+    parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
+};
 use http::HeaderMap;
 use metrics::{counter, histogram};
 use rustfs_ecstore::bucket::{
@@ -536,7 +541,26 @@ pub(crate) struct TableCompactionPlanningReport {
     pub candidate_file_count: usize,
     pub rewrite_group_count: usize,
     pub manual_review_count: usize,
+    #[serde(default, rename = "committed-metadata-location")]
+    pub committed_metadata_location: Option<String>,
+    #[serde(default, rename = "rewrite-groups")]
+    pub rewrite_groups: Vec<TableCompactionRewriteGroup>,
     pub snapshot_reports: Vec<TableCompactionSnapshotReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TableCompactionRewriteGroup {
+    pub group_id: String,
+    #[serde(rename = "input-file-locations")]
+    pub input_file_locations: Vec<String>,
+    #[serde(rename = "input-file-count")]
+    pub input_file_count: usize,
+    #[serde(rename = "input-bytes")]
+    pub input_bytes: u64,
+    #[serde(default, rename = "output-file-location")]
+    pub output_file_location: Option<String>,
+    #[serde(default, rename = "output-bytes")]
+    pub output_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -551,6 +575,8 @@ pub(crate) struct TableCompactionSnapshotReport {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableCompactionPlanningStatus {
     NoCandidates,
+    RewriteCandidates,
+    Committed,
     ManualReviewRequired,
 }
 
@@ -558,9 +584,14 @@ pub(crate) enum TableCompactionPlanningStatus {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableCompactionPlanningReason {
     ManifestList,
+    ManifestFile,
+    SmallDataFile,
+    RewriteGroup,
+    CompactionCommitted,
     ManifestAvroReaderUnavailable,
     MissingCurrentSnapshot,
     MissingManifestList,
+    MissingDataFile,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -850,6 +881,14 @@ fn table_warehouse_object_prefix_from_location(table_bucket: &str, warehouse_loc
 
 fn table_warehouse_object_prefix(entry: &TableEntry) -> TableCatalogStoreResult<String> {
     table_warehouse_object_prefix_from_location(&entry.table_bucket, &entry.warehouse_location)
+}
+
+fn table_warehouse_data_dir_path(entry: &TableEntry) -> TableCatalogStoreResult<String> {
+    Ok(format!("{}{}", table_warehouse_object_prefix(entry)?, DATA_DIR))
+}
+
+fn table_object_s3_location(table_bucket: &str, object_key: &str) -> String {
+    format!("s3://{table_bucket}/{object_key}")
 }
 
 fn metadata_warehouse_location(
@@ -1970,14 +2009,182 @@ where
             )));
         }
 
-        Ok(table_compaction_planning_report(
-            table_bucket,
-            &namespace,
-            &table,
-            &entry,
+        table_compaction_planning_report(&self.backend, table_bucket, &namespace, &table, &entry, &current_metadata, config).await
+    }
+
+    pub(crate) async fn commit_table_compaction(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        config: TableCompactionPlanningConfig,
+    ) -> TableCatalogStoreResult<TableCompactionPlanningReport> {
+        validate_table_compaction_planning_config(&config)?;
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
+        let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &table_path).await? else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "table {}/{}/{}",
+                table_bucket,
+                namespace.public_name(),
+                table.as_str()
+            )));
+        };
+        if !is_valid_table_metadata_location(&namespace, &table, &entry.metadata_location) {
+            return Err(TableCatalogStoreError::Invalid(
+                "current metadata location must be inside the table metadata directory".to_string(),
+            ));
+        }
+
+        let Some(current_metadata_object) = self.backend.read_object(table_bucket, &entry.metadata_location).await? else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "current metadata object {}",
+                entry.metadata_location
+            )));
+        };
+        let current_metadata = serde_json::from_slice::<serde_json::Value>(&current_metadata_object.data).map_err(|err| {
+            TableCatalogStoreError::Invalid(format!("failed to parse current metadata {}: {err}", entry.metadata_location))
+        })?;
+        if !current_metadata.is_object() {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "current metadata {} must be a JSON object",
+                entry.metadata_location
+            )));
+        }
+        validate_unpartitioned_compaction_table(&current_metadata)?;
+
+        let mut report =
+            table_compaction_planning_report(&self.backend, table_bucket, &namespace, &table, &entry, &current_metadata, config)
+                .await?;
+        if report.status != TableCompactionPlanningStatus::RewriteCandidates {
+            return Err(TableCatalogStoreError::Invalid("compaction has no safe rewrite candidates".to_string()));
+        }
+        let current_data_files =
+            compaction_current_data_files(&self.backend, table_bucket, &namespace, &table, &entry, &current_metadata).await?;
+        let rewritten_inputs = report
+            .rewrite_groups
+            .iter()
+            .flat_map(|group| group.input_file_locations.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let mut manifest_data_files = current_data_files
+            .into_iter()
+            .filter(|file| !rewritten_inputs.contains(&file.object_key))
+            .collect::<Vec<_>>();
+
+        let now = OffsetDateTime::now_utc();
+        let snapshot_id = compaction_snapshot_id(&current_metadata, &entry, now);
+        let sequence_number = next_compaction_sequence_number(&current_metadata);
+        let metadata_dir = default_table_metadata_dir_path(&namespace, &table);
+        let data_dir = table_warehouse_data_dir_path(&entry)?;
+        let compaction_id = Uuid::new_v4().to_string();
+        let mut compacted_files = Vec::with_capacity(report.rewrite_groups.len());
+        for rewrite_group in &mut report.rewrite_groups {
+            let output_file = format!("{data_dir}/compaction-{compaction_id}-{}.parquet", rewrite_group.group_id);
+            let output_file_path = table_object_s3_location(table_bucket, &output_file);
+            let mut input_files = Vec::with_capacity(rewrite_group.input_file_locations.len());
+            for input_file in &rewrite_group.input_file_locations {
+                let Some(input_object) = self.backend.read_object(table_bucket, input_file).await? else {
+                    return Err(TableCatalogStoreError::NotFound(format!("compaction input data file {input_file}")));
+                };
+                input_files.push((input_file.clone(), input_object.data));
+            }
+            let compacted_file = compact_parquet_data_files(&input_files)?;
+            let output_bytes = u64::try_from(compacted_file.data.len()).unwrap_or(u64::MAX);
+            self.backend
+                .put_object(table_bucket, &output_file, compacted_file.data, TableCatalogPutPrecondition::IfAbsent)
+                .await?;
+            rewrite_group.output_file_location = Some(output_file_path.clone());
+            rewrite_group.output_bytes = Some(output_bytes);
+            compacted_files.push(CompactedDataFile {
+                object_key: output_file,
+                file_path: output_file_path,
+                file_size_bytes: output_bytes,
+                record_count: compacted_file.record_count,
+                status: 1,
+                snapshot_id,
+                sequence_number,
+                file_sequence_number: sequence_number,
+            });
+        }
+        manifest_data_files.extend(compacted_files.iter().cloned());
+
+        let new_manifest = format!("{metadata_dir}/manifest-compaction-{compaction_id}.avro");
+        let new_manifest_list = format!("{metadata_dir}/snap-{snapshot_id}-compaction-{compaction_id}.avro");
+        let new_metadata =
+            default_table_metadata_file_path(&namespace, &table, &format!("compaction-{compaction_id}.metadata.json"));
+        let manifest_data = compacted_manifest_avro_bytes(&manifest_data_files)?;
+        let manifest_length = u64::try_from(manifest_data.len()).unwrap_or(u64::MAX);
+        self.backend
+            .put_object(table_bucket, &new_manifest, manifest_data, TableCatalogPutPrecondition::IfAbsent)
+            .await?;
+        let added_files_count = compacted_files.len();
+        let added_rows_count = compacted_files
+            .iter()
+            .fold(0_u64, |rows, file| rows.saturating_add(file.record_count));
+        let existing_files_count = manifest_data_files.len().saturating_sub(added_files_count);
+        let existing_rows_count = manifest_data_files
+            .iter()
+            .filter(|file| file.status == 0)
+            .fold(0_u64, |rows, file| rows.saturating_add(file.record_count));
+        let manifest_list_data = compacted_manifest_list_avro_bytes(CompactionManifestListSummary {
+            manifest_path: &new_manifest,
+            manifest_length,
+            snapshot_id,
+            sequence_number,
+            added_files_count,
+            existing_files_count,
+            added_rows_count,
+            existing_rows_count,
+        })?;
+        self.backend
+            .put_object(
+                table_bucket,
+                &new_manifest_list,
+                manifest_list_data,
+                TableCatalogPutPrecondition::IfAbsent,
+            )
+            .await?;
+        let new_metadata_data = compaction_metadata_json(
             &current_metadata,
-            config,
-        ))
+            &entry,
+            snapshot_id,
+            sequence_number,
+            &new_manifest_list,
+            &entry.metadata_location,
+            now,
+        )?;
+        self.backend
+            .put_object(table_bucket, &new_metadata, new_metadata_data, TableCatalogPutPrecondition::IfAbsent)
+            .await?;
+
+        let commit_result = self
+            .commit_table(TableCommitRequest {
+                table_bucket: table_bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                commit_id: format!("compaction-{compaction_id}"),
+                idempotency_key: Some(format!("compaction-{compaction_id}")),
+                operation: "compaction".to_string(),
+                expected_version_token: entry.version_token,
+                expected_metadata_location: entry.metadata_location,
+                new_metadata_location: new_metadata.clone(),
+                requirements: Vec::new(),
+                writer: Some("rustfs-maintenance".to_string()),
+            })
+            .await?;
+
+        report.status = TableCompactionPlanningStatus::Committed;
+        report.committed_metadata_location = Some(commit_result.table.metadata_location);
+        for snapshot in &mut report.snapshot_reports {
+            if snapshot.status == TableCompactionPlanningStatus::RewriteCandidates {
+                snapshot.status = TableCompactionPlanningStatus::Committed;
+                if !snapshot.reasons.contains(&TableCompactionPlanningReason::CompactionCommitted) {
+                    snapshot.reasons.push(TableCompactionPlanningReason::CompactionCommitted);
+                }
+            }
+        }
+        Ok(report)
     }
 
     pub(crate) async fn export_table_catalog_entry(
@@ -3606,6 +3813,13 @@ fn mark_referenced_object_manual_review(
 }
 
 fn manifest_paths_from_manifest_list_avro(data: &[u8]) -> TableCatalogStoreResult<Vec<String>> {
+    Ok(manifest_list_references_from_manifest_list_avro(data)?
+        .into_iter()
+        .map(|reference| reference.manifest_path)
+        .collect())
+}
+
+fn manifest_list_references_from_manifest_list_avro(data: &[u8]) -> TableCatalogStoreResult<Vec<ManifestListReference>> {
     let reader = apache_avro::Reader::new(data)
         .map_err(|err| TableCatalogStoreError::Invalid(format!("failed to read manifest list Avro: {err}")))?;
     let mut manifest_paths = Vec::new();
@@ -3615,12 +3829,23 @@ fn manifest_paths_from_manifest_list_avro(data: &[u8]) -> TableCatalogStoreResul
         let manifest_path = avro_record_field(&value, "manifest_path")
             .and_then(avro_string_value)
             .ok_or_else(|| TableCatalogStoreError::Invalid("manifest list entry missing manifest_path".to_string()))?;
-        manifest_paths.push(manifest_path.to_string());
+        manifest_paths.push(ManifestListReference {
+            manifest_path: manifest_path.to_string(),
+            sequence_number: avro_record_field(&value, "sequence_number").and_then(avro_i64_value),
+            added_snapshot_id: avro_record_field(&value, "added_snapshot_id").and_then(avro_i64_value),
+        });
     }
     Ok(manifest_paths)
 }
 
 fn file_references_from_manifest_avro(data: &[u8]) -> TableCatalogStoreResult<Vec<(String, TableMetadataMaintenanceObjectKind)>> {
+    Ok(data_file_references_from_manifest_avro(data)?
+        .into_iter()
+        .map(|reference| (reference.location, reference.object_kind))
+        .collect())
+}
+
+fn data_file_references_from_manifest_avro(data: &[u8]) -> TableCatalogStoreResult<Vec<ManifestDataFileReference>> {
     let reader = apache_avro::Reader::new(data)
         .map_err(|err| TableCatalogStoreError::Invalid(format!("failed to read manifest Avro: {err}")))?;
     let mut files = Vec::new();
@@ -3639,7 +3864,20 @@ fn file_references_from_manifest_avro(data: &[u8]) -> TableCatalogStoreResult<Ve
             1 | 2 => TableMetadataMaintenanceObjectKind::DeleteFile,
             _ => continue,
         };
-        files.push((file_path.to_string(), object_kind));
+        files.push(ManifestDataFileReference {
+            location: file_path.to_string(),
+            object_kind,
+            entry_status: avro_record_field(&value, "status").and_then(avro_i32_value),
+            snapshot_id: avro_record_field(&value, "snapshot_id").and_then(avro_i64_value),
+            sequence_number: avro_record_field(&value, "sequence_number").and_then(avro_i64_value),
+            file_sequence_number: avro_record_field(&value, "file_sequence_number").and_then(avro_i64_value),
+            record_count: avro_record_field(data_file, "record_count")
+                .and_then(avro_i64_value)
+                .and_then(|value| u64::try_from(value).ok()),
+            file_size_bytes: avro_record_field(data_file, "file_size_in_bytes")
+                .and_then(avro_i64_value)
+                .and_then(|value| u64::try_from(value).ok()),
+        });
     }
     Ok(files)
 }
@@ -3671,6 +3909,13 @@ fn avro_string_value(value: &apache_avro::types::Value) -> Option<&str> {
 fn avro_i32_value(value: &apache_avro::types::Value) -> Option<i32> {
     match avro_non_union_value(value) {
         apache_avro::types::Value::Int(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn avro_i64_value(value: &apache_avro::types::Value) -> Option<i64> {
+    match avro_non_union_value(value) {
+        apache_avro::types::Value::Long(value) => Some(*value),
         _ => None,
     }
 }
@@ -4223,75 +4468,181 @@ fn table_snapshot_expiration_report(
     }
 }
 
-fn table_compaction_planning_report(
+#[derive(Debug, Clone)]
+struct TableCompactionDataFileCandidate {
+    location: String,
+    size_bytes: u64,
+}
+
+struct CompactedParquetFile {
+    data: Vec<u8>,
+    record_count: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CompactedDataFile {
+    object_key: String,
+    file_path: String,
+    file_size_bytes: u64,
+    record_count: u64,
+    status: i32,
+    snapshot_id: i64,
+    sequence_number: i64,
+    file_sequence_number: i64,
+}
+
+struct ManifestDataFileReference {
+    location: String,
+    object_kind: TableMetadataMaintenanceObjectKind,
+    entry_status: Option<i32>,
+    snapshot_id: Option<i64>,
+    sequence_number: Option<i64>,
+    file_sequence_number: Option<i64>,
+    record_count: Option<u64>,
+    file_size_bytes: Option<u64>,
+}
+
+struct ManifestListReference {
+    manifest_path: String,
+    sequence_number: Option<i64>,
+    added_snapshot_id: Option<i64>,
+}
+
+struct CompactionManifestListSummary<'a> {
+    manifest_path: &'a str,
+    manifest_length: u64,
+    snapshot_id: i64,
+    sequence_number: i64,
+    added_files_count: usize,
+    existing_files_count: usize,
+    added_rows_count: u64,
+    existing_rows_count: u64,
+}
+
+async fn table_compaction_planning_report<B>(
+    backend: &B,
     table_bucket: &str,
     namespace: &Namespace,
     table: &IdentifierSegment,
     entry: &TableEntry,
     current_metadata: &serde_json::Value,
     config: TableCompactionPlanningConfig,
-) -> TableCompactionPlanningReport {
+) -> TableCatalogStoreResult<TableCompactionPlanningReport>
+where
+    B: TableCatalogObjectBackend,
+{
     let current_snapshot_id = current_metadata
         .get("current-snapshot-id")
         .and_then(serde_json::Value::as_i64);
-    let snapshot_reports = match current_snapshot_id {
-        Some(current_snapshot_id) => {
-            let current_snapshot = current_metadata
-                .get("snapshots")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-                .find(|snapshot| {
-                    snapshot
-                        .get("snapshot-id")
-                        .and_then(serde_json::Value::as_i64)
-                        .is_some_and(|snapshot_id| snapshot_id == current_snapshot_id)
-                });
-            match current_snapshot {
-                Some(snapshot) => {
-                    let manifest_list = snapshot
-                        .get("manifest-list")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string);
-                    let mut reasons = BTreeSet::new();
-                    if manifest_list.is_some() {
-                        reasons.insert(TableCompactionPlanningReason::ManifestList);
-                        reasons.insert(TableCompactionPlanningReason::ManifestAvroReaderUnavailable);
-                    } else {
-                        reasons.insert(TableCompactionPlanningReason::MissingManifestList);
+    let warehouse_object_prefix = table_warehouse_object_prefix(entry).ok();
+    let mut snapshot_reports = Vec::new();
+    let mut candidates = Vec::new();
+    let mut rewrite_groups = Vec::new();
+
+    if let Some(current_snapshot_id) = current_snapshot_id {
+        let current_snapshot = current_metadata
+            .get("snapshots")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|snapshot| {
+                snapshot
+                    .get("snapshot-id")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some_and(|snapshot_id| snapshot_id == current_snapshot_id)
+            });
+        match current_snapshot {
+            Some(snapshot) => {
+                let manifest_list = snapshot
+                    .get("manifest-list")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string);
+                match manifest_list.as_deref() {
+                    Some(manifest_list) => {
+                        candidates = match compaction_data_file_candidates(
+                            backend,
+                            table_bucket,
+                            namespace,
+                            table,
+                            warehouse_object_prefix.as_deref(),
+                            manifest_list,
+                            &config,
+                        )
+                        .await
+                        {
+                            Ok(candidates) => candidates,
+                            Err(_) => {
+                                snapshot_reports.push(TableCompactionSnapshotReport {
+                                    snapshot_id: Some(current_snapshot_id),
+                                    manifest_list: Some(manifest_list.to_string()),
+                                    status: TableCompactionPlanningStatus::ManualReviewRequired,
+                                    reasons: vec![
+                                        TableCompactionPlanningReason::ManifestList,
+                                        TableCompactionPlanningReason::ManifestAvroReaderUnavailable,
+                                    ],
+                                });
+                                Vec::new()
+                            }
+                        };
+                        if !candidates.is_empty() && snapshot_reports.is_empty() {
+                            rewrite_groups = compaction_rewrite_groups(&candidates, &config);
+                            let (status, reasons) = if rewrite_groups.is_empty() {
+                                (
+                                    TableCompactionPlanningStatus::NoCandidates,
+                                    vec![
+                                        TableCompactionPlanningReason::ManifestList,
+                                        TableCompactionPlanningReason::ManifestFile,
+                                    ],
+                                )
+                            } else {
+                                (
+                                    TableCompactionPlanningStatus::RewriteCandidates,
+                                    vec![
+                                        TableCompactionPlanningReason::ManifestList,
+                                        TableCompactionPlanningReason::ManifestFile,
+                                        TableCompactionPlanningReason::SmallDataFile,
+                                        TableCompactionPlanningReason::RewriteGroup,
+                                    ],
+                                )
+                            };
+                            snapshot_reports.push(TableCompactionSnapshotReport {
+                                snapshot_id: Some(current_snapshot_id),
+                                manifest_list: Some(manifest_list.to_string()),
+                                status,
+                                reasons,
+                            });
+                        }
                     }
-
-                    vec![TableCompactionSnapshotReport {
+                    None => snapshot_reports.push(TableCompactionSnapshotReport {
                         snapshot_id: Some(current_snapshot_id),
-                        manifest_list,
+                        manifest_list: None,
                         status: TableCompactionPlanningStatus::ManualReviewRequired,
-                        reasons: reasons.into_iter().collect(),
-                    }]
+                        reasons: vec![TableCompactionPlanningReason::MissingManifestList],
+                    }),
                 }
-                None => vec![TableCompactionSnapshotReport {
-                    snapshot_id: Some(current_snapshot_id),
-                    manifest_list: None,
-                    status: TableCompactionPlanningStatus::ManualReviewRequired,
-                    reasons: vec![TableCompactionPlanningReason::MissingCurrentSnapshot],
-                }],
             }
+            None => snapshot_reports.push(TableCompactionSnapshotReport {
+                snapshot_id: Some(current_snapshot_id),
+                manifest_list: None,
+                status: TableCompactionPlanningStatus::ManualReviewRequired,
+                reasons: vec![TableCompactionPlanningReason::MissingCurrentSnapshot],
+            }),
         }
-        None => Vec::new(),
-    };
+    }
 
-    let (status, manual_review_count) = if snapshot_reports.is_empty() {
-        (TableCompactionPlanningStatus::NoCandidates, 0)
+    let manual_review_count = snapshot_reports
+        .iter()
+        .filter(|snapshot| snapshot.status == TableCompactionPlanningStatus::ManualReviewRequired)
+        .count();
+    let status = if manual_review_count > 0 {
+        TableCompactionPlanningStatus::ManualReviewRequired
+    } else if rewrite_groups.is_empty() {
+        TableCompactionPlanningStatus::NoCandidates
     } else {
-        (
-            TableCompactionPlanningStatus::ManualReviewRequired,
-            snapshot_reports
-                .iter()
-                .filter(|snapshot| snapshot.status == TableCompactionPlanningStatus::ManualReviewRequired)
-                .count(),
-        )
+        TableCompactionPlanningStatus::RewriteCandidates
     };
 
-    TableCompactionPlanningReport {
+    Ok(TableCompactionPlanningReport {
         table_bucket: table_bucket.to_string(),
         namespace: namespace.public_name(),
         table: table.as_str().to_string(),
@@ -4300,11 +4651,664 @@ fn table_compaction_planning_report(
         current_snapshot_id,
         config,
         status,
-        candidate_file_count: 0,
-        rewrite_group_count: 0,
+        candidate_file_count: candidates.len(),
+        rewrite_group_count: rewrite_groups.len(),
         manual_review_count,
+        committed_metadata_location: None,
+        rewrite_groups,
         snapshot_reports,
+    })
+}
+
+async fn compaction_data_file_candidates<B>(
+    backend: &B,
+    table_bucket: &str,
+    namespace: &Namespace,
+    table: &IdentifierSegment,
+    warehouse_object_prefix: Option<&str>,
+    manifest_list: &str,
+    config: &TableCompactionPlanningConfig,
+) -> TableCatalogStoreResult<Vec<TableCompactionDataFileCandidate>>
+where
+    B: TableCatalogObjectBackend,
+{
+    let Some(manifest_list_key) = table_catalog_object_key_from_location(table_bucket, manifest_list) else {
+        return Err(TableCatalogStoreError::Invalid(
+            "compaction manifest list must be inside the table bucket".to_string(),
+        ));
+    };
+    if table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &manifest_list_key)
+        != Some(TableMetadataMaintenanceObjectKind::ManifestList)
+    {
+        return Err(TableCatalogStoreError::Invalid(
+            "compaction manifest list must be inside the table metadata directory".to_string(),
+        ));
     }
+    let Some(manifest_list_object) = backend.read_object(table_bucket, &manifest_list_key).await? else {
+        return Err(TableCatalogStoreError::NotFound(format!("compaction manifest list {manifest_list_key}")));
+    };
+    let manifest_paths = manifest_paths_from_manifest_list_avro(&manifest_list_object.data)?;
+    let mut candidates = Vec::new();
+    for manifest_location in manifest_paths {
+        let Some(manifest_key) = table_catalog_object_key_from_location(table_bucket, &manifest_location) else {
+            return Err(TableCatalogStoreError::Invalid(
+                "compaction manifest must be inside the table bucket".to_string(),
+            ));
+        };
+        if table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &manifest_key)
+            != Some(TableMetadataMaintenanceObjectKind::ManifestFile)
+        {
+            return Err(TableCatalogStoreError::Invalid(
+                "compaction manifest must be inside the table metadata directory".to_string(),
+            ));
+        }
+        let Some(manifest_object) = backend.read_object(table_bucket, &manifest_key).await? else {
+            return Err(TableCatalogStoreError::NotFound(format!("compaction manifest {manifest_key}")));
+        };
+        for reference in data_file_references_from_manifest_avro(&manifest_object.data)? {
+            if reference.object_kind != TableMetadataMaintenanceObjectKind::DataFile {
+                return Err(TableCatalogStoreError::Invalid(
+                    "compaction currently does not support delete files".to_string(),
+                ));
+            }
+            validate_compaction_manifest_entry_status(reference.entry_status)?;
+            let Some(data_key) = table_catalog_object_key_from_location(table_bucket, &reference.location) else {
+                return Err(TableCatalogStoreError::Invalid(
+                    "compaction data file must be inside the table bucket".to_string(),
+                ));
+            };
+            if table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &data_key)
+                != Some(TableMetadataMaintenanceObjectKind::DataFile)
+            {
+                return Err(TableCatalogStoreError::Invalid(
+                    "compaction data file must be inside the table data directory".to_string(),
+                ));
+            }
+            let Some(data_object) = backend.read_object(table_bucket, &data_key).await? else {
+                return Err(TableCatalogStoreError::NotFound(format!("compaction data file {data_key}")));
+            };
+            let size_bytes = u64::try_from(data_object.data.len()).unwrap_or(u64::MAX);
+            if size_bytes <= config.small_file_threshold_bytes {
+                candidates.push(TableCompactionDataFileCandidate {
+                    location: data_key,
+                    size_bytes,
+                });
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+async fn compaction_current_data_files<B>(
+    backend: &B,
+    table_bucket: &str,
+    namespace: &Namespace,
+    table: &IdentifierSegment,
+    entry: &TableEntry,
+    current_metadata: &serde_json::Value,
+) -> TableCatalogStoreResult<Vec<CompactedDataFile>>
+where
+    B: TableCatalogObjectBackend,
+{
+    let current_snapshot_id = current_metadata
+        .get("current-snapshot-id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| TableCatalogStoreError::Invalid("compaction requires current snapshot metadata".to_string()))?;
+    let current_snapshot = current_metadata
+        .get("snapshots")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|snapshot| {
+            snapshot
+                .get("snapshot-id")
+                .and_then(serde_json::Value::as_i64)
+                .is_some_and(|snapshot_id| snapshot_id == current_snapshot_id)
+        })
+        .ok_or_else(|| TableCatalogStoreError::Invalid("compaction requires current snapshot entry".to_string()))?;
+    let manifest_list = current_snapshot
+        .get("manifest-list")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| TableCatalogStoreError::Invalid("compaction requires current snapshot manifest list".to_string()))?;
+
+    let warehouse_object_prefix = table_warehouse_object_prefix(entry).ok();
+    let Some(manifest_list_key) = table_catalog_object_key_from_location(table_bucket, manifest_list) else {
+        return Err(TableCatalogStoreError::Invalid(
+            "compaction manifest list must be inside the table bucket".to_string(),
+        ));
+    };
+    if table_maintenance_object_kind(namespace, table, warehouse_object_prefix.as_deref(), &manifest_list_key)
+        != Some(TableMetadataMaintenanceObjectKind::ManifestList)
+    {
+        return Err(TableCatalogStoreError::Invalid(
+            "compaction manifest list must be inside the table metadata directory".to_string(),
+        ));
+    }
+    let Some(manifest_list_object) = backend.read_object(table_bucket, &manifest_list_key).await? else {
+        return Err(TableCatalogStoreError::NotFound(format!("compaction manifest list {manifest_list_key}")));
+    };
+
+    let mut data_files = Vec::new();
+    for manifest_reference in manifest_list_references_from_manifest_list_avro(&manifest_list_object.data)? {
+        let Some(manifest_key) = table_catalog_object_key_from_location(table_bucket, &manifest_reference.manifest_path) else {
+            return Err(TableCatalogStoreError::Invalid(
+                "compaction manifest must be inside the table bucket".to_string(),
+            ));
+        };
+        if table_maintenance_object_kind(namespace, table, warehouse_object_prefix.as_deref(), &manifest_key)
+            != Some(TableMetadataMaintenanceObjectKind::ManifestFile)
+        {
+            return Err(TableCatalogStoreError::Invalid(
+                "compaction manifest must be inside the table metadata directory".to_string(),
+            ));
+        }
+        let Some(manifest_object) = backend.read_object(table_bucket, &manifest_key).await? else {
+            return Err(TableCatalogStoreError::NotFound(format!("compaction manifest {manifest_key}")));
+        };
+        for reference in data_file_references_from_manifest_avro(&manifest_object.data)? {
+            if reference.object_kind != TableMetadataMaintenanceObjectKind::DataFile {
+                return Err(TableCatalogStoreError::Invalid(
+                    "compaction currently does not support delete files".to_string(),
+                ));
+            }
+            validate_compaction_manifest_entry_status(reference.entry_status)?;
+            let Some(data_key) = table_catalog_object_key_from_location(table_bucket, &reference.location) else {
+                return Err(TableCatalogStoreError::Invalid(
+                    "compaction data file must be inside the table bucket".to_string(),
+                ));
+            };
+            if table_maintenance_object_kind(namespace, table, warehouse_object_prefix.as_deref(), &data_key)
+                != Some(TableMetadataMaintenanceObjectKind::DataFile)
+            {
+                return Err(TableCatalogStoreError::Invalid(
+                    "compaction data file must be inside the table data directory".to_string(),
+                ));
+            }
+            let Some(data_object) = backend.read_object(table_bucket, &data_key).await? else {
+                return Err(TableCatalogStoreError::NotFound(format!("compaction data file {data_key}")));
+            };
+            let snapshot_id = reference
+                .snapshot_id
+                .or(manifest_reference.added_snapshot_id)
+                .ok_or_else(|| {
+                    TableCatalogStoreError::Invalid("compaction manifest data file missing snapshot id".to_string())
+                })?;
+            let sequence_number = reference
+                .sequence_number
+                .or(manifest_reference.sequence_number)
+                .ok_or_else(|| {
+                    TableCatalogStoreError::Invalid("compaction manifest data file missing sequence number".to_string())
+                })?;
+            let file_sequence_number = reference
+                .file_sequence_number
+                .or(manifest_reference.sequence_number)
+                .ok_or_else(|| {
+                    TableCatalogStoreError::Invalid("compaction manifest data file missing file sequence number".to_string())
+                })?;
+            data_files.push(CompactedDataFile {
+                object_key: data_key,
+                file_path: reference.location,
+                file_size_bytes: reference
+                    .file_size_bytes
+                    .unwrap_or_else(|| u64::try_from(data_object.data.len()).unwrap_or(u64::MAX)),
+                record_count: match reference.record_count {
+                    Some(record_count) => record_count,
+                    None => parquet_record_count(&data_object.data)?,
+                },
+                status: 0,
+                snapshot_id,
+                sequence_number,
+                file_sequence_number,
+            });
+        }
+    }
+
+    Ok(data_files)
+}
+
+fn compaction_rewrite_groups(
+    candidates: &[TableCompactionDataFileCandidate],
+    config: &TableCompactionPlanningConfig,
+) -> Vec<TableCompactionRewriteGroup> {
+    let mut groups = Vec::new();
+    let mut current_locations = Vec::new();
+    let mut current_bytes = 0_u64;
+    for candidate in candidates {
+        let next_bytes = current_bytes.saturating_add(candidate.size_bytes);
+        if !current_locations.is_empty() && next_bytes > config.max_rewrite_bytes_per_job {
+            push_compaction_rewrite_group(&mut groups, &mut current_locations, &mut current_bytes, config);
+        }
+        current_locations.push(candidate.location.clone());
+        current_bytes = current_bytes.saturating_add(candidate.size_bytes);
+    }
+    push_compaction_rewrite_group(&mut groups, &mut current_locations, &mut current_bytes, config);
+    groups
+}
+
+fn push_compaction_rewrite_group(
+    groups: &mut Vec<TableCompactionRewriteGroup>,
+    current_locations: &mut Vec<String>,
+    current_bytes: &mut u64,
+    config: &TableCompactionPlanningConfig,
+) {
+    if current_locations.len() >= config.min_input_files {
+        let input_file_count = current_locations.len();
+        groups.push(TableCompactionRewriteGroup {
+            group_id: format!("{:04}", groups.len() + 1),
+            input_file_locations: std::mem::take(current_locations),
+            input_file_count,
+            input_bytes: *current_bytes,
+            output_file_location: None,
+            output_bytes: None,
+        });
+    } else {
+        current_locations.clear();
+    }
+    *current_bytes = 0;
+}
+
+fn compact_parquet_data_files(input_files: &[(String, Vec<u8>)]) -> TableCatalogStoreResult<CompactedParquetFile> {
+    let mut schema: Option<SchemaRef> = None;
+    let mut batches = Vec::new();
+    let mut record_count = 0_u64;
+
+    for (location, data) in input_files {
+        let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(data.clone())).map_err(|err| {
+            TableCatalogStoreError::Invalid(format!("failed to read compaction input parquet {location}: {err}"))
+        })?;
+        let file_schema = builder.schema().clone();
+        match schema.as_ref() {
+            Some(expected_schema) if expected_schema.as_ref() != file_schema.as_ref() => {
+                return Err(TableCatalogStoreError::Invalid("compaction input parquet schemas must match".to_string()));
+            }
+            Some(_) => {}
+            None => schema = Some(file_schema),
+        }
+
+        let reader = builder.build().map_err(|err| {
+            TableCatalogStoreError::Invalid(format!("failed to build compaction parquet reader {location}: {err}"))
+        })?;
+        for batch in reader {
+            let batch = batch.map_err(|err| {
+                TableCatalogStoreError::Invalid(format!("failed to read compaction parquet batch {location}: {err}"))
+            })?;
+            record_count = record_count.saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX));
+            batches.push(batch);
+        }
+    }
+
+    let Some(schema) = schema else {
+        return Err(TableCatalogStoreError::Invalid(
+            "compaction requires at least one parquet input file".to_string(),
+        ));
+    };
+    let mut data = Vec::new();
+    {
+        let mut writer = ArrowWriter::try_new(&mut data, schema, None)
+            .map_err(|err| TableCatalogStoreError::Internal(format!("failed to build compaction parquet writer: {err}")))?;
+        for batch in batches {
+            writer
+                .write(&batch)
+                .map_err(|err| TableCatalogStoreError::Internal(format!("failed to write compaction parquet batch: {err}")))?;
+        }
+        writer
+            .close()
+            .map_err(|err| TableCatalogStoreError::Internal(format!("failed to close compaction parquet writer: {err}")))?;
+    }
+
+    Ok(CompactedParquetFile { data, record_count })
+}
+
+fn validate_compaction_manifest_entry_status(entry_status: Option<i32>) -> TableCatalogStoreResult<()> {
+    match entry_status {
+        Some(0 | 1) => Ok(()),
+        Some(2) => Err(TableCatalogStoreError::Invalid(
+            "compaction currently does not support deleted manifest entries".to_string(),
+        )),
+        Some(_) => Err(TableCatalogStoreError::Invalid(
+            "compaction manifest entry status is unsupported".to_string(),
+        )),
+        None => Err(TableCatalogStoreError::Invalid("compaction manifest entry missing status".to_string())),
+    }
+}
+
+fn parquet_record_count(data: &[u8]) -> TableCatalogStoreResult<u64> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(data))
+        .map_err(|err| TableCatalogStoreError::Invalid(format!("failed to read compaction parquet metadata: {err}")))?;
+    u64::try_from(builder.metadata().file_metadata().num_rows())
+        .map_err(|_| TableCatalogStoreError::Invalid("compaction parquet record count must not be negative".to_string()))
+}
+
+fn validate_unpartitioned_compaction_table(current_metadata: &serde_json::Value) -> TableCatalogStoreResult<()> {
+    let default_spec_id = current_metadata
+        .get("default-spec-id")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let Some(partition_specs) = current_metadata.get("partition-specs").and_then(serde_json::Value::as_array) else {
+        return Ok(());
+    };
+    let Some(default_spec) = partition_specs.iter().find(|spec| {
+        spec.get("spec-id")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|spec_id| spec_id == default_spec_id)
+    }) else {
+        return Err(TableCatalogStoreError::Invalid(
+            "compaction requires default partition spec metadata".to_string(),
+        ));
+    };
+    if default_spec
+        .get("fields")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|fields| !fields.is_empty())
+    {
+        return Err(TableCatalogStoreError::Invalid(
+            "compaction currently supports unpartitioned tables only".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn compacted_manifest_list_avro_bytes(summary: CompactionManifestListSummary<'_>) -> TableCatalogStoreResult<Vec<u8>> {
+    let schema = apache_avro::Schema::parse_str(
+        r#"
+        {
+          "type": "record",
+          "name": "manifest_file",
+          "fields": [
+            {"name": "manifest_path", "type": "string"},
+            {"name": "manifest_length", "type": "long"},
+            {"name": "partition_spec_id", "type": "int"},
+            {"name": "content", "type": "int"},
+            {"name": "sequence_number", "type": "long"},
+            {"name": "min_sequence_number", "type": "long"},
+            {"name": "added_snapshot_id", "type": "long"},
+            {"name": "added_files_count", "type": "int"},
+            {"name": "existing_files_count", "type": "int"},
+            {"name": "deleted_files_count", "type": "int"},
+            {"name": "added_rows_count", "type": "long"},
+            {"name": "existing_rows_count", "type": "long"},
+            {"name": "deleted_rows_count", "type": "long"},
+            {"name": "partitions", "type": ["null", {"type": "array", "items": {"type": "record", "name": "field_summary", "fields": [
+              {"name": "contains_null", "type": "boolean"},
+              {"name": "lower_bound", "type": ["null", "bytes"], "default": null},
+              {"name": "upper_bound", "type": ["null", "bytes"], "default": null}
+            ]}}], "default": null}
+          ]
+        }
+        "#,
+    )
+    .map_err(|err| TableCatalogStoreError::Internal(format!("failed to build compaction manifest list schema: {err}")))?;
+    let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+    writer
+        .append(apache_avro::types::Value::Record(vec![
+            (
+                "manifest_path".to_string(),
+                apache_avro::types::Value::String(summary.manifest_path.to_string()),
+            ),
+            (
+                "manifest_length".to_string(),
+                apache_avro::types::Value::Long(i64::try_from(summary.manifest_length).unwrap_or(i64::MAX)),
+            ),
+            ("partition_spec_id".to_string(), apache_avro::types::Value::Int(0)),
+            ("content".to_string(), apache_avro::types::Value::Int(0)),
+            ("sequence_number".to_string(), apache_avro::types::Value::Long(summary.sequence_number)),
+            (
+                "min_sequence_number".to_string(),
+                apache_avro::types::Value::Long(summary.sequence_number),
+            ),
+            ("added_snapshot_id".to_string(), apache_avro::types::Value::Long(summary.snapshot_id)),
+            (
+                "added_files_count".to_string(),
+                apache_avro::types::Value::Int(i32::try_from(summary.added_files_count).unwrap_or(i32::MAX)),
+            ),
+            (
+                "existing_files_count".to_string(),
+                apache_avro::types::Value::Int(i32::try_from(summary.existing_files_count).unwrap_or(i32::MAX)),
+            ),
+            ("deleted_files_count".to_string(), apache_avro::types::Value::Int(0)),
+            (
+                "added_rows_count".to_string(),
+                apache_avro::types::Value::Long(i64::try_from(summary.added_rows_count).unwrap_or(i64::MAX)),
+            ),
+            (
+                "existing_rows_count".to_string(),
+                apache_avro::types::Value::Long(i64::try_from(summary.existing_rows_count).unwrap_or(i64::MAX)),
+            ),
+            ("deleted_rows_count".to_string(), apache_avro::types::Value::Long(0)),
+            (
+                "partitions".to_string(),
+                apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+            ),
+        ]))
+        .map_err(|err| TableCatalogStoreError::Internal(format!("failed to write compaction manifest list: {err}")))?;
+    writer
+        .into_inner()
+        .map_err(|err| TableCatalogStoreError::Internal(format!("failed to flush compaction manifest list: {err}")))
+}
+
+fn compacted_manifest_avro_bytes(data_files: &[CompactedDataFile]) -> TableCatalogStoreResult<Vec<u8>> {
+    let schema = apache_avro::Schema::parse_str(
+        r#"
+        {
+          "type": "record",
+          "name": "manifest_entry",
+          "fields": [
+            {"name": "status", "type": "int"},
+            {"name": "snapshot_id", "type": "long"},
+            {"name": "sequence_number", "type": "long"},
+            {"name": "file_sequence_number", "type": "long"},
+            {
+              "name": "data_file",
+              "type": {
+                "type": "record",
+                "name": "data_file",
+                "fields": [
+                  {"name": "content", "type": "int"},
+                  {"name": "file_path", "type": "string"},
+                  {"name": "file_format", "type": "string"},
+                  {"name": "partition", "type": {"type": "record", "name": "partition", "fields": []}},
+                  {"name": "record_count", "type": "long"},
+                  {"name": "file_size_in_bytes", "type": "long"},
+                  {"name": "column_sizes", "type": ["null", {"type": "map", "values": "long"}], "default": null},
+                  {"name": "value_counts", "type": ["null", {"type": "map", "values": "long"}], "default": null},
+                  {"name": "null_value_counts", "type": ["null", {"type": "map", "values": "long"}], "default": null},
+                  {"name": "nan_value_counts", "type": ["null", {"type": "map", "values": "long"}], "default": null},
+                  {"name": "lower_bounds", "type": ["null", {"type": "map", "values": "bytes"}], "default": null},
+                  {"name": "upper_bounds", "type": ["null", {"type": "map", "values": "bytes"}], "default": null},
+                  {"name": "key_metadata", "type": ["null", "bytes"], "default": null},
+                  {"name": "split_offsets", "type": ["null", {"type": "array", "items": "long"}], "default": null},
+                  {"name": "equality_ids", "type": ["null", {"type": "array", "items": "int"}], "default": null},
+                  {"name": "sort_order_id", "type": ["null", "int"], "default": null}
+                ]
+              }
+            }
+          ]
+        }
+        "#,
+    )
+    .map_err(|err| TableCatalogStoreError::Internal(format!("failed to build compaction manifest schema: {err}")))?;
+    let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+    for data_file in data_files {
+        writer
+            .append(apache_avro::types::Value::Record(vec![
+                ("status".to_string(), apache_avro::types::Value::Int(data_file.status)),
+                ("snapshot_id".to_string(), apache_avro::types::Value::Long(data_file.snapshot_id)),
+                ("sequence_number".to_string(), apache_avro::types::Value::Long(data_file.sequence_number)),
+                (
+                    "file_sequence_number".to_string(),
+                    apache_avro::types::Value::Long(data_file.file_sequence_number),
+                ),
+                (
+                    "data_file".to_string(),
+                    apache_avro::types::Value::Record(vec![
+                        ("content".to_string(), apache_avro::types::Value::Int(0)),
+                        ("file_path".to_string(), apache_avro::types::Value::String(data_file.file_path.clone())),
+                        ("file_format".to_string(), apache_avro::types::Value::String("PARQUET".to_string())),
+                        ("partition".to_string(), apache_avro::types::Value::Record(Vec::new())),
+                        (
+                            "record_count".to_string(),
+                            apache_avro::types::Value::Long(i64::try_from(data_file.record_count).unwrap_or(i64::MAX)),
+                        ),
+                        (
+                            "file_size_in_bytes".to_string(),
+                            apache_avro::types::Value::Long(i64::try_from(data_file.file_size_bytes).unwrap_or(i64::MAX)),
+                        ),
+                        (
+                            "column_sizes".to_string(),
+                            apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                        ),
+                        (
+                            "value_counts".to_string(),
+                            apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                        ),
+                        (
+                            "null_value_counts".to_string(),
+                            apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                        ),
+                        (
+                            "nan_value_counts".to_string(),
+                            apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                        ),
+                        (
+                            "lower_bounds".to_string(),
+                            apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                        ),
+                        (
+                            "upper_bounds".to_string(),
+                            apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                        ),
+                        (
+                            "key_metadata".to_string(),
+                            apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                        ),
+                        (
+                            "split_offsets".to_string(),
+                            apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                        ),
+                        (
+                            "equality_ids".to_string(),
+                            apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                        ),
+                        (
+                            "sort_order_id".to_string(),
+                            apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                        ),
+                    ]),
+                ),
+            ]))
+            .map_err(|err| TableCatalogStoreError::Internal(format!("failed to write compaction manifest: {err}")))?;
+    }
+    writer
+        .into_inner()
+        .map_err(|err| TableCatalogStoreError::Internal(format!("failed to flush compaction manifest: {err}")))
+}
+
+fn compaction_snapshot_id(current_metadata: &serde_json::Value, entry: &TableEntry, now: OffsetDateTime) -> i64 {
+    let generation = i64::try_from(entry.generation).unwrap_or(i64::MAX);
+    let mut snapshot_id = unix_timestamp_millis(now).saturating_mul(1000).saturating_add(generation);
+    let existing_snapshot_ids = current_metadata
+        .get("snapshots")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|snapshot| snapshot.get("snapshot-id").and_then(serde_json::Value::as_i64))
+        .collect::<BTreeSet<_>>();
+    while existing_snapshot_ids.contains(&snapshot_id) {
+        snapshot_id = snapshot_id.saturating_add(1);
+    }
+    snapshot_id
+}
+
+fn next_compaction_sequence_number(current_metadata: &serde_json::Value) -> i64 {
+    current_metadata
+        .get("last-sequence-number")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0)
+        .saturating_add(1)
+}
+
+fn compaction_metadata_json(
+    current_metadata: &serde_json::Value,
+    entry: &TableEntry,
+    snapshot_id: i64,
+    sequence_number: i64,
+    manifest_list: &str,
+    previous_metadata_location: &str,
+    now: OffsetDateTime,
+) -> TableCatalogStoreResult<Vec<u8>> {
+    let mut metadata = current_metadata.clone();
+    let now_ms = unix_timestamp_millis(now);
+    let Some(metadata_object) = metadata.as_object_mut() else {
+        return Err(TableCatalogStoreError::Invalid(
+            "compaction metadata source must be a JSON object".to_string(),
+        ));
+    };
+    metadata_object.insert("last-sequence-number".to_string(), serde_json::json!(sequence_number));
+    metadata_object.insert("last-updated-ms".to_string(), serde_json::json!(now_ms));
+    metadata_object.insert("current-snapshot-id".to_string(), serde_json::json!(snapshot_id));
+
+    let snapshots = metadata_object
+        .entry("snapshots".to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    let Some(snapshots) = snapshots.as_array_mut() else {
+        return Err(TableCatalogStoreError::Invalid(
+            "compaction metadata snapshots must be an array".to_string(),
+        ));
+    };
+    snapshots.push(serde_json::json!({
+        "snapshot-id": snapshot_id,
+        "sequence-number": sequence_number,
+        "timestamp-ms": now_ms,
+        "manifest-list": manifest_list,
+        "summary": {
+            "operation": "rewrite",
+            "rustfs.maintenance": "compaction"
+        }
+    }));
+
+    let snapshot_log = metadata_object
+        .entry("snapshot-log".to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    let Some(snapshot_log) = snapshot_log.as_array_mut() else {
+        return Err(TableCatalogStoreError::Invalid(
+            "compaction metadata snapshot log must be an array".to_string(),
+        ));
+    };
+    snapshot_log.push(serde_json::json!({
+        "timestamp-ms": now_ms,
+        "snapshot-id": snapshot_id
+    }));
+
+    let metadata_log = metadata_object
+        .entry("metadata-log".to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    let Some(metadata_log) = metadata_log.as_array_mut() else {
+        return Err(TableCatalogStoreError::Invalid("compaction metadata log must be an array".to_string()));
+    };
+    metadata_log.push(serde_json::json!({
+        "timestamp-ms": now_ms,
+        "metadata-file": previous_metadata_location
+    }));
+
+    let refs = metadata_object
+        .entry("refs".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(refs) = refs.as_object_mut() else {
+        return Err(TableCatalogStoreError::Invalid("compaction metadata refs must be an object".to_string()));
+    };
+    refs.insert(
+        ICEBERG_MAIN_REF.to_string(),
+        serde_json::json!({
+            "snapshot-id": snapshot_id,
+            "type": "branch"
+        }),
+    );
+    metadata_object
+        .entry("location".to_string())
+        .or_insert_with(|| serde_json::json!(entry.warehouse_location));
+
+    serde_json::to_vec(&metadata)
+        .map_err(|err| TableCatalogStoreError::Internal(format!("failed to serialize compaction metadata: {err}")))
 }
 
 fn snapshot_expiration_drafts(
@@ -5301,7 +6305,16 @@ fn is_lower_ascii_alnum(value: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::{
+        arrow::{
+            array::{Array, Int32Array, Int64Array},
+            datatypes::{DataType, Field, Schema, SchemaRef},
+            record_batch::RecordBatch,
+        },
+        parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
+    };
     use std::assert_matches;
+    use std::sync::Arc;
 
     #[test]
     fn reserved_table_object_key_matches_exact_prefix_and_children_only() {
@@ -5742,7 +6755,9 @@ mod tests {
               "type": "record",
               "name": "manifest_file",
               "fields": [
-                {"name": "manifest_path", "type": "string"}
+                {"name": "manifest_path", "type": "string"},
+                {"name": "sequence_number", "type": "long"},
+                {"name": "added_snapshot_id", "type": "long"}
               ]
             }
             "#,
@@ -5751,22 +6766,39 @@ mod tests {
         let mut writer = apache_avro::Writer::new(&schema, Vec::new());
         for manifest_path in manifest_paths {
             writer
-                .append(apache_avro::types::Value::Record(vec![(
-                    "manifest_path".to_string(),
-                    apache_avro::types::Value::String((*manifest_path).to_string()),
-                )]))
+                .append(apache_avro::types::Value::Record(vec![
+                    (
+                        "manifest_path".to_string(),
+                        apache_avro::types::Value::String((*manifest_path).to_string()),
+                    ),
+                    ("sequence_number".to_string(), apache_avro::types::Value::Long(7)),
+                    ("added_snapshot_id".to_string(), apache_avro::types::Value::Long(20)),
+                ]))
                 .expect("manifest list record should append");
         }
         writer.into_inner().expect("manifest list avro bytes should flush")
     }
 
     fn manifest_avro_bytes(files: &[(&str, i32)]) -> Vec<u8> {
+        manifest_avro_bytes_with_status(
+            &files
+                .iter()
+                .map(|(file_path, content)| (*file_path, *content, 1))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn manifest_avro_bytes_with_status(files: &[(&str, i32, i32)]) -> Vec<u8> {
         let schema = apache_avro::Schema::parse_str(
             r#"
             {
               "type": "record",
               "name": "manifest_entry",
               "fields": [
+                {"name": "status", "type": "int"},
+                {"name": "snapshot_id", "type": "long"},
+                {"name": "sequence_number", "type": "long"},
+                {"name": "file_sequence_number", "type": "long"},
                 {
                   "name": "data_file",
                   "type": {
@@ -5774,7 +6806,9 @@ mod tests {
                     "name": "data_file",
                     "fields": [
                       {"name": "content", "type": "int"},
-                      {"name": "file_path", "type": "string"}
+                      {"name": "file_path", "type": "string"},
+                      {"name": "record_count", "type": "long"},
+                      {"name": "file_size_in_bytes", "type": "long"}
                     ]
                   }
                 }
@@ -5784,18 +6818,94 @@ mod tests {
         )
         .expect("manifest avro schema should parse");
         let mut writer = apache_avro::Writer::new(&schema, Vec::new());
-        for (file_path, content) in files {
+        for (file_path, content, status) in files {
             writer
-                .append(apache_avro::types::Value::Record(vec![(
-                    "data_file".to_string(),
-                    apache_avro::types::Value::Record(vec![
-                        ("content".to_string(), apache_avro::types::Value::Int(*content)),
-                        ("file_path".to_string(), apache_avro::types::Value::String((*file_path).to_string())),
-                    ]),
-                )]))
+                .append(apache_avro::types::Value::Record(vec![
+                    ("status".to_string(), apache_avro::types::Value::Int(*status)),
+                    ("snapshot_id".to_string(), apache_avro::types::Value::Long(20)),
+                    ("sequence_number".to_string(), apache_avro::types::Value::Long(7)),
+                    ("file_sequence_number".to_string(), apache_avro::types::Value::Long(7)),
+                    (
+                        "data_file".to_string(),
+                        apache_avro::types::Value::Record(vec![
+                            ("content".to_string(), apache_avro::types::Value::Int(*content)),
+                            ("file_path".to_string(), apache_avro::types::Value::String((*file_path).to_string())),
+                            ("record_count".to_string(), apache_avro::types::Value::Long(1)),
+                            ("file_size_in_bytes".to_string(), apache_avro::types::Value::Long(1)),
+                        ]),
+                    ),
+                ]))
                 .expect("manifest record should append");
         }
         writer.into_inner().expect("manifest avro bytes should flush")
+    }
+
+    fn parquet_i32_bytes(values: &[i32]) -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema) as SchemaRef, vec![Arc::new(Int32Array::from(values.to_vec()))])
+            .expect("parquet test batch should build");
+        let mut bytes = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut bytes, schema, None).expect("parquet writer should build");
+            writer.write(&batch).expect("parquet batch should write");
+            writer.close().expect("parquet writer should close");
+        }
+        bytes
+    }
+
+    fn parquet_i64_bytes(values: &[i64]) -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema) as SchemaRef, vec![Arc::new(Int64Array::from(values.to_vec()))])
+            .expect("parquet test batch should build");
+        let mut bytes = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut bytes, schema, None).expect("parquet writer should build");
+            writer.write(&batch).expect("parquet batch should write");
+            writer.close().expect("parquet writer should close");
+        }
+        bytes
+    }
+
+    fn parquet_i32_values(data: Vec<u8>) -> Vec<i32> {
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(data))
+            .expect("parquet reader should build")
+            .build()
+            .expect("parquet batches should build");
+        let mut values = Vec::new();
+        for batch in reader {
+            let batch = batch.expect("parquet batch should read");
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("first parquet column should be int32");
+            values.extend((0..column.len()).map(|index| column.value(index)));
+        }
+        values
+    }
+
+    #[test]
+    fn compaction_partition_validation_rejects_partitioned_default_spec() {
+        let metadata = serde_json::json!({
+            "default-spec-id": 1,
+            "partition-specs": [
+                {
+                    "spec-id": 1,
+                    "fields": [
+                        {
+                            "source-id": 1,
+                            "field-id": 1000,
+                            "name": "dt",
+                            "transform": "identity"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let error = validate_unpartitioned_compaction_table(&metadata).expect_err("partitioned compaction should be rejected");
+
+        assert!(matches!(error, TableCatalogStoreError::Invalid(message) if message.contains("unpartitioned tables only")));
     }
 
     #[async_trait::async_trait]
@@ -7928,6 +9038,341 @@ mod tests {
                 .reasons
                 .contains(&TableCompactionPlanningReason::MissingCurrentSnapshot)
         );
+    }
+
+    #[tokio::test]
+    async fn compaction_commit_rewrites_small_data_files_and_advances_pointer() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let metadata_dir = default_table_metadata_dir_path(&namespace, &table);
+        let data_dir = default_table_data_dir_path(&namespace, &table);
+        let current = default_table_metadata_file_path(&namespace, &table, "00004.metadata.json");
+        let manifest_list = format!("{metadata_dir}/snap-20.avro");
+        let manifest = format!("{metadata_dir}/manifest-20.avro");
+        let left_data = format!("{data_dir}/part-left.parquet");
+        let right_data = format!("{data_dir}/part-right.parquet");
+        let retained_data = format!("{data_dir}/part-retained.parquet");
+        let left_parquet = parquet_i32_bytes(&[1, 2]);
+        let right_parquet = parquet_i32_bytes(&[3, 4]);
+        let retained_values = (10..20_000).collect::<Vec<_>>();
+        let retained_parquet = parquet_i32_bytes(&retained_values);
+        let small_file_threshold_bytes = u64::try_from(left_parquet.len().max(right_parquet.len())).unwrap();
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[&manifest]))
+            .await;
+        backend
+            .seed_object(
+                bucket,
+                &manifest,
+                manifest_avro_bytes(&[(&left_data, 0), (&right_data, 0), (&retained_data, 0)]),
+            )
+            .await;
+        backend.seed_object(bucket, &left_data, left_parquet).await;
+        backend.seed_object(bucket, &right_data, right_parquet).await;
+        backend.seed_object(bucket, &retained_data, retained_parquet).await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://analytics/tables/table-id",
+                    "last-sequence-number": 7,
+                    "last-updated-ms": 2000,
+                    "metadata-log": [],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 20,
+                            "sequence-number": 7,
+                            "timestamp-ms": 2000,
+                            "manifest-list": manifest_list,
+                            "summary": {
+                                "operation": "append"
+                            }
+                        }
+                    ],
+                    "current-snapshot-id": 20,
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 20,
+                            "type": "branch"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let report = store
+            .commit_table_compaction(
+                bucket,
+                "sales",
+                "orders",
+                TableCompactionPlanningConfig {
+                    target_file_size_bytes: 64 * 1024,
+                    small_file_threshold_bytes,
+                    min_input_files: 2,
+                    max_rewrite_bytes_per_job: 128 * 1024,
+                },
+            )
+            .await
+            .expect("compaction rewrite should commit");
+
+        assert_eq!(report.status, TableCompactionPlanningStatus::Committed);
+        assert_eq!(report.candidate_file_count, 2);
+        assert_eq!(report.rewrite_group_count, 1);
+        assert_eq!(report.manual_review_count, 0);
+        let committed_metadata = report
+            .committed_metadata_location
+            .as_ref()
+            .expect("compaction should report committed metadata");
+        assert_ne!(committed_metadata, &current);
+        let rewrite_group = report.rewrite_groups.first().expect("rewrite group should be reported");
+        assert_eq!(rewrite_group.input_file_locations, vec![left_data.clone(), right_data.clone()]);
+        let output_file = rewrite_group
+            .output_file_location
+            .as_ref()
+            .expect("rewrite group should include output data file");
+        assert!(output_file.starts_with("s3://analytics/tables/table-id/data/"));
+        let output_file_key =
+            table_catalog_object_key_from_location(bucket, output_file).expect("output file should be inside the table bucket");
+        assert!(output_file_key.starts_with("tables/table-id/data/"));
+        let output_object = backend
+            .read_object(bucket, &output_file_key)
+            .await
+            .unwrap()
+            .expect("compacted data file should be written");
+        assert_eq!(parquet_i32_values(output_object.data), vec![1, 2, 3, 4]);
+        assert!(backend.object_exists(bucket, &left_data).await.unwrap());
+        assert!(backend.object_exists(bucket, &right_data).await.unwrap());
+        assert!(backend.object_exists(bucket, &retained_data).await.unwrap());
+
+        let table_entry = store
+            .load_table(bucket, "sales", "orders")
+            .await
+            .unwrap()
+            .expect("table should still exist");
+        assert_eq!(table_entry.metadata_location, *committed_metadata);
+        assert_eq!(table_entry.generation, 2);
+        let metadata_object = backend
+            .read_object(bucket, committed_metadata)
+            .await
+            .unwrap()
+            .expect("compaction metadata should be written");
+        let metadata = serde_json::from_slice::<serde_json::Value>(&metadata_object.data).unwrap();
+        assert_ne!(metadata.get("current-snapshot-id").and_then(serde_json::Value::as_i64), Some(20));
+        assert_eq!(metadata.get("snapshots").and_then(serde_json::Value::as_array).unwrap().len(), 2);
+        assert_eq!(
+            metadata
+                .get("metadata-log")
+                .and_then(serde_json::Value::as_array)
+                .unwrap()
+                .last()
+                .and_then(|entry| entry.get("metadata-file"))
+                .and_then(serde_json::Value::as_str),
+            Some(current.as_str())
+        );
+        assert_eq!(
+            metadata
+                .get("snapshot-log")
+                .and_then(serde_json::Value::as_array)
+                .unwrap()
+                .last()
+                .and_then(|entry| entry.get("snapshot-id"))
+                .and_then(serde_json::Value::as_i64),
+            metadata.get("current-snapshot-id").and_then(serde_json::Value::as_i64)
+        );
+        let current_manifest_list = metadata
+            .get("snapshots")
+            .and_then(serde_json::Value::as_array)
+            .unwrap()
+            .last()
+            .and_then(|snapshot| snapshot.get("manifest-list"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        let manifest_list_object = backend
+            .read_object(bucket, current_manifest_list)
+            .await
+            .unwrap()
+            .expect("compaction manifest list should be written");
+        let manifest_paths = manifest_paths_from_manifest_list_avro(&manifest_list_object.data).unwrap();
+        assert_eq!(manifest_paths.len(), 1);
+        let manifest_object = backend
+            .read_object(bucket, &manifest_paths[0])
+            .await
+            .unwrap()
+            .expect("compaction manifest should be written");
+        let manifest_references = file_references_from_manifest_avro(&manifest_object.data).unwrap();
+        let manifest_data_files = manifest_references
+            .into_iter()
+            .filter_map(|(location, kind)| (kind == TableMetadataMaintenanceObjectKind::DataFile).then_some(location))
+            .collect::<BTreeSet<_>>();
+        assert!(manifest_data_files.contains(output_file));
+        assert!(manifest_data_files.contains(&retained_data));
+        assert!(!manifest_data_files.contains(&left_data));
+        assert!(!manifest_data_files.contains(&right_data));
+    }
+
+    #[tokio::test]
+    async fn compaction_commit_rejects_schema_mismatch_without_advancing_pointer() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let metadata_dir = default_table_metadata_dir_path(&namespace, &table);
+        let data_dir = default_table_data_dir_path(&namespace, &table);
+        let current = default_table_metadata_file_path(&namespace, &table, "00004.metadata.json");
+        let manifest_list = format!("{metadata_dir}/snap-20.avro");
+        let manifest = format!("{metadata_dir}/manifest-20.avro");
+        let left_data = format!("{data_dir}/part-left.parquet");
+        let right_data = format!("{data_dir}/part-right.parquet");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[&manifest]))
+            .await;
+        backend
+            .seed_object(bucket, &manifest, manifest_avro_bytes(&[(&left_data, 0), (&right_data, 0)]))
+            .await;
+        backend.seed_object(bucket, &left_data, parquet_i32_bytes(&[1, 2])).await;
+        backend.seed_object(bucket, &right_data, parquet_i64_bytes(&[3, 4])).await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://analytics/tables/table-id",
+                    "last-sequence-number": 7,
+                    "last-updated-ms": 2000,
+                    "metadata-log": [],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 20,
+                            "sequence-number": 7,
+                            "timestamp-ms": 2000,
+                            "manifest-list": manifest_list,
+                            "summary": {
+                                "operation": "append"
+                            }
+                        }
+                    ],
+                    "current-snapshot-id": 20
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let error = store
+            .commit_table_compaction(
+                bucket,
+                "sales",
+                "orders",
+                TableCompactionPlanningConfig {
+                    target_file_size_bytes: 64 * 1024,
+                    small_file_threshold_bytes: 32 * 1024,
+                    min_input_files: 2,
+                    max_rewrite_bytes_per_job: 128 * 1024,
+                },
+            )
+            .await
+            .expect_err("schema mismatch should reject compaction commit");
+
+        assert!(matches!(error, TableCatalogStoreError::Invalid(message) if message.contains("schemas must match")));
+        let table_entry = store
+            .load_table(bucket, "sales", "orders")
+            .await
+            .unwrap()
+            .expect("table should still exist");
+        assert_eq!(table_entry.metadata_location, current);
+    }
+
+    #[tokio::test]
+    async fn compaction_commit_rejects_deleted_manifest_entries_without_advancing_pointer() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let metadata_dir = default_table_metadata_dir_path(&namespace, &table);
+        let data_dir = default_table_data_dir_path(&namespace, &table);
+        let current = default_table_metadata_file_path(&namespace, &table, "00004.metadata.json");
+        let manifest_list = format!("{metadata_dir}/snap-20.avro");
+        let manifest = format!("{metadata_dir}/manifest-20.avro");
+        let left_data = format!("{data_dir}/part-left.parquet");
+        let deleted_data = format!("{data_dir}/part-deleted.parquet");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[&manifest]))
+            .await;
+        backend
+            .seed_object(
+                bucket,
+                &manifest,
+                manifest_avro_bytes_with_status(&[(&left_data, 0, 1), (&deleted_data, 0, 2)]),
+            )
+            .await;
+        backend.seed_object(bucket, &left_data, parquet_i32_bytes(&[1, 2])).await;
+        backend.seed_object(bucket, &deleted_data, parquet_i32_bytes(&[3, 4])).await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://analytics/tables/table-id",
+                    "last-sequence-number": 7,
+                    "last-updated-ms": 2000,
+                    "metadata-log": [],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 20,
+                            "sequence-number": 7,
+                            "timestamp-ms": 2000,
+                            "manifest-list": manifest_list,
+                            "summary": {
+                                "operation": "overwrite"
+                            }
+                        }
+                    ],
+                    "current-snapshot-id": 20
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let error = store
+            .commit_table_compaction(
+                bucket,
+                "sales",
+                "orders",
+                TableCompactionPlanningConfig {
+                    target_file_size_bytes: 64 * 1024,
+                    small_file_threshold_bytes: 32 * 1024,
+                    min_input_files: 2,
+                    max_rewrite_bytes_per_job: 128 * 1024,
+                },
+            )
+            .await
+            .expect_err("deleted manifest entries should reject compaction commit");
+
+        assert!(matches!(error, TableCatalogStoreError::Invalid(message) if message.contains("no safe rewrite candidates")));
+        let table_entry = store
+            .load_table(bucket, "sales", "orders")
+            .await
+            .unwrap()
+            .expect("table should still exist");
+        assert_eq!(table_entry.metadata_location, current);
     }
 
     #[tokio::test]
