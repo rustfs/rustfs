@@ -19,7 +19,7 @@ use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::C
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{error, info, warn};
 
 use crate::{
     admin::{
@@ -36,8 +36,63 @@ use hyper::Method;
 
 use std::collections::HashSet;
 
+const LOG_COMPONENT_ADMIN_API: &str = "admin_api";
+const LOG_SUBSYSTEM_POOL_ADMIN: &str = "pool_admin";
+const EVENT_ADMIN_REQUEST_REJECTED: &str = "admin_request_rejected";
+const EVENT_ADMIN_REQUEST_FAILED: &str = "admin_request_failed";
+const EVENT_ADMIN_RESPONSE_EMITTED: &str = "admin_response_emitted";
+
 fn endpoints_from_context() -> Option<rustfs_ecstore::endpoints::EndpointServerPools> {
     resolve_endpoints_handle()
+}
+
+fn log_pool_request_rejected(operation: &'static str, reason: &'static str) {
+    warn!(
+        event = EVENT_ADMIN_REQUEST_REJECTED,
+        component = LOG_COMPONENT_ADMIN_API,
+        subsystem = LOG_SUBSYSTEM_POOL_ADMIN,
+        operation,
+        result = "rejected",
+        reason,
+        "admin request rejected"
+    );
+}
+
+fn log_pool_request_rejected_with_pool(operation: &'static str, reason: &'static str, pool: &str) {
+    warn!(
+        event = EVENT_ADMIN_REQUEST_REJECTED,
+        component = LOG_COMPONENT_ADMIN_API,
+        subsystem = LOG_SUBSYSTEM_POOL_ADMIN,
+        operation,
+        result = "rejected",
+        reason,
+        pool,
+        "admin request rejected"
+    );
+}
+
+fn log_pool_request_failed(operation: &'static str, reason: &'static str, err: &dyn std::fmt::Display) {
+    error!(
+        event = EVENT_ADMIN_REQUEST_FAILED,
+        component = LOG_COMPONENT_ADMIN_API,
+        subsystem = LOG_SUBSYSTEM_POOL_ADMIN,
+        operation,
+        result = "failed",
+        reason,
+        error = %err,
+        "admin request failed"
+    );
+}
+
+fn log_pool_response_emitted(operation: &'static str) {
+    info!(
+        event = EVENT_ADMIN_RESPONSE_EMITTED,
+        component = LOG_COMPONENT_ADMIN_API,
+        subsystem = LOG_SUBSYSTEM_POOL_ADMIN,
+        operation,
+        result = "success",
+        "admin response emitted"
+    );
 }
 
 fn validate_start_decommission_guards(decommission_running: bool, rebalance_running: bool) -> s3s::S3Result<()> {
@@ -68,22 +123,31 @@ fn contextualize_admin_pool_api_error(
 }
 
 fn decommission_admin_not_initialized_error(operation: &str) -> S3Error {
+    log_pool_request_failed(
+        operation_to_event(operation),
+        "object_layer_not_initialized",
+        &"object layer not initialized",
+    );
     S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to {operation}: object layer not initialized"))
 }
 
 fn pool_admin_missing_credentials_error(operation: &str) -> S3Error {
+    log_pool_request_rejected(operation_to_event(operation), "missing_credentials");
     S3Error::with_message(S3ErrorCode::InvalidRequest, format!("Failed to {operation}: missing credentials"))
 }
 
 fn pool_admin_query_parse_error(operation: &str) -> S3Error {
+    log_pool_request_rejected(operation_to_event(operation), "invalid_query_parameters");
     S3Error::with_message(S3ErrorCode::InvalidArgument, format!("Failed to {operation}: invalid query parameters"))
 }
 
 fn pool_admin_pool_parse_error(operation: &str, pool: &str) -> S3Error {
+    log_pool_request_rejected_with_pool(operation_to_event(operation), "invalid_pool", pool);
     S3Error::with_message(S3ErrorCode::InvalidArgument, format!("Failed to {operation}: invalid pool `{pool}`"))
 }
 
 fn pool_admin_pool_not_found_error(operation: &str, pool: &str) -> S3Error {
+    log_pool_request_rejected_with_pool(operation_to_event(operation), "pool_not_found", pool);
     S3Error::with_message(
         S3ErrorCode::InvalidArgument,
         format!("Failed to {operation}: pool `{pool}` was not found"),
@@ -91,10 +155,31 @@ fn pool_admin_pool_not_found_error(operation: &str, pool: &str) -> S3Error {
 }
 
 fn pool_admin_pool_index_error(operation: &str, idx: usize, pool_count: usize) -> S3Error {
+    warn!(
+        event = EVENT_ADMIN_REQUEST_REJECTED,
+        component = LOG_COMPONENT_ADMIN_API,
+        subsystem = LOG_SUBSYSTEM_POOL_ADMIN,
+        operation = operation_to_event(operation),
+        result = "rejected",
+        reason = "pool_index_out_of_range",
+        pool_index = idx,
+        pool_count,
+        "admin request rejected"
+    );
     S3Error::with_message(
         S3ErrorCode::InvalidArgument,
         format!("Failed to {operation}: pool index {idx} is out of range for {pool_count} pools"),
     )
+}
+
+fn operation_to_event(operation: &str) -> &'static str {
+    match operation {
+        "list pools" => "list_pools",
+        "load pool status" => "query_pool_status",
+        "start decommission" => "start_decommission",
+        "cancel decommission" => "cancel_decommission",
+        _ => "pool_admin",
+    }
 }
 
 fn parse_pool_idx_by_id(pool: &str, endpoint_count: usize) -> Option<usize> {
@@ -148,8 +233,6 @@ impl Operation for ListPools {
     // GET <endpoint>/<admin-API>/pools/list
     #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle ListPools");
-
         let Some(input_cred) = req.credentials else {
             return Err(pool_admin_missing_credentials_error("list pools"));
         };
@@ -173,11 +256,14 @@ impl Operation for ListPools {
         let usecase = DefaultAdminUsecase::from_global();
         let pool_items = usecase.execute_list_pools().await.map_err(S3Error::from)?;
 
-        let data = serde_json::to_vec(&pool_items)
-            .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "serialize pools list failed"))?;
+        let data = serde_json::to_vec(&pool_items).map_err(|e| {
+            log_pool_request_failed("list_pools", "serialize_pools_list_failed", &e);
+            S3Error::with_message(S3ErrorCode::InternalError, "serialize pools list failed")
+        })?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        log_pool_response_emitted("list_pools");
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
@@ -198,8 +284,6 @@ impl Operation for StatusPool {
     // GET <endpoint>/<admin-API>/pools/status?pool=http://server{1...4}/disk{1...4}
     #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle StatusPool");
-
         let Some(input_cred) = req.credentials else {
             return Err(pool_admin_missing_credentials_error("load pool status"));
         };
@@ -239,11 +323,14 @@ impl Operation for StatusPool {
             .await
             .map_err(S3Error::from)?;
 
-        let data = serde_json::to_vec(&pools_status)
-            .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse accountInfo failed"))?;
+        let data = serde_json::to_vec(&pools_status).map_err(|e| {
+            log_pool_request_failed("query_pool_status", "serialize_pool_status_failed", &e);
+            S3Error::with_message(S3ErrorCode::InternalError, "parse accountInfo failed")
+        })?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        log_pool_response_emitted("query_pool_status");
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
@@ -256,8 +343,6 @@ impl Operation for StartDecommission {
     // POST <endpoint>/<admin-API>/pools/decommission?pool=http://server{1...4}/disk{1...4}
     #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle StartDecommission");
-
         let Some(input_cred) = req.credentials else {
             return Err(pool_admin_missing_credentials_error("start decommission"));
         };
@@ -276,10 +361,12 @@ impl Operation for StartDecommission {
         .await?;
 
         let Some(endpoints) = endpoints_from_context() else {
+            log_pool_request_rejected("start_decommission", "not_implemented");
             return Err(s3_error!(NotImplemented));
         };
 
         if endpoints.legacy() {
+            log_pool_request_rejected("start_decommission", "legacy_endpoints_not_supported");
             return Err(s3_error!(NotImplemented));
         }
 
@@ -335,6 +422,7 @@ impl Operation for StartDecommission {
                 .map_err(|err| contextualize_admin_pool_api_error(err, "start decommission", &pool_context))?;
         }
 
+        log_pool_response_emitted("start_decommission");
         Ok(S3Response::new((StatusCode::OK, Body::default())))
     }
 }
@@ -346,8 +434,6 @@ impl Operation for CancelDecommission {
     // POST <endpoint>/<admin-API>/pools/cancel?pool=http://server{1...4}/disk{1...4}
     #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle CancelDecommission");
-
         let Some(input_cred) = req.credentials else {
             return Err(pool_admin_missing_credentials_error("cancel decommission"));
         };
@@ -366,10 +452,12 @@ impl Operation for CancelDecommission {
         .await?;
 
         let Some(endpoints) = endpoints_from_context() else {
+            log_pool_request_rejected("cancel_decommission", "not_implemented");
             return Err(s3_error!(NotImplemented));
         };
 
         if endpoints.legacy() {
+            log_pool_request_rejected("cancel_decommission", "legacy_endpoints_not_supported");
             return Err(s3_error!(NotImplemented));
         }
 
@@ -394,7 +482,6 @@ impl Operation for CancelDecommission {
         };
 
         let Some(idx) = has_idx else {
-            warn!("specified pool {} not found, please specify a valid pool", &query.pool);
             return Err(pool_admin_pool_not_found_error("cancel decommission", &query.pool));
         };
 
@@ -408,6 +495,7 @@ impl Operation for CancelDecommission {
             .map_err(ApiError::from)
             .map_err(|err| contextualize_admin_pool_api_error(err, "cancel decommission", format!("pool {idx}")))?;
 
+        log_pool_response_emitted("cancel_decommission");
         Ok(S3Response::new((StatusCode::OK, Body::default())))
     }
 }
