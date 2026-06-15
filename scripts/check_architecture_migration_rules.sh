@@ -21,6 +21,26 @@ contains_line() {
   grep -qxF "$needle" "$file"
 }
 
+require_source_line() {
+  local file="$1"
+  local expected="$2"
+  local description="$3"
+
+  if ! contains_line "$expected" "${ROOT_DIR}/${file}"; then
+    report_failure "${description} missing exact source line in ${file}: ${expected}"
+  fi
+}
+
+require_source_contains() {
+  local file="$1"
+  local expected="$2"
+  local description="$3"
+
+  if ! grep -qF "$expected" "${ROOT_DIR}/${file}"; then
+    report_failure "${description} missing source text in ${file}: ${expected}"
+  fi
+}
+
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -29,6 +49,7 @@ PR_TYPE_HITS_FILE="${TMP_DIR}/pr_type_hits.txt"
 SOURCE_MARKERS_FILE="${TMP_DIR}/source_markers.txt"
 SOURCE_IDS_FILE="${TMP_DIR}/source_ids.txt"
 REGISTER_IDS_FILE="${TMP_DIR}/register_ids.txt"
+STORAGE_API_SUPERTRAITS_FILE="${TMP_DIR}/storage_api_supertraits.txt"
 
 awk '
   /^## PR Types$/ {
@@ -152,6 +173,56 @@ while IFS= read -r register_id; do
     report_failure "cleanup-register entry ${register_id} has no source marker"
   fi
 done <"$REGISTER_IDS_FILE"
+
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
+  "pub use admin::{DiskSetSelector, StorageAdminApi};" \
+  "storage-api public admin contract re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
+  "pub use bucket::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};" \
+  "storage-api public bucket DTO re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
+  "pub use error::{StorageErrorCode, StorageResult};" \
+  "storage-api public error contract re-export"
+
+perl -0ne '
+  if (/pub trait StorageAPI:\s*(.*?)\s*\{\s*\}/s) {
+    my $body = $1;
+    while ($body =~ /\b([A-Z][A-Za-z0-9_]*)\b/g) {
+      print "$1\n";
+    }
+  }
+' "${ROOT_DIR}/crates/ecstore/src/store_api/traits.rs" |
+  sort -u >"$STORAGE_API_SUPERTRAITS_FILE"
+
+if [[ ! -s "$STORAGE_API_SUPERTRAITS_FILE" ]]; then
+  report_failure "StorageAPI supertrait declaration not found in crates/ecstore/src/store_api/traits.rs"
+fi
+
+for required_trait in ObjectIO BucketOperations ObjectOperations ListOperations MultipartOperations HealOperations Debug; do
+  if ! contains_line "$required_trait" "$STORAGE_API_SUPERTRAITS_FILE"; then
+    report_failure "StorageAPI no longer covers required operation group ${required_trait}"
+  fi
+done
+
+if contains_line "NamespaceLocking" "$STORAGE_API_SUPERTRAITS_FILE"; then
+  report_failure "NamespaceLocking must remain separate from the full StorageAPI facade"
+fi
+
+require_source_contains \
+  "crates/ecstore/src/store_api/traits.rs" \
+  "pub trait NamespaceLocking: Send + Sync + Debug + 'static" \
+  "separate namespace-locking operation-group trait"
+require_source_contains \
+  "crates/ecstore/tests/storage_api_compat_test.rs" \
+  "fn ecstore_implements_storage_admin_api_contract()" \
+  "ECStore StorageAdminApi compile-time coverage test"
+require_source_contains \
+  "crates/ecstore/tests/storage_api_compat_test.rs" \
+  "fn ecstore_implements_storage_api_and_namespace_locking_contracts()" \
+  "ECStore StorageAPI and NamespaceLocking compile-time coverage test"
 
 if (( FAILURES > 0 )); then
   exit 1

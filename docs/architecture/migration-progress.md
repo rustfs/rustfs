@@ -5,18 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-startup-command-bootstrap`
-- Baseline: `origin/main` at `941b8afee8619c6a038c20aac51565a65c959ee4`
-- PR type for this branch: `pure-move`
-- Runtime behavior changes: no external behavior change expected; the binary
-  entrypoint still builds the Tokio runtime, applies preflight, dispatches
-  non-server commands, and starts server/bootstrap stages in the same order.
-- Rust code changes: add `startup_entrypoint::run_process`, move remaining
-  command dispatch, server bootstrap orchestration, and fatal stderr helpers
-  out of `main.rs`, and keep `main.rs` as the process entry shim.
-- CI/script changes: none.
-- Docs changes: record `R-019` startup command/bootstrap entrypoint progress
-  and update startup timeline ownership.
+- Branch: `overtrue/arch-loss-prevention-guards`
+- Baseline: `origin/main` at `dd6b4c35ad2c24be432c32645ce17e2d312eac78`
+- PR type for this branch: `ci-gate`
+- Runtime behavior changes: no external behavior change expected.
+- Rust code changes: split lifecycle transition compensation bucket
+  reservation from background backfill spawning so the dedupe unit test does
+  not launch an actual compensation task on shared test state.
+- CI/script changes: extend `scripts/check_architecture_migration_rules.sh` to
+  guard public storage-api re-exports, StorageAPI operation-group coverage,
+  NamespaceLocking separation, and ECStore compatibility tests.
+- Docs changes: record `G-006` completion and document the guarded
+  loss-prevention coverage in `crate-boundaries.md`.
 
 ## Phase 0 Tasks
 
@@ -33,12 +33,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 - [x] `G-005` Add dependency direction guard.
   - Acceptance: `./scripts/check_layer_dependencies.sh` passes on current
     `upstream/main` while still rejecting new unaccepted layer dependencies.
-- [~] `G-006` Create migration loss-prevention checks.
-  - Current branch: add a mechanical admin route matrix guard from
+- [x] `G-006` Create migration loss-prevention checks.
+  - Completed slices: add a mechanical admin route matrix guard from
     [`admin-route-action-snapshot.md`](admin-route-action-snapshot.md) and
-    `rustfs/src/admin/route_registration_test.rs`.
-  - Remaining follow-up: add checks for public re-export and storage trait
-    coverage before pure moves.
+    `rustfs/src/admin/route_registration_test.rs`; add migration rules for
+    public storage-api re-export coverage, StorageAPI operation-group coverage,
+    NamespaceLocking separation, and ECStore compatibility-test coverage.
+  - Acceptance: architecture migration rules fail if the public storage-api
+    contract re-export surface drifts, if `StorageAPI` stops covering the
+    documented storage operation groups, if `NamespaceLocking` is folded back
+    into the full storage facade, or if ECStore compile-time compatibility tests
+    for these contracts are removed.
 - [x] `G-007` Create startup timeline table.
   - Acceptance: [`startup-timeline.md`](startup-timeline.md) records current
     binary startup order, side effects, fatal boundaries, and readiness stages.
@@ -740,52 +745,51 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `pure-move`: continue shrinking startup entrypoint orchestration only where a
-   clean module boundary remains without changing fatal stderr behavior.
-2. `ci-gate`: finish `G-006` public re-export and storage trait coverage checks
-   before the remaining cleanup slices.
+1. `pure-move`/`consumer-migration`: continue larger cleanup slices with the
+   loss-prevention guards active for public re-exports and storage trait
+   coverage.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Pure-move slice removes command dispatch and bootstrap orchestration details from binary startup behind a dedicated startup entrypoint boundary. |
-| Migration preservation | passed | Command parse stderr, info/TLS dispatch, observability fatal sentinel, startup order, readiness publication, and shutdown ownership are preserved. |
-| Testing/verification | passed | Focused startup entrypoint and observability guardrail tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
+| Quality/architecture | passed | CI-gate slice extends the existing migration rule script instead of adding a parallel guard system. |
+| Migration preservation | passed | Guards fail on public storage-api re-export drift, StorageAPI operation-group drift, NamespaceLocking collapse, or missing ECStore compatibility tests without changing runtime behavior. |
+| Testing/verification | passed | Script syntax, migration/layer guards, lifecycle compensation dedupe test, ECStore compatibility test, compile check, formatting, diff hygiene, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `941b8afee8619c6a038c20aac51565a65c959ee4`:
+Passed on `dd6b4c35ad2c24be432c32645ce17e2d312eac78`:
 
-- `cargo test -p rustfs startup_entrypoint --no-fail-fast`: passed.
-- `cargo test -p rustfs-obs startup_ --no-fail-fast`: passed.
-- `cargo check -p rustfs --lib`: passed.
-- `cargo check -p rustfs --bin rustfs`: passed.
-- `cargo fmt --all --check`: passed.
-- `git diff --check`: passed.
+- `bash -n scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
-- Added-line and changed-file Rust risk scan: expected fatal-boundary
-  `expect`/`eprintln!` only.
-- Full-file risk scan for changed Rust files: expected process exit and fatal
-  stderr entries are isolated in `startup_entrypoint.rs`.
-- `make pre-commit`: passed, including nextest `6038` passed / `111` skipped
-  and doctests.
+- `cargo test -p rustfs-ecstore --test storage_api_compat_test --no-fail-fast`:
+  passed.
+- `cargo test -p rustfs-ecstore bucket::lifecycle::bucket_lifecycle_ops::tests::reserve_bucket_compensation_deduplicates_same_bucket --no-fail-fast`:
+  passed.
+- `cargo check -p rustfs-ecstore`: passed.
+- `cargo fmt --all --check`: passed.
+- `git diff --check`: passed.
+- Rust risk scan: no new production `unwrap`/`expect`, lossy casts, string
+  errors, public boxed errors, or production `println`/`eprintln`.
+- `make pre-commit`: passed.
 - `git rev-list --left-right --count HEAD...origin/main`: returned `1 0`
   after commit.
 
 Notes:
 
-- This slice centralizes remaining command/bootstrap entrypoint orchestration
-  without changing startup ordering, fatal stderr behavior, readiness ownership,
-  shutdown token ownership, or shutdown handle ownership.
-- Ready publication, scanner start, and shutdown wait remain owned by
-  `startup_services`; `startup_entrypoint` only orchestrates the existing
-  startup sequence and process-level fatal handling.
+- This slice completes the `G-006` loss-prevention follow-up with script-level
+  checks for the public re-export and storage trait coverage called out in the
+  migration checklist.
+- The script reads existing source/test surfaces and does not introduce a new
+  runtime behavior path.
+- The lifecycle compensation dedupe test now covers reservation directly,
+  avoiding a spawned backfill task that can inherit shared object-store test
+  state during the full pre-commit run.
 
 ## Handoff Notes
 
-- R-019 is implemented, locally verified, and current with `origin/main`.
-- Next startup slices can keep using larger pure moves, but must keep startup
-  ordering, fatal/non-fatal boundaries, shutdown ownership, readiness ownership,
-  and fatal stderr behavior explicit in tests and review notes.
+- G-006 is implemented, locally verified, and current with `origin/main`.
+- Larger cleanup slices can now rely on migration rules to catch accidental
+  public storage-api re-export drift and storage trait coverage loss.
