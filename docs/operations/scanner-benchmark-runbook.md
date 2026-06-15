@@ -283,7 +283,7 @@ Compare these fields between baseline and tuned runs:
 | `metrics.pacing_pressure.primary_pressure` | Shows whether pressure is from queues, budgets, pause activity, active scans, or no scanner pressure. |
 | `metrics.pacing_pressure.last_cycle_total_pause_ratio` | Shows how much of the last cycle was cooperative scanner pause time. |
 | `metrics.maintenance_control.primary_control` | Shows whether source-level maintenance is blocked, deferred, active, only pacing-limited, or idle. |
-| `metrics.maintenance_control.sources` | Shows the source, state, reason, backlog, current missed work, and partial-cycle count for each scanner maintenance source. |
+| `metrics.maintenance_control.sources` | Shows the source, state, reason, backlog, current or last-cycle missed work, and partial-cycle count for each scanner maintenance source. |
 | `metrics.current_cycle_objects_scanned` | Confirms object scan progress during the current cycle. |
 | `metrics.current_cycle_directories_scanned` | Confirms directory walk progress during the current cycle. |
 | `metrics.last_cycle_result` | Confirms whether the previous cycle completed, stopped partially, or failed. |

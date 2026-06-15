@@ -1217,15 +1217,24 @@ fn scanner_source_maintenance_state(
     (SCANNER_MAINTENANCE_STATE_IDLE, SCANNER_MAINTENANCE_REASON_IDLE, 0)
 }
 
+fn scanner_maintenance_source_work(metrics: &ScannerMetricsReport) -> &[ScannerSourceWorkSnapshot] {
+    if metrics.current_cycle_source_work.is_empty() {
+        &metrics.last_cycle_source_work
+    } else {
+        &metrics.current_cycle_source_work
+    }
+}
+
 fn scanner_maintenance_control(metrics: &ScannerMetricsReport) -> ScannerMaintenanceControlSnapshot {
     let mut has_blocked = false;
     let mut has_deferred = false;
     let mut has_active = false;
+    let current_source_work = scanner_maintenance_source_work(metrics);
 
     let sources = ScannerWorkSource::all()
         .iter()
         .map(|source| {
-            let current = scanner_source_work_snapshot(&metrics.current_cycle_source_work, *source);
+            let current = scanner_source_work_snapshot(current_source_work, *source);
             let lifetime = scanner_source_work_snapshot(&metrics.source_work, *source);
             let partial_cycles = scanner_source_partial_cycles(metrics, *source);
             let (state, reason, backlog) = scanner_source_maintenance_state(*source, &current, metrics);
@@ -2714,6 +2723,29 @@ mod tests {
         assert_eq!(bucket_replication.current_queued, 1);
 
         metrics.finish_scan_cycle_work(start);
+    }
+
+    #[tokio::test]
+    async fn report_uses_last_cycle_source_work_for_maintenance_control_between_cycles() {
+        let metrics = Metrics::new();
+        let start = metrics.start_scan_cycle_work();
+        metrics.record_scanner_source_missed(ScannerWorkSource::Lifecycle, 2);
+
+        metrics.finish_scan_cycle_work(start);
+        let report = metrics.report().await;
+
+        assert!(report.current_cycle_source_work.is_empty());
+        let lifecycle = report
+            .maintenance_control
+            .sources
+            .iter()
+            .find(|source| source.source == ScannerWorkSource::Lifecycle.as_str())
+            .expect("lifecycle source control should be visible");
+        assert_eq!(report.maintenance_control.primary_control, "blocked_source");
+        assert_eq!(lifecycle.state, "blocked");
+        assert_eq!(lifecycle.reason, "missed_work");
+        assert_eq!(lifecycle.current_missed, 2);
+        assert_eq!(lifecycle.backlog, 2);
     }
 
     #[tokio::test]

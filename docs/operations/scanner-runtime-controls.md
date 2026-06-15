@@ -152,7 +152,9 @@ or heal admission.
 `metrics.maintenance_control` derives a source-level control snapshot from
 scanner pacing, partial-cycle state, source work, and lifecycle transition
 queue state. It does not change scanner scheduling by itself; it explains why a
-source is moving, deferred, or blocked.
+source is moving, deferred, or blocked. When no scan cycle is currently active,
+source-work controls use the last completed cycle so recently missed work stays
+visible between scanner passes.
 
 `metrics.maintenance_control.primary_control` summarizes the highest-priority
 source state:
@@ -173,9 +175,9 @@ Each `metrics.maintenance_control.sources[]` entry has:
 | `state` | `idle`, `active`, `deferred`, or `blocked`. |
 | `reason` | Derived reason such as `active_work`, `queued_work`, `partial_cycle`, `missed_work`, `transition_queue_backlog`, or `transition_queue_full`. |
 | `backlog` | Current source-level backlog estimate from queued or missed work. |
-| `current_checked` | Current-cycle checked work for this source. |
-| `current_queued` | Current-cycle queued work for this source. |
-| `current_missed` | Current-cycle work that could not be admitted. |
+| `current_checked` | Current-cycle checked work for this source, or the last completed cycle when no scan cycle is active. |
+| `current_queued` | Current-cycle queued work for this source, or the last completed cycle when no scan cycle is active. |
+| `current_missed` | Current-cycle work that could not be admitted, or the last completed cycle when no scan cycle is active. |
 | `lifetime_missed` | Lifetime missed work counter for context. |
 | `partial_cycles` | Partial cycles attributed to this source. |
 
