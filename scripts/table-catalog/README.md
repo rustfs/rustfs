@@ -149,10 +149,10 @@ Unsupported behavior is documented instead of hidden behind internal errors. The
 current unsupported inventory is:
 
 - credential vending: automated after table bootstrap with exact-prefix validation and a data-plane scope probe; full no-long-term-data-credential bootstrap is not claimed
-- background maintenance worker: unsupported; maintenance job reports expose retry/quarantine policy fields for future workers
+- background maintenance worker: controlled run-once and heartbeat endpoints are registered; continuous in-process scheduling is not claimed
 - manifest/data reachability cleanup: fail-closed reachability graph reporting only; metadata cleanup must not delete manifest, data, or delete files
 - snapshot expiration dry-run planning and manual catalog commit: supported through metadata maintenance reports
-- automatic maintenance scheduling: unsupported
+- automatic maintenance scheduling: external scheduler hook supported through the worker run endpoint; built-in periodic scheduling is not claimed
 - compaction rewrite: unsupported; planning reports fail closed until manifest Avro reading and rewrite support are implemented
 - Iceberg views: stable unsupported routes are registered and return explicit unsupported JSON
 - external catalog bridges: metadata import/register is supported, but Polaris/Glue/DLF/Hive synchronization is unsupported

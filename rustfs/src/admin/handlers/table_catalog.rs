@@ -72,6 +72,7 @@ const S3_SESSION_TOKEN_CONFIG_KEY: &str = "s3.session-token";
 const TABLE_CATALOG_NAMESPACE_RESOURCE_ROOT: &str = "namespaces";
 const TABLE_CATALOG_TABLE_RESOURCE_ROOT: &str = "tables";
 const TABLE_CATALOG_ADMIN_OPERATION_SLOW_LOG_THRESHOLD: StdDuration = StdDuration::from_secs(2);
+const DEFAULT_TABLE_MAINTENANCE_WORKER_ID: &str = "rustfs-maintenance-worker";
 const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /v1/{prefix}/namespaces",
     "POST /v1/{prefix}/namespaces",
@@ -113,6 +114,8 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
     "PUT /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}",
+    "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/worker/run",
+    "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/heartbeat",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
@@ -149,6 +152,8 @@ static TABLE_METADATA_MAINTENANCE_HANDLER: RestTableMetadataMaintenanceHandler =
 static GET_TABLE_MAINTENANCE_CONFIG_HANDLER: GetTableMaintenanceConfigHandler = GetTableMaintenanceConfigHandler {};
 static PUT_TABLE_MAINTENANCE_CONFIG_HANDLER: PutTableMaintenanceConfigHandler = PutTableMaintenanceConfigHandler {};
 static GET_TABLE_MAINTENANCE_JOB_HANDLER: GetTableMaintenanceJobHandler = GetTableMaintenanceJobHandler {};
+static RUN_TABLE_MAINTENANCE_WORKER_HANDLER: RunTableMaintenanceWorkerHandler = RunTableMaintenanceWorkerHandler {};
+static HEARTBEAT_TABLE_MAINTENANCE_JOB_HANDLER: HeartbeatTableMaintenanceJobHandler = HeartbeatTableMaintenanceJobHandler {};
 static EXPORT_TABLE_CATALOG_HANDLER: ExportTableCatalogHandler = ExportTableCatalogHandler {};
 static IMPORT_TABLE_CATALOG_HANDLER: ImportTableCatalogHandler = ImportTableCatalogHandler {};
 static EXTERNAL_CATALOG_BRIDGE_HANDLER: ExternalCatalogBridgeHandler = ExternalCatalogBridgeHandler {};
@@ -236,6 +241,28 @@ struct TableMetadataMaintenanceRequest {
     commit_snapshot_expiration: bool,
     #[serde(default)]
     compaction: Option<crate::table_catalog::TableCompactionPlanningConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TableMaintenanceWorkerRunRequest {
+    #[serde(default, rename = "worker-id")]
+    worker_id: Option<String>,
+}
+
+impl TableMaintenanceWorkerRunRequest {
+    fn worker_id(&self) -> &str {
+        self.worker_id.as_deref().unwrap_or(DEFAULT_TABLE_MAINTENANCE_WORKER_ID)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TableMaintenanceHeartbeatRequest {
+    #[serde(rename = "lease-id")]
+    lease_id: String,
+    #[serde(rename = "worker-id")]
+    worker_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -686,6 +713,16 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         Method::GET,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/jobs/{{job}}").as_str(),
         AdminOperation(&GET_TABLE_MAINTENANCE_JOB_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/worker/run").as_str(),
+        AdminOperation(&RUN_TABLE_MAINTENANCE_WORKER_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/jobs/{{job}}/heartbeat").as_str(),
+        AdminOperation(&HEARTBEAT_TABLE_MAINTENANCE_JOB_HANDLER),
     )?;
     r.insert(
         Method::GET,
@@ -3365,6 +3402,59 @@ impl Operation for GetTableMaintenanceJobHandler {
     }
 }
 
+pub struct RunTableMaintenanceWorkerHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RunTableMaintenanceWorkerHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
+        let request = read_json_body::<TableMaintenanceWorkerRunRequest>(req.input).await?;
+        let store = table_catalog_store()?;
+        let response = store
+            .run_table_metadata_maintenance_worker_once(
+                &warehouse,
+                &namespace.public_name(),
+                &table,
+                request.worker_id().to_string(),
+            )
+            .await
+            .map_err(catalog_store_error)?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct HeartbeatTableMaintenanceJobHandler {}
+
+#[async_trait::async_trait]
+impl Operation for HeartbeatTableMaintenanceJobHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let job = job_id_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
+        let request = read_json_body::<TableMaintenanceHeartbeatRequest>(req.input).await?;
+        let store = table_catalog_store()?;
+        let response = store
+            .heartbeat_table_metadata_maintenance_job(
+                &warehouse,
+                &namespace.public_name(),
+                &table,
+                &job,
+                &request.lease_id,
+                &request.worker_id,
+            )
+            .await
+            .map_err(catalog_store_error)?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
 pub struct ExportTableCatalogHandler {}
 
 #[async_trait::async_trait]
@@ -3785,6 +3875,8 @@ mod tests {
         assert_operation::<GetTableMaintenanceConfigHandler>();
         assert_operation::<PutTableMaintenanceConfigHandler>();
         assert_operation::<GetTableMaintenanceJobHandler>();
+        assert_operation::<RunTableMaintenanceWorkerHandler>();
+        assert_operation::<HeartbeatTableMaintenanceJobHandler>();
         assert_operation::<ExportTableCatalogHandler>();
         assert_operation::<ImportTableCatalogHandler>();
         assert_operation::<ExternalCatalogBridgeHandler>();
@@ -3848,6 +3940,34 @@ mod tests {
         assert_eq!(compaction.small_file_threshold_bytes, 67_108_864);
         assert_eq!(compaction.min_input_files, 5);
         assert_eq!(compaction.max_rewrite_bytes_per_job, 10_737_418_240);
+    }
+
+    #[test]
+    fn table_maintenance_worker_run_request_uses_stable_default_worker_id() {
+        let request: TableMaintenanceWorkerRunRequest =
+            serde_json::from_value(serde_json::json!({})).expect("worker run request should parse");
+
+        assert_eq!(request.worker_id(), "rustfs-maintenance-worker");
+    }
+
+    #[test]
+    fn table_maintenance_worker_run_request_accepts_worker_id() {
+        let request: TableMaintenanceWorkerRunRequest = serde_json::from_value(serde_json::json!({
+            "worker-id": "worker-a"
+        }))
+        .expect("worker run request should parse worker id");
+
+        assert_eq!(request.worker_id(), "worker-a");
+    }
+
+    #[test]
+    fn table_maintenance_heartbeat_request_requires_lease_id() {
+        let err = serde_json::from_value::<TableMaintenanceHeartbeatRequest>(serde_json::json!({
+            "worker-id": "worker-a"
+        }))
+        .expect_err("heartbeat request should require lease id");
+
+        assert!(err.to_string().contains("lease-id"));
     }
 
     #[tokio::test]
@@ -4752,23 +4872,22 @@ mod tests {
             .expect("maintenance config should persist");
         assert_eq!(config.retain_recent_metadata_files, 2);
         assert!(config.delete_enabled);
-        assert!(
-            store
-                .put_table_maintenance_config(
-                    bucket,
-                    "analytics",
-                    "events",
-                    crate::table_catalog::TableMaintenanceConfig {
-                        version: crate::table_catalog::TABLE_MAINTENANCE_CONFIG_VERSION,
-                        retain_recent_metadata_files: 2,
-                        delete_enabled: true,
-                        background_enabled: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .is_err()
-        );
+        let background_config = store
+            .put_table_maintenance_config(
+                bucket,
+                "analytics",
+                "events",
+                crate::table_catalog::TableMaintenanceConfig {
+                    version: crate::table_catalog::TABLE_MAINTENANCE_CONFIG_VERSION,
+                    retain_recent_metadata_files: 2,
+                    delete_enabled: true,
+                    background_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("background maintenance config should persist");
+        assert!(background_config.background_enabled);
 
         let dry_run = table_metadata_maintenance_response(
             &store,

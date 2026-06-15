@@ -398,6 +398,16 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             "/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1",
         ),
         table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/worker/run",
+            "/analytics/namespaces/sales/tables/orders/maintenance/worker/run",
+        ),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/heartbeat",
+            "/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1/heartbeat",
+        ),
+        table_route_sample(
             Method::GET,
             "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export",
             "/analytics/namespaces/sales/tables/orders/catalog/export",
@@ -534,6 +544,16 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             Method::GET,
             "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}",
             "/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/worker/run",
+            "/analytics/namespaces/sales/tables/orders/maintenance/worker/run",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/heartbeat",
+            "/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1/heartbeat",
         ),
         compat_table_route_sample(
             Method::GET,
@@ -746,6 +766,16 @@ fn test_register_routes_cover_representative_admin_paths() {
     );
     assert_route(
         &router,
+        Method::POST,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/worker/run"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1/heartbeat"),
+    );
+    assert_route(
+        &router,
         Method::GET,
         &table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/export"),
     );
@@ -855,6 +885,16 @@ fn test_register_routes_cover_representative_admin_paths() {
         &router,
         Method::GET,
         &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/worker/run"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1/heartbeat"),
     );
     assert_route(
         &router,
