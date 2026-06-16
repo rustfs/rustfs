@@ -17,6 +17,7 @@ use crate::bucket::lifecycle::evaluator::Evaluator;
 use crate::bucket::lifecycle::lifecycle::{
     self, ExpirationOptions, Lifecycle, ObjectOpts, TransitionOptions, abort_incomplete_multipart_upload_due,
 };
+use crate::bucket::lifecycle::tier_delete_journal::{process_tier_delete_journal_entry, run_tier_delete_journal_recovery_loop};
 use crate::bucket::lifecycle::tier_free_version_recovery::{DEFAULT_FREE_VERSION_RECOVERY_LIMIT, recover_tier_free_versions};
 use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
 use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent};
@@ -101,6 +102,7 @@ pub type ExpiryOpType = Box<dyn ExpiryOp + Send + Sync + 'static>;
 
 static XXHASH_SEED: u64 = 0;
 static TIER_FREE_VERSION_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
+static TIER_DELETE_JOURNAL_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
 
 pub const AMZ_OBJECT_TAGGING: &str = "X-Amz-Tagging";
 pub const AMZ_TAG_COUNT: &str = "x-amz-tagging-count";
@@ -478,12 +480,17 @@ impl ExpiryState {
         if wrkr.is_none() {
             self.stats.increment_missed_tier_journal_tasks();
             self.stats.record_scanner_expiry_state();
-            return Ok(());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "lifecycle expiry worker unavailable for tier journal task",
+            ));
         }
         let wrkr = wrkr.expect("worker channel should exist after None check");
         let queued = self.send_expiry_task(wrkr, Box::new(je.clone())).await;
         if !queued {
             self.stats.increment_missed_tier_journal_tasks();
+            self.stats.record_scanner_expiry_state();
+            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "failed to enqueue tier journal task"));
         }
         self.stats.record_scanner_expiry_state();
         Ok(())
@@ -657,7 +664,7 @@ impl ExpiryState {
                     }
                     else if v.as_any().is::<Jentry>() {
                         let v = v.as_any().downcast_ref::<Jentry>().expect("Jentry downcast failed");
-                        if let Err(err) = delete_object_from_remote_tier_idempotent(&v.obj_name, &v.version_id, &v.tier_name).await {
+                        if let Err(err) = process_tier_delete_journal_entry(api.clone(), v).await {
                             debug!(
                                 event = EVENT_LIFECYCLE_WORKER_STATE,
                                 component = LOG_COMPONENT_ECSTORE,
@@ -1351,7 +1358,8 @@ pub async fn init_background_expiry(api: Arc<ECStore>) {
 
     //let expiry_state = GLOBAL_ExpiryStSate.write().await;
     ExpiryState::resize_workers(workers, api.clone()).await;
-    spawn_tier_free_version_recovery_once(api);
+    spawn_tier_free_version_recovery_once(api.clone());
+    spawn_tier_delete_journal_recovery_once(api);
 }
 
 fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>) {
@@ -1421,6 +1429,19 @@ fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>) {
                 }
             }
         }
+    });
+}
+
+fn spawn_tier_delete_journal_recovery_once(api: Arc<ECStore>) {
+    if TIER_DELETE_JOURNAL_RECOVERY_STARTED.set(()).is_err() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let cancel_token = crate::global::get_background_services_cancel_token()
+            .cloned()
+            .unwrap_or_else(CancellationToken::new);
+        run_tier_delete_journal_recovery_loop(api, cancel_token).await;
     });
 }
 
@@ -2838,6 +2859,7 @@ mod tests {
     };
     use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
     use crate::bucket::lifecycle::core::ExpirationOptions;
+    use crate::bucket::lifecycle::tier_sweeper::Jentry;
     use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
     use crate::bucket::metadata_sys;
     use crate::disk::RUSTFS_META_MULTIPART_BUCKET;
@@ -2891,6 +2913,25 @@ mod tests {
         assert_eq!(expiry.current_active, 0);
         assert_eq!(expiry.current_workers, 0);
         assert_eq!(expiry.queue_missed, 1);
+    }
+
+    #[tokio::test]
+    async fn enqueue_tier_journal_entry_reports_error_without_worker_channel() {
+        let state = ExpiryState::new();
+        let mut state = state.write().await;
+        let je = Jentry {
+            obj_name: "remote/object".to_string(),
+            version_id: "remote-version".to_string(),
+            tier_name: "WARM".to_string(),
+        };
+
+        let err = state
+            .enqueue_tier_journal_entry(&je)
+            .await
+            .expect_err("missing worker should be reported to caller");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(state.stats.missed_tier_journal_tasks(), 1);
     }
 
     #[tokio::test]
