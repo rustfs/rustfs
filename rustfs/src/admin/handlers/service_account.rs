@@ -581,6 +581,7 @@ impl Operation for UpdateServiceAccount {
             description: new_description.clone(),
             expiration: new_expiration,
             session_policy: sp,
+            allow_site_replicator_account: false,
         };
 
         let updated_at = iam_store

@@ -57,8 +57,6 @@ mod readers;
 mod traits;
 mod types;
 
-pub(crate) use rustfs_storage_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
-
 pub use readers::*;
 pub use traits::*;
 pub use types::*;

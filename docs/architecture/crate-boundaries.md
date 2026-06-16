@@ -93,6 +93,11 @@ Required `rustfs-storage-api` public re-exports:
 - `pub use admin::{DiskSetSelector, StorageAdminApi};`
 - `pub use bucket::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};`
 - `pub use error::{StorageErrorCode, StorageResult};`
+- `pub use multipart::{ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};`
 
 ECStore must keep compile-time coverage for both `StorageAdminApi` and the
 separate `NamespaceLocking` operation group.
+
+The old `StorageAPI` aggregate facade must not reappear in production
+`crates/ecstore/src` or `rustfs/src` code after the storage operation groups
+have been made explicit.

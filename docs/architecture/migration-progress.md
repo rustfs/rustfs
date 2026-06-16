@@ -5,17 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-remove-storage-api-facade`
-- Baseline: `origin/main` at `c26593fa7a4b55849e98832cde657c6d4b167262`
-- PR type for this branch: `consumer-migration`
+- Branch: `overtrue/arch-storage-object-contracts-cleanup`
+- Baseline: `origin/main` at `2ff69ae21cad69eaf7d5969eb5267e6e974ef8c6`
+- PR type for this branch: `api-extraction`
 - Runtime behavior changes: no external behavior change expected.
-- Rust code changes: remove the old unused `StorageAPI` facade, its ECStore
-  implementation blocks, its public re-export, and the stale compile-time
-  compatibility test coverage.
-- CI/script changes: adjust architecture migration guardrails to keep the
-  remaining storage-admin and namespace-lock contracts covered.
-- Docs changes: record the final old-facade cleanup slice and its verification
-  state.
+- Rust code changes: move multipart list/result DTO contracts from ECStore
+  `store_api` into `rustfs-storage-api` and migrate in-repo consumers to the
+  shared contract path.
+- CI/script changes: extend migration guards for the multipart DTO public
+  re-export and reject restoring the old ECStore-owned multipart DTO path.
+- Docs changes: record the multipart DTO contract extraction slice.
 
 ## Phase 0 Tasks
 
@@ -36,8 +35,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Completed slices: add a mechanical admin route matrix guard from
     [`admin-route-action-snapshot.md`](admin-route-action-snapshot.md) and
     `rustfs/src/admin/route_registration_test.rs`; add migration rules for
-    public storage-api re-export coverage and ECStore compatibility-test
-    coverage.
+    public storage-api re-export coverage, ECStore compatibility-test coverage,
+    and a production-source guard against reintroducing the removed
+    `StorageAPI` aggregate facade identifier.
   - Acceptance: architecture migration rules fail if the public storage-api
     contract re-export surface drifts or if ECStore compile-time compatibility
     tests for the remaining storage-admin and namespace-lock contracts are
@@ -360,6 +360,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Cleanup slice: migrate in-repo external consumers to
     `rustfs_storage_api`, keep ECStore implementation use crate-private, and
     remove the old public `ecstore::store_api` bucket DTO re-export.
+  - Completed follow-up slice: remove the remaining ECStore-internal bucket DTO
+    aliases from `store_api` and guard against restoring that compatibility
+    path.
   - Acceptance: `rustfs-storage-api` exports these DTOs, in-repo external
     consumers no longer use the old `rustfs_ecstore::store_api` DTO path, and
     `RUSTFS_COMPAT_TODO(API-003)` is removed from source and cleanup register.
@@ -412,6 +415,10 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     implementations after API-007 migrated their consumers.
   - Final cleanup slice: remove the old `StorageAPI` facade after all real
     consumers moved to concrete operation groups.
+  - Loss-prevention cleanup slice: rename the remaining ECStore contract
+    compatibility test away from the old storage-api facade name and guard
+    production ECStore/RustFS source against reintroducing the removed
+    aggregate facade identifier.
   - Acceptance: storage operation traits remain available directly while admin
     inventory surfaces live only on `StorageAdminApi`.
 
@@ -491,6 +498,25 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: focused compile/tests, migration guards, Rust risk scan, and
     required quality/architecture, migration-preservation, and
     testing/verification review passed.
+
+- [x] `API-013` Move multipart list/result DTO contracts.
+  - Completed slice: move `MultipartUploadResult`, `PartInfo`,
+    `MultipartInfo`, `ListMultipartsInfo`, and `ListPartsInfo` from ECStore
+    `store_api` into `rustfs-storage-api`; update ECStore traits and RustFS S3
+    multipart response builders to import these shared contracts directly.
+  - Acceptance: `rustfs-storage-api` exports the multipart DTO contracts,
+    in-repo consumers no longer use the old `rustfs_ecstore::store_api` path
+    for these DTOs, and migration guards reject restoring the old ECStore-owned
+    definitions or re-exports.
+  - Must preserve: multipart upload creation, part listing, multipart upload
+    listing, part metadata, checksum fields, S3 response mapping, and storage
+    operation trait behavior.
+  - Risk defense: keep `CompletePart`, `ObjectInfo`, `ObjectOptions`, readers,
+    filemeta conversions, replication state, encryption, compression, and range
+    semantics in ECStore for this slice.
+  - Verification: focused storage-api/ECStore/RustFS compile checks, multipart
+    response tests, migration/layer guards, formatting, diff hygiene, Rust risk
+    scan, and required three-expert review passed.
 
 ## Phase 8 Background Controller Tasks
 
@@ -768,18 +794,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Old `StorageAPI` facade removal leaves concrete operation traits and remaining storage-admin/namespace-lock contracts explicit. |
-| Migration preservation | passed | ECStore/Sets/SetDisks operation implementations remain in place; only the unused aggregate facade and stale guard coverage are removed. |
-| Testing/verification | passed | Focused compatibility test, compile checks, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Multipart list/result DTOs now live in the storage contract crate, while ECStore keeps implementation-heavy object, reader, range, and complete-part types. |
+| Migration preservation | passed | The slice moves DTO ownership and import paths only; multipart operation bodies, S3 response mapping logic, and storage hot paths are unchanged. |
+| Testing/verification | passed | Focused storage-api/ECStore/RustFS compile checks, multipart response tests, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `c26593fa7a4b55849e98832cde657c6d4b167262`:
+Passed on `2ff69ae21cad69eaf7d5969eb5267e6e974ef8c6`:
 
-- `cargo check -p rustfs-ecstore`: passed.
-- `cargo test -p rustfs-ecstore --test storage_api_compat_test --no-fail-fast`:
+- `cargo check -p rustfs-storage-api -p rustfs-ecstore`: passed.
+- `cargo check -p rustfs`: passed.
+- `cargo test -p rustfs --lib storage::s3_api::multipart --no-fail-fast`:
   passed.
-- `cargo check -p rustfs -p rustfs-ecstore`: passed.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
 - `cargo fmt --all --check`: passed.
@@ -790,15 +816,17 @@ Passed on `c26593fa7a4b55849e98832cde657c6d4b167262`:
 
 Notes:
 
-- This slice removes the old full storage facade after no real code consumers
-  remain.
-- The concrete storage operation traits, `StorageAdminApi`, and
-  `NamespaceLocking` remain available and covered.
-- The slice does not move traits across crate boundaries.
+- This slice follows `rustfs/rustfs#3503` and keeps the old aggregate facade and
+  bucket DTO guards active.
+- The shared multipart list/result DTOs are now owned by `rustfs-storage-api`;
+  ECStore keeps implementation-heavy object, reader, range, and complete-part
+  types.
+- The slice does not move storage operation traits across crate boundaries or
+  alter multipart runtime behavior.
 
 ## Handoff Notes
 
-- Old storage facade removal is locally verified on a branch current with
+- Storage multipart DTO contract cleanup is in progress on a branch current with
   `origin/main`.
-- After this lands, remaining storage work can focus on concrete operation
-  contracts instead of the aggregate facade.
+- After this lands, remaining storage work can continue by extracting only DTOs
+  that have proven low implementation coupling.

@@ -38,10 +38,7 @@ use crate::error::{
 use crate::notification_sys::get_global_notification_sys;
 use crate::resolve_object_store_handle;
 use crate::set_disk::SetDisks;
-use crate::store_api::{
-    BucketOperations, BucketOptions, GetObjectReader, HealOperations, MakeBucketOptions, ObjectIO, ObjectOperations,
-    ObjectOptions,
-};
+use crate::store_api::{BucketOperations, GetObjectReader, HealOperations, ObjectIO, ObjectOperations, ObjectOptions};
 use crate::{global::GLOBAL_LifecycleSys, sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
@@ -53,7 +50,7 @@ use rustfs_common::defer;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_concurrency::workers::Workers;
 use rustfs_filemeta::{FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
-use rustfs_storage_api::StorageAdminApi;
+use rustfs_storage_api::{BucketOptions, MakeBucketOptions, StorageAdminApi};
 use rustfs_utils::path::{encode_dir_object, path_join, path_to_bucket_object, path_to_bucket_object_with_base_path};
 use s3s::dto::{BucketLifecycleConfiguration, DefaultRetention, ReplicationConfiguration};
 use serde::{Deserialize, Serialize};

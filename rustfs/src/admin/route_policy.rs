@@ -719,6 +719,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::Sensitive,
     ),
     admin(
+        HttpMethod::Head,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+        GET_TABLE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
         HttpMethod::Post,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
         COMMIT_TABLE,
@@ -735,6 +741,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/refs",
         GET_TABLE_METADATA,
         RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/refs/{ref}",
+        COMMIT_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/refs/{ref}",
+        COMMIT_TABLE,
+        RouteRiskLevel::High,
     ),
     admin(
         HttpMethod::Get,
@@ -930,6 +948,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::Sensitive,
     ),
     admin(
+        HttpMethod::Head,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+        GET_TABLE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
         HttpMethod::Post,
         "/_iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
         COMMIT_TABLE,
@@ -946,6 +970,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/refs",
         GET_TABLE_METADATA,
         RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/refs/{ref}",
+        COMMIT_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/refs/{ref}",
+        COMMIT_TABLE,
+        RouteRiskLevel::High,
     ),
     admin(
         HttpMethod::Get,
@@ -1214,7 +1250,7 @@ mod tests {
         let table_specs = ADMIN_ROUTE_POLICY_SPECS
             .iter()
             .filter(|spec| spec.path().starts_with("/iceberg/v1") || spec.path().starts_with("/_iceberg/v1"));
-        assert_eq!(table_specs.count(), 72);
+        assert_eq!(table_specs.count(), 78);
         assert_action(HttpMethod::Put, "/iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET);
         assert_action(HttpMethod::Get, "/_iceberg/v1/buckets/{warehouse}", GET_TABLE_BUCKET);
         assert_action(HttpMethod::Get, "/iceberg/v1/{warehouse}/namespaces", GET_TABLE_NAMESPACE);
@@ -1245,6 +1281,11 @@ mod tests {
             GET_TABLE_METADATA,
         );
         assert_action(
+            HttpMethod::Head,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+            GET_TABLE,
+        );
+        assert_action(
             HttpMethod::Post,
             "/_iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
             COMMIT_TABLE,
@@ -1258,6 +1299,16 @@ mod tests {
             HttpMethod::Get,
             "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/refs",
             GET_TABLE_METADATA,
+        );
+        assert_action(
+            HttpMethod::Put,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/refs/{ref}",
+            COMMIT_TABLE,
+        );
+        assert_action(
+            HttpMethod::Delete,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/refs/{ref}",
+            COMMIT_TABLE,
         );
         assert_action(
             HttpMethod::Get,

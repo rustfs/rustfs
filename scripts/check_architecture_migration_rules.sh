@@ -49,6 +49,9 @@ PR_TYPE_HITS_FILE="${TMP_DIR}/pr_type_hits.txt"
 SOURCE_MARKERS_FILE="${TMP_DIR}/source_markers.txt"
 SOURCE_IDS_FILE="${TMP_DIR}/source_ids.txt"
 REGISTER_IDS_FILE="${TMP_DIR}/register_ids.txt"
+LEGACY_STORAGE_API_HITS_FILE="${TMP_DIR}/legacy_storage_api_hits.txt"
+STORE_API_BUCKET_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_bucket_dto_reexports.txt"
+STORE_API_MULTIPART_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_multipart_dto_reexports.txt"
 
 awk '
   /^## PR Types$/ {
@@ -183,19 +186,52 @@ require_source_line \
   "storage-api public bucket DTO re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
+  "pub use multipart::{ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};" \
+  "storage-api public multipart DTO re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
   "pub use error::{StorageErrorCode, StorageResult};" \
   "storage-api public error contract re-export"
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading '\bStorageAPI\b' crates/ecstore/src rustfs/src || true
+) >"$LEGACY_STORAGE_API_HITS_FILE"
+
+if [[ -s "$LEGACY_STORAGE_API_HITS_FILE" ]]; then
+  report_failure "old StorageAPI facade identifier reintroduced in production source: $(paste -sd '; ' "$LEGACY_STORAGE_API_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api::\{[^}]*\b(?:BucketInfo|BucketOptions|DeleteBucketOptions|MakeBucketOptions|SRBucketDeleteOp)\b' \
+    crates/ecstore/src/store_api.rs || true
+) >"$STORE_API_BUCKET_DTO_REEXPORTS_FILE"
+
+if [[ -s "$STORE_API_BUCKET_DTO_REEXPORTS_FILE" ]]; then
+  report_failure "old ecstore store_api bucket DTO re-export reintroduced: $(paste -sd '; ' "$STORE_API_BUCKET_DTO_REEXPORTS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api::\{[^}]*\b(?:ListMultipartsInfo|ListPartsInfo|MultipartInfo|MultipartUploadResult|PartInfo)\b|pub struct (?:ListMultipartsInfo|ListPartsInfo|MultipartInfo|MultipartUploadResult|PartInfo)\b' \
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
+) >"$STORE_API_MULTIPART_DTO_REEXPORTS_FILE"
+
+if [[ -s "$STORE_API_MULTIPART_DTO_REEXPORTS_FILE" ]]; then
+  report_failure "old ecstore store_api multipart DTO path reintroduced: $(paste -sd '; ' "$STORE_API_MULTIPART_DTO_REEXPORTS_FILE")"
+fi
 
 require_source_contains \
   "crates/ecstore/src/store_api/traits.rs" \
   "pub trait NamespaceLocking: Send + Sync + Debug + 'static" \
   "separate namespace-locking operation-group trait"
 require_source_contains \
-  "crates/ecstore/tests/storage_api_compat_test.rs" \
+  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
   "fn ecstore_implements_storage_admin_api_contract()" \
   "ECStore StorageAdminApi compile-time coverage test"
 require_source_contains \
-  "crates/ecstore/tests/storage_api_compat_test.rs" \
+  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
   "fn ecstore_implements_namespace_locking_contract()" \
   "ECStore NamespaceLocking compile-time coverage test"
 
