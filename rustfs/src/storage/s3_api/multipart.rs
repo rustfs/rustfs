@@ -14,7 +14,7 @@
 
 use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
-use rustfs_ecstore::store_api::{ListMultipartsInfo, ListPartsInfo};
+use rustfs_storage_api::{ListMultipartsInfo, ListPartsInfo};
 use s3s::dto::{CommonPrefix, ListMultipartUploadsOutput, ListPartsOutput, MultipartUpload, Part, Timestamp};
 use s3s::{S3Error, S3ErrorCode};
 
@@ -192,7 +192,7 @@ mod tests {
     };
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
     use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
-    use rustfs_ecstore::store_api::{ListMultipartsInfo, ListPartsInfo, MultipartInfo, PartInfo};
+    use rustfs_storage_api::{ListMultipartsInfo, ListPartsInfo, MultipartInfo, PartInfo};
     use s3s::S3ErrorCode;
     use s3s::dto::Timestamp;
     use time::OffsetDateTime;

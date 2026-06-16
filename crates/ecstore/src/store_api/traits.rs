@@ -1,5 +1,8 @@
 use super::*;
-use rustfs_storage_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
+use rustfs_storage_api::{
+    BucketInfo, BucketOptions, DeleteBucketOptions, ListMultipartsInfo, ListPartsInfo, MakeBucketOptions, MultipartInfo,
+    MultipartUploadResult, PartInfo,
+};
 
 #[async_trait::async_trait]
 pub trait ObjectIO: Send + Sync + Debug + 'static {
