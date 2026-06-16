@@ -71,7 +71,15 @@ async fn resume_local_decommission_after_init(store: Arc<ECStore>, rx: Cancellat
             return;
         }
 
-        match store.decommission(rx.clone(), pool_indices.clone()).await {
+        let result = if pool_indices.len() > 1 {
+            store
+                .spawn_decommission_routines(store.clone(), rx.clone(), pool_indices.clone())
+                .await
+        } else {
+            store.decommission(rx.clone(), pool_indices.clone()).await
+        };
+
+        match result {
             Ok(()) => return,
             Err(err) if is_err_decommission_running(&err) => {
                 if let Err(spawn_err) = store
