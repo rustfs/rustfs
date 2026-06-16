@@ -1693,6 +1693,9 @@ mod tests {
                     }
                     Err(_) => break,
                 };
+                stream
+                    .set_nonblocking(false)
+                    .expect("failed to set discovery mock stream blocking");
 
                 seen += 1;
 

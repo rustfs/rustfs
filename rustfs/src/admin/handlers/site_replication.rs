@@ -53,7 +53,9 @@ use rustfs_ecstore::global::{get_global_deployment_id, get_global_endpoints_opt,
 use rustfs_ecstore::store_api::BucketOperations;
 use rustfs_iam::error::is_err_no_such_service_account;
 use rustfs_iam::store::{MappedPolicy, UserType};
-use rustfs_iam::sys::{NewServiceAccountOpts, UpdateServiceAccountOpts, get_claims_from_token_with_secret};
+use rustfs_iam::sys::{
+    NewServiceAccountOpts, SITE_REPLICATOR_SERVICE_ACCOUNT, UpdateServiceAccountOpts, get_claims_from_token_with_secret,
+};
 use rustfs_iam::{get_global_iam_sys, get_oidc};
 use rustfs_madmin::{
     BucketBandwidth, GroupStatus, IDPSettings, InProgressMetric, InQueueMetric, LDAPConfigSettings, LDAPSettings,
@@ -84,7 +86,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -110,7 +112,6 @@ const SITE_REPLICATION_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT: usize = 256;
 const IDENTITY_LDAP_SUB_SYS: &str = "identity_ldap";
 const LEGACY_LDAP_SUB_SYS: &str = "ldapserverconfig";
-const SITE_REPLICATOR_SERVICE_ACCOUNT: &str = "site-replicator-0";
 const SITE_REPLICATION_PEER_JOIN_PATH: &str = "/rustfs/admin/v3/site-replication/peer/join";
 const SITE_REPLICATION_PEER_EDIT_PATH: &str = "/rustfs/admin/v3/site-replication/peer/edit";
 const SITE_REPLICATION_PEER_REMOVE_PATH: &str = "/rustfs/admin/v3/site-replication/peer/remove";
@@ -123,8 +124,10 @@ fn site_replicator_service_account_policy() -> S3Result<Policy> {
     {
       "Effect": "Allow",
       "Action": [
+        "admin:SiteReplicationAdd",
         "admin:SiteReplicationInfo",
-        "admin:SiteReplicationOperation"
+        "admin:SiteReplicationOperation",
+        "admin:SiteReplicationRemove"
       ]
     },
     {
@@ -181,6 +184,7 @@ struct SiteReplicationPeerClientCache {
 }
 
 static SITE_REPLICATION_PEER_CLIENT: LazyLock<Mutex<Option<SiteReplicationPeerClientCache>>> = LazyLock::new(|| Mutex::new(None));
+static SITE_REPLICATION_STATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn site_replication_peer_client_cache_hit(
     cache: &Option<SiteReplicationPeerClientCache>,
@@ -203,11 +207,53 @@ fn site_replication_peer_client_cache_hit(
 struct SiteReplicationState {
     name: String,
     service_account_access_key: String,
+    #[serde(default, skip_serializing)]
     service_account_secret_key: String,
     service_account_parent: String,
     peers: BTreeMap<String, PeerInfo>,
     updated_at: Option<OffsetDateTime>,
     resync_status: BTreeMap<String, SRResyncOpStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_rotation: Option<PendingRotation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_remove: Option<PendingRemove>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PendingRotation {
+    id: String,
+    access_key: String,
+    parent: String,
+    new_secret_key: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    secret_candidates: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    peers: BTreeMap<String, PeerInfo>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    acked_deployment_ids: BTreeSet<String>,
+    #[serde(default, with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
+    updated_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PendingRemove {
+    id: String,
+    req: SRRemoveReq,
+    service_account_access_key: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    secret_candidates: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    original_peers: BTreeMap<String, PeerInfo>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    acked_deployment_ids: BTreeSet<String>,
+    #[serde(default, with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
+    updated_at: Option<OffsetDateTime>,
+}
+
+struct SiteReplicationRuntime {
+    state: SiteReplicationState,
+    local_peer: PeerInfo,
+    service_account_secret_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -366,6 +412,16 @@ async fn validate_site_replication_admin_request(
     Ok(cred)
 }
 
+fn reject_site_replicator_on_public_admin(cred: &rustfs_credentials::Credentials) -> S3Result<()> {
+    if cred.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT {
+        return Err(s3_error!(
+            AccessDenied,
+            "site replicator service account cannot modify site replication state"
+        ));
+    }
+    Ok(())
+}
+
 fn json_response<T: Serialize>(value: &T) -> S3Result<S3Response<(StatusCode, Body)>> {
     let data = serde_json::to_vec(value)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
@@ -486,20 +542,11 @@ async fn load_site_replication_state() -> S3Result<SiteReplicationState> {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
-    match read_config(store.clone(), SITE_REPLICATION_STATE_PATH).await {
+    match read_config(store, SITE_REPLICATION_STATE_PATH).await {
         Ok(data) => {
             let mut state: SiteReplicationState = serde_json::from_slice(&data)
                 .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid site replication state: {e}")))?;
-            let original_state = serde_json::to_vec(&state).ok();
             state.peers = normalize_peer_map_by_identity(state.peers);
-            let normalized_state = serde_json::to_vec(&state).ok();
-            if original_state != normalized_state
-                && let Some(data) = normalized_state
-            {
-                save_config(store, SITE_REPLICATION_STATE_PATH, data).await.map_err(|e| {
-                    S3Error::with_message(S3ErrorCode::InternalError, format!("normalize site replication state failed: {e}"))
-                })?;
-            }
             Ok(state)
         }
         Err(StorageError::ConfigNotFound) => Ok(SiteReplicationState::default()),
@@ -540,7 +587,7 @@ async fn clear_site_replication_state() -> S3Result<()> {
 async fn persist_site_replication_state(state: &SiteReplicationState) -> S3Result<()> {
     let mut normalized = state.clone();
     normalized.peers = normalize_peer_map_by_identity(normalized.peers);
-    if normalized.peers.len() <= 1 {
+    if normalized.peers.len() <= 1 && normalized.pending_rotation.is_none() && normalized.pending_remove.is_none() {
         clear_site_replication_state().await
     } else {
         save_site_replication_state(&normalized).await
@@ -811,13 +858,16 @@ fn site_replication_local_endpoint(uri: &Uri, headers: &HeaderMap) -> String {
     let endpoint = request_endpoint(uri, headers);
     match Url::parse(&endpoint) {
         Ok(mut parsed) => {
+            if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                return request_endpoint(&Uri::from_static("/"), &HeaderMap::new());
+            }
             if parsed.port_or_known_default() == runtime_console_port() && parsed.set_port(Some(global_rustfs_port())).is_ok() {
                 parsed.to_string().trim_end_matches('/').to_string()
             } else {
                 endpoint
             }
         }
-        Err(_) => endpoint,
+        Err(_) => request_endpoint(&Uri::from_static("/"), &HeaderMap::new()),
     }
 }
 
@@ -941,6 +991,63 @@ fn normalize_peer_site(site: PeerSite, replicate_ilm_expiry: bool) -> PeerInfo {
     })
 }
 
+fn validate_site_replication_peer_endpoint(endpoint: &str) -> S3Result<()> {
+    let parsed = Url::parse(endpoint)
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid site endpoint `{endpoint}`: {e}")))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                format!("invalid site endpoint `{endpoint}`: unsupported scheme `{scheme}`"),
+            ));
+        }
+    }
+    if parsed.host_str().is_none() {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("invalid site endpoint `{endpoint}`: missing host"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_add_sites(sites: &[PeerSite], local_peer: &PeerInfo) -> S3Result<()> {
+    if sites.is_empty() {
+        return Err(s3_error!(InvalidRequest, "at least one site is required"));
+    }
+
+    let mut seen = HashSet::new();
+    let mut remote_count = 0usize;
+    for site in sites {
+        if site.endpoint.trim().is_empty() {
+            return Err(s3_error!(InvalidRequest, "site endpoint is required"));
+        }
+        validate_site_replication_peer_endpoint(&site.endpoint)?;
+        let endpoint_key = site_identity_key(&site.endpoint);
+        if !seen.insert(endpoint_key) {
+            return Err(s3_error!(InvalidRequest, "duplicate site endpoint `{}`", site.endpoint));
+        }
+
+        if same_identity_endpoint(&site.endpoint, &local_peer.endpoint) {
+            continue;
+        }
+        remote_count += 1;
+        if site.access_key.trim().is_empty() {
+            return Err(s3_error!(InvalidRequest, "accessKey is required for site `{}`", site.endpoint));
+        }
+        if site.secret_key.trim().is_empty() {
+            return Err(s3_error!(InvalidRequest, "secretKey is required for site `{}`", site.endpoint));
+        }
+    }
+
+    if remote_count == 0 {
+        return Err(s3_error!(InvalidRequest, "at least one remote site is required"));
+    }
+
+    Ok(())
+}
+
 fn build_join_peers(
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
@@ -1007,19 +1114,29 @@ fn reconcile_peer_with_actual_identity(mut state: SiteReplicationState, actual_p
     state
 }
 
-async fn ensure_site_replicator_service_account(parent_user: &str, state: &SiteReplicationState) -> S3Result<(String, String)> {
+async fn site_replicator_service_account_secret(access_key: &str) -> S3Result<String> {
+    let Some(iam_sys) = get_global_iam_sys() else {
+        return Err(s3_error!(InvalidRequest, "iam not init"));
+    };
+
+    iam_sys
+        .get_site_replicator_service_account_secret(access_key)
+        .await
+        .map_err(ApiError::from)
+        .map_err(Into::into)
+}
+
+fn legacy_site_replicator_state_secret(state: &SiteReplicationState) -> Option<String> {
+    (state.service_account_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT && !state.service_account_secret_key.is_empty())
+        .then(|| state.service_account_secret_key.clone())
+}
+
+async fn set_site_replicator_service_account_secret(parent_user: &str, secret_key: String) -> S3Result<String> {
     let Some(iam_sys) = get_global_iam_sys() else {
         return Err(s3_error!(InvalidRequest, "iam not init"));
     };
 
     let access_key = SITE_REPLICATOR_SERVICE_ACCOUNT.to_string();
-    let secret_key =
-        if state.service_account_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT && !state.service_account_secret_key.is_empty() {
-            state.service_account_secret_key.clone()
-        } else {
-            rustfs_credentials::gen_secret_key(40)
-                .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("generate secret key failed: {e}")))?
-        };
 
     if iam_sys.get_service_account(&access_key).await.is_ok() {
         iam_sys
@@ -1032,6 +1149,7 @@ async fn ensure_site_replicator_service_account(parent_user: &str, state: &SiteR
                     description: None,
                     expiration: None,
                     status: None,
+                    allow_site_replicator_account: true,
                 },
             )
             .await
@@ -1055,6 +1173,28 @@ async fn ensure_site_replicator_service_account(parent_user: &str, state: &SiteR
             .await
             .map_err(ApiError::from)?;
     }
+
+    Ok(access_key)
+}
+
+async fn ensure_site_replicator_service_account(parent_user: &str, rotate_secret: bool) -> S3Result<(String, String)> {
+    let Some(iam_sys) = get_global_iam_sys() else {
+        return Err(s3_error!(InvalidRequest, "iam not init"));
+    };
+
+    let access_key = SITE_REPLICATOR_SERVICE_ACCOUNT.to_string();
+    let existing_secret = iam_sys.get_site_replicator_service_account_secret(&access_key).await.ok();
+    let secret_key = if rotate_secret {
+        rustfs_credentials::gen_secret_key(40)
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("generate secret key failed: {e}")))?
+    } else if let Some(secret_key) = existing_secret {
+        secret_key
+    } else {
+        rustfs_credentials::gen_secret_key(40)
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("generate secret key failed: {e}")))?
+    };
+
+    set_site_replicator_service_account_secret(parent_user, secret_key.clone()).await?;
 
     Ok((access_key, secret_key))
 }
@@ -1136,6 +1276,52 @@ async fn send_peer_admin_request<T: Serialize>(
     Ok(body.to_vec())
 }
 
+async fn send_peer_admin_request_with_secret_candidates<T: Serialize>(
+    endpoint: &str,
+    path: &str,
+    access_key: &str,
+    secret_candidates: &[String],
+    body: &T,
+) -> S3Result<Vec<u8>> {
+    let mut tried = HashSet::new();
+    let mut errors = Vec::new();
+
+    for secret_key in secret_candidates.iter().filter(|secret_key| !secret_key.is_empty()) {
+        if !tried.insert(secret_key.as_str()) {
+            continue;
+        }
+
+        match send_peer_admin_request(endpoint, path, access_key, secret_key, body).await {
+            Ok(body) => return Ok(body),
+            Err(err) => {
+                let detail = format!("{err}");
+                let may_retry_with_next_secret = peer_error_may_be_secret_mismatch(&detail);
+                errors.push(summarize_peer_error_detail(&detail));
+                if !may_retry_with_next_secret {
+                    break;
+                }
+            }
+        }
+    }
+
+    Err(S3Error::with_message(
+        S3ErrorCode::InternalError,
+        format!(
+            "peer request to {endpoint}{path} failed with all service-account secrets: {}",
+            errors.join("; ")
+        ),
+    ))
+}
+
+fn peer_error_may_be_secret_mismatch(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("signaturedoesnotmatch")
+        || detail.contains("accessdenied")
+        || detail.contains("forbidden")
+        || detail.contains("401")
+        || detail.contains("403")
+}
+
 async fn send_peer_admin_get_request(endpoint: &str, path: &str, access_key: &str, secret_key: &str) -> S3Result<Vec<u8>> {
     let base = endpoint.trim_end_matches('/');
     let url = format!("{base}{path}");
@@ -1203,19 +1389,43 @@ async fn send_peer_admin_get_request(endpoint: &str, path: &str, access_key: &st
     Ok(body.to_vec())
 }
 
-async fn runtime_site_replication_targets() -> S3Result<Option<(SiteReplicationState, PeerInfo)>> {
+async fn runtime_site_replication_targets() -> S3Result<Option<SiteReplicationRuntime>> {
     let state = load_site_replication_state().await?;
-    if !state.enabled() || state.service_account_access_key.is_empty() || state.service_account_secret_key.is_empty() {
+    if !state.enabled() || state.service_account_access_key.is_empty() {
         return Ok(None);
     }
 
-    Ok(Some((state.clone(), current_local_runtime_peer(&state))))
+    let service_account_secret_key = match site_replicator_service_account_secret(&state.service_account_access_key).await {
+        Ok(secret) => secret,
+        Err(err) => {
+            let Some(secret) = legacy_site_replicator_state_secret(&state) else {
+                return Err(err);
+            };
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                result = "legacy_state_service_account_secret_fallback",
+                error = ?err,
+                "admin site replication state"
+            );
+            secret
+        }
+    };
+    let local_peer = current_local_runtime_peer(&state);
+    Ok(Some(SiteReplicationRuntime {
+        state,
+        local_peer,
+        service_account_secret_key,
+    }))
 }
 
 async fn broadcast_site_replication_json<T: Serialize>(path: &str, body: &T) -> S3Result<()> {
-    let Some((state, local_peer)) = runtime_site_replication_targets().await? else {
+    let Some(runtime) = runtime_site_replication_targets().await? else {
         return Ok(());
     };
+    let state = &runtime.state;
+    let local_peer = &runtime.local_peer;
 
     for peer in state.peers.values() {
         if peer.deployment_id == local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
@@ -1226,7 +1436,7 @@ async fn broadcast_site_replication_json<T: Serialize>(path: &str, body: &T) -> 
             &peer.endpoint,
             path,
             &state.service_account_access_key,
-            &state.service_account_secret_key,
+            &runtime.service_account_secret_key,
             body,
         )
         .await?;
@@ -1236,13 +1446,26 @@ async fn broadcast_site_replication_json<T: Serialize>(path: &str, body: &T) -> 
 }
 
 pub async fn site_replication_make_bucket_hook(bucket: &str, lock_enabled: bool) -> S3Result<()> {
-    let Some((state, local_peer)) = runtime_site_replication_targets().await? else {
+    let Some(runtime) = runtime_site_replication_targets().await? else {
         return Ok(());
     };
 
     ensure_site_replication_bucket_versioning(bucket).await?;
-    ensure_site_replication_bucket_targets(bucket, &state, &local_peer, None).await?;
-    ensure_site_replication_bucket_replication_config(bucket, &state, &local_peer).await?;
+    ensure_site_replication_bucket_targets(
+        bucket,
+        &runtime.state,
+        &runtime.local_peer,
+        None,
+        &runtime.service_account_secret_key,
+    )
+    .await?;
+    ensure_site_replication_bucket_replication_config(
+        bucket,
+        &runtime.state,
+        &runtime.local_peer,
+        &runtime.service_account_secret_key,
+    )
+    .await?;
 
     let created_at = resolve_object_store_handle()
         .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?
@@ -1293,7 +1516,8 @@ pub async fn site_replication_delete_bucket_hook(bucket: &str, force_delete: boo
 }
 
 pub async fn site_replication_bucket_meta_hook(item: SRBucketMeta) -> S3Result<()> {
-    broadcast_site_replication_json("/rustfs/admin/v3/site-replication/peer/bucket-meta", &item).await
+    broadcast_site_replication_json("/rustfs/admin/v3/site-replication/peer/bucket-meta", &encode_bucket_meta_wire_item(item))
+        .await
 }
 
 pub async fn site_replication_iam_change_hook(item: SRIAMItem) -> S3Result<()> {
@@ -1305,6 +1529,37 @@ fn raw_config_to_string(raw: &[u8]) -> Option<String> {
         return None;
     }
     String::from_utf8(raw.to_vec()).ok()
+}
+
+fn raw_config_to_base64(raw: &[u8]) -> Option<String> {
+    (!raw.is_empty()).then(|| BASE64_STANDARD.encode(raw))
+}
+
+fn encode_bucket_meta_wire_value(value: Option<String>) -> Option<String> {
+    value.map(|raw| BASE64_STANDARD.encode(raw.as_bytes()))
+}
+
+fn encode_bucket_meta_wire_item(mut item: SRBucketMeta) -> SRBucketMeta {
+    item.versioning = encode_bucket_meta_wire_value(item.versioning);
+    item.tags = encode_bucket_meta_wire_value(item.tags);
+    item.object_lock_config = encode_bucket_meta_wire_value(item.object_lock_config);
+    item.sse_config = encode_bucket_meta_wire_value(item.sse_config);
+    item.replication_config = encode_bucket_meta_wire_value(item.replication_config);
+    item.expiry_lc_config = encode_bucket_meta_wire_value(item.expiry_lc_config);
+    item.cors = encode_bucket_meta_wire_value(item.cors);
+    item
+}
+
+fn decode_bucket_meta_wire_value(raw: &str) -> Vec<u8> {
+    BASE64_STANDARD
+        .decode(raw.as_bytes())
+        .ok()
+        .filter(|decoded| std::str::from_utf8(decoded).is_ok())
+        .unwrap_or_else(|| raw.as_bytes().to_vec())
+}
+
+fn decode_bucket_meta_wire_option(value: Option<String>) -> Option<Vec<u8>> {
+    value.map(|raw| decode_bucket_meta_wire_value(&raw))
 }
 
 fn maybe_time(value: OffsetDateTime) -> Option<OffsetDateTime> {
@@ -1343,14 +1598,14 @@ async fn build_sr_info(state: &SiteReplicationState, local_peer: &PeerInfo) -> S
 
         if let Some(metadata) = metadata {
             entry.policy = raw_config_to_string(&metadata.policy_config_json).and_then(|raw| serde_json::from_str(&raw).ok());
-            entry.versioning = raw_config_to_string(&metadata.versioning_config_xml);
-            entry.tags = raw_config_to_string(&metadata.tagging_config_xml);
-            entry.object_lock_config = raw_config_to_string(&metadata.object_lock_config_xml);
-            entry.sse_config = raw_config_to_string(&metadata.encryption_config_xml);
-            entry.replication_config = raw_config_to_string(&metadata.replication_config_xml);
-            entry.quota_config = raw_config_to_string(&metadata.quota_config_json);
-            entry.expiry_lc_config = raw_config_to_string(&metadata.lifecycle_config_xml);
-            entry.cors_config = raw_config_to_string(&metadata.cors_config_xml);
+            entry.versioning = raw_config_to_base64(&metadata.versioning_config_xml);
+            entry.tags = raw_config_to_base64(&metadata.tagging_config_xml);
+            entry.object_lock_config = raw_config_to_base64(&metadata.object_lock_config_xml);
+            entry.sse_config = raw_config_to_base64(&metadata.encryption_config_xml);
+            entry.replication_config = raw_config_to_base64(&metadata.replication_config_xml);
+            entry.quota_config = raw_config_to_base64(&metadata.quota_config_json);
+            entry.expiry_lc_config = raw_config_to_base64(&metadata.lifecycle_config_xml);
+            entry.cors_config = raw_config_to_base64(&metadata.cors_config_xml);
             entry.policy_updated_at = maybe_time(metadata.policy_config_updated_at);
             entry.tag_config_updated_at = maybe_time(metadata.tagging_config_updated_at);
             entry.object_lock_config_updated_at = maybe_time(metadata.object_lock_config_updated_at);
@@ -1539,8 +1794,13 @@ fn sr_metainfo_path(uri: &Uri) -> String {
         .unwrap_or_else(|| "/rustfs/admin/v3/site-replication/metainfo".to_string())
 }
 
-async fn fetch_peer_sr_info(peer: &PeerInfo, state: &SiteReplicationState, uri: &Uri) -> S3Result<SRInfo> {
-    if state.service_account_access_key.is_empty() || state.service_account_secret_key.is_empty() {
+async fn fetch_peer_sr_info(
+    peer: &PeerInfo,
+    state: &SiteReplicationState,
+    service_account_secret_key: &str,
+    uri: &Uri,
+) -> S3Result<SRInfo> {
+    if state.service_account_access_key.is_empty() || service_account_secret_key.is_empty() {
         return Err(s3_error!(InvalidRequest, "site replication service account is not configured"));
     }
 
@@ -1548,7 +1808,7 @@ async fn fetch_peer_sr_info(peer: &PeerInfo, state: &SiteReplicationState, uri: 
         &peer.endpoint,
         &sr_metainfo_path(uri),
         &state.service_account_access_key,
-        &state.service_account_secret_key,
+        service_account_secret_key,
     )
     .await?;
 
@@ -1988,6 +2248,13 @@ async fn build_status_info(state: &SiteReplicationState, local_peer: &PeerInfo, 
     let opts = sr_status_options(uri);
     let mut local_info = Some(filter_sr_info(build_sr_info(state, local_peer).await?, &opts));
     let metrics_requested = opts.metrics || opts.include_all_defaults() || opts.entity == SREntityType::Bucket;
+    let service_account_secret_key = if state.enabled() && !state.service_account_access_key.is_empty() {
+        site_replicator_service_account_secret(&state.service_account_access_key)
+            .await
+            .ok()
+    } else {
+        None
+    };
 
     let mut site_infos = BTreeMap::new();
     let mut reachable_peers = HashSet::new();
@@ -1998,24 +2265,37 @@ async fn build_status_info(state: &SiteReplicationState, local_peer: &PeerInfo, 
             continue;
         }
 
-        match fetch_peer_sr_info(peer, state, uri).await {
-            Ok(peer_info) => {
-                site_infos.insert(deployment_id.clone(), filter_sr_info(peer_info, &opts));
-                reachable_peers.insert(deployment_id.clone());
-            }
-            Err(err) => {
+        match service_account_secret_key.as_deref() {
+            Some(secret_key) => match fetch_peer_sr_info(peer, state, secret_key, uri).await {
+                Ok(peer_info) => {
+                    site_infos.insert(deployment_id.clone(), filter_sr_info(peer_info, &opts));
+                    reachable_peers.insert(deployment_id.clone());
+                }
+                Err(err) => {
+                    warn!(
+                        event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                        peer = %peer.endpoint,
+                        result = "peer_metainfo_fetch_failed",
+                        error = ?err,
+                        "admin site replication state"
+                    );
+                    site_infos.insert(deployment_id.clone(), SRInfo::default());
+                }
+            },
+            None => {
                 warn!(
                     event = EVENT_ADMIN_SITE_REPLICATION_STATE,
                     component = LOG_COMPONENT_ADMIN,
                     subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
                     peer = %peer.endpoint,
-                    result = "peer_metainfo_fetch_failed",
-                    error = ?err,
+                    result = "site_replication_service_account_missing",
                     "admin site replication state"
                 );
                 site_infos.insert(deployment_id.clone(), SRInfo::default());
             }
-        }
+        };
     }
 
     let max_buckets = site_infos.values().map(|info| info.buckets.len()).max().unwrap_or(0);
@@ -2104,13 +2384,11 @@ fn merge_add_sites(
     local_peer: PeerInfo,
     sites: Vec<PeerSite>,
     service_account_access_key: String,
-    service_account_secret_key: String,
     service_account_parent: String,
     replicate_ilm_expiry: bool,
 ) -> SiteReplicationState {
     state.name = local_peer.name.clone();
     state.service_account_access_key = service_account_access_key;
-    state.service_account_secret_key = service_account_secret_key;
     state.service_account_parent = service_account_parent;
     state.updated_at = Some(OffsetDateTime::now_utc());
     state.peers = build_join_peers(&state, &local_peer, sites, replicate_ilm_expiry);
@@ -2187,6 +2465,43 @@ fn remove_sites(mut state: SiteReplicationState, req: SRRemoveReq) -> SiteReplic
     state
 }
 
+fn validate_remove_sites_req(state: &SiteReplicationState, req: &SRRemoveReq) -> S3Result<()> {
+    if req.remove_all {
+        if !req.site_names.is_empty() {
+            return Err(s3_error!(InvalidRequest, "sites must be empty when all=true"));
+        }
+        return Ok(());
+    }
+
+    if req.site_names.is_empty() {
+        return Err(s3_error!(InvalidRequest, "sites is required when all=false"));
+    }
+
+    let mut seen = HashSet::new();
+    let names: HashSet<&str> = req
+        .site_names
+        .iter()
+        .map(|name| name.trim())
+        .map(|name| {
+            if name.is_empty() {
+                Err(s3_error!(InvalidRequest, "site name must not be empty"))
+            } else if !seen.insert(name.to_string()) {
+                Err(s3_error!(InvalidRequest, "duplicate site name `{name}`"))
+            } else {
+                Ok(name)
+            }
+        })
+        .collect::<S3Result<HashSet<_>>>()?;
+
+    let matches_local = names.contains(state.name.as_str());
+    let matches_peer = state.peers.values().any(|peer| names.contains(peer.name.as_str()));
+    if !matches_local && !matches_peer {
+        return Err(s3_error!(InvalidRequest, "none of the requested sites are configured"));
+    }
+
+    Ok(())
+}
+
 fn summarize_peer_error_detail(detail: &str) -> String {
     let detail = detail.trim();
     let detail_chars = detail.chars().count();
@@ -2212,6 +2527,124 @@ fn site_replication_remove_status(peer_errors: &[String]) -> ReplicateRemoveStat
         },
         api_version: Some(SITE_REPL_API_VERSION.to_string()),
     }
+}
+
+fn pending_remote_peer_ids(peers: &BTreeMap<String, PeerInfo>, local_peer: &PeerInfo) -> BTreeSet<String> {
+    peers
+        .values()
+        .filter(|peer| {
+            peer.deployment_id != local_peer.deployment_id && !same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
+        })
+        .map(|peer| peer.deployment_id.clone())
+        .collect()
+}
+
+fn pending_all_remote_peers_acked(
+    peers: &BTreeMap<String, PeerInfo>,
+    local_peer: &PeerInfo,
+    acked_deployment_ids: &BTreeSet<String>,
+) -> bool {
+    pending_remote_peer_ids(peers, local_peer)
+        .iter()
+        .all(|deployment_id| acked_deployment_ids.contains(deployment_id))
+}
+
+fn push_unique_secret_candidate(candidates: &mut Vec<String>, secret: String) {
+    if !secret.is_empty() && !candidates.iter().any(|candidate| candidate == &secret) {
+        candidates.push(secret);
+    }
+}
+
+async fn record_pending_rotation_secret_candidate(rotation_id: &str, secret: String) -> S3Result<()> {
+    if secret.is_empty() {
+        return Ok(());
+    }
+
+    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let mut state = load_site_replication_state().await?;
+    if let Some(pending) = state.pending_rotation.as_mut()
+        && pending.id == rotation_id
+    {
+        push_unique_secret_candidate(&mut pending.secret_candidates, secret);
+        save_site_replication_state(&state).await?;
+    }
+    Ok(())
+}
+
+async fn record_pending_remove_secret_candidate(remove_id: &str, secret: String) -> S3Result<()> {
+    if secret.is_empty() {
+        return Ok(());
+    }
+
+    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let mut state = load_site_replication_state().await?;
+    if let Some(pending) = state.pending_remove.as_mut()
+        && pending.id == remove_id
+    {
+        push_unique_secret_candidate(&mut pending.secret_candidates, secret);
+        save_site_replication_state(&state).await?;
+    }
+    Ok(())
+}
+
+async fn mark_pending_rotation_peer_acked(rotation_id: &str, deployment_id: &str) -> S3Result<()> {
+    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let mut state = load_site_replication_state().await?;
+    if let Some(pending) = state.pending_rotation.as_mut()
+        && pending.id == rotation_id
+    {
+        pending.acked_deployment_ids.insert(deployment_id.to_string());
+        save_site_replication_state(&state).await?;
+    }
+    Ok(())
+}
+
+async fn mark_pending_remove_peer_acked(remove_id: &str, deployment_id: &str) -> S3Result<()> {
+    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let mut state = load_site_replication_state().await?;
+    if let Some(pending) = state.pending_remove.as_mut()
+        && pending.id == remove_id
+    {
+        pending.acked_deployment_ids.insert(deployment_id.to_string());
+        save_site_replication_state(&state).await?;
+    }
+    Ok(())
+}
+
+async fn finalize_pending_rotation_if_complete(rotation_id: &str, local_peer: &PeerInfo) -> S3Result<bool> {
+    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let mut state = load_site_replication_state().await?;
+    let Some(pending) = state.pending_rotation.as_ref() else {
+        return Ok(true);
+    };
+    if pending.id != rotation_id {
+        return Ok(false);
+    }
+    if !pending_all_remote_peers_acked(&pending.peers, local_peer, &pending.acked_deployment_ids) {
+        return Ok(false);
+    }
+
+    state.pending_rotation = None;
+    persist_site_replication_state(&state).await?;
+    Ok(true)
+}
+
+async fn finalize_pending_remove_if_complete(remove_id: &str, local_peer: &PeerInfo) -> S3Result<bool> {
+    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let mut state = load_site_replication_state().await?;
+    let Some(pending) = state.pending_remove.as_ref() else {
+        return Ok(true);
+    };
+    if pending.id != remove_id {
+        return Ok(false);
+    }
+    if !pending_all_remote_peers_acked(&pending.original_peers, local_peer, &pending.acked_deployment_ids) {
+        return Ok(false);
+    }
+
+    state.pending_remove = None;
+    persist_site_replication_state(&state).await?;
+    Ok(true)
 }
 
 fn resync_status_for_state(
@@ -2285,9 +2718,10 @@ fn site_replication_bucket_target_for_peer(
     bucket: &str,
     state: &SiteReplicationState,
     peer: &PeerInfo,
+    service_account_secret_key: &str,
     arn_override: Option<String>,
 ) -> S3Result<Option<BucketTarget>> {
-    if state.service_account_access_key.is_empty() || state.service_account_secret_key.is_empty() {
+    if state.service_account_access_key.is_empty() || service_account_secret_key.is_empty() {
         return Ok(None);
     }
 
@@ -2316,7 +2750,7 @@ fn site_replication_bucket_target_for_peer(
         endpoint: format!("{host}:{port}"),
         credentials: Some(Credentials {
             access_key: state.service_account_access_key.clone(),
-            secret_key: state.service_account_secret_key.clone(),
+            secret_key: service_account_secret_key.to_string(),
             session_token: None,
             expiration: None,
         }),
@@ -2335,8 +2769,9 @@ fn reconcile_site_replication_bucket_targets(
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
     config: Option<&s3s::dto::ReplicationConfiguration>,
+    service_account_secret_key: &str,
 ) -> S3Result<BucketTargets> {
-    if !state.enabled() || state.service_account_access_key.is_empty() || state.service_account_secret_key.is_empty() {
+    if !state.enabled() || state.service_account_access_key.is_empty() || service_account_secret_key.is_empty() {
         return Ok(existing);
     }
 
@@ -2348,8 +2783,13 @@ fn reconcile_site_replication_bucket_targets(
             continue;
         }
 
-        let Some(mut target) =
-            site_replication_bucket_target_for_peer(bucket, state, peer, configured_arns.get(&peer.deployment_id).cloned())?
+        let Some(mut target) = site_replication_bucket_target_for_peer(
+            bucket,
+            state,
+            peer,
+            service_account_secret_key,
+            configured_arns.get(&peer.deployment_id).cloned(),
+        )?
         else {
             continue;
         };
@@ -2417,6 +2857,7 @@ fn build_site_replication_config(
     bucket: &str,
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
+    service_account_secret_key: &str,
 ) -> S3Result<Option<ReplicationConfiguration>> {
     let mut rules = Vec::new();
     for peer in state.peers.values() {
@@ -2424,7 +2865,7 @@ fn build_site_replication_config(
             continue;
         }
 
-        let Some(target) = site_replication_bucket_target_for_peer(bucket, state, peer, None)? else {
+        let Some(target) = site_replication_bucket_target_for_peer(bucket, state, peer, service_account_secret_key, None)? else {
             continue;
         };
         rules.push(build_site_replication_rule(
@@ -2449,6 +2890,7 @@ async fn ensure_site_replication_bucket_targets(
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
     config: Option<&s3s::dto::ReplicationConfiguration>,
+    service_account_secret_key: &str,
 ) -> S3Result<()> {
     let existing = match metadata_sys::list_bucket_targets(bucket).await {
         Ok(targets) => targets,
@@ -2456,7 +2898,8 @@ async fn ensure_site_replication_bucket_targets(
         Err(err) => return Err(ApiError::from(err).into()),
     };
 
-    let updated = reconcile_site_replication_bucket_targets(existing, bucket, state, local_peer, config)?;
+    let updated =
+        reconcile_site_replication_bucket_targets(existing, bucket, state, local_peer, config, service_account_secret_key)?;
     if updated.targets.is_empty() {
         return Ok(());
     }
@@ -2475,12 +2918,13 @@ async fn ensure_site_replication_bucket_replication_config(
     bucket: &str,
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
+    service_account_secret_key: &str,
 ) -> S3Result<()> {
     // Fix 6: reconcile rather than early-returning when any config already exists.
     // The old code bailed on Ok(_), so the second site joined a replicated bucket and
     // ended up with NO rule pointing back to the first site. Objects on that site could
     // never travel back, producing the "one-directional" replication symptom.
-    let Some(desired) = build_site_replication_config(bucket, state, local_peer)? else {
+    let Some(desired) = build_site_replication_config(bucket, state, local_peer, service_account_secret_key)? else {
         return Ok(());
     };
 
@@ -2541,7 +2985,11 @@ pub async fn site_replication_peer_deployment_id_for_endpoint(endpoint: &str) ->
 /// that already exists locally, wire up versioning + targets + replication config for each, and
 /// kick a resync toward every remote peer so pre-existing objects back-fill. Errors are logged
 /// but never abort the caller — the admin can run a manual resync if needed.
-async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local_peer: &PeerInfo) {
+async fn backfill_existing_buckets_after_add(
+    state: &SiteReplicationState,
+    local_peer: &PeerInfo,
+    service_account_secret_key: &str,
+) {
     let Some(store) = resolve_object_store_handle() else {
         return;
     };
@@ -2576,7 +3024,8 @@ async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local
             );
             continue;
         }
-        if let Err(err) = ensure_site_replication_bucket_targets(name, state, local_peer, None).await {
+        if let Err(err) = ensure_site_replication_bucket_targets(name, state, local_peer, None, service_account_secret_key).await
+        {
             warn!(
                 event = EVENT_ADMIN_SITE_REPLICATION_STATE,
                 component = LOG_COMPONENT_ADMIN,
@@ -2587,7 +3036,9 @@ async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local
                 "admin site replication state"
             );
         }
-        if let Err(err) = ensure_site_replication_bucket_replication_config(name, state, local_peer).await {
+        if let Err(err) =
+            ensure_site_replication_bucket_replication_config(name, state, local_peer, service_account_secret_key).await
+        {
             warn!(
                 event = EVENT_ADMIN_SITE_REPLICATION_STATE,
                 component = LOG_COMPONENT_ADMIN,
@@ -2646,6 +3097,56 @@ async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local
                     "admin site replication state"
                 );
             }
+        }
+    }
+}
+
+async fn refresh_bucket_targets_after_service_account_rotation(
+    state: &SiteReplicationState,
+    local_peer: &PeerInfo,
+    service_account_secret_key: &str,
+) {
+    let Some(store) = resolve_object_store_handle() else {
+        return;
+    };
+    let buckets = match store.list_bucket(&BucketOptions::default()).await {
+        Ok(buckets) => buckets,
+        Err(err) => {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                result = "rotation_target_refresh_list_buckets_failed",
+                error = ?err,
+                "admin site replication state"
+            );
+            return;
+        }
+    };
+
+    for bucket in buckets {
+        let replication_config = metadata_sys::get_replication_config(&bucket.name)
+            .await
+            .ok()
+            .map(|(config, _)| config);
+        if let Err(err) = ensure_site_replication_bucket_targets(
+            &bucket.name,
+            state,
+            local_peer,
+            replication_config.as_ref(),
+            service_account_secret_key,
+        )
+        .await
+        {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                bucket = %bucket.name,
+                result = "rotation_target_refresh_failed",
+                error = ?err,
+                "admin site replication state"
+            );
         }
     }
 }
@@ -2804,7 +3305,9 @@ async fn cancel_site_bucket_resync(bucket: &str, peer: &PeerInfo, resync_id: &st
 }
 
 fn apply_state_edit_req(mut state: SiteReplicationState, body: SRStateEditReq) -> SiteReplicationState {
-    let incoming_updated_at = body.updated_at.unwrap_or_else(OffsetDateTime::now_utc);
+    let Some(incoming_updated_at) = body.updated_at else {
+        return state;
+    };
     if state.updated_at.is_some_and(|current| incoming_updated_at <= current) {
         return state;
     }
@@ -2846,6 +3349,28 @@ async fn ensure_site_replication_bucket_versioning(bucket: &str) -> S3Result<()>
     Ok(())
 }
 
+fn is_stale_update(local_updated_at: OffsetDateTime, incoming_updated_at: Option<OffsetDateTime>) -> bool {
+    incoming_updated_at.is_some_and(|incoming_updated_at| incoming_updated_at < local_updated_at)
+}
+
+fn bucket_meta_local_updated_at(
+    bucket_meta: &rustfs_ecstore::bucket::metadata::BucketMetadata,
+    config_file: &str,
+) -> OffsetDateTime {
+    match config_file {
+        BUCKET_POLICY_CONFIG => bucket_meta.policy_config_updated_at,
+        BUCKET_TAGGING_CONFIG => bucket_meta.tagging_config_updated_at,
+        BUCKET_VERSIONING_CONFIG => bucket_meta.versioning_config_updated_at,
+        OBJECT_LOCK_CONFIG => bucket_meta.object_lock_config_updated_at,
+        BUCKET_SSECONFIG => bucket_meta.encryption_config_updated_at,
+        BUCKET_REPLICATION_CONFIG => bucket_meta.replication_config_updated_at,
+        BUCKET_QUOTA_CONFIG_FILE => bucket_meta.quota_config_updated_at,
+        BUCKET_LIFECYCLE_CONFIG => bucket_meta.lifecycle_config_updated_at,
+        BUCKET_CORS_CONFIG => bucket_meta.cors_config_updated_at,
+        _ => OffsetDateTime::UNIX_EPOCH,
+    }
+}
+
 async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
     let Some(store) = resolve_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -2875,10 +3400,25 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
         }
     };
 
+    let incoming_updated_at = if item.r#type == "lc-config" {
+        item.expiry_updated_at.or(item.updated_at)
+    } else {
+        item.updated_at
+    };
+    if let Ok(bucket_meta) = metadata_sys::get(&item.bucket).await {
+        let local_updated_at = bucket_meta_local_updated_at(&bucket_meta, config_file);
+        if is_stale_update(local_updated_at, incoming_updated_at) {
+            return Ok(());
+        }
+    }
+
     let replication_config = if item.r#type == "replication-config" {
         item.replication_config
             .as_ref()
-            .map(|raw| deserialize::<s3s::dto::ReplicationConfiguration>(raw.as_bytes()))
+            .map(|raw| {
+                let data = decode_bucket_meta_wire_value(raw);
+                deserialize::<s3s::dto::ReplicationConfiguration>(&data)
+            })
             .transpose()
             .map_err(|e| s3_error!(InvalidRequest, "invalid replication config: {e}"))?
     } else {
@@ -2896,15 +3436,13 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
             .map(|quota| serde_json::to_vec(&quota))
             .transpose()
             .map_err(|e| s3_error!(InvalidRequest, "invalid bucket quota: {}", e))?,
-        "tags" => item.tags.map(String::into_bytes),
-        "version-config" => item.versioning.map(String::into_bytes),
-        "object-lock-config" => item.object_lock_config.map(String::into_bytes),
-        "sse-config" => item.sse_config.map(String::into_bytes),
-        "replication-config" => item.replication_config.map(String::into_bytes),
-        "lc-config" => item.expiry_lc_config.map(String::into_bytes),
-        "cors-config" => item
-            .cors
-            .map(|raw| BASE64_STANDARD.decode(raw.as_bytes()).unwrap_or_else(|_| raw.into_bytes())),
+        "tags" => decode_bucket_meta_wire_option(item.tags),
+        "version-config" => decode_bucket_meta_wire_option(item.versioning),
+        "object-lock-config" => decode_bucket_meta_wire_option(item.object_lock_config),
+        "sse-config" => decode_bucket_meta_wire_option(item.sse_config),
+        "replication-config" => decode_bucket_meta_wire_option(item.replication_config),
+        "lc-config" => decode_bucket_meta_wire_option(item.expiry_lc_config),
+        "cors-config" => decode_bucket_meta_wire_option(item.cors),
         _ => unreachable!(),
     };
 
@@ -2919,9 +3457,16 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
     }
 
     if item.r#type == "replication-config"
-        && let Some((state, local_peer)) = runtime_site_replication_targets().await?
+        && let Some(runtime) = runtime_site_replication_targets().await?
     {
-        ensure_site_replication_bucket_targets(&item.bucket, &state, &local_peer, replication_config.as_ref()).await?;
+        ensure_site_replication_bucket_targets(
+            &item.bucket,
+            &runtime.state,
+            &runtime.local_peer,
+            replication_config.as_ref(),
+            &runtime.service_account_secret_key,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -2934,6 +3479,7 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
     let Some(iam_sys) = get_global_iam_sys() else {
         return Err(s3_error!(InvalidRequest, "iam not init"));
     };
+    let incoming_updated_at = item.updated_at;
 
     match item.r#type.as_str() {
         "policy" => {
@@ -3037,6 +3583,11 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
                 return Err(s3_error!(InvalidRequest, "serviceAccountChange is required"));
             };
             if let Some(create) = change.create {
+                if let Some(local) = iam_sys.get_user(&create.access_key).await
+                    && is_stale_update(local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH), incoming_updated_at)
+                {
+                    return Ok(());
+                }
                 let session_policy = if create.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT {
                     Some(site_replicator_service_account_policy()?)
                 } else {
@@ -3061,6 +3612,7 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
                                     description: (!create.description.is_empty()).then_some(create.description),
                                     expiration: create.expiration,
                                     status: (!create.status.is_empty()).then_some(create.status),
+                                    allow_site_replicator_account: create.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT,
                                 },
                             )
                             .await
@@ -3091,7 +3643,17 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
             }
 
             if let Some(update) = change.update {
-                let session_policy = update.session_policy.as_str().and_then(|raw| serde_json::from_str(raw).ok());
+                if let Some(local) = iam_sys.get_user(&update.access_key).await
+                    && is_stale_update(local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH), incoming_updated_at)
+                {
+                    return Ok(());
+                }
+                let allow_site_replicator_account = update.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT;
+                let session_policy = if allow_site_replicator_account {
+                    Some(site_replicator_service_account_policy()?)
+                } else {
+                    update.session_policy.as_str().and_then(|raw| serde_json::from_str(raw).ok())
+                };
                 iam_sys
                     .update_service_account(
                         &update.access_key,
@@ -3102,6 +3664,7 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
                             description: (!update.description.is_empty()).then_some(update.description),
                             expiration: update.expiration,
                             status: (!update.status.is_empty()).then_some(update.status),
+                            allow_site_replicator_account,
                         },
                     )
                     .await
@@ -3110,6 +3673,11 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
             }
 
             if let Some(delete) = change.delete {
+                if let Some(local) = iam_sys.get_user(&delete.access_key).await
+                    && is_stale_update(local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH), incoming_updated_at)
+                {
+                    return Ok(());
+                }
                 iam_sys
                     .delete_service_account(&delete.access_key, true)
                     .await
@@ -3141,24 +3709,26 @@ pub struct SiteReplicationAddHandler {}
 impl Operation for SiteReplicationAddHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
+        reject_site_replicator_on_public_admin(&cred)?;
         let replicate_ilm_expiry = sr_add_replicate_ilm_expiry(&req.uri);
+        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
         let current_state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &current_state);
         let sites: Vec<PeerSite> = read_site_replication_json(req, &cred.secret_key, true).await?;
+        validate_add_sites(&sites, &local_peer)?;
         let (service_account_access_key, service_account_secret_key) =
-            ensure_site_replicator_service_account(&cred.access_key, &current_state).await?;
+            ensure_site_replicator_service_account(&cred.access_key, false).await?;
         let mut state = merge_add_sites(
             current_state,
             local_peer.clone(),
             sites.clone(),
             service_account_access_key.clone(),
-            service_account_secret_key.clone(),
             cred.access_key.clone(),
             replicate_ilm_expiry,
         );
         let join_req = SRPeerJoinReq {
             svc_acct_access_key: service_account_access_key,
-            svc_acct_secret_key: service_account_secret_key,
+            svc_acct_secret_key: service_account_secret_key.clone(),
             svc_acct_parent: String::new(),
             peers: state.peers.clone(),
             updated_at: state.updated_at,
@@ -3197,7 +3767,7 @@ impl Operation for SiteReplicationAddHandler {
         // Fix 1: back-fill pre-existing buckets so objects created before `replicate add`
         // are not silently left out of replication. Failures are logged but do not abort
         // the overall add operation — the admin can trigger a manual resync if needed.
-        backfill_existing_buckets_after_add(&state, &local_peer).await;
+        backfill_existing_buckets_after_add(&state, &local_peer, &service_account_secret_key).await;
 
         json_response(&ReplicateAddStatus {
             success: true,
@@ -3213,30 +3783,62 @@ pub struct SiteReplicationRemoveHandler {}
 #[async_trait::async_trait]
 impl Operation for SiteReplicationRemoveHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        validate_site_replication_admin_request(&req, AdminAction::SiteReplicationRemoveAction).await?;
-        let current_state = load_site_replication_state().await?;
-        let local_peer = current_local_peer(&req, &current_state);
-        let remove_req: SRRemoveReq = read_site_replication_json(req, "", false).await?;
-        let state = remove_sites(current_state.clone(), remove_req.clone());
-        persist_site_replication_state(&state).await?;
-        let mut status = site_replication_remove_status(&[]);
+        let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationRemoveAction).await?;
+        reject_site_replicator_on_public_admin(&cred)?;
+        let (pending_remove, local_peer) = {
+            let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+            let current_state = load_site_replication_state().await?;
+            let local_peer = current_local_peer(&req, &current_state);
+            let remove_req: SRRemoveReq = read_site_replication_json(req, "", false).await?;
+
+            if let Some(pending) = current_state.pending_remove.clone() {
+                (pending, local_peer)
+            } else {
+                validate_remove_sites_req(&current_state, &remove_req)?;
+                let mut next_state = remove_sites(current_state.clone(), remove_req.clone());
+                let mut peer_remove_req = remove_req;
+                peer_remove_req.requesting_dep_id = local_peer.deployment_id.clone();
+                let pending = PendingRemove {
+                    id: Uuid::new_v4().to_string(),
+                    req: peer_remove_req,
+                    service_account_access_key: current_state.service_account_access_key.clone(),
+                    secret_candidates: legacy_site_replicator_state_secret(&current_state).into_iter().collect(),
+                    original_peers: current_state.peers.clone(),
+                    acked_deployment_ids: BTreeSet::new(),
+                    updated_at: next_state.updated_at,
+                };
+                next_state.pending_remove = Some(pending.clone());
+                persist_site_replication_state(&next_state).await?;
+                (pending, local_peer)
+            }
+        };
 
         let mut peer_errors = Vec::new();
-        if !current_state.service_account_access_key.is_empty() && !current_state.service_account_secret_key.is_empty() {
-            for peer in current_state.peers.values() {
-                if same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
+        let mut secret_candidates = pending_remove.secret_candidates.clone();
+        if pending_remove.service_account_access_key.is_empty() {
+            peer_errors.push("site replication service account unavailable".to_string());
+        } else if let Ok(service_account_secret_key) =
+            site_replicator_service_account_secret(&pending_remove.service_account_access_key).await
+        {
+            record_pending_remove_secret_candidate(&pending_remove.id, service_account_secret_key.clone()).await?;
+            push_unique_secret_candidate(&mut secret_candidates, service_account_secret_key);
+        }
+
+        if secret_candidates.is_empty() {
+            peer_errors.push("site replication service account secret unavailable".to_string());
+        } else {
+            for peer in pending_remove.original_peers.values() {
+                if same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
+                    || pending_remove.acked_deployment_ids.contains(&peer.deployment_id)
+                {
                     continue;
                 }
-                if let Err(err) = send_peer_admin_request(
+                if let Err(err) = send_peer_admin_request_with_secret_candidates(
                     &peer.endpoint,
                     SITE_REPLICATION_PEER_REMOVE_PATH,
-                    &current_state.service_account_access_key,
-                    &current_state.service_account_secret_key,
-                    &SRRemoveReq {
-                        requesting_dep_id: local_peer.deployment_id.clone(),
-                        site_names: remove_req.site_names.clone(),
-                        remove_all: remove_req.remove_all,
-                    },
+                    &pending_remove.service_account_access_key,
+                    &secret_candidates,
+                    &pending_remove.req,
                 )
                 .await
                 {
@@ -3251,13 +3853,21 @@ impl Operation for SiteReplicationRemoveHandler {
                         "admin site replication state"
                     );
                     peer_errors.push(err_detail);
+                } else {
+                    mark_pending_remove_peer_acked(&pending_remove.id, &peer.deployment_id).await?;
                 }
             }
         }
 
-        if !peer_errors.is_empty() {
-            status = site_replication_remove_status(&peer_errors);
+        let complete = finalize_pending_remove_if_complete(&pending_remove.id, &local_peer).await?;
+        if !complete && peer_errors.is_empty() {
+            peer_errors.push("site replication remove is still pending".to_string());
         }
+        let status = if complete && peer_errors.is_empty() {
+            site_replication_remove_status(&[])
+        } else {
+            site_replication_remove_status(&peer_errors)
+        };
 
         json_response(&status)
     }
@@ -3355,9 +3965,23 @@ pub struct SRPeerJoinHandler {}
 impl Operation for SRPeerJoinHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
+        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
         let mut state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &state);
         let join_req: SRPeerJoinReq = read_site_replication_json(req, &cred.secret_key, true).await?;
+
+        if let Some(current_updated_at) = state.updated_at {
+            let Some(incoming_updated_at) = join_req.updated_at else {
+                return json_response(&SRPeerJoinResponse {
+                    peer: state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
+                });
+            };
+            if incoming_updated_at <= current_updated_at {
+                return json_response(&SRPeerJoinResponse {
+                    peer: state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
+                });
+            }
+        }
 
         if !join_req.svc_acct_access_key.is_empty() && !join_req.svc_acct_secret_key.is_empty() {
             let Some(iam_sys) = get_global_iam_sys() else {
@@ -3379,6 +4003,7 @@ impl Operation for SRPeerJoinHandler {
                             description: None,
                             expiration: None,
                             status: None,
+                            allow_site_replicator_account: join_req.svc_acct_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT,
                         },
                     )
                     .await
@@ -3409,7 +4034,6 @@ impl Operation for SRPeerJoinHandler {
         }
 
         state.service_account_access_key = join_req.svc_acct_access_key;
-        state.service_account_secret_key = join_req.svc_acct_secret_key;
         state.service_account_parent = join_req.svc_acct_parent;
         state.updated_at = join_req.updated_at.or_else(|| Some(OffsetDateTime::now_utc()));
         state.peers = normalize_join_peers_for_local(&local_peer, join_req.peers);
@@ -3422,7 +4046,7 @@ impl Operation for SRPeerJoinHandler {
         persist_site_replication_state(&state).await?;
         // Fix 1 (receiving side): ensure the joining peer also sets up replication for any
         // buckets it already owns so the reverse direction works from the start.
-        backfill_existing_buckets_after_add(&state, &local_peer).await;
+        backfill_existing_buckets_after_add(&state, &local_peer, &join_req.svc_acct_secret_key).await;
         json_response(&SRPeerJoinResponse {
             peer: state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
         })
@@ -3479,13 +4103,26 @@ impl Operation for SRPeerBucketOpsHandler {
                     .get_bucket_info(&bucket, &BucketOptions::default())
                     .await
                     .map_err(ApiError::from)?;
-                if let Some((state, local_peer)) = runtime_site_replication_targets().await? {
+                if let Some(runtime) = runtime_site_replication_targets().await? {
                     let replication_config = metadata_sys::get_replication_config(&bucket)
                         .await
                         .ok()
                         .map(|(config, _)| config);
-                    ensure_site_replication_bucket_targets(&bucket, &state, &local_peer, replication_config.as_ref()).await?;
-                    ensure_site_replication_bucket_replication_config(&bucket, &state, &local_peer).await?;
+                    ensure_site_replication_bucket_targets(
+                        &bucket,
+                        &runtime.state,
+                        &runtime.local_peer,
+                        replication_config.as_ref(),
+                        &runtime.service_account_secret_key,
+                    )
+                    .await?;
+                    ensure_site_replication_bucket_replication_config(
+                        &bucket,
+                        &runtime.state,
+                        &runtime.local_peer,
+                        &runtime.service_account_secret_key,
+                    )
+                    .await?;
                 }
             }
             "delete-bucket" => {
@@ -3608,12 +4245,16 @@ pub struct SiteReplicationEditHandler {}
 impl Operation for SiteReplicationEditHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
+        reject_site_replicator_on_public_admin(&cred)?;
         let ilm_expiry_override = sr_edit_ilm_expiry_override(&req.uri);
         let incoming: PeerInfo = read_site_replication_json(req, &cred.secret_key, true).await?;
+        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
         let current_state = load_site_replication_state().await?;
         let state = edit_state(current_state.clone(), incoming.clone(), ilm_expiry_override);
 
-        if !current_state.service_account_access_key.is_empty() && !current_state.service_account_secret_key.is_empty() {
+        if !current_state.service_account_access_key.is_empty() {
+            let service_account_secret_key =
+                site_replicator_service_account_secret(&current_state.service_account_access_key).await?;
             let peers_to_send: Vec<PeerInfo> = if ilm_expiry_override.is_some() {
                 state.peers.values().cloned().collect()
             } else {
@@ -3633,7 +4274,7 @@ impl Operation for SiteReplicationEditHandler {
                         &target.endpoint,
                         SITE_REPLICATION_PEER_EDIT_PATH,
                         &current_state.service_account_access_key,
-                        &current_state.service_account_secret_key,
+                        &service_account_secret_key,
                         peer,
                     )
                     .await?;
@@ -3658,6 +4299,7 @@ impl Operation for SRPeerEditHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
         let ilm_expiry_override = sr_edit_ilm_expiry_override(&req.uri);
+        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
         let state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &state);
         let mut incoming: PeerInfo = read_site_replication_json(req, "", false).await?;
@@ -3681,6 +4323,7 @@ impl Operation for SRPeerRemoveHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationRemoveAction).await?;
         let remove_req: SRRemoveReq = read_site_replication_json(req, "", false).await?;
+        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
         let state = remove_sites(load_site_replication_state().await?, remove_req);
         persist_site_replication_state(&state).await?;
         Ok(empty_response(StatusCode::OK))
@@ -3695,6 +4338,7 @@ impl Operation for SiteReplicationResyncOpHandler {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationResyncAction).await?;
         let operation = query_pairs(&req.uri).get("operation").cloned().unwrap_or_default();
         let peer: PeerInfo = read_site_replication_json(req, "", false).await?;
+        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
         let mut state = load_site_replication_state().await?;
         let local_peer = current_local_runtime_peer(&state);
         let peer = normalize_peer_info(peer);
@@ -3780,8 +4424,10 @@ pub struct SRStateEditHandler {}
 #[async_trait::async_trait]
 impl Operation for SRStateEditHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
+        let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
+        reject_site_replicator_on_public_admin(&cred)?;
         let body: SRStateEditReq = read_site_replication_json(req, "", false).await?;
+        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
         let state = apply_state_edit_req(load_site_replication_state().await?, body);
         save_site_replication_state(&state).await?;
         Ok(empty_response(StatusCode::OK))
@@ -3809,38 +4455,87 @@ pub struct SRRotateServiceAccountHandler {}
 impl Operation for SRRotateServiceAccountHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
-        let mut state = load_site_replication_state().await?;
-        if !state.enabled() {
-            return Err(s3_error!(InvalidRequest, "site replication is not configured"));
-        }
-        let local_peer = current_local_peer(&req, &state);
+        reject_site_replicator_on_public_admin(&cred)?;
+        let (pending_rotation, local_peer, previous_access_key) = {
+            let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+            let mut state = load_site_replication_state().await?;
+            if !state.enabled() {
+                return Err(s3_error!(InvalidRequest, "site replication is not configured"));
+            }
+            let local_peer = current_local_peer(&req, &state);
+            let previous_access_key = state.service_account_access_key.clone();
 
-        // Force generation of a new secret by passing a state with empty secret key.
-        let rotation_state = SiteReplicationState {
-            service_account_access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
-            service_account_secret_key: String::new(),
-            ..state.clone()
+            if let Some(pending) = state.pending_rotation.clone() {
+                (pending, local_peer, previous_access_key)
+            } else {
+                let new_secret_key = rustfs_credentials::gen_secret_key(40)
+                    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("generate secret key failed: {e}")))?;
+                state.service_account_access_key = SITE_REPLICATOR_SERVICE_ACCOUNT.to_string();
+                state.service_account_parent = cred.access_key.clone();
+                state.updated_at = Some(OffsetDateTime::now_utc());
+                let pending = PendingRotation {
+                    id: Uuid::new_v4().to_string(),
+                    access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+                    parent: cred.access_key.clone(),
+                    new_secret_key,
+                    secret_candidates: legacy_site_replicator_state_secret(&state).into_iter().collect(),
+                    peers: state.peers.clone(),
+                    acked_deployment_ids: BTreeSet::new(),
+                    updated_at: state.updated_at,
+                };
+                state.pending_rotation = Some(pending.clone());
+                save_site_replication_state(&state).await?;
+                (pending, local_peer, previous_access_key)
+            }
         };
-        let (svc_ak, new_sk) = ensure_site_replicator_service_account(&cred.access_key, &rotation_state).await?;
 
-        state.service_account_access_key = svc_ak.clone();
-        state.service_account_secret_key = new_sk.clone();
+        if !previous_access_key.is_empty()
+            && let Ok(previous_iam_secret) = site_replicator_service_account_secret(&previous_access_key).await
+        {
+            record_pending_rotation_secret_candidate(&pending_rotation.id, previous_iam_secret).await?;
+        }
+
+        set_site_replicator_service_account_secret(&pending_rotation.parent, pending_rotation.new_secret_key.clone()).await?;
+
+        let rotation_state = SiteReplicationState {
+            service_account_access_key: pending_rotation.access_key.clone(),
+            service_account_parent: pending_rotation.parent.clone(),
+            peers: pending_rotation.peers.clone(),
+            updated_at: pending_rotation.updated_at,
+            ..Default::default()
+        };
+        refresh_bucket_targets_after_service_account_rotation(&rotation_state, &local_peer, &pending_rotation.new_secret_key)
+            .await;
+
+        let mut secret_candidates = pending_rotation.secret_candidates.clone();
+        if let Ok(current_secret) = site_replicator_service_account_secret(&pending_rotation.access_key).await {
+            push_unique_secret_candidate(&mut secret_candidates, current_secret);
+        }
+        push_unique_secret_candidate(&mut secret_candidates, pending_rotation.new_secret_key.clone());
 
         let join_req = SRPeerJoinReq {
-            svc_acct_access_key: svc_ak.clone(),
-            svc_acct_secret_key: new_sk.clone(),
-            svc_acct_parent: cred.access_key.clone(),
-            peers: state.peers.clone(),
-            updated_at: state.updated_at,
+            svc_acct_access_key: pending_rotation.access_key.clone(),
+            svc_acct_secret_key: pending_rotation.new_secret_key.clone(),
+            svc_acct_parent: pending_rotation.parent.clone(),
+            peers: pending_rotation.peers.clone(),
+            updated_at: pending_rotation.updated_at,
         };
 
         let mut peer_errors = Vec::new();
-        for peer in state.peers.values() {
-            if same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
+        for peer in pending_rotation.peers.values() {
+            if same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
+                || pending_rotation.acked_deployment_ids.contains(&peer.deployment_id)
+            {
                 continue;
             }
-            if let Err(err) =
-                send_peer_admin_request(&peer.endpoint, SITE_REPLICATION_PEER_JOIN_PATH, &svc_ak, &new_sk, &join_req).await
+            if let Err(err) = send_peer_admin_request_with_secret_candidates(
+                &peer.endpoint,
+                SITE_REPLICATION_PEER_JOIN_PATH,
+                &pending_rotation.access_key,
+                &secret_candidates,
+                &join_req,
+            )
+            .await
             {
                 let detail = summarize_peer_error_detail(&format!("{}: {err}", peer.endpoint));
                 warn!(
@@ -3853,14 +4548,24 @@ impl Operation for SRRotateServiceAccountHandler {
                     "admin site replication state"
                 );
                 peer_errors.push(detail);
+            } else {
+                mark_pending_rotation_peer_acked(&pending_rotation.id, &peer.deployment_id).await?;
             }
         }
 
-        persist_site_replication_state(&state).await?;
+        let complete = finalize_pending_rotation_if_complete(&pending_rotation.id, &local_peer).await?;
+        if !complete && peer_errors.is_empty() {
+            peer_errors.push("service account rotation is still pending".to_string());
+        }
 
         json_response(&ReplicateEditStatus {
-            success: peer_errors.is_empty(),
-            status: if peer_errors.is_empty() { "Success" } else { "Partial" }.to_string(),
+            success: complete && peer_errors.is_empty(),
+            status: if complete && peer_errors.is_empty() {
+                "Success"
+            } else {
+                "Partial"
+            }
+            .to_string(),
             err_detail: peer_errors.join("; "),
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
         })
@@ -3943,7 +4648,19 @@ mod tests {
             action: Action::AdminAction(AdminAction::SiteReplicationAddAction),
             ..operation_args
         };
-        assert!(!policy.is_allowed(&add_args).await);
+        assert!(policy.is_allowed(&add_args).await);
+
+        let remove_args = rustfs_policy::policy::Args {
+            action: Action::AdminAction(AdminAction::SiteReplicationRemoveAction),
+            ..operation_args
+        };
+        assert!(policy.is_allowed(&remove_args).await);
+
+        let resync_args = rustfs_policy::policy::Args {
+            action: Action::AdminAction(AdminAction::SiteReplicationResyncAction),
+            ..operation_args
+        };
+        assert!(!policy.is_allowed(&resync_args).await);
 
         let put_policy_args = rustfs_policy::policy::Args {
             action: Action::S3Action(S3Action::PutBucketPolicyAction),
@@ -4071,7 +4788,6 @@ mod tests {
                 secret_key: "remote-sk".to_string(),
             }],
             "svc-ak".to_string(),
-            "svc-sk".to_string(),
             "root".to_string(),
             true,
         );
@@ -4103,13 +4819,49 @@ mod tests {
                 },
             ],
             "svc-ak".to_string(),
-            "svc-sk".to_string(),
             "root".to_string(),
             true,
         );
 
         assert_eq!(state.peers.len(), 2);
         assert!(state.peers.contains_key("local-dep"));
+    }
+
+    #[test]
+    fn test_validate_add_sites_rejects_duplicate_endpoints() {
+        let local_peer = peer("local", "https://local.example.com");
+        let sites = vec![
+            PeerSite {
+                endpoint: "https://remote.example.com".to_string(),
+                access_key: "remote-ak".to_string(),
+                secret_key: "remote-sk".to_string(),
+                ..Default::default()
+            },
+            PeerSite {
+                endpoint: "https://remote.example.com/".to_string(),
+                access_key: "remote-ak".to_string(),
+                secret_key: "remote-sk".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let err = validate_add_sites(&sites, &local_peer).expect_err("duplicate endpoint should fail");
+
+        assert!(err.to_string().contains("duplicate site endpoint"));
+    }
+
+    #[test]
+    fn test_validate_add_sites_requires_remote_credentials() {
+        let local_peer = peer("local", "https://local.example.com");
+        let sites = vec![PeerSite {
+            endpoint: "https://remote.example.com".to_string(),
+            access_key: "remote-ak".to_string(),
+            ..Default::default()
+        }];
+
+        let err = validate_add_sites(&sites, &local_peer).expect_err("missing remote secret should fail");
+
+        assert!(err.to_string().contains("secretKey is required"));
     }
 
     #[test]
@@ -4249,6 +5001,18 @@ mod tests {
     }
 
     #[test]
+    fn test_site_replication_local_endpoint_rejects_forwarded_non_http_scheme() {
+        let uri: Uri = "/rustfs/admin/v3/site-replication/status".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("ftp"));
+        headers.insert("host", HeaderValue::from_static("node-a.example.com:9000"));
+
+        let endpoint = site_replication_local_endpoint(&uri, &headers);
+
+        assert!(!endpoint.starts_with("ftp://"));
+    }
+
+    #[test]
     fn test_runtime_tls_enabled_prefers_explicit_tls_over_http_runtime_endpoint() {
         let endpoints = EndpointServerPools::from(vec![PoolEndpoints {
             legacy: false,
@@ -4341,6 +5105,54 @@ mod tests {
 
         assert!(req.remove_all);
         assert!(req.site_names.is_empty());
+    }
+
+    #[test]
+    fn test_validate_remove_sites_req_rejects_empty_and_unknown_sites() {
+        let mut state = SiteReplicationState {
+            name: "local".to_string(),
+            ..Default::default()
+        };
+        state.peers.insert(
+            "remote".to_string(),
+            PeerInfo {
+                deployment_id: "remote".to_string(),
+                ..peer("remote", "https://remote.example.com")
+            },
+        );
+
+        assert!(validate_remove_sites_req(&state, &SRRemoveReq::default()).is_err());
+        assert!(
+            validate_remove_sites_req(
+                &state,
+                &SRRemoveReq {
+                    remove_all: true,
+                    site_names: vec!["remote".to_string()],
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            validate_remove_sites_req(
+                &state,
+                &SRRemoveReq {
+                    site_names: vec!["missing".to_string()],
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            validate_remove_sites_req(
+                &state,
+                &SRRemoveReq {
+                    site_names: vec!["remote".to_string()],
+                    ..Default::default()
+                }
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -4642,7 +5454,7 @@ mod tests {
     fn test_reconcile_site_replication_bucket_targets_upserts_remote_peer_targets() {
         let mut state = SiteReplicationState {
             service_account_access_key: "site-replicator-0".to_string(),
-            service_account_secret_key: "secret".to_string(),
+            service_account_secret_key: "stale-state-secret".to_string(),
             ..Default::default()
         };
         state.peers.insert(
@@ -4669,6 +5481,7 @@ mod tests {
                 ..peer("local", "https://local.example.com")
             },
             None,
+            "runtime-iam-secret",
         )
         .expect("reconcile bucket targets");
 
@@ -4685,7 +5498,112 @@ mod tests {
             .as_ref()
             .expect("site replication target should carry credentials");
         assert_eq!(credentials.access_key, "site-replicator-0");
-        assert_eq!(credentials.secret_key, "secret");
+        assert_eq!(credentials.secret_key, "runtime-iam-secret");
+    }
+
+    #[test]
+    fn test_site_replication_state_does_not_serialize_service_account_secret() {
+        let state = SiteReplicationState {
+            service_account_access_key: "site-replicator-0".to_string(),
+            service_account_secret_key: "do-not-persist".to_string(),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_value(&state).expect("serialize state");
+
+        assert!(json.get("service_account_secret_key").is_none());
+        assert!(json.get("service_account_access_key").is_some());
+    }
+
+    #[test]
+    fn test_pending_rotation_serializes_temporary_secret_until_cleanup() {
+        let state = SiteReplicationState {
+            service_account_access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+            service_account_secret_key: "do-not-persist".to_string(),
+            pending_rotation: Some(PendingRotation {
+                id: "rotation-id".to_string(),
+                access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+                parent: "root".to_string(),
+                new_secret_key: "temporary-new-secret".to_string(),
+                secret_candidates: vec!["temporary-old-secret".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_value(&state).expect("serialize state");
+
+        assert!(json.get("service_account_secret_key").is_none());
+        let pending = json.get("pending_rotation").expect("pending rotation should serialize");
+        assert_eq!(pending.get("new_secret_key").and_then(Value::as_str), Some("temporary-new-secret"));
+        assert!(pending.get("secret_candidates").is_some());
+    }
+
+    #[test]
+    fn test_pending_remote_peer_ack_completion_ignores_local_peer() {
+        let local = PeerInfo {
+            deployment_id: "local".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let remote = PeerInfo {
+            deployment_id: "remote".to_string(),
+            ..peer("remote", "https://remote.example.com")
+        };
+        let peers = BTreeMap::from([
+            (local.deployment_id.clone(), local.clone()),
+            (remote.deployment_id.clone(), remote),
+        ]);
+
+        assert!(!pending_all_remote_peers_acked(&peers, &local, &BTreeSet::new()));
+        assert!(pending_all_remote_peers_acked(&peers, &local, &BTreeSet::from(["remote".to_string()])));
+    }
+
+    #[test]
+    fn test_secret_candidate_retry_only_for_auth_errors() {
+        assert!(peer_error_may_be_secret_mismatch(
+            "peer request failed with 403 Forbidden: SignatureDoesNotMatch"
+        ));
+        assert!(peer_error_may_be_secret_mismatch("AccessDenied"));
+        assert!(!peer_error_may_be_secret_mismatch("peer request failed (timeout): deadline elapsed"));
+        assert!(!peer_error_may_be_secret_mismatch("peer request failed (tls handshake): bad certificate"));
+    }
+
+    #[test]
+    fn test_bucket_meta_wire_values_are_base64_encoded_and_legacy_raw_decodes() {
+        let raw = "<VersioningConfiguration/>";
+        let item = encode_bucket_meta_wire_item(SRBucketMeta {
+            r#type: "version-config".to_string(),
+            bucket: "photos".to_string(),
+            versioning: Some(raw.to_string()),
+            ..Default::default()
+        });
+
+        let encoded = item.versioning.expect("encoded versioning config");
+
+        assert_eq!(decode_bucket_meta_wire_value(&encoded), raw.as_bytes());
+        assert_eq!(decode_bucket_meta_wire_value(raw), raw.as_bytes());
+        assert_ne!(encoded, raw);
+    }
+
+    #[test]
+    fn test_metainfo_bucket_config_values_are_base64_encoded() {
+        let raw = br#"<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>"#;
+
+        assert_eq!(raw_config_to_base64(raw), Some(BASE64_STANDARD.encode(raw)));
+        assert_ne!(raw_config_to_base64(raw), raw_config_to_string(raw));
+        assert_eq!(raw_config_to_base64(&[]), None);
+    }
+
+    #[test]
+    fn test_stale_update_detects_older_incoming_timestamp() {
+        let local = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20);
+        let stale = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(10);
+        let fresh = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(30);
+
+        assert!(is_stale_update(local, Some(stale)));
+        assert!(!is_stale_update(local, Some(local)));
+        assert!(!is_stale_update(local, Some(fresh)));
+        assert!(!is_stale_update(local, None));
     }
 
     #[test]
@@ -4720,6 +5638,7 @@ mod tests {
                     ..peer("local", "https://local.example.com:9000")
                 },
                 None,
+                "secret",
             )
             .expect("peer using same numeric port as local console should remain valid");
 
@@ -4779,6 +5698,33 @@ mod tests {
                     },
                 )]),
                 updated_at: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(10)),
+            },
+        );
+
+        assert_eq!(edited.updated_at, state.updated_at);
+        assert!(!edited.peers["remote"].replicate_ilm_expiry);
+    }
+
+    #[test]
+    fn test_apply_state_edit_req_ignores_missing_updated_at() {
+        let mut state = SiteReplicationState::default();
+        let mut remote = peer("remote", "https://remote.example.com");
+        remote.deployment_id = "remote".to_string();
+        state.peers.insert(remote.deployment_id.clone(), remote);
+        state.updated_at = Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20));
+
+        let edited = apply_state_edit_req(
+            state.clone(),
+            SRStateEditReq {
+                peers: BTreeMap::from([(
+                    "remote".to_string(),
+                    PeerInfo {
+                        deployment_id: "remote".to_string(),
+                        replicate_ilm_expiry: true,
+                        ..peer("remote", "https://remote.example.com")
+                    },
+                )]),
+                updated_at: None,
             },
         );
 

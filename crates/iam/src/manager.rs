@@ -19,8 +19,8 @@ use crate::{
     error::{Error as IamError, is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user},
     store::{GroupInfo, MappedPolicy, Store, UserType, object::IAM_CONFIG_PREFIX},
     sys::{
-        MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED, STATUS_DISABLED, STATUS_ENABLED,
-        UpdateServiceAccountOpts,
+        MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED, SITE_REPLICATOR_CLAIM,
+        SITE_REPLICATOR_SERVICE_ACCOUNT, STATUS_DISABLED, STATUS_ENABLED, UpdateServiceAccountOpts,
     },
 };
 use futures::future::join_all;
@@ -856,6 +856,9 @@ where
         }
 
         m.insert("accessKey".to_owned(), Value::String(name.to_owned()));
+        if name == SITE_REPLICATOR_SERVICE_ACCOUNT && opts.allow_site_replicator_account {
+            m.insert(SITE_REPLICATOR_CLAIM.to_owned(), Value::Bool(true));
+        }
 
         cr.session_token = jwt_sign(&m, &cr.secret_key)?;
 
@@ -2586,6 +2589,7 @@ mod tests {
             description: Some("Updated service account".to_string()),
             expiration: None,
             session_policy: Some(policy),
+            allow_site_replicator_account: false,
         };
 
         assert_eq!(opts.secret_key, Some("new-secret-key".to_string()));
