@@ -87,7 +87,7 @@ configure_alias() {
 up() {
     require_bin docker
     require_bin mc
-    mkdir -p deploy/data/decommission deploy/logs/decommission
+    mkdir -p deploy/data/decommission deploy/data/decommission-tier deploy/logs/decommission
     compose up -d
     wait_healthy
     configure_alias
@@ -107,7 +107,7 @@ down() {
 reset() {
     require_bin docker
     compose down -v --remove-orphans || true
-    rm -rf deploy/data/decommission deploy/logs/decommission .tmp/decommission-validation
+    rm -rf deploy/data/decommission deploy/data/decommission-tier deploy/logs/decommission .tmp/decommission-validation
     echo "local decommission docker environment reset"
 }
 
