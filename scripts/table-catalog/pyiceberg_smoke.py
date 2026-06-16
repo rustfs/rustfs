@@ -157,12 +157,6 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
         "expected_behavior": "metadata maintenance can plan binpack candidates and commit a safe unpartitioned Parquet rewrite through the catalog; built-in periodic scheduling, sort compaction, delete-file rewrite, and row-level compaction are not claimed",
     },
     {
-        "capability": "iceberg-views",
-        "status": "stable-unsupported-routes",
-        "roadmap_area": "view-api",
-        "expected_behavior": "view routes are registered and should return a stable unsupported JSON response until implemented",
-    },
-    {
         "capability": "external-catalog-bridge",
         "status": "metadata-import-only",
         "roadmap_area": "external-catalog",

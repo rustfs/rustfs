@@ -120,6 +120,15 @@ work items. They are intentionally conservative: only PyIceberg is automated by
 this script today; other engines are documented until a repeatable harness is
 added.
 
+RustFS also exposes catalog-backed advanced Iceberg surfaces that are not part
+of the PyIceberg append smoke path yet:
+
+- table refs can be listed, created or replaced, and deleted through catalog
+  commits; refs with explicit retention policy require a forced delete, and
+  `main` cannot be deleted
+- Iceberg views support basic create, list, load, replace, existence check, and
+  drop routes with persisted view metadata and view-scoped authorization
+
 ## Client Matrix
 
 | Client | Current status | Claim |
@@ -154,7 +163,6 @@ current unsupported inventory is:
 - snapshot expiration dry-run planning and manual catalog commit: supported through metadata maintenance reports
 - automatic maintenance scheduling: external scheduler hook supported through the worker run endpoint; built-in periodic scheduling is not claimed
 - compaction rewrite: controlled run-once support for unpartitioned Parquet binpack through metadata maintenance; built-in periodic scheduling, sort compaction, delete-file rewrite, and row-level compaction are not claimed
-- Iceberg views: stable unsupported routes are registered and return explicit unsupported JSON
 - external catalog bridges: metadata import/register is supported, but Polaris/Glue/DLF/Hive synchronization is unsupported
 - multi-table transactions: not a short-term production claim
 
