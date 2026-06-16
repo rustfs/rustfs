@@ -654,7 +654,7 @@ pub fn create_cache_entry_from_summary(summary: &SizeSummary) -> DataUsageEntry 
 }
 
 /// Convert data usage cache to DataUsageInfo
-pub fn cache_to_data_usage_info(cache: &DataUsageCache, path: &str, buckets: &[crate::store_api::BucketInfo]) -> DataUsageInfo {
+pub fn cache_to_data_usage_info(cache: &DataUsageCache, path: &str, buckets: &[rustfs_storage_api::BucketInfo]) -> DataUsageInfo {
     let e = match cache.find(path) {
         Some(e) => e,
         None => return DataUsageInfo::default(),

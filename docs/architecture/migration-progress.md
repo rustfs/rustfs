@@ -5,15 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-contract-guard-cleanup`
-- Baseline: `origin/main` at `0f37c5675e2be5e42d1ef85a57ff9e744d412e91`
+- Branch: `overtrue/arch-storage-dto-path-cleanup`
+- Baseline: `origin/main` at `d094d919257861bb543eb4747412b90b617a6213`
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: no external behavior change expected.
-- Rust code changes: rename the remaining ECStore compatibility test away from
-  the stale storage-api facade name.
-- CI/script changes: add a migration guard that rejects the old `StorageAPI`
-  aggregate facade identifier in production ECStore and RustFS source.
-- Docs changes: record the post-facade loss-prevention cleanup slice.
+- Rust code changes: remove the remaining ECStore-internal bucket DTO aliases
+  from `store_api` and import the shared bucket DTO contracts directly from
+  `rustfs_storage_api`.
+- CI/script changes: add a migration guard that rejects reintroducing old
+  `ecstore::store_api` bucket DTO re-exports.
+- Docs changes: record the post-facade bucket DTO path cleanup slice.
 
 ## Phase 0 Tasks
 
@@ -359,6 +360,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Cleanup slice: migrate in-repo external consumers to
     `rustfs_storage_api`, keep ECStore implementation use crate-private, and
     remove the old public `ecstore::store_api` bucket DTO re-export.
+  - Completed follow-up slice: remove the remaining ECStore-internal bucket DTO
+    aliases from `store_api` and guard against restoring that compatibility
+    path.
   - Acceptance: `rustfs-storage-api` exports these DTOs, in-repo external
     consumers no longer use the old `rustfs_ecstore::store_api` DTO path, and
     `RUSTFS_COMPAT_TODO(API-003)` is removed from source and cleanup register.
@@ -771,18 +775,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Guard cleanup keeps ECStore contract coverage named after the remaining contracts and rejects old facade reintroduction in production source. |
-| Migration preservation | passed | No runtime code path changes; this slice only renames the compatibility test and strengthens migration guardrails. |
-| Testing/verification | passed | Focused contract test, compile checks, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Direct bucket DTO imports leave ECStore `store_api` focused on operation traits and object/listing types; the guard prevents the old DTO alias from returning. |
+| Migration preservation | passed | The slice changes type import paths and migration checks only; storage/listing behavior and operation trait contracts are unchanged. |
+| Testing/verification | passed | Focused ECStore compile/test checks, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `0f37c5675e2be5e42d1ef85a57ff9e744d412e91`:
+Passed on `d094d919257861bb543eb4747412b90b617a6213`:
 
 - `cargo check -p rustfs-ecstore`: passed.
 - `cargo test -p rustfs-ecstore --test ecstore_contract_compat_test --no-fail-fast`:
   passed.
-- `cargo check -p rustfs -p rustfs-ecstore`: passed.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
 - `cargo fmt --all --check`: passed.
@@ -793,16 +796,16 @@ Passed on `0f37c5675e2be5e42d1ef85a57ff9e744d412e91`:
 
 Notes:
 
-- This slice is a post-facade cleanup after `rustfs/rustfs#3490` and
-  `rustfs/rustfs#3487` are both on `main`.
-- The concrete storage operation traits, `StorageAdminApi`, and
-  `NamespaceLocking` remain available and covered.
-- The slice does not move traits across crate boundaries or alter runtime
-  storage behavior.
+- This slice follows `rustfs/rustfs#3501` and keeps the old aggregate facade
+  guard active.
+- The shared bucket DTOs remain owned by `rustfs-storage-api`; ECStore
+  `store_api` keeps only ECStore operation traits and object/listing types.
+- The slice does not move storage operation traits across crate boundaries or
+  alter runtime storage behavior.
 
 ## Handoff Notes
 
-- Storage contract guard cleanup is in progress on a branch current with
+- Storage DTO path cleanup is in progress on a branch current with
   `origin/main`.
 - After this lands, remaining storage work can continue from concrete operation
-  contracts with a guard against restoring the old aggregate facade identifier.
+  contracts and direct shared DTO imports.

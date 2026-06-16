@@ -65,10 +65,9 @@ use crate::{
     rpc::S3PeerSys,
     sets::Sets,
     store_api::{
-        BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
-        HTTPRangeSpec, HealOperations, ListObjectsV2Info, ListOperations, MakeBucketOptions, MultipartOperations,
-        MultipartUploadResult, NamespaceLocking, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo,
-        PutObjReader,
+        BucketOperations, CompletePart, DeletedObject, GetObjectReader, HTTPRangeSpec, HealOperations, ListObjectsV2Info,
+        ListOperations, MultipartOperations, MultipartUploadResult, NamespaceLocking, ObjectInfo, ObjectOperations,
+        ObjectOptions, ObjectToDelete, PartInfo, PutObjReader,
     },
     store_init,
 };
@@ -82,6 +81,7 @@ use rustfs_config::server_config::{Config, get_global_server_config, set_global_
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::{LocalClient, LockClient, NamespaceLockWrapper};
 use rustfs_madmin::heal_commands::HealResultItem;
+use rustfs_storage_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
 use rustfs_utils::path::{decode_dir_object, encode_dir_object, path_join_buf};
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
 use std::cmp::Ordering;

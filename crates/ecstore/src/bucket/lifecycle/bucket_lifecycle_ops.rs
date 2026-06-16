@@ -2868,13 +2868,12 @@ mod tests {
     use crate::error::is_err_invalid_upload_id;
     use crate::set_disk::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
     use crate::store::ECStore;
-    use crate::store_api::{
-        BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations, ObjectInfo, ObjectOptions, PutObjReader,
-    };
+    use crate::store_api::{BucketOperations, MultipartOperations, ObjectInfo, ObjectOptions, PutObjReader};
     use futures::FutureExt;
     use rustfs_common::metrics::{IlmAction, global_metrics};
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
     use rustfs_filemeta::{ReplicateDecision, VersionPurgeStatusType};
+    use rustfs_storage_api::{BucketOptions, MakeBucketOptions};
     use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, Timestamp};
     use serial_test::serial;
     use sha2::{Digest, Sha256};
