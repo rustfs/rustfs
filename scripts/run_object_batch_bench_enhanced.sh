@@ -202,47 +202,52 @@ trim() {
 
 to_bps() {
   local human="$1"
+  local number unit factor
   if [[ "$human" == "N/A" || -z "$human" ]]; then
     echo "N/A"
     return
   fi
-  awk -v v="$human" '
-    function abs(x){return x<0?-x:x}
-    BEGIN{
-      if (match(v, /^([0-9]+(\.[0-9]+)?)\s*(GiB\/s|MiB\/s|KiB\/s|GB\/s|MB\/s|KB\/s|B\/s)$/, m)) {
-        n=m[1]; u=m[3];
-        if (u=="GiB/s") f=1024*1024*1024;
-        else if (u=="MiB/s") f=1024*1024;
-        else if (u=="KiB/s") f=1024;
-        else if (u=="GB/s") f=1000*1000*1000;
-        else if (u=="MB/s") f=1000*1000;
-        else if (u=="KB/s") f=1000;
-        else f=1;
-        printf "%.6f\n", n*f;
-      } else {
-        print "N/A";
-      }
-    }'
+
+  number="$(echo "$human" | awk '{print $1}')"
+  unit="$(echo "$human" | awk '{print $2}')"
+  case "$unit" in
+    GiB/s) factor=1073741824 ;;
+    MiB/s) factor=1048576 ;;
+    KiB/s) factor=1024 ;;
+    GB/s) factor=1000000000 ;;
+    MB/s) factor=1000000 ;;
+    KB/s) factor=1000 ;;
+    B/s) factor=1 ;;
+    *)
+      echo "N/A"
+      return
+      ;;
+  esac
+
+  awk -v n="$number" -v f="$factor" 'BEGIN { printf "%.6f\n", n * f }'
 }
 
 to_ms() {
   local human="$1"
+  local number unit factor
   if [[ "$human" == "N/A" || -z "$human" ]]; then
     echo "N/A"
     return
   fi
-  awk -v v="$human" '
-    BEGIN{
-      if (match(v, /^([0-9]+(\.[0-9]+)?)\s*(ms|us|µs|s)$/, m)) {
-        n=m[1]; u=m[3];
-        if (u=="s") f=1000;
-        else if (u=="ms") f=1;
-        else f=0.001;
-        printf "%.6f\n", n*f;
-      } else {
-        print "N/A";
-      }
-    }'
+
+  number="$(echo "$human" | awk '{print $1}')"
+  unit="$(echo "$human" | awk '{print $2}')"
+  case "$unit" in
+    s) factor=1000 ;;
+    ms) factor=1 ;;
+    us|µs) factor=0.001 ;;
+    *)
+      echo "N/A"
+      return
+      ;;
+  esac
+
+  awk -v n="$number" -v f="$factor" 'BEGIN { printf "%.6f\n", n * f }'
 }
 
 extract_first() {
@@ -255,20 +260,24 @@ extract_metrics() {
   local log_file="$1"
 
   local throughput reqps latency
-  throughput="$(extract_first '[0-9]+(\.[0-9]+)?\s*(GiB/s|MiB/s|KiB/s|GB/s|MB/s|KB/s|B/s)' "$log_file")"
-  reqps="$(extract_first '[0-9]+(\.[0-9]+)?\s*(req/s|ops/s|requests/s)' "$log_file")"
-  latency="$(extract_first '[0-9]+(\.[0-9]+)?\s*(ms|us|µs|s)\s*(avg|mean)' "$log_file")"
+  throughput="$(extract_first '[0-9]+(\.[0-9]+)?[[:space:]]*(GiB/s|MiB/s|KiB/s|GB/s|MB/s|KB/s|B/s)' "$log_file")"
+  reqps="$(extract_first '[0-9]+(\.[0-9]+)?[[:space:]]*(obj/s|req/s|ops/s|requests/s)' "$log_file")"
+  latency="$(rg -o 'Reqs:[[:space:]]+Avg:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' "$log_file" | head -n1 | sed -E 's/^Reqs:[[:space:]]+Avg:[[:space:]]+//')"
 
   if [[ -z "$latency" ]]; then
-    latency="$(extract_first '[0-9]+(\.[0-9]+)?\s*(ms|us|µs|s)' "$log_file")"
+    latency="$(extract_first '[0-9]+(\.[0-9]+)?[[:space:]]*(ms|us|µs|s)' "$log_file")"
   fi
 
   throughput="$(trim "${throughput:-N/A}")"
   reqps="$(trim "${reqps:-N/A}")"
   latency="$(trim "${latency:-N/A}")"
 
-  # Keep only "<num> <unit>" for latency if suffix avg/mean exists.
-  latency="$(echo "$latency" | awk '{print $1" "$2}')"
+  # Normalize to "<num> <unit>" shape for downstream conversion helpers.
+  if [[ "$latency" =~ ^([0-9]+(\.[0-9]+)?)(ms|us|µs|s)$ ]]; then
+    latency="${BASH_REMATCH[1]} ${BASH_REMATCH[3]}"
+  else
+    latency="$(echo "$latency" | awk '{print $1" "$2}')"
+  fi
   reqps_num="$(echo "$reqps" | awk '{print $1}')"
 
   echo "$throughput,${reqps_num:-N/A},$latency"
@@ -329,7 +338,7 @@ run_one_attempt() {
       printf '\n'
       echo "dry run" > "$log_file"
     else
-      if ! "${cmd[@]}" 2>&1 | tee "$log_file"; then
+      if ! "${cmd[@]}" 2>&1 | tee "$log_file" >&2; then
         status="failed"
       fi
     fi
@@ -357,7 +366,7 @@ run_one_attempt() {
       printf '\n'
       echo "dry run" > "$log_file"
     else
-      if ! "${cmd[@]}" 2>&1 | tee "$log_file"; then
+      if ! "${cmd[@]}" 2>&1 | tee "$log_file" >&2; then
         status="failed"
       fi
     fi

@@ -804,6 +804,16 @@ enum SmallWritePath {
     Pipeline,
 }
 
+impl SmallWritePath {
+    fn metric_label(&self) -> &'static str {
+        match self {
+            SmallWritePath::Inline => "write_inline",
+            SmallWritePath::SingleBlockNonInline => "write_single_block_non_inline",
+            SmallWritePath::Pipeline => "write_pipeline",
+        }
+    }
+}
+
 fn classify_small_write_path(is_inline_buffer: bool, object_size: i64, block_size: usize) -> SmallWritePath {
     if should_use_inline_small_fast_path(is_inline_buffer, object_size, block_size) {
         SmallWritePath::Inline
@@ -1061,6 +1071,7 @@ impl ObjectIO for SetDisks {
 
             let shard_file_size = erasure.shard_file_size(data.size());
             let shard_size = erasure.shard_size();
+            let writer_setup_stage_start = Instant::now();
             let writer_futs: Vec<_> = shuffle_disks
                 .iter()
                 .map(|disk_op| {
@@ -1107,6 +1118,10 @@ impl ObjectIO for SetDisks {
                 writers.push(w);
                 errors.push(e);
             }
+            rustfs_io_metrics::record_put_object_stage_duration(
+                "set_disk_writer_setup",
+                writer_setup_stage_start.elapsed().as_secs_f64() * 1000.0,
+            );
 
             let nil_count = errors.iter().filter(|&e| e.is_none()).count();
             if nil_count < write_quorum {
@@ -1135,7 +1150,9 @@ impl ObjectIO for SetDisks {
             );
 
             let write_path = classify_small_write_path(is_inline_buffer, data.size(), fi.erasure.block_size);
+            rustfs_io_metrics::record_put_object_path(write_path.metric_label());
 
+            let encode_stage_start = Instant::now();
             let (reader, w_size) = match write_path {
                 SmallWritePath::Inline => match Arc::new(erasure)
                     .encode_inline_small(stream, &mut writers, write_quorum)
@@ -1165,6 +1182,10 @@ impl ObjectIO for SetDisks {
                     }
                 },
             };
+            rustfs_io_metrics::record_put_object_stage_duration(
+                "set_disk_encode",
+                encode_stage_start.elapsed().as_secs_f64() * 1000.0,
+            );
 
             let _ = mem::replace(&mut data.stream, reader);
             // if let Err(err) = close_bitrot_writers(&mut writers).await {
@@ -1259,6 +1280,7 @@ impl ObjectIO for SetDisks {
                 object_lock_guard = Some(self.acquire_write_lock_diag("put_object_commit", bucket, object).await?);
             }
 
+            let rename_stage_start = Instant::now();
             let (online_disks, _, op_old_dir, cleanup_disks) = Self::rename_data(
                 &shuffle_disks,
                 RUSTFS_META_TMP_BUCKET,
@@ -1269,10 +1291,19 @@ impl ObjectIO for SetDisks {
                 write_quorum,
             )
             .await?;
+            rustfs_io_metrics::record_put_object_stage_duration(
+                "set_disk_rename",
+                rename_stage_start.elapsed().as_secs_f64() * 1000.0,
+            );
 
             if let Some(old_dir) = op_old_dir {
+                let cleanup_stage_start = Instant::now();
                 self.commit_rename_data_dir(&cleanup_disks, bucket, object, &old_dir.to_string(), write_quorum)
                     .await?;
+                rustfs_io_metrics::record_put_object_stage_duration(
+                    "set_disk_old_data_cleanup",
+                    cleanup_stage_start.elapsed().as_secs_f64() * 1000.0,
+                );
             }
 
             drop(object_lock_guard); // drop object lock guard to release the lock

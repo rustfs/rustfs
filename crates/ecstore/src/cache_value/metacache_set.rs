@@ -184,9 +184,19 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
             let mut need_fallback = false;
             let mut last_err = None;
             if let Some(disk) = opdisk {
+                let primary_walk_started = std::time::Instant::now();
                 match disk.walk_dir(wakl_opts, &mut wr).await {
-                    Ok(_res) => {}
+                    Ok(_res) => {
+                        rustfs_io_metrics::record_put_object_stage_duration(
+                            "metacache_walk_dir_primary",
+                            primary_walk_started.elapsed().as_secs_f64() * 1000.0,
+                        );
+                    }
                     Err(err) => {
+                        rustfs_io_metrics::record_put_object_stage_duration(
+                            "metacache_walk_dir_primary_failed",
+                            primary_walk_started.elapsed().as_secs_f64() * 1000.0,
+                        );
                         warn!(
                             event = EVENT_METACACHE_LISTING,
                             component = LOG_COMPONENT_ECSTORE,
@@ -237,6 +247,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                     return Err(err);
                 };
 
+                let fallback_walk_started = std::time::Instant::now();
                 match disk
                     .as_ref()
                     .walk_dir(
@@ -256,10 +267,18 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                     .await
                 {
                     Ok(_r) => {
+                        rustfs_io_metrics::record_put_object_stage_duration(
+                            "metacache_walk_dir_fallback",
+                            fallback_walk_started.elapsed().as_secs_f64() * 1000.0,
+                        );
                         need_fallback = false;
                         last_err = None;
                     }
                     Err(err) => {
+                        rustfs_io_metrics::record_put_object_stage_duration(
+                            "metacache_walk_dir_fallback_failed",
+                            fallback_walk_started.elapsed().as_secs_f64() * 1000.0,
+                        );
                         error!(
                             event = EVENT_METACACHE_LISTING,
                             component = LOG_COMPONENT_ECSTORE,
@@ -538,7 +557,12 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
         Ok(())
     });
 
+    let merge_started = std::time::Instant::now();
     if let Err(err) = revjob.await.map_err(std::io::Error::other)? {
+        rustfs_io_metrics::record_put_object_stage_duration(
+            "metacache_merge_failed",
+            merge_started.elapsed().as_secs_f64() * 1000.0,
+        );
         error!(
             event = EVENT_METACACHE_LISTING,
             component = LOG_COMPONENT_ECSTORE,
@@ -556,6 +580,10 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
 
         return Err(err);
     }
+    rustfs_io_metrics::record_put_object_stage_duration(
+        "metacache_merge",
+        merge_started.elapsed().as_secs_f64() * 1000.0,
+    );
 
     // The merge consumer can finish successfully before every producer finishes
     // (for example after reaching EOF quorum while a tolerated drive is stalled,

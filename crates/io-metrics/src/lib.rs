@@ -409,9 +409,9 @@ pub fn record_get_object(duration_ms: f64, size_bytes: i64) {
 ///
 /// * `duration_ms` - Operation duration in milliseconds
 /// * `size_bytes` - Object size in bytes
-/// * `zero_copy_enabled` - Whether zero-copy was enabled for this operation
+/// * `zero_copy_eligible` - Whether the request was eligible for a zero-copy path
 #[inline(always)]
-pub fn record_put_object(duration_ms: f64, size_bytes: i64, zero_copy_enabled: bool) {
+pub fn record_put_object(duration_ms: f64, size_bytes: i64, zero_copy_eligible: bool) {
     counter!("rustfs_s3_put_object_total").increment(1);
     histogram!("rustfs_s3_put_object_duration_ms").record(duration_ms);
 
@@ -419,9 +419,21 @@ pub fn record_put_object(duration_ms: f64, size_bytes: i64, zero_copy_enabled: b
         histogram!("rustfs_s3_put_object_size_bytes").record(size_bytes as f64);
     }
 
-    if zero_copy_enabled {
+    if zero_copy_eligible {
+        // Backward-compatible alias for historical dashboards.
         counter!("rustfs_s3_put_object_zero_copy_enabled_total").increment(1);
+        counter!("rustfs_s3_put_object_zero_copy_eligible_total").increment(1);
     }
+}
+
+#[inline(always)]
+pub fn record_put_object_path(path: &'static str) {
+    counter!("rustfs_s3_put_object_path_total", "path" => path).increment(1);
+}
+
+#[inline(always)]
+pub fn record_put_object_stage_duration(stage: &'static str, duration_ms: f64) {
+    histogram!("rustfs_s3_put_object_stage_duration_ms", "stage" => stage).record(duration_ms);
 }
 
 /// Record ListObjects operation metrics.
@@ -822,6 +834,14 @@ mod tests {
     fn test_record_put_object() {
         record_put_object(200.0, 1024 * 1024, true);
         record_put_object(100.0, 512, false);
+    }
+
+    #[test]
+    fn test_record_put_object_path_and_stage() {
+        record_put_object_path("small_eager");
+        record_put_object_path("write_inline");
+        record_put_object_stage_duration("ingress_prepare", 12.5);
+        record_put_object_stage_duration("set_disk_encode", 8.0);
     }
 
     #[test]
