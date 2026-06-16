@@ -50,6 +50,7 @@ SOURCE_MARKERS_FILE="${TMP_DIR}/source_markers.txt"
 SOURCE_IDS_FILE="${TMP_DIR}/source_ids.txt"
 REGISTER_IDS_FILE="${TMP_DIR}/register_ids.txt"
 LEGACY_STORAGE_API_HITS_FILE="${TMP_DIR}/legacy_storage_api_hits.txt"
+STORE_API_BUCKET_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_bucket_dto_reexports.txt"
 
 awk '
   /^## PR Types$/ {
@@ -194,6 +195,16 @@ require_source_line \
 
 if [[ -s "$LEGACY_STORAGE_API_HITS_FILE" ]]; then
   report_failure "old StorageAPI facade identifier reintroduced in production source: $(paste -sd '; ' "$LEGACY_STORAGE_API_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api::\{[^}]*\b(?:BucketInfo|BucketOptions|DeleteBucketOptions|MakeBucketOptions|SRBucketDeleteOp)\b' \
+    crates/ecstore/src/store_api.rs || true
+) >"$STORE_API_BUCKET_DTO_REEXPORTS_FILE"
+
+if [[ -s "$STORE_API_BUCKET_DTO_REEXPORTS_FILE" ]]; then
+  report_failure "old ecstore store_api bucket DTO re-export reintroduced: $(paste -sd '; ' "$STORE_API_BUCKET_DTO_REEXPORTS_FILE")"
 fi
 
 require_source_contains \
