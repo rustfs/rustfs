@@ -153,14 +153,38 @@ scripts/run_scanner_validation_harness.sh \
   --out-dir artifacts/scanner-validation
 ```
 
-The harness writes scanner/heal config snapshots, scanner status samples, host
-telemetry when available, run metadata, and `scanner-summary.csv`.
+The harness writes scanner/heal config snapshots, scanner status samples,
+background heal status samples, host telemetry when available, run metadata,
+`scanner-summary.csv`, and `scanner-validation-report.md`.
+
+Use `--metrics-endpoints` when the validation needs per-node distributed
+evidence. The value is a comma-separated list of RustFS endpoints:
+
+```bash
+scripts/run_scanner_validation_harness.sh \
+  --alias ALIAS \
+  --endpoint http://node-a:9000 \
+  --deployment distributed \
+  --workload-label lifecycle-replication-heal-backlog \
+  --metrics-endpoints http://node-a:9000,http://node-b:9000,http://node-c:9000,http://node-d:9000 \
+  --samples 30 \
+  --interval-secs 60 \
+  --out-dir artifacts/scanner-validation-distributed
+```
+
+Each sample stores `/v3/scanner/status`, one `/v3/background-heal/status`
+response per endpoint listed in `--metrics-endpoints`, and one by-host admin
+metrics response per listed endpoint. When `--metrics-endpoints` is omitted,
+the harness captures background-heal status only from `--endpoint`.
 
 For distributed runs, capture scanner admin metrics from every node with
 `by-host=true`. The metrics endpoint reports the node that handles the request;
 `by-host=true` preserves that node's host view but does not collect peer nodes.
 These per-node artifacts include active path age, checkpoint state, pacing
 pressure, source work, and queued/skipped/missed downstream admission counters.
+The validation harness can collect these artifacts automatically with
+`--metrics-endpoints`; the manual loop below is useful when adding extra nodes
+or collecting ad hoc snapshots outside the harness window.
 
 ```bash
 for endpoint in http://node-a:9000 http://node-b:9000 http://node-c:9000; do
@@ -310,11 +334,24 @@ Do not use a single CPU spike as the conclusion. Compare average and p95 CPU
 over the same observation window.
 
 For heal or bitrot pressure investigations, also capture
-`/v3/background-heal/status` and compare `healOperations.queueLength`,
+`/v3/background-heal/status` from every distributed endpoint and compare
+`healOperations.queueLength`,
 `healOperations.activeTasks`, `healOperations.queuedBySource`,
 `healOperations.activeBySource`, `healOperations.queuedByPriority`, and
 `healOperations.activeByPriority`. These fields distinguish scanner-submitted
 low-priority work from manual admin heal and auto-heal work.
+
+`scanner-summary.csv` includes the heal operation totals needed for quick
+before/after comparison. In distributed runs, these fields are aggregated from
+the background-heal status snapshots captured across `--metrics-endpoints`.
+
+| Field | Why it matters |
+|---|---|
+| `heal_queue_length` | Total queued heal requests at the same timestamp as the scanner status sample. |
+| `heal_active_tasks` | Total running heal tasks. |
+| `heal_scanner_queued` | Scanner-submitted heal or bitrot work waiting in the queue. |
+| `heal_admin_queued` | Manual/admin heal work waiting in the queue. |
+| `heal_auto_heal_queued` | Auto-heal work waiting in the queue, typically from disk/set recovery paths. |
 
 ## Interpreting Results
 
@@ -356,5 +393,27 @@ For scanner behavior PRs, include this evidence when available:
 - Scanner status snapshots or time series.
 - Host CPU and disk telemetry.
 - Short conclusion that separates pressure reduction from scanner progress.
+- `scanner-validation-report.md` from the harness when using the scripted
+  collection path.
+
+## Final Parity Validation Closure
+
+Use the final validation run to prove the scanner control plane is coherent,
+not to introduce new runtime behavior. A complete closure package should have
+at least these runs:
+
+| Run | Required evidence |
+|---|---|
+| Single-node, single-disk small-object idle | Scanner status series, host telemetry, `scanner-summary.csv`, and a conclusion that CPU or disk pressure is lower without scan progress stopping. |
+| Single-node erasure or multi-disk | Checkpoint movement, active path age, set/disk scan pressure, data usage freshness, and before/after scanner config. |
+| Distributed lifecycle backlog | `maintenance_control`, lifecycle expiry/transition queue fields, source work missed/failed counts, and by-host admin metrics. |
+| Distributed replication backlog | Bucket replication repair kind counters, site replication passive/active boundary counters, source work queued/skipped/missed counts, and by-host admin metrics. |
+| Heal or bitrot pressure | Background heal `healOperations` queued/active source and priority counts, scanner source work for heal/bitrot, and by-host admin metrics. |
+
+The expected conclusion is MinIO-style scanner behavior at the operational
+contract level: scanner remains enabled, pacing is observable and adjustable,
+partial progress is explainable, maintenance work is attributed by source, and
+downstream lifecycle, replication, heal, and bitrot backlog can be diagnosed
+without guessing from CPU usage alone.
 
 For documentation-only PRs, it is enough to verify links and formatting.
