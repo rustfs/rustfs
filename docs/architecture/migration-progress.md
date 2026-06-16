@@ -5,17 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-remove-storage-api-facade`
-- Baseline: `origin/main` at `c26593fa7a4b55849e98832cde657c6d4b167262`
+- Branch: `overtrue/arch-storage-contract-guard-cleanup`
+- Baseline: `origin/main` at `0f37c5675e2be5e42d1ef85a57ff9e744d412e91`
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: no external behavior change expected.
-- Rust code changes: remove the old unused `StorageAPI` facade, its ECStore
-  implementation blocks, its public re-export, and the stale compile-time
-  compatibility test coverage.
-- CI/script changes: adjust architecture migration guardrails to keep the
-  remaining storage-admin and namespace-lock contracts covered.
-- Docs changes: record the final old-facade cleanup slice and its verification
-  state.
+- Rust code changes: rename the remaining ECStore compatibility test away from
+  the stale storage-api facade name.
+- CI/script changes: add a migration guard that rejects the old `StorageAPI`
+  aggregate facade identifier in production ECStore and RustFS source.
+- Docs changes: record the post-facade loss-prevention cleanup slice.
 
 ## Phase 0 Tasks
 
@@ -36,8 +34,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Completed slices: add a mechanical admin route matrix guard from
     [`admin-route-action-snapshot.md`](admin-route-action-snapshot.md) and
     `rustfs/src/admin/route_registration_test.rs`; add migration rules for
-    public storage-api re-export coverage and ECStore compatibility-test
-    coverage.
+    public storage-api re-export coverage, ECStore compatibility-test coverage,
+    and a production-source guard against reintroducing the removed
+    `StorageAPI` aggregate facade identifier.
   - Acceptance: architecture migration rules fail if the public storage-api
     contract re-export surface drifts or if ECStore compile-time compatibility
     tests for the remaining storage-admin and namespace-lock contracts are
@@ -412,6 +411,10 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     implementations after API-007 migrated their consumers.
   - Final cleanup slice: remove the old `StorageAPI` facade after all real
     consumers moved to concrete operation groups.
+  - Loss-prevention cleanup slice: rename the remaining ECStore contract
+    compatibility test away from the old storage-api facade name and guard
+    production ECStore/RustFS source against reintroducing the removed
+    aggregate facade identifier.
   - Acceptance: storage operation traits remain available directly while admin
     inventory surfaces live only on `StorageAdminApi`.
 
@@ -768,16 +771,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Old `StorageAPI` facade removal leaves concrete operation traits and remaining storage-admin/namespace-lock contracts explicit. |
-| Migration preservation | passed | ECStore/Sets/SetDisks operation implementations remain in place; only the unused aggregate facade and stale guard coverage are removed. |
-| Testing/verification | passed | Focused compatibility test, compile checks, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Guard cleanup keeps ECStore contract coverage named after the remaining contracts and rejects old facade reintroduction in production source. |
+| Migration preservation | passed | No runtime code path changes; this slice only renames the compatibility test and strengthens migration guardrails. |
+| Testing/verification | passed | Focused contract test, compile checks, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `c26593fa7a4b55849e98832cde657c6d4b167262`:
+Passed on `0f37c5675e2be5e42d1ef85a57ff9e744d412e91`:
 
 - `cargo check -p rustfs-ecstore`: passed.
-- `cargo test -p rustfs-ecstore --test storage_api_compat_test --no-fail-fast`:
+- `cargo test -p rustfs-ecstore --test ecstore_contract_compat_test --no-fail-fast`:
   passed.
 - `cargo check -p rustfs -p rustfs-ecstore`: passed.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
@@ -790,15 +793,16 @@ Passed on `c26593fa7a4b55849e98832cde657c6d4b167262`:
 
 Notes:
 
-- This slice removes the old full storage facade after no real code consumers
-  remain.
+- This slice is a post-facade cleanup after `rustfs/rustfs#3490` and
+  `rustfs/rustfs#3487` are both on `main`.
 - The concrete storage operation traits, `StorageAdminApi`, and
   `NamespaceLocking` remain available and covered.
-- The slice does not move traits across crate boundaries.
+- The slice does not move traits across crate boundaries or alter runtime
+  storage behavior.
 
 ## Handoff Notes
 
-- Old storage facade removal is locally verified on a branch current with
+- Storage contract guard cleanup is in progress on a branch current with
   `origin/main`.
-- After this lands, remaining storage work can focus on concrete operation
-  contracts instead of the aggregate facade.
+- After this lands, remaining storage work can continue from concrete operation
+  contracts with a guard against restoring the old aggregate facade identifier.

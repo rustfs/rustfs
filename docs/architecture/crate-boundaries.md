@@ -96,3 +96,7 @@ Required `rustfs-storage-api` public re-exports:
 
 ECStore must keep compile-time coverage for both `StorageAdminApi` and the
 separate `NamespaceLocking` operation group.
+
+The old `StorageAPI` aggregate facade must not reappear in production
+`crates/ecstore/src` or `rustfs/src` code after the storage operation groups
+have been made explicit.
