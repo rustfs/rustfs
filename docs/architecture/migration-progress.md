@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-dto-path-cleanup`
-- Baseline: `origin/main` at `d094d919257861bb543eb4747412b90b617a6213`
-- PR type for this branch: `consumer-migration`
+- Branch: `overtrue/arch-storage-object-contracts-cleanup`
+- Baseline: `origin/main` at `2ff69ae21cad69eaf7d5969eb5267e6e974ef8c6`
+- PR type for this branch: `api-extraction`
 - Runtime behavior changes: no external behavior change expected.
-- Rust code changes: remove the remaining ECStore-internal bucket DTO aliases
-  from `store_api` and import the shared bucket DTO contracts directly from
-  `rustfs_storage_api`.
-- CI/script changes: add a migration guard that rejects reintroducing old
-  `ecstore::store_api` bucket DTO re-exports.
-- Docs changes: record the post-facade bucket DTO path cleanup slice.
+- Rust code changes: move multipart list/result DTO contracts from ECStore
+  `store_api` into `rustfs-storage-api` and migrate in-repo consumers to the
+  shared contract path.
+- CI/script changes: extend migration guards for the multipart DTO public
+  re-export and reject restoring the old ECStore-owned multipart DTO path.
+- Docs changes: record the multipart DTO contract extraction slice.
 
 ## Phase 0 Tasks
 
@@ -499,6 +499,25 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     required quality/architecture, migration-preservation, and
     testing/verification review passed.
 
+- [x] `API-013` Move multipart list/result DTO contracts.
+  - Completed slice: move `MultipartUploadResult`, `PartInfo`,
+    `MultipartInfo`, `ListMultipartsInfo`, and `ListPartsInfo` from ECStore
+    `store_api` into `rustfs-storage-api`; update ECStore traits and RustFS S3
+    multipart response builders to import these shared contracts directly.
+  - Acceptance: `rustfs-storage-api` exports the multipart DTO contracts,
+    in-repo consumers no longer use the old `rustfs_ecstore::store_api` path
+    for these DTOs, and migration guards reject restoring the old ECStore-owned
+    definitions or re-exports.
+  - Must preserve: multipart upload creation, part listing, multipart upload
+    listing, part metadata, checksum fields, S3 response mapping, and storage
+    operation trait behavior.
+  - Risk defense: keep `CompletePart`, `ObjectInfo`, `ObjectOptions`, readers,
+    filemeta conversions, replication state, encryption, compression, and range
+    semantics in ECStore for this slice.
+  - Verification: focused storage-api/ECStore/RustFS compile checks, multipart
+    response tests, migration/layer guards, formatting, diff hygiene, Rust risk
+    scan, and required three-expert review passed.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -775,16 +794,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Direct bucket DTO imports leave ECStore `store_api` focused on operation traits and object/listing types; the guard prevents the old DTO alias from returning. |
-| Migration preservation | passed | The slice changes type import paths and migration checks only; storage/listing behavior and operation trait contracts are unchanged. |
-| Testing/verification | passed | Focused ECStore compile/test checks, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Multipart list/result DTOs now live in the storage contract crate, while ECStore keeps implementation-heavy object, reader, range, and complete-part types. |
+| Migration preservation | passed | The slice moves DTO ownership and import paths only; multipart operation bodies, S3 response mapping logic, and storage hot paths are unchanged. |
+| Testing/verification | passed | Focused storage-api/ECStore/RustFS compile checks, multipart response tests, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `d094d919257861bb543eb4747412b90b617a6213`:
+Passed on `2ff69ae21cad69eaf7d5969eb5267e6e974ef8c6`:
 
-- `cargo check -p rustfs-ecstore`: passed.
-- `cargo test -p rustfs-ecstore --test ecstore_contract_compat_test --no-fail-fast`:
+- `cargo check -p rustfs-storage-api -p rustfs-ecstore`: passed.
+- `cargo check -p rustfs`: passed.
+- `cargo test -p rustfs --lib storage::s3_api::multipart --no-fail-fast`:
   passed.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
@@ -796,16 +816,17 @@ Passed on `d094d919257861bb543eb4747412b90b617a6213`:
 
 Notes:
 
-- This slice follows `rustfs/rustfs#3501` and keeps the old aggregate facade
-  guard active.
-- The shared bucket DTOs remain owned by `rustfs-storage-api`; ECStore
-  `store_api` keeps only ECStore operation traits and object/listing types.
+- This slice follows `rustfs/rustfs#3503` and keeps the old aggregate facade and
+  bucket DTO guards active.
+- The shared multipart list/result DTOs are now owned by `rustfs-storage-api`;
+  ECStore keeps implementation-heavy object, reader, range, and complete-part
+  types.
 - The slice does not move storage operation traits across crate boundaries or
-  alter runtime storage behavior.
+  alter multipart runtime behavior.
 
 ## Handoff Notes
 
-- Storage DTO path cleanup is in progress on a branch current with
+- Storage multipart DTO contract cleanup is in progress on a branch current with
   `origin/main`.
-- After this lands, remaining storage work can continue from concrete operation
-  contracts and direct shared DTO imports.
+- After this lands, remaining storage work can continue by extracting only DTOs
+  that have proven low implementation coupling.
