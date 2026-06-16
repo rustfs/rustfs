@@ -248,9 +248,15 @@ enum GetObjectTimeoutStage {
     BeforeRead,
 }
 
-async fn enqueue_transitioned_delete_cleanup(bucket: &str, object: &str, opts: &ObjectOptions, existing: Option<&ObjectInfo>) {
+async fn enqueue_transitioned_delete_cleanup(
+    store: Arc<ECStore>,
+    bucket: &str,
+    object: &str,
+    opts: &ObjectOptions,
+    existing: Option<&ObjectInfo>,
+) -> std::io::Result<()> {
     let Some(existing) = existing else {
-        return;
+        return Ok(());
     };
     let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Cleanup);
 
@@ -266,8 +272,10 @@ async fn enqueue_transitioned_delete_cleanup(bucket: &str, object: &str, opts: &
         )
     };
     let Some(je) = je else {
-        return;
+        return Ok(());
     };
+
+    rustfs_ecstore::bucket::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry(store, &je).await?;
 
     let mut expiry_state = rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState
         .write()
@@ -280,9 +288,10 @@ async fn enqueue_transitioned_delete_cleanup(bucket: &str, object: &str, opts: &
             remote_version_id = %existing.transitioned_object.version_id,
             tier = %existing.transitioned_object.tier,
             error = ?err,
-            "failed to enqueue transitioned object cleanup"
+            "transitioned object cleanup journal persisted but was not queued"
         );
     }
+    Ok(())
 }
 
 pin_project! {
@@ -3274,7 +3283,8 @@ impl DefaultObjectUsecase {
                     dobjs[i].replication_state = Some(object_to_delete[i].replication_state());
                 }
                 delete_results[didx].delete_object = Some(dobjs[i].clone());
-                enqueue_transitioned_delete_cleanup(
+                if let Err(err) = enqueue_transitioned_delete_cleanup(
+                    store.clone(),
                     &bucket,
                     &object_to_delete[i].object_name,
                     &ObjectOptions {
@@ -3285,7 +3295,15 @@ impl DefaultObjectUsecase {
                     },
                     existing_object_infos[i].as_ref(),
                 )
-                .await;
+                .await
+                {
+                    warn!(
+                        bucket = %bucket,
+                        object = %object_to_delete[i].object_name,
+                        error = ?err,
+                        "failed to persist transitioned object cleanup journal"
+                    );
+                }
                 let size = object_sizes[i].max(0) as u64;
                 rustfs_ecstore::data_usage::record_bucket_object_delete_memory(
                     &bucket,
@@ -3508,7 +3526,16 @@ impl DefaultObjectUsecase {
             }
         };
 
-        enqueue_transitioned_delete_cleanup(&bucket, &key, &opts, existing_object_info.as_ref()).await;
+        if let Err(err) =
+            enqueue_transitioned_delete_cleanup(store.clone(), &bucket, &key, &opts, existing_object_info.as_ref()).await
+        {
+            warn!(
+                bucket = %bucket,
+                object = %key,
+                error = ?err,
+                "failed to persist transitioned object cleanup journal"
+            );
+        }
 
         // Fast in-memory update for immediate quota and admin usage consistency
         rustfs_ecstore::data_usage::record_bucket_object_delete_memory(
