@@ -152,9 +152,9 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
     },
     {
         "capability": "compaction-rewrite",
-        "status": "planning-only",
+        "status": "controlled-run-once-supported",
         "roadmap_area": "snapshot-maintenance",
-        "expected_behavior": "compaction planning fails closed until data file rewrite support is implemented; no data file rewrite or automatic compaction is claimed",
+        "expected_behavior": "metadata maintenance can plan binpack candidates and commit a safe unpartitioned Parquet rewrite through the catalog; built-in periodic scheduling, sort compaction, delete-file rewrite, and row-level compaction are not claimed",
     },
     {
         "capability": "iceberg-views",
