@@ -38,13 +38,12 @@ use rustfs_ecstore::{
         target::BucketTargets,
     },
     error::StorageError,
-    store_api::BucketOperations,
 };
 use rustfs_policy::policy::{
     BucketPolicy,
     action::{Action, AdminAction},
 };
-use rustfs_storage_api::{BucketOptions, MakeBucketOptions};
+use rustfs_storage_api::{BucketOperations, BucketOptions, MakeBucketOptions};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::{
     Body, S3Request, S3Response, S3Result,

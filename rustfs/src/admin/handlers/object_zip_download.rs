@@ -33,10 +33,10 @@ use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::get_global_action_cred;
 use rustfs_ecstore::{
     global::get_global_region,
-    store_api::{BucketOperations, ListOperations, ObjectIO, ObjectOperations, ObjectOptions},
+    store_api::{ListOperations, ObjectIO, ObjectOperations, ObjectOptions},
 };
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_storage_api::bucket::BucketOptions;
+use rustfs_storage_api::{BucketOperations, bucket::BucketOptions};
 use rustfs_trusted_proxies::{ClientInfo, ValidationMode};
 use rustfs_utils::{base64_decode_url_safe_no_pad, base64_encode_url_safe_no_pad};
 use s3s::{Body, S3Request, S3Response, S3Result, dto::StreamingBlob, header::CONTENT_TYPE, s3_error};
