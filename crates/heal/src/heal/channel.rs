@@ -432,6 +432,7 @@ impl HealChannelProcessor {
 
         let mut heal_request = HealRequest::new(heal_type, options, priority);
         heal_request.id = request.id;
+        heal_request.source = request.source;
         // force_start controls admission/queue semantics only. Do not reinterpret it as
         // destructive heal options: admin clients commonly pass forceStart=true together
         // with remove=false, and turning that into remove_corrupted=true can delete the
@@ -480,7 +481,9 @@ mod tests {
     use super::*;
     use crate::heal::manager::HealConfig;
     use crate::heal::storage::HealStorageAPI;
-    use rustfs_common::heal_channel::{HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealScanMode};
+    use rustfs_common::heal_channel::{
+        HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealRequestSource, HealScanMode,
+    };
     use std::sync::Arc;
 
     // Mock storage for testing
@@ -611,6 +614,7 @@ mod tests {
             pool_index: None,
             set_index: None,
             force_start: false,
+            source: HealRequestSource::Internal,
         };
 
         let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
@@ -641,11 +645,13 @@ mod tests {
             pool_index: Some(0),
             set_index: Some(1),
             force_start: false,
+            source: HealRequestSource::Scanner,
         };
 
         let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
         assert!(matches!(heal_request.heal_type, HealType::Object { .. }));
         assert_eq!(heal_request.priority, HealPriority::High);
+        assert_eq!(heal_request.source, HealRequestSource::Scanner);
         assert_eq!(heal_request.options.scan_mode, HealScanMode::Deep);
         assert!(heal_request.options.remove_corrupted);
         assert!(heal_request.options.recreate_missing);
@@ -673,6 +679,7 @@ mod tests {
             pool_index: None,
             set_index: None,
             force_start: false,
+            source: HealRequestSource::Internal,
         };
 
         let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
@@ -702,6 +709,7 @@ mod tests {
             pool_index: None,
             set_index: None,
             force_start: false,
+            source: HealRequestSource::Internal,
         };
 
         let result = processor.convert_to_heal_request(channel_request);
@@ -738,6 +746,7 @@ mod tests {
                 pool_index: None,
                 set_index: None,
                 force_start: false,
+                source: HealRequestSource::Internal,
             };
 
             let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
@@ -767,6 +776,7 @@ mod tests {
             pool_index: None,
             set_index: None,
             force_start: true, // Admission force only; must not override explicit heal options.
+            source: HealRequestSource::Internal,
         };
 
         let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
@@ -798,6 +808,7 @@ mod tests {
             pool_index: None,
             set_index: None,
             force_start: false,
+            source: HealRequestSource::Internal,
         };
 
         let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
@@ -833,6 +844,7 @@ mod tests {
             pool_index: None,
             set_index: None,
             force_start: false,
+            source: HealRequestSource::Internal,
         };
 
         let (tx, rx) = oneshot::channel();
@@ -882,6 +894,7 @@ mod tests {
             pool_index: None,
             set_index: None,
             force_start: false,
+            source: HealRequestSource::Internal,
         };
 
         let (tx, rx) = oneshot::channel();

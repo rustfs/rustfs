@@ -45,6 +45,8 @@ const DEFAULT_REMOTE_DELETE_BREAKER_WINDOW_SECS: usize = 30;
 const METRIC_DELETE_REMOTE_FAILED_TOTAL: &str = "rustfs_delete_remote_failed_total";
 const METRIC_DELETE_REMOTE_BREAKER_TOTAL: &str = "rustfs_delete_remote_breaker_total";
 const METRIC_DELETE_REMOTE_INFLIGHT: &str = "rustfs_delete_remote_inflight";
+const ERR_REMOTE_DELETE_BREAKER_OPEN: &str = "remote tier delete breaker is open due to signer/header failures";
+const ERR_REMOTE_DELETE_LIMITER_CLOSED: &str = "remote tier delete limiter is closed";
 
 static REMOTE_DELETE_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
@@ -62,6 +64,11 @@ static REMOTE_DELETE_BREAKER: LazyLock<Mutex<RemoteDeleteBreaker>> = LazyLock::n
         ),
     ))
 });
+
+#[cfg(test)]
+static REMOTE_TIER_DELETE_TEST_HOOK: std::sync::LazyLock<
+    std::sync::Mutex<Option<Box<dyn Fn(&str, &str, &str) -> std::io::Result<()> + Send + Sync>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
 #[derive(Debug)]
 struct RemoteDeleteBreaker {
@@ -156,6 +163,11 @@ async fn record_remote_delete_failure(err: &std::io::Error, now: Instant) {
             "remote tier delete breaker opened by signer/header failures"
         );
     }
+}
+
+fn should_record_remote_delete_failure(err: &std::io::Error) -> bool {
+    let message = err.to_string();
+    message != ERR_REMOTE_DELETE_BREAKER_OPEN && message != ERR_REMOTE_DELETE_LIMITER_CLOSED
 }
 
 #[derive(Default)]
@@ -277,31 +289,78 @@ impl ExpiryOp for Jentry {
 }
 
 pub async fn delete_object_from_remote_tier(obj_name: &str, rv_id: &str, tier_name: &str) -> Result<(), std::io::Error> {
+    let result = delete_object_from_remote_tier_raw(obj_name, rv_id, tier_name).await;
+    if let Err(err) = &result
+        && should_record_remote_delete_failure(err)
+    {
+        record_remote_delete_failure(err, Instant::now()).await;
+    }
+    result
+}
+
+async fn delete_object_from_remote_tier_raw(obj_name: &str, rv_id: &str, tier_name: &str) -> Result<(), std::io::Error> {
+    #[cfg(test)]
+    if let Some(result) = run_remote_tier_delete_test_hook(obj_name, rv_id, tier_name) {
+        return result;
+    }
+
     if remote_delete_breaker_is_open(Instant::now()).await {
         metrics::counter!(METRIC_DELETE_REMOTE_BREAKER_TOTAL).increment(1);
-        return Err(std::io::Error::other("remote tier delete breaker is open due to signer/header failures"));
+        return Err(std::io::Error::other(ERR_REMOTE_DELETE_BREAKER_OPEN));
     }
 
     let _permit = REMOTE_DELETE_LIMITER
         .acquire()
         .await
-        .map_err(|_| std::io::Error::other("remote tier delete limiter is closed"))?;
+        .map_err(|_| std::io::Error::other(ERR_REMOTE_DELETE_LIMITER_CLOSED))?;
     let _inflight = RemoteDeleteInflightGuard::new();
 
     let mut config_mgr = GLOBAL_TierConfigMgr.write().await;
     let w = match config_mgr.get_driver(tier_name).await {
         Ok(w) => w,
-        Err(e) => {
-            let err = std::io::Error::other(e);
-            record_remote_delete_failure(&err, Instant::now()).await;
-            return Err(err);
-        }
+        Err(e) => return Err(std::io::Error::other(e)),
     };
-    let result = w.remove(obj_name, rv_id).await;
-    if let Err(err) = &result {
-        record_remote_delete_failure(err, Instant::now()).await;
+    w.remove(obj_name, rv_id).await
+}
+
+#[cfg(test)]
+fn run_remote_tier_delete_test_hook(obj_name: &str, rv_id: &str, tier_name: &str) -> Option<std::io::Result<()>> {
+    REMOTE_TIER_DELETE_TEST_HOOK
+        .lock()
+        .expect("remote tier delete test hook lock should not poison")
+        .as_ref()
+        .map(|hook| hook(obj_name, rv_id, tier_name))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteTierDeleteOutcome {
+    Deleted,
+    AlreadyRemoved,
+}
+
+pub async fn delete_object_from_remote_tier_idempotent(
+    obj_name: &str,
+    rv_id: &str,
+    tier_name: &str,
+) -> Result<RemoteTierDeleteOutcome, std::io::Error> {
+    match delete_object_from_remote_tier_raw(obj_name, rv_id, tier_name).await {
+        Ok(()) => Ok(RemoteTierDeleteOutcome::Deleted),
+        Err(err) if is_remote_tier_not_found_error(&err) => Ok(RemoteTierDeleteOutcome::AlreadyRemoved),
+        Err(err) => {
+            if should_record_remote_delete_failure(&err) {
+                record_remote_delete_failure(&err, Instant::now()).await;
+            }
+            Err(err)
+        }
     }
-    result
+}
+
+pub(crate) fn is_remote_tier_not_found_error(err: &std::io::Error) -> bool {
+    let message = err.to_string();
+    message.contains("NoSuchKey")
+        || message.contains("NoSuchVersion")
+        || message.contains("ObjectNotFound")
+        || message.contains("VersionNotFound")
 }
 
 pub fn transitioned_delete_journal_entry(
@@ -340,9 +399,34 @@ pub fn transitioned_force_delete_journal_entry(transitioned: &TransitionedObject
 mod test {
     use crate::client::signer_error::invalid_utf8_header_error;
 
-    use super::{RemoteDeleteBreaker, is_signer_header_error};
+    use super::{
+        ERR_REMOTE_DELETE_BREAKER_OPEN, ERR_REMOTE_DELETE_LIMITER_CLOSED, REMOTE_TIER_DELETE_TEST_HOOK, RemoteDeleteBreaker,
+        RemoteTierDeleteOutcome, delete_object_from_remote_tier_idempotent, is_remote_tier_not_found_error,
+        is_signer_header_error, should_record_remote_delete_failure,
+    };
     use std::io::{Error, ErrorKind};
     use std::time::{Duration, Instant};
+
+    struct RemoteTierDeleteHookGuard;
+
+    impl Drop for RemoteTierDeleteHookGuard {
+        fn drop(&mut self) {
+            let mut hook = REMOTE_TIER_DELETE_TEST_HOOK
+                .lock()
+                .expect("remote tier delete test hook lock should not poison");
+            *hook = None;
+        }
+    }
+
+    fn set_remote_tier_delete_test_hook(
+        hook_fn: impl Fn(&str, &str, &str) -> std::io::Result<()> + Send + Sync + 'static,
+    ) -> RemoteTierDeleteHookGuard {
+        let mut hook = REMOTE_TIER_DELETE_TEST_HOOK
+            .lock()
+            .expect("remote tier delete test hook lock should not poison");
+        *hook = Some(Box::new(hook_fn));
+        RemoteTierDeleteHookGuard
+    }
 
     #[test]
     fn signer_header_error_detection_matches_utf8_failures() {
@@ -363,6 +447,54 @@ mod test {
     fn signer_header_error_detection_matches_structured_marker() {
         let err = invalid_utf8_header_error("failed to sign v4 request", "x-amz-meta-invalid");
         assert!(is_signer_header_error(&err));
+    }
+
+    #[test]
+    fn remote_tier_not_found_errors_are_idempotent_success() {
+        assert!(is_remote_tier_not_found_error(&Error::other("NoSuchVersion")));
+        assert!(is_remote_tier_not_found_error(&Error::other("NoSuchKey")));
+        assert!(is_remote_tier_not_found_error(&Error::other("ObjectNotFound")));
+        assert!(is_remote_tier_not_found_error(&Error::other("VersionNotFound")));
+        assert!(!is_remote_tier_not_found_error(&Error::other("timeout")));
+        assert!(!is_remote_tier_not_found_error(&Error::other("tier config not found")));
+        assert!(!is_remote_tier_not_found_error(&Error::other("driver not found")));
+    }
+
+    #[test]
+    fn remote_tier_control_plane_short_circuit_errors_do_not_count_as_delete_failures() {
+        assert!(!should_record_remote_delete_failure(&Error::other(ERR_REMOTE_DELETE_BREAKER_OPEN)));
+        assert!(!should_record_remote_delete_failure(&Error::other(ERR_REMOTE_DELETE_LIMITER_CLOSED)));
+        assert!(should_record_remote_delete_failure(&Error::other("driver not found")));
+        assert!(should_record_remote_delete_failure(&Error::other("NoSuchVersion")));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn idempotent_remote_delete_treats_hooked_nosuchversion_as_already_removed() {
+        let _hook = set_remote_tier_delete_test_hook(|obj_name, rv_id, tier_name| {
+            assert_eq!(obj_name, "remote/object");
+            assert_eq!(rv_id, "remote-version");
+            assert_eq!(tier_name, "WARM");
+            Err(Error::other("NoSuchVersion"))
+        });
+
+        let outcome = delete_object_from_remote_tier_idempotent("remote/object", "remote-version", "WARM")
+            .await
+            .expect("remote not-found should be idempotent success");
+
+        assert_eq!(outcome, RemoteTierDeleteOutcome::AlreadyRemoved);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn idempotent_remote_delete_preserves_driver_not_found_failures() {
+        let _hook = set_remote_tier_delete_test_hook(|_, _, _| Err(Error::other("driver not found")));
+
+        let err = delete_object_from_remote_tier_idempotent("remote/object", "remote-version", "WARM")
+            .await
+            .expect_err("driver lookup failure must not be idempotent success");
+
+        assert!(err.to_string().contains("driver not found"));
     }
 
     #[test]

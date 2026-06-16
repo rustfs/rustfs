@@ -133,15 +133,16 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
     },
     {
         "capability": "background-maintenance-worker",
-        "status": "unsupported",
+        "status": "controlled-run-once-supported",
         "roadmap_area": "maintenance-worker",
-        "expected_behavior": "manual maintenance APIs may exist, but background-enabled maintenance is rejected",
+        "catalog_endpoint": "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/maintenance/worker/run",
+        "expected_behavior": "background-enabled maintenance can be driven by the worker run endpoint with current-job backpressure, retry deferral, lease expiry recovery, and heartbeat updates; built-in periodic scheduling is not claimed",
     },
     {
         "capability": "manifest-data-reachability-cleanup",
-        "status": "unsupported",
+        "status": "conservative-cleanup-supported",
         "roadmap_area": "reachability-cleanup",
-        "expected_behavior": "metadata-only cleanup must not delete manifest, data, or delete files",
+        "expected_behavior": "metadata maintenance reads manifest-list and manifest Avro references, reports retained manifest/data/delete objects, and deletes only unreferenced table objects that pass the safety window",
     },
     {
         "capability": "snapshot-expiration",
@@ -151,15 +152,21 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
     },
     {
         "capability": "compaction-rewrite",
-        "status": "planning-only",
+        "status": "controlled-run-once-supported",
         "roadmap_area": "snapshot-maintenance",
-        "expected_behavior": "compaction planning fails closed when manifest Avro reading is required; no data file rewrite or automatic compaction is claimed",
+        "expected_behavior": "metadata maintenance can plan binpack candidates and commit a safe unpartitioned Parquet rewrite through the catalog; built-in periodic scheduling, sort compaction, delete-file rewrite, and row-level compaction are not claimed",
     },
     {
         "capability": "iceberg-views",
-        "status": "unsupported",
+        "status": "stable-unsupported-routes",
         "roadmap_area": "view-api",
-        "expected_behavior": "view routes should return a stable unsupported response until implemented",
+        "expected_behavior": "view routes are registered and should return a stable unsupported JSON response until implemented",
+    },
+    {
+        "capability": "external-catalog-bridge",
+        "status": "metadata-import-only",
+        "roadmap_area": "external-catalog",
+        "expected_behavior": "catalog import/register supports an existing Iceberg metadata location, while Polaris, Glue, DLF, and Hive synchronization remain unsupported",
     },
     {
         "capability": "multi-table-transactions",

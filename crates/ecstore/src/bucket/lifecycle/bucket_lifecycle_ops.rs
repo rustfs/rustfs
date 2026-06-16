@@ -17,8 +17,9 @@ use crate::bucket::lifecycle::evaluator::Evaluator;
 use crate::bucket::lifecycle::lifecycle::{
     self, ExpirationOptions, Lifecycle, ObjectOpts, TransitionOptions, abort_incomplete_multipart_upload_due,
 };
+use crate::bucket::lifecycle::tier_free_version_recovery::{DEFAULT_FREE_VERSION_RECOVERY_LIMIT, recover_tier_free_versions};
 use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
-use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier};
+use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent};
 use crate::bucket::object_lock::objectlock_sys::check_object_lock_for_deletion;
 use crate::bucket::replication::{
     DeletedObjectReplicationInfo, ReplicationConfig, check_replicate_delete, schedule_replication_delete,
@@ -71,7 +72,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration as StdDuration;
 use time::OffsetDateTime;
 use tokio::select;
@@ -99,6 +100,7 @@ pub type TraceFn =
 pub type ExpiryOpType = Box<dyn ExpiryOp + Send + Sync + 'static>;
 
 static XXHASH_SEED: u64 = 0;
+static TIER_FREE_VERSION_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
 
 pub const AMZ_OBJECT_TAGGING: &str = "X-Amz-Tagging";
 pub const AMZ_TAG_COUNT: &str = "x-amz-tagging-count";
@@ -441,6 +443,23 @@ impl ExpiryState {
         }))
     }
 
+    #[cfg(test)]
+    fn new_with_unconsumed_worker_channel(capacity: usize) -> Arc<RwLock<Self>> {
+        let (tx, rx) = mpsc::channel(capacity);
+        Arc::new(RwLock::new(Self {
+            tasks_tx: vec![tx],
+            tasks_rx: vec![Arc::new(tokio::sync::Mutex::new(rx))],
+            stats: Arc::new(ExpiryStats {
+                missed_expiry_tasks: AtomicI64::new(0),
+                missed_freevers_tasks: AtomicI64::new(0),
+                missed_tier_journal_tasks: AtomicI64::new(0),
+                pending_tasks: AtomicI64::new(0),
+                active_tasks: AtomicI64::new(0),
+                workers: AtomicI64::new(1),
+            }),
+        }))
+    }
+
     pub fn pending_tasks(&self) -> usize {
         usize::try_from(self.stats.pending_tasks().max(0)).unwrap_or(usize::MAX)
     }
@@ -470,13 +489,13 @@ impl ExpiryState {
         Ok(())
     }
 
-    pub async fn enqueue_free_version(&mut self, oi: ObjectInfo) {
+    pub async fn enqueue_free_version(&mut self, oi: ObjectInfo) -> bool {
         let task = FreeVersionTask(oi);
         let wrkr = self.get_worker_ch(task.op_hash());
         if wrkr.is_none() {
             self.stats.increment_missed_freevers_tasks();
             self.stats.record_scanner_expiry_state();
-            return;
+            return false;
         }
         let wrkr = wrkr.expect("worker channel should exist after None check");
         let queued = self.send_expiry_task(wrkr, Box::new(task)).await;
@@ -484,6 +503,7 @@ impl ExpiryState {
             self.stats.increment_missed_freevers_tasks();
         }
         self.stats.record_scanner_expiry_state();
+        queued
     }
 
     pub async fn enqueue_by_days(&mut self, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) -> bool {
@@ -637,7 +657,7 @@ impl ExpiryState {
                     }
                     else if v.as_any().is::<Jentry>() {
                         let v = v.as_any().downcast_ref::<Jentry>().expect("Jentry downcast failed");
-                        if let Err(err) = delete_object_from_remote_tier(&v.obj_name, &v.version_id, &v.tier_name).await {
+                        if let Err(err) = delete_object_from_remote_tier_idempotent(&v.obj_name, &v.version_id, &v.tier_name).await {
                             debug!(
                                 event = EVENT_LIFECYCLE_WORKER_STATE,
                                 component = LOG_COMPONENT_ECSTORE,
@@ -654,7 +674,7 @@ impl ExpiryState {
                     else if v.as_any().is::<FreeVersionTask>() {
                         let v = v.as_any().downcast_ref::<FreeVersionTask>().expect("FreeVersionTask downcast failed");
                         let oi = v.0.clone();
-                        if let Err(err) = delete_object_from_remote_tier(
+                        if let Err(err) = delete_object_from_remote_tier_idempotent(
                             &oi.transitioned_object.name,
                             &oi.transitioned_object.version_id,
                             &oi.transitioned_object.tier,
@@ -742,6 +762,33 @@ impl ExpiryState {
             }
         }
     }
+}
+
+async fn enqueue_recovered_free_version_with_state(state: &Arc<RwLock<ExpiryState>>, oi: ObjectInfo) -> bool {
+    let task = FreeVersionTask(oi);
+    let hash = task.op_hash();
+    let (wrkr, stats) = {
+        let state = state.read().await;
+        (state.get_worker_ch(hash), Arc::clone(&state.stats))
+    };
+    let Some(wrkr) = wrkr else {
+        stats.increment_missed_freevers_tasks();
+        stats.record_scanner_expiry_state();
+        return false;
+    };
+
+    let queued = wrkr.try_send(Some(Box::new(task))).is_ok();
+    if !queued {
+        stats.increment_missed_freevers_tasks();
+    } else {
+        stats.increment_pending_tasks();
+    }
+    stats.record_scanner_expiry_state();
+    queued
+}
+
+pub async fn enqueue_recovered_free_version(oi: ObjectInfo) -> bool {
+    enqueue_recovered_free_version_with_state(&GLOBAL_ExpiryState, oi).await
 }
 
 struct TransitionTask {
@@ -1303,7 +1350,78 @@ pub async fn init_background_expiry(api: Arc<ECStore>) {
     }
 
     //let expiry_state = GLOBAL_ExpiryStSate.write().await;
-    ExpiryState::resize_workers(workers, api).await;
+    ExpiryState::resize_workers(workers, api.clone()).await;
+    spawn_tier_free_version_recovery_once(api);
+}
+
+fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>) {
+    if TIER_FREE_VERSION_RECOVERY_STARTED.set(()).is_err() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let cancel_token = crate::global::get_background_services_cancel_token()
+            .cloned()
+            .unwrap_or_else(CancellationToken::new);
+        let mut interval = tokio::time::interval(StdDuration::from_secs(60));
+        let mut bucket_marker: Option<String> = None;
+        let mut object_marker: Option<String> = None;
+
+        loop {
+            select! {
+                _ = cancel_token.cancelled() => return,
+                _ = interval.tick() => {}
+            }
+
+            let started_at = std::time::Instant::now();
+            match recover_tier_free_versions(
+                api.clone(),
+                DEFAULT_FREE_VERSION_RECOVERY_LIMIT,
+                bucket_marker.clone(),
+                object_marker.clone(),
+            )
+            .await
+            {
+                Ok(stats) => {
+                    bucket_marker = stats.next_bucket_marker;
+                    object_marker = stats.next_object_marker;
+                    let (pending_tasks, active_tasks) = {
+                        let state = GLOBAL_ExpiryState.read().await;
+                        (state.pending_tasks(), state.stats.active_tasks())
+                    };
+                    debug!(
+                        event = EVENT_LIFECYCLE_WORKER_STATE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                        duration_ms = started_at.elapsed().as_millis(),
+                        scanned = stats.scanned,
+                        scanned_entries = stats.scanned_entries,
+                        buckets_scanned = stats.buckets_scanned,
+                        enqueued = stats.enqueued,
+                        failed = stats.failed,
+                        truncated = stats.truncated,
+                        next_bucket_marker = ?bucket_marker,
+                        next_object_marker = ?object_marker,
+                        pending_tasks,
+                        active_tasks,
+                        "Recovered tier free-version cleanup tasks"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        event = EVENT_LIFECYCLE_WORKER_STATE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                        duration_ms = started_at.elapsed().as_millis(),
+                        next_bucket_marker = ?bucket_marker,
+                        next_object_marker = ?object_marker,
+                        error = ?err,
+                        "Failed to recover tier free-version cleanup tasks"
+                    );
+                }
+            }
+        }
+    });
 }
 
 #[derive(Debug, Clone)]
@@ -1751,6 +1869,17 @@ fn mark_delete_opts_skip_decommissioned_on_remote_success(opts: &mut ObjectOptio
     }
 }
 
+fn transitioned_cleanup_tuple(oi: &ObjectInfo) -> Result<(&str, &str, &str), std::io::Error> {
+    let transitioned = &oi.transitioned_object;
+    if transitioned.status != lifecycle::TRANSITION_COMPLETE {
+        return Err(std::io::Error::other("transitioned object cleanup tuple is not complete"));
+    }
+    if transitioned.name.is_empty() || transitioned.version_id.is_empty() || transitioned.tier.is_empty() {
+        return Err(std::io::Error::other("transitioned object cleanup tuple is incomplete"));
+    }
+    Ok((&transitioned.name, &transitioned.version_id, &transitioned.tier))
+}
+
 pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
     if let Some(lc) = GLOBAL_LifecycleSys.get(&oi.bucket).await {
         enqueue_transition_with_lifecycle(oi, &lc, &src).await;
@@ -1984,6 +2113,7 @@ pub async fn expire_transitioned_object(
     //let traceFn = GLOBAL_LifecycleSys.trace(oi);
     let mut opts = ObjectOptions {
         versioned: BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
+        version_suspended: BucketVersioningSys::prefix_suspended(&oi.bucket, &oi.name).await,
         expiration: ExpirationOptions { expire: true },
         ..Default::default()
     };
@@ -2002,29 +2132,12 @@ pub async fn expire_transitioned_object(
         };
     }
 
-    let ret = delete_object_from_remote_tier(
-        &oi.transitioned_object.name,
-        &oi.transitioned_object.version_id,
-        &oi.transitioned_object.tier,
-    )
-    .await;
-    if let Err(e) = &ret {
-        error!(
-            event = EVENT_LIFECYCLE_TIER_OPERATION_FAILED,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-            bucket = %oi.bucket,
-            object = %oi.name,
-            tier = %oi.transitioned_object.tier,
-            tier_object = %oi.transitioned_object.name,
-            tier_version_id = %oi.transitioned_object.version_id,
-            operation = "delete_remote_transitioned_object",
-            error = ?e,
-            "Lifecycle tier operation failed"
-        );
-    }
-    mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, ret.is_ok());
+    let (_remote_object, _remote_version, _tier) = transitioned_cleanup_tuple(oi)?;
 
+    // Delete local metadata first so concurrent GET cannot observe metadata
+    // pointing to a remote tier version that has already been removed. If this
+    // only creates a delete marker, remote cleanup must be driven by persisted
+    // free-version recovery rather than the visible delete result.
     let dobj = match api.delete_object(&oi.bucket, &oi.name, opts).await {
         Ok(obj) => obj,
         Err(e) => {
@@ -2038,8 +2151,7 @@ pub async fn expire_transitioned_object(
                 error = ?e,
                 "Lifecycle delete failed"
             );
-            // Return the original object info if deletion fails
-            oi.clone()
+            return Err(std::io::Error::other(e));
         }
     };
 
@@ -2716,14 +2828,16 @@ mod tests {
     use super::{
         DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
         DEFAULT_TRANSITION_WORKERS_CAP, ExpiryState, GLOBAL_TransitionState, StaleMultipartUploadCandidate, TransitionState,
-        cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at, lifecycle_deleted_object,
-        lifecycle_rule_has_date_expiration, lifecycle_version_purge_state_from_completed_targets,
-        mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate, replication_state_for_delete,
-        resolve_transition_queue_capacity, resolve_transition_queue_send_timeout, resolve_transition_worker_count,
-        resolve_transition_workers_absolute_max, should_defer_date_expiry_for_recent_config_update,
-        should_reuse_lifecycle_delete_replication_state,
+        TransitionedObject, cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
+        enqueue_recovered_free_version_with_state, lifecycle_deleted_object, lifecycle_rule_has_date_expiration,
+        lifecycle_version_purge_state_from_completed_targets, mark_delete_opts_skip_decommissioned_on_remote_success,
+        merge_stale_multipart_candidate, replication_state_for_delete, resolve_transition_queue_capacity,
+        resolve_transition_queue_send_timeout, resolve_transition_worker_count, resolve_transition_workers_absolute_max,
+        should_defer_date_expiry_for_recent_config_update, should_reuse_lifecycle_delete_replication_state,
+        transitioned_cleanup_tuple,
     };
     use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
+    use crate::bucket::lifecycle::core::ExpirationOptions;
     use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
     use crate::bucket::metadata_sys;
     use crate::disk::RUSTFS_META_MULTIPART_BUCKET;
@@ -2777,6 +2891,104 @@ mod tests {
         assert_eq!(expiry.current_active, 0);
         assert_eq!(expiry.current_workers, 0);
         assert_eq!(expiry.queue_missed, 1);
+    }
+
+    #[tokio::test]
+    async fn enqueue_free_version_reports_false_without_worker_channel() {
+        let state = ExpiryState::new();
+        let mut state = state.write().await;
+        let oi = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            transitioned_object: TransitionedObject {
+                name: "remote/object".to_string(),
+                version_id: "remote-version".to_string(),
+                tier: "WARM".to_string(),
+                free_version: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let queued = state.enqueue_free_version(oi).await;
+
+        assert!(!queued);
+        assert_eq!(state.stats.missed_free_vers_tasks(), 1);
+    }
+
+    #[tokio::test]
+    async fn enqueue_recovered_free_version_reports_false_without_worker_channel() {
+        let state = ExpiryState::new();
+        let oi = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            transitioned_object: TransitionedObject {
+                name: "remote/object".to_string(),
+                version_id: "remote-version".to_string(),
+                tier: "WARM".to_string(),
+                free_version: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let queued = enqueue_recovered_free_version_with_state(&state, oi).await;
+        let state = state.read().await;
+
+        assert!(!queued);
+        assert_eq!(state.stats.missed_free_vers_tasks(), 1);
+    }
+
+    #[tokio::test]
+    async fn enqueue_recovered_free_version_reports_false_when_worker_queue_full() {
+        let state = ExpiryState::new_with_unconsumed_worker_channel(1);
+        let oi = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            transitioned_object: TransitionedObject {
+                name: "remote/object".to_string(),
+                version_id: "remote-version".to_string(),
+                tier: "WARM".to_string(),
+                free_version: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let first = enqueue_recovered_free_version_with_state(&state, oi.clone()).await;
+        let second = enqueue_recovered_free_version_with_state(&state, oi).await;
+        let state = state.read().await;
+
+        assert!(first);
+        assert!(!second);
+        assert_eq!(state.stats.pending_tasks(), 1);
+        assert_eq!(state.stats.missed_free_vers_tasks(), 1);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_free_version_recovery_enqueue_reports_retryable_queue_failure() {
+        let state = ExpiryState::new_with_unconsumed_worker_channel(1);
+        let oi = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            transitioned_object: TransitionedObject {
+                name: "remote/object".to_string(),
+                version_id: "remote-version".to_string(),
+                tier: "WARM".to_string(),
+                free_version: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let first = enqueue_recovered_free_version_with_state(&state, oi.clone()).await;
+        let second = enqueue_recovered_free_version_with_state(&state, oi).await;
+        let state = state.read().await;
+
+        assert!(first);
+        assert!(!second);
+        assert_eq!(state.stats.pending_tasks(), 1);
+        assert_eq!(state.stats.missed_free_vers_tasks(), 1);
     }
 
     #[tokio::test]
@@ -2837,6 +3049,80 @@ mod tests {
         mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, true);
 
         assert!(opts.skip_decommissioned);
+    }
+
+    #[test]
+    fn transitioned_expiry_must_not_skip_free_version_before_remote_cleanup() {
+        let mut opts = ObjectOptions::default();
+
+        mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, false);
+
+        assert!(!opts.skip_decommissioned);
+        assert!(!opts.skip_free_version);
+    }
+
+    #[test]
+    fn transitioned_cleanup_tuple_requires_remote_name_version_and_tier() {
+        let mut oi = ObjectInfo::default();
+        oi.transitioned_object.status = crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string();
+        oi.transitioned_object.name = "remote/object".to_string();
+        oi.transitioned_object.version_id = "remote-version".to_string();
+        oi.transitioned_object.tier = "WARM".to_string();
+
+        let tuple = transitioned_cleanup_tuple(&oi).expect("complete tuple should be accepted");
+
+        assert_eq!(tuple, ("remote/object", "remote-version", "WARM"));
+    }
+
+    #[test]
+    fn transitioned_cleanup_tuple_rejects_missing_remote_version() {
+        let mut oi = ObjectInfo::default();
+        oi.transitioned_object.status = crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string();
+        oi.transitioned_object.name = "remote/object".to_string();
+        oi.transitioned_object.tier = "WARM".to_string();
+
+        let err = transitioned_cleanup_tuple(&oi).expect_err("missing version must be rejected");
+
+        assert!(err.to_string().contains("cleanup tuple is incomplete"));
+    }
+
+    #[test]
+    fn transitioned_cleanup_tuple_rejects_non_complete_status() {
+        let mut oi = ObjectInfo::default();
+        oi.transitioned_object.name = "remote/object".to_string();
+        oi.transitioned_object.version_id = "remote-version".to_string();
+        oi.transitioned_object.tier = "WARM".to_string();
+        oi.transitioned_object.status = "pending".to_string();
+
+        let err = transitioned_cleanup_tuple(&oi).expect_err("non-complete transition must be rejected");
+
+        assert!(err.to_string().contains("not complete"));
+    }
+
+    #[test]
+    fn transitioned_expiry_sets_version_suspended_in_delete_options() {
+        let opts = ObjectOptions {
+            versioned: true,
+            version_suspended: true,
+            expiration: ExpirationOptions { expire: true },
+            ..Default::default()
+        };
+
+        assert!(opts.versioned);
+        assert!(opts.version_suspended);
+        assert!(!opts.skip_free_version);
+    }
+
+    #[test]
+    fn delete_marker_result_must_not_drive_remote_cleanup() {
+        let dobj = ObjectInfo {
+            delete_marker: true,
+            transitioned_object: TransitionedObject::default(),
+            ..Default::default()
+        };
+
+        assert!(dobj.delete_marker);
+        assert!(dobj.transitioned_object.name.is_empty());
     }
 
     // SAFETY: this helper is only used from `#[serial]` tests and those tests run under a

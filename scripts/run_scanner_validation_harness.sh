@@ -9,6 +9,7 @@ SECRET_KEY_ENV="RUSTFS_SECRET_KEY"
 REGION="us-east-1"
 DEPLOYMENT="single-disk"
 WORKLOAD_LABEL="unspecified"
+METRICS_ENDPOINTS=""
 SAMPLES=30
 INTERVAL_SECS=60
 OUT_DIR=""
@@ -38,6 +39,9 @@ Optional:
   --region                SigV4 region (default: us-east-1).
   --deployment            single-disk | multi-disk | distributed (default: single-disk).
   --workload-label        Free-form workload label written to metadata.
+  --metrics-endpoints     Optional comma-separated RustFS endpoints for
+                          per-endpoint background-heal status and
+                          /metrics?types=1&by-host=true&n=1 capture.
   --samples               Number of scanner status samples (default: 30).
   --interval-secs         Seconds between samples (default: 60).
   --out-dir               Output directory (default: target/bench/scanner-validation-<timestamp>).
@@ -49,8 +53,10 @@ Optional:
   -h, --help              Show this help.
 
 The harness collects scanner/heal config snapshots, scanner status samples,
-host telemetry when available, and a compact scanner-summary.csv file. It does
-not generate object workload or modify scanner configuration.
+background heal status samples, optional distributed by-host admin metrics,
+host telemetry when available, a compact scanner-summary.csv file, and a
+scanner-validation-report.md file. It does not generate object workload or
+modify scanner configuration.
 USAGE
 }
 
@@ -91,6 +97,7 @@ parse_args() {
       --region) REGION="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --deployment) DEPLOYMENT="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --workload-label) WORKLOAD_LABEL="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --metrics-endpoints) METRICS_ENDPOINTS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --samples) SAMPLES="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --interval-secs) INTERVAL_SECS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --out-dir) OUT_DIR="$(arg_value "$1" "${2:-}")"; shift 2 ;;
@@ -151,8 +158,10 @@ setup_output() {
   fi
 
   mkdir -p "$OUT_DIR/status"
+  mkdir -p "$OUT_DIR/heal"
+  mkdir -p "$OUT_DIR/metrics"
   SUMMARY_CSV="$OUT_DIR/scanner-summary.csv"
-  echo "timestamp,primary_pressure,current_cycle_objects_scanned,current_cycle_directories_scanned,last_cycle_result,last_cycle_partial_reason,last_cycle_partial_source,lifecycle_transition_scanner_missed,source_work_missed_total" >"$SUMMARY_CSV"
+  echo "timestamp,primary_pressure,current_cycle_objects_scanned,current_cycle_directories_scanned,last_cycle_result,last_cycle_partial_reason,last_cycle_partial_source,lifecycle_transition_scanner_missed,source_work_missed_total,heal_queue_length,heal_active_tasks,heal_scanner_queued,heal_admin_queued,heal_auto_heal_queued" >"$SUMMARY_CSV"
 }
 
 git_value() {
@@ -169,6 +178,7 @@ write_metadata() {
     printf 'workload_label=%s\n' "$WORKLOAD_LABEL"
     printf 'endpoint=%s\n' "$ENDPOINT"
     printf 'region=%s\n' "$REGION"
+    printf 'metrics_endpoints=%s\n' "$METRICS_ENDPOINTS"
     printf 'samples=%s\n' "$SAMPLES"
     printf 'interval_secs=%s\n' "$INTERVAL_SECS"
     printf 'git_commit=%s\n' "$(git_value rev-parse HEAD)"
@@ -232,10 +242,142 @@ scanner_status_url() {
   printf '%s/rustfs/admin/v3/scanner/status\n' "${ENDPOINT%/}"
 }
 
+background_heal_status_url() {
+  printf '%s/rustfs/admin/v3/background-heal/status\n' "${1%/}"
+}
+
+metrics_url() {
+  printf '%s/rustfs/admin/v3/metrics?types=1&by-host=true&n=1\n' "${1%/}"
+}
+
+endpoint_label() {
+  local endpoint="$1"
+  local label
+
+  label="${endpoint#*://}"
+  label="${label%%/*}"
+  printf '%s' "$label" | tr -c 'A-Za-z0-9._-' '_'
+}
+
+background_heal_status_endpoints() {
+  local endpoint
+  local endpoints=()
+  local emitted=false
+
+  if [[ -n "$METRICS_ENDPOINTS" ]]; then
+    IFS=',' read -r -a endpoints <<<"$METRICS_ENDPOINTS"
+    for endpoint in "${endpoints[@]}"; do
+      if [[ -z "$endpoint" ]]; then
+        continue
+      fi
+      printf '%s\n' "$endpoint"
+      emitted=true
+    done
+  fi
+
+  if [[ "$emitted" != "true" ]]; then
+    printf '%s\n' "$ENDPOINT"
+  fi
+}
+
+write_heal_status_summary() {
+  local summary_file="$1"
+  shift
+
+  "$JQ_BIN" -s '
+    {
+      healOperations: {
+        queueLength: (map(.healOperations.queueLength // .healQueueLength // 0) | add // 0),
+        activeTasks: (map(.healOperations.activeTasks // .healActiveTasks // 0) | add // 0),
+        queuedBySource: {
+          scanner: (map(.healOperations.queuedBySource.scanner // 0) | add // 0),
+          admin: (map(.healOperations.queuedBySource.admin // 0) | add // 0),
+          autoHeal: (map(.healOperations.queuedBySource.autoHeal // 0) | add // 0),
+          internal: (map(.healOperations.queuedBySource.internal // 0) | add // 0)
+        },
+        activeBySource: {
+          scanner: (map(.healOperations.activeBySource.scanner // 0) | add // 0),
+          admin: (map(.healOperations.activeBySource.admin // 0) | add // 0),
+          autoHeal: (map(.healOperations.activeBySource.autoHeal // 0) | add // 0),
+          internal: (map(.healOperations.activeBySource.internal // 0) | add // 0)
+        },
+        queuedByPriority: {
+          low: (map(.healOperations.queuedByPriority.low // 0) | add // 0),
+          normal: (map(.healOperations.queuedByPriority.normal // 0) | add // 0),
+          high: (map(.healOperations.queuedByPriority.high // 0) | add // 0),
+          urgent: (map(.healOperations.queuedByPriority.urgent // 0) | add // 0)
+        },
+        activeByPriority: {
+          low: (map(.healOperations.activeByPriority.low // 0) | add // 0),
+          normal: (map(.healOperations.activeByPriority.normal // 0) | add // 0),
+          high: (map(.healOperations.activeByPriority.high // 0) | add // 0),
+          urgent: (map(.healOperations.activeByPriority.urgent // 0) | add // 0)
+        }
+      }
+    }
+  ' "$@" >"$summary_file"
+}
+
+capture_background_heal_status_sample() {
+  local index="$1"
+  local ts="$2"
+  local summary_file="$3"
+  local endpoint label heal_status_file
+  local heal_status_files=()
+
+  while IFS= read -r endpoint; do
+    label="$(endpoint_label "$endpoint")"
+    heal_status_file="$OUT_DIR/heal/background-heal-status.${label}.${index}.${ts}.json"
+    AWS_ACCESS_KEY_ID="$ACCESS_KEY" \
+    AWS_SECRET_ACCESS_KEY="$SECRET_KEY" \
+    AWS_DEFAULT_REGION="$REGION" \
+    "$AWSCURL_BIN" \
+      --service s3 \
+      --region "$REGION" \
+      --request POST \
+      "$(background_heal_status_url "$endpoint")" \
+      | "$JQ_BIN" . >"$heal_status_file"
+    heal_status_files+=("$heal_status_file")
+  done < <(background_heal_status_endpoints)
+
+  write_heal_status_summary "$summary_file" "${heal_status_files[@]}"
+}
+
+capture_distributed_metrics_sample() {
+  local index="$1"
+  local ts="$2"
+  local endpoint label metrics_file
+  local endpoints=()
+
+  if [[ -z "$METRICS_ENDPOINTS" ]]; then
+    return
+  fi
+
+  IFS=',' read -r -a endpoints <<<"$METRICS_ENDPOINTS"
+  for endpoint in "${endpoints[@]}"; do
+    if [[ -z "$endpoint" ]]; then
+      continue
+    fi
+
+    label="$(endpoint_label "$endpoint")"
+    metrics_file="$OUT_DIR/metrics/admin-metrics.${label}.${index}.${ts}.ndjson"
+    AWS_ACCESS_KEY_ID="$ACCESS_KEY" \
+    AWS_SECRET_ACCESS_KEY="$SECRET_KEY" \
+    AWS_DEFAULT_REGION="$REGION" \
+    "$AWSCURL_BIN" \
+      --service s3 \
+      --region "$REGION" \
+      --request GET \
+      "$(metrics_url "$endpoint")" \
+      >"$metrics_file"
+  done
+}
+
 capture_status_sample() {
   local index="$1"
   local ts="$2"
   local status_file="$OUT_DIR/status/scanner-status.${index}.${ts}.json"
+  local heal_summary_file="$OUT_DIR/heal/background-heal-summary.${index}.${ts}.json"
 
   AWS_ACCESS_KEY_ID="$ACCESS_KEY" \
   AWS_SECRET_ACCESS_KEY="$SECRET_KEY" \
@@ -247,7 +389,10 @@ capture_status_sample() {
     "$(scanner_status_url)" \
     | "$JQ_BIN" . >"$status_file"
 
-  "$JQ_BIN" -r --arg ts "$ts" '
+  capture_background_heal_status_sample "$index" "$ts" "$heal_summary_file"
+
+  "$JQ_BIN" -r --arg ts "$ts" --slurpfile heal_status "$heal_summary_file" '
+    ($heal_status[0] // {}) as $heal |
     [
       $ts,
       (.metrics.pacing_pressure.primary_pressure // ""),
@@ -257,9 +402,16 @@ capture_status_sample() {
       (.metrics.last_cycle_partial_reason // ""),
       (.metrics.last_cycle_partial_source // ""),
       (.metrics.lifecycle_transition.scanner_missed // 0),
-      ((.metrics.source_work // []) | map(.missed // 0) | add // 0)
+      ((.metrics.source_work // []) | map(.missed // 0) | add // 0),
+      ($heal.healOperations.queueLength // $heal.healQueueLength // 0),
+      ($heal.healOperations.activeTasks // $heal.healActiveTasks // 0),
+      ($heal.healOperations.queuedBySource.scanner // 0),
+      ($heal.healOperations.queuedBySource.admin // 0),
+      ($heal.healOperations.queuedBySource.autoHeal // 0)
     ] | @csv
   ' "$status_file" >>"$SUMMARY_CSV"
+
+  capture_distributed_metrics_sample "$index" "$ts"
 }
 
 capture_status_series() {
@@ -273,6 +425,46 @@ capture_status_series() {
       sleep "$INTERVAL_SECS"
     fi
   done
+}
+
+count_artifacts() {
+  local dir="$1"
+  local pattern="$2"
+
+  find "$dir" -type f -name "$pattern" 2>/dev/null | wc -l | tr -d ' '
+}
+
+write_report() {
+  local status_count heal_status_count metrics_count
+  status_count="$(count_artifacts "$OUT_DIR/status" 'scanner-status.*.json')"
+  heal_status_count="$(count_artifacts "$OUT_DIR/heal" 'background-heal-status.*.json')"
+  metrics_count="$(count_artifacts "$OUT_DIR/metrics" 'admin-metrics.*.ndjson')"
+
+  cat >"$OUT_DIR/scanner-validation-report.md" <<EOF
+## Scanner Validation Report
+
+Deployment: $DEPLOYMENT
+Workload label: $WORKLOAD_LABEL
+Endpoint: $ENDPOINT
+Samples: $SAMPLES
+Interval seconds: $INTERVAL_SECS
+
+## Artifact Summary
+
+- Scanner status snapshots: $status_count
+- Background heal status snapshots: $heal_status_count
+- Distributed admin metrics snapshots: $metrics_count
+- Summary CSV: scanner-summary.csv
+- Run metadata: run-metadata.env
+
+## Review Checklist
+
+- Compare scanner progress and pressure in scanner-summary.csv.
+- Check source work missed totals before accepting pressure reductions.
+- Check healOperations queued and active counts when heal or bitrot pressure is involved.
+- Use distributed admin metrics snapshots for by-host investigation when metrics endpoints were provided.
+- Attach host telemetry when pidstat, iostat, or mpstat files are present.
+EOF
 }
 
 main() {
@@ -291,6 +483,7 @@ main() {
   start_host_telemetry
   capture_status_series
   wait_host_telemetry
+  write_report
 
   echo "Scanner validation artifacts written to $OUT_DIR"
 }

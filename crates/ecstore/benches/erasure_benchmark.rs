@@ -44,9 +44,12 @@
 //! - SIMD optimization for different shard sizes
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use rustfs_ecstore::erasure_coding::{Erasure, calc_shard_size};
+use rustfs_ecstore::erasure_coding::{BitrotReader, BitrotWriter, Erasure, calc_shard_size};
+use rustfs_utils::HashAlgorithm;
 use std::hint::black_box;
+use std::io::Cursor;
 use std::time::Duration;
+use tokio::runtime::Runtime;
 
 /// Benchmark configuration structure
 #[derive(Clone, Debug)]
@@ -328,11 +331,113 @@ fn bench_memory_patterns(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark: end-to-end streaming decode through `Erasure::decode`.
+///
+/// Unlike `bench_decode_performance` (which calls `decode_data` on in-memory
+/// shards), this drives the async `ParallelReader` path that reads each shard
+/// through a `BitrotReader` per erasure stripe. That is the path executed on
+/// every object GET, and the one where per-stripe shard buffers are allocated.
+fn bench_streaming_decode(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let hash_algo = HashAlgorithm::HighwayHash256;
+
+    // (data_shards, parity_shards, object_size, block_size)
+    let configs = vec![
+        (4usize, 2usize, 16 * 1024 * 1024usize, 1024 * 1024usize),
+        (6, 3, 24 * 1024 * 1024, 1024 * 1024),
+        (4, 2, 4 * 1024 * 1024, 64 * 1024),
+    ];
+
+    for (data_shards, parity_shards, data_size, block_size) in configs {
+        let data = generate_test_data(data_size);
+        let erasure = Erasure::new(data_shards, parity_shards, block_size);
+        let shard_size = erasure.shard_size();
+        let total_len = data.len();
+
+        // Pre-encode the object into per-shard bitrot streams once (setup).
+        let total_shards = data_shards + parity_shards;
+        let shard_bufs: Vec<Vec<u8>> = rt.block_on(async {
+            let mut writers: Vec<BitrotWriter<Cursor<Vec<u8>>>> = (0..total_shards)
+                .map(|_| BitrotWriter::new(Cursor::new(Vec::new()), shard_size, hash_algo.clone()))
+                .collect();
+            let mut off = 0;
+            while off < data.len() {
+                let end = (off + block_size).min(data.len());
+                let shards = erasure.encode_data(&data[off..end]).unwrap();
+                for (i, shard) in shards.iter().enumerate() {
+                    writers[i].write(shard).await.unwrap();
+                }
+                off = end;
+            }
+            writers.into_iter().map(|w| w.into_inner().into_inner()).collect()
+        });
+
+        // verify=true mirrors the production default (bitrot verification on);
+        // verify=false isolates the buffer-handling cost from the hash pass.
+        for verify in [true, false] {
+            let skip_verify = !verify;
+            let mut group = c.benchmark_group("streaming_decode");
+            group.throughput(Throughput::Bytes(total_len as u64));
+            group.sample_size(10);
+            group.measurement_time(Duration::from_secs(5));
+
+            let name = format!(
+                "{}+{}_{}KB_{}KB-block_verify-{}",
+                data_shards,
+                parity_shards,
+                data_size / 1024,
+                block_size / 1024,
+                verify
+            );
+
+            // Validate decode once per config (untimed) so a regression in
+            // success or output length fails the benchmark without putting
+            // assertions inside the measured loop.
+            {
+                let readers: Vec<Option<BitrotReader<Cursor<&[u8]>>>> = shard_bufs
+                    .iter()
+                    .map(|buf| Some(BitrotReader::new(Cursor::new(buf.as_slice()), shard_size, hash_algo.clone(), skip_verify)))
+                    .collect();
+                let mut sink = tokio::io::sink();
+                let (written, err) = rt.block_on(erasure.decode(&mut sink, readers, 0, total_len, total_len));
+                assert!(err.is_none(), "decode failed: {err:?}");
+                assert_eq!(written, total_len, "decode wrote {written} of {total_len} bytes");
+            }
+
+            group.bench_function(BenchmarkId::new("decode", name), |b| {
+                b.iter_batched(
+                    || {
+                        // Setup (untimed): per-shard readers positioned at the
+                        // object start, plus the no-op sink, so reader/UUID and
+                        // sink construction stay out of the timed decode path.
+                        let readers: Vec<Option<BitrotReader<Cursor<&[u8]>>>> = shard_bufs
+                            .iter()
+                            .map(|buf| {
+                                Some(BitrotReader::new(Cursor::new(buf.as_slice()), shard_size, hash_algo.clone(), skip_verify))
+                            })
+                            .collect();
+                        (readers, tokio::io::sink())
+                    },
+                    |(readers, mut sink)| {
+                        rt.block_on(async {
+                            let (written, _err) = erasure.decode(black_box(&mut sink), readers, 0, total_len, total_len).await;
+                            black_box(written);
+                        });
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            });
+            group.finish();
+        }
+    }
+}
+
 // Benchmark group configuration
 criterion_group!(
     benches,
     bench_encode_performance,
     bench_decode_performance,
+    bench_streaming_decode,
     bench_shard_size_impact,
     bench_coding_configurations,
     bench_memory_patterns

@@ -5,18 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-loss-prevention-guards`
-- Baseline: `origin/main` at `dd6b4c35ad2c24be432c32645ce17e2d312eac78`
-- PR type for this branch: `ci-gate`
+- Branch: `overtrue/arch-remove-storage-api-facade`
+- Baseline: `origin/main` at `c26593fa7a4b55849e98832cde657c6d4b167262`
+- PR type for this branch: `consumer-migration`
 - Runtime behavior changes: no external behavior change expected.
-- Rust code changes: split lifecycle transition compensation bucket
-  reservation from background backfill spawning so the dedupe unit test does
-  not launch an actual compensation task on shared test state.
-- CI/script changes: extend `scripts/check_architecture_migration_rules.sh` to
-  guard public storage-api re-exports, StorageAPI operation-group coverage,
-  NamespaceLocking separation, and ECStore compatibility tests.
-- Docs changes: record `G-006` completion and document the guarded
-  loss-prevention coverage in `crate-boundaries.md`.
+- Rust code changes: remove the old unused `StorageAPI` facade, its ECStore
+  implementation blocks, its public re-export, and the stale compile-time
+  compatibility test coverage.
+- CI/script changes: adjust architecture migration guardrails to keep the
+  remaining storage-admin and namespace-lock contracts covered.
+- Docs changes: record the final old-facade cleanup slice and its verification
+  state.
 
 ## Phase 0 Tasks
 
@@ -37,13 +36,12 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Completed slices: add a mechanical admin route matrix guard from
     [`admin-route-action-snapshot.md`](admin-route-action-snapshot.md) and
     `rustfs/src/admin/route_registration_test.rs`; add migration rules for
-    public storage-api re-export coverage, StorageAPI operation-group coverage,
-    NamespaceLocking separation, and ECStore compatibility-test coverage.
+    public storage-api re-export coverage and ECStore compatibility-test
+    coverage.
   - Acceptance: architecture migration rules fail if the public storage-api
-    contract re-export surface drifts, if `StorageAPI` stops covering the
-    documented storage operation groups, if `NamespaceLocking` is folded back
-    into the full storage facade, or if ECStore compile-time compatibility tests
-    for these contracts are removed.
+    contract re-export surface drifts or if ECStore compile-time compatibility
+    tests for the remaining storage-admin and namespace-lock contracts are
+    removed.
 - [x] `G-007` Create startup timeline table.
   - Acceptance: [`startup-timeline.md`](startup-timeline.md) records current
     binary startup order, side effects, fatal boundaries, and readiness stages.
@@ -412,7 +410,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Completed slice: `rustfs/rustfs#3340` removed duplicate admin-read methods
     from the old `StorageAPI` trait and its ECStore/Sets/SetDisks/test
     implementations after API-007 migrated their consumers.
-  - Acceptance: old `StorageAPI` keeps storage operation traits while admin
+  - Final cleanup slice: remove the old `StorageAPI` facade after all real
+    consumers moved to concrete operation groups.
+  - Acceptance: storage operation traits remain available directly while admin
     inventory surfaces live only on `StorageAdminApi`.
 
 - [x] `API-009` Narrow metadata helper storage bounds.
@@ -421,6 +421,11 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     full `StorageAPI` when the helper only needs `ObjectIO`,
     `ObjectOperations`, `BucketOperations`, `ListOperations`, or
     `StorageAdminApi`.
+  - Cleanup slice: remove stale full `StorageAPI` dependencies from config
+    persistence test support after the server-config persistence helpers moved
+    to their actual object I/O and storage-admin bounds.
+  - Completed cleanup slice: `rustfs/rustfs#3489` removed the stale full
+    facade dependency from config persistence test support.
   - Acceptance: metadata helper contracts express the actual operation group
     they need, while callers and persistence behavior remain unchanged.
 
@@ -430,8 +435,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     helper only needs `ObjectIO`.
   - Acceptance: resync metadata helpers express object-I/O-only persistence
     requirements, while replication execution, delete replication, multipart
-    replication, object lookups, and scheduling behavior remain on full
-    `StorageAPI` where needed.
+    replication, object lookups, and scheduling behavior remain on the concrete
+    operation groups they need.
 
 - [x] `API-011` Narrow scanner cache helper storage bounds.
   - Completed slice: `rustfs/rustfs#3348` narrowed scanner data-usage cache
@@ -444,9 +449,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     cache paths, retry and timeout behavior, cache-save metrics, publish/update
     channel behavior, scanner cycle scheduling, disk scan concurrency, bucket
     scan semantics, lifecycle/replication decisions, and storage hot paths.
-  - Risk defense: do not move traits to `rustfs-storage-api`, do not remove
-    `StorageAPI`, do not alter helper bodies, and do not narrow scanner paths
-    that need bucket operations, disk inventory, or full storage orchestration.
+  - Risk defense: do not move traits to `rustfs-storage-api`, do not alter
+    helper bodies, and do not narrow scanner paths that need bucket operations,
+    disk inventory, or full storage orchestration.
   - Verification: focused compile/tests, migration guards, Rust risk scan, and
     required quality/architecture, migration-preservation, and
     testing/verification review passed.
@@ -461,6 +466,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     namespace locking directly on ECStore storage types, and remove the
     temporary namespace-lock compatibility method from the full storage trait
     and cleanup register entry.
+  - Completed cleanup slice: `rustfs/rustfs#3477` narrowed remaining table
+    catalog backend and rebalance metadata helper consumers away from full
+    `StorageAPI` where they only need object I/O, object operations, list
+    operations, and namespace locking.
+  - Completed follow-up slice: `rustfs/rustfs#3485` narrowed replication pool,
+    resync leader-lock, delete replication, object replication, and multipart
+    replication helpers away from full `StorageAPI` where they only need object
+    I/O, object operations, list operations, and namespace locking.
+  - Final cleanup slice: remove the unused old `StorageAPI` facade, its
+    implementation blocks, public re-export, and stale guard coverage.
   - Acceptance: table catalog object backend contracts express the actual
     object read/write, metadata/delete, list, and namespace-lock capabilities
     they need; namespace-lock consumers depend on `NamespaceLocking` instead of
@@ -471,8 +486,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     scanner/heal/replication/config persistence, and storage hot paths.
   - Risk defense: do not move traits into `rustfs-storage-api`, do not change
     lock implementation code, do not alter table catalog method bodies, and do
-    not retain stale API-012 compatibility markers after the old `StorageAPI`
-    lock method is removed.
+    not leave stale full-facade compatibility coverage after consumers move to
+    concrete operation groups.
   - Verification: focused compile/tests, migration guards, Rust risk scan, and
     required quality/architecture, migration-preservation, and
     testing/verification review passed.
@@ -746,50 +761,44 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Next PRs
 
 1. `pure-move`/`consumer-migration`: continue larger cleanup slices with the
-   loss-prevention guards active for public re-exports and storage trait
-   coverage.
+   loss-prevention guards active for public re-exports and remaining storage
+   compatibility contracts.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | CI-gate slice extends the existing migration rule script instead of adding a parallel guard system. |
-| Migration preservation | passed | Guards fail on public storage-api re-export drift, StorageAPI operation-group drift, NamespaceLocking collapse, or missing ECStore compatibility tests without changing runtime behavior. |
-| Testing/verification | passed | Script syntax, migration/layer guards, lifecycle compensation dedupe test, ECStore compatibility test, compile check, formatting, diff hygiene, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Old `StorageAPI` facade removal leaves concrete operation traits and remaining storage-admin/namespace-lock contracts explicit. |
+| Migration preservation | passed | ECStore/Sets/SetDisks operation implementations remain in place; only the unused aggregate facade and stale guard coverage are removed. |
+| Testing/verification | passed | Focused compatibility test, compile checks, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `dd6b4c35ad2c24be432c32645ce17e2d312eac78`:
+Passed on `c26593fa7a4b55849e98832cde657c6d4b167262`:
 
-- `bash -n scripts/check_architecture_migration_rules.sh`: passed.
-- `./scripts/check_architecture_migration_rules.sh`: passed.
-- `./scripts/check_layer_dependencies.sh`: passed.
+- `cargo check -p rustfs-ecstore`: passed.
 - `cargo test -p rustfs-ecstore --test storage_api_compat_test --no-fail-fast`:
   passed.
-- `cargo test -p rustfs-ecstore bucket::lifecycle::bucket_lifecycle_ops::tests::reserve_bucket_compensation_deduplicates_same_bucket --no-fail-fast`:
-  passed.
-- `cargo check -p rustfs-ecstore`: passed.
+- `cargo check -p rustfs -p rustfs-ecstore`: passed.
+- `./scripts/check_architecture_migration_rules.sh`: passed.
+- `./scripts/check_layer_dependencies.sh`: passed.
 - `cargo fmt --all --check`: passed.
 - `git diff --check`: passed.
-- Rust risk scan: no new production `unwrap`/`expect`, lossy casts, string
-  errors, public boxed errors, or production `println`/`eprintln`.
+- Rust risk scan: no new production `unwrap`/`expect`, panic/todo markers,
+  `unsafe`, or process-spawning calls in added Rust lines.
 - `make pre-commit`: passed.
-- `git rev-list --left-right --count HEAD...origin/main`: returned `1 0`
-  after commit.
 
 Notes:
 
-- This slice completes the `G-006` loss-prevention follow-up with script-level
-  checks for the public re-export and storage trait coverage called out in the
-  migration checklist.
-- The script reads existing source/test surfaces and does not introduce a new
-  runtime behavior path.
-- The lifecycle compensation dedupe test now covers reservation directly,
-  avoiding a spawned backfill task that can inherit shared object-store test
-  state during the full pre-commit run.
+- This slice removes the old full storage facade after no real code consumers
+  remain.
+- The concrete storage operation traits, `StorageAdminApi`, and
+  `NamespaceLocking` remain available and covered.
+- The slice does not move traits across crate boundaries.
 
 ## Handoff Notes
 
-- G-006 is implemented, locally verified, and current with `origin/main`.
-- Larger cleanup slices can now rely on migration rules to catch accidental
-  public storage-api re-export drift and storage trait coverage loss.
+- Old storage facade removal is locally verified on a branch current with
+  `origin/main`.
+- After this lands, remaining storage work can focus on concrete operation
+  contracts instead of the aggregate facade.

@@ -22,7 +22,7 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
-use rustfs_common::heal_channel::{HealChannelPriority, HealChannelRequest, HealOpts};
+use rustfs_common::heal_channel::{HealChannelPriority, HealChannelRequest, HealOpts, HealRequestSource};
 use rustfs_config::MAX_HEAL_REQUEST_SIZE;
 use rustfs_ecstore::bucket::utils::is_valid_object_prefix;
 use rustfs_ecstore::store_api::HealOperations;
@@ -186,6 +186,7 @@ struct BackgroundHealStatus<'a> {
     info: &'a BackgroundHealInfo,
     heal_queue_length: u64,
     heal_active_tasks: u64,
+    heal_operations: rustfs_heal::HealOperationsSnapshot,
 }
 
 #[derive(Debug, Deserialize)]
@@ -265,6 +266,7 @@ fn build_heal_channel_request(hip: &HealInitParams) -> HealChannelRequest {
     heal_request.update_parity = Some(hip.hs.update_parity);
     heal_request.recursive = Some(hip.hs.recursive);
     heal_request.dry_run = Some(hip.hs.dry_run);
+    heal_request.source = HealRequestSource::Admin;
     heal_request
 }
 
@@ -301,11 +303,15 @@ fn heal_channel_response_items(
     heal_channel_response_status(response).1
 }
 
-fn encode_background_heal_status(info: &BackgroundHealInfo) -> S3Result<Vec<u8>> {
+fn encode_background_heal_status(
+    info: &BackgroundHealInfo,
+    heal_operations: rustfs_heal::HealOperationsSnapshot,
+) -> S3Result<Vec<u8>> {
     let status = BackgroundHealStatus {
         info,
-        heal_queue_length: rustfs_heal::current_heal_queue_length(),
-        heal_active_tasks: rustfs_heal::current_heal_active_tasks(),
+        heal_queue_length: heal_operations.queue_length,
+        heal_active_tasks: heal_operations.active_tasks,
+        heal_operations,
     };
     serde_json::to_vec(&status).map_err(|e| {
         warn!(
@@ -669,7 +675,8 @@ impl Operation for BackgroundHealStatusHandler {
         };
 
         let info = read_background_heal_info(store).await;
-        let body = encode_background_heal_status(&info)?;
+        let heal_operations = rustfs_heal::current_heal_operations_snapshot().await;
+        let body = encode_background_heal_status(&info, heal_operations)?;
         info!(
             event = EVENT_ADMIN_RESPONSE_EMITTED,
             component = LOG_COMPONENT_ADMIN_API,
@@ -695,7 +702,7 @@ mod tests {
     use http::StatusCode;
     use http::Uri;
     use matchit::Router;
-    use rustfs_common::heal_channel::{HealChannelPriority, HealOpts, HealScanMode};
+    use rustfs_common::heal_channel::{HealChannelPriority, HealOpts, HealRequestSource, HealScanMode};
     use rustfs_ecstore::error::StorageError;
     use rustfs_scanner::scanner::BackgroundHealInfo;
     use s3s::{
@@ -979,7 +986,13 @@ mod tests {
             current_scan_mode: HealScanMode::Deep,
         };
 
-        let encoded = encode_background_heal_status(&info).expect("background heal info should serialize");
+        let operations = rustfs_heal::HealOperationsSnapshot {
+            queue_length: 3,
+            active_tasks: 2,
+            ..Default::default()
+        };
+
+        let encoded = encode_background_heal_status(&info, operations).expect("background heal info should serialize");
         let json: serde_json::Value = serde_json::from_slice(&encoded).expect("json should deserialize");
 
         assert_eq!(json["bitrotStartCycle"], 42);
@@ -987,6 +1000,12 @@ mod tests {
         assert!(json["bitrotStartTime"].is_null());
         assert!(json["healQueueLength"].is_u64());
         assert!(json["healActiveTasks"].is_u64());
+        assert_eq!(json["healOperations"]["queueLength"], json["healQueueLength"]);
+        assert_eq!(json["healOperations"]["activeTasks"], json["healActiveTasks"]);
+        assert!(json["healOperations"]["queuedBySource"]["scanner"].is_u64());
+        assert!(json["healOperations"]["queuedBySource"]["admin"].is_u64());
+        assert!(json["healOperations"]["queuedByPriority"]["low"].is_u64());
+        assert!(json["healOperations"]["queuedByPriority"]["high"].is_u64());
     }
 
     #[test]
@@ -1041,6 +1060,7 @@ mod tests {
         assert_eq!(request.bucket, "bucket-a");
         assert_eq!(request.object_prefix.as_deref(), Some("prefix-a"));
         assert_eq!(request.priority, HealChannelPriority::High);
+        assert_eq!(request.source, HealRequestSource::Admin);
         assert!(request.force_start);
         assert_eq!(request.pool_index, Some(1));
         assert_eq!(request.set_index, Some(2));

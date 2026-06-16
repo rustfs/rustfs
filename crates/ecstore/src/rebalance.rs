@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::StorageAPI;
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use crate::config::com::{read_config_with_metadata, save_config_with_opts};
 use crate::data_movement;
@@ -52,7 +51,8 @@ use uuid::Uuid;
 const REBAL_META_FMT: u16 = 1; // Replace with actual format value
 const REBAL_META_VER: u16 = 1; // Replace with actual version value
 const REBAL_META_NAME: &str = "rebalance.bin";
-const REBALANCE_LISTING_MAX_ATTEMPTS: usize = 3;
+const DEFAULT_REBALANCE_MAX_ATTEMPTS: usize = 3;
+const REBALANCE_MAX_ATTEMPTS_ENV: &str = "RUSTFS_REBALANCE_MAX_ATTEMPTS";
 const REBALANCE_LISTING_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const REBALANCE_MIGRATION_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const REBALANCE_MIGRATION_LOCK_RETRY_CAP: Duration = Duration::from_secs(10);
@@ -667,7 +667,7 @@ impl RebalanceMeta {
 }
 
 impl ECStore {
-    async fn save_rebalance_meta_with_merge<S: StorageAPI + NamespaceLocking>(
+    async fn save_rebalance_meta_with_merge<S: ObjectIO + NamespaceLocking>(
         &self,
         pool: Arc<S>,
         local_snapshot: &RebalanceMeta,
@@ -2057,6 +2057,17 @@ fn should_retry_rebalance_listing(err: &Error, attempt: usize, max_attempts: usi
     attempt + 1 < max_attempts && is_transient_rebalance_error(err)
 }
 
+fn parse_rebalance_max_attempts(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|attempts| *attempts > 0)
+        .unwrap_or(DEFAULT_REBALANCE_MAX_ATTEMPTS)
+}
+
+fn rebalance_max_attempts() -> usize {
+    parse_rebalance_max_attempts(std::env::var(REBALANCE_MAX_ATTEMPTS_ENV).ok().as_deref())
+}
+
 fn rebalance_listing_retry_delay(attempt: usize) -> Duration {
     let multiplier = u32::try_from(attempt.saturating_add(1)).unwrap_or(u32::MAX);
     REBALANCE_LISTING_RETRY_BASE_DELAY.saturating_mul(multiplier)
@@ -2613,7 +2624,7 @@ impl ECStore {
                 pool_index,
                 version,
                 version_id.clone(),
-                3,
+                rebalance_max_attempts(),
                 should_ignore_rebalance_data_usage_cache(bucket.as_str()),
                 &mut transfer,
             )
@@ -2902,15 +2913,9 @@ impl ECStore {
             let entry_tasks = entry_tasks.clone();
 
             let job = tokio::spawn(async move {
-                let list_result = run_rebalance_listing_with_retry(
-                    set,
-                    rx,
-                    bucket.clone(),
-                    rebalance_entry,
-                    set_idx,
-                    REBALANCE_LISTING_MAX_ATTEMPTS,
-                )
-                .await;
+                let list_result =
+                    run_rebalance_listing_with_retry(set, rx, bucket.clone(), rebalance_entry, set_idx, rebalance_max_attempts())
+                        .await;
                 let entry_result = wait_rebalance_entry_tasks(set_idx, entry_tasks).await;
                 let result = list_result.and(entry_result);
                 if let Err(err) = &result {
@@ -3170,11 +3175,11 @@ mod rebalance_unit_tests {
         ensure_rebalance_listing_disks_available, ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index,
         has_deferred_rebalance_error, is_rebalance_stopped_terminal_event, is_transient_rebalance_error,
         load_rebalance_bucket_configs, mark_rebalance_bucket_done, merge_rebalance_meta, migrate_entry_version,
-        migrate_entry_version_with_retry_wait, next_rebal_bucket_from_stat, rebalance_delete_marker_opts,
-        rebalance_listing_retry_delay, rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error,
-        rebalance_meta_load_unknown_version_error, rebalance_migration_retry_delay, record_rebalance_cleanup_warning_in_meta,
-        resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket, resolve_rebalance_bucket_error,
-        resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
+        migrate_entry_version_with_retry_wait, next_rebal_bucket_from_stat, parse_rebalance_max_attempts,
+        rebalance_delete_marker_opts, rebalance_listing_retry_delay, rebalance_meta_load_no_data_error,
+        rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error, rebalance_migration_retry_delay,
+        record_rebalance_cleanup_warning_in_meta, resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket,
+        resolve_rebalance_bucket_error, resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
         resolve_rebalance_file_info_versions_result, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
         resolve_rebalance_migrate_result_error, resolve_rebalance_optional_bucket_config_result, resolve_rebalance_participants,
         resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error,
@@ -4775,6 +4780,15 @@ mod rebalance_unit_tests {
         assert!(should_retry_rebalance_listing(&Error::SlowDown, 1, 3));
         assert!(!should_retry_rebalance_listing(&Error::SlowDown, 2, 3));
         assert!(!should_retry_rebalance_listing(&Error::FileAccessDenied, 0, 3));
+    }
+
+    #[test]
+    fn test_parse_rebalance_max_attempts_uses_positive_override_or_default() {
+        assert_eq!(parse_rebalance_max_attempts(Some("5")), 5);
+        assert_eq!(parse_rebalance_max_attempts(Some(" 7 ")), 7);
+        assert_eq!(parse_rebalance_max_attempts(Some("0")), 3);
+        assert_eq!(parse_rebalance_max_attempts(Some("invalid")), 3);
+        assert_eq!(parse_rebalance_max_attempts(None), 3);
     }
 
     #[test]

@@ -99,6 +99,7 @@ metrics.lifecycle_transition.current_queued
 metrics.lifecycle_transition.scanner_missed
 metrics.maintenance_control.primary_control
 metrics.source_work
+metrics.replication_repair
 metrics.scan_checkpoint
 ```
 
@@ -146,6 +147,55 @@ deduplicated.
 Use these counters to decide whether scan progress is limited by scanner pacing
 or by a downstream subsystem such as lifecycle transition, replication repair,
 or heal admission.
+
+## Reading Heal Operations
+
+The background heal status route is:
+
+```text
+POST /v3/background-heal/status
+```
+
+It reports scanner-driven bitrot state together with heal queue execution
+state. `healQueueLength` and `healActiveTasks` keep the legacy totals.
+`healOperations` adds the same totals split by request source and priority:
+
+| Field | Meaning |
+|---|---|
+| `queueLength` | Total queued heal requests. |
+| `activeTasks` | Total running heal tasks. |
+| `queuedBySource` | Queued requests split into `scanner`, `admin`, `autoHeal`, and `internal`. |
+| `activeBySource` | Running tasks split into `scanner`, `admin`, `autoHeal`, and `internal`. |
+| `queuedByPriority` | Queued requests split into `low`, `normal`, `high`, and `urgent`. |
+| `activeByPriority` | Running tasks split into `low`, `normal`, `high`, and `urgent`. |
+
+Use this route when `metrics.source_work` shows `heal` or `bitrot` queued or
+missed work. Scanner-originated object checks should appear under
+`scanner/low` for opportunistic work, while manual admin heal should appear
+under `admin/high`. If scanner work grows but admin work remains blocked, treat
+that as heal queue pressure rather than scanner pacing pressure.
+
+## Reading Replication Repair
+
+`metrics.replication_repair`, `metrics.current_cycle_replication_repair`, and
+`metrics.last_cycle_replication_repair` split scanner-discovered replication
+repair work by source and repair kind.
+
+Each entry has the same `checked`, `queued`, `executed`, `failed`, `skipped`,
+and `missed` counters used by `source_work`, plus:
+
+| Field | Meaning |
+|---|---|
+| `source` | `bucket_replication` for bucket replication repair, or `site_replication` for site replication boundary signals. |
+| `kind` | Bucket repair kinds are `object`, `delete_marker`, `version_purge`, and `existing_object`. Site replication boundary kinds are `passive_requeue` and `active_resync`. |
+
+For bucket replication, `queued` means scanner-discovered repair was admitted
+to the replication queue, `missed` means the queue or worker path could not
+accept it, and `skipped` means the object did not require a new repair task.
+
+The site replication kinds keep passive scanner discovery separate from active
+resync. Scanner status may report site replication boundary counters, but the
+scanner should not be treated as the active site replication resync controller.
 
 ## Reading Maintenance Control
 

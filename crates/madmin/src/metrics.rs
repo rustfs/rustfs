@@ -159,6 +159,26 @@ pub struct ScannerSourceWorkSnapshot {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerReplicationRepairSnapshot {
+    #[serde(rename = "source", default)]
+    pub source: String,
+    #[serde(rename = "kind", default)]
+    pub kind: String,
+    #[serde(rename = "checked", default)]
+    pub checked: u64,
+    #[serde(rename = "queued", default)]
+    pub queued: u64,
+    #[serde(rename = "executed", default)]
+    pub executed: u64,
+    #[serde(rename = "failed", default)]
+    pub failed: u64,
+    #[serde(rename = "skipped", default)]
+    pub skipped: u64,
+    #[serde(rename = "missed", default)]
+    pub missed: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScannerMaintenanceSourceSnapshot {
     #[serde(rename = "source", default)]
     pub source: String,
@@ -271,6 +291,17 @@ impl ScannerSourceWorkSnapshot {
     }
 }
 
+impl ScannerReplicationRepairSnapshot {
+    fn merge(&mut self, other: &Self) {
+        self.checked = self.checked.saturating_add(other.checked);
+        self.queued = self.queued.saturating_add(other.queued);
+        self.executed = self.executed.saturating_add(other.executed);
+        self.failed = self.failed.saturating_add(other.failed);
+        self.skipped = self.skipped.saturating_add(other.skipped);
+        self.missed = self.missed.saturating_add(other.missed);
+    }
+}
+
 fn merge_source_work_snapshots(target: &mut Vec<ScannerSourceWorkSnapshot>, source: &[ScannerSourceWorkSnapshot]) {
     for work in source {
         if let Some(existing) = target.iter_mut().find(|existing| existing.source == work.source) {
@@ -280,6 +311,23 @@ fn merge_source_work_snapshots(target: &mut Vec<ScannerSourceWorkSnapshot>, sour
         }
     }
     target.sort_by(|left, right| left.source.cmp(&right.source));
+}
+
+fn merge_replication_repair_snapshots(
+    target: &mut Vec<ScannerReplicationRepairSnapshot>,
+    source: &[ScannerReplicationRepairSnapshot],
+) {
+    for repair in source {
+        if let Some(existing) = target
+            .iter_mut()
+            .find(|existing| existing.source == repair.source && existing.kind == repair.kind)
+        {
+            existing.merge(repair);
+        } else {
+            target.push(repair.clone());
+        }
+    }
+    target.sort_by(|left, right| left.source.cmp(&right.source).then_with(|| left.kind.cmp(&right.kind)));
 }
 
 const SCANNER_PRIMARY_PRESSURE_NONE: &str = "none";
@@ -599,6 +647,12 @@ pub struct ScannerMetrics {
     pub current_cycle_source_work: Vec<ScannerSourceWorkSnapshot>,
     #[serde(rename = "last_cycle_source_work", default)]
     pub last_cycle_source_work: Vec<ScannerSourceWorkSnapshot>,
+    #[serde(rename = "replication_repair", default)]
+    pub replication_repair: Vec<ScannerReplicationRepairSnapshot>,
+    #[serde(rename = "current_cycle_replication_repair", default)]
+    pub current_cycle_replication_repair: Vec<ScannerReplicationRepairSnapshot>,
+    #[serde(rename = "last_cycle_replication_repair", default)]
+    pub last_cycle_replication_repair: Vec<ScannerReplicationRepairSnapshot>,
     #[serde(rename = "partial_cycles", default)]
     pub partial_cycles: u64,
 }
@@ -730,6 +784,9 @@ impl ScannerMetrics {
         merge_source_work_snapshots(&mut self.source_work, &other.source_work);
         merge_source_work_snapshots(&mut self.current_cycle_source_work, &other.current_cycle_source_work);
         merge_source_work_snapshots(&mut self.last_cycle_source_work, &other.last_cycle_source_work);
+        merge_replication_repair_snapshots(&mut self.replication_repair, &other.replication_repair);
+        merge_replication_repair_snapshots(&mut self.current_cycle_replication_repair, &other.current_cycle_replication_repair);
+        merge_replication_repair_snapshots(&mut self.last_cycle_replication_repair, &other.last_cycle_replication_repair);
 
         if self.ongoing_buckets < other.ongoing_buckets {
             self.ongoing_buckets = other.ongoing_buckets;
@@ -1555,6 +1612,68 @@ mod tests {
         assert_eq!(usage.current_checked, 7);
         assert_eq!(usage.current_queued, 1);
         assert_eq!(usage.partial_cycles, 2);
+    }
+
+    #[test]
+    fn scanner_metrics_merge_aggregates_replication_repair_status() {
+        let collected_at = Utc::now();
+        let mut scanner = ScannerMetrics {
+            collected_at,
+            replication_repair: vec![ScannerReplicationRepairSnapshot {
+                source: "bucket_replication".to_string(),
+                kind: "object".to_string(),
+                queued: 2,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        scanner.merge(&ScannerMetrics {
+            collected_at: collected_at + chrono::Duration::seconds(1),
+            replication_repair: vec![
+                ScannerReplicationRepairSnapshot {
+                    source: "bucket_replication".to_string(),
+                    kind: "object".to_string(),
+                    missed: 3,
+                    ..Default::default()
+                },
+                ScannerReplicationRepairSnapshot {
+                    source: "bucket_replication".to_string(),
+                    kind: "delete_marker".to_string(),
+                    skipped: 4,
+                    ..Default::default()
+                },
+                ScannerReplicationRepairSnapshot {
+                    source: "site_replication".to_string(),
+                    kind: "active_resync".to_string(),
+                    queued: 5,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+
+        let object = scanner
+            .replication_repair
+            .iter()
+            .find(|repair| repair.source == "bucket_replication" && repair.kind == "object")
+            .expect("bucket object repair snapshot should be merged");
+        assert_eq!(object.queued, 2);
+        assert_eq!(object.missed, 3);
+
+        let delete_marker = scanner
+            .replication_repair
+            .iter()
+            .find(|repair| repair.source == "bucket_replication" && repair.kind == "delete_marker")
+            .expect("bucket delete-marker repair snapshot should be merged");
+        assert_eq!(delete_marker.skipped, 4);
+
+        let site_resync = scanner
+            .replication_repair
+            .iter()
+            .find(|repair| repair.source == "site_replication" && repair.kind == "active_resync")
+            .expect("site active resync snapshot should remain separate");
+        assert_eq!(site_resync.queued, 5);
     }
 
     #[test]

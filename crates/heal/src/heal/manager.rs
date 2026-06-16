@@ -19,7 +19,7 @@ use crate::heal::{
 };
 use crate::{Error, Result};
 use metrics::{counter, gauge};
-use rustfs_common::heal_channel::{HealAdmissionDropReason, HealAdmissionResult};
+use rustfs_common::heal_channel::{HealAdmissionDropReason, HealAdmissionResult, HealRequestSource};
 use rustfs_ecstore::disk::DiskAPI;
 use rustfs_ecstore::disk::error::DiskError;
 use rustfs_ecstore::global::GLOBAL_LOCAL_DISK_MAP;
@@ -113,6 +113,61 @@ struct CompletedHealStatus {
 pub struct HealTaskReport {
     pub status: HealTaskStatus,
     pub result_items: Vec<HealResultItem>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealPriorityCounts {
+    pub low: u64,
+    pub normal: u64,
+    pub high: u64,
+    pub urgent: u64,
+}
+
+impl HealPriorityCounts {
+    fn increment(&mut self, priority: HealPriority) {
+        match priority {
+            HealPriority::Low => self.low += 1,
+            HealPriority::Normal => self.normal += 1,
+            HealPriority::High => self.high += 1,
+            HealPriority::Urgent => self.urgent += 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealSourceCounts {
+    pub scanner: u64,
+    pub admin: u64,
+    pub auto_heal: u64,
+    pub internal: u64,
+}
+
+impl HealSourceCounts {
+    fn increment(&mut self, source: HealRequestSource) {
+        match source {
+            HealRequestSource::Scanner => self.scanner += 1,
+            HealRequestSource::Admin => self.admin += 1,
+            HealRequestSource::AutoHeal => self.auto_heal += 1,
+            HealRequestSource::Internal => self.internal += 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealOperationsSnapshot {
+    pub queue_length: u64,
+    pub active_tasks: u64,
+    pub queued_by_priority: HealPriorityCounts,
+    pub active_by_priority: HealPriorityCounts,
+    pub queued_by_source: HealSourceCounts,
+    pub active_by_source: HealSourceCounts,
+}
+
+fn usize_to_u64_saturated(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 impl PriorityHealQueue {
@@ -210,6 +265,16 @@ impl PriorityHealQueue {
             *stats.entry(item.priority).or_insert(0) += 1;
         }
         stats
+    }
+
+    fn operation_counts(&self) -> (HealPriorityCounts, HealSourceCounts) {
+        let mut priority = HealPriorityCounts::default();
+        let mut source = HealSourceCounts::default();
+        for item in &self.heap {
+            priority.increment(item.request.priority);
+            source.increment(item.request.source);
+        }
+        (priority, source)
     }
 
     #[cfg(test)]
@@ -1095,6 +1160,36 @@ impl HealManager {
         queue.len()
     }
 
+    pub async fn operations_snapshot(&self) -> HealOperationsSnapshot {
+        let (queue_length, queued_by_priority, queued_by_source) = {
+            let queue = self.heal_queue.lock().await;
+            let (priority, source) = queue.operation_counts();
+            publish_heal_queue_length(&queue);
+            (usize_to_u64_saturated(queue.len()), priority, source)
+        };
+
+        let (active_tasks, active_by_priority, active_by_source) = {
+            let active_heals = self.active_heals.lock().await;
+            let mut priority = HealPriorityCounts::default();
+            let mut source = HealSourceCounts::default();
+            for task in active_heals.values() {
+                priority.increment(task.priority);
+                source.increment(task.source);
+            }
+            publish_active_heal_count(&active_heals);
+            (usize_to_u64_saturated(active_heals.len()), priority, source)
+        };
+
+        HealOperationsSnapshot {
+            queue_length,
+            active_tasks,
+            queued_by_priority,
+            active_by_priority,
+            queued_by_source,
+            active_by_source,
+        }
+    }
+
     /// Start scheduler
     async fn start_scheduler(&self) -> Result<()> {
         let config = self.config.clone();
@@ -1304,7 +1399,7 @@ impl HealManager {
                             }
 
                             // enqueue erasure set heal request for this disk
-                            let req = HealRequest::new(
+                            let mut req = HealRequest::new(
                                 HealType::ErasureSet {
                                     buckets: buckets.clone(),
                                     set_disk_id: set_disk_id.clone(),
@@ -1312,6 +1407,7 @@ impl HealManager {
                                 HealOptions::default(),
                                 HealPriority::Normal,
                             );
+                            req.source = HealRequestSource::AutoHeal;
                             let mut queue = heal_queue.lock().await;
                             if matches!(queue.push(req), QueuePushOutcome::Accepted) {
                                 publish_heal_queue_length(&queue);
@@ -1623,8 +1719,8 @@ fn can_schedule_request(request: &HealRequest, running_per_set: &HashMap<String,
 mod tests {
     use super::*;
     use crate::heal::storage::HealStorageAPI;
-    use crate::heal::task::{HealOptions, HealPriority, HealRequest, HealType};
-    use rustfs_common::heal_channel::HealOpts;
+    use crate::heal::task::{HealOptions, HealPriority, HealRequest, HealTask, HealType};
+    use rustfs_common::heal_channel::{HealOpts, HealRequestSource};
     use rustfs_ecstore::disk::{DiskStore, endpoint::Endpoint};
     use rustfs_madmin::heal_commands::HealResultItem;
     use rustfs_storage_api::BucketInfo;
@@ -2170,6 +2266,85 @@ mod tests {
                 .expect("queued request should have status"),
             HealTaskStatus::Pending
         );
+    }
+
+    #[tokio::test]
+    async fn test_operations_snapshot_counts_queue_by_source_and_priority() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        let mut scanner_request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket-a".to_string(),
+                object: "object-a".to_string(),
+                version_id: None,
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+        scanner_request.source = HealRequestSource::Scanner;
+
+        let mut admin_request = HealRequest::bucket("bucket-b".to_string());
+        admin_request.priority = HealPriority::High;
+        admin_request.source = HealRequestSource::Admin;
+
+        let mut auto_request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-c".to_string()],
+                set_disk_id: "0-0".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Normal,
+        );
+        auto_request.source = HealRequestSource::AutoHeal;
+
+        manager
+            .submit_heal_request(scanner_request)
+            .await
+            .expect("scanner request should be accepted");
+        manager
+            .submit_heal_request(admin_request)
+            .await
+            .expect("admin request should be accepted");
+        manager
+            .submit_heal_request(auto_request)
+            .await
+            .expect("auto request should be accepted");
+
+        let snapshot = manager.operations_snapshot().await;
+
+        assert_eq!(snapshot.queue_length, 3);
+        assert_eq!(snapshot.active_tasks, 0);
+        assert_eq!(snapshot.queued_by_priority.low, 1);
+        assert_eq!(snapshot.queued_by_priority.normal, 1);
+        assert_eq!(snapshot.queued_by_priority.high, 1);
+        assert_eq!(snapshot.queued_by_priority.urgent, 0);
+        assert_eq!(snapshot.queued_by_source.scanner, 1);
+        assert_eq!(snapshot.queued_by_source.admin, 1);
+        assert_eq!(snapshot.queued_by_source.auto_heal, 1);
+        assert_eq!(snapshot.queued_by_source.internal, 0);
+    }
+
+    #[tokio::test]
+    async fn test_operations_snapshot_counts_active_by_source_and_priority() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        let mut request = HealRequest::bucket("bucket-a".to_string());
+        request.priority = HealPriority::High;
+        request.source = HealRequestSource::Admin;
+        let task = Arc::new(HealTask::from_request(request, manager.storage.clone()));
+        let task_id = task.id.clone();
+
+        manager.active_heals.lock().await.insert(task_id, task);
+
+        let snapshot = manager.operations_snapshot().await;
+
+        assert_eq!(snapshot.queue_length, 0);
+        assert_eq!(snapshot.active_tasks, 1);
+        assert_eq!(snapshot.active_by_priority.high, 1);
+        assert_eq!(snapshot.active_by_source.admin, 1);
+        assert_eq!(snapshot.active_by_source.scanner, 0);
     }
 
     #[tokio::test]
