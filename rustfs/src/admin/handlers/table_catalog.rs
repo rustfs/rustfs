@@ -241,6 +241,8 @@ struct TableMetadataMaintenanceRequest {
     commit_snapshot_expiration: bool,
     #[serde(default)]
     compaction: Option<crate::table_catalog::TableCompactionPlanningConfig>,
+    #[serde(default, rename = "commit-compaction")]
+    commit_compaction: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2626,11 +2628,30 @@ where
             "snapshot expiration commit cannot be combined with metadata deletion"
         ));
     }
+    if request.delete && request.commit_compaction {
+        return Err(s3_error!(InvalidRequest, "compaction commit cannot be combined with metadata deletion"));
+    }
+    if request.commit_snapshot_expiration && request.commit_compaction {
+        return Err(s3_error!(
+            InvalidRequest,
+            "compaction commit cannot be combined with snapshot expiration commit"
+        ));
+    }
+    if request.commit_compaction && request.compaction.is_none() {
+        return Err(s3_error!(InvalidRequest, "commit-compaction requires a compaction request"));
+    }
 
     let snapshot_expiration_request = request.snapshot_expiration;
     let commit_snapshot_expiration = request.commit_snapshot_expiration;
     let compaction_request = request.compaction;
+    let commit_compaction = request.commit_compaction;
     let compaction = match compaction_request {
+        Some(config) if commit_compaction => Some(
+            store
+                .commit_table_compaction(bucket, &namespace.public_name(), table, config)
+                .await
+                .map_err(catalog_store_error)?,
+        ),
         Some(config) => Some(
             store
                 .plan_table_compaction(bucket, &namespace.public_name(), table, config)
@@ -2673,15 +2694,19 @@ where
             .snapshot_expiration
             .as_ref()
             .is_some_and(|snapshot_expiration| snapshot_expiration.committed_metadata_location.is_some());
+        let committed_compaction = report
+            .compaction
+            .as_ref()
+            .is_some_and(|compaction| compaction.committed_metadata_location.is_some());
         match store.put_table_metadata_maintenance_report(&report).await {
             Ok(()) => {}
-            Err(err) if committed_snapshot_expiration => {
+            Err(err) if committed_snapshot_expiration || committed_compaction => {
                 tracing::warn!(
                     error = %err,
                     warehouse = bucket,
                     namespace = namespace.public_name(),
                     table,
-                    "failed to persist table maintenance report after snapshot expiration commit"
+                    "failed to persist table maintenance report after catalog maintenance commit"
                 );
             }
             Err(err) => return Err(catalog_store_error(err)),
@@ -3895,6 +3920,7 @@ mod tests {
         assert!(request.snapshot_expiration.is_none());
         assert!(!request.commit_snapshot_expiration);
         assert!(request.compaction.is_none());
+        assert!(!request.commit_compaction);
     }
 
     #[test]
@@ -3910,6 +3936,7 @@ mod tests {
         assert!(request.snapshot_expiration.is_none());
         assert!(!request.commit_snapshot_expiration);
         assert!(request.compaction.is_none());
+        assert!(!request.commit_compaction);
     }
 
     #[test]
@@ -3920,6 +3947,7 @@ mod tests {
                 "min-snapshots-to-keep": 2,
                 "max-snapshot-age-ms": 3600000
             },
+            "commit-compaction": true,
             "compaction": {
                 "target-file-size-bytes": 536870912,
                 "small-file-threshold-bytes": 67108864,
@@ -3935,6 +3963,7 @@ mod tests {
         assert_eq!(snapshot_expiration.min_snapshots_to_keep, 2);
         assert_eq!(snapshot_expiration.max_snapshot_age_ms, 3_600_000);
         assert!(request.commit_snapshot_expiration);
+        assert!(request.commit_compaction);
         let compaction = request.compaction.expect("compaction config should be present");
         assert_eq!(compaction.target_file_size_bytes, 536_870_912);
         assert_eq!(compaction.small_file_threshold_bytes, 67_108_864);
@@ -4909,6 +4938,7 @@ mod tests {
                     min_input_files: 2,
                     max_rewrite_bytes_per_job: 1024 * 1024 * 1024,
                 }),
+                commit_compaction: false,
             },
         )
         .await
@@ -4955,6 +4985,7 @@ mod tests {
                 snapshot_expiration: None,
                 commit_snapshot_expiration: false,
                 compaction: None,
+                commit_compaction: false,
             },
         )
         .await
@@ -5046,6 +5077,7 @@ mod tests {
                 }),
                 commit_snapshot_expiration: true,
                 compaction: None,
+                commit_compaction: false,
             },
         )
         .await
@@ -5164,6 +5196,7 @@ mod tests {
                 }),
                 commit_snapshot_expiration: true,
                 compaction: None,
+                commit_compaction: false,
             },
         )
         .await;
@@ -5283,6 +5316,7 @@ mod tests {
                 }),
                 commit_snapshot_expiration: true,
                 compaction: None,
+                commit_compaction: false,
             },
         )
         .await;
