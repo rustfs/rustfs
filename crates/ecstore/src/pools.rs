@@ -44,7 +44,7 @@ use crate::store_api::{
 };
 use crate::{global::GLOBAL_LifecycleSys, sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
-use futures::future::BoxFuture;
+use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use http::HeaderMap;
 #[cfg(test)]
 use rmp_serde::Deserializer;
@@ -78,6 +78,8 @@ const EVENT_DECOMMISSION_BUCKET: &str = "decommission_bucket";
 const EVENT_DECOMMISSION_ENTRY: &str = "decommission_entry";
 const DECOMMISSION_PROGRESS_SAVE_INTERVAL: Duration = Duration::seconds(30);
 const DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD: usize = 1000;
+const DECOMMISSION_BUCKET_CONCURRENCY_ENV: &str = "RUSTFS_DECOMMISSION_BUCKET_CONCURRENCY";
+const DECOMMISSION_BUCKET_CONCURRENCY_DEFAULT_CAP: usize = 4;
 
 pub const POOL_META_NAME: &str = "pool.bin";
 pub const POOL_META_FORMAT: u16 = 1;
@@ -141,6 +143,35 @@ fn ensure_decommission_routines_scheduled(bound_count: usize, expected_count: us
     }
 
     Ok(())
+}
+
+fn default_decommission_bucket_concurrency(cpu_count: usize) -> usize {
+    cpu_count.clamp(1, DECOMMISSION_BUCKET_CONCURRENCY_DEFAULT_CAP)
+}
+
+fn decommission_bucket_concurrency_limit() -> usize {
+    let default_limit = default_decommission_bucket_concurrency(num_cpus::get());
+    rustfs_utils::get_env_usize(DECOMMISSION_BUCKET_CONCURRENCY_ENV, default_limit).max(1)
+}
+
+fn is_decommission_meta_bucket(bucket: &DecomBucketInfo) -> bool {
+    bucket.name == RUSTFS_META_BUCKET
+}
+
+fn split_decommission_buckets(buckets: Vec<DecomBucketInfo>) -> (Vec<DecomBucketInfo>, Vec<DecomBucketInfo>) {
+    let mut regular = Vec::with_capacity(buckets.len());
+    let mut meta = Vec::new();
+
+    for bucket in buckets {
+        if is_decommission_meta_bucket(&bucket) {
+            meta.push(bucket);
+        } else {
+            regular.push(bucket);
+        }
+    }
+
+    regular.shrink_to_fit();
+    (regular, meta)
 }
 
 fn ensure_decommission_not_rebalancing(rebalance_running: bool) -> Result<()> {
@@ -415,12 +446,72 @@ fn should_preserve_decommission_canceled_state(meta_canceled: bool, cancel_signa
     meta_canceled || cancel_signal
 }
 
+fn should_continue_decommission_queue(meta: &PoolMeta, idx: usize) -> bool {
+    meta.pools
+        .get(idx)
+        .and_then(|pool| pool.decommission.as_ref())
+        .is_some_and(|info| info.complete && !info.failed && !info.canceled)
+}
+
 fn decommission_cancel_signal_result(cancel_signal: bool) -> Result<()> {
     if cancel_signal {
         Err(StorageError::OperationCanceled)
     } else {
         Ok(())
     }
+}
+
+async fn run_decommission_buckets_bounded<F>(
+    rx: CancellationToken,
+    buckets: Vec<DecomBucketInfo>,
+    limit: usize,
+    mut start_bucket: F,
+) -> Result<()>
+where
+    F: FnMut(DecomBucketInfo, CancellationToken) -> BoxFuture<'static, Result<()>>,
+{
+    let mut pending = buckets.into_iter();
+    let mut active: FuturesUnordered<BoxFuture<'static, Result<()>>> = FuturesUnordered::new();
+    let mut first_err = None;
+    let limit = limit.max(1);
+
+    for _ in 0..limit {
+        let Some(bucket) = pending.next() else {
+            break;
+        };
+
+        active.push(start_bucket(bucket, rx.clone()));
+    }
+
+    while let Some(result) = active.next().await {
+        if let Err(err) = result {
+            rx.cancel();
+            if first_err.is_none() {
+                first_err = Some(err);
+            }
+            continue;
+        }
+
+        if first_err.is_some() || rx.is_cancelled() {
+            continue;
+        }
+
+        let Some(bucket) = pending.next() else {
+            continue;
+        };
+
+        active.push(start_bucket(bucket, rx.clone()));
+    }
+
+    if first_err.is_none() && rx.is_cancelled() && pending.len() > 0 {
+        return decommission_cancel_signal_result(true);
+    }
+
+    if let Some(err) = first_err {
+        return Err(err);
+    }
+
+    Ok(())
 }
 
 fn is_decommission_cancel_terminal(complete: bool, failed: bool, canceled: bool) -> bool {
@@ -452,6 +543,12 @@ fn ensure_decommission_terminal_operation_supported(single_pool: bool, operation
 fn validate_start_decommission_request(indices: &[usize], single_pool: bool) -> Result<()> {
     if indices.is_empty() {
         return Err(Error::other("failed to start decommission: no target pools were provided"));
+    }
+
+    if indices.len() > 1 {
+        return Err(Error::other(
+            "failed to start decommission: decommission supports one target pool at a time",
+        ));
     }
 
     ensure_decommission_terminal_operation_supported(single_pool, "start decommission")
@@ -1405,9 +1502,26 @@ impl ECStore {
 
         ensure_decommission_routines_scheduled(index_cancelers.len(), indices.len())?;
 
-        for (idx, canceler) in index_cancelers {
-            let store = store.clone();
-            tokio::spawn(async move {
+        tokio::spawn(async move {
+            let mut stop_queue = false;
+
+            for (idx, canceler) in index_cancelers {
+                if stop_queue || rx.is_cancelled() {
+                    canceler.cancel();
+                    if let Err(err) = store.decommission_cancel(idx).await {
+                        warn!(
+                            event = EVENT_DECOMMISSION_STATE,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_POOLS,
+                            pool_index = idx,
+                            state = "queued_cancel_failed",
+                            error = %err,
+                            "Failed to cancel queued decommission"
+                        );
+                    }
+                    continue;
+                }
+
                 if let Err(err) = store.do_decommission_in_routine(canceler, idx).await {
                     error!(
                         event = EVENT_DECOMMISSION_STATE,
@@ -1418,9 +1532,16 @@ impl ECStore {
                         error = %err,
                         "Decommission routine failed"
                     );
+                    stop_queue = true;
+                    continue;
                 }
-            });
-        }
+
+                stop_queue = {
+                    let pool_meta = store.pool_meta.read().await;
+                    !should_continue_decommission_queue(&pool_meta, idx)
+                };
+            }
+        });
 
         Ok(())
     }
@@ -2293,6 +2414,83 @@ impl ECStore {
         Ok(())
     }
 
+    async fn decommission_pending_bucket(
+        self: &Arc<Self>,
+        rx: CancellationToken,
+        idx: usize,
+        pool: Arc<Sets>,
+        bucket: DecomBucketInfo,
+    ) -> Result<()> {
+        let is_decommissioned = {
+            let pool_meta = self.pool_meta.read().await;
+            resolve_decommission_bucket_state(&pool_meta, idx, &bucket)?
+        };
+
+        if is_decommissioned {
+            warn!("decommission: already done, moving on {}", bucket.to_string());
+
+            {
+                let mut pool_meta = self.pool_meta.write().await;
+                if mark_decommission_bucket_done(&mut pool_meta, idx, &bucket)? {
+                    resolve_decommission_bucket_done_save_result(
+                        pool_meta.save(self.pools.clone()).await,
+                        idx,
+                        bucket.name.as_str(),
+                    )?;
+                    pool_meta.mark_decommission_progress_saved();
+                }
+            }
+            return Ok(());
+        }
+
+        warn!("decommission: currently on bucket {}", &bucket.name);
+
+        if let Err(err) = self.decommission_pool(rx.clone(), idx, pool, bucket.clone()).await {
+            error!("decommission: decommission_pool err {:?}", &err);
+            return Err(err);
+        } else {
+            warn!("decommission: decommission_pool done {}", &bucket.name);
+        }
+
+        if let Err(err) = decommission_cancel_signal_result(rx.is_cancelled()) {
+            warn!("decommission: cancellation observed after decommission_pool {}", &bucket.name);
+            return Err(err);
+        }
+
+        {
+            let mut pool_meta = self.pool_meta.write().await;
+            if mark_decommission_bucket_done(&mut pool_meta, idx, &bucket)? {
+                resolve_decommission_bucket_done_save_result(
+                    pool_meta.save(self.pools.clone()).await,
+                    idx,
+                    bucket.name.as_str(),
+                )?;
+                pool_meta.mark_decommission_progress_saved();
+            }
+
+            warn!("decommission: decommission_pool bucket_done {}", &bucket.name);
+        }
+
+        Ok(())
+    }
+
+    async fn decommission_buckets_concurrently(
+        self: &Arc<Self>,
+        rx: CancellationToken,
+        idx: usize,
+        pool: Arc<Sets>,
+        buckets: Vec<DecomBucketInfo>,
+        limit: usize,
+    ) -> Result<()> {
+        let store = Arc::clone(self);
+        run_decommission_buckets_bounded(rx, buckets, limit, move |bucket, rx| {
+            let store = Arc::clone(&store);
+            let pool = pool.clone();
+            Box::pin(async move { store.decommission_pending_bucket(rx, idx, pool, bucket).await })
+        })
+        .await
+    }
+
     #[tracing::instrument(skip(self, rx))]
     async fn decommission_in_background(self: &Arc<Self>, rx: CancellationToken, idx: usize) -> Result<()> {
         let pool = get_by_index(self.pools.as_slice(), idx, "load decommission background pool")?.clone();
@@ -2302,56 +2500,22 @@ impl ECStore {
             pool_meta.pending_buckets(idx)
         };
 
-        for bucket in pending.iter() {
-            let is_decommissioned = {
-                let pool_meta = self.pool_meta.read().await;
-                resolve_decommission_bucket_state(&pool_meta, idx, bucket)?
-            };
-
-            if is_decommissioned {
-                warn!("decommission: already done, moving on {}", bucket.to_string());
-
-                {
-                    let mut pool_meta = self.pool_meta.write().await;
-                    if mark_decommission_bucket_done(&mut pool_meta, idx, bucket)? {
-                        resolve_decommission_bucket_done_save_result(
-                            pool_meta.save(self.pools.clone()).await,
-                            idx,
-                            bucket.name.as_str(),
-                        )?;
-                        pool_meta.mark_decommission_progress_saved();
-                    }
-                }
-                continue;
+        let bucket_concurrency = decommission_bucket_concurrency_limit();
+        if bucket_concurrency <= 1 {
+            for bucket in pending {
+                self.decommission_pending_bucket(rx.clone(), idx, pool.clone(), bucket)
+                    .await?;
             }
+            return Ok(());
+        }
 
-            warn!("decommission: currently on bucket {}", &bucket.name);
+        let (regular_buckets, meta_buckets) = split_decommission_buckets(pending);
+        self.decommission_buckets_concurrently(rx.clone(), idx, pool.clone(), regular_buckets, bucket_concurrency)
+            .await?;
 
-            if let Err(err) = self.decommission_pool(rx.clone(), idx, pool.clone(), bucket.clone()).await {
-                error!("decommission: decommission_pool err {:?}", &err);
-                return Err(err);
-            } else {
-                warn!("decommission: decommission_pool done {}", &bucket.name);
-            }
-
-            if let Err(err) = decommission_cancel_signal_result(rx.is_cancelled()) {
-                warn!("decommission: cancellation observed after decommission_pool {}", &bucket.name);
-                return Err(err);
-            }
-
-            {
-                let mut pool_meta = self.pool_meta.write().await;
-                if mark_decommission_bucket_done(&mut pool_meta, idx, bucket)? {
-                    resolve_decommission_bucket_done_save_result(
-                        pool_meta.save(self.pools.clone()).await,
-                        idx,
-                        bucket.name.as_str(),
-                    )?;
-                    pool_meta.mark_decommission_progress_saved();
-                }
-
-                warn!("decommission: decommission_pool bucket_done {}", &bucket.name);
-            }
+        for bucket in meta_buckets {
+            self.decommission_pending_bucket(rx.clone(), idx, pool.clone(), bucket)
+                .await?;
         }
 
         Ok(())
@@ -3151,25 +3315,31 @@ mod pools_tests {
         DecommissionTerminalState, PoolDecommissionInfo, PoolMeta, PoolStatus, bind_decommission_cancelers,
         cancel_decommission_canceler, classify_decommission_terminal_state, count_decommission_item,
         decommission_cancel_signal_result, decommission_item_size, decommission_meta_bucket_options,
-        decommission_start_guard_state, dedup_indices, ensure_decommission_cancel_allowed,
-        ensure_decommission_listing_disks_available, ensure_decommission_not_rebalancing, ensure_decommission_start_allowed,
-        ensure_decommission_terminal_operation_supported, ensure_valid_decommission_pool_index, get_by_index,
-        has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_terminal,
-        load_decommission_entry_versions, mark_decommission_bucket_done, require_decommission_store,
-        resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
+        decommission_start_guard_state, dedup_indices, default_decommission_bucket_concurrency,
+        ensure_decommission_cancel_allowed, ensure_decommission_listing_disks_available, ensure_decommission_not_rebalancing,
+        ensure_decommission_start_allowed, ensure_decommission_terminal_operation_supported,
+        ensure_valid_decommission_pool_index, get_by_index, has_active_decommission_canceler, is_decommission_active,
+        is_decommission_cancel_terminal, load_decommission_entry_versions, mark_decommission_bucket_done,
+        require_decommission_store, resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
         resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
         resolve_decommission_entry_reload_result, resolve_decommission_listing_worker_result,
         resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,
         resolve_decommission_preflight_heal_result, resolve_decommission_spawn_failure_result,
         resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
-        resolve_decommission_update_after_result, should_cleanup_decommission_source_entry,
-        should_count_decommission_version_complete, should_preserve_decommission_canceled_state, take_decommission_canceler,
+        resolve_decommission_update_after_result, run_decommission_buckets_bounded, should_cleanup_decommission_source_entry,
+        should_continue_decommission_queue, should_count_decommission_version_complete,
+        should_preserve_decommission_canceled_state, split_decommission_buckets, take_decommission_canceler,
         track_decommission_current_object, validate_start_decommission_request, with_decommission_entry_context,
     };
     use crate::data_movement;
     use crate::error::Error;
     use rustfs_filemeta::MetaCacheEntry;
     use rustfs_rio::Index;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    use std::time::Duration as StdDuration;
     use time::{Duration, OffsetDateTime};
     use tokio_util::sync::CancellationToken;
 
@@ -3182,6 +3352,160 @@ mod pools_tests {
     fn test_dedup_indices_handles_empty_input() {
         let empty: Vec<usize> = Vec::new();
         assert!(dedup_indices(&empty).is_empty());
+    }
+
+    #[test]
+    fn test_default_decommission_bucket_concurrency_is_conservative() {
+        assert_eq!(default_decommission_bucket_concurrency(0), 1);
+        assert_eq!(default_decommission_bucket_concurrency(1), 1);
+        assert_eq!(default_decommission_bucket_concurrency(2), 2);
+        assert_eq!(default_decommission_bucket_concurrency(8), 4);
+    }
+
+    #[test]
+    fn test_split_decommission_buckets_keeps_meta_buckets_last() {
+        let (regular, meta) = split_decommission_buckets(vec![
+            DecomBucketInfo {
+                name: "bucket-a".to_string(),
+                ..Default::default()
+            },
+            DecomBucketInfo {
+                name: crate::disk::RUSTFS_META_BUCKET.to_string(),
+                prefix: crate::config::com::CONFIG_PREFIX.to_string(),
+            },
+            DecomBucketInfo {
+                name: "bucket-b".to_string(),
+                ..Default::default()
+            },
+            DecomBucketInfo {
+                name: crate::disk::RUSTFS_META_BUCKET.to_string(),
+                prefix: crate::disk::BUCKET_META_PREFIX.to_string(),
+            },
+        ]);
+
+        assert_eq!(
+            regular.iter().map(|bucket| bucket.name.as_str()).collect::<Vec<_>>(),
+            vec!["bucket-a", "bucket-b",]
+        );
+        assert_eq!(
+            meta.iter().map(|bucket| bucket.prefix.as_str()).collect::<Vec<_>>(),
+            vec![crate::config::com::CONFIG_PREFIX, crate::disk::BUCKET_META_PREFIX,]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_decommission_buckets_bounded_respects_limit() {
+        let rx = CancellationToken::new();
+        let running = Arc::new(AtomicUsize::new(0));
+        let max_running = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let buckets = (0..8)
+            .map(|idx| DecomBucketInfo {
+                name: format!("bucket-{idx}"),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        run_decommission_buckets_bounded(rx, buckets, 2, {
+            let running = Arc::clone(&running);
+            let max_running = Arc::clone(&max_running);
+            let started = Arc::clone(&started);
+            move |_bucket, _rx| {
+                let running = Arc::clone(&running);
+                let max_running = Arc::clone(&max_running);
+                let started = Arc::clone(&started);
+                Box::pin(async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    let current = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_running.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(StdDuration::from_millis(10)).await;
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+        })
+        .await
+        .expect("bounded bucket scheduler should complete");
+
+        assert_eq!(started.load(Ordering::SeqCst), 8);
+        assert_eq!(max_running.load(Ordering::SeqCst), 2);
+        assert_eq!(running.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_run_decommission_buckets_bounded_cancels_and_stops_launching_after_failure() {
+        let rx = CancellationToken::new();
+        let started = Arc::new(AtomicUsize::new(0));
+        let observed_cancel = Arc::new(AtomicBool::new(false));
+        let buckets = (0..5)
+            .map(|idx| DecomBucketInfo {
+                name: format!("bucket-{idx}"),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        let err = tokio::time::timeout(
+            StdDuration::from_secs(2),
+            run_decommission_buckets_bounded(rx.clone(), buckets, 2, {
+                let started = Arc::clone(&started);
+                let observed_cancel = Arc::clone(&observed_cancel);
+                move |bucket, rx| {
+                    let started = Arc::clone(&started);
+                    let observed_cancel = Arc::clone(&observed_cancel);
+                    Box::pin(async move {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        if bucket.name == "bucket-0" {
+                            while started.load(Ordering::SeqCst) < 2 {
+                                tokio::task::yield_now().await;
+                            }
+                            return Err(Error::SlowDown);
+                        }
+
+                        rx.cancelled().await;
+                        observed_cancel.store(true, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }
+            }),
+        )
+        .await
+        .expect("bucket scheduler should not hang after a bucket failure")
+        .expect_err("first bucket failure should be returned");
+
+        assert!(matches!(err, Error::SlowDown));
+        assert!(rx.is_cancelled());
+        assert!(observed_cancel.load(Ordering::SeqCst));
+        assert_eq!(started.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_run_decommission_buckets_bounded_external_cancel_stops_pending_buckets() {
+        let rx = CancellationToken::new();
+        let started = Arc::new(AtomicUsize::new(0));
+        let buckets = (0..4)
+            .map(|idx| DecomBucketInfo {
+                name: format!("bucket-{idx}"),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        let err = run_decommission_buckets_bounded(rx.clone(), buckets, 1, {
+            let started = Arc::clone(&started);
+            move |_bucket, rx| {
+                let started = Arc::clone(&started);
+                Box::pin(async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    rx.cancel();
+                    Ok(())
+                })
+            }
+        })
+        .await
+        .expect_err("external cancellation with pending buckets should stop the scheduler");
+
+        assert!(matches!(err, Error::OperationCanceled));
+        assert!(rx.is_cancelled());
+        assert_eq!(started.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -3748,6 +4072,38 @@ mod pools_tests {
     }
 
     #[tokio::test]
+    async fn test_pool_meta_update_after_rejects_out_of_range_index() {
+        let mut meta = PoolMeta::default();
+        let err = meta
+            .update_after(1, Vec::new(), Duration::seconds(1))
+            .await
+            .expect_err("out-of-range index should fail");
+        assert!(err.to_string().contains("invalid decommission pool index 1 for 0 pools"));
+    }
+
+    #[tokio::test]
+    async fn test_pool_meta_update_after_rejects_when_decommission_missing() {
+        let mut meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: None,
+            }],
+            ..Default::default()
+        };
+
+        let err = meta
+            .update_after(0, Vec::new(), Duration::seconds(1))
+            .await
+            .expect_err("pool without decommission should fail");
+        assert!(
+            err.to_string()
+                .contains("failed to update decommission metadata timestamp: decommission metadata not initialized")
+        );
+    }
+
+    #[tokio::test]
     async fn test_pool_meta_update_after_skips_before_time_and_item_thresholds() {
         let mut meta = PoolMeta {
             pools: vec![PoolStatus {
@@ -3820,38 +4176,6 @@ mod pools_tests {
         assert!(saved);
         let info = meta.pools[0].decommission.as_ref().expect("decommission info should exist");
         assert_eq!(info.items_since_last_progress_save(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_pool_meta_update_after_rejects_out_of_range_index() {
-        let mut meta = PoolMeta::default();
-        let err = meta
-            .update_after(1, Vec::new(), Duration::seconds(1))
-            .await
-            .expect_err("out-of-range index should fail");
-        assert!(err.to_string().contains("invalid decommission pool index 1 for 0 pools"));
-    }
-
-    #[tokio::test]
-    async fn test_pool_meta_update_after_rejects_when_decommission_missing() {
-        let mut meta = PoolMeta {
-            pools: vec![PoolStatus {
-                id: 0,
-                cmd_line: "pool-0".to_string(),
-                last_update: OffsetDateTime::UNIX_EPOCH,
-                decommission: None,
-            }],
-            ..Default::default()
-        };
-
-        let err = meta
-            .update_after(0, Vec::new(), Duration::seconds(1))
-            .await
-            .expect_err("pool without decommission should fail");
-        assert!(
-            err.to_string()
-                .contains("failed to update decommission metadata timestamp: decommission metadata not initialized")
-        );
     }
 
     #[test]
@@ -3994,6 +4318,61 @@ mod pools_tests {
     }
 
     #[test]
+    fn test_should_continue_decommission_queue_requires_clean_completion() {
+        let meta = PoolMeta {
+            pools: vec![
+                PoolStatus {
+                    id: 0,
+                    cmd_line: "pool-0".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: Some(PoolDecommissionInfo {
+                        complete: true,
+                        ..Default::default()
+                    }),
+                },
+                PoolStatus {
+                    id: 1,
+                    cmd_line: "pool-1".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: Some(PoolDecommissionInfo::default()),
+                },
+                PoolStatus {
+                    id: 2,
+                    cmd_line: "pool-2".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: Some(PoolDecommissionInfo {
+                        failed: true,
+                        ..Default::default()
+                    }),
+                },
+                PoolStatus {
+                    id: 3,
+                    cmd_line: "pool-3".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: Some(PoolDecommissionInfo {
+                        canceled: true,
+                        ..Default::default()
+                    }),
+                },
+                PoolStatus {
+                    id: 4,
+                    cmd_line: "pool-4".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(should_continue_decommission_queue(&meta, 0));
+        assert!(!should_continue_decommission_queue(&meta, 1));
+        assert!(!should_continue_decommission_queue(&meta, 2));
+        assert!(!should_continue_decommission_queue(&meta, 3));
+        assert!(!should_continue_decommission_queue(&meta, 4));
+        assert!(!should_continue_decommission_queue(&meta, 5));
+    }
+
+    #[test]
     fn test_decommission_cancel_signal_result_returns_err_when_canceled() {
         let err = decommission_cancel_signal_result(true).expect_err("canceled signal should return operation-canceled");
         assert!(matches!(err, Error::OperationCanceled));
@@ -4086,8 +4465,18 @@ mod pools_tests {
     }
 
     #[test]
-    fn test_contextualized_decommission_start_request_allows_non_empty_multi_pool() {
-        assert!(validate_start_decommission_request(&[0, 1], false).is_ok());
+    fn test_contextualized_decommission_start_request_rejects_multiple_target_pools() {
+        let err = validate_start_decommission_request(&[0, 1], false)
+            .expect_err("multiple target pools should be rejected for single active draining");
+        assert!(
+            err.to_string()
+                .contains("failed to start decommission: decommission supports one target pool at a time")
+        );
+    }
+
+    #[test]
+    fn test_contextualized_decommission_start_request_allows_one_target_pool() {
+        assert!(validate_start_decommission_request(&[0], false).is_ok());
     }
 
     #[test]
