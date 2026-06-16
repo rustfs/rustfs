@@ -16,8 +16,13 @@ use crate::server::{MINIO_ADMIN_PREFIX, has_path_prefix};
 use rustfs_crypto::{decrypt_data, decrypt_stream_io, encrypt_stream_io};
 use s3s::{Body, S3Result, s3_error};
 
+/// Returns `true` if `s` contains any whitespace character.
+///
+/// Used to reject identifiers (access keys, user/group/policy names) that
+/// contain spaces. Detects whitespace anywhere in the string — leading,
+/// trailing, or internal — so values like `"my key"` are correctly rejected.
 pub(crate) fn has_space_be(s: &str) -> bool {
-    s.trim().len() != s.len()
+    s.chars().any(char::is_whitespace)
 }
 
 pub(crate) fn is_compat_admin_request(path: &str) -> bool {
@@ -59,6 +64,21 @@ mod tests {
     use super::*;
     use rustfs_crypto::encrypt_data;
     use s3s::Body;
+
+    #[test]
+    fn has_space_be_detects_any_whitespace() {
+        // Internal space — the original bug: access keys like "my key" slipped
+        // past validation because only leading/trailing space was detected.
+        assert!(has_space_be("my key"));
+        assert!(has_space_be("ab\tcd"));
+        // Leading / trailing whitespace (already caught before the fix).
+        assert!(has_space_be(" abcd"));
+        assert!(has_space_be("abcd "));
+        // Clean identifiers must pass.
+        assert!(!has_space_be("abcd"));
+        assert!(!has_space_be("my-key_01"));
+        assert!(!has_space_be(""));
+    }
 
     #[test]
     fn detects_compat_admin_paths_only_for_external_prefix() {

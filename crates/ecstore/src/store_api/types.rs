@@ -1050,6 +1050,7 @@ pub struct WalkOptions {
     pub ask_disks: String,                    // dictates how many disks are being listed
     pub versions_sort: WalkVersionsSortOrder, // sort order for versions of the same object; default: Ascending order in ModTime
     pub limit: usize,                         // maximum number of items, 0 means no limit
+    pub include_free_versions: bool,          // include persisted tier free-version cleanup records
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]

@@ -160,6 +160,16 @@ fn is_decommission_active(complete: bool, failed: bool, canceled: bool) -> bool 
     !complete && !failed && !canceled
 }
 
+fn validate_decommission_terminal_state(complete: bool, failed: bool, canceled: bool) -> Result<()> {
+    let terminal_count = [complete, failed, canceled].into_iter().filter(|terminal| *terminal).count();
+    if terminal_count > 1 {
+        return Err(Error::other(format!(
+            "pool metadata load failed: invalid decommission terminal state complete={complete} failed={failed} canceled={canceled}"
+        )));
+    }
+    Ok(())
+}
+
 fn invalid_decommission_pool_index_error(pool_count: usize, idx: usize) -> Error {
     Error::other(format!("invalid decommission pool index {idx} for {pool_count} pools"))
 }
@@ -532,30 +542,37 @@ struct PersistedPoolDecommissionInfo {
     pub bytes_failed: usize,
 }
 
-impl From<PersistedPoolMeta> for PoolMeta {
-    fn from(value: PersistedPoolMeta) -> Self {
-        Self {
+impl TryFrom<PersistedPoolMeta> for PoolMeta {
+    type Error = Error;
+
+    fn try_from(value: PersistedPoolMeta) -> Result<Self> {
+        Ok(Self {
             version: value.version,
-            pools: value.pools.into_iter().map(Into::into).collect(),
+            pools: value.pools.into_iter().map(TryInto::try_into).collect::<Result<Vec<_>>>()?,
             dont_save: false,
-        }
+        })
     }
 }
 
-impl From<PersistedPoolStatus> for PoolStatus {
-    fn from(value: PersistedPoolStatus) -> Self {
-        Self {
+impl TryFrom<PersistedPoolStatus> for PoolStatus {
+    type Error = Error;
+
+    fn try_from(value: PersistedPoolStatus) -> Result<Self> {
+        Ok(Self {
             id: value.id,
             cmd_line: value.cmd_line,
             last_update: value.last_update,
-            decommission: value.decommission.map(Into::into),
-        }
+            decommission: value.decommission.map(TryInto::try_into).transpose()?,
+        })
     }
 }
 
-impl From<PersistedPoolDecommissionInfo> for PoolDecommissionInfo {
-    fn from(value: PersistedPoolDecommissionInfo) -> Self {
-        Self {
+impl TryFrom<PersistedPoolDecommissionInfo> for PoolDecommissionInfo {
+    type Error = Error;
+
+    fn try_from(value: PersistedPoolDecommissionInfo) -> Result<Self> {
+        validate_decommission_terminal_state(value.complete, value.failed, value.canceled)?;
+        Ok(Self {
             start_time: value.start_time,
             start_size: value.start_size,
             total_size: value.total_size,
@@ -572,7 +589,7 @@ impl From<PersistedPoolDecommissionInfo> for PoolDecommissionInfo {
             items_decommission_failed: value.items_decommission_failed,
             bytes_done: value.bytes_done,
             bytes_failed: value.bytes_failed,
-        }
+        })
     }
 }
 
@@ -622,7 +639,7 @@ impl From<&PoolDecommissionInfo> for PersistedPoolDecommissionInfo {
 impl PoolMeta {
     fn decode_pool_meta_payload(payload: &[u8]) -> Result<Self> {
         match rmp_serde::from_slice::<PersistedPoolMeta>(payload) {
-            Ok(meta) => Ok(meta.into()),
+            Ok(meta) => meta.try_into(),
             Err(persisted_err) => {
                 let mut legacy: PoolMeta = rmp_serde::from_slice(payload).map_err(|legacy_err| {
                     Error::other(format!(
@@ -631,6 +648,11 @@ impl PoolMeta {
                 })?;
                 // Runtime-only flag must not be restored from on-disk payload.
                 legacy.dont_save = false;
+                for pool in &legacy.pools {
+                    if let Some(decommission) = &pool.decommission {
+                        validate_decommission_terminal_state(decommission.complete, decommission.failed, decommission.canceled)?;
+                    }
+                }
                 Ok(legacy)
             }
         }
@@ -2706,7 +2728,8 @@ mod tests {
         let mut deserializer = Deserializer::new(Cursor::new(&buf));
         let restored: PoolMeta = PersistedPoolMeta::deserialize(&mut deserializer)
             .expect("pool meta should deserialize")
-            .into();
+            .try_into()
+            .expect("pool meta should validate");
 
         let restored_decommission = restored.pools[0]
             .decommission
@@ -2781,6 +2804,63 @@ mod tests {
         assert!(decommission.bucket.is_empty());
         assert!(decommission.prefix.is_empty());
         assert!(decommission.object.is_empty());
+    }
+
+    #[test]
+    fn pool_meta_decode_rejects_invalid_decommission_terminal_state() {
+        let start_time = OffsetDateTime::now_utc();
+        let persisted_meta = PersistedPoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![PersistedPoolStatus {
+                id: 1,
+                cmd_line: "/data/pool1/disk{1...4}".to_string(),
+                last_update: start_time,
+                decommission: Some(PersistedPoolDecommissionInfo {
+                    start_time: Some(start_time),
+                    complete: true,
+                    failed: true,
+                    canceled: false,
+                    ..Default::default()
+                }),
+            }],
+        };
+
+        let mut payload = Vec::new();
+        persisted_meta
+            .serialize(&mut Serializer::new(&mut payload))
+            .expect("persisted payload should serialize");
+
+        let err = PoolMeta::decode_pool_meta_payload(&payload).expect_err("invalid terminal state should fail decode");
+        assert!(err.to_string().contains("invalid decommission terminal state"));
+    }
+
+    #[test]
+    fn pool_meta_decode_rejects_invalid_legacy_decommission_terminal_state() {
+        let start_time = OffsetDateTime::now_utc();
+        let legacy_meta = PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![PoolStatus {
+                id: 1,
+                cmd_line: "/legacy/pool".to_string(),
+                last_update: start_time,
+                decommission: Some(PoolDecommissionInfo {
+                    start_time: Some(start_time),
+                    complete: true,
+                    failed: false,
+                    canceled: true,
+                    ..Default::default()
+                }),
+            }],
+            dont_save: true,
+        };
+
+        let mut payload = Vec::new();
+        legacy_meta
+            .serialize(&mut Serializer::new(&mut payload))
+            .expect("legacy payload should serialize");
+
+        let err = PoolMeta::decode_pool_meta_payload(&payload).expect_err("invalid legacy terminal state should fail decode");
+        assert!(err.to_string().contains("invalid decommission terminal state"));
     }
 }
 

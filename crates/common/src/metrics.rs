@@ -309,6 +309,62 @@ impl ScannerWorkSource {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScannerReplicationRepairKind {
+    BucketObject,
+    BucketDeleteMarker,
+    BucketVersionPurge,
+    BucketExistingObject,
+    SitePassiveRequeue,
+    SiteActiveResync,
+}
+
+impl ScannerReplicationRepairKind {
+    const ALL: [Self; 6] = [
+        Self::BucketObject,
+        Self::BucketDeleteMarker,
+        Self::BucketVersionPurge,
+        Self::BucketExistingObject,
+        Self::SitePassiveRequeue,
+        Self::SiteActiveResync,
+    ];
+
+    pub fn source(self) -> ScannerWorkSource {
+        match self {
+            Self::BucketObject | Self::BucketDeleteMarker | Self::BucketVersionPurge | Self::BucketExistingObject => {
+                ScannerWorkSource::BucketReplication
+            }
+            Self::SitePassiveRequeue | Self::SiteActiveResync => ScannerWorkSource::SiteReplication,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BucketObject => "object",
+            Self::BucketDeleteMarker => "delete_marker",
+            Self::BucketVersionPurge => "version_purge",
+            Self::BucketExistingObject => "existing_object",
+            Self::SitePassiveRequeue => "passive_requeue",
+            Self::SiteActiveResync => "active_resync",
+        }
+    }
+
+    fn all() -> &'static [Self] {
+        &Self::ALL
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::BucketObject => 0,
+            Self::BucketDeleteMarker => 1,
+            Self::BucketVersionPurge => 2,
+            Self::BucketExistingObject => 3,
+            Self::SitePassiveRequeue => 4,
+            Self::SiteActiveResync => 5,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct ScannerSourceWorkCounters {
     checked: AtomicU64,
@@ -358,6 +414,17 @@ impl ScannerSourceWorkUpdate {
             queued: 0,
             executed: count,
             failed: 0,
+            skipped: 0,
+            missed: 0,
+        }
+    }
+
+    pub const fn failed(count: u64) -> Self {
+        Self {
+            checked: 0,
+            queued: 0,
+            executed: 0,
+            failed: count,
             skipped: 0,
             missed: 0,
         }
@@ -435,6 +502,19 @@ impl ScannerSourceWorkValues {
     fn snapshot(self, source: ScannerWorkSource) -> ScannerSourceWorkSnapshot {
         ScannerSourceWorkSnapshot {
             source: source.as_str().to_string(),
+            checked: self.checked,
+            queued: self.queued,
+            executed: self.executed,
+            failed: self.failed,
+            skipped: self.skipped,
+            missed: self.missed,
+        }
+    }
+
+    fn replication_repair_snapshot(self, kind: ScannerReplicationRepairKind) -> ScannerReplicationRepairSnapshot {
+        ScannerReplicationRepairSnapshot {
+            source: kind.source().as_str().to_string(),
+            kind: kind.as_str().to_string(),
             checked: self.checked,
             queued: self.queued,
             executed: self.executed,
@@ -638,6 +718,13 @@ pub struct Metrics {
     scanner_ilm_actions: AtomicU64,
     scanner_lifecycle_expiry_actions: AtomicU64,
     scanner_lifecycle_transition_actions: AtomicU64,
+    scanner_expiry_queue_capacity: AtomicU64,
+    scanner_expiry_queued: AtomicU64,
+    scanner_expiry_active: AtomicU64,
+    scanner_expiry_workers: AtomicU64,
+    scanner_expiry_queue_missed: AtomicU64,
+    scanner_expiry_queued_total: AtomicU64,
+    scanner_expiry_missed_total: AtomicU64,
     scanner_transition_queue_capacity: AtomicU64,
     scanner_transition_queued: AtomicU64,
     scanner_transition_active: AtomicU64,
@@ -645,6 +732,7 @@ pub struct Metrics {
     scanner_transition_queue_full: AtomicU64,
     scanner_transition_queue_send_timeout: AtomicU64,
     scanner_transition_compensation_scheduled: AtomicU64,
+    scanner_transition_compensation_pending: AtomicU64,
     scanner_transition_compensation_running: AtomicU64,
     scanner_transition_queued_total: AtomicU64,
     scanner_transition_missed_total: AtomicU64,
@@ -668,6 +756,9 @@ pub struct Metrics {
     scanner_source_work: Vec<ScannerSourceWorkCounters>,
     current_scan_cycle_source_work_start: Vec<ScannerSourceWorkCounters>,
     last_scan_cycle_source_work: Vec<ScannerSourceWorkCounters>,
+    scanner_replication_repair_work: Vec<ScannerSourceWorkCounters>,
+    current_scan_cycle_replication_repair_work_start: Vec<ScannerSourceWorkCounters>,
+    last_scan_cycle_replication_repair_work: Vec<ScannerSourceWorkCounters>,
     partial_scan_cycles: AtomicU64,
 }
 
@@ -763,6 +854,47 @@ pub struct ScannerSourceWorkSnapshot {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerReplicationRepairSnapshot {
+    pub source: String,
+    pub kind: String,
+    pub checked: u64,
+    pub queued: u64,
+    pub executed: u64,
+    pub failed: u64,
+    pub skipped: u64,
+    #[serde(default)]
+    pub missed: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerMaintenanceSourceSnapshot {
+    pub source: String,
+    pub state: String,
+    pub reason: String,
+    pub backlog: u64,
+    pub current_checked: u64,
+    pub current_queued: u64,
+    pub current_missed: u64,
+    pub lifetime_missed: u64,
+    pub partial_cycles: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerMaintenanceControlSnapshot {
+    pub primary_control: String,
+    pub sources: Vec<ScannerMaintenanceSourceSnapshot>,
+}
+
+impl Default for ScannerMaintenanceControlSnapshot {
+    fn default() -> Self {
+        Self {
+            primary_control: SCANNER_MAINTENANCE_CONTROL_NONE.to_string(),
+            sources: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScannerSourceCycleSnapshot {
     pub source: String,
     pub cycles: u64,
@@ -796,6 +928,26 @@ impl Default for ScannerPacingPressureSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScannerLifecycleExpiryStateUpdate {
+    pub queue_capacity: u64,
+    pub queued: u64,
+    pub active: u64,
+    pub workers: u64,
+    pub queue_missed: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerLifecycleExpirySnapshot {
+    pub current_queue_capacity: u64,
+    pub current_queued: u64,
+    pub current_active: u64,
+    pub current_workers: u64,
+    pub queue_missed: u64,
+    pub scanner_queued: u64,
+    pub scanner_missed: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScannerLifecycleTransitionStateUpdate {
     pub queue_capacity: u64,
     pub queued: u64,
@@ -804,6 +956,7 @@ pub struct ScannerLifecycleTransitionStateUpdate {
     pub queue_full: u64,
     pub queue_send_timeout: u64,
     pub compensation_scheduled: u64,
+    pub compensation_pending: u64,
     pub compensation_running: u64,
 }
 
@@ -816,6 +969,7 @@ pub struct ScannerLifecycleTransitionSnapshot {
     pub queue_full: u64,
     pub queue_send_timeout: u64,
     pub compensation_scheduled: u64,
+    pub compensation_pending: u64,
     pub compensation_running: u64,
     pub scanner_queued: u64,
     pub scanner_missed: u64,
@@ -938,7 +1092,11 @@ pub struct ScannerMetricsReport {
     #[serde(default)]
     pub pacing_pressure: ScannerPacingPressureSnapshot,
     #[serde(default)]
+    pub lifecycle_expiry: ScannerLifecycleExpirySnapshot,
+    #[serde(default)]
     pub lifecycle_transition: ScannerLifecycleTransitionSnapshot,
+    #[serde(default)]
+    pub maintenance_control: ScannerMaintenanceControlSnapshot,
     #[serde(default)]
     pub throttle_idle_mode_enabled: bool,
     #[serde(default)]
@@ -976,6 +1134,12 @@ pub struct ScannerMetricsReport {
     pub current_cycle_source_work: Vec<ScannerSourceWorkSnapshot>,
     #[serde(default)]
     pub last_cycle_source_work: Vec<ScannerSourceWorkSnapshot>,
+    #[serde(default)]
+    pub replication_repair: Vec<ScannerReplicationRepairSnapshot>,
+    #[serde(default)]
+    pub current_cycle_replication_repair: Vec<ScannerReplicationRepairSnapshot>,
+    #[serde(default)]
+    pub last_cycle_replication_repair: Vec<ScannerReplicationRepairSnapshot>,
     #[serde(default)]
     pub partial_cycles: u64,
 }
@@ -1087,6 +1251,205 @@ fn scanner_pacing_pressure(metrics: &ScannerMetricsReport) -> ScannerPacingPress
         last_cycle_throttle_sleep_ratio,
         last_cycle_yield_ratio,
         last_cycle_total_pause_ratio,
+    }
+}
+
+const SCANNER_MAINTENANCE_CONTROL_NONE: &str = "none";
+const SCANNER_MAINTENANCE_CONTROL_BLOCKED_SOURCE: &str = "blocked_source";
+const SCANNER_MAINTENANCE_CONTROL_DEFERRED_SOURCE: &str = "deferred_source";
+const SCANNER_MAINTENANCE_CONTROL_ACTIVE_SOURCE: &str = "active_source";
+const SCANNER_MAINTENANCE_CONTROL_PACING_PRESSURE: &str = "pacing_pressure";
+
+const SCANNER_MAINTENANCE_STATE_IDLE: &str = "idle";
+const SCANNER_MAINTENANCE_STATE_ACTIVE: &str = "active";
+const SCANNER_MAINTENANCE_STATE_DEFERRED: &str = "deferred";
+const SCANNER_MAINTENANCE_STATE_BLOCKED: &str = "blocked";
+
+const SCANNER_MAINTENANCE_REASON_IDLE: &str = "idle";
+const SCANNER_MAINTENANCE_REASON_ACTIVE_WORK: &str = "active_work";
+const SCANNER_MAINTENANCE_REASON_QUEUED_WORK: &str = "queued_work";
+const SCANNER_MAINTENANCE_REASON_PARTIAL_CYCLE: &str = "partial_cycle";
+const SCANNER_MAINTENANCE_REASON_MISSED_WORK: &str = "missed_work";
+const SCANNER_MAINTENANCE_REASON_EXPIRY_QUEUE_BACKLOG: &str = "expiry_queue_backlog";
+const SCANNER_MAINTENANCE_REASON_TRANSITION_FAILED: &str = "transition_failed";
+const SCANNER_MAINTENANCE_REASON_TRANSITION_COMPENSATION_BACKLOG: &str = "transition_compensation_backlog";
+const SCANNER_MAINTENANCE_REASON_TRANSITION_QUEUE_BACKLOG: &str = "transition_queue_backlog";
+const SCANNER_MAINTENANCE_REASON_TRANSITION_QUEUE_FULL: &str = "transition_queue_full";
+
+fn scanner_source_work_snapshot(work: &[ScannerSourceWorkSnapshot], source: ScannerWorkSource) -> ScannerSourceWorkSnapshot {
+    work.iter()
+        .find(|snapshot| snapshot.source == source.as_str())
+        .cloned()
+        .unwrap_or_else(|| ScannerSourceWorkSnapshot {
+            source: source.as_str().to_string(),
+            ..Default::default()
+        })
+}
+
+fn scanner_source_partial_cycles(metrics: &ScannerMetricsReport, source: ScannerWorkSource) -> u64 {
+    metrics
+        .partial_cycles_by_source
+        .iter()
+        .find(|snapshot| snapshot.source == source.as_str())
+        .map(|snapshot| snapshot.cycles)
+        .unwrap_or_default()
+}
+
+fn scanner_source_has_current_work(work: &ScannerSourceWorkSnapshot) -> bool {
+    work.checked > 0 || work.queued > 0 || work.executed > 0 || work.failed > 0 || work.skipped > 0 || work.missed > 0
+}
+
+fn scanner_lifecycle_transition_backlog(metrics: &ScannerMetricsReport) -> u64 {
+    metrics
+        .lifecycle_transition
+        .current_queued
+        .saturating_add(metrics.lifecycle_transition.current_active)
+        .saturating_add(metrics.lifecycle_transition.compensation_pending)
+        .saturating_add(metrics.lifecycle_transition.compensation_running)
+}
+
+fn scanner_lifecycle_expiry_backlog(metrics: &ScannerMetricsReport) -> u64 {
+    metrics
+        .lifecycle_expiry
+        .current_queued
+        .saturating_add(metrics.lifecycle_expiry.current_active)
+}
+
+fn scanner_source_maintenance_state(
+    source: ScannerWorkSource,
+    current: &ScannerSourceWorkSnapshot,
+    metrics: &ScannerMetricsReport,
+) -> (&'static str, &'static str, u64) {
+    if current.missed > 0 {
+        return (SCANNER_MAINTENANCE_STATE_BLOCKED, SCANNER_MAINTENANCE_REASON_MISSED_WORK, current.missed);
+    }
+
+    if source == ScannerWorkSource::Lifecycle && current.failed > 0 {
+        return (
+            SCANNER_MAINTENANCE_STATE_BLOCKED,
+            SCANNER_MAINTENANCE_REASON_TRANSITION_FAILED,
+            current.failed,
+        );
+    }
+
+    if source == ScannerWorkSource::Lifecycle {
+        let transition_backlog = scanner_lifecycle_transition_backlog(metrics);
+        if metrics.lifecycle_transition.current_queue_capacity > 0
+            && metrics.lifecycle_transition.current_queued >= metrics.lifecycle_transition.current_queue_capacity
+        {
+            return (
+                SCANNER_MAINTENANCE_STATE_BLOCKED,
+                SCANNER_MAINTENANCE_REASON_TRANSITION_QUEUE_FULL,
+                transition_backlog,
+            );
+        }
+    }
+
+    if metrics.last_cycle_partial_source == source.as_str() && metrics.pacing_pressure.last_cycle_budget_limited {
+        return (SCANNER_MAINTENANCE_STATE_DEFERRED, SCANNER_MAINTENANCE_REASON_PARTIAL_CYCLE, 0);
+    }
+
+    if current.queued > 0 {
+        return (SCANNER_MAINTENANCE_STATE_ACTIVE, SCANNER_MAINTENANCE_REASON_QUEUED_WORK, current.queued);
+    }
+
+    if source == ScannerWorkSource::Lifecycle {
+        let expiry_backlog = scanner_lifecycle_expiry_backlog(metrics);
+        if expiry_backlog > 0 {
+            return (
+                SCANNER_MAINTENANCE_STATE_ACTIVE,
+                SCANNER_MAINTENANCE_REASON_EXPIRY_QUEUE_BACKLOG,
+                expiry_backlog,
+            );
+        }
+
+        let compensation_backlog = metrics
+            .lifecycle_transition
+            .compensation_pending
+            .saturating_add(metrics.lifecycle_transition.compensation_running);
+        if compensation_backlog > 0 {
+            return (
+                SCANNER_MAINTENANCE_STATE_ACTIVE,
+                SCANNER_MAINTENANCE_REASON_TRANSITION_COMPENSATION_BACKLOG,
+                compensation_backlog,
+            );
+        }
+
+        let transition_backlog = scanner_lifecycle_transition_backlog(metrics);
+        if transition_backlog > 0 {
+            return (
+                SCANNER_MAINTENANCE_STATE_ACTIVE,
+                SCANNER_MAINTENANCE_REASON_TRANSITION_QUEUE_BACKLOG,
+                transition_backlog,
+            );
+        }
+    }
+
+    if scanner_source_has_current_work(current) {
+        return (SCANNER_MAINTENANCE_STATE_ACTIVE, SCANNER_MAINTENANCE_REASON_ACTIVE_WORK, 0);
+    }
+
+    (SCANNER_MAINTENANCE_STATE_IDLE, SCANNER_MAINTENANCE_REASON_IDLE, 0)
+}
+
+fn scanner_maintenance_source_work(metrics: &ScannerMetricsReport) -> &[ScannerSourceWorkSnapshot] {
+    if metrics.current_cycle_source_work.is_empty() {
+        &metrics.last_cycle_source_work
+    } else {
+        &metrics.current_cycle_source_work
+    }
+}
+
+fn scanner_maintenance_control(metrics: &ScannerMetricsReport) -> ScannerMaintenanceControlSnapshot {
+    let mut has_blocked = false;
+    let mut has_deferred = false;
+    let mut has_active = false;
+    let current_source_work = scanner_maintenance_source_work(metrics);
+
+    let sources = ScannerWorkSource::all()
+        .iter()
+        .map(|source| {
+            let current = scanner_source_work_snapshot(current_source_work, *source);
+            let lifetime = scanner_source_work_snapshot(&metrics.source_work, *source);
+            let partial_cycles = scanner_source_partial_cycles(metrics, *source);
+            let (state, reason, backlog) = scanner_source_maintenance_state(*source, &current, metrics);
+
+            match state {
+                SCANNER_MAINTENANCE_STATE_BLOCKED => has_blocked = true,
+                SCANNER_MAINTENANCE_STATE_DEFERRED => has_deferred = true,
+                SCANNER_MAINTENANCE_STATE_ACTIVE => has_active = true,
+                _ => {}
+            }
+
+            ScannerMaintenanceSourceSnapshot {
+                source: source.as_str().to_string(),
+                state: state.to_string(),
+                reason: reason.to_string(),
+                backlog,
+                current_checked: current.checked,
+                current_queued: current.queued,
+                current_missed: current.missed,
+                lifetime_missed: lifetime.missed,
+                partial_cycles,
+            }
+        })
+        .collect();
+
+    let primary_control = if has_blocked {
+        SCANNER_MAINTENANCE_CONTROL_BLOCKED_SOURCE
+    } else if has_deferred {
+        SCANNER_MAINTENANCE_CONTROL_DEFERRED_SOURCE
+    } else if has_active {
+        SCANNER_MAINTENANCE_CONTROL_ACTIVE_SOURCE
+    } else if metrics.pacing_pressure.primary_pressure != SCANNER_MAINTENANCE_CONTROL_NONE {
+        SCANNER_MAINTENANCE_CONTROL_PACING_PRESSURE
+    } else {
+        SCANNER_MAINTENANCE_CONTROL_NONE
+    };
+
+    ScannerMaintenanceControlSnapshot {
+        primary_control: primary_control.to_string(),
+        sources,
     }
 }
 
@@ -1230,6 +1593,13 @@ impl Metrics {
             scanner_ilm_actions: AtomicU64::new(0),
             scanner_lifecycle_expiry_actions: AtomicU64::new(0),
             scanner_lifecycle_transition_actions: AtomicU64::new(0),
+            scanner_expiry_queue_capacity: AtomicU64::new(0),
+            scanner_expiry_queued: AtomicU64::new(0),
+            scanner_expiry_active: AtomicU64::new(0),
+            scanner_expiry_workers: AtomicU64::new(0),
+            scanner_expiry_queue_missed: AtomicU64::new(0),
+            scanner_expiry_queued_total: AtomicU64::new(0),
+            scanner_expiry_missed_total: AtomicU64::new(0),
             scanner_transition_queue_capacity: AtomicU64::new(0),
             scanner_transition_queued: AtomicU64::new(0),
             scanner_transition_active: AtomicU64::new(0),
@@ -1237,6 +1607,7 @@ impl Metrics {
             scanner_transition_queue_full: AtomicU64::new(0),
             scanner_transition_queue_send_timeout: AtomicU64::new(0),
             scanner_transition_compensation_scheduled: AtomicU64::new(0),
+            scanner_transition_compensation_pending: AtomicU64::new(0),
             scanner_transition_compensation_running: AtomicU64::new(0),
             scanner_transition_queued_total: AtomicU64::new(0),
             scanner_transition_missed_total: AtomicU64::new(0),
@@ -1266,6 +1637,18 @@ impl Metrics {
                 .map(|_| ScannerSourceWorkCounters::default())
                 .collect(),
             last_scan_cycle_source_work: ScannerWorkSource::all()
+                .iter()
+                .map(|_| ScannerSourceWorkCounters::default())
+                .collect(),
+            scanner_replication_repair_work: ScannerReplicationRepairKind::all()
+                .iter()
+                .map(|_| ScannerSourceWorkCounters::default())
+                .collect(),
+            current_scan_cycle_replication_repair_work_start: ScannerReplicationRepairKind::all()
+                .iter()
+                .map(|_| ScannerSourceWorkCounters::default())
+                .collect(),
+            last_scan_cycle_replication_repair_work: ScannerReplicationRepairKind::all()
                 .iter()
                 .map(|_| ScannerSourceWorkCounters::default())
                 .collect(),
@@ -1434,6 +1817,15 @@ impl Metrics {
         }
     }
 
+    pub fn record_scanner_expiry_enqueue_result(&self, count: u64, queued: bool) {
+        self.record_scanner_ilm_enqueue_result(count, queued);
+        if queued {
+            self.scanner_expiry_queued_total.fetch_add(count, Ordering::Relaxed);
+        } else {
+            self.scanner_expiry_missed_total.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
     pub fn record_scanner_transition_enqueue_result(&self, count: u64, queued: bool) {
         self.record_scanner_ilm_enqueue_result(count, queued);
         if queued {
@@ -1441,6 +1833,15 @@ impl Metrics {
         } else {
             self.scanner_transition_missed_total.fetch_add(count, Ordering::Relaxed);
         }
+    }
+
+    pub fn record_scanner_lifecycle_expiry_state(&self, state: ScannerLifecycleExpiryStateUpdate) {
+        self.scanner_expiry_queue_capacity
+            .store(state.queue_capacity, Ordering::Relaxed);
+        self.scanner_expiry_queued.store(state.queued, Ordering::Relaxed);
+        self.scanner_expiry_active.store(state.active, Ordering::Relaxed);
+        self.scanner_expiry_workers.store(state.workers, Ordering::Relaxed);
+        self.scanner_expiry_queue_missed.store(state.queue_missed, Ordering::Relaxed);
     }
 
     pub fn record_scanner_lifecycle_transition_state(&self, state: ScannerLifecycleTransitionStateUpdate) {
@@ -1454,6 +1855,8 @@ impl Metrics {
             .store(state.queue_send_timeout, Ordering::Relaxed);
         self.scanner_transition_compensation_scheduled
             .store(state.compensation_scheduled, Ordering::Relaxed);
+        self.scanner_transition_compensation_pending
+            .store(state.compensation_pending, Ordering::Relaxed);
         self.scanner_transition_compensation_running
             .store(state.compensation_running, Ordering::Relaxed);
     }
@@ -1464,6 +1867,10 @@ impl Metrics {
 
     pub fn record_scanner_transition_failed(&self, count: u64) {
         self.scanner_transition_failed.fetch_add(count, Ordering::Relaxed);
+        self.record_scanner_source_failed(ScannerWorkSource::Lifecycle, count);
+        if !self.current_scan_cycle_work_active.load(Ordering::Relaxed) {
+            self.record_last_cycle_scanner_source_work(ScannerWorkSource::Lifecycle, ScannerSourceWorkUpdate::failed(count));
+        }
     }
 
     pub fn record_scanner_checkpoint_set(&self, version: u16, resume_after: impl Into<String>, reason: impl Into<String>) {
@@ -1508,6 +1915,18 @@ impl Metrics {
         }
     }
 
+    pub fn record_scanner_replication_repair_work(&self, kind: ScannerReplicationRepairKind, work: ScannerSourceWorkUpdate) {
+        if let Some(counters) = self.scanner_replication_repair_work.get(kind.index()) {
+            counters.add(work);
+        }
+    }
+
+    fn record_last_cycle_scanner_source_work(&self, source: ScannerWorkSource, work: ScannerSourceWorkUpdate) {
+        if let Some(counters) = self.last_scan_cycle_source_work.get(source.index()) {
+            counters.add(work);
+        }
+    }
+
     pub fn record_scanner_source_checked(&self, source: ScannerWorkSource, count: u64) {
         self.record_scanner_source_work(source, ScannerSourceWorkUpdate::checked(count));
     }
@@ -1518,6 +1937,10 @@ impl Metrics {
 
     pub fn record_scanner_source_executed(&self, source: ScannerWorkSource, count: u64) {
         self.record_scanner_source_work(source, ScannerSourceWorkUpdate::executed(count));
+    }
+
+    pub fn record_scanner_source_failed(&self, source: ScannerWorkSource, count: u64) {
+        self.record_scanner_source_work(source, ScannerSourceWorkUpdate::failed(count));
     }
 
     pub fn record_scanner_source_missed(&self, source: ScannerWorkSource, count: u64) {
@@ -1746,6 +2169,7 @@ impl Metrics {
     pub fn start_scan_cycle_work(&self) -> ScanCycleWorkSnapshot {
         let snapshot = self.scan_cycle_work_snapshot();
         let source_snapshot = self.scanner_source_work_values();
+        let replication_repair_snapshot = self.scanner_replication_repair_work_values();
         self.current_scan_cycle_objects_start
             .store(snapshot.objects_scanned, Ordering::Relaxed);
         self.current_scan_cycle_directories_start
@@ -1775,6 +2199,10 @@ impl Metrics {
         self.current_scan_cycle_usage_saves_start
             .store(snapshot.usage_saves, Ordering::Relaxed);
         self.store_scanner_source_work_values(&self.current_scan_cycle_source_work_start, &source_snapshot);
+        self.store_scanner_replication_repair_work_values(
+            &self.current_scan_cycle_replication_repair_work_start,
+            &replication_repair_snapshot,
+        );
         self.current_scan_cycle_work_active.store(true, Ordering::Relaxed);
         snapshot
     }
@@ -1782,8 +2210,11 @@ impl Metrics {
     pub fn finish_scan_cycle_work(&self, start: ScanCycleWorkSnapshot) {
         let work = self.scan_cycle_work_since(start);
         let source_work = self.scanner_source_work_since(&self.current_scan_cycle_source_work_start_values());
+        let replication_repair_work =
+            self.scanner_replication_repair_work_since(&self.current_scan_cycle_replication_repair_work_start_values());
         self.record_scan_cycle_work(work);
         self.record_scan_cycle_source_work(&source_work);
+        self.record_scan_cycle_replication_repair_work(&replication_repair_work);
         self.current_scan_cycle_work_active.store(false, Ordering::Relaxed);
     }
 
@@ -1899,9 +2330,79 @@ impl Metrics {
             .collect()
     }
 
+    fn scanner_replication_repair_work_values(&self) -> Vec<ScannerSourceWorkValues> {
+        ScannerReplicationRepairKind::all()
+            .iter()
+            .filter_map(|kind| {
+                self.scanner_replication_repair_work
+                    .get(kind.index())
+                    .map(ScannerSourceWorkCounters::values)
+            })
+            .collect()
+    }
+
+    fn current_scan_cycle_replication_repair_work_start_values(&self) -> Vec<ScannerSourceWorkValues> {
+        ScannerReplicationRepairKind::all()
+            .iter()
+            .filter_map(|kind| {
+                self.current_scan_cycle_replication_repair_work_start
+                    .get(kind.index())
+                    .map(ScannerSourceWorkCounters::values)
+            })
+            .collect()
+    }
+
+    fn scanner_replication_repair_work_since(&self, start: &[ScannerSourceWorkValues]) -> Vec<ScannerSourceWorkValues> {
+        self.scanner_replication_repair_work_values()
+            .into_iter()
+            .enumerate()
+            .map(|(index, current)| current.saturating_sub(start.get(index).copied().unwrap_or_default()))
+            .collect()
+    }
+
+    fn scanner_replication_repair_work_snapshots(
+        &self,
+        values: &[ScannerSourceWorkValues],
+    ) -> Vec<ScannerReplicationRepairSnapshot> {
+        ScannerReplicationRepairKind::all()
+            .iter()
+            .filter_map(|kind| {
+                values
+                    .get(kind.index())
+                    .map(|values| values.replication_repair_snapshot(*kind))
+            })
+            .collect()
+    }
+
+    fn scanner_replication_repair_work_counter_snapshots(
+        &self,
+        counters: &[ScannerSourceWorkCounters],
+    ) -> Vec<ScannerReplicationRepairSnapshot> {
+        ScannerReplicationRepairKind::all()
+            .iter()
+            .filter_map(|kind| {
+                counters
+                    .get(kind.index())
+                    .map(|counters| counters.values().replication_repair_snapshot(*kind))
+            })
+            .collect()
+    }
+
     fn store_scanner_source_work_values(&self, counters: &[ScannerSourceWorkCounters], values: &[ScannerSourceWorkValues]) {
         for source in ScannerWorkSource::all() {
             if let (Some(counter), Some(values)) = (counters.get(source.index()), values.get(source.index())) {
+                counter.store(*values);
+            }
+        }
+    }
+
+    fn store_scanner_replication_repair_work_values(
+        &self,
+        counters: &[ScannerSourceWorkCounters],
+        values: &[ScannerSourceWorkValues],
+    ) {
+        for kind in ScannerReplicationRepairKind::all() {
+            if let (Some(counter), Some(values)) = (counters.get(kind.index()), values.get(kind.index())) {
                 counter.store(*values);
             }
         }
@@ -1938,6 +2439,10 @@ impl Metrics {
 
     fn record_scan_cycle_source_work(&self, work: &[ScannerSourceWorkValues]) {
         self.store_scanner_source_work_values(&self.last_scan_cycle_source_work, work);
+    }
+
+    fn record_scan_cycle_replication_repair_work(&self, work: &[ScannerSourceWorkValues]) {
+        self.store_scanner_replication_repair_work_values(&self.last_scan_cycle_replication_repair_work, work);
     }
 
     /// Snapshot of every path currently being scanned.
@@ -2012,6 +2517,8 @@ impl Metrics {
         if self.current_scan_cycle_work_active.load(Ordering::Relaxed) {
             let current_work = self.scan_cycle_work_since(self.current_scan_cycle_work_start());
             let current_source_work = self.scanner_source_work_since(&self.current_scan_cycle_source_work_start_values());
+            let current_replication_repair_work =
+                self.scanner_replication_repair_work_since(&self.current_scan_cycle_replication_repair_work_start_values());
             m.current_cycle_objects_scanned = current_work.objects_scanned;
             m.current_cycle_directories_scanned = current_work.directories_scanned;
             m.current_cycle_bucket_drive_scans = current_work.bucket_drive_scans;
@@ -2027,6 +2534,7 @@ impl Metrics {
             m.current_cycle_replication_checks = current_work.replication_checks;
             m.current_cycle_usage_saves = current_work.usage_saves;
             m.current_cycle_source_work = self.scanner_source_work_snapshots(&current_source_work);
+            m.current_cycle_replication_repair = self.scanner_replication_repair_work_snapshots(&current_replication_repair_work);
         }
         let last_cycle_result = self.last_scan_cycle_result.load(Ordering::Relaxed);
         m.last_cycle_result = scan_cycle_result_label(last_cycle_result).to_string();
@@ -2057,6 +2565,8 @@ impl Metrics {
         m.last_cycle_replication_checks = self.last_scan_cycle_replication_checks.load(Ordering::Relaxed);
         m.last_cycle_usage_saves = self.last_scan_cycle_usage_saves.load(Ordering::Relaxed);
         m.last_cycle_source_work = self.scanner_source_work_counter_snapshots(&self.last_scan_cycle_source_work);
+        m.last_cycle_replication_repair =
+            self.scanner_replication_repair_work_counter_snapshots(&self.last_scan_cycle_replication_repair_work);
         m.failed_cycles = self.failed_scan_cycles.load(Ordering::Relaxed);
         m.partial_cycles_unknown = self.partial_scan_cycles_unknown.load(Ordering::Relaxed);
         m.partial_cycles_runtime = self.partial_scan_cycles_runtime.load(Ordering::Relaxed);
@@ -2073,6 +2583,15 @@ impl Metrics {
                     })
             })
             .collect();
+        m.lifecycle_expiry = ScannerLifecycleExpirySnapshot {
+            current_queue_capacity: self.scanner_expiry_queue_capacity.load(Ordering::Relaxed),
+            current_queued: self.scanner_expiry_queued.load(Ordering::Relaxed),
+            current_active: self.scanner_expiry_active.load(Ordering::Relaxed),
+            current_workers: self.scanner_expiry_workers.load(Ordering::Relaxed),
+            queue_missed: self.scanner_expiry_queue_missed.load(Ordering::Relaxed),
+            scanner_queued: self.scanner_expiry_queued_total.load(Ordering::Relaxed),
+            scanner_missed: self.scanner_expiry_missed_total.load(Ordering::Relaxed),
+        };
         m.lifecycle_transition = ScannerLifecycleTransitionSnapshot {
             current_queue_capacity: self.scanner_transition_queue_capacity.load(Ordering::Relaxed),
             current_queued: self.scanner_transition_queued.load(Ordering::Relaxed),
@@ -2081,6 +2600,7 @@ impl Metrics {
             queue_full: self.scanner_transition_queue_full.load(Ordering::Relaxed),
             queue_send_timeout: self.scanner_transition_queue_send_timeout.load(Ordering::Relaxed),
             compensation_scheduled: self.scanner_transition_compensation_scheduled.load(Ordering::Relaxed),
+            compensation_pending: self.scanner_transition_compensation_pending.load(Ordering::Relaxed),
             compensation_running: self.scanner_transition_compensation_running.load(Ordering::Relaxed),
             scanner_queued: self.scanner_transition_queued_total.load(Ordering::Relaxed),
             scanner_missed: self.scanner_transition_missed_total.load(Ordering::Relaxed),
@@ -2106,6 +2626,7 @@ impl Metrics {
         m.scan_checkpoint_ignored = self.scanner_checkpoint_ignored.load(Ordering::Relaxed);
         m.scan_checkpoint_stale = self.scanner_checkpoint_stale.load(Ordering::Relaxed);
         m.source_work = self.scanner_source_work_counter_snapshots(&self.scanner_source_work);
+        m.replication_repair = self.scanner_replication_repair_work_counter_snapshots(&self.scanner_replication_repair_work);
         m.partial_cycles = self.partial_scan_cycles.load(Ordering::Relaxed);
 
         // Lifetime operation counts
@@ -2163,6 +2684,7 @@ impl Metrics {
         }
 
         m.pacing_pressure = scanner_pacing_pressure(&m);
+        m.maintenance_control = scanner_maintenance_control(&m);
 
         m
     }
@@ -2456,6 +2978,7 @@ mod tests {
             queue_full: 3,
             queue_send_timeout: 1,
             compensation_scheduled: 2,
+            compensation_pending: 3,
             compensation_running: 1,
         });
         metrics.record_scanner_transition_enqueue_result(6, true);
@@ -2472,11 +2995,239 @@ mod tests {
         assert_eq!(report.lifecycle_transition.queue_full, 3);
         assert_eq!(report.lifecycle_transition.queue_send_timeout, 1);
         assert_eq!(report.lifecycle_transition.compensation_scheduled, 2);
+        assert_eq!(report.lifecycle_transition.compensation_pending, 3);
         assert_eq!(report.lifecycle_transition.compensation_running, 1);
         assert_eq!(report.lifecycle_transition.scanner_queued, 6);
         assert_eq!(report.lifecycle_transition.scanner_missed, 2);
         assert_eq!(report.lifecycle_transition.completed, 4);
         assert_eq!(report.lifecycle_transition.failed, 1);
+    }
+
+    #[tokio::test]
+    async fn report_includes_scanner_lifecycle_expiry_status() {
+        let metrics = Metrics::new();
+        metrics.record_scanner_lifecycle_expiry_state(ScannerLifecycleExpiryStateUpdate {
+            queue_capacity: 16,
+            queued: 5,
+            active: 2,
+            workers: 4,
+            queue_missed: 3,
+        });
+        metrics.record_scanner_expiry_enqueue_result(6, true);
+        metrics.record_scanner_expiry_enqueue_result(2, false);
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.lifecycle_expiry.current_queue_capacity, 16);
+        assert_eq!(report.lifecycle_expiry.current_queued, 5);
+        assert_eq!(report.lifecycle_expiry.current_active, 2);
+        assert_eq!(report.lifecycle_expiry.current_workers, 4);
+        assert_eq!(report.lifecycle_expiry.queue_missed, 3);
+        assert_eq!(report.lifecycle_expiry.scanner_queued, 6);
+        assert_eq!(report.lifecycle_expiry.scanner_missed, 2);
+    }
+
+    #[tokio::test]
+    async fn report_derives_scanner_maintenance_control_status() {
+        let metrics = Metrics::new();
+        let start = metrics.start_scan_cycle_work();
+        metrics.record_scanner_source_checked(ScannerWorkSource::Usage, 3);
+        metrics.record_scanner_source_missed(ScannerWorkSource::Lifecycle, 2);
+        metrics.record_scanner_source_queued(ScannerWorkSource::BucketReplication, 1);
+        metrics.record_scan_cycle_partial_with_source(
+            Duration::from_secs(5),
+            ScanCyclePartialReason::Objects,
+            Some(ScannerWorkSource::Usage),
+        );
+        metrics.record_scanner_lifecycle_transition_state(ScannerLifecycleTransitionStateUpdate {
+            queue_capacity: 4,
+            queued: 2,
+            queue_full: 1,
+            ..Default::default()
+        });
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.maintenance_control.primary_control, "blocked_source");
+        let usage = report
+            .maintenance_control
+            .sources
+            .iter()
+            .find(|source| source.source == ScannerWorkSource::Usage.as_str())
+            .expect("usage source control should be visible");
+        assert_eq!(usage.state, "deferred");
+        assert_eq!(usage.reason, "partial_cycle");
+        assert_eq!(usage.current_checked, 3);
+        assert_eq!(usage.partial_cycles, 1);
+
+        let lifecycle = report
+            .maintenance_control
+            .sources
+            .iter()
+            .find(|source| source.source == ScannerWorkSource::Lifecycle.as_str())
+            .expect("lifecycle source control should be visible");
+        assert_eq!(lifecycle.state, "blocked");
+        assert_eq!(lifecycle.reason, "missed_work");
+        assert_eq!(lifecycle.current_missed, 2);
+        assert_eq!(lifecycle.backlog, 2);
+
+        let bucket_replication = report
+            .maintenance_control
+            .sources
+            .iter()
+            .find(|source| source.source == ScannerWorkSource::BucketReplication.as_str())
+            .expect("bucket replication source control should be visible");
+        assert_eq!(bucket_replication.state, "active");
+        assert_eq!(bucket_replication.reason, "queued_work");
+        assert_eq!(bucket_replication.current_queued, 1);
+
+        metrics.finish_scan_cycle_work(start);
+    }
+
+    #[tokio::test]
+    async fn report_marks_transition_failures_as_blocked_lifecycle_control() {
+        let metrics = Metrics::new();
+        let _start = metrics.start_scan_cycle_work();
+
+        metrics.record_scanner_transition_failed(2);
+        let report = metrics.report().await;
+
+        let lifecycle_work = report
+            .current_cycle_source_work
+            .iter()
+            .find(|work| work.source == ScannerWorkSource::Lifecycle.as_str())
+            .expect("current lifecycle source work should be visible");
+        assert_eq!(lifecycle_work.failed, 2);
+
+        let lifecycle = report
+            .maintenance_control
+            .sources
+            .iter()
+            .find(|source| source.source == ScannerWorkSource::Lifecycle.as_str())
+            .expect("lifecycle source control should be visible");
+        assert_eq!(report.maintenance_control.primary_control, "blocked_source");
+        assert_eq!(lifecycle.state, "blocked");
+        assert_eq!(lifecycle.reason, "transition_failed");
+        assert_eq!(lifecycle.backlog, 2);
+    }
+
+    #[tokio::test]
+    async fn report_marks_off_cycle_transition_failures_as_blocked_lifecycle_control() {
+        let metrics = Metrics::new();
+        let start = metrics.start_scan_cycle_work();
+        metrics.finish_scan_cycle_work(start);
+
+        metrics.record_scanner_transition_failed(1);
+        let report = metrics.report().await;
+
+        assert!(report.current_cycle_source_work.is_empty());
+        let lifecycle_work = report
+            .last_cycle_source_work
+            .iter()
+            .find(|work| work.source == ScannerWorkSource::Lifecycle.as_str())
+            .expect("last-cycle lifecycle source work should be visible");
+        assert_eq!(lifecycle_work.failed, 1);
+
+        let lifecycle = report
+            .maintenance_control
+            .sources
+            .iter()
+            .find(|source| source.source == ScannerWorkSource::Lifecycle.as_str())
+            .expect("lifecycle source control should be visible");
+        assert_eq!(report.maintenance_control.primary_control, "blocked_source");
+        assert_eq!(lifecycle.state, "blocked");
+        assert_eq!(lifecycle.reason, "transition_failed");
+        assert_eq!(lifecycle.backlog, 1);
+    }
+
+    #[tokio::test]
+    async fn report_marks_expiry_queue_backlog_as_lifecycle_control() {
+        let metrics = Metrics::new();
+        metrics.record_scanner_lifecycle_expiry_state(ScannerLifecycleExpiryStateUpdate {
+            queued: 2,
+            active: 1,
+            ..Default::default()
+        });
+
+        let report = metrics.report().await;
+
+        let lifecycle = report
+            .maintenance_control
+            .sources
+            .iter()
+            .find(|source| source.source == ScannerWorkSource::Lifecycle.as_str())
+            .expect("lifecycle source control should be visible");
+        assert_eq!(report.maintenance_control.primary_control, "active_source");
+        assert_eq!(lifecycle.state, "active");
+        assert_eq!(lifecycle.reason, "expiry_queue_backlog");
+        assert_eq!(lifecycle.backlog, 3);
+    }
+
+    #[tokio::test]
+    async fn report_marks_running_transition_compensation_as_lifecycle_backlog() {
+        let metrics = Metrics::new();
+        metrics.record_scanner_lifecycle_transition_state(ScannerLifecycleTransitionStateUpdate {
+            compensation_running: 1,
+            ..Default::default()
+        });
+
+        let report = metrics.report().await;
+
+        let lifecycle = report
+            .maintenance_control
+            .sources
+            .iter()
+            .find(|source| source.source == ScannerWorkSource::Lifecycle.as_str())
+            .expect("lifecycle source control should be visible");
+        assert_eq!(report.maintenance_control.primary_control, "active_source");
+        assert_eq!(lifecycle.state, "active");
+        assert_eq!(lifecycle.reason, "transition_compensation_backlog");
+        assert_eq!(lifecycle.backlog, 1);
+    }
+
+    #[tokio::test]
+    async fn report_marks_pending_transition_compensation_as_lifecycle_backlog() {
+        let metrics = Metrics::new();
+        metrics.record_scanner_lifecycle_transition_state(ScannerLifecycleTransitionStateUpdate {
+            compensation_pending: 2,
+            ..Default::default()
+        });
+
+        let report = metrics.report().await;
+
+        let lifecycle = report
+            .maintenance_control
+            .sources
+            .iter()
+            .find(|source| source.source == ScannerWorkSource::Lifecycle.as_str())
+            .expect("lifecycle source control should be visible");
+        assert_eq!(report.maintenance_control.primary_control, "active_source");
+        assert_eq!(lifecycle.state, "active");
+        assert_eq!(lifecycle.reason, "transition_compensation_backlog");
+        assert_eq!(lifecycle.backlog, 2);
+    }
+
+    #[tokio::test]
+    async fn report_uses_last_cycle_source_work_for_maintenance_control_between_cycles() {
+        let metrics = Metrics::new();
+        let start = metrics.start_scan_cycle_work();
+        metrics.record_scanner_source_missed(ScannerWorkSource::Lifecycle, 2);
+
+        metrics.finish_scan_cycle_work(start);
+        let report = metrics.report().await;
+
+        assert!(report.current_cycle_source_work.is_empty());
+        let lifecycle = report
+            .maintenance_control
+            .sources
+            .iter()
+            .find(|source| source.source == ScannerWorkSource::Lifecycle.as_str())
+            .expect("lifecycle source control should be visible");
+        assert_eq!(report.maintenance_control.primary_control, "blocked_source");
+        assert_eq!(lifecycle.state, "blocked");
+        assert_eq!(lifecycle.reason, "missed_work");
+        assert_eq!(lifecycle.current_missed, 2);
+        assert_eq!(lifecycle.backlog, 2);
     }
 
     #[tokio::test]
@@ -2513,6 +3264,60 @@ mod tests {
             .expect("heal source work should be visible");
         assert_eq!(heal.checked, 5);
         assert_eq!(heal.executed, 0);
+    }
+
+    #[tokio::test]
+    async fn report_includes_scanner_replication_repair_work() {
+        let metrics = Metrics::new();
+
+        metrics.record_scanner_replication_repair_work(
+            ScannerReplicationRepairKind::BucketObject,
+            ScannerSourceWorkUpdate::queued(2),
+        );
+        metrics.record_scanner_replication_repair_work(
+            ScannerReplicationRepairKind::BucketDeleteMarker,
+            ScannerSourceWorkUpdate::missed(1),
+        );
+        metrics.record_scanner_replication_repair_work(
+            ScannerReplicationRepairKind::BucketVersionPurge,
+            ScannerSourceWorkUpdate {
+                skipped: 3,
+                ..Default::default()
+            },
+        );
+        metrics.record_scanner_replication_repair_work(
+            ScannerReplicationRepairKind::BucketExistingObject,
+            ScannerSourceWorkUpdate::queued(4),
+        );
+
+        let report = metrics.report().await;
+        let object = report
+            .replication_repair
+            .iter()
+            .find(|repair| repair.source == "bucket_replication" && repair.kind == "object")
+            .expect("bucket object repair work should be visible");
+        assert_eq!(object.queued, 2);
+
+        let delete_marker = report
+            .replication_repair
+            .iter()
+            .find(|repair| repair.source == "bucket_replication" && repair.kind == "delete_marker")
+            .expect("bucket delete-marker repair work should be visible");
+        assert_eq!(delete_marker.missed, 1);
+
+        let version_purge = report
+            .replication_repair
+            .iter()
+            .find(|repair| repair.source == "bucket_replication" && repair.kind == "version_purge")
+            .expect("bucket version purge repair work should be visible");
+        assert_eq!(version_purge.skipped, 3);
+
+        let existing_object = report
+            .replication_repair
+            .iter()
+            .find(|repair| repair.source == "bucket_replication" && repair.kind == "existing_object")
+            .expect("bucket existing object repair work should be visible");
+        assert_eq!(existing_object.queued, 4);
     }
 
     #[tokio::test]

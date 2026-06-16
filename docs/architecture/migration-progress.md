@@ -5,19 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-startup-core-runtime-bootstrap`
-- Baseline: `origin/main` at `73e534682e93d1ed2c7b0e752ad550d969ca96b2`
-- PR type for this branch: `pure-move`
-- Runtime behavior changes: no external behavior change expected; startup
-  runtime foundation still logs dial9/license state, prints the logo, initializes
-  profiling and trusted proxies, installs the rustls provider, and publishes
-  outbound TLS material in the same order and with the same fatal boundary.
-- Rust code changes: centralize startup runtime foundation bootstrap in
-  `startup_runtime::init_startup_runtime_foundation` and use it from binary
-  startup.
-- CI/script changes: none.
-- Docs changes: record `R-012` startup runtime foundation bootstrap progress and
-  verification.
+- Branch: `overtrue/arch-remove-storage-api-facade`
+- Baseline: `origin/main` at `c26593fa7a4b55849e98832cde657c6d4b167262`
+- PR type for this branch: `consumer-migration`
+- Runtime behavior changes: no external behavior change expected.
+- Rust code changes: remove the old unused `StorageAPI` facade, its ECStore
+  implementation blocks, its public re-export, and the stale compile-time
+  compatibility test coverage.
+- CI/script changes: adjust architecture migration guardrails to keep the
+  remaining storage-admin and namespace-lock contracts covered.
+- Docs changes: record the final old-facade cleanup slice and its verification
+  state.
 
 ## Phase 0 Tasks
 
@@ -34,12 +32,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 - [x] `G-005` Add dependency direction guard.
   - Acceptance: `./scripts/check_layer_dependencies.sh` passes on current
     `upstream/main` while still rejecting new unaccepted layer dependencies.
-- [~] `G-006` Create migration loss-prevention checks.
-  - Current branch: add a mechanical admin route matrix guard from
+- [x] `G-006` Create migration loss-prevention checks.
+  - Completed slices: add a mechanical admin route matrix guard from
     [`admin-route-action-snapshot.md`](admin-route-action-snapshot.md) and
-    `rustfs/src/admin/route_registration_test.rs`.
-  - Remaining follow-up: add checks for public re-export and storage trait
-    coverage before pure moves.
+    `rustfs/src/admin/route_registration_test.rs`; add migration rules for
+    public storage-api re-export coverage and ECStore compatibility-test
+    coverage.
+  - Acceptance: architecture migration rules fail if the public storage-api
+    contract re-export surface drifts or if ECStore compile-time compatibility
+    tests for the remaining storage-admin and namespace-lock contracts are
+    removed.
 - [x] `G-007` Create startup timeline table.
   - Acceptance: [`startup-timeline.md`](startup-timeline.md) records current
     binary startup order, side effects, fatal boundaries, and readiness stages.
@@ -408,7 +410,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Completed slice: `rustfs/rustfs#3340` removed duplicate admin-read methods
     from the old `StorageAPI` trait and its ECStore/Sets/SetDisks/test
     implementations after API-007 migrated their consumers.
-  - Acceptance: old `StorageAPI` keeps storage operation traits while admin
+  - Final cleanup slice: remove the old `StorageAPI` facade after all real
+    consumers moved to concrete operation groups.
+  - Acceptance: storage operation traits remain available directly while admin
     inventory surfaces live only on `StorageAdminApi`.
 
 - [x] `API-009` Narrow metadata helper storage bounds.
@@ -417,6 +421,11 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     full `StorageAPI` when the helper only needs `ObjectIO`,
     `ObjectOperations`, `BucketOperations`, `ListOperations`, or
     `StorageAdminApi`.
+  - Cleanup slice: remove stale full `StorageAPI` dependencies from config
+    persistence test support after the server-config persistence helpers moved
+    to their actual object I/O and storage-admin bounds.
+  - Completed cleanup slice: `rustfs/rustfs#3489` removed the stale full
+    facade dependency from config persistence test support.
   - Acceptance: metadata helper contracts express the actual operation group
     they need, while callers and persistence behavior remain unchanged.
 
@@ -426,8 +435,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     helper only needs `ObjectIO`.
   - Acceptance: resync metadata helpers express object-I/O-only persistence
     requirements, while replication execution, delete replication, multipart
-    replication, object lookups, and scheduling behavior remain on full
-    `StorageAPI` where needed.
+    replication, object lookups, and scheduling behavior remain on the concrete
+    operation groups they need.
 
 - [x] `API-011` Narrow scanner cache helper storage bounds.
   - Completed slice: `rustfs/rustfs#3348` narrowed scanner data-usage cache
@@ -440,9 +449,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     cache paths, retry and timeout behavior, cache-save metrics, publish/update
     channel behavior, scanner cycle scheduling, disk scan concurrency, bucket
     scan semantics, lifecycle/replication decisions, and storage hot paths.
-  - Risk defense: do not move traits to `rustfs-storage-api`, do not remove
-    `StorageAPI`, do not alter helper bodies, and do not narrow scanner paths
-    that need bucket operations, disk inventory, or full storage orchestration.
+  - Risk defense: do not move traits to `rustfs-storage-api`, do not alter
+    helper bodies, and do not narrow scanner paths that need bucket operations,
+    disk inventory, or full storage orchestration.
   - Verification: focused compile/tests, migration guards, Rust risk scan, and
     required quality/architecture, migration-preservation, and
     testing/verification review passed.
@@ -457,6 +466,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     namespace locking directly on ECStore storage types, and remove the
     temporary namespace-lock compatibility method from the full storage trait
     and cleanup register entry.
+  - Completed cleanup slice: `rustfs/rustfs#3477` narrowed remaining table
+    catalog backend and rebalance metadata helper consumers away from full
+    `StorageAPI` where they only need object I/O, object operations, list
+    operations, and namespace locking.
+  - Completed follow-up slice: `rustfs/rustfs#3485` narrowed replication pool,
+    resync leader-lock, delete replication, object replication, and multipart
+    replication helpers away from full `StorageAPI` where they only need object
+    I/O, object operations, list operations, and namespace locking.
+  - Final cleanup slice: remove the unused old `StorageAPI` facade, its
+    implementation blocks, public re-export, and stale guard coverage.
   - Acceptance: table catalog object backend contracts express the actual
     object read/write, metadata/delete, list, and namespace-lock capabilities
     they need; namespace-lock consumers depend on `NamespaceLocking` instead of
@@ -467,8 +486,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     scanner/heal/replication/config persistence, and storage hot paths.
   - Risk defense: do not move traits into `rustfs-storage-api`, do not change
     lock implementation code, do not alter table catalog method bodies, and do
-    not retain stale API-012 compatibility markers after the old `StorageAPI`
-    lock method is removed.
+    not leave stale full-facade compatibility coverage after consumers move to
+    concrete operation groups.
   - Verification: focused compile/tests, migration guards, Rust risk scan, and
     required quality/architecture, migration-preservation, and
     testing/verification review passed.
@@ -609,49 +628,177 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     formatting, migration guards, Rust risk scan, branch freshness check, and
     pre-commit quality gate.
 
+- [x] `R-013` Centralize startup server preflight bootstrap.
+  - Do: move external-prefix compatibility reporting, config snapshot
+    initialization, runtime license initialization, observability guard
+    initialization/storage, and startup runtime foundation bootstrap behind
+    `startup_preflight::init_startup_server_preflight`.
+  - Acceptance: env compatibility is applied before command parsing and reported
+    after observability starts, config snapshot and license init happen before
+    runtime foundation, observability init failure still emits the dedicated
+    fatal stderr and sentinel, guard storage failure still returns the original
+    error, and runtime foundation ordering/fatal boundaries stay unchanged.
+  - Must preserve: env compat conflict/applied events, observability guard
+    set/failure events, startup order, fatal stderr suppression sentinel, and
+    existing command/subcommand behavior.
+  - Verification: focused startup preflight tests, binary/lib compile checks,
+    formatting, migration guards, Rust risk scan, branch freshness check, and
+    pre-commit quality gate.
+
+- [x] `R-014` Centralize startup listen and HTTP server bootstrap.
+  - Do: move server config logging, readiness creation, region/address setup,
+    default credential warning, global action credentials, global port/address
+    publication, capacity management, service state manager setup, and
+    S3/console HTTP server startup behind `startup_server` helpers.
+  - Acceptance: endpoint/storage initialization still happens after listen
+    context setup and before HTTP server startup; S3 still disables console
+    mode; console server still starts only when enabled with a non-empty console
+    address; global action credential and address error mappings remain
+    unchanged.
+  - Must preserve: sanitized config/start/default credential/action credential
+    log events, region validation, server address/port derivation, global
+    port/address publication, capacity init timing, service `Starting` update,
+    S3/console server config shape, and shutdown handle ownership.
+  - Verification: focused startup server tests, binary/lib compile checks,
+    formatting, migration guards, Rust risk scan, branch freshness check, and
+    pre-commit quality gate.
+
+- [x] `R-015` Centralize startup storage foundation bootstrap.
+  - Do: move endpoint parsing, unsupported filesystem policy enforcement, global
+    endpoint publication, erasure type update, local disk initialization, local
+    disk ID map prewarm, lock client initialization, and storage pool logging
+    behind a `startup_storage` helper.
+  - Acceptance: storage foundation still runs after listen context setup and
+    before HTTP server startup; endpoint parse errors and local disk init errors
+    keep the same logging and `Error::other` mappings; global endpoints and
+    erasure type are published before local disk and lock client setup.
+  - Must preserve: endpoint parse start/failure events, unsupported filesystem
+    policy enforcement, global endpoint clone shape, erasure type update timing,
+    local disk init/prewarm order, lock client setup, storage pool
+    formatting/host-risk/debug logs, and endpoint pool ownership for later
+    ECStore startup.
+  - Verification: focused startup storage tests, binary/lib compile checks,
+    formatting, migration guards, Rust risk scan, branch freshness check, and
+    pre-commit quality gate.
+
+- [x] `R-016` Centralize startup storage runtime bootstrap.
+  - Do: move runtime cancellation token creation, ECStore initialization,
+    ECStore config initialization, server-config migration attempt, global
+    config retry loop, `StorageReady` stage publication, and background
+    replication startup behind the `startup_storage` boundary.
+  - Acceptance: storage runtime still starts after HTTP server startup and
+    before KMS startup; ECStore init failure keeps the same structured error log
+    and propagated error; global config init still logs every failed attempt,
+    sleeps between attempts, and becomes fatal after the 16th failed attempt;
+    `StorageReady` is still marked after global config init succeeds and before
+    background replication startup.
+  - Must preserve: cancellation token ownership for later shutdown, endpoint
+    pool clone ownership for ECStore startup, ECStore config init/migration
+    order, retry count/log fields, fatal error string, readiness stage timing,
+    and non-fatal background replication startup behavior.
+  - Verification: focused startup storage tests, binary/lib compile checks,
+    formatting, migration guards, Rust risk scan, branch freshness check, and
+    pre-commit quality gate.
+
+- [x] `R-017` Centralize startup runtime service bootstrap.
+  - Do: move KMS startup, optional protocol shutdown collection, buffer
+    profiling, event notifier/audit startup, deadlock detector startup, bucket
+    metadata migration, replication resync, IAM bootstrap, Keystone/OIDC auth
+    integration startup, notification runtime setup, AHM/heal setup, server info,
+    update check, allocator reclaim, metrics runtime, memory observability, and
+    auto-tuner startup behind the `startup_services` boundary.
+  - Acceptance: startup service initialization still runs after storage runtime
+    initialization and before the server-ready log; `main.rs` keeps ownership of
+    shutdown handling, server-ready publication, global init time, and scanner
+    start; `startup_services` returns protocol shutdown handles, IAM bootstrap
+    disposition, and scanner enablement.
+  - Must preserve: KMS fatal behavior, protocol fatal/disabled behavior, audit
+    non-fatal behavior, deadlock detector logging, bucket list and replication
+    resync fatal behavior, bucket/IAM metadata migration non-fatal behavior, IAM
+    deferred recovery semantics, Keystone parse fatal and runtime non-fatal
+    behavior, OIDC non-fatal behavior, notification init fatal behavior,
+    scanner-implies-heal behavior, metric-enabled guard, and shutdown token
+    ownership.
+  - Verification: focused startup services tests, binary/lib compile checks,
+    formatting, migration guards, Rust risk scan, branch freshness check, and
+    pre-commit quality gate.
+
+- [x] `R-018` Centralize startup ready, scanner, and shutdown lifecycle.
+  - Do: move server-ready logging, IAM readiness publication, global init time,
+    scanner start, shutdown signal wait, background shutdown ordering, protocol
+    shutdown, notifier/audit/profiling shutdown, HTTP shutdown, and final stopped
+    state logging behind the `startup_services` boundary.
+  - Acceptance: `main.rs` still initializes listen/storage/runtime services in
+    the same order, then delegates lifecycle completion; `startup_services`
+    owns the shutdown handles, runtime token, readiness handle, store, and
+    service runtime needed for ready/scanner/shutdown orchestration.
+  - Must preserve: server-ready log fields, inline/deferred IAM readiness
+    behavior, global init time timing, scanner start timing, shutdown signal log,
+    runtime token cancellation before service-specific shutdown, scanner before
+    AHM shutdown order, protocol shutdown order, notifier/audit/profiling
+    shutdown order, HTTP shutdown order, stopped service state, and final stopped
+    logs.
+  - Verification: focused startup services tests, binary/lib compile checks,
+    formatting, migration guards, Rust risk scan, branch freshness check, and
+    pre-commit quality gate.
+
+- [x] `R-019` Centralize startup command and bootstrap entrypoint.
+  - Do: move Tokio runtime result handling, command parsing/dispatch, server
+    preflight error mapping, startup run orchestration, and pre-observability
+    fatal stderr formatting behind `startup_entrypoint::run_process`.
+  - Acceptance: `main.rs` only owns the global allocator declarations and calls
+    the startup entrypoint; `startup_entrypoint` preserves the existing
+    command, preflight, listen, storage, runtime-service, ready, and shutdown
+    order.
+  - Must preserve: Tokio runtime build fatal `expect`, command parse fatal
+    stderr context and exit code, info/TLS subcommand behavior, observability
+    fatal sentinel suppression, server runtime failure log fields, startup stage
+    ordering, readiness publication, and shutdown ownership.
+  - Verification: focused startup entrypoint and observability guardrail tests,
+    binary/lib compile checks, formatting, migration guards, Rust risk scan,
+    branch freshness check, and pre-commit quality gate.
+
 ## Next PRs
 
-1. `pure-move`: continue extracting startup boot wrappers in larger slices while
-   preserving startup order and readiness ownership.
-2. `ci-gate`: finish `G-006` public re-export and storage trait coverage checks
-   before the remaining cleanup slices.
+1. `pure-move`/`consumer-migration`: continue larger cleanup slices with the
+   loss-prevention guards active for public re-exports and remaining storage
+   compatibility contracts.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Pure-move slice removes startup runtime foundation details from binary startup without changing ownership or adding abstraction beyond the existing startup module pattern. |
-| Migration preservation | passed | BOOT-006 order, dial9/license log fields, profiling/proxy/provider non-fatal setup, TLS fatal boundary, generation saturation, and TLS metric condition are preserved. |
-| Testing/verification | passed | Focused startup runtime tests, compile checks, formatting, migration/layer guards, Rust risk scan, branch freshness check, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Old `StorageAPI` facade removal leaves concrete operation traits and remaining storage-admin/namespace-lock contracts explicit. |
+| Migration preservation | passed | ECStore/Sets/SetDisks operation implementations remain in place; only the unused aggregate facade and stale guard coverage are removed. |
+| Testing/verification | passed | Focused compatibility test, compile checks, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `73e534682e93d1ed2c7b0e752ad550d969ca96b2`:
+Passed on `c26593fa7a4b55849e98832cde657c6d4b167262`:
 
-- `cargo test -p rustfs startup_runtime --no-fail-fast`.
-- `cargo check -p rustfs --lib`.
-- `cargo check -p rustfs --bin rustfs`.
-- `cargo fmt --all --check`.
-- `git diff --check`.
-- `./scripts/check_architecture_migration_rules.sh`.
-- `./scripts/check_layer_dependencies.sh`.
-- `git rev-list --left-right --count HEAD...origin/main` returned `0 0`.
-- Added-line Rust risk scan for changed Rust files: no matches.
-- Full-file risk scan for changed Rust files: matches are existing docs example
-  output and existing binary startup stderr/expect usage.
-- `make pre-commit`: all checks passed, including nextest with 6002 passed and
-  111 skipped, plus doctests.
+- `cargo check -p rustfs-ecstore`: passed.
+- `cargo test -p rustfs-ecstore --test storage_api_compat_test --no-fail-fast`:
+  passed.
+- `cargo check -p rustfs -p rustfs-ecstore`: passed.
+- `./scripts/check_architecture_migration_rules.sh`: passed.
+- `./scripts/check_layer_dependencies.sh`: passed.
+- `cargo fmt --all --check`: passed.
+- `git diff --check`: passed.
+- Rust risk scan: no new production `unwrap`/`expect`, panic/todo markers,
+  `unsafe`, or process-spawning calls in added Rust lines.
+- `make pre-commit`: passed.
 
 Notes:
 
-- This slice centralizes startup runtime foundation bootstrap without changing
-  startup ordering or fatal boundaries.
-- Observability initialization remains in binary startup so early fatal stderr
-  handling stays unchanged.
+- This slice removes the old full storage facade after no real code consumers
+  remain.
+- The concrete storage operation traits, `StorageAdminApi`, and
+  `NamespaceLocking` remain available and covered.
+- The slice does not move traits across crate boundaries.
 
 ## Handoff Notes
 
-- R-012 is complete.
-- Next startup slices can keep using larger pure moves, but must keep startup
-  ordering, fatal/non-fatal boundaries, shutdown ownership, and readiness
-  ownership explicit in tests.
+- Old storage facade removal is locally verified on a branch current with
+  `origin/main`.
+- After this lands, remaining storage work can focus on concrete operation
+  contracts instead of the aggregate facade.

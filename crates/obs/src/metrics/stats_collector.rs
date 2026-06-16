@@ -870,7 +870,7 @@ pub async fn collect_cluster_usage_metric_stats() -> Option<(ClusterUsageStats, 
 
 /// Collect ILM metrics from the current lifecycle runtime state.
 pub async fn collect_ilm_metric_stats() -> Option<IlmStats> {
-    let expiry_pending_tasks = GLOBAL_ExpiryState.read().await.pending_tasks().await as u64;
+    let expiry_pending_tasks = GLOBAL_ExpiryState.read().await.pending_tasks() as u64;
     let transition_active_tasks = GLOBAL_TransitionState.active_tasks().max(0) as u64;
     let transition_pending_tasks = GLOBAL_TransitionState.pending_tasks() as u64;
     let transition_missed_immediate_tasks = GLOBAL_TransitionState.missed_immediate_tasks().max(0) as u64;

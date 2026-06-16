@@ -22,7 +22,7 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
-use rustfs_common::heal_channel::{HealChannelPriority, HealChannelRequest, HealOpts};
+use rustfs_common::heal_channel::{HealChannelPriority, HealChannelRequest, HealOpts, HealRequestSource};
 use rustfs_config::MAX_HEAL_REQUEST_SIZE;
 use rustfs_ecstore::bucket::utils::is_valid_object_prefix;
 use rustfs_ecstore::store_api::HealOperations;
@@ -37,6 +37,12 @@ use std::path::PathBuf;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
+
+const LOG_COMPONENT_ADMIN_API: &str = "admin_api";
+const LOG_SUBSYSTEM_HEAL_ADMIN: &str = "heal_admin";
+const EVENT_ADMIN_REQUEST_REJECTED: &str = "admin_request_rejected";
+const EVENT_ADMIN_REQUEST_FAILED: &str = "admin_request_failed";
+const EVENT_ADMIN_RESPONSE_EMITTED: &str = "admin_response_emitted";
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct HealInitParams {
@@ -85,7 +91,16 @@ fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> 
 
     if hip.client_token.is_empty() {
         hip.hs = serde_json::from_slice(body).map_err(|e| {
-            info!("err request body parse, err: {:?}", e);
+            warn!(
+                event = EVENT_ADMIN_REQUEST_REJECTED,
+                component = LOG_COMPONENT_ADMIN_API,
+                subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+                operation = "heal_request_init",
+                result = "rejected",
+                reason = "request_body_parse_failed",
+                error = ?e,
+                "admin request rejected"
+            );
             s3_error!(InvalidRequest, "err request body parse")
         })?;
     }
@@ -171,6 +186,7 @@ struct BackgroundHealStatus<'a> {
     info: &'a BackgroundHealInfo,
     heal_queue_length: u64,
     heal_active_tasks: u64,
+    heal_operations: rustfs_heal::HealOperationsSnapshot,
 }
 
 #[derive(Debug, Deserialize)]
@@ -250,6 +266,7 @@ fn build_heal_channel_request(hip: &HealInitParams) -> HealChannelRequest {
     heal_request.update_parity = Some(hip.hs.update_parity);
     heal_request.recursive = Some(hip.hs.recursive);
     heal_request.dry_run = Some(hip.hs.dry_run);
+    heal_request.source = HealRequestSource::Admin;
     heal_request
 }
 
@@ -286,13 +303,29 @@ fn heal_channel_response_items(
     heal_channel_response_status(response).1
 }
 
-fn encode_background_heal_status(info: &BackgroundHealInfo) -> S3Result<Vec<u8>> {
+fn encode_background_heal_status(
+    info: &BackgroundHealInfo,
+    heal_operations: rustfs_heal::HealOperationsSnapshot,
+) -> S3Result<Vec<u8>> {
     let status = BackgroundHealStatus {
         info,
-        heal_queue_length: rustfs_heal::current_heal_queue_length(),
-        heal_active_tasks: rustfs_heal::current_heal_active_tasks(),
+        heal_queue_length: heal_operations.queue_length,
+        heal_active_tasks: heal_operations.active_tasks,
+        heal_operations,
     };
-    serde_json::to_vec(&status).map_err(|e| s3_error!(InternalError, "failed to serialize background heal status: {e}"))
+    serde_json::to_vec(&status).map_err(|e| {
+        warn!(
+            event = EVENT_ADMIN_REQUEST_FAILED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+            operation = "background_heal_status",
+            result = "failed",
+            reason = "serialize_background_heal_status_failed",
+            error = %e,
+            "admin request failed"
+        );
+        s3_error!(InternalError, "failed to serialize background heal status: {e}")
+    })
 }
 
 fn validate_heal_request_mode(hip: &HealInitParams) -> S3Result<()> {
@@ -311,10 +344,30 @@ fn map_root_heal_status(heal_err: Option<rustfs_ecstore::error::Error>) -> S3Res
     match heal_err {
         None => Ok(()),
         Some(rustfs_ecstore::error::StorageError::NoHealRequired) => {
-            warn!("root heal completed with non-fatal status: no heal required");
+            info!(
+                event = EVENT_ADMIN_RESPONSE_EMITTED,
+                component = LOG_COMPONENT_ADMIN_API,
+                subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+                operation = "root_heal",
+                result = "success",
+                state = "no_heal_required",
+                "admin response emitted"
+            );
             Ok(())
         }
-        Some(err) => Err(s3_error!(InternalError, "root heal failed: {err}")),
+        Some(err) => {
+            warn!(
+                event = EVENT_ADMIN_REQUEST_FAILED,
+                component = LOG_COMPONENT_ADMIN_API,
+                subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+                operation = "root_heal",
+                result = "failed",
+                reason = "root_heal_failed",
+                error = %err,
+                "admin request failed"
+            );
+            Err(s3_error!(InternalError, "root heal failed: {err}"))
+        }
     }
 }
 
@@ -350,7 +403,6 @@ pub struct HealHandler {}
 #[async_trait::async_trait]
 impl Operation for HealHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle HealHandler, req: {:?}, params: {:?}", req, params);
         validate_heal_admin_request(&req).await?;
         let client_address = req
             .extensions
@@ -361,31 +413,72 @@ impl Operation for HealHandler {
         let bytes = match input.store_all_limited(MAX_HEAL_REQUEST_SIZE).await {
             Ok(b) => b,
             Err(e) => {
-                warn!("get body failed, e: {:?}", e);
+                warn!(
+                    event = EVENT_ADMIN_REQUEST_REJECTED,
+                    component = LOG_COMPONENT_ADMIN_API,
+                    subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+                    operation = "heal_request_body",
+                    result = "rejected",
+                    reason = "request_body_read_failed",
+                    error = ?e,
+                    "admin request rejected"
+                );
                 return Err(s3_error!(InvalidRequest, "heal request body too large or failed to read"));
             }
         };
-        info!("bytes: {:?}", bytes);
         let hip = extract_heal_init_params(&bytes, &req.uri, params)?;
         // The heal channel currently models bucket/object work. Root heal reuses the
         // existing format-heal path directly so `/v3/heal/` is accepted intentionally.
         if should_handle_root_heal_directly(&hip) {
             let Some(store) = resolve_object_store_handle() else {
+                warn!(
+                    event = EVENT_ADMIN_REQUEST_FAILED,
+                    component = LOG_COMPONENT_ADMIN_API,
+                    subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+                    operation = "root_heal",
+                    result = "failed",
+                    reason = "server_not_initialized",
+                    "admin request failed"
+                );
                 return Err(s3_error!(InternalError, "server not initialized"));
             };
 
-            let (_, heal_err) = store
-                .heal_format(hip.hs.dry_run)
-                .await
-                .map_err(|e| s3_error!(InternalError, "root heal failed: {e}"))?;
+            let (_, heal_err) = store.heal_format(hip.hs.dry_run).await.map_err(|e| {
+                warn!(
+                    event = EVENT_ADMIN_REQUEST_FAILED,
+                    component = LOG_COMPONENT_ADMIN_API,
+                    subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+                    operation = "root_heal",
+                    result = "failed",
+                    reason = "heal_format_failed",
+                    error = %e,
+                    "admin request failed"
+                );
+                s3_error!(InternalError, "root heal failed: {e}")
+            })?;
 
             map_root_heal_status(heal_err)?;
             let body = encode_heal_start_success("root-heal".to_string(), client_address)?;
+            info!(
+                event = EVENT_ADMIN_RESPONSE_EMITTED,
+                component = LOG_COMPONENT_ADMIN_API,
+                subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+                operation = "root_heal",
+                result = "success",
+                state = "started",
+                "admin response emitted"
+            );
 
             return Ok(json_response(StatusCode::OK, body));
         }
         validate_heal_request_mode(&hip)?;
-        info!("body: {:?}", hip);
+        let response_operation = if hip.force_stop {
+            "cancel_heal"
+        } else if !hip.client_token.is_empty() && !hip.force_start {
+            "query_heal_status"
+        } else {
+            "start_heal"
+        };
 
         let heal_path = path_join(&[PathBuf::from(hip.bucket.clone()), PathBuf::from(hip.obj_prefix.clone())]);
         let (tx, mut rx) = mpsc::channel(1);
@@ -548,6 +641,15 @@ impl Operation for HealHandler {
         }
 
         let (status, body) = map_heal_response(rx.recv().await)?;
+        info!(
+            event = EVENT_ADMIN_RESPONSE_EMITTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+            operation = response_operation,
+            result = "success",
+            status_code = status.as_u16(),
+            "admin response emitted"
+        );
         Ok(json_response(status, body))
     }
 }
@@ -557,15 +659,32 @@ pub struct BackgroundHealStatusHandler {}
 #[async_trait::async_trait]
 impl Operation for BackgroundHealStatusHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle BackgroundHealStatusHandler");
         validate_heal_admin_request(&req).await?;
 
         let Some(store) = resolve_object_store_handle() else {
+            warn!(
+                event = EVENT_ADMIN_REQUEST_FAILED,
+                component = LOG_COMPONENT_ADMIN_API,
+                subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+                operation = "background_heal_status",
+                result = "failed",
+                reason = "server_not_initialized",
+                "admin request failed"
+            );
             return Err(s3_error!(InternalError, "server not initialized"));
         };
 
         let info = read_background_heal_info(store).await;
-        let body = encode_background_heal_status(&info)?;
+        let heal_operations = rustfs_heal::current_heal_operations_snapshot().await;
+        let body = encode_background_heal_status(&info, heal_operations)?;
+        info!(
+            event = EVENT_ADMIN_RESPONSE_EMITTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+            operation = "background_heal_status",
+            result = "success",
+            "admin response emitted"
+        );
 
         Ok(json_response(StatusCode::OK, body))
     }
@@ -583,7 +702,7 @@ mod tests {
     use http::StatusCode;
     use http::Uri;
     use matchit::Router;
-    use rustfs_common::heal_channel::{HealChannelPriority, HealOpts, HealScanMode};
+    use rustfs_common::heal_channel::{HealChannelPriority, HealOpts, HealRequestSource, HealScanMode};
     use rustfs_ecstore::error::StorageError;
     use rustfs_scanner::scanner::BackgroundHealInfo;
     use s3s::{
@@ -867,7 +986,13 @@ mod tests {
             current_scan_mode: HealScanMode::Deep,
         };
 
-        let encoded = encode_background_heal_status(&info).expect("background heal info should serialize");
+        let operations = rustfs_heal::HealOperationsSnapshot {
+            queue_length: 3,
+            active_tasks: 2,
+            ..Default::default()
+        };
+
+        let encoded = encode_background_heal_status(&info, operations).expect("background heal info should serialize");
         let json: serde_json::Value = serde_json::from_slice(&encoded).expect("json should deserialize");
 
         assert_eq!(json["bitrotStartCycle"], 42);
@@ -875,6 +1000,12 @@ mod tests {
         assert!(json["bitrotStartTime"].is_null());
         assert!(json["healQueueLength"].is_u64());
         assert!(json["healActiveTasks"].is_u64());
+        assert_eq!(json["healOperations"]["queueLength"], json["healQueueLength"]);
+        assert_eq!(json["healOperations"]["activeTasks"], json["healActiveTasks"]);
+        assert!(json["healOperations"]["queuedBySource"]["scanner"].is_u64());
+        assert!(json["healOperations"]["queuedBySource"]["admin"].is_u64());
+        assert!(json["healOperations"]["queuedByPriority"]["low"].is_u64());
+        assert!(json["healOperations"]["queuedByPriority"]["high"].is_u64());
     }
 
     #[test]
@@ -929,6 +1060,7 @@ mod tests {
         assert_eq!(request.bucket, "bucket-a");
         assert_eq!(request.object_prefix.as_deref(), Some("prefix-a"));
         assert_eq!(request.priority, HealChannelPriority::High);
+        assert_eq!(request.source, HealRequestSource::Admin);
         assert!(request.force_start);
         assert_eq!(request.pool_index, Some(1));
         assert_eq!(request.set_index, Some(2));

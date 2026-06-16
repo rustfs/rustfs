@@ -97,7 +97,9 @@ metrics.pacing_pressure.primary_pressure
 metrics.pacing_pressure.last_cycle_budget_limited
 metrics.lifecycle_transition.current_queued
 metrics.lifecycle_transition.scanner_missed
+metrics.maintenance_control.primary_control
 metrics.source_work
+metrics.replication_repair
 metrics.scan_checkpoint
 ```
 
@@ -146,6 +148,112 @@ Use these counters to decide whether scan progress is limited by scanner pacing
 or by a downstream subsystem such as lifecycle transition, replication repair,
 or heal admission.
 
+## Reading Heal Operations
+
+The background heal status route is:
+
+```text
+POST /v3/background-heal/status
+```
+
+It reports scanner-driven bitrot state together with heal queue execution
+state. `healQueueLength` and `healActiveTasks` keep the legacy totals.
+`healOperations` adds the same totals split by request source and priority:
+
+| Field | Meaning |
+|---|---|
+| `queueLength` | Total queued heal requests. |
+| `activeTasks` | Total running heal tasks. |
+| `queuedBySource` | Queued requests split into `scanner`, `admin`, `autoHeal`, and `internal`. |
+| `activeBySource` | Running tasks split into `scanner`, `admin`, `autoHeal`, and `internal`. |
+| `queuedByPriority` | Queued requests split into `low`, `normal`, `high`, and `urgent`. |
+| `activeByPriority` | Running tasks split into `low`, `normal`, `high`, and `urgent`. |
+
+Use this route when `metrics.source_work` shows `heal` or `bitrot` queued or
+missed work. Scanner-originated object checks should appear under
+`scanner/low` for opportunistic work, while manual admin heal should appear
+under `admin/high`. If scanner work grows but admin work remains blocked, treat
+that as heal queue pressure rather than scanner pacing pressure.
+
+## Reading Replication Repair
+
+`metrics.replication_repair`, `metrics.current_cycle_replication_repair`, and
+`metrics.last_cycle_replication_repair` split scanner-discovered replication
+repair work by source and repair kind.
+
+Each entry has the same `checked`, `queued`, `executed`, `failed`, `skipped`,
+and `missed` counters used by `source_work`, plus:
+
+| Field | Meaning |
+|---|---|
+| `source` | `bucket_replication` for bucket replication repair, or `site_replication` for site replication boundary signals. |
+| `kind` | Bucket repair kinds are `object`, `delete_marker`, `version_purge`, and `existing_object`. Site replication boundary kinds are `passive_requeue` and `active_resync`. |
+
+For bucket replication, `queued` means scanner-discovered repair was admitted
+to the replication queue, `missed` means the queue or worker path could not
+accept it, and `skipped` means the object did not require a new repair task.
+
+The site replication kinds keep passive scanner discovery separate from active
+resync. Scanner status may report site replication boundary counters, but the
+scanner should not be treated as the active site replication resync controller.
+
+## Reading Maintenance Control
+
+`metrics.maintenance_control` derives a source-level control snapshot from
+scanner pacing, partial-cycle state, source work, and lifecycle transition
+queue state. It does not change scanner scheduling by itself; it explains why a
+source is moving, deferred, or blocked. When no scan cycle is currently active,
+source-work controls use the last completed cycle so recently missed work stays
+visible between scanner passes.
+
+`metrics.maintenance_control.primary_control` summarizes the highest-priority
+source state:
+
+| Value | Meaning |
+|---|---|
+| `blocked_source` | At least one maintenance source found work that could not be admitted or is blocked by a downstream queue. |
+| `deferred_source` | At least one source was deferred by a partial scanner cycle or budget-limited pass. |
+| `active_source` | At least one source has current-cycle work or queued downstream work. |
+| `pacing_pressure` | No source-specific state dominated, but scanner pacing pressure is still visible. |
+| `none` | No source-level maintenance control pressure was observed. |
+
+Each `metrics.maintenance_control.sources[]` entry has:
+
+| Field | Meaning |
+|---|---|
+| `source` | Scanner source such as `usage`, `lifecycle`, `bucket_replication`, `site_replication`, `heal`, `bitrot`, or `alerts`. |
+| `state` | `idle`, `active`, `deferred`, or `blocked`. |
+| `reason` | Derived reason such as `active_work`, `queued_work`, `partial_cycle`, `missed_work`, `expiry_queue_backlog`, `transition_failed`, `transition_compensation_backlog`, `transition_queue_backlog`, or `transition_queue_full`. |
+| `backlog` | Current source-level backlog estimate from queued or missed work. |
+| `current_checked` | Current-cycle checked work for this source, or the last completed cycle when no scan cycle is active. |
+| `current_queued` | Current-cycle queued work for this source, or the last completed cycle when no scan cycle is active. |
+| `current_missed` | Current-cycle work that could not be admitted, or the last completed cycle when no scan cycle is active. |
+| `lifetime_missed` | Lifetime missed work counter for context. |
+| `partial_cycles` | Partial cycles attributed to this source. |
+
+Use this snapshot before changing scanner controls. For example,
+`blocked_source` with `lifecycle/missed_work` points at downstream lifecycle
+admission, while `deferred_source` with `usage/partial_cycle` points at scanner
+cycle budgets. `lifecycle/expiry_queue_backlog` means scanner-driven expiry or
+delete work is still queued or active in the expiry worker pool.
+`lifecycle/transition_failed` means transition worker execution failed during
+the current or last completed scan cycle, while
+`lifecycle/transition_compensation_backlog` means transition compensation is
+still pending or running after queue backpressure.
+
+`metrics.lifecycle_expiry` exposes the expiry/delete worker queue observed by
+scanner-driven lifecycle work:
+
+| Field | Meaning |
+|---|---|
+| `current_queue_capacity` | Effective expiry worker queue capacity for this node. |
+| `current_queued` | Expiry/delete tasks currently waiting in the worker queue. |
+| `current_active` | Expiry/delete tasks currently running in a worker. |
+| `current_workers` | Configured expiry worker count. |
+| `queue_missed` | Expiry/delete tasks that could not be queued because no worker channel was available or the queue was closed. |
+| `scanner_queued` | Scanner-discovered expiry/delete object versions admitted to the expiry queue. |
+| `scanner_missed` | Scanner-discovered expiry/delete object versions that could not be admitted. |
+
 ## Reading Distributed Metrics
 
 `/rustfs/admin/v3/scanner/status` and `/rustfs/admin/v3/metrics` report the
@@ -169,11 +277,13 @@ done
 ```
 
 The `aggregated.scanner` payload preserves the same scanner progress,
-checkpoint, pacing, source work, and lifecycle transition fields used by the
-local scanner status, but only for the node that returned the response. The
-`by_host.*.scanner` payload keeps that node's host view. Compare the per-node
-artifacts externally to find old active paths, partial checkpoints, pacing
-pressure, or downstream queue admission problems across the deployment.
+checkpoint, pacing, source work, maintenance control, lifecycle expiry, and
+lifecycle transition fields used by the local scanner status, but only for the
+node that returned the response. The `by_host.*.scanner` payload keeps that
+node's host view.
+Compare the per-node artifacts externally to find old active paths, partial
+checkpoints, pacing pressure, source-level control pressure, or downstream
+queue admission problems across the deployment.
 
 ## Reading Lifecycle Transition Status
 
@@ -189,6 +299,7 @@ work:
 | `queue_full` | Queue-full observations in the transition state. |
 | `queue_send_timeout` | Send timeouts for transition queue admission. |
 | `compensation_scheduled` | Buckets scheduled for transition compensation. |
+| `compensation_pending` | Buckets with transition compensation still pending or running. |
 | `compensation_running` | Transition compensation tasks currently running. |
 | `scanner_queued` | Scanner transition tasks admitted to the queue. |
 | `scanner_missed` | Scanner transition tasks that could not be admitted. |
@@ -206,21 +317,23 @@ sustained CPU usage while the scanner is enabled:
 
 1. Read `/v3/scanner/status`.
 2. Check `metrics.pacing_pressure.primary_pressure`.
-3. Check `runtime_config.delay`, `runtime_config.max_wait_seconds`, and
+3. Check `metrics.maintenance_control.primary_control` and source entries
+   before changing runtime controls.
+4. Check `runtime_config.delay`, `runtime_config.max_wait_seconds`, and
    `runtime_config.cycle_interval_seconds` to confirm the active values and
    their sources.
-4. Check `metrics.current_cycle_objects_scanned`,
+5. Check `metrics.current_cycle_objects_scanned`,
    `metrics.current_cycle_directories_scanned`, and active paths to confirm the
    scanner is the active work.
-5. If `primary_pressure` is `throttle_pause` and pause ratios are low, raise
+6. If `primary_pressure` is `throttle_pause` and pause ratios are low, raise
    `scanner.delay` first.
-6. If individual sleeps are too short, raise `scanner.max_wait`.
-7. If each scan cycle finishes but starts too often, raise `scanner.cycle`.
-8. If scans must be broken into bounded chunks, set one of the cycle budgets:
+7. If individual sleeps are too short, raise `scanner.max_wait`.
+8. If each scan cycle finishes but starts too often, raise `scanner.cycle`.
+9. If scans must be broken into bounded chunks, set one of the cycle budgets:
    `scanner.cycle_max_duration`, `scanner.cycle_max_objects`, or
    `scanner.cycle_max_directories`.
-9. Recheck `pacing_pressure`, source work, and lifecycle transition status after
-   one or more scanner cycles.
+10. Recheck `pacing_pressure`, `maintenance_control`, source work, and
+    lifecycle transition status after one or more scanner cycles.
 
 Do not rely only on a longer cycle interval if lifecycle, replication, heal, or
 bitrot work must keep moving. Use source work and transition status to confirm

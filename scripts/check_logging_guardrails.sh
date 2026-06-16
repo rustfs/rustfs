@@ -20,6 +20,12 @@ checked_files=(
   "rustfs/src/admin/handlers/quota.rs"
   "rustfs/src/admin/handlers/rebalance.rs"
   "rustfs/src/admin/handlers/tier.rs"
+  "rustfs/src/admin/handlers/event.rs"
+  "rustfs/src/admin/handlers/audit.rs"
+  "rustfs/src/admin/handlers/pools.rs"
+  "rustfs/src/admin/handlers/system.rs"
+  "rustfs/src/storage/rpc/http_service.rs"
+  "rustfs/src/storage/rpc/node_service.rs"
   "crates/audit/src/pipeline.rs"
   "crates/audit/src/system.rs"
   "crates/audit/src/global.rs"
@@ -223,6 +229,24 @@ forbidden_patterns=(
   'warn!("handle RebalanceStop notification_sys load_rebalance_meta")'
   'warn!("rebalance stop propagation failed after local state update: {err}")'
   'warn!("handle RebalanceStop notification_sys load_rebalance_meta done")'
+  'warn!("handle ListPools")'
+  'warn!("handle StatusPool")'
+  'warn!("handle StartDecommission")'
+  'warn!("handle CancelDecommission")'
+  'warn!("specified pool {} not found, please specify a valid pool", &query.pool)'
+  'warn!("handle ServiceHandle")'
+  'warn!("handle InspectDataHandler")'
+  'warn!("handle StorageInfoHandler")'
+  'warn!("handle DataUsageInfoHandler")'
+  'warn!("failed to read request body: {:?}")'
+  'info!("Setting target config for type '\''{}'\'', name '\''{}'\''", target_type, target_name)'
+  'info!("Removing target config for type '\''{}'\'', name '\''{}'\''", target_type, target_name)'
+  'warn!("{message}")'
+  'warn!(error = %e, "walk_dir failed")'
+  'info!("handling load_rebalance_meta request")'
+  'info!("load_rebalance_meta completed")'
+  'info!(start_rebalance, "spawning background rebalance task")'
+  'error!(error = %message, "background rebalance start failed")'
   'warn!("get body failed, e: {:?}")'
   'debug!("add tier args {:?}")'
   'warn!("parse force failed, e: {:?}")'
@@ -235,10 +259,7 @@ forbidden_patterns=(
   'warn!("tier_config_mgr rand: {}")'
   'warn!("tier_config_mgr clear failed, e: {:?}")'
   'warn!("tier_config_mgr save failed, e: {:?}")'
-  'warn!(
-            component = LOG_COMPONENT_ADMIN,
-            subsystem = LOG_SUBSYSTEM_OBJECT_LAMBDA,
-            event = "object_lambda_tls_verification_disabled"'
+  'event = "object_lambda_tls_verification_disabled"'
   'info!("FTP system initialized successfully"'
   'debug!("FTP system is disabled")'
   'info!("FTP system disabled"'

@@ -137,7 +137,7 @@ futures-core = "0.3.32"
 futures-lite = "2.6.1"
 futures-util = "0.3.32"
 pollster = "0.4.0"
-pulsar = { version = "6.8.0", default-features = false, features = ["tokio-rustls-runtime"] }
+pulsar = { version = "6.8.0", default-features = false, features = ["tokio-rustls-runtime","telemetry"] }
 lapin = { version = "4.10.0", default-features = false, features = ["tokio", "rustls", "rustls--aws_lc_rs"] }
 hyper = { version = "1.10.1", features = ["http2", "http1", "server"] }
 hyper-rustls = { version = "0.27.9", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs", "webpki-roots"] }
@@ -160,6 +160,7 @@ tower = { version = "0.5.3", features = ["timeout"] }
 tower-http = { version = "0.6.11", features = ["cors"] }
 
 # Serialization and Data Formats
+apache-avro = "0.21.0"
 bytes = { version = "1.11.1", features = ["serde"] }
 bytesize = "2.4.0"
 byteorder = "1.5.0"
@@ -216,7 +217,7 @@ aws-smithy-http-client = { version = "1.1.13", default-features = false, feature
 aws-smithy-types = { version = "1.5.0" }
 base64 = "0.22.1"
 base64-simd = "0.8.0"
-brotli = "8.0.3"
+brotli = "8.0.4"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 const-str = { version = "1.1.0", features = ["std", "proc"] }
 convert_case = "0.11.0"
@@ -270,7 +271,7 @@ redis = { version = "1.2.3", features = ["connection-manager", "tokio-rustls-com
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.2" }
-s3s = { git = "https://github.com/rustfs/s3s", rev = "cf4c3346ed2554daa7fc6437f9969b076a5137ad", features = ["minio"] }
+s3s = { git = "https://github.com/rustfs/s3s", rev = "c59b62f7badf29fefefec69381d13cd459f44aa8", features = ["minio"] }
 serial_test = "3.5.0"
 shadow-rs = { version = "2.0.0", default-features = false }
 siphasher = "1.0.3"

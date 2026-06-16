@@ -82,3 +82,17 @@ The current decision is recorded in
 global server-config state in `ecstore`, and preserve the old
 `rustfs_ecstore::config::*` path with a temporary compatibility marker during
 the first extraction.
+
+## Loss-Prevention Coverage
+
+Architecture migration checks must keep public contract re-exports and ECStore
+compatibility coverage from silently drifting during cleanup PRs.
+
+Required `rustfs-storage-api` public re-exports:
+
+- `pub use admin::{DiskSetSelector, StorageAdminApi};`
+- `pub use bucket::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};`
+- `pub use error::{StorageErrorCode, StorageResult};`
+
+ECStore must keep compile-time coverage for both `StorageAdminApi` and the
+separate `NamespaceLocking` operation group.

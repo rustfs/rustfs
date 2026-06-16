@@ -21,6 +21,26 @@ contains_line() {
   grep -qxF "$needle" "$file"
 }
 
+require_source_line() {
+  local file="$1"
+  local expected="$2"
+  local description="$3"
+
+  if ! contains_line "$expected" "${ROOT_DIR}/${file}"; then
+    report_failure "${description} missing exact source line in ${file}: ${expected}"
+  fi
+}
+
+require_source_contains() {
+  local file="$1"
+  local expected="$2"
+  local description="$3"
+
+  if ! grep -qF "$expected" "${ROOT_DIR}/${file}"; then
+    report_failure "${description} missing source text in ${file}: ${expected}"
+  fi
+}
+
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -152,6 +172,32 @@ while IFS= read -r register_id; do
     report_failure "cleanup-register entry ${register_id} has no source marker"
   fi
 done <"$REGISTER_IDS_FILE"
+
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
+  "pub use admin::{DiskSetSelector, StorageAdminApi};" \
+  "storage-api public admin contract re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
+  "pub use bucket::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};" \
+  "storage-api public bucket DTO re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
+  "pub use error::{StorageErrorCode, StorageResult};" \
+  "storage-api public error contract re-export"
+
+require_source_contains \
+  "crates/ecstore/src/store_api/traits.rs" \
+  "pub trait NamespaceLocking: Send + Sync + Debug + 'static" \
+  "separate namespace-locking operation-group trait"
+require_source_contains \
+  "crates/ecstore/tests/storage_api_compat_test.rs" \
+  "fn ecstore_implements_storage_admin_api_contract()" \
+  "ECStore StorageAdminApi compile-time coverage test"
+require_source_contains \
+  "crates/ecstore/tests/storage_api_compat_test.rs" \
+  "fn ecstore_implements_namespace_locking_contract()" \
+  "ECStore NamespaceLocking compile-time coverage test"
 
 if (( FAILURES > 0 )); then
   exit 1

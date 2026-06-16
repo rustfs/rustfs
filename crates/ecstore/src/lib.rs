@@ -60,7 +60,6 @@ pub use global::{get_global_lock_client, get_global_lock_clients, set_global_loc
 pub use global::{new_object_layer_fn, resolve_object_store_handle, set_object_store_resolver};
 
 pub use global::GLOBAL_Endpoints;
-pub use store_api::StorageAPI;
 
 #[cfg(test)]
 mod rio_tests {

@@ -72,6 +72,7 @@ const S3_SESSION_TOKEN_CONFIG_KEY: &str = "s3.session-token";
 const TABLE_CATALOG_NAMESPACE_RESOURCE_ROOT: &str = "namespaces";
 const TABLE_CATALOG_TABLE_RESOURCE_ROOT: &str = "tables";
 const TABLE_CATALOG_ADMIN_OPERATION_SLOW_LOG_THRESHOLD: StdDuration = StdDuration::from_secs(2);
+const DEFAULT_TABLE_MAINTENANCE_WORKER_ID: &str = "rustfs-maintenance-worker";
 const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /v1/{prefix}/namespaces",
     "POST /v1/{prefix}/namespaces",
@@ -96,19 +97,28 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /{warehouse}/namespaces/{namespace}/tables",
     "POST /{warehouse}/namespaces/{namespace}/tables",
     "POST /{warehouse}/namespaces/{namespace}/register",
+    "GET /{warehouse}/namespaces/{namespace}/views",
+    "POST /{warehouse}/namespaces/{namespace}/views",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}",
     "HEAD /{warehouse}/namespaces/{namespace}/tables/{table}",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/credentials",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}",
     "DELETE /{warehouse}/namespaces/{namespace}/tables/{table}",
+    "GET /{warehouse}/namespaces/{namespace}/views/{view}",
+    "POST /{warehouse}/namespaces/{namespace}/views/{view}",
+    "DELETE /{warehouse}/namespaces/{namespace}/views/{view}",
+    "GET /{warehouse}/namespaces/{namespace}/tables/{table}/refs",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
     "PUT /{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
     "PUT /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}",
+    "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/worker/run",
+    "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/heartbeat",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
+    "GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/diagnostics",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
@@ -125,19 +135,28 @@ static DROP_NAMESPACE_HANDLER: RestDropNamespaceHandler = RestDropNamespaceHandl
 static LIST_TABLES_HANDLER: RestListTablesHandler = RestListTablesHandler {};
 static CREATE_TABLE_HANDLER: RestCreateTableHandler = RestCreateTableHandler {};
 static REGISTER_TABLE_HANDLER: RestRegisterTableHandler = RestRegisterTableHandler {};
+static LIST_VIEWS_HANDLER: RestListViewsHandler = RestListViewsHandler {};
+static CREATE_VIEW_HANDLER: RestCreateViewHandler = RestCreateViewHandler {};
 static LOAD_TABLE_HANDLER: RestLoadTableHandler = RestLoadTableHandler {};
 static TABLE_EXISTS_HANDLER: RestTableExistsHandler = RestTableExistsHandler {};
 static LOAD_CREDENTIALS_HANDLER: RestLoadCredentialsHandler = RestLoadCredentialsHandler {};
 static COMMIT_TABLE_HANDLER: RestCommitTableHandler = RestCommitTableHandler {};
 static DROP_TABLE_HANDLER: RestDropTableHandler = RestDropTableHandler {};
+static LOAD_VIEW_HANDLER: RestLoadViewHandler = RestLoadViewHandler {};
+static REPLACE_VIEW_HANDLER: RestReplaceViewHandler = RestReplaceViewHandler {};
+static DROP_VIEW_HANDLER: RestDropViewHandler = RestDropViewHandler {};
+static LIST_TABLE_REFS_HANDLER: ListTableRefsHandler = ListTableRefsHandler {};
 static GET_TABLE_METADATA_LOCATION_HANDLER: GetTableMetadataLocationHandler = GetTableMetadataLocationHandler {};
 static UPDATE_TABLE_METADATA_LOCATION_HANDLER: UpdateTableMetadataLocationHandler = UpdateTableMetadataLocationHandler {};
 static TABLE_METADATA_MAINTENANCE_HANDLER: RestTableMetadataMaintenanceHandler = RestTableMetadataMaintenanceHandler {};
 static GET_TABLE_MAINTENANCE_CONFIG_HANDLER: GetTableMaintenanceConfigHandler = GetTableMaintenanceConfigHandler {};
 static PUT_TABLE_MAINTENANCE_CONFIG_HANDLER: PutTableMaintenanceConfigHandler = PutTableMaintenanceConfigHandler {};
 static GET_TABLE_MAINTENANCE_JOB_HANDLER: GetTableMaintenanceJobHandler = GetTableMaintenanceJobHandler {};
+static RUN_TABLE_MAINTENANCE_WORKER_HANDLER: RunTableMaintenanceWorkerHandler = RunTableMaintenanceWorkerHandler {};
+static HEARTBEAT_TABLE_MAINTENANCE_JOB_HANDLER: HeartbeatTableMaintenanceJobHandler = HeartbeatTableMaintenanceJobHandler {};
 static EXPORT_TABLE_CATALOG_HANDLER: ExportTableCatalogHandler = ExportTableCatalogHandler {};
 static IMPORT_TABLE_CATALOG_HANDLER: ImportTableCatalogHandler = ImportTableCatalogHandler {};
+static EXTERNAL_CATALOG_BRIDGE_HANDLER: ExternalCatalogBridgeHandler = ExternalCatalogBridgeHandler {};
 static GET_TABLE_CATALOG_DIAGNOSTICS_HANDLER: GetTableCatalogDiagnosticsHandler = GetTableCatalogDiagnosticsHandler {};
 static RECOVER_TABLE_CATALOG_HANDLER: RecoverTableCatalogHandler = RecoverTableCatalogHandler {};
 static ROLLBACK_TABLE_CATALOG_HANDLER: RollbackTableCatalogHandler = RollbackTableCatalogHandler {};
@@ -216,6 +235,36 @@ struct TableMetadataMaintenanceRequest {
     retain_recent_metadata_files: usize,
     #[serde(default)]
     delete: bool,
+    #[serde(default, rename = "snapshot-expiration")]
+    snapshot_expiration: Option<crate::table_catalog::TableSnapshotExpirationConfig>,
+    #[serde(default, rename = "commit-snapshot-expiration")]
+    commit_snapshot_expiration: bool,
+    #[serde(default)]
+    compaction: Option<crate::table_catalog::TableCompactionPlanningConfig>,
+    #[serde(default, rename = "commit-compaction")]
+    commit_compaction: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TableMaintenanceWorkerRunRequest {
+    #[serde(default, rename = "worker-id")]
+    worker_id: Option<String>,
+}
+
+impl TableMaintenanceWorkerRunRequest {
+    fn worker_id(&self) -> &str {
+        self.worker_id.as_deref().unwrap_or(DEFAULT_TABLE_MAINTENANCE_WORKER_ID)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TableMaintenanceHeartbeatRequest {
+    #[serde(rename = "lease-id")]
+    lease_id: String,
+    #[serde(rename = "worker-id")]
+    worker_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,6 +300,47 @@ struct RollbackTableRequest {
     commit_id: Option<String>,
     #[serde(default, rename = "idempotency-key", alias = "idempotencyKey")]
     idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct UnsupportedCatalogFeatureResponse {
+    feature: &'static str,
+    status: &'static str,
+    reason: &'static str,
+    replacement: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct TableRefsResponse {
+    table_bucket: String,
+    namespace: String,
+    table: String,
+    current_metadata_location: String,
+    current_snapshot_id: Option<i64>,
+    protected_ref_count: usize,
+    user_defined_ref_count: usize,
+    refs: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct ExternalCatalogBridgeResponse {
+    table_bucket: String,
+    namespace: String,
+    table: String,
+    status: &'static str,
+    supported_import: &'static str,
+    unsupported_bridges: Vec<ExternalCatalogBridgeCapability>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct ExternalCatalogBridgeCapability {
+    catalog: &'static str,
+    status: &'static str,
+    reason: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -543,6 +633,16 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
     )?;
     r.insert(
         Method::GET,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/views").as_str(),
+        AdminOperation(&LIST_VIEWS_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/views").as_str(),
+        AdminOperation(&CREATE_VIEW_HANDLER),
+    )?;
+    r.insert(
+        Method::GET,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}").as_str(),
         AdminOperation(&LOAD_TABLE_HANDLER),
     )?;
@@ -565,6 +665,26 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         Method::DELETE,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}").as_str(),
         AdminOperation(&DROP_TABLE_HANDLER),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/views/{{view}}").as_str(),
+        AdminOperation(&LOAD_VIEW_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/views/{{view}}").as_str(),
+        AdminOperation(&REPLACE_VIEW_HANDLER),
+    )?;
+    r.insert(
+        Method::DELETE,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/views/{{view}}").as_str(),
+        AdminOperation(&DROP_VIEW_HANDLER),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/refs").as_str(),
+        AdminOperation(&LIST_TABLE_REFS_HANDLER),
     )?;
     r.insert(
         Method::GET,
@@ -597,6 +717,16 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         AdminOperation(&GET_TABLE_MAINTENANCE_JOB_HANDLER),
     )?;
     r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/worker/run").as_str(),
+        AdminOperation(&RUN_TABLE_MAINTENANCE_WORKER_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/jobs/{{job}}/heartbeat").as_str(),
+        AdminOperation(&HEARTBEAT_TABLE_MAINTENANCE_JOB_HANDLER),
+    )?;
+    r.insert(
         Method::GET,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/catalog/export").as_str(),
         AdminOperation(&EXPORT_TABLE_CATALOG_HANDLER),
@@ -605,6 +735,11 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         Method::POST,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/catalog/import").as_str(),
         AdminOperation(&IMPORT_TABLE_CATALOG_HANDLER),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/catalog/external").as_str(),
+        AdminOperation(&EXTERNAL_CATALOG_BRIDGE_HANDLER),
     )?;
     r.insert(
         Method::GET,
@@ -646,6 +781,21 @@ fn build_json_response<T: Serialize>(status: StatusCode, body: &T) -> S3Result<S
 
 fn empty_response(status: StatusCode) -> S3Response<(StatusCode, Body)> {
     S3Response::new((status, Body::default()))
+}
+
+fn unsupported_catalog_feature_response(
+    feature: &'static str,
+    replacement: &'static str,
+) -> S3Result<S3Response<(StatusCode, Body)>> {
+    build_json_response(
+        StatusCode::NOT_IMPLEMENTED,
+        &UnsupportedCatalogFeatureResponse {
+            feature,
+            status: "unsupported",
+            reason: "the catalog advertises this advanced Iceberg surface explicitly but does not implement it yet",
+            replacement,
+        },
+    )
 }
 
 fn duration_millis_u64(duration: StdDuration) -> u64 {
@@ -834,6 +984,13 @@ fn table_name_from_params(params: &Params<'_, '_>) -> S3Result<String> {
     crate::table_catalog::IdentifierSegment::parse(table.to_string())
         .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
     Ok(table.to_string())
+}
+
+fn view_name_from_params(params: &Params<'_, '_>) -> S3Result<String> {
+    let view = params.get("view").unwrap_or("");
+    crate::table_catalog::IdentifierSegment::parse(view.to_string())
+        .map_err(|err| s3_error!(InvalidRequest, "invalid view name: {}", err))?;
+    Ok(view.to_string())
 }
 
 fn job_id_from_params(params: &Params<'_, '_>) -> S3Result<String> {
@@ -2456,6 +2613,7 @@ where
 
 async fn table_metadata_maintenance_response<B>(
     store: &crate::table_catalog::ObjectTableCatalogStore<B>,
+    metadata_backend: &B,
     bucket: &str,
     namespace: &crate::table_catalog::Namespace,
     table: &str,
@@ -2464,27 +2622,264 @@ async fn table_metadata_maintenance_response<B>(
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
-    let report = if request.delete {
-        store
-            .delete_table_metadata_maintenance_candidates(
-                bucket,
-                &namespace.public_name(),
-                table,
-                request.retain_recent_metadata_files,
-            )
-            .await
-            .map_err(catalog_store_error)
-    } else {
-        store
-            .plan_table_metadata_maintenance(bucket, &namespace.public_name(), table, request.retain_recent_metadata_files)
-            .await
-            .map_err(catalog_store_error)
-    }?;
-    store
-        .put_table_metadata_maintenance_report(&report)
+    if request.delete && request.commit_snapshot_expiration {
+        return Err(s3_error!(
+            InvalidRequest,
+            "snapshot expiration commit cannot be combined with metadata deletion"
+        ));
+    }
+    if request.delete && request.commit_compaction {
+        return Err(s3_error!(InvalidRequest, "compaction commit cannot be combined with metadata deletion"));
+    }
+    if request.commit_snapshot_expiration && request.commit_compaction {
+        return Err(s3_error!(
+            InvalidRequest,
+            "compaction commit cannot be combined with snapshot expiration commit"
+        ));
+    }
+    if request.commit_compaction && request.compaction.is_none() {
+        return Err(s3_error!(InvalidRequest, "commit-compaction requires a compaction request"));
+    }
+
+    let snapshot_expiration_request = request.snapshot_expiration;
+    let commit_snapshot_expiration = request.commit_snapshot_expiration;
+    let compaction_request = request.compaction;
+    let commit_compaction = request.commit_compaction;
+    let compaction = match compaction_request {
+        Some(config) if commit_compaction => Some(
+            store
+                .commit_table_compaction(bucket, &namespace.public_name(), table, config)
+                .await
+                .map_err(catalog_store_error)?,
+        ),
+        Some(config) => Some(
+            store
+                .plan_table_compaction(bucket, &namespace.public_name(), table, config)
+                .await
+                .map_err(catalog_store_error)?,
+        ),
+        None => None,
+    };
+    let snapshot_expiration_plan = match snapshot_expiration_request {
+        Some(config) => Some(
+            store
+                .plan_table_snapshot_expiration(bucket, &namespace.public_name(), table, config)
+                .await
+                .map_err(catalog_store_error)?,
+        ),
+        None => None,
+    };
+    let mut report = store
+        .run_table_metadata_maintenance_with_retention(
+            bucket,
+            &namespace.public_name(),
+            table,
+            request.delete,
+            Some("rustfs-admin".to_string()),
+            request.retain_recent_metadata_files,
+        )
         .await
         .map_err(catalog_store_error)?;
+    let snapshot_expiration = match (snapshot_expiration_plan, commit_snapshot_expiration) {
+        (Some(plan), true) => {
+            Some(commit_table_snapshot_expiration_response(store, metadata_backend, bucket, namespace, table, plan).await?)
+        }
+        (Some(plan), false) => Some(plan),
+        (None, _) => None,
+    };
+    report.snapshot_expiration = snapshot_expiration;
+    report.compaction = compaction;
+    if report.snapshot_expiration.is_some() || report.compaction.is_some() {
+        let committed_snapshot_expiration = report
+            .snapshot_expiration
+            .as_ref()
+            .is_some_and(|snapshot_expiration| snapshot_expiration.committed_metadata_location.is_some());
+        let committed_compaction = report
+            .compaction
+            .as_ref()
+            .is_some_and(|compaction| compaction.committed_metadata_location.is_some());
+        match store.put_table_metadata_maintenance_report(&report).await {
+            Ok(()) => {}
+            Err(err) if committed_snapshot_expiration || committed_compaction => {
+                tracing::warn!(
+                    error = %err,
+                    warehouse = bucket,
+                    namespace = namespace.public_name(),
+                    table,
+                    "failed to persist table maintenance report after catalog maintenance commit"
+                );
+            }
+            Err(err) => return Err(catalog_store_error(err)),
+        }
+    }
     Ok(report)
+}
+
+async fn commit_table_snapshot_expiration_response<B>(
+    store: &crate::table_catalog::ObjectTableCatalogStore<B>,
+    metadata_backend: &B,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+    mut report: crate::table_catalog::TableSnapshotExpirationReport,
+) -> S3Result<crate::table_catalog::TableSnapshotExpirationReport>
+where
+    B: crate::table_catalog::TableCatalogObjectBackend,
+{
+    let Some(current) = store
+        .load_table(bucket, &namespace.public_name(), table)
+        .await
+        .map_err(catalog_store_error)?
+    else {
+        return Err(s3_error!(InvalidRequest, "table not found"));
+    };
+    if report.table_id != current.table_id || report.current_metadata_location != current.metadata_location {
+        return Err(s3_error!(PreconditionFailed, "snapshot expiration plan is stale"));
+    }
+    if report.manual_review_count > 0 {
+        return Err(s3_error!(InvalidRequest, "snapshot expiration plan requires manual review before commit"));
+    }
+    let expired_snapshot_ids = report
+        .snapshot_reports
+        .iter()
+        .filter(|snapshot| snapshot.state == crate::table_catalog::TableSnapshotExpirationSnapshotState::ExpirationCandidate)
+        .filter_map(|snapshot| snapshot.snapshot_id)
+        .collect::<Vec<_>>();
+    if expired_snapshot_ids.is_empty() {
+        return Ok(report);
+    }
+
+    let current_metadata = read_table_metadata_json(metadata_backend, bucket, &current.metadata_location).await?;
+    let updates = [serde_json::json!({
+        "action": "remove-snapshots",
+        "snapshot-ids": expired_snapshot_ids.clone()
+    })];
+    let next_metadata = apply_table_commit_updates(current_metadata.clone(), &updates, &current.metadata_location)?;
+    validate_metadata_matches_current_metadata(&current_metadata, &next_metadata)?;
+    validate_metadata_table_location_in_bucket(bucket, &next_metadata)?;
+    let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
+        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
+    let (commit_id, metadata_file_token) = standard_commit_ids(None);
+    let next_generation = current.generation.saturating_add(1);
+    let next_metadata_location = crate::table_catalog::default_table_metadata_file_path(
+        namespace,
+        &table_name,
+        &next_metadata_file_name(next_generation, &metadata_file_token),
+    );
+    let next_metadata_data = serde_json::to_vec(&next_metadata)
+        .map_err(|err| s3_error!(InternalError, "failed to serialize snapshot expiration metadata: {}", err))?;
+    metadata_backend
+        .put_object(
+            bucket,
+            &next_metadata_location,
+            next_metadata_data,
+            crate::table_catalog::TableCatalogPutPrecondition::IfAbsent,
+        )
+        .await
+        .map_err(catalog_store_error)?;
+
+    let commit_request = crate::table_catalog::TableCommitRequest {
+        table_bucket: bucket.to_string(),
+        namespace: namespace.public_name(),
+        table: table.to_string(),
+        commit_id,
+        idempotency_key: None,
+        operation: "expire-snapshots".to_string(),
+        expected_version_token: current.version_token,
+        expected_metadata_location: current.metadata_location,
+        new_metadata_location: next_metadata_location,
+        requirements: Vec::new(),
+        writer: Some("rustfs-maintenance".to_string()),
+    };
+    let result = store.commit_table(commit_request).await.map_err(catalog_store_error)?;
+    report.expired_snapshot_ids = expired_snapshot_ids;
+    report.committed_metadata_location = Some(result.table.metadata_location);
+    Ok(report)
+}
+
+async fn table_refs_response<S>(
+    store: &S,
+    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+) -> S3Result<TableRefsResponse>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let Some(entry) = store
+        .load_table(bucket, &namespace.public_name(), table)
+        .await
+        .map_err(catalog_store_error)?
+    else {
+        return Err(s3_error!(InvalidRequest, "table not found"));
+    };
+    let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
+    let current_snapshot_id = metadata.get("current-snapshot-id").and_then(serde_json::Value::as_i64);
+    let refs = metadata
+        .get("refs")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let protected_ref_count = refs
+        .values()
+        .filter(|reference| {
+            reference
+                .get("snapshot-id")
+                .and_then(serde_json::Value::as_i64)
+                .is_some_and(|snapshot_id| Some(snapshot_id) != current_snapshot_id)
+        })
+        .count();
+    let user_defined_ref_count = refs.keys().filter(|name| name.as_str() != "main").count();
+
+    Ok(TableRefsResponse {
+        table_bucket: bucket.to_string(),
+        namespace: namespace.public_name(),
+        table: table.to_string(),
+        current_metadata_location: entry.metadata_location,
+        current_snapshot_id,
+        protected_ref_count,
+        user_defined_ref_count,
+        refs,
+    })
+}
+
+fn external_catalog_bridge_response(
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+) -> ExternalCatalogBridgeResponse {
+    ExternalCatalogBridgeResponse {
+        table_bucket: bucket.to_string(),
+        namespace: namespace.public_name(),
+        table: table.to_string(),
+        status: "metadata-import-supported",
+        supported_import: "register/import an existing Iceberg metadata location into the RustFS catalog; online external catalog synchronization is not implemented",
+        unsupported_bridges: vec![
+            ExternalCatalogBridgeCapability {
+                catalog: "polaris",
+                status: "unsupported",
+                reason: "online REST catalog bridge and policy synchronization are not implemented",
+            },
+            ExternalCatalogBridgeCapability {
+                catalog: "glue",
+                status: "unsupported",
+                reason: "Glue catalog synchronization is not implemented",
+            },
+            ExternalCatalogBridgeCapability {
+                catalog: "dlf",
+                status: "unsupported",
+                reason: "DLF catalog synchronization is not implemented",
+            },
+            ExternalCatalogBridgeCapability {
+                catalog: "hive-metastore",
+                status: "unsupported",
+                reason: "Hive Metastore synchronization is not implemented",
+            },
+        ],
+    }
 }
 
 async fn catalog_import_response<B>(
@@ -2747,6 +3142,32 @@ impl Operation for RestRegisterTableHandler {
     }
 }
 
+pub struct RestListViewsHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestListViewsHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let resource = TableCatalogResource::namespace(&warehouse, &namespace);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
+        unsupported_catalog_feature_response("iceberg-views", "use Iceberg tables; view catalog routes are reserved")
+    }
+}
+
+pub struct RestCreateViewHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestCreateViewHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let resource = TableCatalogResource::namespace(&warehouse, &namespace);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::CreateTableAction).await?;
+        unsupported_catalog_feature_response("iceberg-views", "create a table or register an existing Iceberg table")
+    }
+}
+
 pub struct RestLoadTableHandler {}
 
 #[async_trait::async_trait]
@@ -2831,6 +3252,65 @@ impl Operation for RestDropTableHandler {
     }
 }
 
+pub struct RestLoadViewHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestLoadViewHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let _view = view_name_from_params(&params)?;
+        let resource = TableCatalogResource::namespace(&warehouse, &namespace);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
+        unsupported_catalog_feature_response("iceberg-views", "use Iceberg tables; view load is reserved")
+    }
+}
+
+pub struct RestReplaceViewHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestReplaceViewHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let _view = view_name_from_params(&params)?;
+        let resource = TableCatalogResource::namespace(&warehouse, &namespace);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
+        unsupported_catalog_feature_response("iceberg-views", "commit table metadata updates; view replacement is reserved")
+    }
+}
+
+pub struct RestDropViewHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestDropViewHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let _view = view_name_from_params(&params)?;
+        let resource = TableCatalogResource::namespace(&warehouse, &namespace);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::DeleteTableAction).await?;
+        unsupported_catalog_feature_response("iceberg-views", "drop table resources; view deletion is reserved")
+    }
+}
+
+pub struct ListTableRefsHandler {}
+
+#[async_trait::async_trait]
+impl Operation for ListTableRefsHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
+        let metadata_backend = table_catalog_backend()?;
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let response = table_refs_response(&store, &metadata_backend, &warehouse, &namespace, &table).await?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
 pub struct GetTableMetadataLocationHandler {}
 
 #[async_trait::async_trait]
@@ -2878,8 +3358,9 @@ impl Operation for RestTableMetadataMaintenanceHandler {
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
         let request = read_json_body::<TableMetadataMaintenanceRequest>(req.input).await?;
         let metadata_backend = table_catalog_backend()?;
-        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend);
-        let response = table_metadata_maintenance_response(&store, &warehouse, &namespace, &table, request).await?;
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let response =
+            table_metadata_maintenance_response(&store, &metadata_backend, &warehouse, &namespace, &table, request).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -2946,6 +3427,59 @@ impl Operation for GetTableMaintenanceJobHandler {
     }
 }
 
+pub struct RunTableMaintenanceWorkerHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RunTableMaintenanceWorkerHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
+        let request = read_json_body::<TableMaintenanceWorkerRunRequest>(req.input).await?;
+        let store = table_catalog_store()?;
+        let response = store
+            .run_table_metadata_maintenance_worker_once(
+                &warehouse,
+                &namespace.public_name(),
+                &table,
+                request.worker_id().to_string(),
+            )
+            .await
+            .map_err(catalog_store_error)?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct HeartbeatTableMaintenanceJobHandler {}
+
+#[async_trait::async_trait]
+impl Operation for HeartbeatTableMaintenanceJobHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let job = job_id_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
+        let request = read_json_body::<TableMaintenanceHeartbeatRequest>(req.input).await?;
+        let store = table_catalog_store()?;
+        let response = store
+            .heartbeat_table_metadata_maintenance_job(
+                &warehouse,
+                &namespace.public_name(),
+                &table,
+                &job,
+                &request.lease_id,
+                &request.worker_id,
+            )
+            .await
+            .map_err(catalog_store_error)?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
 pub struct ExportTableCatalogHandler {}
 
 #[async_trait::async_trait]
@@ -2986,6 +3520,20 @@ impl Operation for ImportTableCatalogHandler {
             catalog_import_response(&store, &metadata_backend, &warehouse, &namespace, &table, request, table_bucket_enabled)
                 .await?;
         build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct ExternalCatalogBridgeHandler {}
+
+#[async_trait::async_trait]
+impl Operation for ExternalCatalogBridgeHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
+        build_json_response(StatusCode::OK, &external_catalog_bridge_response(&warehouse, &namespace, &table))
     }
 }
 
@@ -3109,6 +3657,8 @@ mod tests {
                 .endpoints
                 .contains(&"POST /{warehouse}/namespaces/{namespace}/tables")
         );
+        assert!(response.endpoints.contains(&"GET /{warehouse}/namespaces/{namespace}/views"));
+        assert!(response.endpoints.contains(&"POST /{warehouse}/namespaces/{namespace}/views"));
         assert!(
             response
                 .endpoints
@@ -3128,6 +3678,21 @@ mod tests {
             response
                 .endpoints
                 .contains(&"GET /{warehouse}/namespaces/{namespace}/tables/{table}/credentials")
+        );
+        assert!(
+            response
+                .endpoints
+                .contains(&"GET /{warehouse}/namespaces/{namespace}/views/{view}")
+        );
+        assert!(
+            response
+                .endpoints
+                .contains(&"GET /{warehouse}/namespaces/{namespace}/tables/{table}/refs")
+        );
+        assert!(
+            response
+                .endpoints
+                .contains(&"GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external")
         );
         assert!(
             response
@@ -3169,11 +3734,17 @@ mod tests {
             ("RestListTablesHandler", "AdminAction::GetTableAction"),
             ("RestCreateTableHandler", "AdminAction::CreateTableAction"),
             ("RestRegisterTableHandler", "AdminAction::RegisterTableAction"),
+            ("RestListViewsHandler", "AdminAction::GetTableMetadataAction"),
+            ("RestCreateViewHandler", "AdminAction::CreateTableAction"),
             ("RestLoadTableHandler", "AdminAction::GetTableMetadataAction"),
             ("RestTableExistsHandler", "AdminAction::GetTableAction"),
             ("RestLoadCredentialsHandler", "AdminAction::GetTableCredentialsAction"),
             ("RestCommitTableHandler", "AdminAction::CommitTableAction"),
             ("RestDropTableHandler", "AdminAction::DeleteTableAction"),
+            ("RestLoadViewHandler", "AdminAction::GetTableMetadataAction"),
+            ("RestReplaceViewHandler", "AdminAction::CommitTableAction"),
+            ("RestDropViewHandler", "AdminAction::DeleteTableAction"),
+            ("ListTableRefsHandler", "AdminAction::GetTableMetadataAction"),
             ("GetTableMetadataLocationHandler", "AdminAction::GetTableMetadataLocationAction"),
             ("UpdateTableMetadataLocationHandler", "AdminAction::SetTableMetadataLocationAction"),
             ("RestTableMetadataMaintenanceHandler", "AdminAction::RunTableMaintenanceAction"),
@@ -3182,6 +3753,7 @@ mod tests {
             ("GetTableMaintenanceJobHandler", "AdminAction::GetTableLifecycleAction"),
             ("ExportTableCatalogHandler", "AdminAction::GetTableMetadataAction"),
             ("ImportTableCatalogHandler", "AdminAction::RegisterTableAction"),
+            ("ExternalCatalogBridgeHandler", "AdminAction::GetTableMetadataAction"),
             ("GetTableCatalogDiagnosticsHandler", "AdminAction::GetTableMetadataAction"),
             ("RecoverTableCatalogHandler", "AdminAction::CommitTableAction"),
             ("RollbackTableCatalogHandler", "AdminAction::CommitTableAction"),
@@ -3207,6 +3779,7 @@ mod tests {
             ("RestLoadCredentialsHandler", "AdminAction::GetTableCredentialsAction"),
             ("RestCommitTableHandler", "AdminAction::CommitTableAction"),
             ("RestDropTableHandler", "AdminAction::DeleteTableAction"),
+            ("ListTableRefsHandler", "AdminAction::GetTableMetadataAction"),
             ("GetTableMetadataLocationHandler", "AdminAction::GetTableMetadataLocationAction"),
             ("UpdateTableMetadataLocationHandler", "AdminAction::SetTableMetadataLocationAction"),
             ("RestTableMetadataMaintenanceHandler", "AdminAction::RunTableMaintenanceAction"),
@@ -3215,6 +3788,7 @@ mod tests {
             ("GetTableMaintenanceJobHandler", "AdminAction::GetTableLifecycleAction"),
             ("ExportTableCatalogHandler", "AdminAction::GetTableMetadataAction"),
             ("ImportTableCatalogHandler", "AdminAction::RegisterTableAction"),
+            ("ExternalCatalogBridgeHandler", "AdminAction::GetTableMetadataAction"),
             ("GetTableCatalogDiagnosticsHandler", "AdminAction::GetTableMetadataAction"),
             ("RecoverTableCatalogHandler", "AdminAction::CommitTableAction"),
             ("RollbackTableCatalogHandler", "AdminAction::CommitTableAction"),
@@ -3275,11 +3849,17 @@ mod tests {
         let _: &RestListTablesHandler = &LIST_TABLES_HANDLER;
         let _: &RestCreateTableHandler = &CREATE_TABLE_HANDLER;
         let _: &RestRegisterTableHandler = &REGISTER_TABLE_HANDLER;
+        let _: &RestListViewsHandler = &LIST_VIEWS_HANDLER;
+        let _: &RestCreateViewHandler = &CREATE_VIEW_HANDLER;
         let _: &RestLoadTableHandler = &LOAD_TABLE_HANDLER;
         let _: &RestTableExistsHandler = &TABLE_EXISTS_HANDLER;
         let _: &RestLoadCredentialsHandler = &LOAD_CREDENTIALS_HANDLER;
         let _: &RestCommitTableHandler = &COMMIT_TABLE_HANDLER;
         let _: &RestDropTableHandler = &DROP_TABLE_HANDLER;
+        let _: &RestLoadViewHandler = &LOAD_VIEW_HANDLER;
+        let _: &RestReplaceViewHandler = &REPLACE_VIEW_HANDLER;
+        let _: &RestDropViewHandler = &DROP_VIEW_HANDLER;
+        let _: &ListTableRefsHandler = &LIST_TABLE_REFS_HANDLER;
         let _: &GetTableMetadataLocationHandler = &GET_TABLE_METADATA_LOCATION_HANDLER;
         let _: &UpdateTableMetadataLocationHandler = &UPDATE_TABLE_METADATA_LOCATION_HANDLER;
         let _: &RestTableMetadataMaintenanceHandler = &TABLE_METADATA_MAINTENANCE_HANDLER;
@@ -3288,7 +3868,9 @@ mod tests {
         let _: &GetTableMaintenanceJobHandler = &GET_TABLE_MAINTENANCE_JOB_HANDLER;
         let _: &ExportTableCatalogHandler = &EXPORT_TABLE_CATALOG_HANDLER;
         let _: &ImportTableCatalogHandler = &IMPORT_TABLE_CATALOG_HANDLER;
+        let _: &ExternalCatalogBridgeHandler = &EXTERNAL_CATALOG_BRIDGE_HANDLER;
         let _: &GetTableCatalogDiagnosticsHandler = &GET_TABLE_CATALOG_DIAGNOSTICS_HANDLER;
+        let _: &RecoverTableCatalogHandler = &RECOVER_TABLE_CATALOG_HANDLER;
         let _: &RollbackTableCatalogHandler = &ROLLBACK_TABLE_CATALOG_HANDLER;
 
         assert_operation::<EnableTableBucketHandler>();
@@ -3301,20 +3883,30 @@ mod tests {
         assert_operation::<RestListTablesHandler>();
         assert_operation::<RestCreateTableHandler>();
         assert_operation::<RestRegisterTableHandler>();
+        assert_operation::<RestListViewsHandler>();
+        assert_operation::<RestCreateViewHandler>();
         assert_operation::<RestLoadTableHandler>();
         assert_operation::<RestTableExistsHandler>();
         assert_operation::<RestLoadCredentialsHandler>();
         assert_operation::<RestCommitTableHandler>();
         assert_operation::<RestDropTableHandler>();
+        assert_operation::<RestLoadViewHandler>();
+        assert_operation::<RestReplaceViewHandler>();
+        assert_operation::<RestDropViewHandler>();
+        assert_operation::<ListTableRefsHandler>();
         assert_operation::<GetTableMetadataLocationHandler>();
         assert_operation::<UpdateTableMetadataLocationHandler>();
         assert_operation::<RestTableMetadataMaintenanceHandler>();
         assert_operation::<GetTableMaintenanceConfigHandler>();
         assert_operation::<PutTableMaintenanceConfigHandler>();
         assert_operation::<GetTableMaintenanceJobHandler>();
+        assert_operation::<RunTableMaintenanceWorkerHandler>();
+        assert_operation::<HeartbeatTableMaintenanceJobHandler>();
         assert_operation::<ExportTableCatalogHandler>();
         assert_operation::<ImportTableCatalogHandler>();
+        assert_operation::<ExternalCatalogBridgeHandler>();
         assert_operation::<GetTableCatalogDiagnosticsHandler>();
+        assert_operation::<RecoverTableCatalogHandler>();
         assert_operation::<RollbackTableCatalogHandler>();
     }
 
@@ -3325,6 +3917,10 @@ mod tests {
 
         assert_eq!(request.retain_recent_metadata_files, 0);
         assert!(!request.delete);
+        assert!(request.snapshot_expiration.is_none());
+        assert!(!request.commit_snapshot_expiration);
+        assert!(request.compaction.is_none());
+        assert!(!request.commit_compaction);
     }
 
     #[test]
@@ -3337,6 +3933,70 @@ mod tests {
 
         assert_eq!(request.retain_recent_metadata_files, 2);
         assert!(request.delete);
+        assert!(request.snapshot_expiration.is_none());
+        assert!(!request.commit_snapshot_expiration);
+        assert!(request.compaction.is_none());
+        assert!(!request.commit_compaction);
+    }
+
+    #[test]
+    fn table_metadata_maintenance_request_accepts_snapshot_and_compaction_plans() {
+        let request: TableMetadataMaintenanceRequest = serde_json::from_value(serde_json::json!({
+            "commit-snapshot-expiration": true,
+            "snapshot-expiration": {
+                "min-snapshots-to-keep": 2,
+                "max-snapshot-age-ms": 3600000
+            },
+            "commit-compaction": true,
+            "compaction": {
+                "target-file-size-bytes": 536870912,
+                "small-file-threshold-bytes": 67108864,
+                "min-input-files": 5,
+                "max-rewrite-bytes-per-job": 10737418240u64
+            }
+        }))
+        .expect("metadata maintenance request should parse maintenance planning config");
+
+        let snapshot_expiration = request
+            .snapshot_expiration
+            .expect("snapshot expiration config should be present");
+        assert_eq!(snapshot_expiration.min_snapshots_to_keep, 2);
+        assert_eq!(snapshot_expiration.max_snapshot_age_ms, 3_600_000);
+        assert!(request.commit_snapshot_expiration);
+        assert!(request.commit_compaction);
+        let compaction = request.compaction.expect("compaction config should be present");
+        assert_eq!(compaction.target_file_size_bytes, 536_870_912);
+        assert_eq!(compaction.small_file_threshold_bytes, 67_108_864);
+        assert_eq!(compaction.min_input_files, 5);
+        assert_eq!(compaction.max_rewrite_bytes_per_job, 10_737_418_240);
+    }
+
+    #[test]
+    fn table_maintenance_worker_run_request_uses_stable_default_worker_id() {
+        let request: TableMaintenanceWorkerRunRequest =
+            serde_json::from_value(serde_json::json!({})).expect("worker run request should parse");
+
+        assert_eq!(request.worker_id(), "rustfs-maintenance-worker");
+    }
+
+    #[test]
+    fn table_maintenance_worker_run_request_accepts_worker_id() {
+        let request: TableMaintenanceWorkerRunRequest = serde_json::from_value(serde_json::json!({
+            "worker-id": "worker-a"
+        }))
+        .expect("worker run request should parse worker id");
+
+        assert_eq!(request.worker_id(), "worker-a");
+    }
+
+    #[test]
+    fn table_maintenance_heartbeat_request_requires_lease_id() {
+        let err = serde_json::from_value::<TableMaintenanceHeartbeatRequest>(serde_json::json!({
+            "worker-id": "worker-a"
+        }))
+        .expect_err("heartbeat request should require lease id");
+
+        assert!(err.to_string().contains("lease-id"));
     }
 
     #[tokio::test]
@@ -4194,7 +4854,26 @@ mod tests {
                 bucket,
                 &current,
                 serde_json::json!({
-                    "metadata-log": []
+                    "current-snapshot-id": 20,
+                    "metadata-log": [],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 10,
+                            "timestamp-ms": 1000,
+                            "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro"
+                        },
+                        {
+                            "snapshot-id": 20,
+                            "timestamp-ms": 2000,
+                            "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-20.avro"
+                        }
+                    ],
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 20,
+                            "type": "branch"
+                        }
+                    }
                 }),
                 Some(OffsetDateTime::UNIX_EPOCH),
             )
@@ -4215,43 +4894,72 @@ mod tests {
                     retain_recent_metadata_files: 2,
                     delete_enabled: true,
                     background_enabled: false,
+                    ..Default::default()
                 },
             )
             .await
             .expect("maintenance config should persist");
         assert_eq!(config.retain_recent_metadata_files, 2);
         assert!(config.delete_enabled);
-        assert!(
-            store
-                .put_table_maintenance_config(
-                    bucket,
-                    "analytics",
-                    "events",
-                    crate::table_catalog::TableMaintenanceConfig {
-                        version: crate::table_catalog::TABLE_MAINTENANCE_CONFIG_VERSION,
-                        retain_recent_metadata_files: 2,
-                        delete_enabled: true,
-                        background_enabled: true,
-                    },
-                )
-                .await
-                .is_err()
-        );
+        let background_config = store
+            .put_table_maintenance_config(
+                bucket,
+                "analytics",
+                "events",
+                crate::table_catalog::TableMaintenanceConfig {
+                    version: crate::table_catalog::TABLE_MAINTENANCE_CONFIG_VERSION,
+                    retain_recent_metadata_files: 2,
+                    delete_enabled: true,
+                    background_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("background maintenance config should persist");
+        assert!(background_config.background_enabled);
 
         let dry_run = table_metadata_maintenance_response(
             &store,
+            &backend,
             bucket,
             &namespace,
             "events",
             TableMetadataMaintenanceRequest {
                 retain_recent_metadata_files: 0,
                 delete: false,
+                snapshot_expiration: Some(crate::table_catalog::TableSnapshotExpirationConfig {
+                    min_snapshots_to_keep: 1,
+                    max_snapshot_age_ms: 1,
+                }),
+                commit_snapshot_expiration: false,
+                compaction: Some(crate::table_catalog::TableCompactionPlanningConfig {
+                    target_file_size_bytes: 512 * 1024 * 1024,
+                    small_file_threshold_bytes: 64 * 1024 * 1024,
+                    min_input_files: 2,
+                    max_rewrite_bytes_per_job: 1024 * 1024 * 1024,
+                }),
+                commit_compaction: false,
             },
         )
         .await
         .expect("metadata maintenance dry-run should succeed");
         assert_eq!(dry_run.cleanup_candidate_locations, vec![old.clone()]);
         assert_eq!(dry_run.deletable_metadata_locations, vec![old.clone()]);
+        let snapshot_expiration = dry_run
+            .snapshot_expiration
+            .as_ref()
+            .expect("dry-run report should include snapshot expiration planning");
+        assert_eq!(snapshot_expiration.expiration_candidate_count, 1);
+        assert_eq!(snapshot_expiration.current_snapshot_id, Some(20));
+        let compaction = dry_run
+            .compaction
+            .as_ref()
+            .expect("dry-run report should include compaction planning");
+        assert_eq!(
+            compaction.status,
+            crate::table_catalog::TableCompactionPlanningStatus::ManualReviewRequired
+        );
+        assert_eq!(compaction.manual_review_count, 1);
         let stored_dry_run = store
             .get_table_metadata_maintenance_report(bucket, "analytics", "events", &dry_run.job.job_id)
             .await
@@ -4267,12 +4975,17 @@ mod tests {
 
         let deleted = table_metadata_maintenance_response(
             &store,
+            &backend,
             bucket,
             &namespace,
             "events",
             TableMetadataMaintenanceRequest {
                 retain_recent_metadata_files: 0,
                 delete: true,
+                snapshot_expiration: None,
+                commit_snapshot_expiration: false,
+                compaction: None,
+                commit_compaction: false,
             },
         )
         .await
@@ -4284,6 +4997,386 @@ mod tests {
                 .object_exists(bucket, &old)
                 .await
                 .expect("old metadata lookup should succeed after delete")
+        );
+    }
+
+    #[tokio::test]
+    async fn table_metadata_maintenance_helper_commits_snapshot_expiration() {
+        let backend = TestTableCatalogObjectBackend::default();
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "warehouse";
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
+        let current = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+        seed_object_table_for_metadata_maintenance(&store, &backend, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .put_json_with_mod_time(
+                bucket,
+                &current,
+                serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://warehouse/tables/table-id",
+                    "last-sequence-number": 2,
+                    "last-updated-ms": 2000,
+                    "last-column-id": 1,
+                    "schemas": [],
+                    "current-schema-id": 0,
+                    "partition-specs": [],
+                    "default-spec-id": 0,
+                    "sort-orders": [],
+                    "default-sort-order-id": 0,
+                    "current-snapshot-id": 20,
+                    "metadata-log": [],
+                    "snapshot-log": [
+                        {
+                            "timestamp-ms": 1000,
+                            "snapshot-id": 10
+                        },
+                        {
+                            "timestamp-ms": 2000,
+                            "snapshot-id": 20
+                        }
+                    ],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 10,
+                            "timestamp-ms": 1000,
+                            "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro"
+                        },
+                        {
+                            "snapshot-id": 20,
+                            "timestamp-ms": 2000,
+                            "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-20.avro"
+                        }
+                    ],
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 20,
+                            "type": "branch"
+                        }
+                    }
+                }),
+                Some(OffsetDateTime::UNIX_EPOCH),
+            )
+            .await;
+
+        let report = table_metadata_maintenance_response(
+            &store,
+            &backend,
+            bucket,
+            &namespace,
+            "events",
+            TableMetadataMaintenanceRequest {
+                retain_recent_metadata_files: 0,
+                delete: false,
+                snapshot_expiration: Some(crate::table_catalog::TableSnapshotExpirationConfig {
+                    min_snapshots_to_keep: 1,
+                    max_snapshot_age_ms: 1,
+                }),
+                commit_snapshot_expiration: true,
+                compaction: None,
+                commit_compaction: false,
+            },
+        )
+        .await
+        .expect("snapshot expiration commit should succeed");
+
+        let snapshot_expiration = report
+            .snapshot_expiration
+            .as_ref()
+            .expect("maintenance report should include snapshot expiration");
+        assert_eq!(snapshot_expiration.expired_snapshot_ids, vec![10]);
+        let committed_location = snapshot_expiration
+            .committed_metadata_location
+            .as_ref()
+            .expect("snapshot expiration commit should report committed metadata")
+            .clone();
+        assert_ne!(committed_location, current);
+
+        let entry = store
+            .load_table(bucket, "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+        assert_eq!(entry.metadata_location, committed_location);
+        assert_eq!(entry.generation, 2);
+
+        let committed_object = backend
+            .read_object(bucket, &entry.metadata_location)
+            .await
+            .expect("committed metadata lookup should succeed")
+            .expect("committed metadata object should exist");
+        let committed_metadata =
+            serde_json::from_slice::<serde_json::Value>(&committed_object.data).expect("committed metadata should be valid JSON");
+        let snapshots = committed_metadata
+            .get("snapshots")
+            .and_then(serde_json::Value::as_array)
+            .expect("committed metadata should contain snapshots");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].get("snapshot-id").and_then(serde_json::Value::as_i64), Some(20));
+        let snapshot_log = committed_metadata
+            .get("snapshot-log")
+            .and_then(serde_json::Value::as_array)
+            .expect("committed metadata should contain snapshot-log");
+        assert_eq!(snapshot_log.len(), 1);
+        assert_eq!(
+            committed_metadata["metadata-log"][0]["metadata-file"],
+            serde_json::Value::String(current.clone())
+        );
+        assert!(
+            backend
+                .object_exists(bucket, &current)
+                .await
+                .expect("previous metadata lookup should succeed")
+        );
+    }
+
+    #[tokio::test]
+    async fn table_metadata_maintenance_helper_rejects_snapshot_expiration_manual_review_commit() {
+        let backend = TestTableCatalogObjectBackend::default();
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "warehouse";
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
+        let current = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+        seed_object_table_for_metadata_maintenance(&store, &backend, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .put_json_with_mod_time(
+                bucket,
+                &current,
+                serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://warehouse/tables/table-id",
+                    "current-snapshot-id": 20,
+                    "metadata-log": [],
+                    "snapshot-log": [],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 10,
+                            "timestamp-ms": 1000,
+                            "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro"
+                        },
+                        {
+                            "snapshot-id": 20,
+                            "timestamp-ms": 2000,
+                            "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-20.avro"
+                        }
+                    ],
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 20,
+                            "type": "branch"
+                        },
+                        "audit": {
+                            "snapshot-id": 10,
+                            "type": "tag"
+                        }
+                    }
+                }),
+                Some(OffsetDateTime::UNIX_EPOCH),
+            )
+            .await;
+
+        let result = table_metadata_maintenance_response(
+            &store,
+            &backend,
+            bucket,
+            &namespace,
+            "events",
+            TableMetadataMaintenanceRequest {
+                retain_recent_metadata_files: 0,
+                delete: false,
+                snapshot_expiration: Some(crate::table_catalog::TableSnapshotExpirationConfig {
+                    min_snapshots_to_keep: 1,
+                    max_snapshot_age_ms: 1,
+                }),
+                commit_snapshot_expiration: true,
+                compaction: None,
+                commit_compaction: false,
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        let entry = store
+            .load_table(bucket, "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+        assert_eq!(entry.metadata_location, current);
+        assert_eq!(entry.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn table_metadata_maintenance_helper_rejects_stale_snapshot_expiration_plan() {
+        let backend = TestTableCatalogObjectBackend::default();
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "warehouse";
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
+        let current = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let next = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00003.metadata.json");
+
+        let metadata = serde_json::json!({
+            "format-version": 2,
+            "table-uuid": "table-uuid",
+            "location": "s3://warehouse/tables/table-id",
+            "current-snapshot-id": 20,
+            "metadata-log": [],
+            "snapshot-log": [],
+            "snapshots": [
+                {
+                    "snapshot-id": 10,
+                    "timestamp-ms": 1000,
+                    "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro"
+                },
+                {
+                    "snapshot-id": 20,
+                    "timestamp-ms": 2000,
+                    "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-20.avro"
+                }
+            ],
+            "refs": {
+                "main": {
+                    "snapshot-id": 20,
+                    "type": "branch"
+                }
+            }
+        });
+        seed_object_table_for_metadata_maintenance(&store, &backend, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .put_json_with_mod_time(bucket, &current, metadata.clone(), Some(OffsetDateTime::UNIX_EPOCH))
+            .await;
+        backend
+            .put_json_with_mod_time(bucket, &next, metadata, Some(OffsetDateTime::UNIX_EPOCH))
+            .await;
+
+        let stale_plan = store
+            .plan_table_snapshot_expiration(
+                bucket,
+                "analytics",
+                "events",
+                crate::table_catalog::TableSnapshotExpirationConfig {
+                    min_snapshots_to_keep: 1,
+                    max_snapshot_age_ms: 1,
+                },
+            )
+            .await
+            .expect("snapshot expiration plan should build");
+        store
+            .commit_table(crate::table_catalog::TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                commit_id: "advance-pointer".to_string(),
+                idempotency_key: None,
+                operation: "append".to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current,
+                new_metadata_location: next,
+                requirements: Vec::new(),
+                writer: Some("test".to_string()),
+            })
+            .await
+            .expect("pointer advance should succeed");
+
+        let result = commit_table_snapshot_expiration_response(&store, &backend, bucket, &namespace, "events", stale_plan).await;
+
+        assert!(result.is_err());
+        let entry = store
+            .load_table(bucket, "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+        assert_eq!(entry.generation, 2);
+    }
+
+    #[tokio::test]
+    async fn table_metadata_maintenance_helper_rejects_delete_with_snapshot_expiration_commit() {
+        let backend = TestTableCatalogObjectBackend::default();
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+
+        let result = table_metadata_maintenance_response(
+            &store,
+            &backend,
+            "warehouse",
+            &namespace,
+            "events",
+            TableMetadataMaintenanceRequest {
+                retain_recent_metadata_files: 0,
+                delete: true,
+                snapshot_expiration: Some(crate::table_catalog::TableSnapshotExpirationConfig {
+                    min_snapshots_to_keep: 1,
+                    max_snapshot_age_ms: 1,
+                }),
+                commit_snapshot_expiration: true,
+                compaction: None,
+                commit_compaction: false,
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn table_refs_response_reports_current_and_user_defined_refs() {
+        let backend = TestTableCatalogObjectBackend::default();
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "warehouse";
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
+        let current = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        seed_object_table_for_metadata_maintenance(&store, &backend, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .put_json_with_mod_time(
+                bucket,
+                &current,
+                serde_json::json!({
+                    "current-snapshot-id": 10,
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 10,
+                            "type": "branch"
+                        },
+                        "audit": {
+                            "snapshot-id": 9,
+                            "type": "tag"
+                        }
+                    }
+                }),
+                Some(OffsetDateTime::UNIX_EPOCH),
+            )
+            .await;
+
+        let response = table_refs_response(&store, &backend, bucket, &namespace, "events")
+            .await
+            .expect("refs response should load");
+
+        assert_eq!(response.current_snapshot_id, Some(10));
+        assert_eq!(response.protected_ref_count, 1);
+        assert_eq!(response.user_defined_ref_count, 1);
+        assert!(response.refs.contains_key("main"));
+        assert!(response.refs.contains_key("audit"));
+    }
+
+    #[test]
+    fn external_catalog_bridge_response_lists_unsupported_bridges() {
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let response = external_catalog_bridge_response("warehouse", &namespace, "events");
+
+        assert_eq!(response.status, "metadata-import-supported");
+        assert_eq!(response.unsupported_bridges.len(), 4);
+        assert!(
+            response
+                .unsupported_bridges
+                .iter()
+                .any(|bridge| bridge.catalog == "polaris" && bridge.status == "unsupported")
         );
     }
 
