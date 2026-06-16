@@ -2326,6 +2326,7 @@ impl DefaultObjectUsecase {
         // x-amz-expiration: predict from lifecycle configuration
         let expiration = resolve_put_object_expiration(bucket, &info).await;
         let storage_class = response_storage_class(&info, &info.user_defined);
+        let content_disposition = info.user_defined.get("content-disposition").cloned();
 
         let output = GetObjectOutput {
             body,
@@ -2333,6 +2334,7 @@ impl DefaultObjectUsecase {
             last_modified,
             content_type,
             content_encoding: info.content_encoding.clone(),
+            content_disposition,
             accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
             content_range,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
@@ -5293,6 +5295,66 @@ mod tests {
                 .as_ref()
                 .map(StorageClass::as_str),
             Some(storageclass::STANDARD_IA)
+        );
+    }
+
+    #[tokio::test]
+    async fn build_get_object_output_context_returns_content_disposition() {
+        let mut metadata = HashMap::new();
+        metadata.insert("content-disposition".to_string(), "attachment; filename=\"demo.png\"".to_string());
+
+        let info = ObjectInfo {
+            bucket: "test-bucket".to_string(),
+            name: "path/raw".to_string(),
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+
+        let input = GetObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("path/raw".to_string())
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultObjectUsecase::without_context();
+        let queue_status = concurrency::IoQueueStatus::default();
+
+        let context = usecase
+            .build_get_object_output_context(
+                &req,
+                get_concurrency_manager(),
+                "test-bucket",
+                "path/raw",
+                info.clone(),
+                info,
+                wrap_reader(tokio::io::empty()),
+                None,
+                None,
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                Duration::ZERO,
+                0.0,
+                &queue_status,
+                1,
+                None,
+                false,
+            )
+            .await
+            .expect("get object output context");
+
+        assert_eq!(context.output.content_disposition.as_deref(), Some("attachment; filename=\"demo.png\""));
+        assert!(
+            !context
+                .output
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.contains_key("content-disposition"))
         );
     }
 
