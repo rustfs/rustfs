@@ -80,7 +80,7 @@ behind narrower contracts.
 | `DEFAULT_KVS` | `crates/ecstore/src/config/mod.rs` | Registry for defaults across storage class, scanner, notify, audit, and OIDC. | Move defaults only after an explicit registration contract exists. |
 | `GLOBAL_SERVER_CONFIG` | `crates/ecstore/src/config/mod.rs` | Process-wide mutable server config snapshot. | Migrate readers behind `AppContext` or a server-config provider before changing storage. |
 | `ConfigSys::init` | `crates/ecstore/src/config/mod.rs` | Reads persisted config, looks up derived config, and stores the global snapshot. | Startup order must remain unchanged until the lifecycle contract owns this dependency. |
-| `read_config_without_migrate` | `crates/ecstore/src/config/com.rs` | Loads persisted server config through `StorageAPI`. | Persistence stays in `ecstore` until pure model and persistence are separated. |
+| `read_config_without_migrate` | `crates/ecstore/src/config/com.rs` | Loads persisted server config through ECStore-owned object I/O and storage-admin contracts. | Persistence stays in `ecstore` until pure model and persistence are separated. |
 | `save_server_config` | `crates/ecstore/src/config/com.rs` | Persists the canonical server config object. | Preserve external object shape and config-history behavior. |
 | `get_global_server_config` / `set_global_server_config` | `crates/ecstore/src/config/mod.rs` | Clone/read and replace the global server-config snapshot. | Do not remove until all runtime readers have an injected provider path. |
 
@@ -91,7 +91,7 @@ behind narrower contracts.
 | Files | Current usage |
 |---|---|
 | `crates/ecstore/src/config/mod.rs` | Defines `KV`, `KVS`, `Config`, defaults, global snapshot, initialization, and tests. |
-| `crates/ecstore/src/config/com.rs` | Encodes, decodes, reads, writes, creates, and normalizes server config objects through `StorageAPI`. |
+| `crates/ecstore/src/config/com.rs` | Encodes, decodes, reads, writes, creates, and normalizes server config objects through ECStore-local persistence helpers. |
 | `crates/ecstore/src/config/{notify,audit,oidc,scanner,storageclass}.rs` | Register default `KVS` values and subsystem-specific parsing helpers. |
 | `crates/ecstore/src/store.rs` | Exposes store-level server-config accessors that delegate to the global config snapshot. |
 
@@ -162,7 +162,7 @@ behind narrower contracts.
 | `KVS` is the effective target config carrier | Notify, audit, and target factories consume `KVS` after file/env merge. | Keep `KVS` API stable until target descriptor and runtime crates are behind a shared contract. |
 | `DEFAULT_KVS` registration is global | Defaults are initialized centrally and used by admin validation/rendering. | Add a registration contract before changing initialization order. |
 | Global snapshot readers still exist | Server, admin, IAM, scanner, and site-replication paths can still read global config. | Migrate readers through `AppContext`/provider paths in small steps after the model contract is stable. |
-| Persistence helpers depend on `StorageAPI` | Moving them with the pure model would pull storage implementation dependencies upward. | Keep read/write helpers in `ecstore` until a storage-facing persistence contract is explicit. |
+| Persistence helpers depend on ECStore storage contracts | Moving them with the pure model would pull storage implementation dependencies upward. | Keep read/write helpers in `ecstore` until a storage-facing persistence contract is explicit. |
 
 ## Recommended Migration Order
 
@@ -176,8 +176,8 @@ behind narrower contracts.
    behavior, and representative admin config rendering paths.
 5. Migrate global `Config` readers behind `ServerConfigInterface` or a narrower
    provider in small PRs.
-6. Move persistence helpers only after `StorageAPI` dependencies can stay below
-   the model contract.
+6. Move persistence helpers only after object-I/O and storage-admin dependencies
+   can stay below the model contract.
 7. Evaluate crate split only after consumers no longer need old paths except
    explicit `RUSTFS_COMPAT_TODO(<task-id>)` compatibility shims.
 
