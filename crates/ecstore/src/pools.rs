@@ -272,8 +272,11 @@ fn first_resumable_decommission_queue_indices(meta: &PoolMeta) -> Vec<usize> {
     let mut indices = Vec::new();
     for (idx, pool) in meta.pools.iter().enumerate() {
         if let Some(decommission) = &pool.decommission {
-            if decommission.complete || decommission.failed || decommission.canceled {
+            if decommission.complete {
                 continue;
+            }
+            if decommission.failed || decommission.canceled {
+                break;
             }
             indices.push(idx);
         }
@@ -6157,7 +6160,7 @@ mod pools_tests {
     }
 
     #[test]
-    fn test_first_resumable_decommission_queue_indices_skips_terminal_states() {
+    fn test_first_resumable_decommission_queue_indices_stops_at_failed_or_canceled_state() {
         let meta = PoolMeta {
             pools: vec![
                 decommission_test_pool_status(
@@ -6193,7 +6196,39 @@ mod pools_tests {
             ..Default::default()
         };
 
-        assert_eq!(first_resumable_decommission_queue_indices(&meta), vec![3]);
+        assert!(first_resumable_decommission_queue_indices(&meta).is_empty());
+    }
+
+    #[test]
+    fn test_first_resumable_decommission_queue_indices_allows_after_completed_prefix() {
+        let meta = PoolMeta {
+            pools: vec![
+                decommission_test_pool_status(
+                    0,
+                    Some(PoolDecommissionInfo {
+                        complete: true,
+                        ..Default::default()
+                    }),
+                ),
+                decommission_test_pool_status(
+                    1,
+                    Some(PoolDecommissionInfo {
+                        queued: true,
+                        ..Default::default()
+                    }),
+                ),
+                decommission_test_pool_status(
+                    2,
+                    Some(PoolDecommissionInfo {
+                        queued: true,
+                        ..Default::default()
+                    }),
+                ),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(first_resumable_decommission_queue_indices(&meta), vec![1, 2]);
     }
 
     #[test]
