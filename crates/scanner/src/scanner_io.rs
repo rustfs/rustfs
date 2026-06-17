@@ -109,6 +109,14 @@ pub fn record_dirty_usage_bucket(bucket: &str) {
     dirty_usage_buckets().insert(bucket.to_string(), generation);
 }
 
+pub fn clear_dirty_usage_bucket(bucket: &str) {
+    if bucket.is_empty() {
+        return;
+    }
+
+    dirty_usage_buckets().remove(bucket);
+}
+
 fn snapshot_dirty_usage_buckets(buckets: &[BucketInfo]) -> DirtyUsageBuckets {
     let dirty_buckets = dirty_usage_buckets();
     buckets
@@ -1537,6 +1545,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn dirty_usage_snapshot_clear_preserves_newer_generation() {
         clear_dirty_usage_buckets_for_tests();
         record_dirty_usage_bucket("photos");
@@ -1546,6 +1555,23 @@ mod tests {
         record_dirty_usage_bucket("photos");
         clear_dirty_usage_buckets(&snapshot);
 
+        assert_eq!(dirty_usage_bucket_count(), 1);
+        clear_dirty_usage_buckets_for_tests();
+    }
+
+    #[test]
+    #[serial]
+    fn clear_dirty_usage_bucket_removes_deleted_bucket_marker() {
+        clear_dirty_usage_buckets_for_tests();
+        record_dirty_usage_bucket("photos");
+        record_dirty_usage_bucket("videos");
+
+        clear_dirty_usage_bucket("photos");
+
+        let buckets = vec![bucket_info("photos"), bucket_info("videos")];
+        let snapshot = snapshot_dirty_usage_buckets(&buckets);
+        assert!(!snapshot.contains_key("photos"));
+        assert!(snapshot.contains_key("videos"));
         assert_eq!(dirty_usage_bucket_count(), 1);
         clear_dirty_usage_buckets_for_tests();
     }

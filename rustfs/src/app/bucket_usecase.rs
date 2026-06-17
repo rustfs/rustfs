@@ -832,6 +832,7 @@ impl DefaultBucketUsecase {
             )
             .await
             .map_err(ApiError::from)?;
+        rustfs_scanner::clear_dirty_usage_bucket(&input.bucket);
 
         if let Err(err) = site_replication_delete_bucket_hook(&input.bucket, force).await {
             warn!(bucket = %input.bucket, error = ?err, "site replication delete bucket hook failed");

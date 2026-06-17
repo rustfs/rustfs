@@ -4790,7 +4790,10 @@ impl DefaultObjectUsecase {
                     return Err(ApiError::from(e).into());
                 }
             };
-            wrote_any_entry = true;
+            if !wrote_any_entry {
+                rustfs_scanner::record_dirty_usage_bucket(&bucket);
+                wrote_any_entry = true;
+            }
 
             let _manager = get_concurrency_manager();
             let _fpath_clone = fpath.clone();
@@ -4864,9 +4867,6 @@ impl DefaultObjectUsecase {
         };
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
-        if wrote_any_entry {
-            rustfs_scanner::record_dirty_usage_bucket(&bucket);
-        }
         result
     }
 }
