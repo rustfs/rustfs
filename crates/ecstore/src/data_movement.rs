@@ -1586,6 +1586,18 @@ mod tests {
     }
 
     #[test]
+    fn test_data_movement_overwrite_resume_rejects_replication_mismatch() {
+        let source = overwrite_equivalence_source();
+        let target = ObjectInfo {
+            replication_status_internal: Some("arn:minio:replication:target=FAILED;".to_string()),
+            replication_status: rustfs_filemeta::ReplicationStatusType::Failed,
+            ..source.clone()
+        };
+
+        assert!(!overwrite_resume_for_target(&source, target));
+    }
+
+    #[test]
     fn test_data_movement_overwrite_resume_rejects_tag_mismatch() {
         let source = overwrite_equivalence_source();
         let target = ObjectInfo {
