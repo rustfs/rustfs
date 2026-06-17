@@ -52,7 +52,7 @@ use tokio::{net::TcpStream, time::Duration};
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
-use tracing::{Instrument, warn};
+use tracing::{Instrument, debug, warn};
 
 pub const PEER_RESTSIGNAL: &str = "signal";
 pub const PEER_RESTSUB_SYS: &str = "sub-sys";
@@ -945,7 +945,17 @@ impl PeerRestClient {
 
                 let response = client.load_rebalance_meta(request).await?.into_inner();
 
-                warn!("load_rebalance_meta response {:?}, grid_host: {:?}", response, &self.grid_host);
+                debug!(
+                    event = "peer_rebalance_meta",
+                    component = "ecstore",
+                    subsystem = "peer_rest_client",
+                    action = "load_rebalance_meta",
+                    result = "response_received",
+                    peer = %self.grid_host,
+                    success = response.success,
+                    start_rebalance = start_rebalance,
+                    "peer rebalance metadata response"
+                );
                 if !response.success {
                     if let Some(msg) = response.error_info {
                         return Err(Error::other(msg));

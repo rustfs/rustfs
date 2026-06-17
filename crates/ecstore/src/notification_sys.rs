@@ -32,10 +32,13 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 use tokio::time::timeout;
-use tracing::{error, warn};
+use tracing::{debug, error, info, warn};
 
 /// After this many consecutive admin-call failures, mark the peer as offline.
 const CONSECUTIVE_FAILURE_THRESHOLD: u32 = 3;
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_NOTIFICATION: &str = "notification";
+const EVENT_NOTIFICATION_PEER_PROPAGATION: &str = "notification_peer_propagation";
 
 /// Cached result from the last successful admin call to a peer.
 struct PeerAdminCache {
@@ -472,6 +475,15 @@ impl NotificationSys {
                 let host = client.grid_host.clone();
                 futures.push(async move { client.reload_pool_meta().await.map_err(|err| (host, err)) });
             } else {
+                warn!(
+                    event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    action = "reload_pool_meta",
+                    result = "peer_unreachable",
+                    peer_index = idx,
+                    "notification peer propagation"
+                );
                 failures.push(format!("peer[{idx}] reload_pool_meta failed: peer is not reachable"));
             }
         }
@@ -479,7 +491,16 @@ impl NotificationSys {
         for result in join_all(futures).await {
             if let Err((host, err)) = result {
                 let failure = format!("peer {host} reload_pool_meta failed: {err}");
-                error!("notification reload_pool_meta err {}", failure);
+                error!(
+                    event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    action = "reload_pool_meta",
+                    result = "peer_failed",
+                    peer = %host,
+                    error = %err,
+                    "notification peer propagation"
+                );
                 failures.push(failure);
             }
         }
@@ -494,24 +515,52 @@ impl NotificationSys {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         for (idx, client) in self.peer_clients.iter().enumerate() {
             if let Some(client) = client {
-                warn!(
-                    "notification load_rebalance_meta start: {}, index: {}, client: {:?}",
-                    start, idx, client.host
-                );
                 let host = client.grid_host.clone();
-                futures.push(async move { client.load_rebalance_meta(start).await.map_err(|err| (host, err)) });
+                futures.push(async move {
+                    let result = client.load_rebalance_meta(start).await;
+                    (host, result)
+                });
             } else {
+                warn!(
+                    event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    action = "load_rebalance_meta",
+                    result = "peer_unreachable",
+                    peer_index = idx,
+                    start_rebalance = start,
+                    "notification peer propagation"
+                );
                 failures.push(format!("peer[{idx}] {operation} failed: peer is not reachable"));
             }
         }
 
-        for result in join_all(futures).await {
-            if let Err((host, err)) = result {
+        for (host, result) in join_all(futures).await {
+            if let Err(err) = result {
                 let failure = format!("peer {host} {operation} failed: {err}");
-                error!("notification load_rebalance_meta err {}", failure);
+                error!(
+                    event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    action = "load_rebalance_meta",
+                    result = "peer_failed",
+                    peer = %host,
+                    start_rebalance = start,
+                    error = %err,
+                    "notification peer propagation"
+                );
                 failures.push(failure);
             } else {
-                warn!("notification load_rebalance_meta success");
+                debug!(
+                    event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    action = "load_rebalance_meta",
+                    result = "peer_success",
+                    peer = %host,
+                    start_rebalance = start,
+                    "notification peer propagation"
+                );
             }
         }
 
@@ -519,15 +568,26 @@ impl NotificationSys {
     }
 
     pub async fn stop_rebalance(&self) -> Result<()> {
-        warn!("notification stop_rebalance start");
+        info!(
+            event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+            action = "stop_rebalance",
+            state = "started",
+            "notification peer propagation"
+        );
         let Some(store) = resolve_object_store_handle() else {
-            error!("stop_rebalance: not init");
+            error!(
+                event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                action = "stop_rebalance",
+                result = "failed",
+                reason = "object_layer_not_initialized",
+                "notification peer propagation"
+            );
             return Err(Error::other("stop_rebalance: object layer not initialized"));
         };
-
-        // warn!("notification stop_rebalance load_rebalance_meta");
-        // self.load_rebalance_meta(false).await;
-        // warn!("notification stop_rebalance load_rebalance_meta done");
 
         let mut failures = Vec::new();
 
@@ -535,38 +595,91 @@ impl NotificationSys {
         for (idx, client) in self.peer_clients.iter().enumerate() {
             if let Some(client) = client {
                 let host = client.grid_host.clone();
-                futures.push(async move { client.stop_rebalance().await.map_err(|err| (host, err)) });
+                futures.push(async move {
+                    let result = client.stop_rebalance().await;
+                    (host, result)
+                });
             } else {
+                warn!(
+                    event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    action = "stop_rebalance",
+                    result = "peer_unreachable",
+                    peer_index = idx,
+                    "notification peer propagation"
+                );
                 failures.push(format!("peer[{idx}] stop_rebalance failed: peer is not reachable"));
             }
         }
 
-        for result in join_all(futures).await {
-            if let Err((host, err)) = result {
+        for (host, result) in join_all(futures).await {
+            if let Err(err) = result {
                 let failure = format!("peer {host} stop_rebalance failed: {err}");
-                error!("notification stop_rebalance err {}", failure);
+                error!(
+                    event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    action = "stop_rebalance",
+                    result = "peer_failed",
+                    peer = %host,
+                    error = %err,
+                    "notification peer propagation"
+                );
                 failures.push(failure);
+            } else {
+                debug!(
+                    event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    action = "stop_rebalance",
+                    result = "peer_success",
+                    peer = %host,
+                    "notification peer propagation"
+                );
             }
         }
 
-        warn!("notification stop_rebalance stop_rebalance start");
         match store.stop_rebalance().await {
             Ok(_) => {
                 if let Err(err) = store.save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt).await {
-                    error!("notification stop_rebalance local save err {:?}", err);
+                    error!(
+                        event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                        action = "stop_rebalance",
+                        result = "local_save_failed",
+                        error = %err,
+                        "notification peer propagation"
+                    );
                     return Err(Error::other(format!(
                         "local stop_rebalance save_rebalance_stats(stopped_at) failed: {err}"
                     )));
                 }
             }
             Err(err) => {
-                error!("notification stop_rebalance local stop err {:?}", err);
+                error!(
+                    event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    action = "stop_rebalance",
+                    result = "local_stop_failed",
+                    error = %err,
+                    "notification peer propagation"
+                );
                 return Err(Error::other(format!("local stop_rebalance stop failed: {err}")));
             }
         }
 
         aggregate_notification_failures("stop_rebalance", failures)?;
-        warn!("notification stop_rebalance stop_rebalance done");
+        info!(
+            event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+            action = "stop_rebalance",
+            result = "success",
+            "notification peer propagation"
+        );
         Ok(())
     }
 

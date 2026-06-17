@@ -31,6 +31,10 @@ use rustfs_ecstore::{
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_storage_api::{BucketOperations, BucketOptions, StorageAdminApi};
+use rustfs_utils::{
+    MaskedAccessKey,
+    http::{AMZ_REQUEST_ID, REQUEST_ID_HEADER},
+};
 use s3s::{
     Body, S3Request, S3Response, S3Result,
     header::{CONTENT_LENGTH, CONTENT_TYPE},
@@ -39,11 +43,39 @@ use s3s::{
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use time::OffsetDateTime;
-use tracing::info;
+use tracing::{error, info, warn};
 
 const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_REBALANCE: &str = "rebalance";
 const EVENT_ADMIN_REBALANCE_STATE: &str = "admin_rebalance_state";
+
+fn admin_request_id(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(REQUEST_ID_HEADER)
+        .or_else(|| headers.get(AMZ_REQUEST_ID))
+        .and_then(|value| value.to_str().ok())
+}
+
+fn admin_remote_addr(req: &S3Request<Body>) -> Option<String> {
+    req.extensions
+        .get::<Option<RemoteAddr>>()
+        .and_then(|opt| opt.map(|addr| addr.0.to_string()))
+}
+
+fn log_rebalance_request_rejected(action: &str, reason: &str, request_id: &str, actor: &str, remote_addr: &str) {
+    warn!(
+        event = EVENT_ADMIN_REBALANCE_STATE,
+        component = LOG_COMPONENT_ADMIN,
+        subsystem = LOG_SUBSYSTEM_REBALANCE,
+        action,
+        result = "rejected",
+        reason,
+        request_id = %request_id,
+        actor = %actor,
+        remote_addr = %remote_addr,
+        "admin rebalance state"
+    );
+}
 
 pub fn register_rebalance_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -224,12 +256,16 @@ pub struct RebalanceStart {}
 impl Operation for RebalanceStart {
     #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let request_id = admin_request_id(&req.headers).unwrap_or_default().to_string();
+        let remote_addr = admin_remote_addr(&req).unwrap_or_default();
         info!(
             event = EVENT_ADMIN_REBALANCE_STATE,
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_REBALANCE,
             action = "start",
             state = "requested",
+            request_id = %request_id,
+            remote_addr = %remote_addr,
             "admin rebalance state"
         );
 
@@ -239,6 +275,7 @@ impl Operation for RebalanceStart {
 
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+        let actor = MaskedAccessKey(&input_cred.access_key).to_string();
 
         validate_admin_request(
             &req.headers,
@@ -255,14 +292,17 @@ impl Operation for RebalanceStart {
         };
 
         if store.pools.len() == 1 {
+            log_rebalance_request_rejected("start", "single_pool_not_supported", &request_id, &actor, &remote_addr);
             return Err(s3_error!(NotImplemented));
         }
 
         if store.is_decommission_running().await {
+            log_rebalance_request_rejected("start", "decommission_in_progress", &request_id, &actor, &remote_addr);
             return Err(s3_error!(InvalidRequest, "cannot start rebalance while decommission is in progress"));
         }
 
         if store.is_rebalance_conflicting_with_decommission().await {
+            log_rebalance_request_rejected("start", "rebalance_already_in_progress", &request_id, &actor, &remote_addr);
             return Err(s3_error!(OperationAborted, "rebalance is already in progress"));
         }
 
@@ -291,6 +331,9 @@ impl Operation for RebalanceStart {
             subsystem = LOG_SUBSYSTEM_REBALANCE,
             action = "start",
             state = "started",
+            request_id = %request_id,
+            actor = %actor,
+            remote_addr = %remote_addr,
             rebalance_id = %id,
             "admin rebalance state"
         );
@@ -301,15 +344,23 @@ impl Operation for RebalanceStart {
                 subsystem = LOG_SUBSYSTEM_REBALANCE,
                 action = "start",
                 state = "propagation_started",
+                request_id = %request_id,
+                actor = %actor,
+                remote_addr = %remote_addr,
+                rebalance_id = %id,
                 "admin rebalance state"
             );
             notification_sys.load_rebalance_meta(true).await.map_err(|err| {
-                info!(
+                error!(
                     event = EVENT_ADMIN_REBALANCE_STATE,
                     component = LOG_COMPONENT_ADMIN,
                     subsystem = LOG_SUBSYSTEM_REBALANCE,
                     action = "start",
                     result = "propagation_failed",
+                    request_id = %request_id,
+                    actor = %actor,
+                    remote_addr = %remote_addr,
+                    rebalance_id = %id,
                     error = %err,
                     "admin rebalance state"
                 );
@@ -321,6 +372,11 @@ impl Operation for RebalanceStart {
                 subsystem = LOG_SUBSYSTEM_REBALANCE,
                 action = "start",
                 state = "propagation_completed",
+                result = "success",
+                request_id = %request_id,
+                actor = %actor,
+                remote_addr = %remote_addr,
+                rebalance_id = %id,
                 "admin rebalance state"
             );
         }
@@ -343,12 +399,16 @@ pub struct RebalanceStatus {}
 impl Operation for RebalanceStatus {
     #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let request_id = admin_request_id(&req.headers).unwrap_or_default().to_string();
+        let remote_addr = admin_remote_addr(&req).unwrap_or_default();
         info!(
             event = EVENT_ADMIN_REBALANCE_STATE,
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_REBALANCE,
             action = "status",
             state = "requested",
+            request_id = %request_id,
+            remote_addr = %remote_addr,
             "admin rebalance state"
         );
 
@@ -358,6 +418,7 @@ impl Operation for RebalanceStatus {
 
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+        let actor = MaskedAccessKey(&input_cred.access_key).to_string();
 
         validate_admin_request(
             &req.headers,
@@ -386,6 +447,7 @@ impl Operation for RebalanceStatus {
         let mut meta = RebalanceMeta::new();
         if let Err(err) = meta.load(first_pool).await {
             if err == StorageError::ConfigNotFound {
+                log_rebalance_request_rejected("status", "rebalance_not_started", &request_id, &actor, &remote_addr);
                 return Err(s3_error!(NoSuchResource, "pool rebalance is not started"));
             }
 
@@ -414,6 +476,20 @@ impl Operation for RebalanceStatus {
 
         let data = serde_json::to_string(&admin_status)
             .map_err(|e| s3_error!(InternalError, "failed to serialize rebalance status response: {}", e))?;
+        info!(
+            event = EVENT_ADMIN_REBALANCE_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            action = "status",
+            result = "success",
+            request_id = %request_id,
+            actor = %actor,
+            remote_addr = %remote_addr,
+            rebalance_id = %admin_status.id,
+            pool_count = admin_status.pools.len(),
+            cleanup_warning_count = admin_status.pools.iter().map(|pool| pool.cleanup_warnings.count).sum::<u64>(),
+            "admin rebalance state"
+        );
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
@@ -428,12 +504,16 @@ pub struct RebalanceStop {}
 impl Operation for RebalanceStop {
     #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let request_id = admin_request_id(&req.headers).unwrap_or_default().to_string();
+        let remote_addr = admin_remote_addr(&req).unwrap_or_default();
         info!(
             event = EVENT_ADMIN_REBALANCE_STATE,
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_REBALANCE,
             action = "stop",
             state = "requested",
+            request_id = %request_id,
+            remote_addr = %remote_addr,
             "admin rebalance state"
         );
 
@@ -443,6 +523,7 @@ impl Operation for RebalanceStop {
 
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+        let actor = MaskedAccessKey(&input_cred.access_key).to_string();
 
         validate_admin_request(
             &req.headers,
@@ -459,6 +540,7 @@ impl Operation for RebalanceStop {
         };
 
         if !store.is_rebalance_conflicting_with_decommission().await {
+            log_rebalance_request_rejected("stop", "rebalance_not_started", &request_id, &actor, &remote_addr);
             return Err(s3_error!(NoSuchResource, "pool rebalance is not started"));
         }
 
@@ -485,6 +567,10 @@ impl Operation for RebalanceStop {
             subsystem = LOG_SUBSYSTEM_REBALANCE,
             action = "stop",
             state = "local_stop_persisted",
+            result = "success",
+            request_id = %request_id,
+            actor = %actor,
+            remote_addr = %remote_addr,
             "admin rebalance state"
         );
         if let Some(notification_sys) = get_global_notification_sys() {
@@ -494,15 +580,21 @@ impl Operation for RebalanceStop {
                 subsystem = LOG_SUBSYSTEM_REBALANCE,
                 action = "stop",
                 state = "propagation_started",
+                request_id = %request_id,
+                actor = %actor,
+                remote_addr = %remote_addr,
                 "admin rebalance state"
             );
             notification_sys.load_rebalance_meta(false).await.map_err(|err| {
-                info!(
+                error!(
                     event = EVENT_ADMIN_REBALANCE_STATE,
                     component = LOG_COMPONENT_ADMIN,
                     subsystem = LOG_SUBSYSTEM_REBALANCE,
                     action = "stop",
                     result = "propagation_failed",
+                    request_id = %request_id,
+                    actor = %actor,
+                    remote_addr = %remote_addr,
                     error = %err,
                     "admin rebalance state"
                 );
@@ -514,6 +606,10 @@ impl Operation for RebalanceStop {
                 subsystem = LOG_SUBSYSTEM_REBALANCE,
                 action = "stop",
                 state = "propagation_completed",
+                result = "success",
+                request_id = %request_id,
+                actor = %actor,
+                remote_addr = %remote_addr,
                 "admin rebalance state"
             );
         }

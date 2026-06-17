@@ -15,6 +15,10 @@
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_utils::{
+    MaskedAccessKey,
+    http::{AMZ_REQUEST_ID, REQUEST_ID_HEADER},
+};
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
@@ -38,9 +42,39 @@ use std::collections::HashSet;
 
 const LOG_COMPONENT_ADMIN_API: &str = "admin_api";
 const LOG_SUBSYSTEM_POOL_ADMIN: &str = "pool_admin";
+const EVENT_ADMIN_REQUEST_STATE: &str = "admin_request_state";
 const EVENT_ADMIN_REQUEST_REJECTED: &str = "admin_request_rejected";
 const EVENT_ADMIN_REQUEST_FAILED: &str = "admin_request_failed";
 const EVENT_ADMIN_RESPONSE_EMITTED: &str = "admin_response_emitted";
+
+fn admin_request_id(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(REQUEST_ID_HEADER)
+        .or_else(|| headers.get(AMZ_REQUEST_ID))
+        .and_then(|value| value.to_str().ok())
+}
+
+fn admin_remote_addr(req: &S3Request<Body>) -> Option<String> {
+    req.extensions
+        .get::<Option<RemoteAddr>>()
+        .and_then(|opt| opt.map(|addr| addr.0.to_string()))
+}
+
+fn log_pool_request_rejected_with_context(operation: &str, reason: &str, request_id: &str, actor: &str, remote_addr: &str) {
+    warn!(
+        event = EVENT_ADMIN_REQUEST_REJECTED,
+        component = LOG_COMPONENT_ADMIN_API,
+        subsystem = LOG_SUBSYSTEM_POOL_ADMIN,
+        operation,
+        action = operation,
+        result = "rejected",
+        reason,
+        request_id = %request_id,
+        actor = %actor,
+        remote_addr = %remote_addr,
+        "admin request rejected"
+    );
+}
 
 macro_rules! log_pool_request_rejected {
     ($operation:expr, $reason:expr) => {
@@ -49,6 +83,7 @@ macro_rules! log_pool_request_rejected {
             component = LOG_COMPONENT_ADMIN_API,
             subsystem = LOG_SUBSYSTEM_POOL_ADMIN,
             operation = $operation,
+            action = $operation,
             result = "rejected",
             reason = $reason,
             "admin request rejected"
@@ -63,6 +98,7 @@ macro_rules! log_pool_request_rejected_with_pool {
             component = LOG_COMPONENT_ADMIN_API,
             subsystem = LOG_SUBSYSTEM_POOL_ADMIN,
             operation = $operation,
+            action = $operation,
             result = "rejected",
             reason = $reason,
             pool = $pool,
@@ -78,6 +114,7 @@ macro_rules! log_pool_request_failed {
             component = LOG_COMPONENT_ADMIN_API,
             subsystem = LOG_SUBSYSTEM_POOL_ADMIN,
             operation = $operation,
+            action = $operation,
             result = "failed",
             reason = $reason,
             error = %$err,
@@ -89,10 +126,11 @@ macro_rules! log_pool_request_failed {
 macro_rules! log_pool_response_emitted {
     ($operation:expr) => {
         info!(
-            event = EVENT_ADMIN_RESPONSE_EMITTED,
+            event = EVENT_ADMIN_REQUEST_STATE,
             component = LOG_COMPONENT_ADMIN_API,
             subsystem = LOG_SUBSYSTEM_POOL_ADMIN,
             operation = $operation,
+            action = $operation,
             result = "success",
             "admin response emitted"
         );
@@ -351,12 +389,27 @@ impl Operation for StartDecommission {
     // POST <endpoint>/<admin-API>/pools/decommission?pool=http://server{1...4}/disk{1...4}
     #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let request_id = admin_request_id(&req.headers).unwrap_or_default().to_string();
+        let remote_addr = admin_remote_addr(&req).unwrap_or_default();
+        info!(
+            event = EVENT_ADMIN_REQUEST_STATE,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_POOL_ADMIN,
+            operation = "start_decommission",
+            action = "start_decommission",
+            state = "requested",
+            request_id = %request_id,
+            remote_addr = %remote_addr,
+            "admin pool request state"
+        );
+
         let Some(input_cred) = req.credentials else {
             return Err(pool_admin_missing_credentials_error("start decommission"));
         };
 
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+        let actor = MaskedAccessKey(&input_cred.access_key).to_string();
 
         validate_admin_request(
             &req.headers,
@@ -369,12 +422,18 @@ impl Operation for StartDecommission {
         .await?;
 
         let Some(endpoints) = endpoints_from_context() else {
-            log_pool_request_rejected!("start_decommission", "not_implemented");
+            log_pool_request_rejected_with_context("start_decommission", "not_implemented", &request_id, &actor, &remote_addr);
             return Err(s3_error!(NotImplemented));
         };
 
         if endpoints.legacy() {
-            log_pool_request_rejected!("start_decommission", "legacy_endpoints_not_supported");
+            log_pool_request_rejected_with_context(
+                "start_decommission",
+                "legacy_endpoints_not_supported",
+                &request_id,
+                &actor,
+                &remote_addr,
+            );
             return Err(s3_error!(NotImplemented));
         }
 
@@ -382,7 +441,26 @@ impl Operation for StartDecommission {
             return Err(decommission_admin_not_initialized_error("start decommission"));
         };
 
-        validate_start_decommission_guards(store.is_decommission_running().await, store.is_rebalance_started().await)?;
+        let decommission_running = store.is_decommission_running().await;
+        let rebalance_running = store.is_rebalance_started().await;
+        if decommission_running {
+            log_pool_request_rejected_with_context(
+                "start_decommission",
+                "decommission_already_running",
+                &request_id,
+                &actor,
+                &remote_addr,
+            );
+        } else if rebalance_running {
+            log_pool_request_rejected_with_context(
+                "start_decommission",
+                "rebalance_in_progress",
+                &request_id,
+                &actor,
+                &remote_addr,
+            );
+        }
+        validate_start_decommission_guards(decommission_running, rebalance_running)?;
 
         let query = {
             if let Some(query) = req.uri.query() {
@@ -424,13 +502,25 @@ impl Operation for StartDecommission {
         if !pools_indices.is_empty() {
             let pool_context = format!("pools {:?}", &pools_indices);
             store
-                .decommission(ctx.clone(), pools_indices)
+                .decommission(ctx.clone(), pools_indices.clone())
                 .await
                 .map_err(ApiError::from)
                 .map_err(|err| contextualize_admin_pool_api_error(err, "start decommission", &pool_context))?;
         }
 
-        log_pool_response_emitted!("start_decommission");
+        info!(
+            event = EVENT_ADMIN_RESPONSE_EMITTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_POOL_ADMIN,
+            operation = "start_decommission",
+            action = "start_decommission",
+            result = "success",
+            request_id = %request_id,
+            actor = %actor,
+            remote_addr = %remote_addr,
+            pool_indices = ?pools_indices,
+            "admin response emitted"
+        );
         Ok(S3Response::new((StatusCode::OK, Body::default())))
     }
 }
@@ -442,12 +532,27 @@ impl Operation for CancelDecommission {
     // POST <endpoint>/<admin-API>/pools/cancel?pool=http://server{1...4}/disk{1...4}
     #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let request_id = admin_request_id(&req.headers).unwrap_or_default().to_string();
+        let remote_addr = admin_remote_addr(&req).unwrap_or_default();
+        info!(
+            event = EVENT_ADMIN_REQUEST_STATE,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_POOL_ADMIN,
+            operation = "cancel_decommission",
+            action = "cancel_decommission",
+            state = "requested",
+            request_id = %request_id,
+            remote_addr = %remote_addr,
+            "admin pool request state"
+        );
+
         let Some(input_cred) = req.credentials else {
             return Err(pool_admin_missing_credentials_error("cancel decommission"));
         };
 
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+        let actor = MaskedAccessKey(&input_cred.access_key).to_string();
 
         validate_admin_request(
             &req.headers,
@@ -460,12 +565,18 @@ impl Operation for CancelDecommission {
         .await?;
 
         let Some(endpoints) = endpoints_from_context() else {
-            log_pool_request_rejected!("cancel_decommission", "not_implemented");
+            log_pool_request_rejected_with_context("cancel_decommission", "not_implemented", &request_id, &actor, &remote_addr);
             return Err(s3_error!(NotImplemented));
         };
 
         if endpoints.legacy() {
-            log_pool_request_rejected!("cancel_decommission", "legacy_endpoints_not_supported");
+            log_pool_request_rejected_with_context(
+                "cancel_decommission",
+                "legacy_endpoints_not_supported",
+                &request_id,
+                &actor,
+                &remote_addr,
+            );
             return Err(s3_error!(NotImplemented));
         }
 
@@ -503,7 +614,19 @@ impl Operation for CancelDecommission {
             .map_err(ApiError::from)
             .map_err(|err| contextualize_admin_pool_api_error(err, "cancel decommission", format!("pool {idx}")))?;
 
-        log_pool_response_emitted!("cancel_decommission");
+        info!(
+            event = EVENT_ADMIN_RESPONSE_EMITTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_POOL_ADMIN,
+            operation = "cancel_decommission",
+            action = "cancel_decommission",
+            result = "success",
+            request_id = %request_id,
+            actor = %actor,
+            remote_addr = %remote_addr,
+            pool_index = idx,
+            "admin response emitted"
+        );
         Ok(S3Response::new((StatusCode::OK, Body::default())))
     }
 }
