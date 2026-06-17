@@ -1276,15 +1276,12 @@ mod tests {
     proptest! {
         #[test]
         fn validate_object_name_ok_outputs_are_safe(input in any::<String>()) {
-            match ObjectKeyMapper::validate_object_name(&input) {
-                Ok(()) => {
-                    prop_assert!(!input.is_empty());
-                    prop_assert!(input.len() <= 1024);
-                    prop_assert!(!input.starts_with('/'));
-                    prop_assert!(!input.chars().any(char::is_control));
-                    prop_assert!(!input.split('/').any(|segment| segment == ".."));
-                }
-                Err(_) => {}
+            if let Ok(()) = ObjectKeyMapper::validate_object_name(&input) {
+                prop_assert!(!input.is_empty());
+                prop_assert!(input.len() <= 1024);
+                prop_assert!(!input.starts_with('/'));
+                prop_assert!(!input.chars().any(char::is_control));
+                prop_assert!(!input.split('/').any(|segment| segment == ".."));
             }
         }
 
