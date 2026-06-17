@@ -1785,6 +1785,16 @@ fn lifecycle_action_removes_data_movement_version(action: IlmAction) -> bool {
     )
 }
 
+fn resolve_data_movement_lifecycle_expiry_result(action: IlmAction, apply_actions: bool, applied: bool) -> Result<bool> {
+    if !apply_actions || applied {
+        return Ok(true);
+    }
+
+    Err(Error::other(format!(
+        "failed to apply lifecycle expiry action {action:?} during data movement"
+    )))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn should_skip_lifecycle_for_data_movement(
     store: Arc<ECStore>,
@@ -1795,9 +1805,9 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
     replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
     apply_actions: bool,
     event_source: &LcEventSrc,
-) -> bool {
+) -> Result<bool> {
     let Some(lifecycle_config) = lifecycle_config else {
-        return false;
+        return Ok(false);
     };
 
     let versioned = BucketVersioningSys::prefix_enabled(bucket, &version.name).await;
@@ -1809,15 +1819,13 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
             if apply_actions && object_info.is_remote() {
                 let _ = apply_expiry_on_transitioned_object(store, &object_info, &event, event_source).await;
             }
-            false
+            Ok(false)
         }
         action if lifecycle_action_removes_data_movement_version(action) => {
-            if apply_actions {
-                let _ = apply_expiry_rule(&event, event_source, &object_info).await;
-            }
-            true
+            let applied = !apply_actions || apply_expiry_rule(&event, event_source, &object_info).await;
+            resolve_data_movement_lifecycle_expiry_result(action, apply_actions, applied)
         }
-        _ => false,
+        _ => Ok(false),
     }
 }
 
@@ -2187,6 +2195,7 @@ impl ECStore {
                 &LcEventSrc::Decom,
             )
             .await
+            .map_err(|err| with_decommission_entry_context("lifecycle_expiry", bucket.as_str(), version.name.as_str(), err))?
             {
                 expired += 1;
                 cleanup_preflight_allowed_missing.push(data_movement::source_cleanup_version_identity(version));
@@ -3372,7 +3381,7 @@ impl ECStore {
                             if version.deleted {
                                 continue;
                             }
-                            if should_skip_lifecycle_for_data_movement(
+                            let skip_lifecycle = match should_skip_lifecycle_for_data_movement(
                                 Arc::clone(&store),
                                 &bucket_name,
                                 version,
@@ -3384,6 +3393,17 @@ impl ECStore {
                             )
                             .await
                             {
+                                Ok(skip_lifecycle) => skip_lifecycle,
+                                Err(err) => {
+                                    let mut first_err = entry_error.lock().await;
+                                    if first_err.is_none() {
+                                        *first_err = Some(err);
+                                        callback_rx.cancel();
+                                    }
+                                    return;
+                                }
+                            };
+                            if skip_lifecycle {
                                 continue;
                             }
                             remaining += 1;
@@ -3472,6 +3492,22 @@ mod tests {
         assert!(lifecycle_action_removes_data_movement_version(
             IlmAction::DelMarkerDeleteAllVersionsAction
         ));
+    }
+
+    #[test]
+    fn resolve_data_movement_lifecycle_expiry_result_allows_dry_run_skip() {
+        let skip = resolve_data_movement_lifecycle_expiry_result(IlmAction::DeleteVersionAction, false, false)
+            .expect("dry-run lifecycle evaluation should not require expiry enqueue");
+
+        assert!(skip);
+    }
+
+    #[test]
+    fn resolve_data_movement_lifecycle_expiry_result_rejects_apply_failure() {
+        let err = resolve_data_movement_lifecycle_expiry_result(IlmAction::DeleteVersionAction, true, false)
+            .expect_err("failed lifecycle expiry enqueue should not be treated as skipped");
+
+        assert!(err.to_string().contains("failed to apply lifecycle expiry action"));
     }
 
     #[test]

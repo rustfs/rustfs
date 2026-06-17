@@ -3214,7 +3214,7 @@ impl ECStore {
                 return Err(Error::OperationCanceled);
             }
 
-            if crate::pools::should_skip_lifecycle_for_data_movement(
+            let skip_lifecycle = match crate::pools::should_skip_lifecycle_for_data_movement(
                 self.clone(),
                 &bucket,
                 version,
@@ -3226,6 +3226,33 @@ impl ECStore {
             )
             .await
             {
+                Ok(skip_lifecycle) => skip_lifecycle,
+                Err(err) => {
+                    let deferred_error = format!("deferred rebalance lifecycle expiry failure: {err}");
+                    warn!(
+                        event = EVENT_REBALANCE_ENTRY,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        pool_index,
+                        bucket = %bucket,
+                        object = %version.name,
+                        state = "deferred",
+                        stage = "lifecycle_expiry",
+                        error = %err,
+                        "Deferred rebalance entry after lifecycle expiry failure"
+                    );
+                    if let Err(stats_err) = self.update_rebalance_last_error(pool_index, deferred_error.clone()).await {
+                        error!(
+                            "rebalance_entry {} failed to record lifecycle expiry failure for {}: {}",
+                            &bucket, &entry.name, stats_err
+                        );
+                    }
+                    return Ok(RebalanceEntryOutcome::Deferred {
+                        last_error: deferred_error,
+                    });
+                }
+            };
+            if skip_lifecycle {
                 expired += 1;
                 debug!(
                     event = EVENT_REBALANCE_ENTRY,
