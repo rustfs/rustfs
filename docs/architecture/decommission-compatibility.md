@@ -133,6 +133,55 @@ Before implementation, product/compatibility review must choose:
 Until those choices are made, RustFS intentionally preserves the current
 single-pool contract.
 
+## MinIO Divergence Decisions
+
+This section records the current product decisions for behavior that is close to
+MinIO but not always byte-for-byte identical.
+
+### Empty Delete Markers
+
+MinIO decommission documentation states that empty delete markers, meaning delete
+markers with no successor object versions, are not transitioned to another pool.
+
+RustFS follows that behavior for decommission when the bucket has no replication
+configuration: a lone remaining delete marker is treated as cleanup-only metadata
+and is skipped. When replication is configured, RustFS intentionally keeps the
+delete marker eligible for movement so delete-marker replication and purge state
+are not lost.
+
+RustFS rebalance uses the same predicate as decommission: skip only a lone delete
+marker without replication. This is intentional even though MinIO's public
+documentation calls out the decommission case more explicitly than the rebalance
+case.
+
+Regression guards:
+
+- `should_skip_decommission_delete_marker_characterizes_empty_marker_without_replication`
+- `should_skip_decommission_delete_marker_characterizes_replication_configured`
+- `test_should_skip_rebalance_delete_marker_characterizes_empty_marker_without_replication`
+- `test_should_skip_rebalance_delete_marker_characterizes_replication_configured`
+
+### Lifecycle-Expired Versions During Cleanup
+
+MinIO decommission ignores versions that are already expired by lifecycle rules.
+RustFS follows that decommission behavior by allowing safely expired versions to
+count toward source cleanup completion.
+
+RustFS rebalance is intentionally stricter. Expired versions do not prove that a
+target pool received an equivalent version, so rebalance cleanup requires actual
+rebalance completion for the source entry instead of treating lifecycle-expired
+versions as moved.
+
+Regression guards:
+
+- `test_should_cleanup_decommission_source_entry_accepts_migrated_and_safely_expired_versions`
+- `test_should_cleanup_decommission_source_entry_accepts_versions_only_safely_expired_by_lifecycle`
+- `test_should_cleanup_rebalance_source_entry_rejects_versions_only_expired_by_lifecycle`
+
+No migration step is required for these decisions because this note documents the
+current RustFS behavior. Changing either decision later requires an operator
+compatibility note and updated characterization tests.
+
 ## Regression Guard
 
 The single-pool contract is guarded by
