@@ -705,6 +705,18 @@ pub struct HealManager {
     notify: Arc<Notify>,
 }
 
+struct HealQueueContext<'a> {
+    heal_queue: &'a Arc<Mutex<PriorityHealQueue>>,
+    active_heals: &'a Arc<Mutex<HashMap<String, Arc<HealTask>>>>,
+    completed_heals: &'a Arc<Mutex<HashMap<String, CompletedHealStatus>>>,
+    retrying_heals: &'a Arc<Mutex<HashMap<String, RetryingHeal>>>,
+    config: &'a Arc<RwLock<HealConfig>>,
+    statistics: &'a Arc<RwLock<HealStatistics>>,
+    storage: &'a Arc<dyn HealStorageAPI>,
+    notify: &'a Arc<Notify>,
+    cancel_token: &'a CancellationToken,
+}
+
 impl HealManager {
     fn classify_full_admission(request: &HealRequest, config: &HealConfig) -> HealAdmissionResult {
         if request.priority == HealPriority::Low && config.low_priority_drop_when_full {
@@ -1610,10 +1622,32 @@ impl HealManager {
                         break;
                     }
                     _ = notify.notified(), if event_driven_scheduler_enable => {
-                        Self::process_heal_queue(&heal_queue, &active_heals, &completed_heals, &retrying_heals, &config, &statistics, &storage, &notify, &cancel_token).await;
+                        Self::process_heal_queue(HealQueueContext {
+                            heal_queue: &heal_queue,
+                            active_heals: &active_heals,
+                            completed_heals: &completed_heals,
+                            retrying_heals: &retrying_heals,
+                            config: &config,
+                            statistics: &statistics,
+                            storage: &storage,
+                            notify: &notify,
+                            cancel_token: &cancel_token,
+                        })
+                        .await;
                     }
                     _ = interval.tick() => {
-                        Self::process_heal_queue(&heal_queue, &active_heals, &completed_heals, &retrying_heals, &config, &statistics, &storage, &notify, &cancel_token).await;
+                        Self::process_heal_queue(HealQueueContext {
+                            heal_queue: &heal_queue,
+                            active_heals: &active_heals,
+                            completed_heals: &completed_heals,
+                            retrying_heals: &retrying_heals,
+                            config: &config,
+                            statistics: &statistics,
+                            storage: &storage,
+                            notify: &notify,
+                            cancel_token: &cancel_token,
+                        })
+                        .await;
                     }
                 }
             }
@@ -1841,17 +1875,19 @@ impl HealManager {
 
     /// Process heal queue
     /// Processes multiple tasks per cycle when capacity allows and queue has high-priority items
-    async fn process_heal_queue(
-        heal_queue: &Arc<Mutex<PriorityHealQueue>>,
-        active_heals: &Arc<Mutex<HashMap<String, Arc<HealTask>>>>,
-        completed_heals: &Arc<Mutex<HashMap<String, CompletedHealStatus>>>,
-        retrying_heals: &Arc<Mutex<HashMap<String, RetryingHeal>>>,
-        config: &Arc<RwLock<HealConfig>>,
-        statistics: &Arc<RwLock<HealStatistics>>,
-        storage: &Arc<dyn HealStorageAPI>,
-        notify: &Arc<Notify>,
-        cancel_token: &CancellationToken,
-    ) {
+    async fn process_heal_queue(context: HealQueueContext<'_>) {
+        let HealQueueContext {
+            heal_queue,
+            active_heals,
+            completed_heals,
+            retrying_heals,
+            config,
+            statistics,
+            storage,
+            notify,
+            cancel_token,
+        } = context;
+
         let config = config.read().await;
         let mut active_heals_guard = active_heals.lock().await;
         publish_active_heal_count(&active_heals_guard);
