@@ -20,15 +20,16 @@ use crate::store_api::{
 use bytes::Bytes;
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex};
 use rustfs_utils::path::encode_dir_object;
-use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncReadExt, BufReader, ReadBuf};
+use tokio::io::{AsyncRead, BufReader, ReadBuf};
 use tracing::error;
+
+type SharedDataMovementStream = Arc<Mutex<Box<dyn AsyncRead + Unpin + Send + Sync>>>;
 
 pub struct IndexedDataMovementReader<R> {
     inner: R,
@@ -67,17 +68,58 @@ pub fn decode_part_index(index: Option<&Bytes>) -> Option<Index> {
     }
 }
 
-pub fn put_obj_reader_from_chunk(chunk: Vec<u8>, size: i64, actual_size: i64, index: Option<Index>) -> Result<PutObjReader> {
-    use sha2::{Digest, Sha256};
+struct DataMovementPartReader {
+    inner: SharedDataMovementStream,
+    remaining: u64,
+}
 
-    let sha256hex = if !chunk.is_empty() {
-        Some(hex_simd::encode_to_string(Sha256::digest(&chunk), hex_simd::AsciiCase::Lower))
-    } else {
-        None
-    };
+impl DataMovementPartReader {
+    fn new(inner: SharedDataMovementStream, size: u64) -> Self {
+        Self { inner, remaining: size }
+    }
+}
 
-    let reader = IndexedDataMovementReader::new(Cursor::new(chunk), index);
-    let hash_reader = HashReader::from_stream(reader, size, actual_size, None, sha256hex, false)?;
+impl AsyncRead for DataMovementPartReader {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        if self.remaining == 0 || buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        let allowed = buf.remaining().min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        let target = buf.initialize_unfilled_to(allowed);
+        let mut limited_buf = ReadBuf::new(target);
+
+        let poll = {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| std::io::Error::other("data movement stream lock poisoned"))?;
+            Pin::new(&mut **inner).poll_read(cx, &mut limited_buf)
+        };
+
+        if let Poll::Ready(Ok(())) = &poll {
+            let read = limited_buf.filled().len();
+            buf.advance(read);
+            self.remaining = self.remaining.saturating_sub(u64::try_from(read).unwrap_or(u64::MAX));
+        }
+
+        poll
+    }
+}
+
+impl EtagResolvable for DataMovementPartReader {}
+
+impl HashReaderDetector for DataMovementPartReader {}
+
+fn put_obj_reader_from_part_stream(
+    stream: SharedDataMovementStream,
+    size: i64,
+    actual_size: i64,
+    index: Option<Index>,
+) -> Result<PutObjReader> {
+    let limit = u64::try_from(size).map_err(|_| Error::other("part size overflow"))?;
+    let reader = IndexedDataMovementReader::new(DataMovementPartReader::new(stream, limit), index);
+    let hash_reader = HashReader::from_reader(reader, size, actual_size, None, None, false)?;
     Ok(PutObjReader::new(hash_reader))
 }
 
@@ -248,6 +290,26 @@ fn data_movement_part_stage_error(
     Error::other(format!("{op_label}: {stage} failed for {bucket}/{object} part {part_number}: {err}"))
 }
 
+fn is_data_movement_part_read_error(err: &Error) -> bool {
+    fn is_unexpected_eof(err: &std::io::Error) -> bool {
+        err.kind() == std::io::ErrorKind::UnexpectedEof
+            || err
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<std::io::Error>())
+                .is_some_and(is_unexpected_eof)
+    }
+
+    matches!(err, Error::Io(io_err) if is_unexpected_eof(io_err))
+}
+
+fn data_movement_part_upload_failure_stage(err: &Error) -> &'static str {
+    if is_data_movement_part_read_error(err) {
+        "read_part"
+    } else {
+        "put_object_part"
+    }
+}
+
 pub(crate) async fn migrate_object(
     store: Arc<ECStore>,
     pool_idx: usize,
@@ -282,21 +344,9 @@ pub(crate) async fn migrate_object(
         let abort_multipart_flag = new_multipart_abort_flag();
         let multipart_result: Result<()> = async {
             let mut parts = vec![CompletePart::default(); object_info.parts.len()];
-            let mut reader = rd.stream;
+            let reader = Arc::new(Mutex::new(rd.stream));
 
             for (i, part) in object_info.parts.iter().enumerate() {
-                let mut chunk = vec![0u8; part.size];
-                reader.read_exact(&mut chunk).await.map_err(|err| {
-                    data_movement_part_stage_error(
-                        op_label,
-                        "read_part",
-                        bucket.as_str(),
-                        object_info.name.as_str(),
-                        part.number,
-                        Error::other(err.to_string()),
-                    )
-                })?;
-
                 let part_size = i64::try_from(part.size).map_err(|_| {
                     data_movement_part_stage_error(
                         op_label,
@@ -309,16 +359,17 @@ pub(crate) async fn migrate_object(
                 })?;
                 let part_actual_size = if part.actual_size > 0 { part.actual_size } else { part_size };
                 let index = decode_part_index(part.index.as_ref());
-                let mut data = put_obj_reader_from_chunk(chunk, part_size, part_actual_size, index).map_err(|err| {
-                    data_movement_part_stage_error(
-                        op_label,
-                        "prepare_part",
-                        bucket.as_str(),
-                        object_info.name.as_str(),
-                        part.number,
-                        err,
-                    )
-                })?;
+                let mut data =
+                    put_obj_reader_from_part_stream(reader.clone(), part_size, part_actual_size, index).map_err(|err| {
+                        data_movement_part_stage_error(
+                            op_label,
+                            "prepare_part",
+                            bucket.as_str(),
+                            object_info.name.as_str(),
+                            part.number,
+                            err,
+                        )
+                    })?;
 
                 let pi = match store
                     .put_object_part(
@@ -337,9 +388,10 @@ pub(crate) async fn migrate_object(
                     Ok(pi) => pi,
                     Err(err) => {
                         error!("{op_label}: put_object_part {i} err {:?}", &err);
+                        let stage = data_movement_part_upload_failure_stage(&err);
                         return Err(data_movement_part_stage_error(
                             op_label,
-                            "put_object_part",
+                            stage,
                             bucket.as_str(),
                             object_info.name.as_str(),
                             part.number,
@@ -460,8 +512,47 @@ pub(crate) async fn migrate_object(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    use std::sync::atomic::AtomicUsize;
     use time::OffsetDateTime;
+    use tokio::io::AsyncReadExt;
     use uuid::Uuid;
+
+    struct MaxReadRequestReader {
+        remaining: u64,
+        max_request: usize,
+        largest_request: Arc<AtomicUsize>,
+    }
+
+    impl MaxReadRequestReader {
+        fn new(remaining: u64, max_request: usize, largest_request: Arc<AtomicUsize>) -> Self {
+            Self {
+                remaining,
+                max_request,
+                largest_request,
+            }
+        }
+    }
+
+    impl AsyncRead for MaxReadRequestReader {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            let requested = buf.remaining();
+            self.largest_request.fetch_max(requested, Ordering::Relaxed);
+            if requested > self.max_request {
+                return Poll::Ready(Err(std::io::Error::other(format!("oversized read request: {requested}"))));
+            }
+            if self.remaining == 0 || requested == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            let read = requested.min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+            let target = buf.initialize_unfilled_to(read);
+            target.fill(b'x');
+            buf.advance(read);
+            self.remaining = self.remaining.saturating_sub(u64::try_from(read).unwrap_or(u64::MAX));
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[test]
     fn test_new_multipart_abort_flag_defaults_to_abort_enabled() {
@@ -511,6 +602,18 @@ mod tests {
     }
 
     #[test]
+    fn test_data_movement_part_upload_failure_stage_reports_short_read() {
+        let err = Error::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short part"));
+
+        assert_eq!(data_movement_part_upload_failure_stage(&err), "read_part");
+    }
+
+    #[test]
+    fn test_data_movement_part_upload_failure_stage_keeps_write_errors() {
+        assert_eq!(data_movement_part_upload_failure_stage(&Error::SlowDown), "put_object_part");
+    }
+
+    #[test]
     fn test_should_check_data_movement_overwrite_resume_only_for_overwrite_error() {
         assert!(should_check_data_movement_overwrite_resume(&Error::DataMovementOverwriteErr(
             "bucket-a".to_string(),
@@ -544,6 +647,81 @@ mod tests {
 
         assert_eq!(decoded.total_uncompressed, 2_097_152);
         assert_eq!(decoded.total_compressed, 2_097_152);
+    }
+
+    #[tokio::test]
+    async fn test_multipart_part_stream_preserves_boundaries() {
+        let stream: Box<dyn AsyncRead + Unpin + Send + Sync> = Box::new(Cursor::new(b"abcdef".to_vec()));
+        let shared = Arc::new(Mutex::new(stream));
+
+        let mut first =
+            put_obj_reader_from_part_stream(shared.clone(), 3, 3, None).expect("first bounded part reader should be created");
+        let mut first_data = Vec::new();
+        first
+            .stream
+            .read_to_end(&mut first_data)
+            .await
+            .expect("first part should read only its boundary");
+
+        let mut second =
+            put_obj_reader_from_part_stream(shared, 3, 3, None).expect("second bounded part reader should be created");
+        let mut second_data = Vec::new();
+        second
+            .stream
+            .read_to_end(&mut second_data)
+            .await
+            .expect("second part should continue at the next boundary");
+
+        assert_eq!(first_data, b"abc");
+        assert_eq!(second_data, b"def");
+    }
+
+    #[tokio::test]
+    async fn test_multipart_part_stream_does_not_request_full_large_part() {
+        let largest_request = Arc::new(AtomicUsize::new(0));
+        let stream: Box<dyn AsyncRead + Unpin + Send + Sync> =
+            Box::new(MaxReadRequestReader::new(16 * 1024 * 1024, 8 * 1024, largest_request.clone()));
+        let shared = Arc::new(Mutex::new(stream));
+        let mut data = put_obj_reader_from_part_stream(shared, 16 * 1024 * 1024, 16 * 1024 * 1024, None)
+            .expect("large bounded part reader should be created without allocating part size");
+
+        let mut buf = [0u8; 8 * 1024];
+        let read = data
+            .stream
+            .read(&mut buf)
+            .await
+            .expect("bounded reader should satisfy a small read against a large advertised part");
+
+        assert_eq!(read, buf.len());
+        assert!(largest_request.load(Ordering::Relaxed) <= buf.len());
+    }
+
+    #[tokio::test]
+    async fn test_multipart_part_stream_reports_short_part() {
+        let stream: Box<dyn AsyncRead + Unpin + Send + Sync> = Box::new(Cursor::new(b"abc".to_vec()));
+        let shared = Arc::new(Mutex::new(stream));
+        let mut data = put_obj_reader_from_part_stream(shared, 5, 5, None).expect("short bounded part reader should be created");
+
+        let err = data
+            .stream
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("short source stream should fail the part reader");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn test_multipart_part_stream_preserves_index() {
+        let mut index = Index::new();
+        index.add(0, 0).expect("index entry should be accepted");
+
+        let stream: Box<dyn AsyncRead + Unpin + Send + Sync> = Box::new(Cursor::new(b"abc".to_vec()));
+        let shared = Arc::new(Mutex::new(stream));
+        let data = put_obj_reader_from_part_stream(shared, 3, 3, Some(index))
+            .expect("bounded part reader should retain compression index");
+
+        assert!(data.stream.try_get_index().is_some());
     }
 
     #[test]
