@@ -97,7 +97,7 @@ Required `rustfs-storage-api` public re-exports:
 - `pub use object::{HTTPPreconditions, HTTPRangeError, HTTPRangeSpec, ObjectLockRetentionOptions};`
 - `pub use object::{ListObjectVersionsInfo, ListObjectsInfo, ListObjectsV2Info, ObjectInfoOrErr};`
 - `pub use object::{ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState};`
-- `pub use object::{VersionMarker, WalkVersionsSortOrder};`
+- `pub use object::{VersionMarker, WalkOptions, WalkVersionsSortOrder};`
 
 ECStore must keep compile-time coverage for both `StorageAdminApi` and the
 separate `NamespaceLocking` operation group.

@@ -154,6 +154,31 @@ pub enum WalkVersionsSortOrder {
     Descending,
 }
 
+#[derive(Clone)]
+pub struct WalkOptions<Filter> {
+    pub filter: Option<Filter>,
+    pub marker: Option<String>,
+    pub latest_only: bool,
+    pub ask_disks: String,
+    pub versions_sort: WalkVersionsSortOrder,
+    pub limit: usize,
+    pub include_free_versions: bool,
+}
+
+impl<Filter> Default for WalkOptions<Filter> {
+    fn default() -> Self {
+        Self {
+            filter: None,
+            marker: None,
+            latest_only: false,
+            ask_disks: String::new(),
+            versions_sort: WalkVersionsSortOrder::default(),
+            limit: 0,
+            include_free_versions: false,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ListObjectsInfo<ObjectItem> {
     pub is_truncated: bool,
@@ -416,6 +441,21 @@ mod tests {
     #[test]
     fn walk_versions_sort_order_defaults_to_ascending() {
         assert!(matches!(WalkVersionsSortOrder::default(), WalkVersionsSortOrder::Ascending));
+    }
+
+    #[test]
+    fn walk_options_defaults_preserve_existing_contract() {
+        type TestFilter = fn(&str) -> bool;
+
+        let opts = WalkOptions::<TestFilter>::default();
+
+        assert!(opts.filter.is_none());
+        assert!(opts.marker.is_none());
+        assert!(!opts.latest_only);
+        assert!(opts.ask_disks.is_empty());
+        assert!(matches!(opts.versions_sort, WalkVersionsSortOrder::Ascending));
+        assert_eq!(opts.limit, 0);
+        assert!(!opts.include_free_versions);
     }
 
     #[test]

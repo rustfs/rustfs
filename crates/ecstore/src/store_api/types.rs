@@ -1,13 +1,14 @@
 use super::*;
 use rustfs_storage_api::{
     HTTPPreconditions, ObjectLockRetentionOptions, ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState,
-    VersionMarker, WalkVersionsSortOrder,
+    VersionMarker,
 };
 
 pub type ListObjectsInfo = rustfs_storage_api::ListObjectsInfo<ObjectInfo>;
 pub type ListObjectsV2Info = rustfs_storage_api::ListObjectsV2Info<ObjectInfo>;
 pub type ListObjectVersionsInfo = rustfs_storage_api::ListObjectVersionsInfo<ObjectInfo>;
 pub type ObjectInfoOrErr = rustfs_storage_api::ObjectInfoOrErr<ObjectInfo, Error>;
+pub type WalkOptions = rustfs_storage_api::WalkOptions<WalkFilter>;
 
 #[derive(Debug, Default, Clone)]
 pub struct ObjectOptions {
@@ -767,17 +768,6 @@ impl DeletedObject {
 }
 
 type WalkFilter = fn(&FileInfo) -> bool;
-
-#[derive(Clone, Default)]
-pub struct WalkOptions {
-    pub filter: Option<WalkFilter>,           // return WalkFilter returns 'true/false'
-    pub marker: Option<String>,               // set to skip until this object
-    pub latest_only: bool,                    // returns only latest versions for all matching objects
-    pub ask_disks: String,                    // dictates how many disks are being listed
-    pub versions_sort: WalkVersionsSortOrder, // sort order for versions of the same object; default: Ascending order in ModTime
-    pub limit: usize,                         // maximum number of items, 0 means no limit
-    pub include_free_versions: bool,          // include persisted tier free-version cleanup records
-}
 
 #[cfg(test)]
 mod tests {
