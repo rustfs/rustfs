@@ -1,5 +1,5 @@
 use super::*;
-use rustfs_storage_api::{HTTPPreconditions, ObjectLockRetentionOptions};
+use rustfs_storage_api::{HTTPPreconditions, ObjectLockRetentionOptions, VersionMarker, WalkVersionsSortOrder};
 
 #[derive(Debug, Default, Clone)]
 pub struct ObjectOptions {
@@ -740,12 +740,6 @@ impl ObjectInfo {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VersionMarker {
-    Null,
-    Version(Uuid),
-}
-
 fn versions_after_marker(file_infos: &rustfs_filemeta::FileInfoVersions, marker: VersionMarker) -> &[FileInfo] {
     let marker_idx = match marker {
         VersionMarker::Null => file_infos.versions.iter().position(|version| version.version_id.is_none()),
@@ -874,13 +868,6 @@ pub struct WalkOptions {
     pub versions_sort: WalkVersionsSortOrder, // sort order for versions of the same object; default: Ascending order in ModTime
     pub limit: usize,                         // maximum number of items, 0 means no limit
     pub include_free_versions: bool,          // include persisted tier free-version cleanup records
-}
-
-#[derive(Clone, Default, PartialEq, Eq)]
-pub enum WalkVersionsSortOrder {
-    #[default]
-    Ascending,
-    Descending,
 }
 
 #[derive(Debug)]
