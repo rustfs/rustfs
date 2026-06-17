@@ -37,6 +37,8 @@ fuzz/
   - Exercises object-path acceptance and containment invariants using public path helpers.
 - `local_metadata`
   - Exercises `rustfs-filemeta` metadata decoding and `rustfs-utils` block decompression.
+- `policy_ingress`
+  - Exercises RustFS-owned bucket policy and policy-doc JSON ingress behavior, including strict-vs-tolerant unknown-field expectations.
 
 ## Usage
 

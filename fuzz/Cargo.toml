@@ -14,7 +14,10 @@ arbitrary = "1"
 libfuzzer-sys = "0.4"
 rustfs-ecstore = { path = "../crates/ecstore" }
 rustfs-filemeta = { path = "../crates/filemeta" }
+rustfs-policy = { path = "../crates/policy" }
+rustfs-security-governance = { path = "../crates/security-governance" }
 rustfs-utils = { path = "../crates/utils", features = ["compress", "path"] }
+serde_json = "1"
 
 [[bin]]
 name = "bucket_validation"
@@ -26,6 +29,13 @@ bench = false
 [[bin]]
 name = "local_metadata"
 path = "fuzz_targets/local_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy_ingress"
+path = "fuzz_targets/policy_ingress.rs"
 test = false
 doc = false
 bench = false
