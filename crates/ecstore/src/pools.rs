@@ -543,6 +543,13 @@ fn decommission_cancel_signal_result(cancel_signal: bool) -> Result<()> {
     }
 }
 
+fn is_decommission_cancel_requested(cancel_signal: bool, pool: Option<&PoolStatus>) -> bool {
+    cancel_signal
+        || pool
+            .and_then(|pool| pool.decommission.as_ref())
+            .is_some_and(|info| info.canceled)
+}
+
 async fn run_decommission_buckets_bounded<F>(
     rx: CancellationToken,
     buckets: Vec<DecomBucketInfo>,
@@ -1694,7 +1701,6 @@ impl ECStore {
     #[tracing::instrument(skip(self))]
     pub async fn decommission_cancel(&self, idx: usize) -> Result<()> {
         ensure_decommission_terminal_operation_supported(self.single_pool(), "cancel decommission")?;
-        ensure_local_decommission_pool_leaders(&self.endpoints(), &[idx])?;
 
         let should_reload_pool_meta = {
             let mut lock = self.pool_meta.write().await;
@@ -1777,6 +1783,11 @@ impl ECStore {
         }
 
         false
+    }
+
+    async fn decommission_cancel_requested(&self, idx: usize, rx: &CancellationToken) -> bool {
+        let pool_meta = self.pool_meta.read().await;
+        is_decommission_cancel_requested(rx.is_cancelled(), pool_meta.pools.get(idx))
     }
 
     pub(crate) async fn spawn_decommission_routines(
@@ -1921,6 +1932,9 @@ impl ECStore {
             );
             return Ok(());
         }
+        if self.decommission_cancel_requested(idx, &rx).await {
+            rx.cancel();
+        }
         decommission_cancel_signal_result(rx.is_cancelled())?;
 
         let mut fivs = load_decommission_entry_versions(&entry, &bucket, "file_info_versions")?;
@@ -1933,6 +1947,9 @@ impl ECStore {
         let mut cleanup_preflight_allowed_missing = Vec::new();
 
         for version in fivs.versions.iter() {
+            if self.decommission_cancel_requested(idx, &rx).await {
+                rx.cancel();
+            }
             decommission_cancel_signal_result(rx.is_cancelled())?;
 
             if should_skip_lifecycle_for_data_movement(
@@ -3977,20 +3994,20 @@ mod pools_tests {
         ensure_decommission_start_allowed, ensure_decommission_start_rebalance_meta_allowed,
         ensure_decommission_terminal_operation_supported, ensure_local_decommission_pool_leaders,
         ensure_valid_decommission_pool_index, get_by_index, has_active_decommission_canceler, is_decommission_active,
-        is_decommission_cancel_terminal, load_decommission_entry_versions, mark_decommission_bucket_done,
-        pool_meta_has_active_decommission, require_decommission_store, resolve_decommission_bucket_done_save_result,
-        resolve_decommission_bucket_state, resolve_decommission_check_after_list_result,
-        resolve_decommission_entry_cleanup_delete_result, resolve_decommission_entry_reload_result,
-        resolve_decommission_listing_worker_result, resolve_decommission_optional_bucket_config_result,
-        resolve_decommission_pool_meta_reload_result, resolve_decommission_preflight_heal_result,
-        resolve_decommission_progress_save_result, resolve_decommission_spawn_failure_result,
-        resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
-        resolve_decommission_update_after_result, resolve_start_decommission_pool_meta_reload_result,
-        rollback_start_decommission_pool_meta, run_decommission_buckets_bounded, should_cleanup_decommission_source_entry,
-        should_continue_decommission_queue, should_count_decommission_version_complete,
-        should_preserve_decommission_canceled_state, split_decommission_buckets, take_and_cancel_decommission_canceler,
-        take_decommission_canceler, track_decommission_current_object, validate_start_decommission_request,
-        wait_decommission_worker_drain, with_decommission_entry_context,
+        is_decommission_cancel_requested, is_decommission_cancel_terminal, load_decommission_entry_versions,
+        mark_decommission_bucket_done, pool_meta_has_active_decommission, require_decommission_store,
+        resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
+        resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
+        resolve_decommission_entry_reload_result, resolve_decommission_listing_worker_result,
+        resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,
+        resolve_decommission_preflight_heal_result, resolve_decommission_progress_save_result,
+        resolve_decommission_spawn_failure_result, resolve_decommission_terminal_mark_after_error_result,
+        resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result,
+        resolve_start_decommission_pool_meta_reload_result, rollback_start_decommission_pool_meta,
+        run_decommission_buckets_bounded, should_cleanup_decommission_source_entry, should_continue_decommission_queue,
+        should_count_decommission_version_complete, should_preserve_decommission_canceled_state, split_decommission_buckets,
+        take_and_cancel_decommission_canceler, take_decommission_canceler, track_decommission_current_object,
+        validate_start_decommission_request, wait_decommission_worker_drain, with_decommission_entry_context,
     };
     use crate::data_movement;
     use crate::disk::endpoint::Endpoint;
@@ -5352,6 +5369,35 @@ mod pools_tests {
     #[test]
     fn test_decommission_cancel_signal_result_returns_ok_when_not_canceled() {
         assert!(decommission_cancel_signal_result(false).is_ok());
+    }
+
+    #[test]
+    fn test_is_decommission_cancel_requested_accepts_signal_or_metadata() {
+        let pool = PoolStatus {
+            id: 0,
+            cmd_line: "pool-0".to_string(),
+            last_update: OffsetDateTime::UNIX_EPOCH,
+            decommission: Some(PoolDecommissionInfo {
+                canceled: true,
+                ..Default::default()
+            }),
+        };
+
+        assert!(is_decommission_cancel_requested(false, Some(&pool)));
+        assert!(is_decommission_cancel_requested(true, None));
+    }
+
+    #[test]
+    fn test_is_decommission_cancel_requested_rejects_active_without_signal() {
+        let pool = PoolStatus {
+            id: 0,
+            cmd_line: "pool-0".to_string(),
+            last_update: OffsetDateTime::UNIX_EPOCH,
+            decommission: Some(PoolDecommissionInfo::default()),
+        };
+
+        assert!(!is_decommission_cancel_requested(false, Some(&pool)));
+        assert!(!is_decommission_cancel_requested(false, None));
     }
 
     #[test]
