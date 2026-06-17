@@ -580,10 +580,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
 
         return Err(err);
     }
-    rustfs_io_metrics::record_put_object_stage_duration(
-        "metacache_merge",
-        merge_started.elapsed().as_secs_f64() * 1000.0,
-    );
+    rustfs_io_metrics::record_put_object_stage_duration("metacache_merge", merge_started.elapsed().as_secs_f64() * 1000.0);
 
     // The merge consumer can finish successfully before every producer finishes
     // (for example after reaching EOF quorum while a tolerated drive is stalled,

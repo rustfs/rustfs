@@ -86,6 +86,7 @@ use rustfs_filemeta::{
     ReplicationType, RestoreStatusOps, VersionPurgeStatusType, parse_restore_obj_status, replication_statuses_map,
     version_purge_statuses_map,
 };
+use rustfs_io_core::{BytesPool, PooledBuffer};
 use rustfs_io_metrics;
 use rustfs_lock::NamespaceLockGuard;
 use rustfs_notify::EventArgsBuilder;
@@ -95,7 +96,6 @@ use rustfs_s3select_api::object_store::bytes_stream;
 use rustfs_targets::{
     EventName, extract_params_header, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
 };
-use rustfs_io_core::{BytesPool, PooledBuffer};
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, CONTENT_TYPE,
@@ -118,8 +118,8 @@ use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
 use std::ops::Add;
-use std::pin::Pin;
 use std::path::{Component, Path};
+use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use std::str::FromStr;
@@ -136,6 +136,11 @@ use uuid::Uuid;
 
 const ACCEPT_RANGES_BYTES: &str = "bytes";
 const MAX_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
+const LOG_COMPONENT_APP: &str = "app";
+const LOG_SUBSYSTEM_OBJECT: &str = "object";
+const EVENT_PUT_OBJECT_STORE_INFLIGHT_SLOW: &str = "put_object_store_inflight_slow";
+const EVENT_PUT_OBJECT_STORE_RETURNED: &str = "put_object_store_returned";
+const PUT_OBJECT_STORE_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 static GET_OBJECT_BUFFER_THRESHOLD_WARNED: AtomicBool = AtomicBool::new(false);
 
 fn decoded_content_length_from_headers(headers: &HeaderMap) -> S3Result<Option<i64>> {
@@ -472,7 +477,7 @@ fn should_use_small_eager_put_path(
     should_compress: bool,
     is_extract: bool,
 ) -> bool {
-    const SMALL_EAGER_PUT_MAX_SIZE: i64 = 1024 * 1024;
+    const SMALL_EAGER_PUT_MAX_SIZE: i64 = 256 * 1024;
 
     if is_extract || should_compress || server_side_encryption_requested {
         return false;
@@ -1928,13 +1933,8 @@ impl DefaultObjectUsecase {
             debug!("Zero-copy write enabled for {} byte object (bucket={}, key={})", size, bucket, key);
         }
 
-        let use_small_eager_put_path = should_use_small_eager_put_path(
-            size,
-            &req.headers,
-            server_side_encryption_requested,
-            should_compress,
-            false,
-        );
+        let use_small_eager_put_path =
+            should_use_small_eager_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
         let put_path = if should_compress {
             "stream_compressed"
         } else if use_small_eager_put_path {
@@ -2170,6 +2170,11 @@ impl DefaultObjectUsecase {
 
         let mt2 = metadata.clone();
         opts.user_defined.extend(metadata);
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
+        let request_id = request_context
+            .as_ref()
+            .map(|ctx| ctx.request_id.clone())
+            .unwrap_or_else(|| request_context::RequestContext::fallback().request_id);
 
         let repoptions =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
@@ -2184,13 +2189,76 @@ impl DefaultObjectUsecase {
             );
         }
 
+        let store_put_watchdog = tokio_util::sync::CancellationToken::new();
+        spawn_traced({
+            let store_put_watchdog = store_put_watchdog.clone();
+            let request_id = request_id.clone();
+            let bucket = bucket.clone();
+            let key = key.clone();
+            let put_path = put_path.to_string();
+            async move {
+                tokio::select! {
+                    _ = store_put_watchdog.cancelled() => {}
+                    _ = tokio::time::sleep(PUT_OBJECT_STORE_WARN_THRESHOLD) => {
+                        warn!(
+                            target: "rustfs::app::object_usecase",
+                            event = EVENT_PUT_OBJECT_STORE_INFLIGHT_SLOW,
+                            component = LOG_COMPONENT_APP,
+                            subsystem = LOG_SUBSYSTEM_OBJECT,
+                            request_id = %request_id,
+                            bucket = %bucket,
+                            key = %key,
+                            put_path = %put_path,
+                            object_size = actual_size,
+                            threshold_ms = PUT_OBJECT_STORE_WARN_THRESHOLD.as_millis() as u64,
+                            state = "store_put_pending",
+                            "PutObject store write remains in flight"
+                        );
+                    }
+                }
+            }
+        });
+
         let obj_info = match store
             .put_object(&bucket, &key, &mut reader, &opts)
             .await
             .map_err(ApiError::from)
         {
-            Ok(obj_info) => obj_info,
+            Ok(obj_info) => {
+                store_put_watchdog.cancel();
+                debug!(
+                    target: "rustfs::app::object_usecase",
+                    event = EVENT_PUT_OBJECT_STORE_RETURNED,
+                    component = LOG_COMPONENT_APP,
+                    subsystem = LOG_SUBSYSTEM_OBJECT,
+                    request_id = %request_id,
+                    bucket = %bucket,
+                    key = %key,
+                    put_path = put_path,
+                    object_size = actual_size,
+                    duration_ms = start_time.elapsed().as_millis() as u64,
+                    result = "success",
+                    "PutObject store write returned"
+                );
+                obj_info
+            }
             Err(err) => {
+                store_put_watchdog.cancel();
+                warn!(
+                    target: "rustfs::app::object_usecase",
+                    event = EVENT_PUT_OBJECT_STORE_RETURNED,
+                    component = LOG_COMPONENT_APP,
+                    subsystem = LOG_SUBSYSTEM_OBJECT,
+                    request_id = %request_id,
+                    bucket = %bucket,
+                    key = %key,
+                    put_path = put_path,
+                    object_size = actual_size,
+                    duration_ms = start_time.elapsed().as_millis() as u64,
+                    result = "error",
+                    error = %err,
+                    "PutObject store write returned"
+                );
                 let result: S3Result<S3Response<PutObjectOutput>> = Err(err.into());
                 let _ = helper.complete(&result);
                 return result;

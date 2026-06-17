@@ -137,6 +137,8 @@ const LOG_SUBSYSTEM_SET_DISK: &str = "set_disk";
 const EVENT_SET_DISK_MULTIPART: &str = "set_disk_multipart";
 const EVENT_SET_DISK_WRITE: &str = "set_disk_write";
 const EVENT_SET_DISK_HEAL: &str = "set_disk_heal";
+const EVENT_SET_DISK_COMMIT_TAIL_SLOW: &str = "set_disk_commit_tail_slow";
+const SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS: u128 = 5_000;
 
 use crate::rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
 
@@ -1295,6 +1297,22 @@ impl ObjectIO for SetDisks {
                 "set_disk_rename",
                 rename_stage_start.elapsed().as_secs_f64() * 1000.0,
             );
+            let rename_stage_ms = rename_stage_start.elapsed().as_millis();
+            if rename_stage_ms >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
+                warn!(
+                    event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    stage = "rename_data",
+                    bucket = %bucket,
+                    object = %object,
+                    tmp_dir = %tmp_dir,
+                    duration_ms = rename_stage_ms as u64,
+                    write_quorum,
+                    state = "slow",
+                    "SetDisk commit tail stage is slow"
+                );
+            }
 
             if let Some(old_dir) = op_old_dir {
                 let cleanup_stage_start = Instant::now();
@@ -1304,6 +1322,23 @@ impl ObjectIO for SetDisks {
                     "set_disk_old_data_cleanup",
                     cleanup_stage_start.elapsed().as_secs_f64() * 1000.0,
                 );
+                let cleanup_stage_ms = cleanup_stage_start.elapsed().as_millis();
+                if cleanup_stage_ms >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
+                    warn!(
+                        event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        stage = "commit_rename_data_dir",
+                        bucket = %bucket,
+                        object = %object,
+                        tmp_dir = %tmp_dir,
+                        old_dir = %old_dir,
+                        duration_ms = cleanup_stage_ms as u64,
+                        write_quorum,
+                        state = "slow",
+                        "SetDisk commit tail stage is slow"
+                    );
+                }
             }
 
             drop(object_lock_guard); // drop object lock guard to release the lock
@@ -1335,6 +1370,23 @@ impl ObjectIO for SetDisks {
                     online_success_count,
                     op_old_dir = ?op_old_dir,
                     "issue3031_put_object_commit_succeeded"
+                );
+            }
+
+            let total_commit_tail_ms = rename_stage_start.elapsed().as_millis();
+            if total_commit_tail_ms >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
+                warn!(
+                    event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    stage = "put_object_commit_tail",
+                    bucket = %bucket,
+                    object = %object,
+                    tmp_dir = %tmp_dir,
+                    duration_ms = total_commit_tail_ms as u64,
+                    write_quorum,
+                    state = "slow",
+                    "SetDisk commit tail is slow"
                 );
             }
 

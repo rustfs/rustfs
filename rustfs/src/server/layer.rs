@@ -24,7 +24,9 @@ use crate::server::{
     has_path_prefix, is_admin_path, is_table_catalog_path,
 };
 use crate::storage::apply_cors_headers;
-use crate::storage::request_context::{RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers};
+use crate::storage::request_context::{
+    RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers, spawn_traced,
+};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode, Uri};
 use http_body::Body;
@@ -38,17 +40,20 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 use tower::{Layer, Service};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use url::form_urlencoded;
 
 const HTTP_REQUEST_COMPLETED_EVENT: &str = "http_request_completed";
 const HTTP_REQUEST_FAILED_EVENT: &str = "http_request_failed";
+const HTTP_REQUEST_INFLIGHT_SLOW_EVENT: &str = "http_request_inflight_slow";
 const LOG_COMPONENT_SERVER: &str = "server";
 const LOG_SUBSYSTEM_HTTP: &str = "http";
 const REDACTED_QUERY_VALUE: &str = "redacted";
 const OBJECT_ZIP_DOWNLOADS_PATH: &str = "/v3/object-zip-downloads/";
+const HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 
 pub(crate) fn redact_sensitive_uri_query(uri: &http::Uri) -> String {
     let path = uri.path();
@@ -322,9 +327,39 @@ where
     fn call(&mut self, req: HttpRequest<B>) -> Self::Future {
         let context = RequestLogContext::from_request(&req);
         let mut inner = self.inner.clone();
+        let watchdog = CancellationToken::new();
+        let watchdog_context = context.clone();
+
+        spawn_traced({
+            let watchdog = watchdog.clone();
+            async move {
+                tokio::select! {
+                    _ = watchdog.cancelled() => {}
+                    _ = tokio::time::sleep(HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD) => {
+                        warn!(
+                            event = HTTP_REQUEST_INFLIGHT_SLOW_EVENT,
+                            component = LOG_COMPONENT_SERVER,
+                            subsystem = LOG_SUBSYSTEM_HTTP,
+                            request_id = %watchdog_context.request_id,
+                            trace_id = %watchdog_context.trace_id.as_deref().unwrap_or("unknown"),
+                            span_id = %watchdog_context.span_id.as_deref().unwrap_or("unknown"),
+                            peer_addr = %watchdog_context.peer_addr,
+                            method = %watchdog_context.method,
+                            uri = %watchdog_context.uri,
+                            duration_ms = watchdog_context.duration_ms(),
+                            active_requests = active_http_requests(),
+                            threshold_ms = HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD.as_millis() as u64,
+                            state = "response_pending",
+                            "HTTP request remains in flight"
+                        );
+                    }
+                }
+            }
+        });
 
         Box::pin(async move {
             let result = inner.call(req).await;
+            watchdog.cancel();
             match &result {
                 Ok(response) => context.log_response(response),
                 Err(error) => context.log_failure(error),
