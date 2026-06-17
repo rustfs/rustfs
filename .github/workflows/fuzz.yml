@@ -46,6 +46,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
 
 jobs:
   pr-fuzz-smoke:
@@ -77,7 +78,23 @@ jobs:
         with:
           tool: cargo-fuzz
 
+      - name: Run path_containment smoke target
+        env:
+          FUZZ_TARGET: path_containment
+        run: ./scripts/fuzz/run_ci_targets.sh
+
+      - name: Run bucket_validation smoke target
+        env:
+          FUZZ_TARGET: bucket_validation
+        run: ./scripts/fuzz/run_ci_targets.sh
+
+      - name: Run local_metadata smoke target
+        env:
+          FUZZ_TARGET: local_metadata
+        run: ./scripts/fuzz/run_ci_targets.sh
+
       - name: Run bounded fuzz smoke targets
+        if: ${{ false }}
         run: ./scripts/fuzz/run_ci_targets.sh
 
       - name: Upload fuzz smoke artifacts
