@@ -122,12 +122,12 @@ Do not silently convert propagation failure into success.
 
 ### Implementation Steps
 
-- [ ] Add a helper in `rustfs/src/admin/handlers/rebalance.rs` such as `rollback_cluster_rebalance_start(store, notification_sys, rebalance_id)` that calls local `stop_rebalance()` and peer stop/rollback propagation.
-- [ ] Add a unit test for formatting rollback failure context so an error includes `failed to propagate rebalance start`, local rollback result, and peer rollback result.
-- [ ] Add an admin handler or helper-level test that simulates one peer accepting start and another peer failing, then verifies cluster rollback is attempted.
-- [ ] Update the `RebalanceStart` error path to call the rollback helper before returning.
-- [ ] If rollback is rebalance-id guarded, add a test where a newer operation ID is present and rollback refuses to stop it.
-- [ ] Run:
+- [x] Add a helper in `rustfs/src/admin/handlers/rebalance.rs` such as `rollback_cluster_rebalance_start(store, notification_sys, rebalance_id)` that calls local `stop_rebalance()` and peer stop/rollback propagation.
+- [x] Add a unit test for formatting rollback failure context so an error includes `failed to propagate rebalance start`, local rollback result, and peer rollback result.
+- [x] Add an admin handler or helper-level test that simulates one peer accepting start and another peer failing, then verifies cluster rollback is attempted.
+- [x] Update the `RebalanceStart` error path to call the rollback helper before returning.
+- [x] If rollback is rebalance-id guarded, add a test where a newer operation ID is present and rollback refuses to stop it. Not applicable for the implemented rollback path because stop/rollback does not use an operation-id compatibility gate.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs rebalance --lib
@@ -177,15 +177,15 @@ Preserve per-part checksums when completing multipart upload:
 
 ### Implementation Steps
 
-- [ ] Add a failing test that builds an uploaded multipart part with checksums and completes it through the same code that pushes `ObjectPartInfo`.
-- [ ] Update the `ObjectPartInfo` construction in `crates/ecstore/src/set_disk.rs` to include:
+- [x] Add a failing test that builds an uploaded multipart part with checksums and completes it through the same code that pushes `ObjectPartInfo`.
+- [x] Update the `ObjectPartInfo` construction in `crates/ecstore/src/set_disk.rs` to include:
 
 ```rust
 checksums: ext_part.checksums.clone(),
 ```
 
-- [ ] Add or update a data movement test that migrates a multipart object and asserts target parts preserve checksum entries.
-- [ ] Run:
+- [x] Add or update a data movement test that migrates a multipart object and asserts target parts preserve checksum entries.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs-ecstore multipart --lib
@@ -247,14 +247,14 @@ Use exact equality for these fields. A false negative is safer than a false posi
 
 ### Implementation Steps
 
-- [ ] Add a helper such as `is_equivalent_data_movement_part(source, target)` in `crates/ecstore/src/data_movement.rs`.
-- [ ] Update `is_equivalent_data_movement_object()` to compare replication/version purge fields, object tags, expires, and call the part helper.
-- [ ] Add a failing test where source and target differ only by missing per-part checksum and assert overwrite convergence is rejected.
-- [ ] Add a failing test where source and target differ only by version purge status and assert overwrite convergence is rejected.
-- [ ] Add failing tests where source and target differ only by object tags or expires and assert overwrite convergence is rejected.
-- [ ] Confirm the data movement write path preserves tags and expires; if it does not, extend the write options or create a separate write-path task before allowing source cleanup.
-- [ ] Add a positive test where all fields match and overwrite convergence is accepted.
-- [ ] Run:
+- [x] Add a helper such as `is_equivalent_data_movement_part(source, target)` in `crates/ecstore/src/data_movement.rs`.
+- [x] Update `is_equivalent_data_movement_object()` to compare replication/version purge fields, object tags, expires, and call the part helper.
+- [x] Add a failing test where source and target differ only by missing per-part checksum and assert overwrite convergence is rejected.
+- [x] Add a failing test where source and target differ only by version purge status and assert overwrite convergence is rejected.
+- [x] Add failing tests where source and target differ only by object tags or expires and assert overwrite convergence is rejected.
+- [x] Confirm the data movement write path preserves tags and expires; if it does not, extend the write options or create a separate write-path task before allowing source cleanup.
+- [x] Add a positive test where all fields match and overwrite convergence is accepted.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs-ecstore DataMovementOverwriteErr --lib
@@ -314,10 +314,10 @@ If avoiding `as` casts, use `u64::try_from(remote.entries.len()).unwrap_or(u64::
 
 ### Implementation Steps
 
-- [ ] Add a failing test where remote has one warning entry, local has a different warning entry, both have count `1`, and merge produces `count >= 2`.
-- [ ] Add a decode test that serializes the merged metadata and decodes it through `RebalanceMeta::decode_rebalance_meta_payload`.
-- [ ] Update `merge_rebalance_cleanup_warnings()` to normalize count after merging entries.
-- [ ] Run:
+- [x] Add a failing test where remote has one warning entry, local has a different warning entry, both have count `1`, and merge produces `count >= 2`.
+- [x] Add a decode test that serializes the merged metadata and decodes it through `RebalanceMeta::decode_rebalance_meta_payload`.
+- [x] Update `merge_rebalance_cleanup_warnings()` to normalize count after merging entries.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs-ecstore cleanup_warning --lib
@@ -368,11 +368,11 @@ The data-movement delete marker path should:
 
 ### Implementation Steps
 
-- [ ] Add a failing test where default placement selects the source pool but another target pool is available; rebalance delete marker migration must still write to the non-source target.
-- [ ] Fix or prove the `handle_delete_object()` data-movement delete marker branch so it writes through the resolved non-source fallback target.
-- [ ] Keep `rebalance_delete_marker()` narrow unless rebalance-specific context is required.
-- [ ] Preserve version ID, delete marker flag, mod time, replication delete marker state, and `src_pool_idx`.
-- [ ] Run:
+- [x] Add a failing test where default placement selects the source pool but another target pool is available; rebalance delete marker migration must still write to the non-source target.
+- [x] Fix or prove the `handle_delete_object()` data-movement delete marker branch so it writes through the resolved non-source fallback target.
+- [x] Keep `rebalance_delete_marker()` narrow unless rebalance-specific context is required.
+- [x] Preserve version ID, delete marker flag, mod time, replication delete marker state, and `src_pool_idx`.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs-ecstore rebalance_delete_marker --lib
@@ -436,14 +436,14 @@ Recommended first implementation: rollback if the current pool meta mutation can
 
 ### Implementation Steps
 
-- [ ] Add a failing test where `reload_pool_meta()` fails after `pool_meta.save()` and the resulting local state is not active without a worker.
-- [ ] Implement the selected rollback or degraded-state behavior.
-- [ ] If rollback is chosen, prove `is_suspended()` and `is_decommission_running()` return normal non-decommission behavior after the failed start.
-- [ ] If rollback is chosen, prove peers that accepted the active state receive rollback metadata, or status reports partial rollback with affected peers.
-- [ ] If degraded-start-with-worker is chosen, prove status/logs expose `reload_pool_meta` failure and local worker startup proceeds.
-- [ ] If degraded-start-with-worker is chosen, prove peers either receive the degraded marker or status reports unknown peer state.
-- [ ] Add restart coverage proving failed starts do not auto-resume as successful starts unless the durable degraded-state design explicitly allows it.
-- [ ] Run:
+- [x] Add a failing test where `reload_pool_meta()` fails after `pool_meta.save()` and the resulting local state is not active without a worker.
+- [x] Implement the selected rollback or degraded-state behavior.
+- [x] If rollback is chosen, prove `is_suspended()` and `is_decommission_running()` return normal non-decommission behavior after the failed start.
+- [x] If rollback is chosen, prove peers that accepted the active state receive rollback metadata, or status reports partial rollback with affected peers.
+- [x] If degraded-start-with-worker is chosen, prove status/logs expose `reload_pool_meta` failure and local worker startup proceeds. Not applicable because R06 selected rollback instead of degraded-start-with-worker.
+- [x] If degraded-start-with-worker is chosen, prove peers either receive the degraded marker or status reports unknown peer state. Not applicable because R06 selected rollback instead of degraded-start-with-worker.
+- [x] Add restart coverage proving failed starts do not auto-resume as successful starts unless the durable degraded-state design explicitly allows it.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs-ecstore start_decommission --lib
@@ -500,11 +500,11 @@ Add an explicit stop-requested state without breaking existing clients:
 
 ### Implementation Steps
 
-- [ ] Add a test where stop is requested but a pool still has an active worker/cancel token and admin status reports `stopping = true`.
-- [ ] Add a test where terminal stop event clears `stopping` and reports stopped.
-- [ ] Add a test where decommission start is rejected while rebalance is stopping but not terminal.
-- [ ] Implement the minimal metadata/status fields required to distinguish the states.
-- [ ] Run:
+- [x] Add a test where stop is requested but a pool still has an active worker/cancel token and admin status reports `stopping = true`.
+- [x] Add a test where terminal stop event clears `stopping` and reports stopped.
+- [x] Add a test where decommission start is rejected while rebalance is stopping but not terminal.
+- [x] Implement the minimal metadata/status fields required to distinguish the states.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs-ecstore stop_rebalance --lib
@@ -558,12 +558,12 @@ Do not allow arbitrary missing versions. Only allow absence for versions counted
 
 ### Implementation Steps
 
-- [ ] Extend the cleanup preflight helper to accept optional allowed-missing identities.
-- [ ] In decommission, collect identities for versions counted in `expired`.
-- [ ] Pass the allowed-missing set to cleanup preflight.
-- [ ] Add a test where a safe-expired version is absent during preflight and cleanup is allowed.
-- [ ] Add a negative test where a non-expired migrated version is absent or changed and cleanup is blocked.
-- [ ] Run:
+- [x] Extend the cleanup preflight helper to accept optional allowed-missing identities.
+- [x] In decommission, collect identities for versions counted in `expired`.
+- [x] Pass the allowed-missing set to cleanup preflight.
+- [x] Add a test where a safe-expired version is absent during preflight and cleanup is allowed.
+- [x] Add a negative test where a non-expired migrated version is absent or changed and cleanup is blocked.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs-ecstore decommission_entry --lib
@@ -620,10 +620,10 @@ Normalize all decommission start/cancel reject logs after authentication to incl
 
 ### Implementation Steps
 
-- [ ] Add helper overloads or a small `PoolAuditContext` struct containing `request_id`, `actor`, and `remote_addr`.
-- [ ] Update invalid query, invalid pool, pool not found, and pool index out-of-range paths in decommission start/cancel to use contextual logging after authentication.
-- [ ] Add log-capture tests if an existing tracing test helper is available; otherwise add helper-level tests for field construction.
-- [ ] Run:
+- [x] Add helper overloads or a small `PoolAuditContext` struct containing `request_id`, `actor`, and `remote_addr`.
+- [x] Update invalid query, invalid pool, pool not found, and pool index out-of-range paths in decommission start/cancel to use contextual logging after authentication.
+- [x] Add log-capture tests if an existing tracing test helper is available; otherwise add helper-level tests for field construction.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs pools --lib
@@ -673,11 +673,11 @@ Keep legacy compatibility but make it explicit:
 
 ### Implementation Steps
 
-- [ ] Add a failing test for a legacy-shaped payload with an extra `unexpected` field and assert decode fails.
-- [ ] Add a passing test for a legacy-shaped payload with only supported legacy fields.
-- [ ] Add `LegacyPoolMeta`, `LegacyPoolStatus` if needed, and `LegacyPoolDecommissionInfo` if needed.
-- [ ] Replace lenient `rmp_serde::from_slice::<PoolMeta>` fallback with strict legacy DTO decode.
-- [ ] Run:
+- [x] Add a failing test for a legacy-shaped payload with an extra `unexpected` field and assert decode fails.
+- [x] Add a passing test for a legacy-shaped payload with only supported legacy fields.
+- [x] Add `LegacyPoolMeta`, `LegacyPoolStatus` if needed, and `LegacyPoolDecommissionInfo` if needed.
+- [x] Replace lenient `rmp_serde::from_slice::<PoolMeta>` fallback with strict legacy DTO decode.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs-ecstore pool_meta --lib
@@ -728,10 +728,10 @@ Avoid broad test infrastructure rewrites. Use existing init helper seams if full
 
 ### Implementation Steps
 
-- [ ] Inspect existing `store::init::tests` helpers and identify the narrowest integration seam that loads persisted pool meta and rebalance meta.
-- [ ] Add a test for active decommission plus started rebalance metadata and assert rebalance is not started.
-- [ ] Add or keep a positive test where only rebalance metadata allows auto-start.
-- [ ] Run:
+- [x] Inspect existing `store::init::tests` helpers and identify the narrowest integration seam that loads persisted pool meta and rebalance meta.
+- [x] Add a test for active decommission plus started rebalance metadata and assert rebalance is not started.
+- [x] Add or keep a positive test where only rebalance metadata allows auto-start.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs-ecstore init --lib
@@ -794,14 +794,14 @@ Do not broaden this task into a metadata rewrite. Keep the change local to exist
 
 ### Implementation Steps
 
-- [ ] Inventory all `pool_meta.write()` sections in `crates/ecstore/src/pools.rs` that await `save()`.
-- [ ] Add a helper only if it materially reduces repeated snapshot/save/error handling across affected paths.
-- [ ] Add a save serialization, generation, or merge-before-save mechanism for full `PoolMeta` persistence.
-- [ ] Refactor `start_decommission`, `decommission_cancel`, `decommission_failed`, `complete_decommission`, bucket-done, and progress-save paths so no Tokio write guard lives across `save(...).await`.
-- [ ] Add a regression test with an instrumented or delayed save seam proving a concurrent read-side operation such as `is_suspended()` or decommission status lookup is not blocked by an in-flight save.
-- [ ] Add a regression test where two saves complete out of order and the older snapshot cannot overwrite newer durable state.
-- [ ] Add tests for save failure handling in start and terminal-state paths.
-- [ ] Run:
+- [x] Inventory all `pool_meta.write()` sections in `crates/ecstore/src/pools.rs` that await `save()`.
+- [x] Add a helper only if it materially reduces repeated snapshot/save/error handling across affected paths.
+- [x] Add a save serialization, generation, or merge-before-save mechanism for full `PoolMeta` persistence.
+- [x] Refactor `start_decommission`, `decommission_cancel`, `decommission_failed`, `complete_decommission`, bucket-done, and progress-save paths so no Tokio write guard lives across `save(...).await`.
+- [x] Add a regression test with an instrumented or delayed save seam proving a concurrent read-side operation such as `is_suspended()` or decommission status lookup is not blocked by an in-flight save.
+- [x] Add a regression test where two saves complete out of order and the older snapshot cannot overwrite newer durable state.
+- [x] Add tests for save failure handling in start and terminal-state paths.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs-ecstore decommission --lib
@@ -862,14 +862,14 @@ The guard should prevent duplicate starts, stale returned operation IDs, and cro
 
 ### Implementation Steps
 
-- [ ] Add a concurrent-start regression test where two start attempts race and only one operation ID can be accepted.
-- [ ] Add a rebalance-vs-decommission race regression test where decommission attempts to start between rebalance metadata init and worker start.
-- [ ] Add or reuse a shared start guard around rebalance check, `init_rebalance_meta()`, and `start_rebalance()`.
-- [ ] Apply the same conflict domain to decommission start checks and active-state transition.
-- [ ] Ensure the loser receives `OperationAborted` or an equivalent existing admin error instead of a stale success ID.
-- [ ] If local rebalance worker start fails after metadata init, roll back or persist a failed state before releasing the guard.
-- [ ] Verify R01 rollback path releases the guard and leaves later starts possible.
-- [ ] Run:
+- [x] Add a concurrent-start regression test where two start attempts race and only one operation ID can be accepted.
+- [x] Add a rebalance-vs-decommission race regression test where decommission attempts to start between rebalance metadata init and worker start.
+- [x] Add or reuse a shared start guard around rebalance check, `init_rebalance_meta()`, and `start_rebalance()`.
+- [x] Apply the same conflict domain to decommission start checks and active-state transition.
+- [x] Ensure the loser receives `OperationAborted` or an equivalent existing admin error instead of a stale success ID.
+- [x] If local rebalance worker start fails after metadata init, roll back or persist a failed state before releasing the guard.
+- [x] Verify R01 rollback path releases the guard and leaves later starts possible.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs-ecstore start_rebalance --lib
@@ -930,11 +930,11 @@ This is a mandatory proof gate. If the test proves RustFS loses user-visible ver
 
 ### Implementation Steps
 
-- [ ] Identify the narrowest existing E2E harness that can create multi-pool RustFS and call admin decommission/rebalance.
-- [ ] Add versioned-bucket scenarios for only-delete-marker and delete-marker-plus-history.
-- [ ] Add assertions for `ListObjectVersions`, current `GET`, and version-specific `GET` after migration and source cleanup.
-- [ ] If the current behavior loses required version metadata, commit the proof/characterization test as R14 and add a new follow-up implementation task before changing behavior.
-- [ ] Run:
+- [x] Identify the narrowest existing E2E harness that can create multi-pool RustFS and call admin decommission/rebalance.
+- [x] Add versioned-bucket scenarios for only-delete-marker and delete-marker-plus-history.
+- [x] Add assertions for `ListObjectVersions`, current `GET`, and version-specific `GET` after migration and source cleanup.
+- [x] If the current behavior loses required version metadata, commit the proof/characterization test as R14 and add a new follow-up implementation task before changing behavior.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs-ecstore rebalance_delete_marker --lib
