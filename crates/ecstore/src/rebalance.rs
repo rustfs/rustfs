@@ -2638,6 +2638,8 @@ fn should_cleanup_rebalance_source_entry(rebalanced: usize, total_versions: usiz
 }
 
 fn should_skip_rebalance_delete_marker(version: &FileInfo, remaining_versions: usize, replication_configured: bool) -> bool {
+    // Keep rebalance aligned with decommission: an empty delete marker is
+    // cleanup-only metadata unless replication is configured.
     version.deleted && remaining_versions == 1 && !replication_configured
 }
 
@@ -6079,12 +6081,12 @@ mod rebalance_unit_tests {
     }
 
     #[test]
-    fn test_should_skip_rebalance_delete_marker_when_last_remaining_without_replication() {
+    fn test_should_skip_rebalance_delete_marker_characterizes_empty_marker_without_replication() {
         assert!(should_skip_rebalance_delete_marker(&version_deleted(), 1, false));
     }
 
     #[test]
-    fn test_should_skip_rebalance_delete_marker_rejects_configured_replication() {
+    fn test_should_skip_rebalance_delete_marker_characterizes_replication_configured() {
         assert!(!should_skip_rebalance_delete_marker(&version_deleted(), 1, true));
     }
 

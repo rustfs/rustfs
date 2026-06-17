@@ -1726,6 +1726,8 @@ fn should_skip_decommission_delete_marker(
     remaining_versions: usize,
     replication_configured: bool,
 ) -> bool {
+    // Match MinIO decommission behavior: an empty delete marker is not moved to
+    // another pool unless replication is configured and its marker state matters.
     version.deleted && remaining_versions == 1 && !replication_configured
 }
 
@@ -3499,7 +3501,7 @@ mod tests {
     }
 
     #[test]
-    fn should_skip_decommission_delete_marker_when_last_remaining_without_replication() {
+    fn should_skip_decommission_delete_marker_characterizes_empty_marker_without_replication() {
         let version = rustfs_filemeta::FileInfo {
             deleted: true,
             ..Default::default()
@@ -3509,7 +3511,7 @@ mod tests {
     }
 
     #[test]
-    fn should_skip_decommission_delete_marker_rejects_configured_replication() {
+    fn should_skip_decommission_delete_marker_characterizes_replication_configured() {
         let version = rustfs_filemeta::FileInfo {
             deleted: true,
             ..Default::default()
