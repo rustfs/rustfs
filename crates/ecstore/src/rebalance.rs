@@ -2952,12 +2952,14 @@ fn merge_rebalance_pool_stats(remote: &mut RebalanceStats, local: &RebalanceStat
     match local.info.status {
         RebalStatus::Failed => {
             remote.info.status = RebalStatus::Failed;
+            remote.info.stopping = false;
             remote.info.end_time = local.info.end_time.or(remote.info.end_time);
             remote.info.last_error = local.info.last_error.clone().or_else(|| remote.info.last_error.clone());
         }
         RebalStatus::Stopped => {
             if remote.info.status != RebalStatus::Failed {
                 remote.info.status = RebalStatus::Stopped;
+                remote.info.stopping = false;
                 remote.info.end_time = local.info.end_time.or(remote.info.end_time);
                 remote.info.last_error =
                     merge_rebalance_stop_propagation_error(remote.info.last_error.clone(), local.info.last_error.clone());
@@ -2966,6 +2968,7 @@ fn merge_rebalance_pool_stats(remote: &mut RebalanceStats, local: &RebalanceStat
         RebalStatus::Completed => {
             if !matches!(remote.info.status, RebalStatus::Failed | RebalStatus::Stopped) {
                 remote.info.status = RebalStatus::Completed;
+                remote.info.stopping = false;
                 remote.info.end_time = local.info.end_time.or(remote.info.end_time);
                 remote.info.last_error = None;
             }
@@ -2973,6 +2976,7 @@ fn merge_rebalance_pool_stats(remote: &mut RebalanceStats, local: &RebalanceStat
         RebalStatus::Started => {
             if !is_rebalance_terminal_status(remote.info.status) {
                 remote.info.status = RebalStatus::Started;
+                remote.info.stopping |= local.info.stopping;
                 remote.info.last_error = local.info.last_error.clone();
             }
         }
@@ -3883,13 +3887,13 @@ mod rebalance_unit_tests {
         has_deferred_rebalance_error, heal_rebalance_stopping_without_worker, is_rebalance_stop_propagation_error,
         is_rebalance_stopped_terminal_event, is_terminal_rebalance_reload, is_transient_rebalance_error,
         load_rebalance_bucket_configs, mark_rebalance_bucket_done, mark_started_rebalance_pools_stopped, merge_rebalance_meta,
-        migrate_entry_version, migrate_entry_version_with_delete_marker, migrate_entry_version_with_retry_wait,
-        next_rebal_bucket_from_stat, parse_rebalance_max_attempts, rebalance_delete_marker_opts, rebalance_listing_retry_delay,
-        rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error,
-        rebalance_migration_retry_delay, rebalance_object_migration_read_opts, rebalance_source_cleanup_opts,
-        record_rebalance_cleanup_warning_in_meta, refresh_missing_rebalance_pool_stats,
-        resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket, resolve_rebalance_bucket_error,
-        resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
+        merge_rebalance_pool_stats, migrate_entry_version, migrate_entry_version_with_delete_marker,
+        migrate_entry_version_with_retry_wait, next_rebal_bucket_from_stat, parse_rebalance_max_attempts,
+        rebalance_delete_marker_opts, rebalance_listing_retry_delay, rebalance_meta_load_no_data_error,
+        rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error, rebalance_migration_retry_delay,
+        rebalance_object_migration_read_opts, rebalance_source_cleanup_opts, record_rebalance_cleanup_warning_in_meta,
+        refresh_missing_rebalance_pool_stats, resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket,
+        resolve_rebalance_bucket_error, resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
         resolve_rebalance_file_info_versions_result, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
         resolve_rebalance_migrate_result_error, resolve_rebalance_optional_bucket_config_result, resolve_rebalance_participants,
         resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error,
@@ -3898,7 +3902,7 @@ mod rebalance_unit_tests {
         should_defer_rebalance_entry_failure, should_ignore_rebalance_data_usage_cache, should_pool_participate,
         should_preserve_rebalance_stopped_state, should_retry_rebalance_listing, should_skip_rebalance_delete_marker,
         should_skip_start_rebalance, sleep_rebalance_migration_retry, stop_rebalance_meta_snapshot,
-        stop_rebalance_meta_snapshot_for_id, stop_rebalance_state, take_bucket_from_rebalance_queue,
+        stop_rebalance_meta_snapshot_for_id, stop_rebalance_state, take_bucket_from_rebalance_queue, validate_rebalance_meta,
         validate_rebalance_start_gate_state, validate_rebalance_start_pool_meta, validate_start_rebalance_state,
         wait_rebalance_listing_retry, with_rebalance_entry_context,
     };
@@ -5100,6 +5104,70 @@ mod rebalance_unit_tests {
         merge_rebalance_meta(&mut remote, &local);
 
         assert_eq!(remote.id, "id-b");
+    }
+
+    #[test]
+    fn test_merge_rebalance_meta_preserves_stopping_stop_snapshot() {
+        let stopped_at = OffsetDateTime::from_unix_timestamp(1_000).expect("valid stop timestamp");
+        let mut remote = RebalanceMeta {
+            id: "rebal-1".to_string(),
+            ..Default::default()
+        };
+        remote.pool_stats.push(RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                stopping: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let mut local = RebalanceMeta {
+            id: "rebal-1".to_string(),
+            stopped_at: Some(stopped_at),
+            ..Default::default()
+        };
+        local.pool_stats.push(RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                stopping: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        merge_rebalance_meta(&mut remote, &local);
+
+        assert_eq!(remote.stopped_at, Some(stopped_at));
+        assert!(remote.pool_stats[0].info.stopping);
+        validate_rebalance_meta(&remote).expect("merged stop snapshot should remain loadable");
+    }
+
+    #[test]
+    fn test_merge_rebalance_pool_stats_clears_stopping_for_terminal_status() {
+        let mut remote = RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                stopping: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let local = RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Stopped,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        merge_rebalance_pool_stats(&mut remote, &local);
+
+        assert_eq!(remote.info.status, RebalStatus::Stopped);
+        assert!(!remote.info.stopping);
     }
 
     #[test]
