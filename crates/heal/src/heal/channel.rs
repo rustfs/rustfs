@@ -268,6 +268,14 @@ impl HealChannelProcessor {
                 result_items,
             }) => ("running".to_string(), None, result_items),
             Ok(HealTaskReport {
+                status: HealTaskStatus::Retrying { error, retry_attempt },
+                result_items,
+            }) => (
+                "running".to_string(),
+                Some(format!("heal task retrying after recoverable failure, attempt {retry_attempt}: {error}")),
+                result_items,
+            ),
+            Ok(HealTaskReport {
                 status: HealTaskStatus::Completed,
                 result_items,
             }) => ("finished".to_string(), None, result_items),
