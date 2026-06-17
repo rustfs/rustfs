@@ -3830,15 +3830,7 @@ impl MultipartOperations for SetDisks {
             object_size += ext_part.size;
             object_actual_size += ext_part.actual_size;
 
-            fi.parts.push(ObjectPartInfo {
-                etag: ext_part.etag.clone(),
-                number: p.part_num,
-                size: ext_part.size,
-                mod_time: ext_part.mod_time,
-                actual_size: ext_part.actual_size,
-                index: ext_part.index.clone(),
-                ..Default::default()
-            });
+            fi.parts.push(completed_multipart_object_part(p.part_num, ext_part));
         }
 
         if let Some(wtcs) = opts.want_checksum.as_ref() {
@@ -4783,6 +4775,19 @@ fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {
     format!("{}-{}", etag_hex, parts.len())
 }
 
+fn completed_multipart_object_part(part_num: usize, ext_part: &ObjectPartInfo) -> ObjectPartInfo {
+    ObjectPartInfo {
+        etag: ext_part.etag.clone(),
+        number: part_num,
+        size: ext_part.size,
+        mod_time: ext_part.mod_time,
+        actual_size: ext_part.actual_size,
+        index: ext_part.index.clone(),
+        checksums: ext_part.checksums.clone(),
+        ..Default::default()
+    }
+}
+
 fn complete_part_checksum(part: &CompletePart, checksum_type: rustfs_rio::ChecksumType) -> Option<Option<String>> {
     match checksum_type.base() {
         rustfs_rio::ChecksumType::SHA256 => Some(part.checksum_sha256.clone()),
@@ -5300,6 +5305,33 @@ mod tests {
         }];
         let single_result = get_complete_multipart_md5(&single_part);
         assert!(single_result.ends_with("-1"));
+    }
+
+    #[test]
+    fn test_completed_multipart_object_part_preserves_checksums() {
+        let checksums = HashMap::from([
+            (rustfs_rio::ChecksumType::CRC32.to_string(), "crc32-value".to_string()),
+            (rustfs_rio::ChecksumType::CRC32C.to_string(), "crc32c-value".to_string()),
+        ]);
+        let ext_part = ObjectPartInfo {
+            number: 7,
+            etag: "etag-7".to_string(),
+            size: 123,
+            actual_size: 456,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            index: Some(Bytes::from_static(&[1, 2, 3])),
+            checksums: Some(checksums.clone()),
+            ..Default::default()
+        };
+
+        let completed = completed_multipart_object_part(7, &ext_part);
+
+        assert_eq!(completed.number, 7);
+        assert_eq!(completed.etag, ext_part.etag);
+        assert_eq!(completed.size, ext_part.size);
+        assert_eq!(completed.actual_size, ext_part.actual_size);
+        assert_eq!(completed.index, ext_part.index);
+        assert_eq!(completed.checksums, Some(checksums));
     }
 
     #[test]
