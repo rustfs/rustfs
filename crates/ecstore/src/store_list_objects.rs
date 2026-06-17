@@ -1158,6 +1158,7 @@ impl ECStore {
 
         tokio::spawn(async move { merge_entry_channels(rx, inputs, merge_tx, 1).await }.instrument(tracing::Span::current()));
 
+        let walk_started = std::time::Instant::now();
         let walk_results = join_all(futures).await;
         let mut errs = Vec::new();
         for walk_result in walk_results {
@@ -1166,6 +1167,10 @@ impl ECStore {
                 Err(err) => errs.push(Some(err.into())),
             }
         }
+        rustfs_io_metrics::record_stage_duration(
+            "store_list_objects_walk_internal",
+            walk_started.elapsed().as_secs_f64() * 1000.0,
+        );
 
         let result = walk_result_from_set_errors(&errs);
         if let Err(err) = &result {
