@@ -910,6 +910,8 @@ impl FileMeta {
 mod test {
     use super::*;
     use crate::test_data::*;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
 
     #[test]
     fn test_new_file_meta() {
@@ -1336,6 +1338,14 @@ mod test {
         for (v1, v2) in fm.versions.iter().zip(fm2.versions.iter()) {
             assert_eq!(v1.header.version_type, v2.header.version_type, "Version types should match");
             assert_eq!(v1.header.version_id, v2.header.version_id, "Version IDs should match");
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn filemeta_load_never_panics_on_arbitrary_bytes(input in vec(any::<u8>(), 0..=4096)) {
+            let result = std::panic::catch_unwind(|| FileMeta::load(&input));
+            prop_assert!(result.is_ok(), "FileMeta::load panicked for arbitrary input");
         }
     }
 
