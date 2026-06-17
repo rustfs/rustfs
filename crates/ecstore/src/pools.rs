@@ -420,7 +420,7 @@ fn is_decommission_copy_cleanup_safe_error(err: &Error) -> bool {
 }
 
 fn should_cleanup_decommission_source_entry(decommissioned: usize, total_versions: usize, expired: usize) -> bool {
-    expired == 0 && decommissioned == total_versions
+    decommissioned.saturating_add(expired) == total_versions
 }
 
 fn decommission_start_guard_state(pool: Option<&PoolStatus>) -> (bool, bool) {
@@ -4122,8 +4122,28 @@ mod pools_tests {
     }
 
     #[test]
-    fn test_should_cleanup_decommission_source_entry_rejects_versions_only_expired_by_lifecycle() {
-        assert!(!should_cleanup_decommission_source_entry(2, 3, 1));
+    fn test_should_cleanup_decommission_source_entry_accepts_migrated_and_safely_expired_versions() {
+        assert!(should_cleanup_decommission_source_entry(1, 2, 1));
+    }
+
+    #[test]
+    fn test_should_cleanup_decommission_source_entry_accepts_versions_only_safely_expired_by_lifecycle() {
+        assert!(should_cleanup_decommission_source_entry(0, 2, 2));
+    }
+
+    #[test]
+    fn test_should_cleanup_decommission_source_entry_rejects_object_lock_retained_version() {
+        assert!(!should_cleanup_decommission_source_entry(1, 2, 0));
+    }
+
+    #[test]
+    fn test_should_cleanup_decommission_source_entry_rejects_replication_pending_version() {
+        assert!(!should_cleanup_decommission_source_entry(2, 3, 0));
+    }
+
+    #[test]
+    fn test_should_cleanup_decommission_source_entry_rejects_counter_overrun() {
+        assert!(!should_cleanup_decommission_source_entry(2, 2, 1));
     }
 
     #[tokio::test]
