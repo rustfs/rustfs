@@ -2529,6 +2529,12 @@ impl SnapshotFileChanges {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SnapshotChangeIdentity {
+    snapshot_id: i64,
+    sequence_number: i64,
+}
+
 async fn validate_table_snapshot_commit_conflicts<B>(
     metadata_backend: &B,
     bucket: &str,
@@ -2539,7 +2545,7 @@ async fn validate_table_snapshot_commit_conflicts<B>(
     updates: &[serde_json::Value],
 ) -> S3Result<()>
 where
-    B: crate::table_catalog::TableCatalogObjectBackend + ?Sized,
+    B: crate::table_catalog::TableCatalogObjectBackend,
 {
     let Some(snapshot) = added_snapshot_update(updates)? else {
         return Ok(());
@@ -2560,9 +2566,19 @@ where
 
     let current_live_files =
         load_current_snapshot_live_files(metadata_backend, bucket, namespace, table, entry, current_metadata).await?;
-    let changes =
-        load_snapshot_file_changes(metadata_backend, bucket, namespace, table, entry, snapshot, snapshot_id, sequence_number)
-            .await?;
+    let changes = load_snapshot_file_changes(
+        metadata_backend,
+        bucket,
+        namespace,
+        table,
+        entry,
+        snapshot,
+        SnapshotChangeIdentity {
+            snapshot_id,
+            sequence_number,
+        },
+    )
+    .await?;
 
     for location in changes.added_data_files.iter().chain(changes.added_delete_files.iter()) {
         if current_live_files.contains(location) {
@@ -2636,7 +2652,7 @@ async fn load_current_snapshot_live_files<B>(
     current_metadata: &serde_json::Value,
 ) -> S3Result<SnapshotLiveFiles>
 where
-    B: crate::table_catalog::TableCatalogObjectBackend + ?Sized,
+    B: crate::table_catalog::TableCatalogObjectBackend,
 {
     let Some(current_snapshot_id) = current_metadata
         .get("current-snapshot-id")
@@ -2683,24 +2699,24 @@ async fn load_snapshot_file_changes<B>(
     table: &crate::table_catalog::IdentifierSegment,
     entry: &crate::table_catalog::TableEntry,
     snapshot: &serde_json::Value,
-    snapshot_id: i64,
-    sequence_number: i64,
+    change_identity: SnapshotChangeIdentity,
 ) -> S3Result<SnapshotFileChanges>
 where
-    B: crate::table_catalog::TableCatalogObjectBackend + ?Sized,
+    B: crate::table_catalog::TableCatalogObjectBackend,
 {
     let mut changes = SnapshotFileChanges::default();
     for reference in read_snapshot_manifest_references(metadata_backend, bucket, namespace, table, entry, snapshot).await? {
         let status = reference
             .entry_status
             .ok_or_else(|| s3_error!(InvalidRequest, "manifest entry status is required"))?;
-        if matches!(status, 1 | 2) {
-            if reference.snapshot_id != Some(snapshot_id) || reference.sequence_number != Some(sequence_number) {
-                return Err(s3_error!(
-                    InvalidRequest,
-                    "manifest changed entries must belong to the committed snapshot"
-                ));
-            }
+        if matches!(status, 1 | 2)
+            && (reference.snapshot_id != Some(change_identity.snapshot_id)
+                || reference.sequence_number != Some(change_identity.sequence_number))
+        {
+            return Err(s3_error!(
+                InvalidRequest,
+                "manifest changed entries must belong to the committed snapshot"
+            ));
         }
 
         match (status, reference.object_kind) {
@@ -2732,7 +2748,7 @@ async fn read_snapshot_manifest_references<B>(
     snapshot: &serde_json::Value,
 ) -> S3Result<Vec<crate::table_catalog::ManifestDataFileReference>>
 where
-    B: crate::table_catalog::TableCatalogObjectBackend + ?Sized,
+    B: crate::table_catalog::TableCatalogObjectBackend,
 {
     let manifest_locations = snapshot_manifest_locations(metadata_backend, bucket, namespace, table, entry, snapshot).await?;
     let mut references = Vec::new();
@@ -2769,7 +2785,7 @@ async fn snapshot_manifest_locations<B>(
     snapshot: &serde_json::Value,
 ) -> S3Result<Vec<String>>
 where
-    B: crate::table_catalog::TableCatalogObjectBackend + ?Sized,
+    B: crate::table_catalog::TableCatalogObjectBackend,
 {
     if let Some(manifest_list_location) = snapshot.get("manifest-list").and_then(serde_json::Value::as_str) {
         let manifest_list_key = table_commit_object_key(
@@ -2820,7 +2836,7 @@ async fn validate_manifest_data_file_reference<B>(
     reference: &crate::table_catalog::ManifestDataFileReference,
 ) -> S3Result<()>
 where
-    B: crate::table_catalog::TableCatalogObjectBackend + ?Sized,
+    B: crate::table_catalog::TableCatalogObjectBackend,
 {
     table_commit_object_key(bucket, namespace, table, entry, &reference.location, reference.object_kind.clone())?;
     let object_key = crate::table_catalog::table_catalog_object_key_from_location(bucket, &reference.location)
