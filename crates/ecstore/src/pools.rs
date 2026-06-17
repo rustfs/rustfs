@@ -1895,6 +1895,16 @@ impl ECStore {
         }
 
         if should_cleanup_decommission_source_entry(decommissioned, fivs.versions.len(), expired) {
+            data_movement::ensure_source_cleanup_versions_unchanged(
+                set.clone(),
+                bucket.as_str(),
+                entry.name.as_str(),
+                &fivs,
+                "decommission",
+            )
+            .await
+            .map_err(|err| with_decommission_entry_context("cleanup_preflight", bucket.as_str(), entry.name.as_str(), err))?;
+
             let cleanup_result = set
                 .delete_object(
                     bucket.as_str(),

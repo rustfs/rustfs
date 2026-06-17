@@ -2757,6 +2757,39 @@ impl ECStore {
         )?;
 
         if should_cleanup_rebalance_source_entry(rebalanced, fivs.versions.len()) {
+            if let Err(err) = data_movement::ensure_source_cleanup_versions_unchanged(
+                set.clone(),
+                bucket.as_str(),
+                entry.name.as_str(),
+                &fivs,
+                "rebalance",
+            )
+            .await
+            {
+                let deferred_error = format!("deferred rebalance source cleanup preflight failure: {err}");
+                warn!(
+                    event = EVENT_REBALANCE_ENTRY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    pool_index,
+                    bucket = %bucket,
+                    object = %entry.name,
+                    stage = "cleanup_preflight",
+                    state = "deferred",
+                    error = %err,
+                    "Deferred rebalance source cleanup because source metadata changed"
+                );
+                if let Err(stats_err) = self.update_rebalance_last_error(pool_index, deferred_error.clone()).await {
+                    error!(
+                        "rebalance_entry {} failed to record cleanup preflight failure for {}: {}",
+                        &bucket, &entry.name, stats_err
+                    );
+                }
+                return Ok(RebalanceEntryOutcome::Deferred {
+                    last_error: deferred_error,
+                });
+            }
+
             let cleanup_warning = resolve_rebalance_entry_cleanup_delete_result(
                 set.delete_object(
                     bucket.as_str(),

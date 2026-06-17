@@ -13,14 +13,17 @@
 // limitations under the License.
 
 use crate::error::{Error, Result, is_err_data_movement_overwrite, is_err_object_not_found, is_err_version_not_found};
+use crate::set_disk::SetDisks;
 use crate::store::ECStore;
 use crate::store_api::{
     CompletePart, GetObjectReader, MultipartOperations, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, PutObjReader,
 };
+use crate::store_list_objects::ListPathOptions;
 use bytes::Bytes;
-use rustfs_filemeta::ObjectPartInfo;
+use rustfs_filemeta::{FileInfo, FileInfoVersions, ObjectPartInfo};
 use rustfs_rio::{ChecksumType, EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex};
-use rustfs_utils::path::encode_dir_object;
+use rustfs_utils::path::{base_dir_from_prefix, encode_dir_object};
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::{
     Arc, Mutex,
@@ -28,9 +31,13 @@ use std::sync::{
 };
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, BufReader, ReadBuf};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 type SharedDataMovementStream = Arc<Mutex<Box<dyn AsyncRead + Unpin + Send + Sync>>>;
+const SOURCE_CLEANUP_PREFLIGHT_LIST_LIMIT: usize = 16;
+const SOURCE_CLEANUP_PREFLIGHT_LIST_LIMIT_I32: i32 = 16;
 
 pub struct IndexedDataMovementReader<R> {
     inner: R,
@@ -254,6 +261,164 @@ fn is_equivalent_data_movement_object(source: &ObjectInfo, target: &ObjectInfo) 
         && source.mod_time == target.mod_time
         && source.storage_class == target.storage_class
         && source.user_defined == target.user_defined
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SourceCleanupPartIdentity {
+    number: usize,
+    etag: String,
+    size: usize,
+    actual_size: i64,
+    mod_time: Option<time::OffsetDateTime>,
+    index: Option<Vec<u8>>,
+    checksums: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SourceCleanupVersionIdentity {
+    name: String,
+    version_id: Option<uuid::Uuid>,
+    deleted: bool,
+    mod_time: Option<time::OffsetDateTime>,
+    size: i64,
+    etag: Option<String>,
+    checksum: Option<Vec<u8>>,
+    data_dir: Option<uuid::Uuid>,
+    metadata: BTreeMap<String, String>,
+    parts: Vec<SourceCleanupPartIdentity>,
+}
+
+fn source_cleanup_part_identity(part: &ObjectPartInfo) -> SourceCleanupPartIdentity {
+    SourceCleanupPartIdentity {
+        number: part.number,
+        etag: part.etag.clone(),
+        size: part.size,
+        actual_size: part.actual_size,
+        mod_time: part.mod_time,
+        index: part.index.as_ref().map(|index| index.to_vec()),
+        checksums: part
+            .checksums
+            .as_ref()
+            .map(|checksums| checksums.iter().map(|(key, value)| (key.clone(), value.clone())).collect())
+            .unwrap_or_default(),
+    }
+}
+
+fn source_cleanup_version_identity(version: &FileInfo) -> SourceCleanupVersionIdentity {
+    let mut parts: Vec<_> = version.parts.iter().map(source_cleanup_part_identity).collect();
+    parts.sort();
+
+    SourceCleanupVersionIdentity {
+        name: version.name.clone(),
+        version_id: version.version_id,
+        deleted: version.deleted,
+        mod_time: version.mod_time,
+        size: version.size,
+        etag: version.get_etag(),
+        checksum: version.checksum.as_ref().map(|checksum| checksum.to_vec()),
+        data_dir: version.data_dir,
+        metadata: version
+            .metadata
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        parts,
+    }
+}
+
+fn source_cleanup_version_identities(fivs: &FileInfoVersions) -> Vec<SourceCleanupVersionIdentity> {
+    let mut identities: Vec<_> = fivs.versions.iter().map(source_cleanup_version_identity).collect();
+    identities.sort();
+    identities
+}
+
+fn source_cleanup_versions_match(expected: &FileInfoVersions, current: &FileInfoVersions) -> bool {
+    source_cleanup_version_identities(expected) == source_cleanup_version_identities(current)
+}
+
+fn source_cleanup_preflight_error(op_label: &str, bucket: &str, object: &str, err: impl std::fmt::Display) -> Error {
+    Error::other(format!("{op_label}: source cleanup preflight failed for {bucket}/{object}: {err}"))
+}
+
+async fn load_source_cleanup_versions(
+    set: Arc<SetDisks>,
+    bucket: &str,
+    object: &str,
+    op_label: &str,
+) -> Result<Option<FileInfoVersions>> {
+    let mut opts = ListPathOptions {
+        bucket: bucket.to_owned(),
+        base_dir: base_dir_from_prefix(object),
+        prefix: object.to_owned(),
+        incl_deleted: true,
+        recursive: true,
+        versioned: true,
+        stop_disk_at_limit: true,
+        limit: SOURCE_CLEANUP_PREFLIGHT_LIST_LIMIT_I32,
+        ..Default::default()
+    };
+    opts.set_filter();
+
+    let (tx, mut rx) = mpsc::channel(SOURCE_CLEANUP_PREFLIGHT_LIST_LIMIT);
+    let cancel = CancellationToken::new();
+    let list_result = set.list_path(cancel.clone(), opts, tx);
+    tokio::pin!(list_result);
+
+    let mut found = None;
+    loop {
+        tokio::select! {
+            result = &mut list_result => {
+                result.map_err(|err| source_cleanup_preflight_error(op_label, bucket, object, err))?;
+                break;
+            }
+            entry = rx.recv() => {
+                let Some(entry) = entry else {
+                    break;
+                };
+                if entry.name == object {
+                    found = Some(entry);
+                }
+            }
+        }
+    }
+
+    while let Ok(entry) = rx.try_recv() {
+        if found.is_none() && entry.name == object {
+            found = Some(entry);
+        }
+    }
+
+    let Some(entry) = found else {
+        return Ok(None);
+    };
+
+    entry
+        .file_info_versions(bucket)
+        .map(Some)
+        .map_err(|err| source_cleanup_preflight_error(op_label, bucket, object, err))
+}
+
+pub(crate) async fn ensure_source_cleanup_versions_unchanged(
+    set: Arc<SetDisks>,
+    bucket: &str,
+    object: &str,
+    expected: &FileInfoVersions,
+    op_label: &str,
+) -> Result<()> {
+    let Some(current) = load_source_cleanup_versions(set, bucket, object, op_label).await? else {
+        return Ok(());
+    };
+
+    if source_cleanup_versions_match(expected, &current) {
+        return Ok(());
+    }
+
+    Err(source_cleanup_preflight_error(
+        op_label,
+        bucket,
+        object,
+        "source versions changed after migration started",
+    ))
 }
 
 fn should_check_data_movement_resume_target(src_pool_idx: usize, target_pool_idx: usize) -> bool {
@@ -697,6 +862,68 @@ mod tests {
             assert_eq!(source_part.actual_size, target_part.actual_size);
             assert_eq!(source_part.checksums, target_part.checksums);
         }
+    }
+
+    fn cleanup_test_file_info(name: &str, version_id: Uuid, metadata_value: &str) -> FileInfo {
+        FileInfo {
+            name: name.to_string(),
+            version_id: Some(version_id),
+            size: 128,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            data_dir: Some(Uuid::from_u128(100)),
+            checksum: Some(Bytes::from_static(b"object-checksum")),
+            metadata: HashMap::from([
+                ("etag".to_string(), "etag-value".to_string()),
+                ("x-amz-meta-key".to_string(), metadata_value.to_string()),
+            ]),
+            parts: vec![ObjectPartInfo {
+                number: 1,
+                etag: "part-etag".to_string(),
+                size: 128,
+                actual_size: 128,
+                mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+                checksums: Some(HashMap::from([(ChecksumType::CRC32C.to_string(), "part-checksum".to_string())])),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn cleanup_test_versions(versions: Vec<FileInfo>) -> FileInfoVersions {
+        FileInfoVersions {
+            name: "object.txt".to_string(),
+            versions,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_source_cleanup_version_identities_accept_same_versions_out_of_order() {
+        let first = cleanup_test_file_info("object.txt", Uuid::from_u128(1), "first");
+        let second = cleanup_test_file_info("object.txt", Uuid::from_u128(2), "second");
+        let expected = cleanup_test_versions(vec![first.clone(), second.clone()]);
+        let current = cleanup_test_versions(vec![second, first]);
+
+        assert!(source_cleanup_versions_match(&expected, &current));
+    }
+
+    #[test]
+    fn test_rebalance_entry_cleanup_preflight_rejects_changed_source_metadata() {
+        let expected = cleanup_test_versions(vec![cleanup_test_file_info("object.txt", Uuid::from_u128(1), "source")]);
+        let current = cleanup_test_versions(vec![cleanup_test_file_info("object.txt", Uuid::from_u128(1), "changed")]);
+
+        assert!(!source_cleanup_versions_match(&expected, &current));
+    }
+
+    #[test]
+    fn test_decommission_entry_cleanup_preflight_rejects_added_source_version() {
+        let expected = cleanup_test_versions(vec![cleanup_test_file_info("object.txt", Uuid::from_u128(1), "source")]);
+        let current = cleanup_test_versions(vec![
+            cleanup_test_file_info("object.txt", Uuid::from_u128(1), "source"),
+            cleanup_test_file_info("object.txt", Uuid::from_u128(2), "new-version"),
+        ]);
+
+        assert!(!source_cleanup_versions_match(&expected, &current));
     }
 
     #[test]
