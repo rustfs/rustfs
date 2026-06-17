@@ -30,10 +30,11 @@ use rustfs_ecstore::{
         com::{delete_config, read_config_no_lock, read_config_with_metadata, save_config, save_config_with_opts},
     },
     store::ECStore,
-    store_api::{HTTPPreconditions, ObjectInfo, ObjectOptions},
+    store_api::{ObjectInfo, ObjectOptions},
 };
 use rustfs_io_metrics::record_system_path_failure;
 use rustfs_policy::{auth::UserIdentity, policy::PolicyDoc};
+use rustfs_storage_api::HTTPPreconditions;
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use serde::{Serialize, de::DeserializeOwned};
 use std::sync::{LazyLock, Mutex};

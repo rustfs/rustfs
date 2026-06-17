@@ -45,8 +45,9 @@ use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::{
     set_disk::get_lock_acquire_timeout,
-    store_api::{HTTPPreconditions, ListOperations, NamespaceLocking, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader},
+    store_api::{ListOperations, NamespaceLocking, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader},
 };
+use rustfs_storage_api::HTTPPreconditions;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use time::{Duration, OffsetDateTime};
 use tokio::io::AsyncReadExt;

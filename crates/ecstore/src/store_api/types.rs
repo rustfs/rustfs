@@ -1,29 +1,5 @@
 use super::*;
-
-#[derive(Debug, Default, Clone)]
-pub struct HTTPPreconditions {
-    pub if_match: Option<String>,
-    pub if_none_match: Option<String>,
-    pub if_modified_since: Option<OffsetDateTime>,
-    pub if_unmodified_since: Option<OffsetDateTime>,
-}
-
-impl HTTPPreconditions {
-    pub(crate) fn if_match_value(&self) -> Option<&str> {
-        non_empty_condition_value(self.if_match.as_deref())
-    }
-
-    pub(crate) fn if_none_match_value(&self) -> Option<&str> {
-        non_empty_condition_value(self.if_none_match.as_deref())
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct ObjectLockRetentionOptions {
-    pub mode: Option<String>,
-    pub retain_until: Option<OffsetDateTime>,
-    pub bypass_governance: bool,
-}
+use rustfs_storage_api::{HTTPPreconditions, ObjectLockRetentionOptions};
 
 #[derive(Debug, Default, Clone)]
 pub struct ObjectOptions {
@@ -180,10 +156,6 @@ impl ObjectOptions {
     }
 }
 
-fn non_empty_condition_value(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|value| !value.is_empty())
-}
-
 fn is_etag_equal(etag1: &str, etag2: &str) -> bool {
     let e1 = etag1.trim_matches('"');
     let e2 = etag2.trim_matches('"');
@@ -198,32 +170,6 @@ fn is_modified_since(mod_time: &OffsetDateTime, given_time: &OffsetDateTime) -> 
     let mod_secs = mod_time.unix_timestamp();
     let given_secs = given_time.unix_timestamp();
     mod_secs > given_secs
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct CompletePart {
-    pub part_num: usize,
-    pub etag: Option<String>,
-    // pub size: Option<usize>,
-    pub checksum_crc32: Option<String>,
-    pub checksum_crc32c: Option<String>,
-    pub checksum_sha1: Option<String>,
-    pub checksum_sha256: Option<String>,
-    pub checksum_crc64nvme: Option<String>,
-}
-
-impl From<s3s::dto::CompletedPart> for CompletePart {
-    fn from(value: s3s::dto::CompletedPart) -> Self {
-        Self {
-            part_num: value.part_number.unwrap_or_default() as usize,
-            etag: value.e_tag.map(|v| v.value().to_owned()),
-            checksum_crc32: value.checksum_crc32,
-            checksum_crc32c: value.checksum_crc32c,
-            checksum_sha1: value.checksum_sha1,
-            checksum_sha256: value.checksum_sha256,
-            checksum_crc64nvme: value.checksum_crc64nvme,
-        }
-    }
 }
 
 #[derive(Debug, Default)]

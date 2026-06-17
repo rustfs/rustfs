@@ -5,16 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-bucket-operations-contract`
-- Baseline: `origin/main` at `1830911973f882e30a1de18a5ff7d2ab669d67dc`
+- Branch: `overtrue/arch-object-option-contracts`
+- Baseline: `origin/main` at `8d24d9133b31c0ca0de0fcd16ad06cd2fdc6f7ae`
 - PR type for this branch: `api-extraction`
 - Runtime behavior changes: no external behavior change expected.
-- Rust code changes: move the `BucketOperations` contract from ECStore
-  `store_api` into `rustfs-storage-api` and migrate in-repo consumers to the
-  shared contract path.
-- CI/script changes: extend migration guards for the bucket contract public
-  re-export and reject restoring the old ECStore-owned `BucketOperations` path.
-- Docs changes: record the bucket operation contract extraction slice.
+- Rust code changes: move the pure `CompletePart`, `HTTPPreconditions`, and
+  `ObjectLockRetentionOptions` helper contracts from ECStore `store_api` into
+  `rustfs-storage-api`, then migrate in-repo consumers to the shared contract
+  path.
+- CI/script changes: extend migration guards for multipart/object helper public
+  re-exports and reject restoring the old ECStore-owned helper definitions.
+- Docs changes: record the object helper contract extraction slice.
 
 ## Phase 0 Tasks
 
@@ -536,6 +537,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration/layer guards, formatting, diff hygiene, Rust risk scan, and
     required three-expert review passed.
 
+- [x] `API-015` Move object option helper contracts.
+  - Completed slice: move `CompletePart`, `HTTPPreconditions`, and
+    `ObjectLockRetentionOptions` from ECStore `store_api` into
+    `rustfs-storage-api`; keep `ObjectOptions`, object/list DTOs, readers,
+    filemeta conversions, and storage implementations in ECStore.
+  - Acceptance: `rustfs-storage-api` exports the moved helper contracts,
+    in-repo consumers no longer use the old `rustfs_ecstore::store_api` path
+    for these helpers, and migration guards reject restoring the old ECStore
+    definitions or public re-exports.
+  - Must preserve: multipart completion mapping, HTTP precondition semantics,
+    object-lock retention fields, object lookup/drop-precondition behavior,
+    storage hot paths, and ECStore-owned implementation-heavy object contracts.
+  - Risk defense: only pure helper DTOs cross into `rustfs-storage-api`;
+    ECStore keeps `ObjectOptions`, `ObjectInfo`, list contracts, readers,
+    lifecycle/replication/rio/filemeta coupling, errors, and implementation
+    bodies.
+  - Verification: focused storage-api/ECStore/RustFS/downstream compile checks,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, and
+    required three-expert review passed.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -812,16 +833,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | `BucketOperations` now lives in the storage contract crate with an associated ECStore error type, while implementation bodies and storage-heavy contracts remain in ECStore. |
-| Migration preservation | passed | The slice changes trait ownership and import paths only; bucket operation bodies, metadata migration flow, admin/Swift/storage callers, and storage hot paths are unchanged. |
+| Quality/architecture | passed | Pure multipart/object helper contracts now live in `rustfs-storage-api`; implementation-heavy object contracts and ECStore behavior stay in ECStore. |
+| Migration preservation | passed | The slice changes helper type ownership and import paths only; multipart completion mapping, HTTP precondition values, object-lock retention fields, and storage hot paths are unchanged. |
 | Testing/verification | passed | Focused storage-api/ECStore/RustFS/downstream compile checks, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `1830911973f882e30a1de18a5ff7d2ab669d67dc`:
+Passed on `8d24d9133b31c0ca0de0fcd16ad06cd2fdc6f7ae`:
 
-- `cargo check -p rustfs-storage-api -p rustfs-ecstore`: passed.
-- `cargo check -p rustfs -p rustfs-heal -p rustfs-scanner -p rustfs-protocols -p rustfs-obs`: passed.
+- `cargo check -p rustfs-storage-api -p rustfs-ecstore -p rustfs-iam -p rustfs-scanner -p rustfs`: passed.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
 - `cargo fmt --all --check`: passed.
@@ -832,16 +852,17 @@ Passed on `1830911973f882e30a1de18a5ff7d2ab669d67dc`:
 
 Notes:
 
-- This slice follows `rustfs/rustfs#3505` and keeps the old aggregate facade,
-  bucket DTO, multipart DTO, and bucket operation contract guards active.
-- The shared `BucketOperations` contract is now owned by
-  `rustfs-storage-api`; ECStore keeps implementation-heavy object, list,
-  reader, lock, and storage error contracts.
-- The slice does not alter bucket runtime behavior.
+- This slice follows `rustfs/rustfs#3507` and keeps the old aggregate facade,
+  bucket DTO, multipart DTO, bucket operation contract, and object helper
+  contract guards active.
+- The shared object helper contracts are now owned by `rustfs-storage-api`;
+  ECStore keeps implementation-heavy object, list, reader, lock, lifecycle,
+  replication, rio, filemeta, and storage error contracts.
+- The slice does not alter object, multipart, or bucket runtime behavior.
 
 ## Handoff Notes
 
-- Bucket operation contract cleanup is in progress on a branch current with
+- Object helper contract cleanup is in progress on a branch current with
   `origin/main`.
-- After this lands, remaining storage work can continue by extracting only DTOs
-  that have proven low implementation coupling.
+- After this lands, remaining storage work can continue by extracting larger
+  low-coupling DTO slices or by narrowing remaining operation-group consumers.
