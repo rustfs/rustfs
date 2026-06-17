@@ -1009,6 +1009,7 @@ impl PoolMeta {
                     pd.canceled = true;
                     pd.failed = false;
                     pd.complete = false;
+                    pd.start_time = None;
 
                     stats.decommission = Some(pd);
                     true
@@ -1032,6 +1033,7 @@ impl PoolMeta {
                     pd.canceled = false;
                     pd.failed = true;
                     pd.complete = false;
+                    pd.start_time = None;
 
                     stats.decommission = Some(pd);
                     true
@@ -3206,9 +3208,9 @@ mod tests {
     }
 
     #[test]
-    fn decommission_state_transitions_preserve_start_time() {
+    fn decommission_terminal_state_transitions_update_start_time() {
         let start_time = OffsetDateTime::now_utc();
-        let mut pool_meta = PoolMeta {
+        let build_pool_meta = || PoolMeta {
             version: POOL_META_VERSION,
             pools: vec![PoolStatus {
                 id: 0,
@@ -3222,23 +3224,20 @@ mod tests {
             dont_save: true,
         };
 
+        let mut pool_meta = build_pool_meta();
         assert!(pool_meta.decommission_failed(0));
-        assert_eq!(
-            pool_meta.pools[0].decommission.as_ref().and_then(|info| info.start_time),
-            Some(start_time)
-        );
+        assert_eq!(pool_meta.pools[0].decommission.as_ref().and_then(|info| info.start_time), None);
 
+        let mut pool_meta = build_pool_meta();
         assert!(pool_meta.decommission_complete(0));
         assert_eq!(
             pool_meta.pools[0].decommission.as_ref().and_then(|info| info.start_time),
             Some(start_time)
         );
 
+        let mut pool_meta = build_pool_meta();
         assert!(pool_meta.decommission_cancel(0));
-        assert_eq!(
-            pool_meta.pools[0].decommission.as_ref().and_then(|info| info.start_time),
-            Some(start_time)
-        );
+        assert_eq!(pool_meta.pools[0].decommission.as_ref().and_then(|info| info.start_time), None);
     }
 
     #[test]
