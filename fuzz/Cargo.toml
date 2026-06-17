@@ -1,0 +1,39 @@
+[package]
+name = "rustfs-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+arbitrary = "1"
+libfuzzer-sys = "0.4"
+rustfs = { path = "../rustfs", default-features = false }
+rustfs-ecstore = { path = "../crates/ecstore" }
+rustfs-filemeta = { path = "../crates/filemeta" }
+rustfs-utils = { path = "../crates/utils", features = ["compress", "path"] }
+
+[[bin]]
+name = "copy_source_range"
+path = "fuzz_targets/copy_source_range.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "local_metadata"
+path = "fuzz_targets/local_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "path_containment"
+path = "fuzz_targets/path_containment.rs"
+test = false
+doc = false
+bench = false

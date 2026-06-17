@@ -23,6 +23,8 @@ deploy/data/*
 .env
 .rustfs.sys
 .cargo/
+!fuzz/.cargo/
+!fuzz/.cargo/config.toml
 !.cargo/config.toml
 profile.json
 .docker/openobserve-otel/data
@@ -47,6 +49,7 @@ docs
 __pycache__/
 !docs/
 docs/*
+!docs/issue-3519-fuzzing-improvement-plan-zh.md
 !docs/architecture/
 !docs/architecture/**
 docs/heal-scanner-logging-governance.md
@@ -62,3 +65,4 @@ rustfs-webdav.code-workspace
 benchmarks.logs
 tmp/
 crates/*/docs
+fuzz/target
