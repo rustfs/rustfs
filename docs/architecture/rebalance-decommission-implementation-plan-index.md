@@ -38,6 +38,20 @@ For a long-running implementation task, use the phase plans as checkpoints:
 3. Review the diff before moving to the next fix block.
 4. Run the phase-level test matrix before considering the phase complete.
 
+## Upstream Change Impact Notes
+
+### 2026-06-17: `ed55857b refactor: move bucket operations contract (#3507)`
+
+This upstream change moved `BucketOperations` from `crates/ecstore/src/store_api/traits.rs` into `crates/storage-api/src/bucket.rs` and re-exported it from `rustfs_storage_api`.
+
+Impact on this remediation plan:
+
+- No F01-F14 risk item is fixed by this upstream change.
+- No planned fix block needs priority changes because of this upstream change.
+- Implementation code that imports or bounds `BucketOperations` must now use `rustfs_storage_api::BucketOperations`.
+- Generic implementations that need the ECStore error type should use an explicit associated error bound such as `BucketOperations<Error = crate::error::Error>`.
+- The only touched planning-relevant files are import/boundary changes in paths such as `crates/ecstore/src/pools.rs`, `crates/ecstore/src/store.rs`, `crates/ecstore/src/set_disk.rs`, and `rustfs/src/admin/handlers/rebalance.rs`; the rebalance/decommission safety logic remains unchanged.
+
 ## Review Gates Before Implementation
 
 Before any code patch starts for a fix block:
