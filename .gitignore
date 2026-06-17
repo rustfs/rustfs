@@ -4,6 +4,8 @@
 .vscode
 .cursor
 .direnv/
+.claude/
+.tmp/
 /test
 /logs
 /data

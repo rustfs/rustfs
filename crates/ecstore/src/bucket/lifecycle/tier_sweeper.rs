@@ -20,15 +20,17 @@
 
 use crate::bucket::lifecycle::bucket_lifecycle_ops::{ExpiryOp, GLOBAL_ExpiryState, TransitionedObject};
 use crate::bucket::lifecycle::lifecycle::{self, ObjectOpts};
+use crate::bucket::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry;
 use crate::client::signer_error::error_chain_contains_signer_header_marker;
 use crate::global::GLOBAL_TierConfigMgr;
+use crate::store::ECStore;
 use rustfs_utils::get_env_usize;
 use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::VecDeque;
 use std::io::Write;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::warn;
@@ -249,10 +251,14 @@ impl ObjSweeper {
         None
     }
 
-    pub async fn sweep(&self) {
+    pub async fn sweep(&self, api: Arc<ECStore>) {
         let Some(je) = self.should_remove_remote_object() else {
             return;
         };
+        if persist_tier_delete_journal_entry(api, &je).await.is_err() {
+            GLOBAL_ExpiryState.write().await.increment_missed_tier_journal_tasks();
+            return;
+        }
         let hash = je.op_hash();
         // Grab the sender under a short read lock, then release the lock so we
         // don't hold it across the async send.

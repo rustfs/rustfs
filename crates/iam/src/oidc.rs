@@ -1693,17 +1693,29 @@ mod tests {
                     }
                     Err(_) => break,
                 };
+                stream
+                    .set_nonblocking(false)
+                    .expect("failed to set discovery mock stream blocking");
 
                 seen += 1;
+                stream
+                    .set_nonblocking(false)
+                    .expect("failed to set discovery mock stream blocking");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .expect("failed to set discovery mock read timeout");
 
                 let mut request_bytes = Vec::new();
                 let mut buffer = [0u8; 4096];
                 loop {
-                    let n = stream.read(&mut buffer).unwrap_or_default();
-                    if n == 0 {
-                        break;
+                    match stream.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(n) => request_bytes.extend_from_slice(&buffer[..n]),
+                        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                            break;
+                        }
+                        Err(_) => break,
                     }
-                    request_bytes.extend_from_slice(&buffer[..n]);
                     if request_bytes.windows(4).any(|w| w == b"\r\n\r\n") {
                         break;
                     }

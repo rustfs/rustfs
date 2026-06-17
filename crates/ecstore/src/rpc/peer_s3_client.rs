@@ -29,7 +29,6 @@ use crate::{
         disk_store::{DiskHealthTracker, get_drive_active_check_interval, get_drive_active_check_timeout},
     },
     endpoints::{EndpointServerPools, Node},
-    store_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
 };
 use async_trait::async_trait;
 use futures::future::join_all;
@@ -39,6 +38,7 @@ use rustfs_protos::proto_gen::node_service::node_service_client::NodeServiceClie
 use rustfs_protos::proto_gen::node_service::{
     DeleteBucketRequest, GetBucketInfoRequest, HealBucketRequest, ListBucketRequest, MakeBucketRequest,
 };
+use rustfs_storage_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
 use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
 use tokio::{net::TcpStream, sync::RwLock, time};
 use tokio_util::sync::CancellationToken;

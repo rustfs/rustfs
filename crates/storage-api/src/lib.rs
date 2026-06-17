@@ -17,7 +17,9 @@
 pub mod admin;
 pub mod bucket;
 pub mod error;
+pub mod multipart;
 
 pub use admin::{DiskSetSelector, StorageAdminApi};
 pub use bucket::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};
 pub use error::{StorageErrorCode, StorageResult};
+pub use multipart::{ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};

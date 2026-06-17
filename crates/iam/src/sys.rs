@@ -45,6 +45,7 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 pub const MAX_SVCSESSION_POLICY_SIZE: usize = 4096;
+pub const SITE_REPLICATOR_SERVICE_ACCOUNT: &str = "site-replicator-0";
 
 pub const STATUS_ENABLED: &str = "enabled";
 pub const STATUS_DISABLED: &str = "disabled";
@@ -52,6 +53,7 @@ pub const STATUS_DISABLED: &str = "disabled";
 pub const POLICYNAME: &str = "policy";
 pub const SESSION_POLICY_NAME: &str = "sessionPolicy";
 pub const SESSION_POLICY_NAME_EXTRACTED: &str = "sessionPolicy-extracted";
+pub(crate) const SITE_REPLICATOR_CLAIM: &str = "site-replicator";
 
 static POLICY_PLUGIN_CLIENT: OnceLock<Arc<RwLock<Option<rustfs_policy::policy::opa::AuthZPlugin>>>> = OnceLock::new();
 
@@ -92,6 +94,7 @@ enum PreparedIamMode {
     },
     ServiceAccount {
         is_owner: bool,
+        bypass_parent_policy: bool,
         parent_user: String,
         combined_policy: Policy,
         mode: PreparedServicePolicyMode,
@@ -448,7 +451,9 @@ impl<T: Store> IamSys<T> {
             return Err(IamError::IAMActionNotAllowed);
         }
 
-        // TODO: check allow_site_replicator_account
+        if opts.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT && !opts.allow_site_replicator_account {
+            return Err(IamError::IAMActionNotAllowed);
+        }
 
         let policy_buf = if let Some(policy) = opts.session_policy {
             policy.validate()?;
@@ -464,6 +469,9 @@ impl<T: Store> IamSys<T> {
 
         let mut m: HashMap<String, Value> = HashMap::new();
         m.insert("parent".to_owned(), Value::String(parent_user.to_owned()));
+        if opts.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT && opts.allow_site_replicator_account {
+            m.insert(SITE_REPLICATOR_CLAIM.to_owned(), Value::Bool(true));
+        }
 
         if !policy_buf.is_empty() {
             m.insert(
@@ -508,6 +516,10 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn update_service_account(&self, name: &str, opts: UpdateServiceAccountOpts) -> Result<OffsetDateTime> {
+        if name == SITE_REPLICATOR_SERVICE_ACCOUNT && !opts.allow_site_replicator_account {
+            return Err(IamError::IAMActionNotAllowed);
+        }
+
         let updated_at = self.store.update_service_account(name, opts).await?;
 
         self.notify_for_service_account(name).await;
@@ -534,6 +546,20 @@ impl<T: Store> IamSys<T> {
         da.credentials.session_token.clear();
 
         Ok((da.credentials, policy))
+    }
+
+    pub async fn get_site_replicator_service_account_secret(&self, access_key: &str) -> Result<String> {
+        if access_key != SITE_REPLICATOR_SERVICE_ACCOUNT {
+            return Err(IamError::NoSuchServiceAccount(access_key.to_string()));
+        }
+
+        let (user, claims) = self.get_account_with_claims_allow_missing_exp(access_key).await?;
+        if !user.credentials.is_service_account() || !claims.get(SITE_REPLICATOR_CLAIM).and_then(Value::as_bool).unwrap_or(false)
+        {
+            return Err(IamError::NoSuchServiceAccount(access_key.to_string()));
+        }
+
+        Ok(user.credentials.secret_key)
     }
 
     async fn get_service_account_internal(&self, access_key: &str) -> Result<(UserIdentity, Option<Policy>)> {
@@ -960,6 +986,7 @@ impl<T: Store> IamSys<T> {
             }
             PreparedIamMode::ServiceAccount {
                 is_owner,
+                bypass_parent_policy,
                 parent_user,
                 combined_policy,
                 mode,
@@ -968,7 +995,7 @@ impl<T: Store> IamSys<T> {
                 let mut parent_args = args.clone();
                 parent_args.account = parent_user;
 
-                let parent_allowed = *is_owner || combined_policy.is_allowed(&parent_args).await;
+                let parent_allowed = *bypass_parent_policy || *is_owner || combined_policy.is_allowed(&parent_args).await;
                 match mode {
                     PreparedServicePolicyMode::Inherited => parent_allowed,
                     PreparedServicePolicyMode::SessionBound => {
@@ -1129,10 +1156,39 @@ impl<T: Store> IamSys<T> {
             };
         }
 
+        let Some(sa) = args.claims.get(&iam_policy_claim_name_sa()) else {
+            return PreparedIamAuth {
+                needs_existing_object_tag: false,
+                mode: PreparedIamMode::Deny,
+            };
+        };
+        let Some(sa_str) = sa.as_str() else {
+            return PreparedIamAuth {
+                needs_existing_object_tag: false,
+                mode: PreparedIamMode::Deny,
+            };
+        };
+
+        let mode = if sa_str == INHERITED_POLICY_TYPE {
+            PreparedServicePolicyMode::Inherited
+        } else {
+            PreparedServicePolicyMode::SessionBound
+        };
+
+        let session_policy = prepare_session_policy(args, true);
+        let bypass_parent_policy = args.account == SITE_REPLICATOR_SERVICE_ACCOUNT
+            && args
+                .claims
+                .get(SITE_REPLICATOR_CLAIM)
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            && matches!(mode, PreparedServicePolicyMode::SessionBound)
+            && matches!(session_policy, PreparedSessionPolicy::Policy(_));
+
         let is_owner = matches!(get_global_action_cred(), Some(cred) if cred.access_key == parent_user);
         let role_arn = args.get_role_arn();
 
-        let svc_policies = if is_owner {
+        let svc_policies = if is_owner || bypass_parent_policy {
             Vec::new()
         } else if role_arn.is_some() {
             let Ok(arn) = ARN::parse(role_arn.unwrap_or_default()) else {
@@ -1157,14 +1213,14 @@ impl<T: Store> IamSys<T> {
             policies
         };
 
-        if !is_owner && svc_policies.is_empty() {
+        if !is_owner && !bypass_parent_policy && svc_policies.is_empty() {
             return PreparedIamAuth {
                 needs_existing_object_tag: false,
                 mode: PreparedIamMode::Deny,
             };
         }
 
-        let combined_policy = if is_owner {
+        let combined_policy = if is_owner || bypass_parent_policy {
             Policy::default()
         } else {
             let (a, c) = self.store.merge_policies(&svc_policies.join(",")).await;
@@ -1176,27 +1232,6 @@ impl<T: Store> IamSys<T> {
             }
             c
         };
-
-        let Some(sa) = args.claims.get(&iam_policy_claim_name_sa()) else {
-            return PreparedIamAuth {
-                needs_existing_object_tag: false,
-                mode: PreparedIamMode::Deny,
-            };
-        };
-        let Some(sa_str) = sa.as_str() else {
-            return PreparedIamAuth {
-                needs_existing_object_tag: false,
-                mode: PreparedIamMode::Deny,
-            };
-        };
-
-        let mode = if sa_str == INHERITED_POLICY_TYPE {
-            PreparedServicePolicyMode::Inherited
-        } else {
-            PreparedServicePolicyMode::SessionBound
-        };
-
-        let session_policy = prepare_session_policy(args, true);
         let needs_existing_object_tag = policy_needs_existing_object_tag_for_args(&combined_policy, args).await
             || matches!(mode, PreparedServicePolicyMode::SessionBound)
                 && prepared_session_policy_needs_existing_object_tag_for_args(&session_policy, args).await;
@@ -1205,6 +1240,7 @@ impl<T: Store> IamSys<T> {
             needs_existing_object_tag,
             mode: PreparedIamMode::ServiceAccount {
                 is_owner,
+                bypass_parent_policy,
                 parent_user: parent_user.to_string(),
                 combined_policy,
                 mode,
@@ -1295,6 +1331,7 @@ pub struct UpdateServiceAccountOpts {
     pub description: Option<String>,
     pub expiration: Option<OffsetDateTime>,
     pub status: Option<String>,
+    pub allow_site_replicator_account: bool,
 }
 
 pub fn get_claims_from_token_with_secret(token: &str, secret: &str) -> Result<HashMap<String, Value>> {
@@ -1684,6 +1721,7 @@ mod tests {
                     description: None,
                     expiration: Some(updated_expiration),
                     status: None,
+                    allow_site_replicator_account: false,
                 },
             )
             .await
@@ -1729,6 +1767,7 @@ mod tests {
                     description: None,
                     expiration: Some(updated_expiration),
                     status: None,
+                    allow_site_replicator_account: false,
                 },
             )
             .await
@@ -1744,6 +1783,72 @@ mod tests {
             get_claims_from_token_with_secret(&updated_user.credentials.session_token, &updated_user.credentials.secret_key)
                 .expect("updated service account JWT should decode after adding expiration");
         assert_eq!(claims.get("exp").and_then(|v| v.as_i64()), Some(updated_expiration.unix_timestamp()));
+    }
+
+    #[tokio::test]
+    async fn test_site_replicator_update_requires_explicit_internal_allowance() {
+        ensure_test_global_credentials();
+
+        let store = StsTestMockStore { empty_policies: false };
+        let cache_manager = IamCache::new(store).await.unwrap();
+        let iam_sys = IamSys::new(cache_manager);
+
+        let (cred, _) = iam_sys
+            .new_service_account(
+                "svc-parent-user",
+                None,
+                NewServiceAccountOpts {
+                    access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+                    secret_key: "siteReplicatorSecretKeyForTest1234567890".to_string(),
+                    allow_site_replicator_account: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("internal site replicator account should be created with explicit allowance");
+
+        assert!(
+            iam_sys
+                .update_service_account(
+                    &cred.access_key,
+                    UpdateServiceAccountOpts {
+                        session_policy: None,
+                        secret_key: None,
+                        name: None,
+                        description: None,
+                        expiration: None,
+                        status: Some(STATUS_ENABLED.to_string()),
+                        allow_site_replicator_account: false,
+                    },
+                )
+                .await
+                .is_err(),
+            "ordinary update must not mutate the internal site replicator account"
+        );
+
+        iam_sys
+            .update_service_account(
+                &cred.access_key,
+                UpdateServiceAccountOpts {
+                    session_policy: None,
+                    secret_key: None,
+                    name: None,
+                    description: None,
+                    expiration: None,
+                    status: Some(STATUS_ENABLED.to_string()),
+                    allow_site_replicator_account: true,
+                },
+            )
+            .await
+            .expect("internal update should be allowed explicitly");
+
+        assert_eq!(
+            iam_sys
+                .get_site_replicator_service_account_secret(&cred.access_key)
+                .await
+                .expect("internal secret should be readable for canonical account"),
+            cred.secret_key
+        );
     }
 
     #[tokio::test]

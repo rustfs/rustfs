@@ -1116,6 +1116,7 @@ impl Operation for ImportIam {
                                         description: None,
                                         expiration: None,
                                         status: Some(status),
+                                        allow_site_replicator_account: false,
                                     },
                                 )
                                 .await

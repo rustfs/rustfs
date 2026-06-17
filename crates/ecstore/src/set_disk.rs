@@ -34,8 +34,8 @@ use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
 use crate::global::{GLOBAL_LocalNodeName, GLOBAL_TierConfigMgr};
 use crate::store_api::ListObjectVersionsInfo;
-use crate::store_api::{ListPartsInfo, ObjectOptions, ObjectToDelete};
 use crate::store_api::{ObjectInfoOrErr, WalkOptions};
+use crate::store_api::{ObjectOptions, ObjectToDelete};
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::{
         LifecycleOps, gen_transition_objname, get_transitioned_object_reader, put_restore_opts,
@@ -52,10 +52,8 @@ use crate::{
     event_notification::{EventArgs, send_event},
     global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id, is_dist_erasure},
     store_api::{
-        BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
-        HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectsV2Info, ListOperations, MakeBucketOptions, MultipartInfo,
-        MultipartOperations, MultipartUploadResult, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, PartInfo,
-        PutObjReader,
+        BucketOperations, CompletePart, DeletedObject, GetObjectReader, HTTPRangeSpec, HealOperations, ListObjectsV2Info,
+        ListOperations, MultipartOperations, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, PutObjReader,
     },
     store_init::load_format_erasure,
 };
@@ -87,6 +85,10 @@ use rustfs_object_capacity::capacity_scope::{
     CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope,
 };
 use rustfs_s3_types::EventName;
+use rustfs_storage_api::{
+    BucketInfo, BucketOptions, DeleteBucketOptions, ListMultipartsInfo, ListPartsInfo, MakeBucketOptions, MultipartInfo,
+    MultipartUploadResult, PartInfo,
+};
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::{

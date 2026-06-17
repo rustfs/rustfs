@@ -67,6 +67,7 @@ pub const TABLE_RESERVED_PREFIX: &str = BUCKET_TABLE_RESERVED_PREFIX;
 const WAREHOUSE_ROOT: &str = "warehouses";
 const NAMESPACE_ROOT: &str = "namespaces";
 const TABLE_ROOT: &str = "tables";
+const VIEW_ROOT: &str = "views";
 const NAMESPACE_MARKER_FILE: &str = "namespace.json";
 const TABLE_MARKER_FILE: &str = "table.json";
 const CURRENT_POINTER_FILE: &str = "current.json";
@@ -77,6 +78,7 @@ const DELETE_DIR: &str = "delete";
 const TABLE_BUCKET_ENTRY_FILE: &str = "table-bucket.json";
 const NAMESPACE_ENTRY_FILE: &str = "namespace-entry.json";
 const TABLE_ENTRY_FILE: &str = "table-entry.json";
+const VIEW_ENTRY_FILE: &str = "view-entry.json";
 const INTERNAL_CATALOG_ROOT: &str = BUCKET_TABLE_CATALOG_META_PREFIX;
 const TABLE_BUCKET_ROOT: &str = BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX;
 const COMMIT_LOG_ROOT: &str = "commits";
@@ -222,6 +224,28 @@ pub(crate) struct TableEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ViewEntry {
+    pub version: u16,
+    pub table_bucket: String,
+    pub namespace: String,
+    pub view: String,
+    pub view_id: String,
+    pub view_uuid: String,
+    pub format: String,
+    pub format_version: u16,
+    pub warehouse_location: String,
+    pub metadata_location: String,
+    pub version_token: String,
+    pub generation: u64,
+    pub state: TableCatalogEntryState,
+    #[serde(default)]
+    pub properties: BTreeMap<String, String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum CommitLogStatus {
     Staged,
@@ -271,6 +295,23 @@ pub(crate) struct TableCommitRequest {
 pub(crate) struct TableCommitResult {
     pub table: TableEntry,
     pub commit_log: CommitLogEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ViewCommitRequest {
+    pub table_bucket: String,
+    pub namespace: String,
+    pub view: String,
+    pub expected_version_token: String,
+    pub expected_metadata_location: String,
+    pub new_metadata_location: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ViewCommitResult {
+    pub view: ViewEntry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -984,6 +1025,16 @@ pub(crate) trait TableCatalogStore: Send + Sync {
 
     async fn drop_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()>;
 
+    async fn create_view(&self, entry: ViewEntry) -> TableCatalogStoreResult<()>;
+
+    async fn list_views(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<ViewEntry>>;
+
+    async fn load_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<Option<ViewEntry>>;
+
+    async fn replace_view(&self, request: ViewCommitRequest) -> TableCatalogStoreResult<ViewCommitResult>;
+
+    async fn drop_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<()>;
+
     async fn get_commit_by_id(
         &self,
         table_bucket: &str,
@@ -1101,6 +1152,19 @@ impl TableCatalogObjectPaths {
             self.table_entries_prefix(table_bucket, namespace),
             table.as_str(),
             TABLE_ENTRY_FILE
+        )
+    }
+
+    pub fn view_entries_prefix(&self, table_bucket: &str, namespace: &Namespace) -> String {
+        format!("{}{}/{}/", self.namespace_entries_prefix(table_bucket), namespace.storage_id(), VIEW_ROOT)
+    }
+
+    pub fn view_entry_path(&self, table_bucket: &str, namespace: &Namespace, view: &IdentifierSegment) -> String {
+        format!(
+            "{}{}/{}",
+            self.view_entries_prefix(table_bucket, namespace),
+            view.as_str(),
+            VIEW_ENTRY_FILE
         )
     }
 
@@ -1338,6 +1402,25 @@ where
         Ok(Some((entry, etag)))
     }
 
+    async fn read_view_with_etag_unlocked(
+        &self,
+        table_bucket: &str,
+        namespace: &Namespace,
+        view: &IdentifierSegment,
+    ) -> TableCatalogStoreResult<Option<(ViewEntry, String)>> {
+        let view_path = self.paths.view_entry_path(table_bucket, namespace, view);
+        let Some((entry, etag)) = self
+            .read_entry_unlocked::<ViewEntry>(self.catalog_bucket(), &view_path)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(etag) = etag else {
+            return Err(TableCatalogStoreError::Internal(format!("catalog view entry has no etag: {view_path}")));
+        };
+        Ok(Some((entry, etag)))
+    }
+
     async fn write_table_entry(
         &self,
         entry: TableEntry,
@@ -1355,6 +1438,22 @@ where
         }
         let table_path = self.paths.table_entry_path(&entry.table_bucket, &namespace, &table);
         self.write_entry(self.catalog_bucket(), &table_path, &entry, precondition)
+            .await
+    }
+
+    async fn write_view_entry(&self, entry: ViewEntry, precondition: TableCatalogPutPrecondition) -> TableCatalogStoreResult<()> {
+        validate_catalog_entry_version("view", entry.version)?;
+        self.require_table_bucket(&entry.table_bucket).await?;
+        let namespace = parse_namespace_for_store(&entry.namespace)?;
+        let view = parse_table_for_store(&entry.view)?;
+        if self.get_namespace(&entry.table_bucket, &entry.namespace).await?.is_none() {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "namespace {}/{}",
+                entry.table_bucket, entry.namespace
+            )));
+        }
+        let view_path = self.paths.view_entry_path(&entry.table_bucket, &namespace, &view);
+        self.write_entry(self.catalog_bucket(), &view_path, &entry, precondition)
             .await
     }
 
@@ -2912,6 +3011,13 @@ where
                 namespace.public_name()
             )));
         }
+        if !self.list_views(table_bucket, &namespace.public_name()).await?.is_empty() {
+            return Err(TableCatalogStoreError::Conflict(format!(
+                "namespace {}/{} is not empty",
+                table_bucket,
+                namespace.public_name()
+            )));
+        }
         self.backend
             .delete_object(self.catalog_bucket(), &self.paths.namespace_entry_path(table_bucket, &namespace))
             .await
@@ -3229,6 +3335,115 @@ where
                 table_bucket,
                 namespace.public_name(),
                 table.as_str()
+            )));
+        }
+        self.backend.delete_object(self.catalog_bucket(), &object).await
+    }
+
+    async fn create_view(&self, entry: ViewEntry) -> TableCatalogStoreResult<()> {
+        self.write_view_entry(entry, TableCatalogPutPrecondition::IfAbsent).await
+    }
+
+    async fn list_views(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<ViewEntry>> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        let mut entries = Vec::new();
+        for object in self
+            .backend
+            .list_objects(self.catalog_bucket(), &self.paths.view_entries_prefix(table_bucket, &namespace))
+            .await?
+        {
+            if !object.ends_with(VIEW_ENTRY_FILE) {
+                continue;
+            }
+            if let Some((entry, _)) = self.read_entry::<ViewEntry>(self.catalog_bucket(), &object).await? {
+                entries.push(entry);
+            }
+        }
+        entries.sort_by(|left, right| left.view.cmp(&right.view));
+        Ok(entries)
+    }
+
+    async fn load_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<Option<ViewEntry>> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        let view = parse_table_for_store(view)?;
+        self.read_entry::<ViewEntry>(self.catalog_bucket(), &self.paths.view_entry_path(table_bucket, &namespace, &view))
+            .await
+            .map(|entry| entry.map(|(view, _)| view))
+    }
+
+    async fn replace_view(&self, request: ViewCommitRequest) -> TableCatalogStoreResult<ViewCommitResult> {
+        let namespace = parse_namespace_for_store(&request.namespace)?;
+        let view = parse_table_for_store(&request.view)?;
+        let view_path = self.paths.view_entry_path(&request.table_bucket, &namespace, &view);
+        let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &view_path).await?;
+        let Some((current, current_etag)) = self
+            .read_view_with_etag_unlocked(&request.table_bucket, &namespace, &view)
+            .await?
+        else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "view {}/{}/{}",
+                request.table_bucket, request.namespace, request.view
+            )));
+        };
+        if current.version_token != request.expected_version_token {
+            return Err(TableCatalogStoreError::Conflict(
+                "current view version token does not match expected token".to_string(),
+            ));
+        }
+        if current.metadata_location != request.expected_metadata_location {
+            return Err(TableCatalogStoreError::Conflict(
+                "current view metadata location does not match expected location".to_string(),
+            ));
+        }
+        if !is_valid_view_metadata_location(&namespace, &view, &request.new_metadata_location) {
+            return Err(TableCatalogStoreError::Invalid(
+                "new metadata location must be inside the view metadata directory".to_string(),
+            ));
+        }
+        let Some(new_metadata_object) = self
+            .backend
+            .read_object(&request.table_bucket, &request.new_metadata_location)
+            .await?
+        else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "new view metadata object {}",
+                request.new_metadata_location
+            )));
+        };
+        let next_warehouse_location =
+            metadata_warehouse_location(&request.table_bucket, &request.new_metadata_location, &new_metadata_object)?;
+
+        let mut next = current;
+        next.metadata_location = request.new_metadata_location;
+        if let Some(warehouse_location) = next_warehouse_location {
+            next.warehouse_location = warehouse_location;
+        }
+        next.version_token = format!("token-{}", Uuid::new_v4());
+        next.generation = next.generation.saturating_add(1);
+        self.write_entry_unlocked(
+            self.catalog_bucket(),
+            &view_path,
+            &next,
+            TableCatalogPutPrecondition::IfMatch(current_etag),
+        )
+        .await?;
+        Ok(ViewCommitResult { view: next })
+    }
+
+    async fn drop_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<()> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        let view = parse_table_for_store(view)?;
+        let object = self.paths.view_entry_path(table_bucket, &namespace, &view);
+        if self
+            .load_view(table_bucket, &namespace.public_name(), view.as_str())
+            .await?
+            .is_none()
+        {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "view {}/{}/{}",
+                table_bucket,
+                namespace.public_name(),
+                view.as_str()
             )));
         }
         self.backend.delete_object(self.catalog_bucket(), &object).await
@@ -6163,6 +6378,22 @@ pub(crate) fn default_table_delete_dir_path(namespace: &Namespace, table: &Ident
     format!("{}{}/{}", default_table_root_prefix(namespace), table.as_str(), DELETE_DIR)
 }
 
+pub(crate) fn default_view_root_prefix(namespace: &Namespace) -> String {
+    format!("{}{}/{}/", default_namespace_root_prefix(), namespace.storage_id(), VIEW_ROOT)
+}
+
+pub(crate) fn default_view_metadata_dir_path(namespace: &Namespace, view: &IdentifierSegment) -> String {
+    format!("{}{}/{}", default_view_root_prefix(namespace), view.as_str(), METADATA_DIR)
+}
+
+pub(crate) fn default_view_metadata_file_path(
+    namespace: &Namespace,
+    view: &IdentifierSegment,
+    metadata_file_name: &str,
+) -> String {
+    format!("{}/{}", default_view_metadata_dir_path(namespace, view), metadata_file_name)
+}
+
 pub(crate) fn default_table_metadata_file_path(
     namespace: &Namespace,
     table: &IdentifierSegment,
@@ -6224,6 +6455,17 @@ pub(crate) fn is_valid_table_metadata_location(
     }
 
     let metadata_prefix = format!("{}/", default_table_metadata_dir_path(namespace, table));
+    metadata_location
+        .strip_prefix(&metadata_prefix)
+        .is_some_and(is_valid_table_metadata_file_name)
+}
+
+pub(crate) fn is_valid_view_metadata_location(namespace: &Namespace, view: &IdentifierSegment, metadata_location: &str) -> bool {
+    if metadata_location.is_empty() {
+        return false;
+    }
+
+    let metadata_prefix = format!("{}/", default_view_metadata_dir_path(namespace, view));
     metadata_location
         .strip_prefix(&metadata_prefix)
         .is_some_and(is_valid_table_metadata_file_name)
@@ -6554,6 +6796,50 @@ mod tests {
             Ok(())
         }
 
+        async fn create_view(&self, _entry: ViewEntry) -> TableCatalogStoreResult<()> {
+            Ok(())
+        }
+
+        async fn list_views(&self, _table_bucket: &str, _namespace: &str) -> TableCatalogStoreResult<Vec<ViewEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn load_view(
+            &self,
+            _table_bucket: &str,
+            _namespace: &str,
+            _view: &str,
+        ) -> TableCatalogStoreResult<Option<ViewEntry>> {
+            Ok(None)
+        }
+
+        async fn replace_view(&self, request: ViewCommitRequest) -> TableCatalogStoreResult<ViewCommitResult> {
+            Ok(ViewCommitResult {
+                view: ViewEntry {
+                    version: TABLE_CATALOG_ENTRY_VERSION,
+                    table_bucket: request.table_bucket,
+                    namespace: request.namespace,
+                    view: request.view,
+                    view_id: "view-id".to_string(),
+                    view_uuid: "view-uuid".to_string(),
+                    format: "ICEBERG_VIEW".to_string(),
+                    format_version: 1,
+                    warehouse_location: "s3://analytics/views/view-id".to_string(),
+                    metadata_location: request.new_metadata_location,
+                    version_token: "token-v2".to_string(),
+                    generation: 2,
+                    state: TableCatalogEntryState::Active,
+                    properties: BTreeMap::new(),
+                    created_at: None,
+                    updated_at: None,
+                },
+            })
+        }
+
+        async fn drop_view(&self, _table_bucket: &str, _namespace: &str, _view: &str) -> TableCatalogStoreResult<()> {
+            Ok(())
+        }
+
         async fn get_commit_by_id(
             &self,
             _table_bucket: &str,
@@ -6635,6 +6921,10 @@ mod tests {
         assert_eq!(
             paths.table_entry_path(bucket, &namespace, &table),
             format!("{bucket_root}namespaces/analytics/daily_events/tables/events/table-entry.json")
+        );
+        assert_eq!(
+            paths.view_entry_path(bucket, &namespace, &table),
+            format!("{bucket_root}namespaces/analytics/daily_events/views/events/view-entry.json")
         );
 
         let commit_path = paths.commit_log_entry_path("table/../bucket", "table/../id", "commit/%2f\nid");
@@ -7045,6 +7335,27 @@ mod tests {
         }
     }
 
+    fn test_view_entry(bucket: &str, namespace: &Namespace, view: &IdentifierSegment, metadata_location: String) -> ViewEntry {
+        ViewEntry {
+            version: TABLE_CATALOG_ENTRY_VERSION,
+            table_bucket: bucket.to_string(),
+            namespace: namespace.public_name(),
+            view: view.as_str().to_string(),
+            view_id: "view-id".to_string(),
+            view_uuid: "view-uuid".to_string(),
+            format: "ICEBERG_VIEW".to_string(),
+            format_version: 1,
+            warehouse_location: format!("s3://{bucket}/views/view-id"),
+            metadata_location,
+            version_token: "token-v1".to_string(),
+            generation: 1,
+            state: TableCatalogEntryState::Active,
+            properties: BTreeMap::new(),
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
     async fn seed_table_for_metadata_maintenance(
         store: &ObjectTableCatalogStore<TestCatalogObjectBackend>,
         bucket: &str,
@@ -7076,6 +7387,75 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         assert_eq!(object_buckets, BTreeSet::from([rustfs_ecstore::disk::RUSTFS_META_BUCKET]));
+    }
+
+    #[tokio::test]
+    async fn object_table_catalog_store_persists_view_entries_and_blocks_non_empty_namespace_drop() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let view = IdentifierSegment::parse("recent_orders").unwrap();
+        let current_metadata = default_view_metadata_file_path(&namespace, &view, "00001.metadata.json");
+        let next_metadata = default_view_metadata_file_path(&namespace, &view, "00002.metadata.json");
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+        store
+            .create_view(test_view_entry(bucket, &namespace, &view, current_metadata.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(store.list_views(bucket, &namespace.public_name()).await.unwrap()[0].view, "recent_orders");
+        assert!(
+            store
+                .load_view(bucket, &namespace.public_name(), view.as_str())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(matches!(
+            store.drop_namespace(bucket, &namespace.public_name()).await,
+            Err(TableCatalogStoreError::Conflict(_))
+        ));
+
+        backend
+            .seed_object(
+                bucket,
+                &next_metadata,
+                serde_json::to_vec(&serde_json::json!({
+                    "format-version": 1,
+                    "view-uuid": "view-uuid",
+                    "location": format!("s3://{bucket}/views/view-id")
+                }))
+                .unwrap(),
+            )
+            .await;
+        let result = store
+            .replace_view(ViewCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                view: view.as_str().to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current_metadata,
+                new_metadata_location: next_metadata.clone(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.view.metadata_location, next_metadata);
+        assert_eq!(result.view.generation, 2);
+        assert_ne!(result.view.version_token, "token-v1");
+
+        store
+            .drop_view(bucket, &namespace.public_name(), view.as_str())
+            .await
+            .unwrap();
+        assert!(store.list_views(bucket, &namespace.public_name()).await.unwrap().is_empty());
+        store.drop_namespace(bucket, &namespace.public_name()).await.unwrap();
     }
 
     #[tokio::test]
