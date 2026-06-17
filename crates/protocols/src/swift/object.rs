@@ -111,6 +111,14 @@ impl ObjectKeyMapper {
             return Err(SwiftError::BadRequest("Object name cannot contain null bytes".to_string()));
         }
 
+        if object.chars().any(char::is_control) {
+            return Err(SwiftError::BadRequest("Object name cannot contain control characters".to_string()));
+        }
+
+        if object.starts_with('/') {
+            return Err(SwiftError::BadRequest("Object name cannot start with '/'".to_string()));
+        }
+
         // Check for directory traversal attempts
         if object.contains("..") {
             // Allow ".." as part of a filename, but not as a path segment
@@ -1115,6 +1123,7 @@ pub fn format_content_range(start: i64, end: i64, total: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn test_validate_object_name_valid() {
@@ -1157,6 +1166,30 @@ mod tests {
         match result {
             Err(SwiftError::BadRequest(msg)) => {
                 assert!(msg.contains("null"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_validate_object_name_control_character() {
+        let result = ObjectKeyMapper::validate_object_name("file\nname.txt");
+        assert!(result.is_err());
+        match result {
+            Err(SwiftError::BadRequest(msg)) => {
+                assert!(msg.contains("control"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_validate_object_name_leading_slash() {
+        let result = ObjectKeyMapper::validate_object_name("/file.txt");
+        assert!(result.is_err());
+        match result {
+            Err(SwiftError::BadRequest(msg)) => {
+                assert!(msg.contains("start with '/'"));
             }
             _ => panic!("Expected BadRequest error"),
         }
@@ -1238,6 +1271,44 @@ mod tests {
 
         // Empty segments
         assert_eq!(ObjectKeyMapper::normalize_path("path///to/file.txt"), "path/to/file.txt");
+    }
+
+    proptest! {
+        #[test]
+        fn validate_object_name_ok_outputs_are_safe(input in any::<String>()) {
+            match ObjectKeyMapper::validate_object_name(&input) {
+                Ok(()) => {
+                    prop_assert!(!input.is_empty());
+                    prop_assert!(input.len() <= 1024);
+                    prop_assert!(!input.starts_with('/'));
+                    prop_assert!(!input.chars().any(char::is_control));
+                    prop_assert!(!input.split('/').any(|segment| segment == ".."));
+                }
+                Err(_) => {}
+            }
+        }
+
+        #[test]
+        fn decode_object_from_url_round_trips_valid_input(input in any::<String>()) {
+            let encoded = ObjectKeyMapper::encode_object_for_url(&input);
+
+            match ObjectKeyMapper::decode_object_from_url(&encoded) {
+                Ok(decoded) => {
+                    prop_assert_eq!(decoded.as_str(), input.as_str());
+                    prop_assert!(ObjectKeyMapper::validate_object_name(&decoded).is_ok());
+                }
+                Err(_) => {
+                    prop_assert!(ObjectKeyMapper::validate_object_name(&input).is_err());
+                }
+            }
+        }
+
+        #[test]
+        fn normalize_path_is_idempotent(input in any::<String>()) {
+            let once = ObjectKeyMapper::normalize_path(&input);
+            let twice = ObjectKeyMapper::normalize_path(&once);
+            prop_assert_eq!(twice, once);
+        }
     }
 
     #[test]
