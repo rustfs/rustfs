@@ -2329,7 +2329,12 @@ fn resolve_rebalance_save_task_result(
 }
 
 fn resolve_rebalance_meta_save_result(result: Result<()>, stage: &str) -> Result<()> {
-    result.map_err(|err| Error::other(format!("rebalance meta save failed during {stage}: {err}")))
+    match result {
+        Ok(()) => Ok(()),
+        Err(Error::RebalanceAlreadyRunning) => Err(Error::RebalanceAlreadyRunning),
+        Err(Error::DecommissionAlreadyRunning) => Err(Error::DecommissionAlreadyRunning),
+        Err(err) => Err(Error::other(format!("rebalance meta save failed during {stage}: {err}"))),
+    }
 }
 
 fn rebalance_meta_lock_error(err: rustfs_lock::LockError) -> Error {
@@ -4993,6 +4998,17 @@ mod rebalance_unit_tests {
         let message = err.to_string();
         assert!(message.contains("rebalance meta save failed during init_rebalance_meta"));
         assert!(message.contains(Error::SlowDown.to_string().as_str()));
+    }
+
+    #[test]
+    fn test_resolve_rebalance_meta_save_result_preserves_conflict_errors() {
+        let err = resolve_rebalance_meta_save_result(Err(Error::RebalanceAlreadyRunning), "init_rebalance_meta")
+            .expect_err("rebalance conflict should be preserved");
+        assert!(matches!(err, Error::RebalanceAlreadyRunning));
+
+        let err = resolve_rebalance_meta_save_result(Err(Error::DecommissionAlreadyRunning), "init_rebalance_meta")
+            .expect_err("decommission conflict should be preserved");
+        assert!(matches!(err, Error::DecommissionAlreadyRunning));
     }
 
     #[test]
