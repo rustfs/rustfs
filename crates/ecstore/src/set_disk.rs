@@ -1221,7 +1221,10 @@ impl ObjectIO for SetDisks {
 
             //TODO: userDefined
 
-            let etag = data.stream.try_resolve_etag().unwrap_or_default();
+            let mut etag = data.stream.try_resolve_etag().unwrap_or_default();
+            if let Some(ref tag) = opts.preserve_etag {
+                etag = tag.clone();
+            }
 
             user_defined.insert("etag".to_owned(), etag.clone());
 

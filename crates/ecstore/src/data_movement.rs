@@ -236,6 +236,28 @@ fn data_movement_put_object_opts(object_info: &ObjectInfo, src_pool_idx: usize) 
     }
 }
 
+fn data_movement_put_object_reader(
+    bucket: &str,
+    object_info: &ObjectInfo,
+    rd: GetObjectReader,
+    op_label: &str,
+) -> Result<PutObjReader> {
+    let actual_size = object_info
+        .get_actual_size()
+        .map_err(|err| data_movement_stage_error(op_label, "prepare_put_object", bucket, object_info.name.as_str(), err))?;
+    let index = object_info
+        .parts
+        .first()
+        .and_then(|part| decode_part_index(part.index.as_ref()));
+    let reader = IndexedDataMovementReader::new(BufReader::new(rd.stream), index);
+    let hrd = HashReader::from_stream(reader, object_info.size, actual_size, None, None, false)
+        .map_err(|err| data_movement_stage_error(op_label, "prepare_put_object", bucket, object_info.name.as_str(), err))?;
+    let mut data = PutObjReader::new(hrd);
+    add_data_movement_calculated_checksum(&mut data, data_movement_object_checksum_type(object_info))
+        .map_err(|err| data_movement_stage_error(op_label, "prepare_put_object", bucket, object_info.name.as_str(), err))?;
+    Ok(data)
+}
+
 fn resolve_data_movement_abort_result(
     op_label: &str,
     bucket: &str,
@@ -767,22 +789,7 @@ pub(crate) async fn migrate_object(
         return Ok(());
     }
 
-    let actual_size = object_info.get_actual_size().map_err(|err| {
-        data_movement_stage_error(op_label, "prepare_put_object", bucket.as_str(), object_info.name.as_str(), err)
-    })?;
-    let index = object_info
-        .parts
-        .first()
-        .and_then(|part| decode_part_index(part.index.as_ref()));
-    let reader = IndexedDataMovementReader::new(BufReader::new(rd.stream), index);
-    let hrd =
-        HashReader::from_stream(reader, object_info.size, actual_size, object_info.etag.clone(), None, false).map_err(|err| {
-            data_movement_stage_error(op_label, "prepare_put_object", bucket.as_str(), object_info.name.as_str(), err)
-        })?;
-    let mut data = PutObjReader::new(hrd);
-    add_data_movement_calculated_checksum(&mut data, data_movement_object_checksum_type(&object_info)).map_err(|err| {
-        data_movement_stage_error(op_label, "prepare_put_object", bucket.as_str(), object_info.name.as_str(), err)
-    })?;
+    let mut data = data_movement_put_object_reader(bucket.as_str(), &object_info, rd, op_label)?;
 
     if let Err(err) = store
         .put_object(
@@ -1120,6 +1127,32 @@ mod tests {
             .as_ref()
             .expect("migrated reader should contain calculated checksum");
         assert_eq!(migrated.to_bytes(&[]), checksum.to_bytes(&[]));
+    }
+
+    #[tokio::test]
+    async fn test_data_movement_single_part_raw_reader_does_not_validate_source_etag() {
+        let raw_payload = b"raw-encrypted-or-compressed-bytes".to_vec();
+        let object_info = ObjectInfo {
+            name: "object.txt".to_string(),
+            size: i64::try_from(raw_payload.len()).expect("test payload size should fit i64"),
+            actual_size: 128,
+            etag: Some("logical-source-etag".to_string()),
+            ..Default::default()
+        };
+        let rd = GetObjectReader {
+            stream: Box::new(Cursor::new(raw_payload.clone())),
+            object_info: object_info.clone(),
+        };
+
+        let mut data = data_movement_put_object_reader("bucket-a", &object_info, rd, "test_migration")
+            .expect("raw data movement reader should ignore source ETag during stream validation");
+        let mut migrated = Vec::new();
+        data.stream
+            .read_to_end(&mut migrated)
+            .await
+            .expect("raw data movement reader should consume payload without ETag mismatch");
+
+        assert_eq!(migrated, raw_payload);
     }
 
     #[test]
