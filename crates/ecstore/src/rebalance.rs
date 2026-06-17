@@ -546,6 +546,8 @@ pub struct RebalanceInfo {
     pub last_error: Option<String>, // Last rebalance error message
     #[serde(rename = "status")]
     pub status: RebalStatus, // Current state of rebalance operation
+    #[serde(rename = "stopping", default)]
+    pub stopping: bool, // True after stop is requested and before worker terminal acknowledgement
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -606,12 +608,12 @@ fn is_rebalance_pool_started(pool_stat: &RebalanceStats) -> bool {
     pool_stat.participating && pool_stat.info.status == RebalStatus::Started
 }
 
-fn is_rebalance_in_progress(meta: &RebalanceMeta) -> bool {
-    if meta.stopped_at.is_some() {
-        return false;
-    }
+fn is_rebalance_pool_active(pool_stat: &RebalanceStats) -> bool {
+    is_rebalance_pool_started(pool_stat) || pool_stat.info.stopping
+}
 
-    meta.pool_stats.iter().any(is_rebalance_pool_started)
+fn is_rebalance_in_progress(meta: &RebalanceMeta) -> bool {
+    meta.pool_stats.iter().any(is_rebalance_pool_active)
 }
 
 fn is_rebalance_conflicting_with_decommission(meta: &RebalanceMeta) -> bool {
@@ -668,9 +670,15 @@ fn validate_rebalance_pool_stat(pool_stat: &RebalanceStats, pool_index: usize, m
         )));
     }
 
-    if meta_stopped && pool_stat.info.status == RebalStatus::Started {
+    if meta_stopped && pool_stat.info.status == RebalStatus::Started && !pool_stat.info.stopping {
         return Err(invalid_rebalance_meta_error(format!(
             "pool {pool_index} is started after rebalance stop timestamp was recorded"
+        )));
+    }
+
+    if pool_stat.info.stopping && pool_stat.info.status != RebalStatus::Started {
+        return Err(invalid_rebalance_meta_error(format!(
+            "pool {pool_index} is stopping without a started rebalance status"
         )));
     }
 
@@ -1417,6 +1425,7 @@ impl ECStore {
                                         &mut pool_stat.info.status,
                                         &mut pool_stat.info.end_time,
                                         &mut pool_stat.info.last_error,
+                                        &mut pool_stat.info.stopping,
                                         terminal_event,
                                         now,
                                     );
@@ -2404,9 +2413,11 @@ fn apply_rebalance_terminal_event(
     status: &mut RebalStatus,
     end_time: &mut Option<OffsetDateTime>,
     last_error: &mut Option<String>,
+    stopping: &mut bool,
     terminal_event: RebalanceTerminalEvent,
     now: OffsetDateTime,
 ) {
+    *stopping = false;
     match terminal_event {
         RebalanceTerminalEvent::Completed { .. } => {
             *status = RebalStatus::Completed;
@@ -2486,11 +2497,11 @@ fn is_rebalance_stopped_terminal_event(terminal_event: &RebalanceTerminalEvent) 
 }
 
 fn should_preserve_rebalance_stopped_state(
-    meta_stopped: bool,
+    _meta_stopped: bool,
     status: RebalStatus,
     terminal_event: &RebalanceTerminalEvent,
 ) -> bool {
-    (meta_stopped || status == RebalStatus::Stopped) && !is_rebalance_stopped_terminal_event(terminal_event)
+    status == RebalStatus::Stopped && !is_rebalance_stopped_terminal_event(terminal_event)
 }
 
 fn resolve_rebalance_participants(pool_stats: &[RebalanceStats], pool_count: usize) -> Vec<bool> {
@@ -2681,15 +2692,25 @@ fn mark_started_rebalance_pools_stopped(meta: &mut RebalanceMeta, stop_time: Off
     for pool_stat in meta.pool_stats.iter_mut() {
         if pool_stat.info.status == RebalStatus::Started {
             pool_stat.info.status = RebalStatus::Stopped;
+            pool_stat.info.stopping = false;
             pool_stat.info.end_time.get_or_insert(stop_time);
             pool_stat.info.last_error = None;
         }
     }
 }
 
+fn mark_started_rebalance_pools_stopping(meta: &mut RebalanceMeta) {
+    for pool_stat in meta.pool_stats.iter_mut() {
+        if pool_stat.info.status == RebalStatus::Started {
+            pool_stat.info.stopping = true;
+            pool_stat.info.last_error = None;
+        }
+    }
+}
+
 fn apply_stopped_at(meta: &mut RebalanceMeta, now: OffsetDateTime) {
-    meta.stopped_at = Some(now);
-    mark_started_rebalance_pools_stopped(meta, now);
+    meta.stopped_at.get_or_insert(now);
+    mark_started_rebalance_pools_stopping(meta);
 }
 
 fn stop_rebalance_state(meta: &mut RebalanceMeta, now: OffsetDateTime) {
@@ -2697,13 +2718,10 @@ fn stop_rebalance_state(meta: &mut RebalanceMeta, now: OffsetDateTime) {
         cancel_tx.cancel();
     }
 
-    let stop_time = meta.stopped_at.unwrap_or(now);
     if meta.stopped_at.is_none() && is_rebalance_in_progress(meta) {
-        meta.stopped_at = Some(stop_time);
-    }
-
-    if meta.stopped_at.is_some() {
-        mark_started_rebalance_pools_stopped(meta, stop_time);
+        apply_stopped_at(meta, now);
+    } else if meta.stopped_at.is_some() {
+        mark_started_rebalance_pools_stopping(meta);
     }
 }
 
@@ -5712,11 +5730,13 @@ mod rebalance_unit_tests {
         let mut status = RebalStatus::Started;
         let mut end_time = None;
         let mut last_error = None;
+        let mut stopping = true;
 
         apply_rebalance_terminal_event(
             &mut status,
             &mut end_time,
             &mut last_error,
+            &mut stopping,
             RebalanceTerminalEvent::ChannelClosed {
                 msg: "channel closed".to_string(),
                 last_error: "rebalance save channel closed before terminal event".to_string(),
@@ -5727,6 +5747,7 @@ mod rebalance_unit_tests {
         assert_eq!(status, RebalStatus::Failed);
         assert_eq!(end_time, Some(now));
         assert_eq!(last_error.as_deref(), Some("rebalance save channel closed before terminal event"));
+        assert!(!stopping);
     }
 
     #[test]
@@ -5735,11 +5756,13 @@ mod rebalance_unit_tests {
         let mut status = RebalStatus::Started;
         let mut end_time = None;
         let mut last_error = Some("old-error".to_string());
+        let mut stopping = true;
 
         apply_rebalance_terminal_event(
             &mut status,
             &mut end_time,
             &mut last_error,
+            &mut stopping,
             RebalanceTerminalEvent::Stopped {
                 msg: "rebalance stopped".to_string(),
             },
@@ -5749,6 +5772,7 @@ mod rebalance_unit_tests {
         assert_eq!(status, RebalStatus::Stopped);
         assert_eq!(end_time, Some(now));
         assert_eq!(last_error, None);
+        assert!(!stopping);
     }
 
     #[test]
@@ -5770,7 +5794,7 @@ mod rebalance_unit_tests {
             msg: "completed".to_string(),
         };
 
-        assert!(should_preserve_rebalance_stopped_state(true, RebalStatus::Started, &event));
+        assert!(!should_preserve_rebalance_stopped_state(true, RebalStatus::Started, &event));
     }
 
     #[test]
@@ -6144,6 +6168,7 @@ mod rebalance_unit_tests {
                 info: RebalanceInfo {
                     start_time: Some(now),
                     status: RebalStatus::Started,
+                    stopping: true,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -6216,7 +6241,8 @@ mod rebalance_unit_tests {
                 participating: true,
                 info: RebalanceInfo {
                     start_time: Some(now),
-                    status: RebalStatus::Started,
+                    status: RebalStatus::Stopped,
+                    end_time: Some(now),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -6228,7 +6254,28 @@ mod rebalance_unit_tests {
     }
 
     #[test]
-    fn test_is_rebalance_in_progress_stopped_takes_precedence() {
+    fn test_is_rebalance_conflicting_with_decommission_true_when_stopping() {
+        let now = OffsetDateTime::now_utc();
+        let meta = RebalanceMeta {
+            stopped_at: Some(now),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    start_time: Some(now),
+                    status: RebalStatus::Started,
+                    stopping: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(is_rebalance_conflicting_with_decommission(&meta));
+    }
+
+    #[test]
+    fn test_is_rebalance_in_progress_stopping_takes_precedence() {
         let now = OffsetDateTime::now_utc();
         let meta = RebalanceMeta {
             stopped_at: Some(now),
@@ -6244,7 +6291,7 @@ mod rebalance_unit_tests {
             ..Default::default()
         };
 
-        assert!(!is_rebalance_in_progress(&meta));
+        assert!(is_rebalance_in_progress(&meta));
     }
 
     #[test]
@@ -6624,7 +6671,7 @@ mod rebalance_unit_tests {
     }
 
     #[test]
-    fn test_apply_stopped_at_transitions_started_pools_only() {
+    fn test_apply_stopped_at_marks_started_pools_stopping_only() {
         let now = OffsetDateTime::now_utc();
         let mut meta = RebalanceMeta {
             pool_stats: vec![
@@ -6653,17 +6700,20 @@ mod rebalance_unit_tests {
         apply_stopped_at(&mut meta, now);
 
         assert_eq!(meta.stopped_at, Some(now));
-        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Stopped);
-        assert_eq!(meta.pool_stats[0].info.end_time, Some(now));
+        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Started);
+        assert!(meta.pool_stats[0].info.stopping);
+        assert_eq!(meta.pool_stats[0].info.end_time, None);
         assert_eq!(meta.pool_stats[0].info.last_error, None);
+        assert!(is_rebalance_in_progress(&meta));
 
         assert_eq!(meta.pool_stats[1].info.status, RebalStatus::Failed);
+        assert!(!meta.pool_stats[1].info.stopping);
         assert_eq!(meta.pool_stats[1].info.end_time, Some(now));
         assert_eq!(meta.pool_stats[1].info.last_error.as_deref(), Some("failed"));
     }
 
     #[test]
-    fn test_stop_rebalance_state_cancels_token_and_marks_stopped_when_in_progress() {
+    fn test_stop_rebalance_state_cancels_token_and_marks_stopping_when_in_progress() {
         let now = OffsetDateTime::from_unix_timestamp(10_000).unwrap();
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
@@ -6685,8 +6735,10 @@ mod rebalance_unit_tests {
         assert!(cancel_clone.is_cancelled());
         assert!(meta.cancel.is_none());
         assert_eq!(meta.stopped_at, Some(now));
-        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Stopped);
-        assert_eq!(meta.pool_stats[0].info.end_time, Some(now));
+        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Started);
+        assert!(meta.pool_stats[0].info.stopping);
+        assert_eq!(meta.pool_stats[0].info.end_time, None);
+        assert!(is_rebalance_in_progress(&meta));
     }
 
     #[test]
@@ -6717,7 +6769,7 @@ mod rebalance_unit_tests {
     }
 
     #[test]
-    fn test_stop_rebalance_state_normalizes_started_pool_when_stopped_at_already_set() {
+    fn test_stop_rebalance_state_marks_started_pool_stopping_when_stopped_at_already_set() {
         let stopped_at = OffsetDateTime::from_unix_timestamp(30_000).unwrap();
         let now = OffsetDateTime::from_unix_timestamp(40_000).unwrap();
         let cancel = CancellationToken::new();
@@ -6742,8 +6794,9 @@ mod rebalance_unit_tests {
         assert!(cancel_clone.is_cancelled());
         assert!(meta.cancel.is_none());
         assert_eq!(meta.stopped_at, Some(stopped_at));
-        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Stopped);
-        assert_eq!(meta.pool_stats[0].info.end_time, Some(stopped_at));
+        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Started);
+        assert!(meta.pool_stats[0].info.stopping);
+        assert_eq!(meta.pool_stats[0].info.end_time, None);
         assert_eq!(meta.pool_stats[0].info.last_error, None);
     }
 
@@ -6754,7 +6807,7 @@ mod rebalance_unit_tests {
     }
 
     #[test]
-    fn test_stop_rebalance_meta_snapshot_stops_meta_and_returns_snapshot() {
+    fn test_stop_rebalance_meta_snapshot_marks_stopping_and_returns_snapshot() {
         let now = OffsetDateTime::from_unix_timestamp(60_000).unwrap();
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
@@ -6777,13 +6830,15 @@ mod rebalance_unit_tests {
         assert!(meta.cancel.is_none());
         assert_eq!(meta.stopped_at, Some(now));
         assert_eq!(meta.last_refreshed_at, Some(now));
-        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Stopped);
+        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Started);
+        assert!(meta.pool_stats[0].info.stopping);
 
         assert!(snapshot.cancel.is_none());
         assert_eq!(snapshot.stopped_at, Some(now));
         assert_eq!(snapshot.last_refreshed_at, Some(now));
-        assert_eq!(snapshot.pool_stats[0].info.status, RebalStatus::Stopped);
-        assert_eq!(snapshot.pool_stats[0].info.end_time, Some(now));
+        assert_eq!(snapshot.pool_stats[0].info.status, RebalStatus::Started);
+        assert!(snapshot.pool_stats[0].info.stopping);
+        assert_eq!(snapshot.pool_stats[0].info.end_time, None);
     }
 
     #[test]
@@ -6818,7 +6873,7 @@ mod rebalance_unit_tests {
     }
 
     #[test]
-    fn test_apply_rebalance_save_option_stopped_at_updates_refresh_and_statuses() {
+    fn test_apply_rebalance_save_option_stopped_at_marks_stopping() {
         let now = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
         let mut meta = RebalanceMeta {
             pool_stats: vec![
@@ -6845,10 +6900,12 @@ mod rebalance_unit_tests {
 
         assert_eq!(meta.stopped_at, Some(now));
         assert_eq!(meta.last_refreshed_at, Some(now));
-        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Stopped);
-        assert_eq!(meta.pool_stats[0].info.end_time, Some(now));
+        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Started);
+        assert!(meta.pool_stats[0].info.stopping);
+        assert_eq!(meta.pool_stats[0].info.end_time, None);
         assert!(meta.pool_stats[0].info.last_error.is_none());
         assert_eq!(meta.pool_stats[1].info.status, RebalStatus::Failed);
+        assert!(!meta.pool_stats[1].info.stopping);
         assert_eq!(meta.pool_stats[1].info.last_error.as_deref(), Some("previous failure"));
     }
 

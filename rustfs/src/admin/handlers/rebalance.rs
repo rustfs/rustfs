@@ -172,6 +172,8 @@ pub struct RebalancePoolStatus {
     pub id: usize, // Pool index (zero-based)
     #[serde(rename = "status")]
     pub status: String, // Active if rebalance is running, empty otherwise
+    #[serde(rename = "stopping")]
+    pub stopping: bool, // Stop requested but worker terminal acknowledgement not yet persisted
     #[serde(rename = "used")]
     pub used: f64, // Fraction of used space in range 0.0..=1.0
     #[serde(rename = "lastError")]
@@ -277,6 +279,7 @@ fn build_rebalance_pool_statuses(
             let mut status = RebalancePoolStatus {
                 id: i,
                 status: ps.info.status.to_string(),
+                stopping: ps.info.stopping,
                 used: rebalance_pool_used(disk_stats, i),
                 last_error: ps.info.last_error.clone(),
                 cleanup_warnings: ps.cleanup_warnings.clone(),
@@ -1070,6 +1073,26 @@ mod rebalance_handler_tests {
     }
 
     #[test]
+    fn test_build_rebalance_pool_statuses_reports_stopping() {
+        let pool_stats = vec![RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                stopping: true,
+                start_time: Some(OffsetDateTime::from_unix_timestamp(2_000).unwrap()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+
+        let statuses =
+            build_rebalance_pool_statuses(OffsetDateTime::from_unix_timestamp(2_010).unwrap(), None, 0.3, &pool_stats, &[]);
+
+        assert_eq!(statuses[0].status, "Started");
+        assert!(statuses[0].stopping);
+    }
+
+    #[test]
     fn test_build_rebalance_pool_statuses_empty_inputs() {
         let statuses = build_rebalance_pool_statuses(
             OffsetDateTime::from_unix_timestamp(2_000).unwrap(),
@@ -1093,6 +1116,7 @@ mod rebalance_handler_tests {
             pools: vec![RebalancePoolStatus {
                 id: 0,
                 status: "Started".to_string(),
+                stopping: true,
                 used: 0.5,
                 last_error: Some("temporary error".to_string()),
                 cleanup_warnings: RebalanceCleanupWarnings {
@@ -1125,6 +1149,7 @@ mod rebalance_handler_tests {
         assert!(json.contains("\"remainingBuckets\""));
         assert!(json.contains("\"lastError\""));
         assert!(json.contains("\"cleanupWarnings\""));
+        assert!(json.contains("\"stopping\":true"));
         assert!(json.contains("\"lastMsg\":\"cleanup warning\""));
         assert!(json.contains("\"entries\""));
         assert!(json.contains("\"message\":\"cleanup warning\""));
@@ -1140,6 +1165,7 @@ mod rebalance_handler_tests {
             pools: vec![RebalancePoolStatus {
                 id: 0,
                 status: "Stopped".to_string(),
+                stopping: false,
                 used: 0.3,
                 last_error: None,
                 cleanup_warnings: RebalanceCleanupWarnings::default(),
