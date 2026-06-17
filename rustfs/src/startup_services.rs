@@ -355,6 +355,7 @@ async fn init_observability_runtime(ctx: CancellationToken) {
     crate::allocator_reclaim::init_allocator_reclaim(ctx.clone());
 
     if rustfs_obs::observability_metric_enabled() {
+        rustfs_io_metrics::set_put_stage_metrics_enabled(true);
         init_metrics_runtime(ctx.clone());
         crate::memory_observability::init_memory_observability(ctx.clone());
         init_auto_tuner(ctx).await;

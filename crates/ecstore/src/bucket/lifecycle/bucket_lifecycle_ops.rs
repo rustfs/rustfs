@@ -1416,6 +1416,10 @@ fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>) {
                     );
                 }
                 Err(err) => {
+                    rustfs_io_metrics::record_stage_duration(
+                        "lifecycle_free_version_recovery_failed",
+                        started_at.elapsed().as_secs_f64() * 1000.0,
+                    );
                     warn!(
                         event = EVENT_LIFECYCLE_WORKER_STATE,
                         component = LOG_COMPONENT_ECSTORE,
