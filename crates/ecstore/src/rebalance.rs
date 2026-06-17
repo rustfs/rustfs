@@ -843,6 +843,17 @@ impl ECStore {
             {
                 let mut rebalance_meta = self.rebalance_meta.write().await;
 
+                if cancel_rebalance_worker_for_terminal_reload(rebalance_meta.as_mut(), &meta) {
+                    debug!(
+                        event = EVENT_REBALANCE_STATE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        state = "worker_cancelled",
+                        reason = "terminal_metadata_reload",
+                        "Cancelled local rebalance worker after terminal metadata reload"
+                    );
+                }
+
                 *rebalance_meta = Some(meta);
 
                 drop(rebalance_meta);
@@ -1798,6 +1809,31 @@ fn should_accept_rebalance_stats_update(meta: &RebalanceMeta, pool_index: usize)
         .is_some_and(|pool_stat| pool_stat.info.status == RebalStatus::Started)
 }
 
+fn is_terminal_rebalance_reload(meta: &RebalanceMeta) -> bool {
+    meta.stopped_at.is_some()
+        || meta
+            .pool_stats
+            .iter()
+            .any(|pool_stat| pool_stat.info.stopping || pool_stat.info.status == RebalStatus::Stopped)
+}
+
+fn cancel_rebalance_worker_for_terminal_reload(local_meta: Option<&mut RebalanceMeta>, loaded_meta: &RebalanceMeta) -> bool {
+    if !is_terminal_rebalance_reload(loaded_meta) {
+        return false;
+    }
+
+    let Some(local_meta) = local_meta else {
+        return false;
+    };
+
+    let Some(cancel_tx) = local_meta.cancel.take() else {
+        return false;
+    };
+
+    cancel_tx.cancel();
+    true
+}
+
 fn resolve_next_rebalance_bucket(meta: Option<&RebalanceMeta>, pool_index: usize) -> Result<Option<String>> {
     let Some(meta) = meta else {
         return Err(rebalance_metadata_not_initialized_error("resolve next rebalance bucket"));
@@ -1808,14 +1844,27 @@ fn resolve_next_rebalance_bucket(meta: Option<&RebalanceMeta>, pool_index: usize
         return Err(invalid_rebalance_pool_index_error(pool_index, meta.pool_stats.len()));
     };
 
-    if pool_stat.info.status == RebalStatus::Completed || !pool_stat.participating {
+    if meta.stopped_at.is_some() || pool_stat.info.stopping {
         debug!(
             event = EVENT_REBALANCE_BUCKET,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REBALANCE,
             pool_index,
             state = "unavailable",
-            reason = "completed_or_not_participating",
+            reason = "terminal_stop",
+            "No rebalance bucket available"
+        );
+        return Ok(None);
+    }
+
+    if pool_stat.info.status != RebalStatus::Started || !pool_stat.participating {
+        debug!(
+            event = EVENT_REBALANCE_BUCKET,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            pool_index,
+            state = "unavailable",
+            reason = "not_started_or_not_participating",
             "No rebalance bucket available"
         );
         return Ok(None);
@@ -3483,15 +3532,16 @@ mod rebalance_unit_tests {
         REBALANCE_CLEANUP_WARNING_ENTRY_LIMIT, RebalSaveOpt, RebalStatus, RebalanceBucketOutcome, RebalanceCleanupDeleteOutcome,
         RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta,
         RebalanceStats, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event, apply_stopped_at,
-        classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
-        complete_rebalance_pools_at_goal, complete_rebalance_pools_with_empty_queue, defer_bucket_in_rebalance_queue,
-        ensure_rebalance_listing_disks_available, ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index,
-        has_deferred_rebalance_error, is_rebalance_stopped_terminal_event, is_transient_rebalance_error,
-        load_rebalance_bucket_configs, mark_rebalance_bucket_done, merge_rebalance_meta, migrate_entry_version,
-        migrate_entry_version_with_delete_marker, migrate_entry_version_with_retry_wait, next_rebal_bucket_from_stat,
-        parse_rebalance_max_attempts, rebalance_delete_marker_opts, rebalance_listing_retry_delay,
-        rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error,
-        rebalance_migration_retry_delay, record_rebalance_cleanup_warning_in_meta, refresh_missing_rebalance_pool_stats,
+        cancel_rebalance_worker_for_terminal_reload, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc,
+        clone_rebalance_pool_stats, complete_rebalance_pools_at_goal, complete_rebalance_pools_with_empty_queue,
+        defer_bucket_in_rebalance_queue, ensure_rebalance_listing_disks_available, ensure_rebalance_not_decommissioning,
+        ensure_valid_rebalance_pool_index, has_deferred_rebalance_error, is_rebalance_stopped_terminal_event,
+        is_terminal_rebalance_reload, is_transient_rebalance_error, load_rebalance_bucket_configs, mark_rebalance_bucket_done,
+        merge_rebalance_meta, migrate_entry_version, migrate_entry_version_with_delete_marker,
+        migrate_entry_version_with_retry_wait, next_rebal_bucket_from_stat, parse_rebalance_max_attempts,
+        rebalance_delete_marker_opts, rebalance_listing_retry_delay, rebalance_meta_load_no_data_error,
+        rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error, rebalance_migration_retry_delay,
+        record_rebalance_cleanup_warning_in_meta, refresh_missing_rebalance_pool_stats,
         resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket, resolve_rebalance_bucket_error,
         resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
         resolve_rebalance_file_info_versions_result, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
@@ -6493,6 +6543,46 @@ mod rebalance_unit_tests {
     }
 
     #[test]
+    fn test_resolve_next_rebalance_bucket_returns_none_for_stopped_meta() {
+        let meta = RebalanceMeta {
+            stopped_at: Some(OffsetDateTime::UNIX_EPOCH),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                buckets: vec!["bucket-a".to_string()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let next = resolve_next_rebalance_bucket(Some(&meta), 0).expect("stopped meta should return none");
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn test_resolve_next_rebalance_bucket_returns_none_for_stopping_pool() {
+        let meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    stopping: true,
+                    ..Default::default()
+                },
+                buckets: vec!["bucket-a".to_string()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let next = resolve_next_rebalance_bucket(Some(&meta), 0).expect("stopping pool should return none");
+        assert!(next.is_none());
+    }
+
+    #[test]
     fn test_resolve_next_rebalance_bucket_returns_first_bucket_for_active_pool() {
         let now = OffsetDateTime::now_utc();
         let meta = RebalanceMeta {
@@ -6805,6 +6895,76 @@ mod rebalance_unit_tests {
         assert!(!meta.pool_stats[1].info.stopping);
         assert_eq!(meta.pool_stats[1].info.end_time, Some(now));
         assert_eq!(meta.pool_stats[1].info.last_error.as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn test_cancel_rebalance_worker_for_terminal_reload_cancels_existing_token() {
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let mut local = RebalanceMeta {
+            cancel: Some(cancel),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let loaded = RebalanceMeta {
+            stopped_at: Some(OffsetDateTime::UNIX_EPOCH),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    stopping: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(is_terminal_rebalance_reload(&loaded));
+        assert!(cancel_rebalance_worker_for_terminal_reload(Some(&mut local), &loaded));
+        assert!(cancel_clone.is_cancelled());
+        assert!(local.cancel.is_none());
+    }
+
+    #[test]
+    fn test_cancel_rebalance_worker_for_terminal_reload_keeps_active_token() {
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let mut local = RebalanceMeta {
+            cancel: Some(cancel),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let loaded = RebalanceMeta {
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(!is_terminal_rebalance_reload(&loaded));
+        assert!(!cancel_rebalance_worker_for_terminal_reload(Some(&mut local), &loaded));
+        assert!(!cancel_clone.is_cancelled());
+        assert!(local.cancel.is_some());
     }
 
     #[test]

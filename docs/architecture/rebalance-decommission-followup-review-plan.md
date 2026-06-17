@@ -1362,12 +1362,12 @@ Make terminal reload authoritative for local workers:
 
 ### Implementation Steps
 
-- [ ] Add a helper that applies terminal loaded metadata to the local cancel token.
-- [ ] Call it from `load_rebalance_meta()` after replacing in-memory metadata.
-- [ ] Harden `resolve_next_rebalance_bucket()` so stopped/stopping metadata returns no bucket.
-- [ ] Add tests for terminal reload cancelling an in-memory token.
-- [ ] Add tests for `next_rebal_bucket()` returning `None` when `stopped_at` or stopping status is present.
-- [ ] Run:
+- [x] Add a helper that applies terminal loaded metadata to the local cancel token.
+- [x] Call it from `load_rebalance_meta()` after replacing in-memory metadata.
+- [x] Harden `resolve_next_rebalance_bucket()` so stopped/stopping metadata returns no bucket.
+- [x] Add tests for terminal reload cancelling an in-memory token.
+- [x] Add tests for `next_rebal_bucket()` returning `None` when `stopped_at` or stopping status is present.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs-ecstore load_rebalance_meta --lib
