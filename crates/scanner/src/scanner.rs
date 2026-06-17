@@ -53,7 +53,6 @@ use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-const SINGLE_DISK_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
 const LOG_COMPONENT_SCANNER: &str = "scanner";
 const LOG_SUBSYSTEM_RUNTIME: &str = "runtime";
 const LOG_SUBSYSTEM_BACKGROUND_HEAL: &str = "background_heal";
@@ -147,12 +146,12 @@ fn initial_scanner_delay_for_startup(
     has_active_replication: bool,
 ) -> Duration {
     // Skip the startup delay when the cache is cold (first ever scan) OR when active replication
-    // rules exist. In single-disk/Slowest mode the normal inter-cycle delay is 27-33 minutes; if
-    // the node was SIGKILL'd with FAILED-status objects queued, waiting that long leaves them
-    // permanently unhealed until the next full cycle. Replication config is live-read at startup
-    // by configure_scanner_defaults, so this signal is always current regardless of when the
-    // persisted DataUsageInfo was last written.
-    if (usage_cache_is_cold || has_active_replication) && has_buckets {
+    // rules exist. A cold usage cache also covers startup-before-bucket-creation: running the
+    // first cycle promptly keeps later bucket metrics bounded by the normal scanner cycle instead
+    // of an extra startup delay. Replication config is live-read at startup by
+    // configure_scanner_defaults, so this signal is always current regardless of when the persisted
+    // DataUsageInfo was last written.
+    if usage_cache_is_cold || (has_active_replication && has_buckets) {
         Duration::ZERO
     } else {
         initial_scanner_delay_for(start_delay_secs)
@@ -239,11 +238,7 @@ async fn initial_scanner_startup_usage_state(storeapi: &Arc<ECStore>) -> (bool, 
         }
     };
 
-    if !has_buckets {
-        return (false, false);
-    }
-
-    (persisted_usage_cache_is_cold_for_startup(storeapi).await, true)
+    (persisted_usage_cache_is_cold_for_startup(storeapi).await, has_buckets)
 }
 
 pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
@@ -331,12 +326,12 @@ impl ScannerMaintenanceFeatures {
     }
 }
 
-fn single_disk_default_cycle_secs(features: ScannerMaintenanceFeatures) -> Option<u64> {
-    if features.needs_regular_cycle() {
-        None
-    } else {
-        Some(SINGLE_DISK_SCANNER_CYCLE_SECS)
-    }
+fn single_disk_default_cycle_secs(_features: ScannerMaintenanceFeatures) -> Option<u64> {
+    None
+}
+
+fn single_disk_default_speed() -> ScannerSpeed {
+    ScannerSpeed::Default
 }
 
 async fn detect_scanner_maintenance_features(storeapi: &Arc<ECStore>) -> ScannerMaintenanceFeatures {
@@ -421,7 +416,7 @@ async fn configure_scanner_defaults(storeapi: &Arc<ECStore>) -> ScannerMaintenan
     if is_erasure_sd().await {
         let features = detect_scanner_maintenance_features(storeapi).await;
         let default_cycle_secs = single_disk_default_cycle_secs(features);
-        set_scanner_default_speed(ScannerSpeed::Slowest);
+        set_scanner_default_speed(single_disk_default_speed());
         set_scanner_default_cycle_secs(default_cycle_secs);
         info!(
             target: "rustfs::scanner",
@@ -1082,6 +1077,8 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::sync::Mutex;
 
+    const TEST_DEFAULT_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
+
     struct ScannerDefaultSpeedGuard;
 
     impl ScannerDefaultSpeedGuard {
@@ -1219,10 +1216,9 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_initial_scanner_delay_keeps_configured_delay_without_buckets() {
+    fn test_initial_scanner_delay_skips_for_cold_usage_cache_without_buckets() {
         let delay = initial_scanner_delay_for_startup(Some(120), true, false, false);
-        assert!(delay >= Duration::from_secs(108));
-        assert!(delay <= Duration::from_secs(132));
+        assert_eq!(delay, Duration::ZERO);
     }
 
     #[test]
@@ -1425,7 +1421,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_cycle_interval_prefers_explicit_cycle_over_default_cycle() {
-        let _guard = ScannerDefaultCycleGuard::set(SINGLE_DISK_SCANNER_CYCLE_SECS);
+        let _guard = ScannerDefaultCycleGuard::set(TEST_DEFAULT_SCANNER_CYCLE_SECS);
 
         with_var(ENV_SCANNER_CYCLE, Some("42"), || {
             assert_eq!(cycle_interval(), Duration::from_secs(42));
@@ -1463,19 +1459,21 @@ mod tests {
     #[test]
     #[serial]
     fn test_cycle_interval_uses_default_cycle_override_when_unconfigured() {
-        let _guard = ScannerDefaultCycleGuard::set(SINGLE_DISK_SCANNER_CYCLE_SECS);
+        let _guard = ScannerDefaultCycleGuard::set(TEST_DEFAULT_SCANNER_CYCLE_SECS);
 
         with_unset_scanner_timing_env(|| {
-            assert_eq!(cycle_interval(), Duration::from_secs(SINGLE_DISK_SCANNER_CYCLE_SECS));
+            assert_eq!(cycle_interval(), Duration::from_secs(TEST_DEFAULT_SCANNER_CYCLE_SECS));
         });
     }
 
     #[test]
-    fn test_single_disk_default_cycle_uses_long_interval_without_maintenance_features() {
-        assert_eq!(
-            single_disk_default_cycle_secs(ScannerMaintenanceFeatures::default()),
-            Some(SINGLE_DISK_SCANNER_CYCLE_SECS)
-        );
+    fn test_single_disk_default_cycle_uses_speed_based_interval_without_maintenance_features() {
+        assert_eq!(single_disk_default_cycle_secs(ScannerMaintenanceFeatures::default()), None);
+    }
+
+    #[test]
+    fn test_single_disk_default_speed_uses_regular_scanner_default() {
+        assert_eq!(single_disk_default_speed(), ScannerSpeed::Default);
     }
 
     #[test]
@@ -1513,15 +1511,15 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_cycle_interval_keeps_single_disk_cycle_with_explicit_speed() {
-        let _guard = ScannerDefaultCycleGuard::set(SINGLE_DISK_SCANNER_CYCLE_SECS);
+    fn test_cycle_interval_keeps_default_cycle_with_explicit_speed() {
+        let _guard = ScannerDefaultCycleGuard::set(TEST_DEFAULT_SCANNER_CYCLE_SECS);
 
         with_var_unset(ENV_SCANNER_CYCLE, || {
             with_var_unset("MINIO_SCANNER_CYCLE", || {
                 with_var_unset(ENV_SCANNER_START_DELAY_SECS, || {
                     with_var_unset(ENV_SCANNER_START_DELAY_SECS_DEPRECATED, || {
                         with_var(ENV_SCANNER_SPEED, Some("slowest"), || {
-                            assert_eq!(cycle_interval(), Duration::from_secs(SINGLE_DISK_SCANNER_CYCLE_SECS));
+                            assert_eq!(cycle_interval(), Duration::from_secs(TEST_DEFAULT_SCANNER_CYCLE_SECS));
                         });
                     });
                 });
@@ -1532,7 +1530,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_cycle_interval_prefers_explicit_start_delay_over_default_cycle() {
-        let _guard = ScannerDefaultCycleGuard::set(SINGLE_DISK_SCANNER_CYCLE_SECS);
+        let _guard = ScannerDefaultCycleGuard::set(TEST_DEFAULT_SCANNER_CYCLE_SECS);
 
         with_var_unset(ENV_SCANNER_CYCLE, || {
             with_var_unset("MINIO_SCANNER_CYCLE", || {

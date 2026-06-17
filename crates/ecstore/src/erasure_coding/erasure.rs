@@ -394,7 +394,7 @@ impl Erasure {
             encoder,
             legacy_encoder,
             uses_legacy,
-            _id: Uuid::new_v4(),
+            _id: Uuid::nil(), // Unused in hot paths; avoid CSPRNG syscall
         }
     }
 
@@ -631,15 +631,11 @@ impl Erasure {
     ) -> Result<usize, E>
     where
         R: AsyncRead + Send + Sync + Unpin,
-        F: FnMut(std::io::Result<Vec<Bytes>>) -> Fut + Send,
-        Fut: std::future::Future<Output = Result<(), E>> + Send,
+        F: FnMut(io::Result<Vec<Bytes>>) -> Fut + Send,
+        Fut: Future<Output = Result<(), E>> + Send,
     {
         if self.block_size == 0 {
-            on_block(Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "erasure block_size must be non-zero",
-            )))
-            .await?;
+            on_block(Err(io::Error::new(io::ErrorKind::InvalidInput, "erasure block_size must be non-zero"))).await?;
             return Ok(0);
         }
 
@@ -662,7 +658,7 @@ impl Erasure {
                     {
                         Ok(result) => result,
                         Err(err) => {
-                            on_block(Err(std::io::Error::other(format!("EC encode task failed: {err}")))).await?;
+                            on_block(Err(io::Error::other(format!("EC encode task failed: {err}")))).await?;
                             break;
                         }
                     };
@@ -673,7 +669,7 @@ impl Erasure {
                     warn!("encode_stream_callback_async read unexpected ok");
                     break;
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                     warn!("encode_stream_callback_async read unexpected eof");
                     break;
                 }
@@ -690,7 +686,6 @@ impl Erasure {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
 
     fn optional_shards(shards: &[Bytes]) -> Vec<Option<Vec<u8>>> {
@@ -1140,7 +1135,7 @@ mod tests {
         assert_eq!(total, 0);
         let observed = observed.lock().unwrap();
         let (kind, message) = observed.as_ref().expect("callback should be invoked once");
-        assert_eq!(*kind, std::io::ErrorKind::InvalidInput);
+        assert_eq!(*kind, io::ErrorKind::InvalidInput);
         assert!(message.contains("block_size"));
     }
 
