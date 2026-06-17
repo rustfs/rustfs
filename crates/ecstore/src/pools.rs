@@ -352,6 +352,12 @@ fn resolve_decommission_update_after_result(result: Result<bool>) -> Result<bool
     result.map_err(|err| Error::other(format!("decommission metadata update failed: {err}")))
 }
 
+fn resolve_decommission_progress_save_result(result: Result<()>) -> Option<Error> {
+    result
+        .err()
+        .map(|err| Error::other(format!("decommission progress save failed: {err}")))
+}
+
 fn resolve_decommission_preflight_heal_result<T>(bucket: &str, result: Result<T>) -> Result<T> {
     result.map_err(|err| Error::other(format!("decommission preflight heal failed for bucket {bucket}: {err}")))
 }
@@ -2235,21 +2241,31 @@ impl ECStore {
         };
 
         if should_save_progress {
-            self.save_current_pool_meta()
-                .await
-                .map_err(|err| with_decommission_entry_context("update_after", bucket.as_str(), entry.name.as_str(), err))?;
-            {
+            let save_result = self.save_current_pool_meta().await;
+            if let Some(err) = resolve_decommission_progress_save_result(save_result) {
+                warn!(
+                    event = EVENT_DECOMMISSION_ENTRY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = idx,
+                    bucket = %bucket,
+                    object = %entry.name,
+                    state = "progress_save_failed",
+                    error = %err,
+                    "Decommission progress save failed; continuing and will retry at the next checkpoint"
+                );
+            } else {
                 let mut pool_meta = self.pool_meta.write().await;
                 pool_meta.mark_decommission_progress_saved();
-            }
-            if let Some(notification_sys) = get_global_notification_sys()
-                && let Err(err) = resolve_decommission_entry_reload_result(
-                    notification_sys.reload_pool_meta().await,
-                    bucket.as_str(),
-                    entry.name.as_str(),
-                )
-            {
-                warn!("{err}");
+                if let Some(notification_sys) = get_global_notification_sys()
+                    && let Err(err) = resolve_decommission_entry_reload_result(
+                        notification_sys.reload_pool_meta().await,
+                        bucket.as_str(),
+                        entry.name.as_str(),
+                    )
+                {
+                    warn!("{err}");
+                }
             }
         }
 
@@ -3959,13 +3975,14 @@ mod pools_tests {
         resolve_decommission_entry_cleanup_delete_result, resolve_decommission_entry_reload_result,
         resolve_decommission_listing_worker_result, resolve_decommission_optional_bucket_config_result,
         resolve_decommission_pool_meta_reload_result, resolve_decommission_preflight_heal_result,
-        resolve_decommission_spawn_failure_result, resolve_decommission_terminal_mark_after_error_result,
-        resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result,
-        resolve_start_decommission_pool_meta_reload_result, rollback_start_decommission_pool_meta,
-        run_decommission_buckets_bounded, should_cleanup_decommission_source_entry, should_continue_decommission_queue,
-        should_count_decommission_version_complete, should_preserve_decommission_canceled_state, split_decommission_buckets,
-        take_and_cancel_decommission_canceler, take_decommission_canceler, track_decommission_current_object,
-        validate_start_decommission_request, wait_decommission_worker_drain, with_decommission_entry_context,
+        resolve_decommission_progress_save_result, resolve_decommission_spawn_failure_result,
+        resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
+        resolve_decommission_update_after_result, resolve_start_decommission_pool_meta_reload_result,
+        rollback_start_decommission_pool_meta, run_decommission_buckets_bounded, should_cleanup_decommission_source_entry,
+        should_continue_decommission_queue, should_count_decommission_version_complete,
+        should_preserve_decommission_canceled_state, split_decommission_buckets, take_and_cancel_decommission_canceler,
+        take_decommission_canceler, track_decommission_current_object, validate_start_decommission_request,
+        wait_decommission_worker_drain, with_decommission_entry_context,
     };
     use crate::data_movement;
     use crate::disk::endpoint::Endpoint;
@@ -4503,6 +4520,20 @@ mod pools_tests {
             .expect_err("invalid argument should be wrapped with context");
         assert!(err.to_string().contains("decommission metadata update failed"));
         assert!(err.to_string().contains("invalid decommission pool index 0 for 0 pools"));
+    }
+
+    #[test]
+    fn test_resolve_decommission_progress_save_result_returns_none_on_success() {
+        assert!(resolve_decommission_progress_save_result(Ok(())).is_none());
+    }
+
+    #[test]
+    fn test_resolve_decommission_progress_save_result_returns_error_for_best_effort_failure() {
+        let err = resolve_decommission_progress_save_result(Err(Error::SlowDown))
+            .expect("progress save failure should be returned for logging");
+
+        assert!(err.to_string().contains("decommission progress save failed"));
+        assert!(err.to_string().contains(Error::SlowDown.to_string().as_str()));
     }
 
     #[test]
