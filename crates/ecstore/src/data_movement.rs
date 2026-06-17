@@ -271,6 +271,36 @@ fn is_equivalent_data_movement_part(source: &ObjectPartInfo, target: &ObjectPart
         && source.checksums == target.checksums
 }
 
+fn data_movement_parts_by_number(parts: &[ObjectPartInfo]) -> Option<BTreeMap<usize, &ObjectPartInfo>> {
+    let mut parts_by_number = BTreeMap::new();
+    for part in parts {
+        if parts_by_number.insert(part.number, part).is_some() {
+            return None;
+        }
+    }
+
+    Some(parts_by_number)
+}
+
+fn are_equivalent_data_movement_parts(source: &[ObjectPartInfo], target: &[ObjectPartInfo]) -> bool {
+    if source.len() != target.len() {
+        return false;
+    }
+
+    let Some(source_parts) = data_movement_parts_by_number(source) else {
+        return false;
+    };
+    let Some(target_parts) = data_movement_parts_by_number(target) else {
+        return false;
+    };
+
+    source_parts.iter().all(|(number, source_part)| {
+        target_parts
+            .get(number)
+            .is_some_and(|target_part| is_equivalent_data_movement_part(source_part, target_part))
+    })
+}
+
 fn is_equivalent_data_movement_object(source: &ObjectInfo, target: &ObjectInfo) -> bool {
     source.version_id == target.version_id
         && source.delete_marker == target.delete_marker
@@ -287,12 +317,7 @@ fn is_equivalent_data_movement_object(source: &ObjectInfo, target: &ObjectInfo) 
         && source.replication_status == target.replication_status
         && source.version_purge_status_internal == target.version_purge_status_internal
         && source.version_purge_status == target.version_purge_status
-        && source.parts.len() == target.parts.len()
-        && source
-            .parts
-            .iter()
-            .zip(target.parts.iter())
-            .all(|(source_part, target_part)| is_equivalent_data_movement_part(source_part, target_part))
+        && are_equivalent_data_movement_parts(&source.parts, &target.parts)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1568,6 +1593,44 @@ mod tests {
         let mut target = source.clone();
         let mut parts = target.parts.as_ref().clone();
         parts[0].checksums = None;
+        target.parts = Arc::new(parts);
+
+        assert!(!overwrite_resume_for_target(&source, target));
+    }
+
+    fn overwrite_equivalence_source_with_two_parts() -> ObjectInfo {
+        let source = overwrite_equivalence_source();
+        let mut parts = source.parts.as_ref().clone();
+        let mut second_part = parts[0].clone();
+        second_part.number = 2;
+        second_part.etag = "part-etag-2".to_string();
+        second_part.index = Some(Bytes::from_static(&[4, 5, 6]));
+        second_part.checksums = Some(HashMap::from([(ChecksumType::CRC32C.to_string(), "part-checksum-2".to_string())]));
+        parts.push(second_part);
+
+        ObjectInfo {
+            parts: Arc::new(parts),
+            ..source
+        }
+    }
+
+    #[test]
+    fn test_data_movement_overwrite_resume_accepts_parts_reordered_by_number() {
+        let source = overwrite_equivalence_source_with_two_parts();
+        let mut target = source.clone();
+        let mut parts = target.parts.as_ref().clone();
+        parts.reverse();
+        target.parts = Arc::new(parts);
+
+        assert!(overwrite_resume_for_target(&source, target));
+    }
+
+    #[test]
+    fn test_data_movement_overwrite_resume_rejects_duplicate_part_number() {
+        let source = overwrite_equivalence_source_with_two_parts();
+        let mut target = source.clone();
+        let mut parts = target.parts.as_ref().clone();
+        parts[1].number = parts[0].number;
         target.parts = Arc::new(parts);
 
         assert!(!overwrite_resume_for_target(&source, target));
