@@ -865,24 +865,20 @@ impl ECStore {
 
     #[tracing::instrument(skip_all)]
     pub async fn update_rebalance_stats(&self) -> Result<()> {
-        let mut ok = false;
+        let pool_count = self.pools.len();
+        let meta_to_save = {
+            let mut rebalance_meta = self.rebalance_meta.write().await;
+            let pool_stats = clone_rebalance_pool_stats(rebalance_meta.as_ref())?;
 
-        let pool_stats = {
-            let rebalance_meta = self.rebalance_meta.read().await;
-            clone_rebalance_pool_stats(rebalance_meta.as_ref())?
-        };
+            debug!(
+                event = EVENT_REBALANCE_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                pool_count = pool_stats.len(),
+                "Refreshing rebalance stats snapshot"
+            );
 
-        debug!(
-            event = EVENT_REBALANCE_STATE,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_REBALANCE,
-            pool_count = pool_stats.len(),
-            "Refreshing rebalance stats snapshot"
-        );
-
-        for i in 0..self.pools.len() {
-            if pool_stats.get(i).is_none() {
-                let mut rebalance_meta = self.rebalance_meta.write().await;
+            for i in pool_stats.len()..pool_count {
                 debug!(
                     event = EVENT_REBALANCE_STATE,
                     component = LOG_COMPONENT_ECSTORE,
@@ -891,15 +887,12 @@ impl ECStore {
                     state = "pool_stat_missing",
                     "Adding missing rebalance pool stats entry"
                 );
-                if let Some(meta) = rebalance_meta.as_mut() {
-                    meta.pool_stats.push(RebalanceStats::default());
-                }
-                ok = true;
-                drop(rebalance_meta);
             }
-        }
 
-        if ok {
+            refresh_missing_rebalance_pool_stats(rebalance_meta.as_mut(), pool_count)?
+        };
+
+        if let Some(meta_to_save) = meta_to_save {
             debug!(
                 event = EVENT_REBALANCE_STATE,
                 component = LOG_COMPONENT_ECSTORE,
@@ -908,15 +901,12 @@ impl ECStore {
                 "Saving rebalance metadata after stats refresh"
             );
 
-            let rebalance_meta = self.rebalance_meta.read().await;
-            if let Some(meta) = rebalance_meta.as_ref() {
-                let pool = clone_first_arc(&self.pools, "update_rebalance_stats: no pools available")?;
-                resolve_rebalance_meta_save_result(
-                    self.save_rebalance_meta_with_merge(pool, meta, "update_rebalance_stats")
-                        .await,
-                    "update_rebalance_stats",
-                )?;
-            }
+            let pool = clone_first_arc(&self.pools, "update_rebalance_stats: no pools available")?;
+            resolve_rebalance_meta_save_result(
+                self.save_rebalance_meta_with_merge(pool, &meta_to_save, "update_rebalance_stats")
+                    .await,
+                "update_rebalance_stats",
+            )?;
         }
 
         Ok(())
@@ -1772,6 +1762,23 @@ fn clone_rebalance_pool_stats(meta: Option<&RebalanceMeta>) -> Result<Vec<Rebala
         return Err(rebalance_metadata_not_initialized_error("clone rebalance pool stats"));
     };
     Ok(meta.pool_stats.clone())
+}
+
+fn refresh_missing_rebalance_pool_stats(meta: Option<&mut RebalanceMeta>, pool_count: usize) -> Result<Option<RebalanceMeta>> {
+    let Some(meta) = meta else {
+        return Err(rebalance_metadata_not_initialized_error("refresh rebalance pool stats"));
+    };
+
+    if meta.pool_stats.len() >= pool_count {
+        return Ok(None);
+    }
+
+    meta.pool_stats.reserve(pool_count.saturating_sub(meta.pool_stats.len()));
+    while meta.pool_stats.len() < pool_count {
+        meta.pool_stats.push(RebalanceStats::default());
+    }
+
+    Ok(Some(meta.clone()))
 }
 
 fn should_accept_rebalance_stats_update(meta: &RebalanceMeta, pool_index: usize) -> bool {
@@ -3456,8 +3463,9 @@ mod rebalance_unit_tests {
         migrate_entry_version_with_retry_wait, next_rebal_bucket_from_stat, parse_rebalance_max_attempts,
         rebalance_delete_marker_opts, rebalance_listing_retry_delay, rebalance_meta_load_no_data_error,
         rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error, rebalance_migration_retry_delay,
-        record_rebalance_cleanup_warning_in_meta, resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket,
-        resolve_rebalance_bucket_error, resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
+        record_rebalance_cleanup_warning_in_meta, refresh_missing_rebalance_pool_stats,
+        resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket, resolve_rebalance_bucket_error,
+        resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
         resolve_rebalance_file_info_versions_result, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
         resolve_rebalance_migrate_result_error, resolve_rebalance_optional_bucket_config_result, resolve_rebalance_participants,
         resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error,
@@ -6357,6 +6365,43 @@ mod rebalance_unit_tests {
 
         let stats = clone_rebalance_pool_stats(Some(&meta)).expect("metadata should clone pool stats");
         assert_eq!(stats.len(), 1);
+    }
+
+    #[test]
+    fn test_update_rebalance_stats_refresh_helper_returns_save_snapshot_when_extended() {
+        let mut meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats::default()],
+            ..Default::default()
+        };
+
+        let snapshot = refresh_missing_rebalance_pool_stats(Some(&mut meta), 3)
+            .expect("refresh should succeed")
+            .expect("extended metadata should be saved");
+
+        assert_eq!(meta.pool_stats.len(), 3);
+        assert_eq!(snapshot.pool_stats.len(), 3);
+    }
+
+    #[test]
+    fn test_update_rebalance_stats_refresh_helper_skips_save_when_complete() {
+        let mut meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats::default(), RebalanceStats::default()],
+            ..Default::default()
+        };
+
+        let snapshot = refresh_missing_rebalance_pool_stats(Some(&mut meta), 2).expect("refresh should succeed");
+
+        assert!(snapshot.is_none());
+        assert_eq!(meta.pool_stats.len(), 2);
+    }
+
+    #[test]
+    fn test_update_rebalance_stats_refresh_helper_rejects_missing_meta() {
+        let err = refresh_missing_rebalance_pool_stats(None, 1).expect_err("missing rebalance meta should fail");
+        assert!(
+            err.to_string()
+                .contains("failed to refresh rebalance pool stats: rebalance metadata not initialized")
+        );
     }
 
     #[test]

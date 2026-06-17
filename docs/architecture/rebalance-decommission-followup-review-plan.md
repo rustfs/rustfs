@@ -1082,9 +1082,9 @@ Do not combine this with R13 unless the same helper naturally covers both paths 
 
 ### Implementation Steps
 
-- [ ] Add a regression test or helper-level assertion showing `update_rebalance_stats()` saves after cloning metadata outside the guard.
-- [ ] Refactor `update_rebalance_stats()` so no `rebalance_meta` read guard is held across async save.
-- [ ] Run:
+- [x] Add a regression test or helper-level assertion showing `update_rebalance_stats()` saves after cloning metadata outside the guard.
+- [x] Refactor `update_rebalance_stats()` so no `rebalance_meta` read guard is held across async save.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs-ecstore update_rebalance_stats --lib
