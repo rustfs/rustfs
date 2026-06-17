@@ -14,6 +14,7 @@
 
 use rustfs_ecstore::bucket::quota::QuotaError;
 use rustfs_ecstore::error::StorageError;
+use rustfs_storage_api::HTTPRangeError;
 use s3s::{S3Error, S3ErrorCode};
 
 #[derive(Debug)]
@@ -277,6 +278,16 @@ impl From<StorageError> for ApiError {
         ApiError {
             code,
             message,
+            source: Some(Box::new(err)),
+        }
+    }
+}
+
+impl From<HTTPRangeError> for ApiError {
+    fn from(err: HTTPRangeError) -> Self {
+        ApiError {
+            code: S3ErrorCode::InvalidRange,
+            message: err.to_string(),
             source: Some(Box::new(err)),
         }
     }

@@ -23,11 +23,11 @@ use crate::global::get_global_endpoints;
 use crate::pools::ListCallback;
 use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
 use crate::store::ECStore;
-use crate::store_api::{GetObjectReader, HTTPRangeSpec, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions};
+use crate::store_api::{GetObjectReader, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions};
 use http::HeaderMap;
 use rand::RngExt as _;
 use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
-use rustfs_storage_api::StorageAdminApi;
+use rustfs_storage_api::{HTTPRangeSpec, StorageAdminApi};
 use rustfs_utils::path::encode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -3167,10 +3167,10 @@ mod rebalance_unit_tests {
     use super::percent_free_ratio;
     use super::rebalance_goal_reached;
     use super::{
-        DiskError, GetObjectReader, HTTPRangeSpec, MigrationBackend, MigrationVersionResult, ObjectInfo, ObjectOptions,
-        RebalSaveOpt, RebalStatus, RebalanceBucketOutcome, RebalanceCleanupWarnings, RebalanceEntryOutcome, RebalanceInfo,
-        RebalanceMeta, RebalanceStats, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event,
-        apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
+        DiskError, GetObjectReader, MigrationBackend, MigrationVersionResult, ObjectInfo, ObjectOptions, RebalSaveOpt,
+        RebalStatus, RebalanceBucketOutcome, RebalanceCleanupWarnings, RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta,
+        RebalanceStats, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event, apply_stopped_at,
+        classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
         complete_rebalance_pools_at_goal, complete_rebalance_pools_with_empty_queue, defer_bucket_in_rebalance_queue,
         ensure_rebalance_listing_disks_available, ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index,
         has_deferred_rebalance_error, is_rebalance_stopped_terminal_event, is_transient_rebalance_error,
@@ -3197,6 +3197,7 @@ mod rebalance_unit_tests {
     use rustfs_filemeta::FileInfo;
     use rustfs_filemeta::TRANSITION_COMPLETE;
     use rustfs_rio::Index;
+    use rustfs_storage_api::HTTPRangeSpec;
     use s3s::dto::ReplicationConfiguration;
     use serde::Serialize;
     use std::io::Cursor;

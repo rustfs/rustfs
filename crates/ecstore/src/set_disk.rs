@@ -52,8 +52,8 @@ use crate::{
     event_notification::{EventArgs, send_event},
     global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id, is_dist_erasure},
     store_api::{
-        DeletedObject, GetObjectReader, HTTPRangeSpec, HealOperations, ListObjectsV2Info, ListOperations, MultipartOperations,
-        NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, PutObjReader,
+        DeletedObject, GetObjectReader, HealOperations, ListObjectsV2Info, ListOperations, MultipartOperations, NamespaceLocking,
+        ObjectIO, ObjectInfo, ObjectOperations, PutObjReader,
     },
     store_init::load_format_erasure,
 };
@@ -85,6 +85,7 @@ use rustfs_object_capacity::capacity_scope::{
     CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope,
 };
 use rustfs_s3_types::EventName;
+use rustfs_storage_api::HTTPRangeSpec;
 use rustfs_storage_api::{
     BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, ListMultipartsInfo, ListPartsInfo,
     MakeBucketOptions, MultipartInfo, MultipartUploadResult, PartInfo,

@@ -5,17 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-object-option-contracts`
-- Baseline: `origin/main` at `8d24d9133b31c0ca0de0fcd16ad06cd2fdc6f7ae`
+- Branch: `overtrue/arch-range-contracts`
+- Baseline: `overtrue/arch-object-option-contracts` at `5328e10a0f0cdda9cc17089956e17432f2875962`
+  over `origin/main` at `a9aba323c6512e6b99c3137258b97b6058075ce9`
 - PR type for this branch: `api-extraction`
 - Runtime behavior changes: no external behavior change expected.
-- Rust code changes: move the pure `CompletePart`, `HTTPPreconditions`, and
-  `ObjectLockRetentionOptions` helper contracts from ECStore `store_api` into
-  `rustfs-storage-api`, then migrate in-repo consumers to the shared contract
-  path.
-- CI/script changes: extend migration guards for multipart/object helper public
-  re-exports and reject restoring the old ECStore-owned helper definitions.
-- Docs changes: record the object helper contract extraction slice.
+- Rust code changes: move the pure `HTTPRangeSpec` range contract and
+  `HTTPRangeError` into `rustfs-storage-api`, then keep ECStore object-info
+  adaptation at the ECStore boundary.
+- CI/script changes: extend migration guards for range helper public re-exports
+  and reject restoring the old ECStore-owned range helper definitions.
+- Docs changes: record the range contract extraction slice.
 
 ## Phase 0 Tasks
 
@@ -553,6 +553,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     ECStore keeps `ObjectOptions`, `ObjectInfo`, list contracts, readers,
     lifecycle/replication/rio/filemeta coupling, errors, and implementation
     bodies.
+  - Verification: focused storage-api/ECStore/RustFS/downstream compile checks,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, and
+    required three-expert review passed.
+
+- [x] `API-016` Move HTTP range helper contracts.
+  - Completed slice: move `HTTPRangeSpec` and `HTTPRangeError` from ECStore
+    `store_api/readers.rs` into `rustfs-storage-api`; keep `ObjectInfo` part
+    adaptation in ECStore and migrate RustFS, ECStore, Swift, scanner, and
+    S3-select consumers to import the shared range contract directly.
+  - Acceptance: `rustfs-storage-api` exports the range helper contracts,
+    in-repo consumers no longer use the old `rustfs_ecstore::store_api` path
+    for `HTTPRangeSpec`, and migration guards reject restoring old ECStore
+    definitions or public re-exports.
+  - Must preserve: S3 range semantics, suffix ranges, multipart part-range
+    boundaries, SSE/rio/compressed range planning, Swift/S3-select reads, and
+    ECStore-owned object-info/filemeta adaptation.
+  - Risk defense: only pure range contract behavior crosses into
+    `rustfs-storage-api`; ECStore keeps readers, `ObjectInfo`, part plaintext
+    size selection, encryption/compression planning, lifecycle/replication/rio
+    coupling, and storage implementation bodies.
   - Verification: focused storage-api/ECStore/RustFS/downstream compile checks,
     migration/layer guards, formatting, diff hygiene, Rust risk scan, and
     required three-expert review passed.

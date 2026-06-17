@@ -63,8 +63,8 @@ use crate::{
     rpc::S3PeerSys,
     sets::Sets,
     store_api::{
-        DeletedObject, GetObjectReader, HTTPRangeSpec, HealOperations, ListObjectsV2Info, ListOperations, MultipartOperations,
-        NamespaceLocking, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader,
+        DeletedObject, GetObjectReader, HealOperations, ListObjectsV2Info, ListOperations, MultipartOperations, NamespaceLocking,
+        ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader,
     },
     store_init,
 };
@@ -78,6 +78,7 @@ use rustfs_config::server_config::{Config, get_global_server_config, set_global_
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::{LocalClient, LockClient, NamespaceLockWrapper};
 use rustfs_madmin::heal_commands::HealResultItem;
+use rustfs_storage_api::HTTPRangeSpec;
 use rustfs_storage_api::{
     BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, ListMultipartsInfo, ListPartsInfo,
     MakeBucketOptions, MultipartInfo, MultipartUploadResult, PartInfo,
