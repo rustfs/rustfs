@@ -20,6 +20,7 @@ Each plan below should be reviewed and executed independently unless the plan ex
 | `rebalance-decommission-phase1-safety-plan.md` | F01, F02, F03, F04, F05 | Drafted | Protect object-version semantics and cluster operation safety |
 | `rebalance-decommission-phase2-data-movement-plan.md` | F06, F07, F08, F09, F10 | Drafted | Stream multipart migration, preserve metadata, and improve convergence |
 | `rebalance-decommission-phase3-hardening-plan.md` | F11, F12, F13, F14 | Drafted | Improve cleanup reporting, auditability, metadata decoding, and threshold docs |
+| `rebalance-decommission-followup-review-plan.md` | R01-R11 | Drafted | Close post-implementation review gaps found after F01-F14 |
 
 ## Execution Recommendation
 
@@ -37,6 +38,8 @@ For a long-running implementation task, use the phase plans as checkpoints:
 2. Run the focused tests listed in that block.
 3. Review the diff before moving to the next fix block.
 4. Run the phase-level test matrix before considering the phase complete.
+
+After the initial F01-F14 implementation pass, continue with `rebalance-decommission-followup-review-plan.md`. That follow-up plan is ordered by remaining risk and should be executed before treating the remediation as complete.
 
 ## Upstream Change Impact Notes
 
