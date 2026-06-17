@@ -69,6 +69,7 @@ pub(crate) const TABLE_RESOURCE_MARKER_VERSION: u16 = 1;
 pub(crate) const TABLE_METADATA_POINTER_VERSION: u16 = 1;
 pub(crate) const TABLE_CATALOG_ENTRY_VERSION: u16 = 1;
 pub(crate) const TABLE_MAINTENANCE_CONFIG_VERSION: u16 = 1;
+pub(crate) const TABLE_EXTERNAL_CATALOG_BRIDGE_VERSION: u16 = 1;
 pub(crate) const TABLE_METADATA_FILE_NAME_MAX_LEN: usize = 128;
 pub const TABLE_RESERVED_PREFIX: &str = BUCKET_TABLE_RESERVED_PREFIX;
 const WAREHOUSE_ROOT: &str = "warehouses";
@@ -90,6 +91,8 @@ const INTERNAL_CATALOG_ROOT: &str = BUCKET_TABLE_CATALOG_META_PREFIX;
 const TABLE_BUCKET_ROOT: &str = BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX;
 const COMMIT_LOG_ROOT: &str = "commits";
 const COMMIT_IDEMPOTENCY_ROOT: &str = "commit-idempotency";
+const EXTERNAL_CATALOG_ROOT: &str = "external-catalog";
+const EXTERNAL_CATALOG_BRIDGE_FILE: &str = "bridge.json";
 const MAINTENANCE_ROOT: &str = "maintenance";
 const MAINTENANCE_CONFIG_FILE: &str = "config.json";
 const MAINTENANCE_JOB_ROOT: &str = "jobs";
@@ -363,6 +366,32 @@ pub(crate) struct TableCommitRequest {
 pub(crate) struct TableCommitResult {
     pub table: TableEntry,
     pub commit_log: CommitLogEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExternalCatalogBridgeEntry {
+    pub version: u16,
+    pub table_bucket: String,
+    pub namespace: String,
+    pub table: String,
+    pub catalog: String,
+    pub external_catalog_id: Option<String>,
+    pub external_namespace: String,
+    pub external_table: String,
+    pub external_table_uuid: Option<String>,
+    pub metadata_location: Option<String>,
+    pub external_version_token: Option<String>,
+    pub policy_mode: String,
+    pub credential_mode: String,
+    pub sync_mode: String,
+    pub rollback_strategy: String,
+    pub last_sync_status: Option<String>,
+    pub last_synced_metadata_location: Option<String>,
+    #[serde(default)]
+    pub properties: BTreeMap<String, String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1223,6 +1252,14 @@ impl TableCatalogObjectPaths {
         )
     }
 
+    pub fn external_catalog_bridge_path(&self, table_bucket: &str, namespace: &Namespace, table: &IdentifierSegment) -> String {
+        format!(
+            "{}{}/{EXTERNAL_CATALOG_ROOT}/{EXTERNAL_CATALOG_BRIDGE_FILE}",
+            self.table_entries_prefix(table_bucket, namespace),
+            table.as_str()
+        )
+    }
+
     pub fn view_entries_prefix(&self, table_bucket: &str, namespace: &Namespace) -> String {
         format!("{}{}/{}/", self.namespace_entries_prefix(table_bucket), namespace.storage_id(), VIEW_ROOT)
     }
@@ -1523,6 +1560,50 @@ where
         let view_path = self.paths.view_entry_path(&entry.table_bucket, &namespace, &view);
         self.write_entry(self.catalog_bucket(), &view_path, &entry, precondition)
             .await
+    }
+
+    pub(crate) async fn get_external_catalog_bridge(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<Option<ExternalCatalogBridgeEntry>> {
+        self.require_table_bucket(table_bucket).await?;
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        if self.get_namespace(table_bucket, &namespace.public_name()).await?.is_none() {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "namespace {}/{}",
+                table_bucket,
+                namespace.public_name()
+            )));
+        }
+        let bridge_path = self.paths.external_catalog_bridge_path(table_bucket, &namespace, &table);
+        self.read_entry::<ExternalCatalogBridgeEntry>(self.catalog_bucket(), &bridge_path)
+            .await
+            .map(|entry| entry.map(|(bridge, _)| bridge))
+    }
+
+    pub(crate) async fn put_external_catalog_bridge(
+        &self,
+        entry: ExternalCatalogBridgeEntry,
+    ) -> TableCatalogStoreResult<ExternalCatalogBridgeEntry> {
+        validate_catalog_entry_version("external catalog bridge", entry.version)?;
+        self.require_table_bucket(&entry.table_bucket).await?;
+        let namespace = parse_namespace_for_store(&entry.namespace)?;
+        let table = parse_table_for_store(&entry.table)?;
+        if self.get_namespace(&entry.table_bucket, &entry.namespace).await?.is_none() {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "namespace {}/{}",
+                entry.table_bucket, entry.namespace
+            )));
+        }
+        let bridge_path = self
+            .paths
+            .external_catalog_bridge_path(&entry.table_bucket, &namespace, &table);
+        self.write_entry(self.catalog_bucket(), &bridge_path, &entry, TableCatalogPutPrecondition::Any)
+            .await?;
+        Ok(entry)
     }
 
     async fn read_commit_by_path(&self, object: &str) -> TableCatalogStoreResult<Option<CommitLogEntry>> {
