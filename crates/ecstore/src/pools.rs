@@ -1468,6 +1468,13 @@ fn decommission_remote_tiered_opts(
     }
 }
 
+fn lifecycle_action_removes_data_movement_version(action: IlmAction) -> bool {
+    matches!(
+        action,
+        IlmAction::DeleteVersionAction | IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn should_skip_lifecycle_for_data_movement(
     store: Arc<ECStore>,
@@ -1494,10 +1501,7 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
             }
             false
         }
-        IlmAction::DeleteAction
-        | IlmAction::DeleteVersionAction
-        | IlmAction::DeleteAllVersionsAction
-        | IlmAction::DelMarkerDeleteAllVersionsAction => {
+        action if lifecycle_action_removes_data_movement_version(action) => {
             if apply_actions {
                 let _ = apply_expiry_rule(&event, event_source, &object_info).await;
             }
@@ -3054,6 +3058,20 @@ mod tests {
         assert_eq!(decommission_remaining_version_count(1, 0), 1);
         assert_eq!(decommission_remaining_version_count(2, 1), 1);
         assert_eq!(decommission_remaining_version_count(1, 1), 0);
+    }
+
+    #[test]
+    fn lifecycle_action_removes_data_movement_version_rejects_delete_marker_action() {
+        assert!(!lifecycle_action_removes_data_movement_version(IlmAction::DeleteAction));
+    }
+
+    #[test]
+    fn lifecycle_action_removes_data_movement_version_accepts_version_delete_actions() {
+        assert!(lifecycle_action_removes_data_movement_version(IlmAction::DeleteVersionAction));
+        assert!(lifecycle_action_removes_data_movement_version(IlmAction::DeleteAllVersionsAction));
+        assert!(lifecycle_action_removes_data_movement_version(
+            IlmAction::DelMarkerDeleteAllVersionsAction
+        ));
     }
 
     #[test]
