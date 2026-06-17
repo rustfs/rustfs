@@ -54,7 +54,47 @@ pub struct QueryPoolStatusRequest {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct AdminPoolListItem {
+pub struct AdminPoolDecommissionInfo {
+    #[serde(rename = "startTime", with = "time::serde::rfc3339::option")]
+    pub start_time: Option<time::OffsetDateTime>,
+    #[serde(rename = "startSize")]
+    pub start_size: usize,
+    #[serde(rename = "totalSize")]
+    pub total_size: usize,
+    #[serde(rename = "currentSize")]
+    pub current_size: usize,
+    #[serde(rename = "complete")]
+    pub complete: bool,
+    #[serde(rename = "failed")]
+    pub failed: bool,
+    #[serde(rename = "canceled")]
+    pub canceled: bool,
+    #[serde(rename = "queued")]
+    pub queued: bool,
+    #[serde(rename = "queuedBuckets")]
+    pub queued_buckets: Vec<String>,
+    #[serde(rename = "decommissionedBuckets")]
+    pub decommissioned_buckets: Vec<String>,
+    #[serde(rename = "bucket")]
+    pub bucket: String,
+    #[serde(rename = "prefix")]
+    pub prefix: String,
+    #[serde(rename = "object")]
+    pub object: String,
+    #[serde(rename = "objectsDecommissioned")]
+    pub items_decommissioned: usize,
+    #[serde(rename = "objectsDecommissionedFailed")]
+    pub items_decommission_failed: usize,
+    #[serde(rename = "bytesDecommissioned")]
+    pub bytes_done: usize,
+    #[serde(rename = "bytesDecommissionedFailed")]
+    pub bytes_failed: usize,
+    #[serde(rename = "waitingReason")]
+    pub waiting_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AdminPoolStatus {
     #[serde(rename = "id")]
     pub id: usize,
     #[serde(rename = "cmdline")]
@@ -72,8 +112,10 @@ pub struct AdminPoolListItem {
     #[serde(rename = "status")]
     pub status: String,
     #[serde(rename = "decommissionInfo")]
-    pub decommission: Option<PoolDecommissionInfo>,
+    pub decommission: Option<AdminPoolDecommissionInfo>,
 }
+
+pub type AdminPoolListItem = AdminPoolStatus;
 
 #[derive(Clone, Default)]
 pub struct DefaultAdminUsecase {
@@ -85,6 +127,7 @@ impl DefaultAdminUsecase {
     const POOL_STATUS_CANCELED: &'static str = "canceled";
     const POOL_STATUS_COMPLETE: &'static str = "complete";
     const POOL_STATUS_FAILED: &'static str = "failed";
+    const POOL_STATUS_QUEUED: &'static str = "queued";
     const POOL_STATUS_RUNNING: &'static str = "running";
 
     #[cfg(test)]
@@ -238,7 +281,7 @@ impl DefaultAdminUsecase {
         Ok(pool_statuses.into_iter().map(Self::pool_list_item_from_status).collect())
     }
 
-    pub async fn execute_query_pool_status(&self, req: QueryPoolStatusRequest) -> AdminUsecaseResult<PoolStatus> {
+    pub async fn execute_query_pool_status(&self, req: QueryPoolStatusRequest) -> AdminUsecaseResult<AdminPoolStatus> {
         let Some(endpoints) = self.endpoints() else {
             return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
         };
@@ -263,7 +306,11 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
 
-        store.status(idx).await.map_err(ApiError::from)
+        store
+            .status(idx)
+            .await
+            .map(Self::pool_list_item_from_status)
+            .map_err(ApiError::from)
     }
 
     fn pool_list_item_from_status(status: PoolStatus) -> AdminPoolListItem {
@@ -277,7 +324,7 @@ impl DefaultAdminUsecase {
         let current_size = decommission.as_ref().map(|info| info.current_size).unwrap_or_default();
         let used_size = total_size.saturating_sub(current_size);
 
-        AdminPoolListItem {
+        AdminPoolStatus {
             id,
             cmd_line,
             last_update,
@@ -286,7 +333,7 @@ impl DefaultAdminUsecase {
             used_size,
             used: Self::used_ratio(total_size, used_size),
             status: Self::pool_list_status(decommission.as_ref()).to_string(),
-            decommission,
+            decommission: decommission.map(Self::admin_decommission_info_from_pool),
         }
     }
 
@@ -295,9 +342,44 @@ impl DefaultAdminUsecase {
             Some(info) if info.complete => Self::POOL_STATUS_COMPLETE,
             Some(info) if info.failed => Self::POOL_STATUS_FAILED,
             Some(info) if info.canceled => Self::POOL_STATUS_CANCELED,
+            Some(info) if info.queued => Self::POOL_STATUS_QUEUED,
             Some(info) if info.start_time.is_some() => Self::POOL_STATUS_RUNNING,
             _ => Self::POOL_STATUS_ACTIVE,
         }
+    }
+
+    fn admin_decommission_info_from_pool(info: PoolDecommissionInfo) -> AdminPoolDecommissionInfo {
+        let waiting_reason = Self::decommission_waiting_reason(&info).map(str::to_string);
+        AdminPoolDecommissionInfo {
+            start_time: info.start_time,
+            start_size: info.start_size,
+            total_size: info.total_size,
+            current_size: info.current_size,
+            complete: info.complete,
+            failed: info.failed,
+            canceled: info.canceled,
+            queued: info.queued,
+            queued_buckets: info.queued_buckets,
+            decommissioned_buckets: info.decommissioned_buckets,
+            bucket: info.bucket,
+            prefix: info.prefix,
+            object: info.object,
+            items_decommissioned: info.items_decommissioned,
+            items_decommission_failed: info.items_decommission_failed,
+            bytes_done: info.bytes_done,
+            bytes_failed: info.bytes_failed,
+            waiting_reason,
+        }
+    }
+
+    fn decommission_waiting_reason(info: &PoolDecommissionInfo) -> Option<&'static str> {
+        if info.complete || info.failed || info.canceled || info.start_time.is_some() {
+            return None;
+        }
+        if info.queued {
+            return Some("queued");
+        }
+        Some("waiting_for_worker")
     }
 
     fn used_ratio(total_size: usize, used_size: usize) -> f64 {
@@ -436,6 +518,45 @@ mod tests {
     }
 
     #[test]
+    fn admin_pool_list_item_exposes_queued_decommission_state() {
+        let item = DefaultAdminUsecase::pool_list_item_from_status(PoolStatus {
+            id: 3,
+            cmd_line: "pool-3".to_string(),
+            last_update: OffsetDateTime::UNIX_EPOCH,
+            decommission: Some(PoolDecommissionInfo {
+                queued: true,
+                queued_buckets: vec!["bucket-a".to_string(), ".rustfs.sys/config".to_string()],
+                decommissioned_buckets: vec!["bucket-done".to_string()],
+                bucket: "bucket-a".to_string(),
+                prefix: "prefix/".to_string(),
+                object: "object.txt".to_string(),
+                items_decommissioned: 7,
+                items_decommission_failed: 1,
+                bytes_done: 1024,
+                bytes_failed: 64,
+                ..Default::default()
+            }),
+        });
+
+        assert_eq!(item.status, "queued");
+        let value = serde_json::to_value(item).expect("admin pool status should serialize");
+        assert_eq!(value["decommissionInfo"]["queued"], true);
+        assert_eq!(
+            value["decommissionInfo"]["queuedBuckets"],
+            serde_json::json!(["bucket-a", ".rustfs.sys/config"])
+        );
+        assert_eq!(value["decommissionInfo"]["decommissionedBuckets"], serde_json::json!(["bucket-done"]));
+        assert_eq!(value["decommissionInfo"]["bucket"], "bucket-a");
+        assert_eq!(value["decommissionInfo"]["prefix"], "prefix/");
+        assert_eq!(value["decommissionInfo"]["object"], "object.txt");
+        assert_eq!(value["decommissionInfo"]["objectsDecommissioned"], 7);
+        assert_eq!(value["decommissionInfo"]["objectsDecommissionedFailed"], 1);
+        assert_eq!(value["decommissionInfo"]["bytesDecommissioned"], 1024);
+        assert_eq!(value["decommissionInfo"]["bytesDecommissionedFailed"], 64);
+        assert_eq!(value["decommissionInfo"]["waitingReason"], "queued");
+    }
+
+    #[test]
     fn admin_pool_list_item_maps_terminal_decommission_statuses() {
         let complete = DefaultAdminUsecase::pool_list_status(Some(&PoolDecommissionInfo {
             complete: true,
@@ -449,11 +570,16 @@ mod tests {
             canceled: true,
             ..Default::default()
         }));
+        let queued = DefaultAdminUsecase::pool_list_status(Some(&PoolDecommissionInfo {
+            queued: true,
+            ..Default::default()
+        }));
         let idle = DefaultAdminUsecase::pool_list_status(None);
 
         assert_eq!(complete, "complete");
         assert_eq!(failed, "failed");
         assert_eq!(canceled, "canceled");
+        assert_eq!(queued, "queued");
         assert_eq!(idle, "active");
     }
 }
