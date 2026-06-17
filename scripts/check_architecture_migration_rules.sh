@@ -54,6 +54,7 @@ STORE_API_BUCKET_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_bucket_dto_reexports.t
 STORE_API_BUCKET_OPERATION_HITS_FILE="${TMP_DIR}/store_api_bucket_operation_hits.txt"
 STORE_API_MULTIPART_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_multipart_dto_reexports.txt"
 STORE_API_OBJECT_HELPER_REEXPORTS_FILE="${TMP_DIR}/store_api_object_helper_reexports.txt"
+STORE_API_RANGE_HELPER_REEXPORTS_FILE="${TMP_DIR}/store_api_range_helper_reexports.txt"
 
 awk '
   /^## PR Types$/ {
@@ -192,7 +193,7 @@ require_source_line \
   "storage-api public multipart DTO re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
-  "pub use object::{HTTPPreconditions, ObjectLockRetentionOptions};" \
+  "pub use object::{HTTPPreconditions, HTTPRangeError, HTTPRangeSpec, ObjectLockRetentionOptions};" \
   "storage-api public object helper contract re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
@@ -240,12 +241,22 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api::\{[^}]*\b(?:HTTPPreconditions|ObjectLockRetentionOptions)\b|pub struct (?:HTTPPreconditions|ObjectLockRetentionOptions)\b' \
+  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:HTTPPreconditions|ObjectLockRetentionOptions)\b|::(?:HTTPPreconditions|ObjectLockRetentionOptions)\b)|pub struct (?:HTTPPreconditions|ObjectLockRetentionOptions)\b' \
     crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
 ) >"$STORE_API_OBJECT_HELPER_REEXPORTS_FILE"
 
 if [[ -s "$STORE_API_OBJECT_HELPER_REEXPORTS_FILE" ]]; then
   report_failure "old ecstore store_api object helper path reintroduced: $(paste -sd '; ' "$STORE_API_OBJECT_HELPER_REEXPORTS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:HTTPRangeError|HTTPRangeSpec)\b|::(?:HTTPRangeError|HTTPRangeSpec)\b)|pub (?:enum HTTPRangeError|struct HTTPRangeSpec)\b' \
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs crates/ecstore/src/store_api/readers.rs || true
+) >"$STORE_API_RANGE_HELPER_REEXPORTS_FILE"
+
+if [[ -s "$STORE_API_RANGE_HELPER_REEXPORTS_FILE" ]]; then
+  report_failure "old ecstore store_api range helper path reintroduced: $(paste -sd '; ' "$STORE_API_RANGE_HELPER_REEXPORTS_FILE")"
 fi
 
 require_source_contains \

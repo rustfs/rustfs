@@ -99,6 +99,10 @@ fn part_plaintext_size(part: &ObjectPartInfo) -> i64 {
     }
 }
 
+fn http_range_spec_from_object_info(oi: &ObjectInfo, part_number: usize) -> Option<HTTPRangeSpec> {
+    HTTPRangeSpec::from_part_sizes(oi.size, part_number, oi.parts.iter().map(part_plaintext_size))
+}
+
 fn restore_request_active(opts: &ObjectOptions) -> bool {
     let restore = &opts.transition.restore_request;
     restore.type_.is_some() || restore.days.is_some() || restore.output_location.is_some() || restore.select_parameters.is_some()
@@ -301,7 +305,7 @@ impl ReadPlan {
         if let Some(part_number) = opts.part_number
             && rs.is_none()
         {
-            rs = HTTPRangeSpec::from_object_info(oi, part_number);
+            rs = http_range_spec_from_object_info(oi, part_number);
         }
 
         let mut is_encrypted = oi.is_encrypted();
@@ -716,105 +720,6 @@ impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for SkipReader<R> {
         }
 
         Pin::new(&mut this.inner).poll_read(cx, buf)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct HTTPRangeSpec {
-    pub is_suffix_length: bool,
-    pub start: i64,
-    pub end: i64,
-}
-
-impl HTTPRangeSpec {
-    pub fn from_object_info(oi: &ObjectInfo, part_number: usize) -> Option<Self> {
-        if oi.size == 0 || oi.parts.is_empty() {
-            return None;
-        }
-
-        if part_number == 0 || part_number > oi.parts.len() {
-            return None;
-        }
-
-        let mut start = 0_i64;
-        let mut end = -1_i64;
-        for i in 0..part_number {
-            let part = &oi.parts[i];
-            start = end + 1;
-            end = start + part_plaintext_size(part) - 1;
-        }
-
-        Some(HTTPRangeSpec {
-            is_suffix_length: false,
-            start,
-            end,
-        })
-    }
-
-    pub fn get_offset_length(&self, res_size: i64) -> Result<(usize, i64)> {
-        let len = self.get_length(res_size)?;
-
-        let mut start = self.start;
-        if self.is_suffix_length {
-            let suffix_len = if self.start < 0 {
-                self.start
-                    .checked_neg()
-                    .ok_or_else(|| Error::InvalidRangeSpec("range value invalid: suffix length overflow".to_string()))?
-            } else {
-                self.start
-            };
-            start = res_size - suffix_len;
-            if start < 0 {
-                start = 0;
-            }
-        }
-        Ok((start as usize, len))
-    }
-    pub fn get_length(&self, res_size: i64) -> Result<i64> {
-        if res_size < 0 {
-            return Err(Error::InvalidRangeSpec("The requested range is not satisfiable".to_string()));
-        }
-
-        if self.is_suffix_length {
-            let specified_len = if self.start < 0 {
-                self.start
-                    .checked_neg()
-                    .ok_or_else(|| Error::InvalidRangeSpec("range value invalid: suffix length overflow".to_string()))?
-            } else {
-                self.start
-            };
-            let mut range_length = specified_len;
-
-            if specified_len > res_size {
-                range_length = res_size;
-            }
-
-            return Ok(range_length);
-        }
-
-        if self.start >= res_size {
-            return Err(Error::InvalidRangeSpec("The requested range is not satisfiable".to_string()));
-        }
-
-        if self.end > -1 {
-            let mut end = self.end;
-            if res_size <= end {
-                end = res_size - 1;
-            }
-
-            let range_length = end - self.start + 1;
-            return Ok(range_length);
-        }
-
-        if self.end == -1 {
-            let range_length = res_size - self.start;
-            return Ok(range_length);
-        }
-
-        Err(Error::InvalidRangeSpec(format!(
-            "range value invalid: start={}, end={}, expected start <= end and end >= -1",
-            self.start, self.end
-        )))
     }
 }
 
@@ -1818,12 +1723,12 @@ mod tests {
             ..Default::default()
         };
 
-        let spec = HTTPRangeSpec::from_object_info(&object_info, 2).unwrap();
+        let spec = http_range_spec_from_object_info(&object_info, 2).unwrap();
         assert_eq!(spec.start, 100);
         assert_eq!(spec.end, 199);
 
-        assert!(HTTPRangeSpec::from_object_info(&object_info, 0).is_none());
-        assert!(HTTPRangeSpec::from_object_info(&object_info, 4).is_none());
+        assert!(http_range_spec_from_object_info(&object_info, 0).is_none());
+        assert!(http_range_spec_from_object_info(&object_info, 4).is_none());
     }
 
     #[test]
@@ -1856,7 +1761,7 @@ mod tests {
             ..Default::default()
         };
 
-        let spec = HTTPRangeSpec::from_object_info(&object_info, 2).unwrap();
+        let spec = http_range_spec_from_object_info(&object_info, 2).unwrap();
         assert_eq!(spec.start, 30);
         assert_eq!(spec.end, 69);
     }
@@ -1891,7 +1796,7 @@ mod tests {
             ..Default::default()
         };
 
-        let spec = HTTPRangeSpec::from_object_info(&object_info, 3).unwrap();
+        let spec = http_range_spec_from_object_info(&object_info, 3).unwrap();
         assert_eq!(spec.start, 60);
         assert_eq!(spec.end, 99);
     }

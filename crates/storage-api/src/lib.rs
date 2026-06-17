@@ -24,4 +24,4 @@ pub use admin::{DiskSetSelector, StorageAdminApi};
 pub use bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};
 pub use error::{StorageErrorCode, StorageResult};
 pub use multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};
-pub use object::{HTTPPreconditions, ObjectLockRetentionOptions};
+pub use object::{HTTPPreconditions, HTTPRangeError, HTTPRangeSpec, ObjectLockRetentionOptions};

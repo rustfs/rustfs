@@ -28,7 +28,7 @@ use crate::{
     global::{GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_lock_clients, is_dist_erasure},
     set_disk::SetDisks,
     store_api::{
-        DeletedObject, GetObjectReader, HTTPRangeSpec, HealOperations, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
+        DeletedObject, GetObjectReader, HealOperations, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
         MultipartOperations, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete,
         PutObjReader,
     },
@@ -49,6 +49,7 @@ use rustfs_lock::NamespaceLockWrapper;
 use rustfs_lock::client::LockClient;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_storage_api::CompletePart;
+use rustfs_storage_api::HTTPRangeSpec;
 use rustfs_storage_api::{
     BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, ListMultipartsInfo, ListPartsInfo, MakeBucketOptions,
     MultipartInfo, MultipartUploadResult, PartInfo,

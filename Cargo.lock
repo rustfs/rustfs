@@ -9975,6 +9975,7 @@ dependencies = [
  "pin-project-lite",
  "rustfs-common",
  "rustfs-ecstore",
+ "rustfs-storage-api",
  "s3s",
  "serde_json",
  "snafu 0.9.1",
