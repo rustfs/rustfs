@@ -2561,6 +2561,8 @@ fn merge_rebalance_cleanup_warnings(remote: &mut RebalanceCleanupWarnings, local
     }
 
     merge_rebalance_cleanup_warning_entries(&mut remote.entries, &local.entries);
+    let retained_entries = u64::try_from(remote.entries.len()).unwrap_or(u64::MAX);
+    remote.count = remote.count.max(retained_entries);
 }
 
 fn merge_rebalance_cleanup_warning_entries(
@@ -4647,6 +4649,65 @@ mod rebalance_unit_tests {
         assert_eq!(remote.pool_stats[1].cleanup_warnings.last_at, Some(warning_at));
         assert_eq!(remote.pool_stats[1].cleanup_warnings.entries.len(), 1);
         assert_eq!(remote.pool_stats[1].cleanup_warnings.entries[0].object, "local-object");
+    }
+
+    #[test]
+    fn test_merge_rebalance_meta_normalizes_cleanup_warning_count_after_entry_merge() {
+        let remote_warning_at = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+        let local_warning_at = OffsetDateTime::from_unix_timestamp(2_000).unwrap();
+        let mut remote = RebalanceMeta {
+            id: "rebal-1".to_string(),
+            percent_free_goal: 0.5,
+            pool_stats: vec![RebalanceStats {
+                cleanup_warnings: RebalanceCleanupWarnings {
+                    count: 1,
+                    last_message: Some("remote cleanup failed".to_string()),
+                    last_bucket: Some("bucket-a".to_string()),
+                    last_object: Some("remote-object".to_string()),
+                    last_at: Some(remote_warning_at),
+                    entries: vec![RebalanceCleanupWarningEntry {
+                        bucket: "bucket-a".to_string(),
+                        object: "remote-object".to_string(),
+                        message: "remote cleanup failed".to_string(),
+                        timestamp: Some(remote_warning_at),
+                    }],
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let local = RebalanceMeta {
+            id: "rebal-1".to_string(),
+            percent_free_goal: 0.5,
+            pool_stats: vec![RebalanceStats {
+                cleanup_warnings: RebalanceCleanupWarnings {
+                    count: 1,
+                    last_message: Some("local cleanup failed".to_string()),
+                    last_bucket: Some("bucket-a".to_string()),
+                    last_object: Some("local-object".to_string()),
+                    last_at: Some(local_warning_at),
+                    entries: vec![RebalanceCleanupWarningEntry {
+                        bucket: "bucket-a".to_string(),
+                        object: "local-object".to_string(),
+                        message: "local cleanup failed".to_string(),
+                        timestamp: Some(local_warning_at),
+                    }],
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        merge_rebalance_meta(&mut remote, &local);
+
+        let warnings = &remote.pool_stats[0].cleanup_warnings;
+        assert_eq!(warnings.entries.len(), 2);
+        assert_eq!(warnings.count, 2);
+        assert_eq!(warnings.last_message.as_deref(), Some("local cleanup failed"));
+        let payload = rmp_serde::to_vec(&remote).expect("merged rebalance metadata should serialize");
+        let decoded = RebalanceMeta::decode_rebalance_meta_payload(payload.as_slice()).expect("merged metadata should decode");
+        assert_eq!(decoded.pool_stats[0].cleanup_warnings.count, 2);
+        assert_eq!(decoded.pool_stats[0].cleanup_warnings.entries.len(), 2);
     }
 
     #[test]
