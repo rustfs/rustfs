@@ -249,13 +249,17 @@ fn invalid_decommission_pool_index_error(pool_count: usize, idx: usize) -> Error
     Error::other(format!("invalid decommission pool index {idx} for {pool_count} pools"))
 }
 
-fn ensure_decommission_start_allowed(pool_present: bool, decommission_active: bool) -> Result<()> {
+fn ensure_decommission_start_allowed(pool_present: bool, decommission_active: bool, decommission_complete: bool) -> Result<()> {
     if !pool_present {
         return Err(Error::other("failed to start decommission: target pool was not found"));
     }
 
     if decommission_active {
         return Err(StorageError::DecommissionAlreadyRunning);
+    }
+
+    if decommission_complete {
+        return Err(Error::other("failed to start decommission: target pool decommission is already complete"));
     }
 
     Ok(())
@@ -493,15 +497,16 @@ fn should_cleanup_decommission_source_entry(decommissioned: usize, total_version
     decommissioned.saturating_add(expired) == total_versions
 }
 
-fn decommission_start_guard_state(pool: Option<&PoolStatus>) -> (bool, bool) {
+fn decommission_start_guard_state(pool: Option<&PoolStatus>) -> (bool, bool, bool) {
     if let Some(pool) = pool {
         let active = pool
             .decommission
             .as_ref()
             .is_some_and(|info| is_decommission_active(info.complete, info.failed, info.canceled));
-        (true, active)
+        let complete = pool.decommission.as_ref().is_some_and(|info| info.complete);
+        (true, active, complete)
     } else {
-        (false, false)
+        (false, false, false)
     }
 }
 
@@ -1131,7 +1136,8 @@ impl PoolMeta {
             .decommission
             .as_ref()
             .is_some_and(|info| is_decommission_active(info.complete, info.failed, info.canceled));
-        ensure_decommission_start_allowed(true, decommission_active)?;
+        let decommission_complete = pool.decommission.as_ref().is_some_and(|info| info.complete);
+        ensure_decommission_start_allowed(true, decommission_active, decommission_complete)?;
 
         let now = OffsetDateTime::now_utc();
         pool.last_update = now;
@@ -2890,8 +2896,9 @@ impl ECStore {
         {
             let pool_meta = self.pool_meta.read().await;
             for idx in indices.iter().copied() {
-                let (pool_present, decommission_active) = decommission_start_guard_state(pool_meta.pools.get(idx));
-                ensure_decommission_start_allowed(pool_present, decommission_active)?;
+                let (pool_present, decommission_active, decommission_complete) =
+                    decommission_start_guard_state(pool_meta.pools.get(idx));
+                ensure_decommission_start_allowed(pool_present, decommission_active, decommission_complete)?;
             }
         }
 
@@ -2930,8 +2937,9 @@ impl ECStore {
         let previous_pool_meta = {
             let mut pool_meta = self.pool_meta.write().await;
             for idx in indices.iter().copied() {
-                let (pool_present, decommission_active) = decommission_start_guard_state(pool_meta.pools.get(idx));
-                ensure_decommission_start_allowed(pool_present, decommission_active)?;
+                let (pool_present, decommission_active, decommission_complete) =
+                    decommission_start_guard_state(pool_meta.pools.get(idx));
+                ensure_decommission_start_allowed(pool_present, decommission_active, decommission_complete)?;
             }
 
             let previous_pool_meta = pool_meta.clone();
@@ -4246,13 +4254,13 @@ mod pools_tests {
         active.pools[0].decommission = Some(PoolDecommissionInfo::default());
 
         assert!(active.is_suspended(0));
-        let (_, decommission_active) = decommission_start_guard_state(active.pools.first());
+        let (_, decommission_active, _) = decommission_start_guard_state(active.pools.first());
         assert!(decommission_active);
 
         rollback_start_decommission_pool_meta(&mut active, previous);
 
         assert!(!active.is_suspended(0));
-        let (_, decommission_active) = decommission_start_guard_state(active.pools.first());
+        let (_, decommission_active, _) = decommission_start_guard_state(active.pools.first());
         assert!(!decommission_active);
     }
 
@@ -5133,7 +5141,7 @@ mod pools_tests {
 
     #[test]
     fn test_ensure_decommission_start_allowed_rejects_missing_pool() {
-        let err = ensure_decommission_start_allowed(false, false).expect_err("missing pool should be invalid");
+        let err = ensure_decommission_start_allowed(false, false, false).expect_err("missing pool should be invalid");
         assert!(
             err.to_string()
                 .contains("failed to start decommission: target pool was not found")
@@ -5142,18 +5150,24 @@ mod pools_tests {
 
     #[test]
     fn test_ensure_decommission_start_allowed_rejects_running_state() {
-        let err = ensure_decommission_start_allowed(true, true).expect_err("active decommission should be rejected");
+        let err = ensure_decommission_start_allowed(true, true, false).expect_err("active decommission should be rejected");
         assert!(matches!(err, Error::DecommissionAlreadyRunning));
     }
 
     #[test]
-    fn test_ensure_decommission_start_allowed_allows_terminal_state() {
-        assert!(ensure_decommission_start_allowed(true, false).is_ok());
+    fn test_ensure_decommission_start_allowed_rejects_completed_state() {
+        let err = ensure_decommission_start_allowed(true, false, true).expect_err("completed decommission should be rejected");
+        assert!(err.to_string().contains("target pool decommission is already complete"));
+    }
+
+    #[test]
+    fn test_ensure_decommission_start_allowed_allows_failed_or_canceled_state() {
+        assert!(ensure_decommission_start_allowed(true, false, false).is_ok());
     }
 
     #[test]
     fn test_decommission_start_guard_state_reports_missing_pool() {
-        assert_eq!(decommission_start_guard_state(None), (false, false));
+        assert_eq!(decommission_start_guard_state(None), (false, false, false));
     }
 
     #[test]
@@ -5165,7 +5179,7 @@ mod pools_tests {
             decommission: None,
         };
 
-        assert_eq!(decommission_start_guard_state(Some(&pool)), (true, false));
+        assert_eq!(decommission_start_guard_state(Some(&pool)), (true, false, false));
     }
 
     #[test]
@@ -5182,11 +5196,11 @@ mod pools_tests {
             }),
         };
 
-        assert_eq!(decommission_start_guard_state(Some(&pool)), (true, true));
+        assert_eq!(decommission_start_guard_state(Some(&pool)), (true, true, false));
     }
 
     #[test]
-    fn test_decommission_start_guard_state_reports_terminal_pool_as_not_active() {
+    fn test_decommission_start_guard_state_reports_canceled_pool_as_restartable() {
         let pool = PoolStatus {
             id: 0,
             cmd_line: "pool-0".to_string(),
@@ -5199,7 +5213,37 @@ mod pools_tests {
             }),
         };
 
-        assert_eq!(decommission_start_guard_state(Some(&pool)), (true, false));
+        assert_eq!(decommission_start_guard_state(Some(&pool)), (true, false, false));
+    }
+
+    #[test]
+    fn test_decommission_start_guard_state_reports_failed_pool_as_restartable() {
+        let pool = PoolStatus {
+            id: 0,
+            cmd_line: "pool-0".to_string(),
+            last_update: OffsetDateTime::UNIX_EPOCH,
+            decommission: Some(PoolDecommissionInfo {
+                failed: true,
+                ..Default::default()
+            }),
+        };
+
+        assert_eq!(decommission_start_guard_state(Some(&pool)), (true, false, false));
+    }
+
+    #[test]
+    fn test_decommission_start_guard_state_reports_completed_pool() {
+        let pool = PoolStatus {
+            id: 0,
+            cmd_line: "pool-0".to_string(),
+            last_update: OffsetDateTime::UNIX_EPOCH,
+            decommission: Some(PoolDecommissionInfo {
+                complete: true,
+                ..Default::default()
+            }),
+        };
+
+        assert_eq!(decommission_start_guard_state(Some(&pool)), (true, false, true));
     }
 
     #[test]
