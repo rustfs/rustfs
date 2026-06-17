@@ -4,6 +4,11 @@ use rustfs_storage_api::{
     VersionMarker, WalkVersionsSortOrder,
 };
 
+pub type ListObjectsInfo = rustfs_storage_api::ListObjectsInfo<ObjectInfo>;
+pub type ListObjectsV2Info = rustfs_storage_api::ListObjectsV2Info<ObjectInfo>;
+pub type ListObjectVersionsInfo = rustfs_storage_api::ListObjectVersionsInfo<ObjectInfo>;
+pub type ObjectInfoOrErr = rustfs_storage_api::ObjectInfoOrErr<ObjectInfo, Error>;
+
 #[derive(Debug, Default, Clone)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
@@ -708,50 +713,6 @@ fn versions_after_marker(file_infos: &rustfs_filemeta::FileInfoVersions, marker:
         .unwrap_or(&file_infos.versions)
 }
 
-#[derive(Debug, Default)]
-pub struct ListObjectsInfo {
-    // Indicates whether the returned list objects response is truncated. A
-    // value of true indicates that the list was truncated. The list can be truncated
-    // if the number of objects exceeds the limit allowed or specified
-    // by max keys.
-    pub is_truncated: bool,
-
-    // When response is truncated (the IsTruncated element value in the response
-    // is true), you can use the key name in this field as marker in the subsequent
-    // request to get next set of objects.
-    pub next_marker: Option<String>,
-
-    // List of objects info for this request.
-    pub objects: Vec<ObjectInfo>,
-
-    // List of prefixes for this request.
-    pub prefixes: Vec<String>,
-}
-
-#[derive(Debug, Default)]
-pub struct ListObjectsV2Info {
-    // Indicates whether the returned list objects response is truncated. A
-    // value of true indicates that the list was truncated. The list can be truncated
-    // if the number of objects exceeds the limit allowed or specified
-    // by max keys.
-    pub is_truncated: bool,
-
-    // When response is truncated (the IsTruncated element value in the response
-    // is true), you can use the key name in this field as marker in the subsequent
-    // request to get next set of objects.
-    //
-    // NOTE: This element is returned only if you have delimiter request parameter
-    // specified.
-    pub continuation_token: Option<String>,
-    pub next_continuation_token: Option<String>,
-
-    // List of objects info for this request.
-    pub objects: Vec<ObjectInfo>,
-
-    // List of prefixes for this request.
-    pub prefixes: Vec<String>,
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct ObjectToDelete {
     pub object_name: String,
@@ -805,15 +766,6 @@ impl DeletedObject {
     }
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct ListObjectVersionsInfo {
-    pub is_truncated: bool,
-    pub next_marker: Option<String>,
-    pub next_version_idmarker: Option<String>,
-    pub objects: Vec<ObjectInfo>,
-    pub prefixes: Vec<String>,
-}
-
 type WalkFilter = fn(&FileInfo) -> bool;
 
 #[derive(Clone, Default)]
@@ -825,12 +777,6 @@ pub struct WalkOptions {
     pub versions_sort: WalkVersionsSortOrder, // sort order for versions of the same object; default: Ascending order in ModTime
     pub limit: usize,                         // maximum number of items, 0 means no limit
     pub include_free_versions: bool,          // include persisted tier free-version cleanup records
-}
-
-#[derive(Debug)]
-pub struct ObjectInfoOrErr {
-    pub item: Option<ObjectInfo>,
-    pub err: Option<Error>,
 }
 
 #[cfg(test)]
