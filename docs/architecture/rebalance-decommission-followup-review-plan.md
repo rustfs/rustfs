@@ -1524,12 +1524,65 @@ Define whether RustFS should:
 2. Add a `rebalance.bin` namespace-lock guarded check/init/start path.
 3. Elect or require a single admin coordinator for distributed rebalance starts.
 
+### Design Draft
+
+Current R13 behavior provides a local start gate around check/init/start and
+prevents duplicate operation IDs on one coordinator process. It also preserves
+the existing rollback behavior when peer start propagation fails. The remaining
+race is distributed: two admin coordinators can still enter the local start gate
+on different nodes at nearly the same time, each observing no active local
+metadata before one of the writes wins the shared `rebalance.bin` merge.
+
+The stronger design option is to guard the rebalance start decision with the
+same namespace that persists `rebalance.bin`:
+
+1. Acquire a cluster-visible namespace lock for `rebalance.bin`.
+2. Reload the current persisted rebalance metadata while holding that lock.
+3. Reject start if the loaded metadata is active, stopping, stopped-but-not
+   terminally acknowledged, or conflicts with decommission metadata.
+4. Compute storage information and the new operation ID.
+5. Persist the new metadata before releasing the lock.
+6. After the lock is released, start the local worker and broadcast
+   `load_rebalance_meta(true)` to peers.
+
+The lock should cover only the metadata decision and write. Worker spawn and
+peer RPC fan-out should remain outside the lock so a slow or unreachable peer
+does not block other metadata readers longer than necessary.
+
+Failure semantics need explicit review before implementation:
+
+- If storage-info collection fails before the metadata write, return an error
+  without changing persisted state.
+- If the metadata save fails, return an error without spawning workers.
+- If local worker start fails after metadata save, mark the operation failed or
+  roll back the metadata under the same namespace lock before returning.
+- If peer start propagation fails after metadata save and local worker start,
+  use the existing R01 rollback path or a product-approved degraded-start state.
+- If rollback fails, status must expose the active/stale metadata and the peer
+  propagation failures.
+
+A stricter single-coordinator model is a separate option: only one elected admin
+coordinator may accept rebalance start requests, and non-coordinators forward or
+reject start attempts. That can simplify distributed races but adds availability
+and leader-election behavior outside the current remediation scope.
+
+Approval questions before code changes:
+
+- Is namespace-lock guarded start sufficient, or is a single admin coordinator
+  required for compatibility?
+- Should rebalance start reject when any peer cannot confirm current metadata
+  before the write, or only after the write during start propagation?
+- Should rollback keep the current R01 semantics, or should failed propagation
+  become a durable degraded state?
+- Which namespace lock implementation is authoritative for metadata objects
+  stored in internal buckets?
+
 ### Implementation Steps
 
-- [ ] Document the current R13 guarantee and the remaining distributed race model.
-- [ ] Propose the namespace-lock guarded start design with failure/rollback semantics.
-- [ ] Do not change start behavior until the design is approved.
-- [ ] Run:
+- [x] Document the current R13 guarantee and the remaining distributed race model.
+- [x] Propose the namespace-lock guarded start design with failure/rollback semantics.
+- [x] Do not change start behavior until the design is approved.
+- [x] Run:
 
 ```bash
 cargo fmt --all --check
