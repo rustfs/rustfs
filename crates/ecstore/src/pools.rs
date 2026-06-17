@@ -272,7 +272,7 @@ fn first_resumable_decommission_queue_indices(meta: &PoolMeta) -> Vec<usize> {
     let mut indices = Vec::new();
     for (idx, pool) in meta.pools.iter().enumerate() {
         if let Some(decommission) = &pool.decommission {
-            if decommission.complete || decommission.canceled {
+            if decommission.complete || decommission.failed || decommission.canceled {
                 continue;
             }
             indices.push(idx);
@@ -1553,9 +1553,10 @@ impl PoolMeta {
         let mut new_pools = Vec::new();
         for pool in &self.pools {
             if let Some(decommission) = &pool.decommission {
-                if decommission.complete || decommission.canceled {
+                if decommission.complete || decommission.failed || decommission.canceled {
                     // Recovery is not required when:
                     // - Decommissioning completed
+                    // - Decommissioning failed and must be explicitly restarted or cleared
                     // - Decommissioning was cancelled
                     continue;
                 }
@@ -6099,16 +6100,51 @@ mod pools_tests {
                 decommission_test_pool_status(
                     2,
                     Some(PoolDecommissionInfo {
+                        failed: true,
+                        ..Default::default()
+                    }),
+                ),
+                decommission_test_pool_status(
+                    3,
+                    Some(PoolDecommissionInfo {
                         queued: true,
                         ..Default::default()
                     }),
                 ),
-                decommission_test_pool_status(3, None),
+                decommission_test_pool_status(4, None),
             ],
             ..Default::default()
         };
 
-        assert_eq!(first_resumable_decommission_queue_indices(&meta), vec![2]);
+        assert_eq!(first_resumable_decommission_queue_indices(&meta), vec![3]);
+    }
+
+    #[test]
+    fn test_return_resumable_pools_skips_failed_decommission() {
+        let meta = PoolMeta {
+            pools: vec![
+                decommission_test_pool_status(
+                    0,
+                    Some(PoolDecommissionInfo {
+                        failed: true,
+                        ..Default::default()
+                    }),
+                ),
+                decommission_test_pool_status(
+                    1,
+                    Some(PoolDecommissionInfo {
+                        queued: true,
+                        ..Default::default()
+                    }),
+                ),
+            ],
+            ..Default::default()
+        };
+
+        let resumable = meta.return_resumable_pools();
+
+        assert_eq!(resumable.len(), 1);
+        assert_eq!(resumable[0].id, 1);
     }
 
     #[test]
