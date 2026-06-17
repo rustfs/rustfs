@@ -2169,7 +2169,7 @@ impl ObjectOperations for SetDisks {
         if let Some(err) = &gerr
             && goi.name.is_empty()
         {
-            if should_create_delete_marker_for_missing_object(&opts) {
+            if should_force_delete_marker_for_missing_version(&opts) {
                 version_found = false;
             } else {
                 return Err(err.clone());
@@ -2238,7 +2238,7 @@ impl ObjectOperations for SetDisks {
                 None
             };
 
-            self.delete_object_version(bucket, object, &fi, should_create_delete_marker_for_missing_object(&opts))
+            self.delete_object_version(bucket, object, &fi, should_force_delete_marker_for_missing_version(&opts))
                 .await
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
@@ -2798,7 +2798,7 @@ fn should_preserve_delete_replication_state(opts: &ObjectOptions) -> bool {
     }) || opts.version_purge_status() == VersionPurgeStatusType::Complete
 }
 
-fn should_create_delete_marker_for_missing_object(opts: &ObjectOptions) -> bool {
+fn should_force_delete_marker_for_missing_version(opts: &ObjectOptions) -> bool {
     opts.delete_marker || (opts.versioned && opts.version_id.is_none() && !opts.data_movement)
 }
 
@@ -5192,18 +5192,18 @@ mod tests {
     }
 
     #[test]
-    fn should_create_delete_marker_for_missing_object_rejects_data_movement_latest_delete() {
+    fn should_force_delete_marker_for_missing_version_rejects_data_movement_latest_delete() {
         let opts = ObjectOptions {
             versioned: true,
             data_movement: true,
             ..Default::default()
         };
 
-        assert!(!should_create_delete_marker_for_missing_object(&opts));
+        assert!(!should_force_delete_marker_for_missing_version(&opts));
     }
 
     #[test]
-    fn should_create_delete_marker_for_missing_object_allows_explicit_marker_creation() {
+    fn should_force_delete_marker_for_missing_version_allows_explicit_marker_creation() {
         let opts = ObjectOptions {
             versioned: true,
             data_movement: true,
@@ -5211,7 +5211,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(should_create_delete_marker_for_missing_object(&opts));
+        assert!(should_force_delete_marker_for_missing_version(&opts));
     }
 
     #[test]
