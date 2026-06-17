@@ -6247,6 +6247,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_file_info_versions_exact_returns_none_for_explicit_not_found() {
+        let format = FormatV3::new(1, 1);
+        let (temp_dir, endpoint, disk) = make_formatted_local_disk_for_info_test(0, &format).await;
+        let bucket = "bucket";
+
+        disk.make_volume(bucket).await.expect("bucket should be created");
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(vec![Some(disk)])),
+            1,
+            0,
+            0,
+            0,
+            vec![endpoint],
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        let versions = set_disks
+            .load_file_info_versions_exact(bucket, "missing-object")
+            .await
+            .expect("explicit object not found should be accepted");
+
+        assert!(versions.is_none());
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn load_file_info_versions_exact_rejects_corrupt_metadata() {
+        let format = FormatV3::new(1, 1);
+        let (temp_dir, endpoint, disk) = make_formatted_local_disk_for_info_test(0, &format).await;
+        let bucket = "bucket";
+        let object = "object.txt";
+
+        disk.make_volume(bucket).await.expect("bucket should be created");
+        let metadata_path = format!("{object}/{STORAGE_FORMAT_FILE}");
+        disk.write_all(bucket, &metadata_path, bytes::Bytes::from_static(b"not-xl-meta"))
+            .await
+            .expect("corrupt metadata file should be written");
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(vec![Some(disk)])),
+            1,
+            0,
+            0,
+            0,
+            vec![endpoint],
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        let err = set_disks
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect_err("corrupt exact metadata must fail closed");
+
+        assert!(!is_err_object_not_found(&err), "corrupt metadata must not be treated as not found: {err}");
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
     async fn list_path_still_uses_disk_after_prior_walk_timeout() {
         use std::pin::Pin;
         use std::task::{Context, Poll};

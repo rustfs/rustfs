@@ -18,11 +18,10 @@ use crate::store::ECStore;
 use crate::store_api::{
     CompletePart, GetObjectReader, MultipartOperations, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, PutObjReader,
 };
-use crate::store_list_objects::ListPathOptions;
 use bytes::Bytes;
 use rustfs_filemeta::{FileInfo, FileInfoVersions, ObjectPartInfo};
 use rustfs_rio::{ChecksumType, EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex};
-use rustfs_utils::path::{base_dir_from_prefix, encode_dir_object};
+use rustfs_utils::path::encode_dir_object;
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::{
@@ -31,13 +30,9 @@ use std::sync::{
 };
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, BufReader, ReadBuf};
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 type SharedDataMovementStream = Arc<Mutex<Box<dyn AsyncRead + Unpin + Send + Sync>>>;
-const SOURCE_CLEANUP_PREFLIGHT_LIST_LIMIT: usize = 16;
-const SOURCE_CLEANUP_PREFLIGHT_LIST_LIMIT_I32: i32 = 16;
 
 pub struct IndexedDataMovementReader<R> {
     inner: R,
@@ -399,55 +394,8 @@ async fn load_source_cleanup_versions(
     object: &str,
     op_label: &str,
 ) -> Result<Option<FileInfoVersions>> {
-    let mut opts = ListPathOptions {
-        bucket: bucket.to_owned(),
-        base_dir: base_dir_from_prefix(object),
-        prefix: object.to_owned(),
-        incl_deleted: true,
-        recursive: true,
-        versioned: true,
-        stop_disk_at_limit: true,
-        limit: SOURCE_CLEANUP_PREFLIGHT_LIST_LIMIT_I32,
-        ..Default::default()
-    };
-    opts.set_filter();
-
-    let (tx, mut rx) = mpsc::channel(SOURCE_CLEANUP_PREFLIGHT_LIST_LIMIT);
-    let cancel = CancellationToken::new();
-    let list_result = set.list_path(cancel.clone(), opts, tx);
-    tokio::pin!(list_result);
-
-    let mut found = None;
-    loop {
-        tokio::select! {
-            result = &mut list_result => {
-                result.map_err(|err| source_cleanup_preflight_error(op_label, bucket, object, err))?;
-                break;
-            }
-            entry = rx.recv() => {
-                let Some(entry) = entry else {
-                    break;
-                };
-                if entry.name == object {
-                    found = Some(entry);
-                }
-            }
-        }
-    }
-
-    while let Ok(entry) = rx.try_recv() {
-        if found.is_none() && entry.name == object {
-            found = Some(entry);
-        }
-    }
-
-    let Some(entry) = found else {
-        return Ok(None);
-    };
-
-    entry
-        .file_info_versions(bucket)
-        .map(Some)
+    set.load_file_info_versions_exact(bucket, object)
+        .await
         .map_err(|err| source_cleanup_preflight_error(op_label, bucket, object, err))
 }
 

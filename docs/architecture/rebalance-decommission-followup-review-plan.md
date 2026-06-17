@@ -1154,11 +1154,11 @@ Do not rely on prefix listing to prove exact object absence.
 
 ### Implementation Steps
 
-- [ ] Add an exact source metadata read helper that returns `Ok(None)` only for explicit object-not-found/version-not-found.
-- [ ] Replace the prefix-list based `load_source_cleanup_versions()` path with the exact helper.
-- [ ] Add a helper-level test that a miss from a non-exact source would fail closed instead of succeeding.
-- [ ] Add or update tests where explicit not-found remains idempotent.
-- [ ] Run:
+- [x] Add an exact source metadata read helper that returns `Ok(None)` only for explicit object-not-found/version-not-found.
+- [x] Replace the prefix-list based `load_source_cleanup_versions()` path with the exact helper.
+- [x] Add a helper-level test that a miss from a non-exact source would fail closed instead of succeeding.
+- [x] Add or update tests where explicit not-found remains idempotent.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs-ecstore source_cleanup --lib
