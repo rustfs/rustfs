@@ -49,7 +49,30 @@
 #[macro_use]
 extern crate metrics;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Global switch for detailed per-stage PUT metrics (path label, stage durations).
+/// When `false`, `record_put_object_path` and `record_put_object_stage_duration`
+/// become no-ops, and callers can skip the `Instant::now()` syscalls entirely.
+///
+/// Set to `true` during startup when OTEL metric export is enabled.
+static PUT_STAGE_METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable detailed per-stage PUT metrics.
+///
+/// Called once during startup, typically gated by `rustfs_obs::observability_metric_enabled()`.
+pub fn set_put_stage_metrics_enabled(enabled: bool) {
+    PUT_STAGE_METRICS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Returns `true` if detailed per-stage PUT metrics are enabled.
+///
+/// Callers should check this before calling `Instant::now()` for stage timing
+/// to avoid unnecessary syscalls when metrics are disabled.
+#[inline(always)]
+pub fn put_stage_metrics_enabled() -> bool {
+    PUT_STAGE_METRICS_ENABLED.load(Ordering::Relaxed)
+}
 
 // Public modules
 pub mod adaptive_ttl;
@@ -428,11 +451,17 @@ pub fn record_put_object(duration_ms: f64, size_bytes: i64, zero_copy_eligible: 
 
 #[inline(always)]
 pub fn record_put_object_path(path: &'static str) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
     counter!("rustfs_s3_put_object_path_total", "path" => path).increment(1);
 }
 
 #[inline(always)]
 pub fn record_put_object_stage_duration(stage: &'static str, duration_ms: f64) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
     histogram!("rustfs_s3_put_object_stage_duration_ms", "stage" => stage).record(duration_ms);
 }
 
@@ -838,10 +867,25 @@ mod tests {
 
     #[test]
     fn test_record_put_object_path_and_stage() {
+        // Enable stage metrics for testing
+        set_put_stage_metrics_enabled(true);
         record_put_object_path("small_eager");
         record_put_object_path("write_inline");
         record_put_object_stage_duration("ingress_prepare", 12.5);
         record_put_object_stage_duration("set_disk_encode", 8.0);
+        // Disable again to not affect other tests
+        set_put_stage_metrics_enabled(false);
+    }
+
+    #[test]
+    fn test_put_stage_metrics_disabled_by_default() {
+        // Default state should be disabled
+        assert!(!put_stage_metrics_enabled());
+        // These should be no-ops (no panic, no recording)
+        record_put_object_path("small_eager");
+        record_put_object_stage_duration("set_disk_encode", 5.0);
+        // Still disabled
+        assert!(!put_stage_metrics_enabled());
     }
 
     #[test]
