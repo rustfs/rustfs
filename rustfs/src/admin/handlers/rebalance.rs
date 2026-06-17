@@ -99,16 +99,37 @@ fn rebalance_start_rollback_error(start_err: &str, rollback_result: &Result<(), 
     }
 }
 
+fn rebalance_rollback_stop_failure_message(rebalance_id: &str, failures: &[String]) -> String {
+    format!("cluster stop_rebalance rollback for {rebalance_id} partial: {}", failures.join("; "))
+}
+
 async fn rollback_cluster_rebalance_start(
     store: &Arc<ECStore>,
     notification_sys: Option<&NotificationSys>,
     rebalance_id: &str,
 ) -> Result<(), String> {
+    let stop_attempt_at = OffsetDateTime::now_utc();
     if let Some(notification_sys) = notification_sys {
-        return notification_sys
-            .stop_rebalance()
+        let stop_failures = notification_sys
+            .stop_rebalance_failures()
             .await
-            .map_err(|err| format!("cluster stop_rebalance rollback for {rebalance_id} failed: {err}"));
+            .map_err(|err| format!("cluster stop_rebalance rollback for {rebalance_id} failed: {err}"))?;
+        if !stop_failures.is_empty() {
+            let record = RebalanceStopPropagationRecord {
+                stop_attempt_at: Some(stop_attempt_at),
+                stop_failures: stop_failures.clone(),
+                terminal_reload_attempt_at: None,
+                terminal_reload_failures: Vec::new(),
+            };
+            store.record_rebalance_stop_propagation(record).await.map_err(|err| {
+                format!(
+                    "cluster stop_rebalance rollback for {rebalance_id} partial; failed to persist stop propagation: {err}; stop failures: {}",
+                    stop_failures.join("; ")
+                )
+            })?;
+            return Err(rebalance_rollback_stop_failure_message(rebalance_id, &stop_failures));
+        }
+        return Ok(());
     }
 
     store
@@ -829,7 +850,7 @@ mod rebalance_handler_tests {
     use super::{
         RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, RebalanceStopPropagationStatus,
         build_rebalance_pool_statuses, build_rebalance_stop_propagation_status, rebalance_pool_used, rebalance_remaining_buckets,
-        rebalance_start_rollback_error, rebalance_used_pct, rollback_result_label,
+        rebalance_rollback_stop_failure_message, rebalance_start_rollback_error, rebalance_used_pct, rollback_result_label,
     };
     use rustfs_ecstore::rebalance::{
         DiskStat, RebalStatus, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta, RebalanceStats,
@@ -866,6 +887,20 @@ mod rebalance_handler_tests {
         assert!(message.contains("failed to propagate rebalance start: peer a failed"));
         assert!(message.contains("rollback result: rollback_partial"));
         assert!(message.contains("rollback error: peer b stop_rebalance failed: timeout"));
+    }
+
+    #[test]
+    fn test_rebalance_rollback_stop_failure_message_lists_failures() {
+        let failures = vec![
+            "peer a stop_rebalance failed: timeout".to_string(),
+            "peer b stop_rebalance failed: unavailable".to_string(),
+        ];
+
+        let message = rebalance_rollback_stop_failure_message("rebalance-id", &failures);
+
+        assert!(message.contains("cluster stop_rebalance rollback for rebalance-id partial"));
+        assert!(message.contains("peer a stop_rebalance failed: timeout"));
+        assert!(message.contains("peer b stop_rebalance failed: unavailable"));
     }
 
     #[test]
