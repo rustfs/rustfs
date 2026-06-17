@@ -9362,6 +9362,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "path-absolutize",
  "pin-project-lite",
+ "proptest",
  "quick-xml 0.40.1",
  "rand 0.10.1",
  "ratelimit",
