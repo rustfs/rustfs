@@ -32,6 +32,9 @@ The smoke test covers:
 - create namespace and table
 - append two rows through PyIceberg
 - reload and scan the table
+- probe direct REST catalog endpoints for metadata-location, table refs,
+  Iceberg views, maintenance config, metadata maintenance, worker run, and
+  catalog diagnostics
 - optionally drop the table and namespace
 
 The default profile uses the canonical RustFS catalog URI:
@@ -104,6 +107,15 @@ temporary credentials:
 - `PutObject` and `GetObject` to the same bucket outside that prefix must be
   rejected.
 
+The direct REST catalog probes run by default after the PyIceberg append and
+scan. For deployments that intentionally expose only the core Iceberg REST
+Catalog table path, skip those probes explicitly:
+
+```bash
+python3 scripts/table-catalog/pyiceberg_smoke.py \
+  --skip-catalog-api-probes
+```
+
 ## Machine-Readable Inventories
 
 The script can print the current conformance inventories without importing
@@ -120,20 +132,23 @@ work items. They are intentionally conservative: only PyIceberg is automated by
 this script today; other engines are documented until a repeatable harness is
 added.
 
-RustFS also exposes catalog-backed advanced Iceberg surfaces that are not part
-of the PyIceberg append smoke path yet:
+The smoke test also probes catalog-backed advanced Iceberg surfaces:
 
 - table refs can be listed, created or replaced, and deleted through catalog
   commits; refs with explicit retention policy require a forced delete, and
   `main` cannot be deleted
 - Iceberg views support basic create, list, load, replace, existence check, and
   drop routes with persisted view metadata and view-scoped authorization
+- metadata maintenance supports safe dry-run planning and controlled worker
+  execution checks
+- catalog diagnostics exposes the table recovery and consistency state used by
+  operators
 
 ## Client Matrix
 
 | Client | Current status | Claim |
 |---|---|---|
-| PyIceberg | Automated smoke target | create namespace, create table, append, reload, scan, optional catalog-vended table credentials with exact-prefix data-plane scope probe |
+| PyIceberg | Automated smoke target | create namespace, create table, append, reload, scan, metadata-location, refs, views, maintenance, diagnostics, optional catalog-vended table credentials with exact-prefix data-plane scope probe |
 | Spark Iceberg REST catalog | Manual-ready | create/load/append/reload should be verified against a running RustFS endpoint |
 | Trino Iceberg REST catalog | Documented, not automated | no write compatibility claim yet |
 | DuckDB Iceberg | Documented, not automated | read-path reference only |
