@@ -595,12 +595,14 @@ pub struct PoolMeta {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PersistedPoolMeta {
     pub version: u16,
     pub pools: Vec<PersistedPoolStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PersistedPoolStatus {
     #[serde(rename = "id")]
     pub id: usize,
@@ -613,6 +615,7 @@ struct PersistedPoolStatus {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PersistedPoolDecommissionInfo {
     #[serde(rename = "startTime", with = "time::serde::rfc3339::option")]
     pub start_time: Option<OffsetDateTime>,
@@ -2771,6 +2774,7 @@ impl ECStore {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use serde::Serialize;
 
     #[test]
     fn ensure_pool_not_left_in_cmdline_after_decommission_allows_active_pool() {
@@ -3062,6 +3066,145 @@ mod tests {
         assert!(decommission.bucket.is_empty());
         assert!(decommission.prefix.is_empty());
         assert!(decommission.object.is_empty());
+    }
+
+    #[test]
+    fn pool_meta_decode_rejects_unknown_persisted_fields() {
+        #[derive(Serialize)]
+        struct PersistedPoolMetaWithUnknownField {
+            version: u16,
+            pools: Vec<PersistedPoolStatus>,
+            unexpected: bool,
+        }
+
+        let payload = rmp_serde::to_vec_named(&PersistedPoolMetaWithUnknownField {
+            version: POOL_META_VERSION,
+            pools: Vec::new(),
+            unexpected: true,
+        })
+        .expect("pool metadata with unknown field should serialize");
+
+        let err = PoolMeta::decode_pool_meta_payload(payload.as_slice())
+            .expect_err("unknown persisted pool metadata field should fail decode");
+        let rendered = err.to_string();
+        assert!(rendered.contains("PoolMeta decode failed for both persisted and legacy formats"));
+        assert!(rendered.contains("unknown field") || rendered.contains("missing field"));
+    }
+
+    #[test]
+    fn pool_meta_decode_rejects_missing_critical_persisted_fields() {
+        #[derive(Serialize)]
+        struct PersistedPoolMetaWithoutPools {
+            version: u16,
+        }
+
+        let payload = rmp_serde::to_vec_named(&PersistedPoolMetaWithoutPools {
+            version: POOL_META_VERSION,
+        })
+        .expect("pool metadata without pools should serialize");
+
+        let err = PoolMeta::decode_pool_meta_payload(payload.as_slice())
+            .expect_err("missing persisted pool metadata pools should fail decode");
+        assert!(
+            err.to_string()
+                .contains("PoolMeta decode failed for both persisted and legacy formats")
+        );
+    }
+
+    #[test]
+    fn pool_meta_decode_rejects_unknown_decommission_fields() {
+        #[derive(Serialize)]
+        struct PersistedPoolStatusWithUnknownDecommission {
+            #[serde(rename = "id")]
+            id: usize,
+            #[serde(rename = "cmdline")]
+            cmd_line: String,
+            #[serde(rename = "lastUpdate", with = "time::serde::rfc3339")]
+            last_update: OffsetDateTime,
+            #[serde(rename = "decommissionInfo")]
+            decommission: Option<PersistedPoolDecommissionInfoWithUnknownField>,
+        }
+
+        #[derive(Serialize)]
+        struct PersistedPoolDecommissionInfoWithUnknownField {
+            #[serde(rename = "startTime", with = "time::serde::rfc3339::option")]
+            start_time: Option<OffsetDateTime>,
+            #[serde(rename = "startSize")]
+            start_size: usize,
+            #[serde(rename = "totalSize")]
+            total_size: usize,
+            #[serde(rename = "currentSize")]
+            current_size: usize,
+            #[serde(rename = "complete")]
+            complete: bool,
+            #[serde(rename = "failed")]
+            failed: bool,
+            #[serde(rename = "canceled")]
+            canceled: bool,
+            #[serde(rename = "queuedBuckets")]
+            queued_buckets: Vec<String>,
+            #[serde(rename = "decommissionedBuckets")]
+            decommissioned_buckets: Vec<String>,
+            #[serde(rename = "bucket")]
+            bucket: String,
+            #[serde(rename = "prefix")]
+            prefix: String,
+            #[serde(rename = "object")]
+            object: String,
+            #[serde(rename = "objectsDecommissioned")]
+            items_decommissioned: usize,
+            #[serde(rename = "objectsDecommissionedFailed")]
+            items_decommission_failed: usize,
+            #[serde(rename = "bytesDecommissioned")]
+            bytes_done: usize,
+            #[serde(rename = "bytesDecommissionedFailed")]
+            bytes_failed: usize,
+            #[serde(rename = "unexpected")]
+            unexpected: bool,
+        }
+
+        #[derive(Serialize)]
+        struct PersistedPoolMetaWithUnknownDecommission {
+            version: u16,
+            pools: Vec<PersistedPoolStatusWithUnknownDecommission>,
+        }
+
+        let start_time = OffsetDateTime::now_utc();
+        let payload = rmp_serde::to_vec_named(&PersistedPoolMetaWithUnknownDecommission {
+            version: POOL_META_VERSION,
+            pools: vec![PersistedPoolStatusWithUnknownDecommission {
+                id: 0,
+                cmd_line: "/data/pool".to_string(),
+                last_update: start_time,
+                decommission: Some(PersistedPoolDecommissionInfoWithUnknownField {
+                    start_time: Some(start_time),
+                    start_size: 0,
+                    total_size: 0,
+                    current_size: 0,
+                    complete: false,
+                    failed: false,
+                    canceled: false,
+                    queued_buckets: Vec::new(),
+                    decommissioned_buckets: Vec::new(),
+                    bucket: String::new(),
+                    prefix: String::new(),
+                    object: String::new(),
+                    items_decommissioned: 0,
+                    items_decommission_failed: 0,
+                    bytes_done: 0,
+                    bytes_failed: 0,
+                    unexpected: true,
+                }),
+            }],
+        })
+        .expect("pool metadata with unknown decommission field should serialize");
+
+        let err = PoolMeta::decode_pool_meta_payload(payload.as_slice())
+            .expect_err("unknown persisted decommission metadata field should fail decode");
+        assert!(
+            err.to_string()
+                .contains("PoolMeta decode failed for both persisted and legacy formats")
+        );
     }
 
     #[test]

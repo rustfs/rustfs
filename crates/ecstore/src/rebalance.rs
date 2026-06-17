@@ -60,6 +60,7 @@ const REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX: &str = "deferred transient rebalanc
 const REBALANCE_CLEANUP_WARNING_ENTRY_LIMIT: usize = 10;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RebalanceStats {
     #[serde(rename = "ifs")]
     pub init_free_space: u64, // Pool free space at the start of rebalance
@@ -534,6 +535,7 @@ pub enum RebalSaveOpt {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RebalanceInfo {
     #[serde(rename = "startTs")]
     pub start_time: Option<OffsetDateTime>, // Time at which rebalance-start was issued
@@ -546,6 +548,7 @@ pub struct RebalanceInfo {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RebalanceCleanupWarningEntry {
     #[serde(rename = "bucket", default)]
     pub bucket: String,
@@ -558,6 +561,7 @@ pub struct RebalanceCleanupWarningEntry {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RebalanceCleanupWarnings {
     #[serde(rename = "count", default)]
     pub count: u64,
@@ -581,6 +585,7 @@ pub struct DiskStat {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RebalanceMeta {
     #[serde(skip)]
     pub cancel: Option<CancellationToken>, // To be invoked on rebalance-stop
@@ -628,10 +633,77 @@ fn rebalance_meta_load_unknown_version_error(ver: u16) -> Error {
     Error::other(format!("rebalance metadata load failed: unknown version {ver}"))
 }
 
+fn rebalance_meta_decode_error(err: rmp_serde::decode::Error) -> Error {
+    Error::other(format!("rebalance metadata decode failed: {err}"))
+}
+
+fn invalid_rebalance_meta_error(message: impl fmt::Display) -> Error {
+    Error::other(format!("rebalance metadata load failed: {message}"))
+}
+
+fn validate_rebalance_cleanup_warnings(warnings: &RebalanceCleanupWarnings, pool_index: usize) -> Result<()> {
+    let entry_count = u64::try_from(warnings.entries.len())
+        .map_err(|_| invalid_rebalance_meta_error(format!("pool {pool_index} cleanup warning entry count overflow")))?;
+    if warnings.count < entry_count {
+        return Err(invalid_rebalance_meta_error(format!(
+            "pool {pool_index} cleanup warning count {} is lower than entry count {entry_count}",
+            warnings.count
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_rebalance_pool_stat(pool_stat: &RebalanceStats, pool_index: usize, meta_stopped: bool) -> Result<()> {
+    if pool_stat.participating && pool_stat.info.status == RebalStatus::None {
+        return Err(invalid_rebalance_meta_error(format!(
+            "pool {pool_index} is participating without a rebalance status"
+        )));
+    }
+
+    if pool_stat.info.status == RebalStatus::Started && pool_stat.info.end_time.is_some() {
+        return Err(invalid_rebalance_meta_error(format!(
+            "pool {pool_index} is started but already has an end time"
+        )));
+    }
+
+    if meta_stopped && pool_stat.info.status == RebalStatus::Started {
+        return Err(invalid_rebalance_meta_error(format!(
+            "pool {pool_index} is started after rebalance stop timestamp was recorded"
+        )));
+    }
+
+    validate_rebalance_cleanup_warnings(&pool_stat.cleanup_warnings, pool_index)
+}
+
+fn validate_rebalance_meta(meta: &RebalanceMeta) -> Result<()> {
+    if !meta.percent_free_goal.is_finite() {
+        return Err(invalid_rebalance_meta_error("percent free goal is not finite"));
+    }
+
+    if !meta.pool_stats.is_empty() && meta.id.trim().is_empty() {
+        return Err(invalid_rebalance_meta_error("rebalance id is empty while pool stats are present"));
+    }
+
+    let meta_stopped = meta.stopped_at.is_some();
+    for (pool_index, pool_stat) in meta.pool_stats.iter().enumerate() {
+        validate_rebalance_pool_stat(pool_stat, pool_index, meta_stopped)?;
+    }
+
+    Ok(())
+}
+
 impl RebalanceMeta {
     pub fn new() -> Self {
         Self::default()
     }
+
+    fn decode_rebalance_meta_payload(payload: &[u8]) -> Result<Self> {
+        let meta: Self = rmp_serde::from_read(Cursor::new(payload)).map_err(rebalance_meta_decode_error)?;
+        validate_rebalance_meta(&meta)?;
+        Ok(meta)
+    }
+
     pub async fn load<S: ObjectIO>(&mut self, store: Arc<S>) -> Result<()> {
         self.load_with_opts(store, ObjectOptions::default()).await
     }
@@ -662,7 +734,7 @@ impl RebalanceMeta {
             ver => return Err(rebalance_meta_load_unknown_version_error(ver)),
         }
 
-        let meta: Self = rmp_serde::from_read(Cursor::new(&data[4..]))?;
+        let meta = Self::decode_rebalance_meta_payload(&data[4..])?;
         *self = meta;
 
         self.last_refreshed_at = Some(OffsetDateTime::now_utc());
@@ -4711,13 +4783,146 @@ mod rebalance_unit_tests {
         };
         let data = rmp_serde::to_vec(&legacy).expect("legacy rebalance metadata should serialize");
 
-        let decoded: RebalanceMeta =
-            rmp_serde::from_slice(data.as_slice()).expect("legacy rebalance metadata should deserialize");
+        let decoded =
+            RebalanceMeta::decode_rebalance_meta_payload(data.as_slice()).expect("legacy rebalance metadata should deserialize");
 
         assert_eq!(decoded.id, "rebal-legacy");
         assert_eq!(decoded.pool_stats.len(), 1);
         assert_eq!(decoded.pool_stats[0].cleanup_warnings, RebalanceCleanupWarnings::default());
         assert_eq!(decoded.pool_stats[0].info.status, RebalStatus::Started);
+    }
+
+    #[test]
+    fn test_rebalance_meta_decode_rejects_unknown_fields() {
+        #[derive(Serialize)]
+        struct RebalanceMetaWithUnknownField {
+            #[serde(rename = "stopTs")]
+            stopped_at: Option<OffsetDateTime>,
+            #[serde(rename = "id")]
+            id: String,
+            #[serde(rename = "pf")]
+            percent_free_goal: f64,
+            #[serde(rename = "rss")]
+            pool_stats: Vec<RebalanceStats>,
+            #[serde(rename = "unexpected")]
+            unexpected: bool,
+        }
+
+        let payload = rmp_serde::to_vec_named(&RebalanceMetaWithUnknownField {
+            stopped_at: None,
+            id: "rebal-unknown".to_string(),
+            percent_free_goal: 0.5,
+            pool_stats: Vec::new(),
+            unexpected: true,
+        })
+        .expect("rebalance metadata with unknown field should serialize");
+
+        let err = RebalanceMeta::decode_rebalance_meta_payload(payload.as_slice())
+            .expect_err("unknown rebalance metadata field should fail decode");
+        assert!(err.to_string().contains("rebalance metadata decode failed"));
+    }
+
+    #[test]
+    fn test_rebalance_meta_decode_rejects_missing_critical_fields() {
+        #[derive(Serialize)]
+        struct RebalanceMetaWithoutId {
+            #[serde(rename = "stopTs")]
+            stopped_at: Option<OffsetDateTime>,
+            #[serde(rename = "pf")]
+            percent_free_goal: f64,
+            #[serde(rename = "rss")]
+            pool_stats: Vec<RebalanceStats>,
+        }
+
+        let payload = rmp_serde::to_vec_named(&RebalanceMetaWithoutId {
+            stopped_at: None,
+            percent_free_goal: 0.5,
+            pool_stats: Vec::new(),
+        })
+        .expect("rebalance metadata without id should serialize");
+
+        let err = RebalanceMeta::decode_rebalance_meta_payload(payload.as_slice())
+            .expect_err("missing rebalance id should fail decode");
+        assert!(err.to_string().contains("rebalance metadata decode failed"));
+    }
+
+    #[test]
+    fn test_rebalance_meta_decode_rejects_invalid_stopped_running_state() {
+        let stopped_at = OffsetDateTime::from_unix_timestamp(1_000).expect("valid stop timestamp");
+        let start_time = OffsetDateTime::from_unix_timestamp(900).expect("valid start timestamp");
+        let meta = RebalanceMeta {
+            stopped_at: Some(stopped_at),
+            id: "rebal-invalid".to_string(),
+            percent_free_goal: 0.5,
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    start_time: Some(start_time),
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let payload = rmp_serde::to_vec(&meta).expect("invalid rebalance metadata should serialize");
+
+        let err = RebalanceMeta::decode_rebalance_meta_payload(payload.as_slice())
+            .expect_err("stopped metadata with started pool should fail validation");
+        assert!(err.to_string().contains("started after rebalance stop timestamp"));
+    }
+
+    #[test]
+    fn test_rebalance_meta_decode_rejects_started_pool_with_end_time() {
+        let start_time = OffsetDateTime::from_unix_timestamp(1_000).expect("valid start timestamp");
+        let end_time = OffsetDateTime::from_unix_timestamp(1_100).expect("valid end timestamp");
+        let meta = RebalanceMeta {
+            id: "rebal-invalid".to_string(),
+            percent_free_goal: 0.5,
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    start_time: Some(start_time),
+                    end_time: Some(end_time),
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let payload = rmp_serde::to_vec(&meta).expect("invalid rebalance metadata should serialize");
+
+        let err = RebalanceMeta::decode_rebalance_meta_payload(payload.as_slice())
+            .expect_err("started pool with end time should fail validation");
+        assert!(err.to_string().contains("started but already has an end time"));
+    }
+
+    #[test]
+    fn test_rebalance_meta_decode_rejects_cleanup_warning_entry_count_mismatch() {
+        let meta = RebalanceMeta {
+            id: "rebal-invalid".to_string(),
+            percent_free_goal: 0.5,
+            pool_stats: vec![RebalanceStats {
+                cleanup_warnings: RebalanceCleanupWarnings {
+                    count: 0,
+                    entries: vec![RebalanceCleanupWarningEntry {
+                        bucket: "bucket-a".to_string(),
+                        object: "obj.txt".to_string(),
+                        message: "cleanup failed".to_string(),
+                        timestamp: None,
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let payload = rmp_serde::to_vec(&meta).expect("invalid rebalance metadata should serialize");
+
+        let err = RebalanceMeta::decode_rebalance_meta_payload(payload.as_slice())
+            .expect_err("cleanup warning count mismatch should fail validation");
+        assert!(err.to_string().contains("cleanup warning count"));
     }
 
     #[test]
