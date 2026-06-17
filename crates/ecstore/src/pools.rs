@@ -1477,6 +1477,18 @@ fn decommission_delete_marker_opts(
     }
 }
 
+fn decommission_object_migration_read_opts(version_id: Option<String>) -> ObjectOptions {
+    ObjectOptions {
+        version_id,
+        no_lock: true,
+        data_movement: true,
+        raw_data_movement_read: true,
+        skip_decommissioned: true,
+        skip_rebalancing: true,
+        ..Default::default()
+    }
+}
+
 fn decommission_remote_tiered_opts(
     version: &rustfs_filemeta::FileInfo,
     version_id: Option<String>,
@@ -1980,11 +1992,7 @@ impl ECStore {
                         &encode_dir_object(&version.name),
                         None,
                         HeaderMap::new(),
-                        &ObjectOptions {
-                            version_id: version_id.clone(),
-                            no_lock: true,
-                            ..Default::default()
-                        },
+                        &decommission_object_migration_read_opts(version_id.clone()),
                     )
                     .await
                 {
@@ -3199,6 +3207,18 @@ mod tests {
         assert_eq!(replication.replica_status, rustfs_filemeta::ReplicationStatusType::Replica);
         assert!(replication.delete_marker);
         assert_eq!(replication.replicate_decision_str, "existing");
+    }
+
+    #[test]
+    fn test_decommission_object_migration_read_opts_are_raw_data_movement() {
+        let opts = decommission_object_migration_read_opts(Some("vid-1".to_string()));
+
+        assert_eq!(opts.version_id.as_deref(), Some("vid-1"));
+        assert!(opts.no_lock);
+        assert!(opts.data_movement);
+        assert!(opts.raw_data_movement_read);
+        assert!(opts.skip_rebalancing);
+        assert!(opts.skip_decommissioned);
     }
 
     #[test]

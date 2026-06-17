@@ -172,6 +172,30 @@ fn rebalance_delete_marker_opts(version: &FileInfo, version_id: Option<String>, 
     }
 }
 
+fn rebalance_object_migration_read_opts(version_id: Option<String>) -> ObjectOptions {
+    ObjectOptions {
+        version_id,
+        no_lock: true,
+        data_movement: true,
+        raw_data_movement_read: true,
+        skip_decommissioned: true,
+        skip_rebalancing: true,
+        ..Default::default()
+    }
+}
+
+fn rebalance_source_cleanup_opts(src_pool_idx: usize) -> ObjectOptions {
+    ObjectOptions {
+        delete_prefix: true,
+        delete_prefix_object: true,
+        src_pool_idx,
+        data_movement: true,
+        skip_decommissioned: true,
+        skip_rebalancing: true,
+        ..Default::default()
+    }
+}
+
 #[async_trait::async_trait]
 pub(crate) trait MigrationBackend: Send + Sync {
     async fn get_object_reader_for_migration(
@@ -409,11 +433,7 @@ where
                 &encode_dir_object(&version.name),
                 None,
                 HeaderMap::new(),
-                &ObjectOptions {
-                    version_id: version_id.clone(),
-                    no_lock: true,
-                    ..Default::default()
-                },
+                &rebalance_object_migration_read_opts(version_id.clone()),
             )
             .await
         {
@@ -3208,12 +3228,7 @@ impl ECStore {
                 set.delete_object(
                     bucket.as_str(),
                     &encode_dir_object(&entry.name),
-                    ObjectOptions {
-                        delete_prefix: true,
-                        delete_prefix_object: true,
-
-                        ..Default::default()
-                    },
+                    rebalance_source_cleanup_opts(pool_index),
                 )
                 .await,
                 bucket.as_str(),
@@ -3695,7 +3710,8 @@ mod rebalance_unit_tests {
         migrate_entry_version_with_delete_marker, migrate_entry_version_with_retry_wait, next_rebal_bucket_from_stat,
         parse_rebalance_max_attempts, rebalance_delete_marker_opts, rebalance_listing_retry_delay,
         rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error,
-        rebalance_migration_retry_delay, record_rebalance_cleanup_warning_in_meta, refresh_missing_rebalance_pool_stats,
+        rebalance_migration_retry_delay, rebalance_object_migration_read_opts, rebalance_source_cleanup_opts,
+        record_rebalance_cleanup_warning_in_meta, refresh_missing_rebalance_pool_stats,
         resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket, resolve_rebalance_bucket_error,
         resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
         resolve_rebalance_file_info_versions_result, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
@@ -3916,6 +3932,30 @@ mod rebalance_unit_tests {
         assert_eq!(replication.replica_status, rustfs_filemeta::ReplicationStatusType::Replica);
         assert!(replication.delete_marker);
         assert_eq!(replication.replicate_decision_str, "existing");
+    }
+
+    #[test]
+    fn test_rebalance_object_migration_read_opts_are_raw_data_movement() {
+        let opts = rebalance_object_migration_read_opts(Some("vid-1".to_string()));
+
+        assert_eq!(opts.version_id.as_deref(), Some("vid-1"));
+        assert!(opts.no_lock);
+        assert!(opts.data_movement);
+        assert!(opts.raw_data_movement_read);
+        assert!(opts.skip_rebalancing);
+        assert!(opts.skip_decommissioned);
+    }
+
+    #[test]
+    fn test_rebalance_source_cleanup_opts_are_data_movement_skip_opts() {
+        let opts = rebalance_source_cleanup_opts(3);
+
+        assert!(opts.delete_prefix);
+        assert!(opts.delete_prefix_object);
+        assert!(opts.data_movement);
+        assert!(opts.skip_rebalancing);
+        assert!(opts.skip_decommissioned);
+        assert_eq!(opts.src_pool_idx, 3);
     }
 
     #[tokio::test]
