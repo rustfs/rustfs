@@ -58,6 +58,7 @@ const REBALANCE_MIGRATION_RETRY_BASE_DELAY: Duration = Duration::from_millis(250
 const REBALANCE_MIGRATION_LOCK_RETRY_CAP: Duration = Duration::from_secs(10);
 const REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX: &str = "deferred transient rebalance entry failure:";
 const REBALANCE_CLEANUP_WARNING_ENTRY_LIMIT: usize = 10;
+const REBALANCE_PERCENT_FREE_GOAL_TOLERANCE: f64 = 0.05;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1651,12 +1652,8 @@ impl ECStore {
                 return true;
             }
 
-            // Mark pool rebalance as done only after it reaches the PercentFreeGoal.
-            let pfi = if pool_stat.init_capacity == 0 {
-                0.0
-            } else {
-                (pool_stat.init_free_space + pool_stat.bytes) as f64 / pool_stat.init_capacity as f64
-            };
+            // Match MinIO's completion semantics: close enough to PercentFreeGoal is complete.
+            let pfi = rebalance_percent_free_after_migration(pool_stat.init_free_space, pool_stat.init_capacity, pool_stat.bytes);
 
             if !has_deferred_rebalance_error(pool_stat)
                 && rebalance_goal_reached(
@@ -1690,8 +1687,8 @@ fn rebalance_goal_reached(init_free_space: u64, init_capacity: u64, bytes: u64, 
         return false;
     }
 
-    let pfi = (init_free_space + bytes) as f64 / init_capacity as f64;
-    pfi + f64::EPSILON >= percent_free_goal
+    let pfi = rebalance_percent_free_after_migration(init_free_space, init_capacity, bytes);
+    (pfi - percent_free_goal).abs() <= REBALANCE_PERCENT_FREE_GOAL_TOLERANCE
 }
 
 fn percent_free_ratio(total_free: u64, total_cap: u64) -> f64 {
@@ -1699,6 +1696,10 @@ fn percent_free_ratio(total_free: u64, total_cap: u64) -> f64 {
         return 0.0;
     }
     total_free as f64 / total_cap as f64
+}
+
+fn rebalance_percent_free_after_migration(init_free_space: u64, init_capacity: u64, bytes: u64) -> f64 {
+    percent_free_ratio(init_free_space.saturating_add(bytes), init_capacity)
 }
 
 fn next_rebal_bucket_from_stat(pool_stat: &RebalanceStats) -> Option<String> {
@@ -4355,7 +4356,17 @@ mod rebalance_unit_tests {
         let goal = 0.45_f64;
 
         assert!(rebalance_goal_reached(init_free_space, init_capacity, 250, goal));
-        assert!(!rebalance_goal_reached(init_free_space, init_capacity, 249, goal));
+        assert!(rebalance_goal_reached(init_free_space, init_capacity, 249, goal));
+    }
+
+    #[test]
+    fn test_rebalance_goal_reached_with_minio_tolerance_below_target() {
+        let init_free_space = 200_u64;
+        let init_capacity = 1_000_u64;
+        let goal = 0.45_f64;
+
+        assert!(rebalance_goal_reached(init_free_space, init_capacity, 200, goal));
+        assert!(!rebalance_goal_reached(init_free_space, init_capacity, 199, goal));
     }
 
     #[test]
@@ -4385,7 +4396,12 @@ mod rebalance_unit_tests {
 
     #[test]
     fn test_rebalance_goal_above_one_is_true_when_reached() {
-        assert!(rebalance_goal_reached(950, 1_000, 100, 1.0));
+        assert!(rebalance_goal_reached(950, 1_000, 99, 1.0));
+    }
+
+    #[test]
+    fn test_rebalance_goal_overshoot_outside_minio_tolerance_is_false() {
+        assert!(!rebalance_goal_reached(950, 1_000, 101, 1.0));
     }
 
     #[test]
@@ -5716,7 +5732,7 @@ mod rebalance_unit_tests {
     }
 
     #[test]
-    fn test_rebalance_goal_not_reached_for_issue_3137_initial_imbalance() {
+    fn test_rebalance_goal_reached_for_issue_3137_with_minio_tolerance() {
         let pool0_capacity = 10_000_u64;
         let pool0_free = 9_135_u64;
         let pool1_capacity = 10_000_u64;
@@ -5724,7 +5740,7 @@ mod rebalance_unit_tests {
         let goal = percent_free_ratio(pool0_free + pool1_free, pool0_capacity + pool1_capacity);
 
         assert!(should_pool_participate(pool0_free, pool0_capacity, goal));
-        assert!(!rebalance_goal_reached(pool0_free, pool0_capacity, 0, goal));
+        assert!(rebalance_goal_reached(pool0_free, pool0_capacity, 0, goal));
     }
 
     #[test]
@@ -6799,13 +6815,13 @@ mod rebalance_unit_tests {
     }
 
     #[test]
-    fn test_rebalance_goal_reached_requires_target_ratio() {
+    fn test_rebalance_goal_reached_requires_minio_tolerance_window() {
         let init_free_space = 150_u64;
         let init_capacity = 800_u64;
         let goal = 0.35_f64;
 
         assert!(!rebalance_goal_reached(init_free_space, init_capacity, 0, goal));
-        assert!(!rebalance_goal_reached(init_free_space, init_capacity, 129, goal));
-        assert!(rebalance_goal_reached(init_free_space, init_capacity, 130, goal));
+        assert!(!rebalance_goal_reached(init_free_space, init_capacity, 89, goal));
+        assert!(rebalance_goal_reached(init_free_space, init_capacity, 90, goal));
     }
 }
