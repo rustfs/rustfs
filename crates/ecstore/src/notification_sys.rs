@@ -1095,6 +1095,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reload_pool_meta_reports_unreachable_peers() {
+        let sys = NotificationSys {
+            peer_clients: vec![None],
+            all_peer_clients: Vec::new(),
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+        };
+
+        let err = sys
+            .reload_pool_meta()
+            .await
+            .expect_err("unreachable peers should fail pool metadata reload");
+
+        let msg = err.to_string();
+        assert!(msg.contains("reload_pool_meta"));
+        assert!(msg.contains("1 failure(s)"));
+        assert!(msg.contains("peer[0]"));
+    }
+
+    #[tokio::test]
     async fn load_bucket_metadata_reports_unreachable_peers() {
         let sys = NotificationSys {
             peer_clients: vec![None],

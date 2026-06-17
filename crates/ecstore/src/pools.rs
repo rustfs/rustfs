@@ -386,6 +386,10 @@ fn resolve_decommission_pool_meta_reload_result(result: Result<()>, stage: &str)
     result.map_err(|err| Error::other(format!("decommission pool meta reload failed during {stage}: {err}")))
 }
 
+fn resolve_start_decommission_pool_meta_reload_result(result: Result<()>) -> Result<()> {
+    resolve_decommission_pool_meta_reload_result(result, "start_decommission")
+}
+
 fn ensure_pool_not_left_in_cmdline_after_decommission(position: usize, cmd_line: &str, completed: bool) -> Result<()> {
     if completed {
         return Err(Error::other(format!(
@@ -2586,11 +2590,19 @@ impl ECStore {
 
         pool_meta.save(self.pools.clone()).await?;
 
-        if let Some(notification_sys) = get_global_notification_sys()
-            && let Err(err) =
-                resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, "start_decommission")
-        {
-            warn!("{err}");
+        if let Some(notification_sys) = get_global_notification_sys() {
+            resolve_start_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await).map_err(|err| {
+                warn!(
+                    event = EVENT_DECOMMISSION_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    state = "start_failed",
+                    stage = "reload_pool_meta",
+                    error = %err,
+                    "Decommission start failed after pool metadata save"
+                );
+                err
+            })?;
         }
 
         Ok(())
@@ -3355,10 +3367,11 @@ mod pools_tests {
         resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,
         resolve_decommission_preflight_heal_result, resolve_decommission_spawn_failure_result,
         resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
-        resolve_decommission_update_after_result, run_decommission_buckets_bounded, should_cleanup_decommission_source_entry,
-        should_continue_decommission_queue, should_count_decommission_version_complete,
-        should_preserve_decommission_canceled_state, split_decommission_buckets, take_decommission_canceler,
-        track_decommission_current_object, validate_start_decommission_request, with_decommission_entry_context,
+        resolve_decommission_update_after_result, resolve_start_decommission_pool_meta_reload_result,
+        run_decommission_buckets_bounded, should_cleanup_decommission_source_entry, should_continue_decommission_queue,
+        should_count_decommission_version_complete, should_preserve_decommission_canceled_state, split_decommission_buckets,
+        take_decommission_canceler, track_decommission_current_object, validate_start_decommission_request,
+        with_decommission_entry_context,
     };
     use crate::data_movement;
     use crate::error::Error;
@@ -4048,6 +4061,19 @@ mod pools_tests {
         let message = err.to_string();
         assert!(message.contains("decommission pool meta reload failed during decommission_failed for pool 3"));
         assert!(message.contains(Error::SlowDown.to_string().as_str()));
+    }
+
+    #[test]
+    fn test_resolve_start_decommission_pool_meta_reload_result_returns_failure() {
+        let err = resolve_start_decommission_pool_meta_reload_result(Err(Error::other(
+            "reload_pool_meta encountered 1 failure(s): peer[0] reload_pool_meta failed",
+        )))
+        .expect_err("start_decommission must fail when peer pool meta reload fails");
+        let message = err.to_string();
+
+        assert!(message.contains("decommission pool meta reload failed during start_decommission"));
+        assert!(message.contains("reload_pool_meta encountered 1 failure(s)"));
+        assert!(message.contains("peer[0]"));
     }
 
     #[test]
