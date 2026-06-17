@@ -38,7 +38,6 @@ use rustfs_ecstore::{
     global::shutdown_background_services,
     notification_sys::new_global_notification_sys,
     store::ECStore,
-    store_api::BucketOperations,
 };
 use rustfs_heal::{
     create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
@@ -46,7 +45,7 @@ use rustfs_heal::{
 use rustfs_iam::init_oidc_sys;
 use rustfs_obs::init_metrics_runtime;
 use rustfs_scanner::init_data_scanner;
-use rustfs_storage_api::BucketOptions;
+use rustfs_storage_api::{BucketOperations, BucketOptions};
 use rustfs_utils::get_env_bool_with_aliases;
 use std::{
     future::Future,

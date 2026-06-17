@@ -63,9 +63,8 @@ use crate::{
     rpc::S3PeerSys,
     sets::Sets,
     store_api::{
-        BucketOperations, CompletePart, DeletedObject, GetObjectReader, HTTPRangeSpec, HealOperations, ListObjectsV2Info,
-        ListOperations, MultipartOperations, NamespaceLocking, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete,
-        PutObjReader,
+        CompletePart, DeletedObject, GetObjectReader, HTTPRangeSpec, HealOperations, ListObjectsV2Info, ListOperations,
+        MultipartOperations, NamespaceLocking, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader,
     },
     store_init,
 };
@@ -80,8 +79,8 @@ use rustfs_filemeta::FileInfo;
 use rustfs_lock::{LocalClient, LockClient, NamespaceLockWrapper};
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_storage_api::{
-    BucketInfo, BucketOptions, DeleteBucketOptions, ListMultipartsInfo, ListPartsInfo, MakeBucketOptions, MultipartInfo,
-    MultipartUploadResult, PartInfo,
+    BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, ListMultipartsInfo, ListPartsInfo, MakeBucketOptions,
+    MultipartInfo, MultipartUploadResult, PartInfo,
 };
 use rustfs_utils::path::{decode_dir_object, encode_dir_object, path_join_buf};
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
@@ -398,6 +397,8 @@ lazy_static! {
 
 #[async_trait::async_trait]
 impl BucketOperations for ECStore {
+    type Error = Error;
+
     #[instrument(skip(self))]
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
         self.handle_make_bucket(bucket, opts).await

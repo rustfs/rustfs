@@ -17,11 +17,11 @@
 use crate::bucket::metadata::BUCKET_METADATA_FILE;
 use crate::bucket::replication::{decode_resync_file, encode_resync_file};
 use crate::disk::{BUCKET_META_PREFIX, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
-use crate::store_api::{BucketOperations, ListOperations, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader};
+use crate::store_api::{ListOperations, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader};
 use http::HeaderMap;
 use rustfs_policy::auth::UserIdentity;
 use rustfs_policy::policy::PolicyDoc;
-use rustfs_storage_api::BucketOptions;
+use rustfs_storage_api::{BucketOperations, BucketOptions};
 use rustfs_utils::path::SLASH_SEPARATOR;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -179,7 +179,7 @@ fn normalize_bucket_meta_blob(path: &str, data: &[u8]) -> std::result::Result<Op
 /// Skips buckets that already exist in RustFS (idempotent).
 pub async fn try_migrate_bucket_metadata<S>(store: Arc<S>)
 where
-    S: BucketOperations + ObjectIO + ObjectOperations,
+    S: BucketOperations<Error = crate::error::Error> + ObjectIO + ObjectOperations,
 {
     let buckets_list = match store
         .list_bucket(&BucketOptions {
