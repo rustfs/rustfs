@@ -14,7 +14,7 @@
 
 use crate::bucket::error::BucketMetadataError;
 use crate::disk::error::DiskError;
-use rustfs_storage_api::StorageErrorCode;
+use rustfs_storage_api::{HTTPRangeError, StorageErrorCode};
 use rustfs_utils::path::decode_dir_object;
 use s3s::{S3Error, S3ErrorCode};
 
@@ -215,6 +215,14 @@ impl StorageError {
                 | StorageError::InsufficientWriteQuorum(_, _)
                 | StorageError::NamespaceLockQuorumUnavailable { .. }
         )
+    }
+}
+
+impl From<HTTPRangeError> for StorageError {
+    fn from(err: HTTPRangeError) -> Self {
+        match err {
+            HTTPRangeError::InvalidRangeSpec(message) => Self::InvalidRangeSpec(message),
+        }
     }
 }
 
