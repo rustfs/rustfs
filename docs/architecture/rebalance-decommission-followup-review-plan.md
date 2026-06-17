@@ -1029,10 +1029,10 @@ Document single-pool support for this remediation scope:
 
 ### Implementation Steps
 
-- [ ] Update the relevant admin/decommission docs with the current single-pool decommission contract.
-- [ ] Keep or add a test that comma-separated multiple pools return the documented error.
-- [ ] Add a short note that MinIO-like queued multi-pool decommission is out of scope for R15 and requires a separate product-approved task.
-- [ ] Run:
+- [x] Update the relevant admin/decommission docs with the current single-pool decommission contract.
+- [x] Keep or add a test that comma-separated multiple pools return the documented error.
+- [x] Add a short note that MinIO-like queued multi-pool decommission is out of scope for R15 and requires a separate product-approved task.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs-ecstore start_decommission --lib
