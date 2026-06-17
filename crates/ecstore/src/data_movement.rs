@@ -18,7 +18,8 @@ use crate::store_api::{
     CompletePart, GetObjectReader, MultipartOperations, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, PutObjReader,
 };
 use bytes::Bytes;
-use rustfs_rio::{EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex};
+use rustfs_filemeta::ObjectPartInfo;
+use rustfs_rio::{ChecksumType, EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex};
 use rustfs_utils::path::encode_dir_object;
 use std::pin::Pin;
 use std::sync::{
@@ -121,6 +122,52 @@ fn put_obj_reader_from_part_stream(
     let reader = IndexedDataMovementReader::new(DataMovementPartReader::new(stream, limit), index);
     let hash_reader = HashReader::from_reader(reader, size, actual_size, None, None, false)?;
     Ok(PutObjReader::new(hash_reader))
+}
+
+fn data_movement_object_checksum_type(object_info: &ObjectInfo) -> Option<ChecksumType> {
+    let checksum = object_info.checksum.as_ref()?;
+    let (checksums, _) = rustfs_rio::read_checksums(checksum.as_ref(), 0);
+    rustfs_rio::BASE_CHECKSUM_TYPES
+        .iter()
+        .copied()
+        .find(|checksum_type| checksums.contains_key(checksum_type.to_string().as_str()))
+}
+
+fn data_movement_multipart_checksum_type(object_info: &ObjectInfo) -> Option<ChecksumType> {
+    let checksum = object_info.user_defined.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM)?;
+    let checksum_type = object_info
+        .user_defined
+        .get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE)
+        .map(String::as_str)
+        .unwrap_or_default();
+    let checksum_type = ChecksumType::from_string_with_obj_type(checksum, checksum_type);
+    checksum_type.is_set().then_some(checksum_type)
+}
+
+fn add_data_movement_calculated_checksum(data: &mut PutObjReader, checksum_type: Option<ChecksumType>) -> Result<()> {
+    if let Some(checksum_type) = checksum_type {
+        data.stream.add_calculated_checksum(checksum_type).map_err(Error::from)?;
+    }
+    Ok(())
+}
+
+fn data_movement_part_checksum(part: &ObjectPartInfo, checksum_type: ChecksumType) -> Option<String> {
+    part.checksums
+        .as_ref()
+        .and_then(|checksums| checksums.get(checksum_type.to_string().as_str()))
+        .cloned()
+}
+
+fn data_movement_complete_part(part_num: usize, etag: Option<String>, source_part: &ObjectPartInfo) -> CompletePart {
+    CompletePart {
+        part_num,
+        etag,
+        checksum_crc32: data_movement_part_checksum(source_part, ChecksumType::CRC32),
+        checksum_crc32c: data_movement_part_checksum(source_part, ChecksumType::CRC32C),
+        checksum_sha1: data_movement_part_checksum(source_part, ChecksumType::SHA1),
+        checksum_sha256: data_movement_part_checksum(source_part, ChecksumType::SHA256),
+        checksum_crc64nvme: data_movement_part_checksum(source_part, ChecksumType::CRC64_NVME),
+    }
 }
 
 pub fn new_multipart_abort_flag() -> Arc<AtomicBool> {
@@ -345,6 +392,7 @@ pub(crate) async fn migrate_object(
         let multipart_result: Result<()> = async {
             let mut parts = vec![CompletePart::default(); object_info.parts.len()];
             let reader = Arc::new(Mutex::new(rd.stream));
+            let multipart_checksum_type = data_movement_multipart_checksum_type(&object_info);
 
             for (i, part) in object_info.parts.iter().enumerate() {
                 let part_size = i64::try_from(part.size).map_err(|_| {
@@ -370,6 +418,16 @@ pub(crate) async fn migrate_object(
                             err,
                         )
                     })?;
+                add_data_movement_calculated_checksum(&mut data, multipart_checksum_type).map_err(|err| {
+                    data_movement_part_stage_error(
+                        op_label,
+                        "prepare_part",
+                        bucket.as_str(),
+                        object_info.name.as_str(),
+                        part.number,
+                        err,
+                    )
+                })?;
 
                 let pi = match store
                     .put_object_part(
@@ -400,11 +458,7 @@ pub(crate) async fn migrate_object(
                     }
                 };
 
-                parts[i] = CompletePart {
-                    part_num: pi.part_num,
-                    etag: pi.etag,
-                    ..Default::default()
-                };
+                parts[i] = data_movement_complete_part(pi.part_num, pi.etag, part);
             }
 
             if let Err(err) = store
@@ -486,6 +540,9 @@ pub(crate) async fn migrate_object(
             data_movement_stage_error(op_label, "prepare_put_object", bucket.as_str(), object_info.name.as_str(), err)
         })?;
     let mut data = PutObjReader::new(hrd);
+    add_data_movement_calculated_checksum(&mut data, data_movement_object_checksum_type(&object_info)).map_err(|err| {
+        data_movement_stage_error(op_label, "prepare_put_object", bucket.as_str(), object_info.name.as_str(), err)
+    })?;
 
     if let Err(err) = store
         .put_object(
@@ -512,6 +569,9 @@ pub(crate) async fn migrate_object(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_rio::HashReaderMut;
+    use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
+    use std::collections::HashMap;
     use std::io::Cursor;
     use std::sync::atomic::AtomicUsize;
     use time::OffsetDateTime;
@@ -551,6 +611,41 @@ mod tests {
             buf.advance(read);
             self.remaining = self.remaining.saturating_sub(u64::try_from(read).unwrap_or(u64::MAX));
             Poll::Ready(Ok(()))
+        }
+    }
+
+    fn assert_data_movement_metadata_equivalent(source: &ObjectInfo, target: &ObjectInfo) {
+        assert_eq!(source.version_id, target.version_id);
+        assert_eq!(source.etag, target.etag);
+        assert_eq!(source.size, target.size);
+        assert_eq!(effective_actual_size(source), effective_actual_size(target));
+        assert_eq!(source.mod_time, target.mod_time);
+        assert_eq!(source.user_defined, target.user_defined);
+        assert_eq!(source.storage_class, target.storage_class);
+        assert_eq!(source.checksum, target.checksum);
+        assert_eq!(source.replication_status_internal, target.replication_status_internal);
+        assert_eq!(source.replication_status, target.replication_status);
+        assert_eq!(source.version_purge_status_internal, target.version_purge_status_internal);
+        assert_eq!(source.version_purge_status, target.version_purge_status);
+        assert_eq!(
+            source.user_defined.get(X_AMZ_OBJECT_LOCK_MODE.as_str()),
+            target.user_defined.get(X_AMZ_OBJECT_LOCK_MODE.as_str())
+        );
+        assert_eq!(
+            source.user_defined.get(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str()),
+            target.user_defined.get(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str())
+        );
+        assert_eq!(
+            source.user_defined.get(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str()),
+            target.user_defined.get(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str())
+        );
+        assert_eq!(source.parts.len(), target.parts.len());
+        for (source_part, target_part) in source.parts.iter().zip(target.parts.iter()) {
+            assert_eq!(source_part.number, target_part.number);
+            assert_eq!(source_part.etag, target_part.etag);
+            assert_eq!(source_part.size, target_part.size);
+            assert_eq!(source_part.actual_size, target_part.actual_size);
+            assert_eq!(source_part.checksums, target_part.checksums);
         }
     }
 
@@ -650,6 +745,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_data_movement_single_part_checksum_is_recalculated_from_source_type() {
+        let payload = b"checksum-payload";
+        let checksum =
+            rustfs_rio::Checksum::new_from_data(ChecksumType::CRC32C, payload).expect("source checksum should be created");
+        let object_info = ObjectInfo {
+            checksum: Some(checksum.to_bytes(&[])),
+            ..Default::default()
+        };
+        let mut data = PutObjReader::from_vec(payload.to_vec());
+
+        add_data_movement_calculated_checksum(&mut data, data_movement_object_checksum_type(&object_info))
+            .expect("source checksum type should be enabled on the migrated reader");
+        data.stream
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect("reader should consume payload and calculate checksum");
+
+        let migrated = data
+            .stream
+            .content_hash()
+            .as_ref()
+            .expect("migrated reader should contain calculated checksum");
+        assert_eq!(migrated.to_bytes(&[]), checksum.to_bytes(&[]));
+    }
+
+    #[test]
+    fn test_data_movement_multipart_checksum_type_uses_source_metadata() {
+        let object_info = ObjectInfo {
+            user_defined: Arc::new(HashMap::from([
+                (rustfs_rio::RUSTFS_MULTIPART_CHECKSUM.to_string(), ChecksumType::CRC64_NVME.to_string()),
+                (
+                    rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE.to_string(),
+                    ChecksumType::CRC64_NVME.obj_type().to_string(),
+                ),
+            ])),
+            ..Default::default()
+        };
+
+        assert_eq!(data_movement_multipart_checksum_type(&object_info), Some(ChecksumType::CRC64_NVME));
+    }
+
+    #[test]
+    fn test_data_movement_complete_part_preserves_source_part_checksums() {
+        let source_part = ObjectPartInfo {
+            number: 2,
+            etag: "etag-2".to_string(),
+            checksums: Some(HashMap::from([
+                (ChecksumType::CRC32.to_string(), "crc32-value".to_string()),
+                (ChecksumType::CRC32C.to_string(), "crc32c-value".to_string()),
+                (ChecksumType::SHA1.to_string(), "sha1-value".to_string()),
+                (ChecksumType::SHA256.to_string(), "sha256-value".to_string()),
+                (ChecksumType::CRC64_NVME.to_string(), "crc64-value".to_string()),
+            ])),
+            ..Default::default()
+        };
+
+        let complete = data_movement_complete_part(2, Some("etag-2".to_string()), &source_part);
+
+        assert_eq!(complete.part_num, 2);
+        assert_eq!(complete.etag.as_deref(), Some("etag-2"));
+        assert_eq!(complete.checksum_crc32.as_deref(), Some("crc32-value"));
+        assert_eq!(complete.checksum_crc32c.as_deref(), Some("crc32c-value"));
+        assert_eq!(complete.checksum_sha1.as_deref(), Some("sha1-value"));
+        assert_eq!(complete.checksum_sha256.as_deref(), Some("sha256-value"));
+        assert_eq!(complete.checksum_crc64nvme.as_deref(), Some("crc64-value"));
+    }
+
+    #[tokio::test]
     async fn test_multipart_part_stream_preserves_boundaries() {
         let stream: Box<dyn AsyncRead + Unpin + Send + Sync> = Box::new(Cursor::new(b"abcdef".to_vec()));
         let shared = Arc::new(Mutex::new(stream));
@@ -722,6 +885,89 @@ mod tests {
             .expect("bounded part reader should retain compression index");
 
         assert!(data.stream.try_get_index().is_some());
+    }
+
+    #[test]
+    fn test_data_movement_metadata_equivalence_accepts_required_fields() {
+        let version_id = Uuid::nil();
+        let mod_time = OffsetDateTime::UNIX_EPOCH;
+        let metadata = Arc::new(HashMap::from([
+            ("x-amz-meta-key".to_string(), "value".to_string()),
+            (rustfs_utils::http::AMZ_STORAGE_CLASS.to_string(), "STANDARD_IA".to_string()),
+            (X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(), "GOVERNANCE".to_string()),
+            (
+                X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+                "2030-01-01T00:00:00Z".to_string(),
+            ),
+            (X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "ON".to_string()),
+        ]));
+        let part = ObjectPartInfo {
+            number: 1,
+            etag: "part-etag".to_string(),
+            size: 128,
+            actual_size: 128,
+            checksums: Some(HashMap::from([(ChecksumType::CRC32C.to_string(), "part-checksum".to_string())])),
+            ..Default::default()
+        };
+        let info = ObjectInfo {
+            version_id: Some(version_id),
+            etag: Some("etag-value".to_string()),
+            size: 128,
+            actual_size: 128,
+            mod_time: Some(mod_time),
+            user_defined: metadata,
+            storage_class: Some("STANDARD_IA".to_string()),
+            checksum: Some(Bytes::from_static(b"object-checksum")),
+            replication_status_internal: Some("arn:minio:replication:target=COMPLETED;".to_string()),
+            replication_status: rustfs_filemeta::ReplicationStatusType::Completed,
+            version_purge_status_internal: Some("arn:minio:replication:target=PENDING;".to_string()),
+            version_purge_status: rustfs_filemeta::VersionPurgeStatusType::Pending,
+            parts: Arc::new(vec![part]),
+            ..Default::default()
+        };
+
+        assert_data_movement_metadata_equivalent(&info, &info.clone());
+    }
+
+    #[test]
+    fn test_data_movement_opts_preserve_replication_and_object_lock_metadata() {
+        let version_id = Uuid::nil();
+        let object_info = ObjectInfo {
+            version_id: Some(version_id),
+            user_defined: Arc::new(HashMap::from([
+                (
+                    rustfs_utils::http::SUFFIX_REPLICATION_STATUS.to_string(),
+                    "arn:minio:target=PENDING;".to_string(),
+                ),
+                (X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(), "COMPLIANCE".to_string()),
+                (
+                    X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+                    "2031-01-01T00:00:00Z".to_string(),
+                ),
+                (X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "ON".to_string()),
+            ])),
+            ..Default::default()
+        };
+
+        let put_opts = data_movement_put_object_opts(&object_info, 3);
+        let new_multipart_opts = data_movement_new_multipart_opts(&object_info, 3);
+
+        assert_eq!(
+            put_opts.user_defined.get(rustfs_utils::http::SUFFIX_REPLICATION_STATUS),
+            Some(&"arn:minio:target=PENDING;".to_string())
+        );
+        assert_eq!(
+            new_multipart_opts.user_defined.get(X_AMZ_OBJECT_LOCK_MODE.as_str()),
+            Some(&"COMPLIANCE".to_string())
+        );
+        assert_eq!(
+            put_opts.user_defined.get(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str()),
+            Some(&"2031-01-01T00:00:00Z".to_string())
+        );
+        assert_eq!(
+            new_multipart_opts.user_defined.get(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str()),
+            Some(&"ON".to_string())
+        );
     }
 
     #[test]
