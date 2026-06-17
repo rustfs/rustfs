@@ -20,7 +20,7 @@ Each plan below should be reviewed and executed independently unless the plan ex
 | `rebalance-decommission-phase1-safety-plan.md` | F01, F02, F03, F04, F05 | Drafted | Protect object-version semantics and cluster operation safety |
 | `rebalance-decommission-phase2-data-movement-plan.md` | F06, F07, F08, F09, F10 | Drafted | Stream multipart migration, preserve metadata, and improve convergence |
 | `rebalance-decommission-phase3-hardening-plan.md` | F11, F12, F13, F14 | Drafted | Improve cleanup reporting, auditability, metadata decoding, and threshold docs |
-| `rebalance-decommission-followup-review-plan.md` | R01-R11 | Drafted | Close post-implementation review gaps found after F01-F14 |
+| `rebalance-decommission-followup-review-plan.md` | R01-R15 | Drafted | Close post-implementation review gaps found after F01-F14 |
 
 ## Execution Recommendation
 

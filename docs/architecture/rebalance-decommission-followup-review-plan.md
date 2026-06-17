@@ -15,8 +15,10 @@
 This plan covers only the gaps found during the follow-up review:
 
 - P1 gaps that can leave cluster state inconsistent or object metadata incomplete.
+- P1 async-lock gaps that can block pool routing, status reads, and decommission progress while disk or peer operations are pending.
 - P2 gaps where the implementation is safer than before but does not fully meet the written acceptance criteria.
 - One P3 test-depth gap for startup recovery.
+- One P3 MinIO compatibility gap where RustFS is intentionally more conservative today but the product contract is not yet explicit.
 
 The following original items had no new material finding in this review and do not need a follow-up task here:
 
@@ -25,21 +27,35 @@ The following original items had no new material finding in this review and do n
 - F10: source cleanup preflight placement and not-found idempotence.
 - F14: MinIO-like rebalance completion tolerance.
 
+## Validated Additional Findings
+
+The following externally reported issues were checked against the current code and are treated as real planning items:
+
+- Decommission start still writes active local `pool_meta` before peer `reload_pool_meta()`. If reload fails, the admin handler returns an error before worker spawning, leaving an active decommission marker that can suspend the source pool without a running worker. Covered by upgraded R06.
+- Rebalance start still performs `check -> init_rebalance_meta -> start_rebalance -> peer load_rebalance_meta(true)` without one atomic start guard. Peer failure is covered by R01; concurrent start identity races are covered by new R13.
+- Multiple decommission paths still hold `pool_meta.write()` across `save(...).await`, including start, cancel, failed, complete, bucket-done, and progress-save paths. Covered by new R12.
+- Last-delete-marker skip behavior exists in both decommission and rebalance and has helper-level tests, but lacks MinIO-compatible version-listing regression coverage after migration and cleanup. Covered by new R14.
+- The admin handler accepts comma-separated decommission targets, but store validation rejects more than one target pool. This is conservative, but the MinIO compatibility contract is not documented or implemented. Covered by new R15.
+
 ## Execution Order
 
 | Order | Task | Original Fix | Priority | Main Risk |
 | --- | --- | --- | --- | --- |
 | 1 | R01 | F05 | P1 | Admin rebalance start can fail while local worker keeps running |
-| 2 | R02 | F07 | P1 | Multipart migration can drop per-part checksum metadata |
-| 3 | R03 | F09 | P1 | Overwrite convergence can accept incomplete target metadata |
-| 4 | R04 | F11 | P1 | Cleanup warning metadata can become self-inconsistent and fail decode |
-| 5 | R05 | F01 | P2 | Rebalance delete marker target write can stall when default placement selects source |
-| 6 | R06 | F03 | P2 | Failed decommission reload leaves no durable degraded state |
-| 7 | R07 | F05 | P2 | Stop status can report stopped while workers are still winding down |
-| 8 | R08 | F08/F10 | P2 | Cleanup preflight can reject safely expired versions already removed by lifecycle |
-| 9 | R09 | F12 | P2 | Decommission rejected-request logs lack complete audit context |
-| 10 | R10 | F13 | P2 | Legacy pool metadata fallback can bypass unknown-field hardening |
-| 11 | R11 | F04 | P3 | Store init recovery lacks full integration-level regression coverage |
+| 2 | R06 | F03 | P1 | Failed decommission reload can leave active metadata without a worker |
+| 3 | R12 | F03 | P1 | Pool metadata write lock is held across async saves |
+| 4 | R02 | F07 | P1 | Multipart migration can drop per-part checksum metadata |
+| 5 | R03 | F09 | P1 | Overwrite convergence can accept incomplete target metadata |
+| 6 | R04 | F11 | P1 | Cleanup warning metadata can become self-inconsistent and fail decode |
+| 7 | R13 | F05 | P2 | Concurrent rebalance starts can return stale operation IDs |
+| 8 | R05 | F01 | P2 | Rebalance delete marker target write can stall when default placement selects source |
+| 9 | R07 | F05 | P2 | Stop status can report stopped while workers are still winding down |
+| 10 | R08 | F08/F10 | P2 | Cleanup preflight can reject safely expired versions already removed by lifecycle |
+| 11 | R09 | F12 | P2 | Decommission rejected-request logs lack complete audit context |
+| 12 | R10 | F13 | P2 | Legacy pool metadata fallback can bypass unknown-field hardening |
+| 13 | R14 | F01 | P2 | Last delete marker migration semantics lack MinIO-compatible E2E proof |
+| 14 | R11 | F04 | P3 | Store init recovery lacks full integration-level regression coverage |
+| 15 | R15 | Compatibility | P3 | Multi-pool decommission support is accepted by API shape but rejected by store |
 
 ## Shared Rules
 
@@ -348,7 +364,7 @@ git commit -m "fix(rebalance): target delete marker movement"
 
 ---
 
-## R06: Persist or Block Decommission Reload-degraded State
+## R06: Prevent Active-but-no-worker Decommission Starts
 
 ### Original Fix
 
@@ -356,7 +372,7 @@ F03: Decommission pool meta reload barrier.
 
 ### Finding
 
-`start_decommission()` saves active `pool_meta` before peer reload. Reload failure returns an API error, but the persisted decommission state does not record that the cluster failed to acknowledge it. A restart can resume the failed start.
+`start_decommission()` saves active `pool_meta` before peer reload. Reload failure returns an API error before the admin handler reaches `spawn_decommission_routines`, but the local pool already has active decommission metadata. That state can make `is_suspended()` exclude the pool and `is_decommission_running()` block rebalance while no local decommission worker is moving data until restart recovery happens.
 
 ### Files
 
@@ -373,19 +389,23 @@ Choose one implementation before coding:
 1. **Rollback on reload failure.**
    - Revert the just-written decommission state and save pool meta again.
    - Safer for user-visible API semantics, but needs careful persistence handling.
+   - Do not use cancel semantics if cancel means "decommissioned pool remains out of ordinary placement" in MinIO-compatible behavior.
 
 2. **Persist degraded state.**
    - Add a durable `reload_failed` or `start_degraded` marker to decommission info.
    - Admin status exposes the marker.
    - Store init refuses to auto-resume degraded decommission until reload succeeds or an admin action clears it.
+   - The admin handler may still start local workers only if the degraded state is explicit and visible in status/logs.
 
-Recommended first implementation: rollback if the current pool meta mutation can be reverted locally without losing unrelated state; otherwise persist degraded state.
+Recommended first implementation: rollback if the current pool meta mutation can be reverted locally without losing unrelated state; otherwise persist degraded state and keep local workers running while surfacing the propagation failure. Do not return an error while leaving active metadata with no worker.
 
 ### Implementation Steps
 
-- [ ] Add a failing test where `reload_pool_meta()` fails after `pool_meta.save()` and restart logic must not resume workers as if start succeeded.
+- [ ] Add a failing test where `reload_pool_meta()` fails after `pool_meta.save()` and the resulting local state is not active without a worker.
 - [ ] Implement the selected rollback or degraded-state behavior.
-- [ ] Add status/error text that includes `reload_pool_meta` and peer failure context.
+- [ ] If rollback is chosen, prove `is_suspended()` and `is_decommission_running()` return normal non-decommission behavior after the failed start.
+- [ ] If degraded-start-with-worker is chosen, prove status/logs expose `reload_pool_meta` failure and local worker startup proceeds.
+- [ ] Add restart coverage proving failed starts do not auto-resume as successful starts unless the durable degraded-state design explicitly allows it.
 - [ ] Run:
 
 ```bash
@@ -398,15 +418,17 @@ cargo fmt --all --check
 
 ### Acceptance Criteria
 
-- Admin start failure does not silently become a resumable successful decommission.
-- Operators can see that reload failed or that rollback happened.
+- Admin start failure cannot leave active decommission metadata without a local worker.
+- Failed propagation either rolls back local active state or starts local workers with visible degraded status.
+- Rebalance is not blocked by a hidden half-started decommission.
+- Operators can see that reload failed, rollback happened, or degraded local execution is active.
 - Existing successful decommission start behavior remains unchanged.
 
 ### Commit
 
 ```bash
 git add crates/ecstore/src/pools.rs crates/ecstore/src/store/init.rs rustfs/src/admin/handlers/pools.rs
-git commit -m "fix(decommission): handle reload-degraded starts"
+git commit -m "fix(decommission): prevent half-started state"
 ```
 
 ---
@@ -692,9 +714,250 @@ git commit -m "test(init): cover decommission rebalance recovery"
 
 ---
 
+## R12: Remove Async Saves from Pool Metadata Write Guards
+
+### Original Fix
+
+F03: Decommission pool metadata durability and reload semantics.
+
+### Finding
+
+Several decommission paths call `pool_meta.save(...).await` while holding `self.pool_meta.write().await`. Confirmed locations include start, cancel, failed, complete, bucket-done, and progress-save paths in `crates/ecstore/src/pools.rs`. This can block `is_suspended()`, pool routing, admin status, and progress updates while disk or peer metadata work is pending. It also violates `crates/AGENTS.md`, which forbids holding Tokio write guards across `.await` unless bounded and unavoidable.
+
+### Files
+
+- Modify: `crates/ecstore/src/pools.rs`
+- Test: `crates/ecstore/src/pools.rs`
+
+### Design
+
+Convert each affected path to a short lock section:
+
+1. Acquire the write guard.
+2. Validate and mutate in-memory metadata.
+3. Clone the minimal save snapshot or full `PoolMeta` snapshot needed for persistence.
+4. Release the write guard before awaiting disk save or peer reload.
+5. On save failure, reacquire a short write guard to roll back or mark an explicit degraded/error state.
+
+Do not broaden this task into a metadata rewrite. Keep the change local to existing decommission save paths.
+
+### Implementation Steps
+
+- [ ] Inventory all `pool_meta.write()` sections in `crates/ecstore/src/pools.rs` that await `save()`.
+- [ ] Add a helper only if it materially reduces repeated snapshot/save/error handling across affected paths.
+- [ ] Refactor `start_decommission`, `decommission_cancel`, `decommission_failed`, `complete_decommission`, bucket-done, and progress-save paths so no Tokio write guard lives across `save(...).await`.
+- [ ] Add a regression test with an instrumented or delayed save seam proving a concurrent read-side operation such as `is_suspended()` or decommission status lookup is not blocked by an in-flight save.
+- [ ] Run:
+
+```bash
+cargo test -p rustfs-ecstore decommission --lib
+cargo test -p rustfs-ecstore pool_meta --lib
+cargo test -p rustfs pools --lib
+cargo fmt --all --check
+```
+
+### Acceptance Criteria
+
+- No `self.pool_meta.write().await` guard in decommission paths is held across `pool_meta.save(...).await`.
+- Save failures remain visible and do not silently lose required metadata state.
+- Pool routing/status reads are not blocked for the duration of slow metadata saves.
+- Existing decommission start/cancel/complete behavior remains unchanged except for improved lock scope.
+
+### Commit
+
+```bash
+git add crates/ecstore/src/pools.rs
+git commit -m "fix(decommission): save pool meta outside write lock"
+```
+
+---
+
+## R13: Serialize Rebalance Start Check, Init, and Worker Start
+
+### Original Fix
+
+F05: Rebalance distributed start semantics.
+
+### Finding
+
+The admin handler checks `is_rebalance_conflicting_with_decommission()`, then separately calls `init_rebalance_meta()` and `start_rebalance()`. `init_rebalance_meta()` writes a fresh operation ID after async storage-info and metadata-save work. Two concurrent starts can both pass the initial check, generate different IDs, and return an ID that no longer matches the effective metadata.
+
+### Files
+
+- Modify: `rustfs/src/admin/handlers/rebalance.rs`
+- Modify: `crates/ecstore/src/rebalance.rs`
+- Test: `crates/ecstore/src/rebalance.rs`
+- Test if needed: `rustfs/src/admin/handlers/rebalance.rs`
+
+### Design
+
+Make rebalance start a single serialized operation:
+
+- Prefer a dedicated start mutex or metadata namespace lock that covers check, init, and local start.
+- Alternatively, make `init_rebalance_meta()` reject existing active metadata with `OperationAborted` semantics before saving a new ID.
+- Keep R01 propagation rollback behavior compatible with the chosen guard.
+
+The guard should prevent duplicate local starts and stale returned operation IDs. It should not block unrelated status reads longer than necessary.
+
+### Implementation Steps
+
+- [ ] Add a concurrent-start regression test where two start attempts race and only one operation ID can be accepted.
+- [ ] Add or reuse a start guard around check, `init_rebalance_meta()`, and `start_rebalance()`.
+- [ ] Ensure the loser receives `OperationAborted` or an equivalent existing admin error instead of a stale success ID.
+- [ ] Verify R01 rollback path releases the guard and leaves later starts possible.
+- [ ] Run:
+
+```bash
+cargo test -p rustfs-ecstore start_rebalance --lib
+cargo test -p rustfs-ecstore rebalance --lib
+cargo test -p rustfs rebalance --lib
+cargo fmt --all --check
+```
+
+### Acceptance Criteria
+
+- Concurrent admin rebalance start requests cannot both return successful different IDs.
+- The accepted operation ID matches persisted and in-memory rebalance metadata.
+- Failed or rolled-back starts do not permanently block later starts.
+
+### Commit
+
+```bash
+git add crates/ecstore/src/rebalance.rs rustfs/src/admin/handlers/rebalance.rs
+git commit -m "fix(rebalance): serialize start operations"
+```
+
+---
+
+## R14: Prove Last-delete-marker Migration Semantics Against MinIO Behavior
+
+### Original Fix
+
+F01: Delete marker and object-version safety.
+
+### Finding
+
+Both decommission and rebalance skip the last remaining delete marker when replication is not configured, then count that version as complete and may clean up the source entry. The helper-level tests prove the predicate, but they do not prove the user-visible behavior after migration: `ListObjectVersions`, current-object `GET`, and version-specific `GET` can expose whether version metadata was lost. Because this behavior was intentionally hardened earlier, treat it as a compatibility proof task first, not an immediate bug fix.
+
+### Files
+
+- Test: `crates/e2e_test/src/`
+- Test if cheaper seam exists: `crates/ecstore/src/pools.rs`
+- Test if cheaper seam exists: `crates/ecstore/src/rebalance.rs`
+
+### Design
+
+Add MinIO-compatible regression coverage for versioned buckets:
+
+- Case A: object has only a delete marker.
+- Case B: object has a delete marker plus historical data version.
+- Case C: repeat A and B with delete-marker replication configured or explicitly absent.
+
+For each case, exercise decommission and rebalance when feasible, then verify:
+
+- `ListObjectVersions` still reports the expected versions/delete markers.
+- Current-object `GET` preserves delete-marker not-found semantics.
+- Version-specific `GET` preserves access to historical versions.
+
+If the test proves RustFS intentionally differs from MinIO, record the product decision in this plan before changing code.
+
+### Implementation Steps
+
+- [ ] Identify the narrowest existing E2E harness that can create multi-pool RustFS and call admin decommission/rebalance.
+- [ ] Add versioned-bucket scenarios for only-delete-marker and delete-marker-plus-history.
+- [ ] Add assertions for `ListObjectVersions`, current `GET`, and version-specific `GET` after migration and source cleanup.
+- [ ] If the current behavior loses required version metadata, split the actual behavior fix into a new implementation task before broadening R14.
+- [ ] Run:
+
+```bash
+cargo test -p rustfs-ecstore rebalance_delete_marker --lib
+cargo test -p rustfs-ecstore decommission --lib
+cargo test -p e2e_test versioning -- --nocapture
+cargo fmt --all --check
+```
+
+### Acceptance Criteria
+
+- Last-delete-marker migration semantics are covered by user-visible versioning assertions.
+- Any RustFS/MinIO behavior difference is either fixed or explicitly documented with product approval.
+- Source cleanup cannot remove the only user-visible version metadata without a failing test.
+
+### Commit
+
+```bash
+git add crates/e2e_test/src crates/ecstore/src/pools.rs crates/ecstore/src/rebalance.rs
+git commit -m "test(data-movement): cover delete marker migration"
+```
+
+---
+
+## R15: Define Multi-pool Decommission Compatibility Semantics
+
+### Original Fix
+
+Compatibility follow-up for decommission admin behavior.
+
+### Finding
+
+`rustfs/src/admin/handlers/pools.rs` parses comma-separated pool targets, but `crates/ecstore/src/pools.rs` rejects more than one index with "decommission supports one target pool at a time". This is conservative and not directly dangerous, but MinIO supports submitting multiple pools for queued serial decommission. RustFS should either document the stricter contract or implement queue semantics.
+
+### Files
+
+- Modify: `docs/`
+- Modify if implementing compatibility: `crates/ecstore/src/pools.rs`
+- Modify if implementing compatibility: `rustfs/src/admin/handlers/pools.rs`
+- Test if implementing compatibility: `crates/ecstore/src/pools.rs`
+- Test if implementing compatibility: `rustfs/src/admin/handlers/pools.rs`
+
+### Design Options
+
+Choose one implementation before coding:
+
+1. **Document single-pool support for now.**
+   - Keep current store behavior.
+   - Update admin/API/architecture documentation to state that RustFS accepts only one target pool per decommission request.
+   - Keep the existing reject test as the compatibility guard.
+
+2. **Implement MinIO-like queued multi-pool decommission.**
+   - Accept multiple target pools.
+   - Persist a serial queue, not parallel movement, unless product requirements say otherwise.
+   - Ensure only the active pool is suspended/decommissioning at a time.
+   - Add status that reports queued, active, completed, failed, and canceled pools.
+
+Recommended first implementation: document the current single-pool contract unless MinIO CLI compatibility is a release blocker.
+
+### Implementation Steps
+
+- [ ] Confirm whether RustFS requires MinIO-compatible multi-pool submission for the target release.
+- [ ] If documenting, update the relevant admin/decommission docs and keep the existing rejection behavior.
+- [ ] If implementing, add a persisted decommission queue and tests proving serial execution across multiple pools.
+- [ ] Add an admin-level test that comma-separated multiple pools either returns the documented error or creates the expected queue.
+- [ ] Run:
+
+```bash
+cargo test -p rustfs-ecstore start_decommission --lib
+cargo test -p rustfs pools --lib
+cargo fmt --all --check
+```
+
+### Acceptance Criteria
+
+- RustFS behavior for multi-pool decommission is explicit and tested.
+- If single-pool-only remains, the error is documented as intentional compatibility scope.
+- If queued mode is implemented, only one pool is actively decommissioned at a time and restart recovery preserves queue order.
+
+### Commit
+
+```bash
+git add docs crates/ecstore/src/pools.rs rustfs/src/admin/handlers/pools.rs
+git commit -m "docs(decommission): define multi-pool support"
+```
+
+---
+
 ## Follow-up Test Matrix
 
-Run after all R01-R11 tasks are complete:
+Run after all R01-R15 tasks are complete:
 
 ```bash
 cargo test -p rustfs-ecstore rebalance --lib
@@ -702,8 +965,10 @@ cargo test -p rustfs-ecstore decommission --lib
 cargo test -p rustfs-ecstore data_movement --lib
 cargo test -p rustfs-ecstore multipart --lib
 cargo test -p rustfs-ecstore metadata --lib
+cargo test -p rustfs-ecstore pool_meta --lib
 cargo test -p rustfs rebalance --lib
 cargo test -p rustfs pools --lib
+cargo test -p e2e_test versioning -- --nocapture
 scripts/check_logging_guardrails.sh
 cargo fmt --all --check
 ```
@@ -722,5 +987,8 @@ After build-based verification, clean generated build artifacts to avoid unneces
 
 - R02 should be completed before R03 because overwrite equivalence should compare the metadata that migration actually persists.
 - R01 should be completed before R07 because rollback behavior and stopping status share stop semantics.
+- R12 should be reviewed before R06 implementation because decommission start rollback/degraded handling should not add new lock-across-await cases.
 - R04 should be completed before any wider metadata hardening because it prevents newly strict decode from rejecting metadata produced by the current merge path.
 - R06 may require a product decision between rollback and durable degraded state. If that decision cannot be made during implementation, stop before code changes and record the trade-off.
+- R14 is a proof task first. If it demonstrates data loss or MinIO-incompatible behavior, create a separate implementation task instead of hiding behavior changes inside the test task.
+- R15 needs an explicit product decision before code changes; documentation-only single-pool support is acceptable if queued multi-pool decommission is not a release requirement.
