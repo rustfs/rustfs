@@ -262,6 +262,7 @@ where
     F: FnMut(usize, String, GetObjectReader) -> Fut + Send,
     Fut: Future<Output = Result<()>> + Send,
 {
+    let rx = CancellationToken::new();
     migrate_entry_version_with_delete_marker(
         set,
         bucket,
@@ -272,6 +273,7 @@ where
         ignore_data_usage_cache,
         transfer,
         |bucket, object, opts| async move { set.delete_object_for_migration(&bucket, &object, opts).await },
+        &rx,
     )
     .await
 }
@@ -287,6 +289,7 @@ async fn migrate_entry_version_with_delete_marker<Backend, F, Fut, D, DFut>(
     ignore_data_usage_cache: bool,
     transfer: F,
     move_delete_marker: D,
+    rx: &CancellationToken,
 ) -> MigrationVersionResult
 where
     Backend: MigrationBackend + ?Sized,
@@ -306,6 +309,7 @@ where
         transfer,
         move_delete_marker,
         sleep_rebalance_migration_retry,
+        rx,
     )
     .await
 }
@@ -321,13 +325,14 @@ async fn migrate_entry_version_with_retry_wait<Backend, F, Fut, W, WFut>(
     ignore_data_usage_cache: bool,
     transfer: F,
     wait_retry: W,
+    rx: &CancellationToken,
 ) -> MigrationVersionResult
 where
     Backend: MigrationBackend + ?Sized,
     F: FnMut(usize, String, GetObjectReader) -> Fut + Send,
     Fut: Future<Output = Result<()>> + Send,
-    W: FnMut(Duration) -> WFut + Send,
-    WFut: Future<Output = ()> + Send,
+    W: FnMut(CancellationToken, Duration) -> WFut + Send,
+    WFut: Future<Output = Result<()>> + Send,
 {
     migrate_entry_version_with_delete_marker_and_retry_wait(
         set,
@@ -340,6 +345,7 @@ where
         transfer,
         |bucket, object, opts| async move { set.delete_object_for_migration(&bucket, &object, opts).await },
         wait_retry,
+        rx,
     )
     .await
 }
@@ -356,6 +362,7 @@ async fn migrate_entry_version_with_delete_marker_and_retry_wait<Backend, F, Fut
     mut transfer: F,
     mut move_delete_marker: D,
     mut wait_retry: W,
+    rx: &CancellationToken,
 ) -> MigrationVersionResult
 where
     Backend: MigrationBackend + ?Sized,
@@ -363,8 +370,8 @@ where
     Fut: Future<Output = Result<()>> + Send,
     D: FnMut(String, String, ObjectOptions) -> DFut + Send,
     DFut: Future<Output = Result<ObjectInfo>> + Send,
-    W: FnMut(Duration) -> WFut + Send,
-    WFut: Future<Output = ()> + Send,
+    W: FnMut(CancellationToken, Duration) -> WFut + Send,
+    WFut: Future<Output = Result<()>> + Send,
 {
     let max_attempts = max_attempts.max(1);
 
@@ -465,7 +472,16 @@ where
                     };
                 }
 
-                wait_retry(rebalance_migration_retry_delay(attempt, err)).await;
+                if let Err(err) = wait_retry(rx.clone(), rebalance_migration_retry_delay(attempt, err)).await {
+                    return MigrationVersionResult {
+                        moved: false,
+                        ignored: false,
+                        cleanup_ignored: false,
+                        failed: true,
+                        stage: Some("read_source"),
+                        error: Some(err),
+                    };
+                }
                 continue;
             }
         };
@@ -497,7 +513,16 @@ where
                 };
             }
 
-            wait_retry(rebalance_migration_retry_delay(attempt, err)).await;
+            if let Err(err) = wait_retry(rx.clone(), rebalance_migration_retry_delay(attempt, err)).await {
+                return MigrationVersionResult {
+                    moved: false,
+                    ignored: false,
+                    cleanup_ignored: false,
+                    failed: true,
+                    stage: Some("write_target"),
+                    error: Some(err),
+                };
+            }
             continue;
         }
 
@@ -2567,8 +2592,11 @@ fn rebalance_lock_retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(jitter_millis)
 }
 
-async fn sleep_rebalance_migration_retry(delay: Duration) {
-    tokio::time::sleep(delay).await;
+async fn sleep_rebalance_migration_retry(rx: CancellationToken, delay: Duration) -> Result<()> {
+    tokio::select! {
+        _ = rx.cancelled() => Err(Error::OperationCanceled),
+        _ = tokio::time::sleep(delay) => Ok(()),
+    }
 }
 
 async fn wait_rebalance_listing_retry(rx: &CancellationToken, delay: Duration) -> Result<()> {
@@ -3243,6 +3271,7 @@ impl ECStore {
                 should_ignore_rebalance_data_usage_cache(bucket.as_str()),
                 &mut transfer,
                 &mut move_delete_marker,
+                &rx,
             )
             .await;
 
@@ -3866,9 +3895,10 @@ mod rebalance_unit_tests {
         should_accept_rebalance_stats_update, should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete,
         should_defer_rebalance_entry_failure, should_ignore_rebalance_data_usage_cache, should_pool_participate,
         should_preserve_rebalance_stopped_state, should_retry_rebalance_listing, should_skip_rebalance_delete_marker,
-        should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_meta_snapshot_for_id, stop_rebalance_state,
-        take_bucket_from_rebalance_queue, validate_rebalance_start_gate_state, validate_rebalance_start_pool_meta,
-        validate_start_rebalance_state, wait_rebalance_listing_retry, with_rebalance_entry_context,
+        should_skip_start_rebalance, sleep_rebalance_migration_retry, stop_rebalance_meta_snapshot,
+        stop_rebalance_meta_snapshot_for_id, stop_rebalance_state, take_bucket_from_rebalance_queue,
+        validate_rebalance_start_gate_state, validate_rebalance_start_pool_meta, validate_start_rebalance_state,
+        wait_rebalance_listing_retry, with_rebalance_entry_context,
     };
     use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -4215,6 +4245,7 @@ mod rebalance_unit_tests {
     async fn test_migrate_entry_version_deleted_version_uses_target_delete_marker_mover() {
         let backend = MigrationBackendSpy::new(None, Some(Err(Error::SlowDown)), None);
         let version = version_deleted();
+        let rx = CancellationToken::new();
         let move_delete_marker_count = Arc::new(AtomicUsize::new(0));
         let mut transfer = |_, _, _| async move { Ok(()) };
         let mut move_delete_marker = {
@@ -4238,6 +4269,7 @@ mod rebalance_unit_tests {
             false,
             &mut transfer,
             &mut move_delete_marker,
+            &rx,
         )
         .await;
 
@@ -4255,6 +4287,7 @@ mod rebalance_unit_tests {
     async fn test_migrate_entry_version_deleted_version_target_failure_blocks_completion() {
         let backend = MigrationBackendSpy::new(None, Some(Ok(ObjectInfo::default())), None);
         let version = version_deleted();
+        let rx = CancellationToken::new();
         let mut transfer = |_, _, _| async move { Ok(()) };
         let mut move_delete_marker = |_bucket: String, _object: String, _opts: ObjectOptions| async move { Err(Error::SlowDown) };
 
@@ -4268,6 +4301,7 @@ mod rebalance_unit_tests {
             false,
             &mut transfer,
             &mut move_delete_marker,
+            &rx,
         )
         .await;
 
@@ -4379,6 +4413,7 @@ mod rebalance_unit_tests {
     #[tokio::test]
     async fn test_migrate_entry_version_reader_retries_before_success() {
         let backend = MigrationBackendSpy::new(Some(Err(Error::SlowDown)), None, None);
+        let rx = CancellationToken::new();
         let transfer_count = Arc::new(AtomicUsize::new(0));
         let wait_count = Arc::new(AtomicUsize::new(0));
         let mut transfer = {
@@ -4404,13 +4439,15 @@ mod rebalance_unit_tests {
             &mut transfer,
             {
                 let wait_count = wait_count.clone();
-                move |_| {
+                move |_, _| {
                     let wait_count = wait_count.clone();
                     async move {
                         wait_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
                     }
                 }
             },
+            &rx,
         )
         .await;
 
@@ -4423,6 +4460,34 @@ mod rebalance_unit_tests {
         assert_eq!(backend.delete_calls(), 0);
         assert_eq!(transfer_count.load(Ordering::SeqCst), 1);
         assert_eq!(wait_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_entry_version_reader_retry_observes_cancellation() {
+        let backend = MigrationBackendSpy::new(Some(Err(Error::SlowDown)), None, None);
+        let rx = CancellationToken::new();
+        rx.cancel();
+        let mut transfer = |_, _, _| async move { Ok(()) };
+
+        let version = version_normal();
+        let result = migrate_entry_version_with_retry_wait(
+            &backend,
+            "bucket".to_string(),
+            1,
+            &version,
+            version.version_id.map(|v| v.to_string()),
+            3,
+            false,
+            &mut transfer,
+            sleep_rebalance_migration_retry,
+            &rx,
+        )
+        .await;
+
+        assert!(result.failed);
+        assert_eq!(result.stage, Some("read_source"));
+        assert!(matches!(result.error, Some(Error::OperationCanceled)));
+        assert_eq!(backend.get_calls(), 1);
     }
 
     struct AlwaysFailGetBackend {
@@ -4547,6 +4612,7 @@ mod rebalance_unit_tests {
     #[tokio::test]
     async fn test_migrate_entry_version_transfer_retries_before_success() {
         let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None, None);
+        let rx = CancellationToken::new();
         let transfer_count = Arc::new(AtomicUsize::new(0));
         let wait_count = Arc::new(AtomicUsize::new(0));
         let mut transfer = {
@@ -4575,13 +4641,15 @@ mod rebalance_unit_tests {
             &mut transfer,
             {
                 let wait_count = wait_count.clone();
-                move |_| {
+                move |_, _| {
                     let wait_count = wait_count.clone();
                     async move {
                         wait_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
                     }
                 }
             },
+            &rx,
         )
         .await;
 
@@ -4597,6 +4665,7 @@ mod rebalance_unit_tests {
     #[tokio::test]
     async fn test_migrate_entry_version_transfer_non_transient_fails_without_retry() {
         let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None, None);
+        let rx = CancellationToken::new();
         let transfer_count = Arc::new(AtomicUsize::new(0));
         let wait_count = Arc::new(AtomicUsize::new(0));
         let mut transfer = {
@@ -4622,13 +4691,15 @@ mod rebalance_unit_tests {
             &mut transfer,
             {
                 let wait_count = wait_count.clone();
-                move |_| {
+                move |_, _| {
                     let wait_count = wait_count.clone();
                     async move {
                         wait_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
                     }
                 }
             },
+            &rx,
         )
         .await;
 
@@ -5833,6 +5904,18 @@ mod rebalance_unit_tests {
         let err = wait_rebalance_listing_retry(&token, Duration::from_secs(30))
             .await
             .expect_err("canceled rebalance should not wait before retrying");
+
+        assert!(matches!(err, Error::OperationCanceled));
+    }
+
+    #[tokio::test]
+    async fn test_sleep_rebalance_migration_retry_returns_canceled_without_sleeping() {
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let err = sleep_rebalance_migration_retry(token, Duration::from_secs(30))
+            .await
+            .expect_err("canceled rebalance should not wait before migration retry");
 
         assert!(matches!(err, Error::OperationCanceled));
     }
