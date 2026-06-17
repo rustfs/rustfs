@@ -258,21 +258,32 @@ fn is_data_movement_delete_marker(info: &ObjectInfo) -> bool {
     info.delete_marker
 }
 
+fn expected_data_movement_tiered_object(source: &rustfs_filemeta::FileInfo) -> ObjectInfo {
+    ObjectInfo::from_file_info(source, "", &source.name, source.version_id.is_some())
+}
+
 fn is_equivalent_data_movement_tiered_object(source: &rustfs_filemeta::FileInfo, target: &ObjectInfo) -> bool {
+    let expected = expected_data_movement_tiered_object(source);
+
     source.version_id == target.version_id
         && !target.delete_marker
         && source.size == target.size
         && source.get_etag() == target.etag
         && source.checksum == target.checksum
         && source.mod_time == target.mod_time
-        && source.transition_status == target.transitioned_object.status
-        && source.transitioned_objname == target.transitioned_object.name
-        && source.transition_tier == target.transitioned_object.tier
-        && source
-            .transition_version_id
-            .map(|version_id| version_id.to_string())
-            .unwrap_or_default()
-            == target.transitioned_object.version_id
+        && expected.user_defined == target.user_defined
+        && expected.user_tags == target.user_tags
+        && expected.expires == target.expires
+        && expected.storage_class == target.storage_class
+        && expected.replication_status_internal == target.replication_status_internal
+        && expected.replication_status == target.replication_status
+        && expected.version_purge_status_internal == target.version_purge_status_internal
+        && expected.version_purge_status == target.version_purge_status
+        && expected.transitioned_object.status == target.transitioned_object.status
+        && expected.transitioned_object.name == target.transitioned_object.name
+        && expected.transitioned_object.tier == target.transitioned_object.tier
+        && expected.transitioned_object.version_id == target.transitioned_object.version_id
+        && expected.transitioned_object.free_version == target.transitioned_object.free_version
         && effective_object_actual_size(target) == Some(source.size)
 }
 
@@ -1274,10 +1285,10 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bucket::lifecycle::bucket_lifecycle_ops::TransitionedObject;
     use crate::bucket::lifecycle::core::TRANSITION_COMPLETE;
     use bytes::Bytes;
     use std::io::Cursor;
+    use std::sync::Arc;
     use tokio::io::AsyncReadExt;
 
     #[test]
@@ -1394,12 +1405,12 @@ mod tests {
         assert!(matches!(result, Err(Error::SlowDown)));
     }
 
-    #[test]
-    fn equivalent_data_movement_tiered_object_accepts_matching_transition_metadata() {
+    fn tiered_equivalence_source() -> FileInfo {
         let version_id = Uuid::nil();
         let transition_version_id = Uuid::new_v4();
         let mod_time = OffsetDateTime::UNIX_EPOCH;
-        let source = FileInfo {
+
+        FileInfo {
             version_id: Some(version_id),
             size: 1024,
             mod_time: Some(mod_time),
@@ -1408,80 +1419,86 @@ mod tests {
             transitioned_objname: "remote/object".to_string(),
             transition_tier: "WARM".to_string(),
             transition_version_id: Some(transition_version_id),
-            metadata: HashMap::from([("etag".to_string(), "etag-value".to_string())]),
-            ..Default::default()
-        };
-        let target = ObjectInfo {
-            version_id: Some(version_id),
-            size: 1024,
-            mod_time: Some(mod_time),
-            checksum: Some(Bytes::from_static(b"checksum")),
-            etag: Some("etag-value".to_string()),
-            transitioned_object: TransitionedObject {
-                name: "remote/object".to_string(),
-                version_id: transition_version_id.to_string(),
-                tier: "WARM".to_string(),
-                status: TRANSITION_COMPLETE.to_string(),
+            replication_state_internal: Some(rustfs_filemeta::ReplicationState {
+                replication_status_internal: Some("arn:minio:replication:target=COMPLETED;".to_string()),
+                targets: rustfs_filemeta::replication_statuses_map("arn:minio:replication:target=COMPLETED;"),
+                version_purge_status_internal: Some("arn:minio:replication:target=PENDING;".to_string()),
+                purge_targets: rustfs_filemeta::version_purge_statuses_map("arn:minio:replication:target=PENDING;"),
                 ..Default::default()
-            },
+            }),
+            metadata: HashMap::from([
+                ("etag".to_string(), "etag-value".to_string()),
+                ("x-amz-meta-key".to_string(), "metadata-value".to_string()),
+                (rustfs_utils::http::AMZ_OBJECT_TAGGING.to_string(), "tag=value".to_string()),
+                ("expires".to_string(), "1970-01-01T00:33:20Z".to_string()),
+            ]),
             ..Default::default()
-        };
+        }
+    }
+
+    fn tiered_equivalence_target(source: &FileInfo) -> ObjectInfo {
+        ObjectInfo::from_file_info(source, "bucket", "object", source.version_id.is_some())
+    }
+
+    #[test]
+    fn equivalent_data_movement_tiered_object_accepts_matching_persisted_metadata() {
+        let source = tiered_equivalence_source();
+        let target = tiered_equivalence_target(&source);
 
         assert!(is_equivalent_data_movement_tiered_object(&source, &target));
     }
 
     #[test]
     fn equivalent_data_movement_tiered_object_rejects_transition_mismatch() {
-        let source = FileInfo {
-            version_id: Some(Uuid::nil()),
-            size: 1024,
-            transition_status: TRANSITION_COMPLETE.to_string(),
-            transitioned_objname: "remote/source".to_string(),
-            transition_tier: "WARM".to_string(),
-            ..Default::default()
-        };
-        let target = ObjectInfo {
-            version_id: source.version_id,
-            size: 1024,
-            transitioned_object: TransitionedObject {
-                name: "remote/target".to_string(),
-                tier: "WARM".to_string(),
-                status: TRANSITION_COMPLETE.to_string(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let source = tiered_equivalence_source();
+        let mut target = tiered_equivalence_target(&source);
+        target.transitioned_object.name = "remote/target".to_string();
+
+        assert!(!is_equivalent_data_movement_tiered_object(&source, &target));
+    }
+
+    #[test]
+    fn equivalent_data_movement_tiered_object_rejects_user_metadata_mismatch() {
+        let source = tiered_equivalence_source();
+        let mut target = tiered_equivalence_target(&source);
+        target.user_defined = Arc::new(HashMap::from([("x-amz-meta-key".to_string(), "target-value".to_string())]));
+
+        assert!(!is_equivalent_data_movement_tiered_object(&source, &target));
+    }
+
+    #[test]
+    fn equivalent_data_movement_tiered_object_rejects_tag_mismatch() {
+        let source = tiered_equivalence_source();
+        let mut target = tiered_equivalence_target(&source);
+        target.user_tags = Arc::new("tag=target".to_string());
+
+        assert!(!is_equivalent_data_movement_tiered_object(&source, &target));
+    }
+
+    #[test]
+    fn equivalent_data_movement_tiered_object_rejects_replication_mismatch() {
+        let source = tiered_equivalence_source();
+        let mut target = tiered_equivalence_target(&source);
+        target.replication_status_internal = Some("arn:minio:replication:target=FAILED;".to_string());
+        target.replication_status = rustfs_filemeta::ReplicationStatusType::Failed;
+
+        assert!(!is_equivalent_data_movement_tiered_object(&source, &target));
+    }
+
+    #[test]
+    fn equivalent_data_movement_tiered_object_rejects_version_purge_mismatch() {
+        let source = tiered_equivalence_source();
+        let mut target = tiered_equivalence_target(&source);
+        target.version_purge_status_internal = Some("arn:minio:replication:target=COMPLETE;".to_string());
+        target.version_purge_status = rustfs_filemeta::VersionPurgeStatusType::Complete;
 
         assert!(!is_equivalent_data_movement_tiered_object(&source, &target));
     }
 
     #[test]
     fn data_movement_tiered_resume_accepts_equivalent_target() {
-        let version_id = Uuid::nil();
-        let transition_version_id = Uuid::new_v4();
-        let source = FileInfo {
-            version_id: Some(version_id),
-            size: 1024,
-            transition_status: TRANSITION_COMPLETE.to_string(),
-            transitioned_objname: "remote/object".to_string(),
-            transition_tier: "WARM".to_string(),
-            transition_version_id: Some(transition_version_id),
-            metadata: HashMap::from([("etag".to_string(), "etag-value".to_string())]),
-            ..Default::default()
-        };
-        let target = ObjectInfo {
-            version_id: Some(version_id),
-            size: 1024,
-            etag: Some("etag-value".to_string()),
-            transitioned_object: TransitionedObject {
-                name: "remote/object".to_string(),
-                version_id: transition_version_id.to_string(),
-                tier: "WARM".to_string(),
-                status: TRANSITION_COMPLETE.to_string(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let source = tiered_equivalence_source();
+        let target = tiered_equivalence_target(&source);
 
         let should_resume = resolve_data_movement_tiered_resume_result(Ok(Some(target)), &source, 0, 1)
             .expect("equivalent tiered target should be evaluated");
@@ -1491,28 +1508,8 @@ mod tests {
 
     #[test]
     fn data_movement_tiered_resume_rejects_source_pool_target() {
-        let version_id = Uuid::nil();
-        let source = FileInfo {
-            version_id: Some(version_id),
-            size: 1024,
-            transition_status: TRANSITION_COMPLETE.to_string(),
-            transitioned_objname: "remote/object".to_string(),
-            transition_tier: "WARM".to_string(),
-            metadata: HashMap::from([("etag".to_string(), "etag-value".to_string())]),
-            ..Default::default()
-        };
-        let target = ObjectInfo {
-            version_id: Some(version_id),
-            size: 1024,
-            etag: Some("etag-value".to_string()),
-            transitioned_object: TransitionedObject {
-                name: "remote/object".to_string(),
-                tier: "WARM".to_string(),
-                status: TRANSITION_COMPLETE.to_string(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let source = tiered_equivalence_source();
+        let target = tiered_equivalence_target(&source);
 
         let should_resume = resolve_data_movement_tiered_resume_result(Ok(Some(target)), &source, 0, 0)
             .expect("source-pool target should be rejected before target lookup");
