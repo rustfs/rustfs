@@ -57,6 +57,7 @@ const REBALANCE_LISTING_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const REBALANCE_MIGRATION_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const REBALANCE_MIGRATION_LOCK_RETRY_CAP: Duration = Duration::from_secs(10);
 const REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX: &str = "deferred transient rebalance entry failure:";
+const REBALANCE_CLEANUP_WARNING_ENTRY_LIMIT: usize = 10;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct RebalanceStats {
@@ -545,6 +546,18 @@ pub struct RebalanceInfo {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RebalanceCleanupWarningEntry {
+    #[serde(rename = "bucket", default)]
+    pub bucket: String,
+    #[serde(rename = "object", default)]
+    pub object: String,
+    #[serde(rename = "message", default)]
+    pub message: String,
+    #[serde(rename = "timestamp", default)]
+    pub timestamp: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RebalanceCleanupWarnings {
     #[serde(rename = "count", default)]
     pub count: u64,
@@ -556,6 +569,8 @@ pub struct RebalanceCleanupWarnings {
     pub last_object: Option<String>,
     #[serde(rename = "lastAt", default)]
     pub last_at: Option<OffsetDateTime>,
+    #[serde(rename = "entries", default)]
+    pub entries: Vec<RebalanceCleanupWarningEntry>,
 }
 
 #[allow(dead_code)]
@@ -1757,13 +1772,34 @@ fn record_rebalance_cleanup_warning_in_meta(
         return Err(invalid_rebalance_pool_index_error(pool_index, meta.pool_stats.len()));
     };
 
-    pool_stat.cleanup_warnings.count = pool_stat.cleanup_warnings.count.saturating_add(1);
-    pool_stat.cleanup_warnings.last_message = Some(message);
-    pool_stat.cleanup_warnings.last_bucket = Some(bucket.to_string());
-    pool_stat.cleanup_warnings.last_object = Some(object.to_string());
-    pool_stat.cleanup_warnings.last_at = Some(now);
+    append_rebalance_cleanup_warning(
+        &mut pool_stat.cleanup_warnings,
+        RebalanceCleanupWarningEntry {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            message,
+            timestamp: Some(now),
+        },
+    );
     meta.last_refreshed_at = Some(now);
     Ok(())
+}
+
+fn append_rebalance_cleanup_warning(warnings: &mut RebalanceCleanupWarnings, entry: RebalanceCleanupWarningEntry) {
+    warnings.count = warnings.count.saturating_add(1);
+    warnings.last_message = Some(entry.message.clone());
+    warnings.last_bucket = Some(entry.bucket.clone());
+    warnings.last_object = Some(entry.object.clone());
+    warnings.last_at = entry.timestamp;
+    warnings.entries.push(entry);
+    truncate_rebalance_cleanup_warning_entries(&mut warnings.entries);
+}
+
+fn truncate_rebalance_cleanup_warning_entries(entries: &mut Vec<RebalanceCleanupWarningEntry>) {
+    let excess = entries.len().saturating_sub(REBALANCE_CLEANUP_WARNING_ENTRY_LIMIT);
+    if excess > 0 {
+        entries.drain(0..excess);
+    }
 }
 
 fn take_bucket_from_rebalance_queue(pool_stat: &mut RebalanceStats, bucket: &str) -> bool {
@@ -2399,6 +2435,22 @@ fn merge_rebalance_cleanup_warnings(remote: &mut RebalanceCleanupWarnings, local
         remote.last_object = local.last_object.clone();
         remote.last_at = local.last_at;
     }
+
+    merge_rebalance_cleanup_warning_entries(&mut remote.entries, &local.entries);
+}
+
+fn merge_rebalance_cleanup_warning_entries(
+    remote: &mut Vec<RebalanceCleanupWarningEntry>,
+    local: &[RebalanceCleanupWarningEntry],
+) {
+    for entry in local {
+        if !remote.iter().any(|existing| existing == entry) {
+            remote.push(entry.clone());
+        }
+    }
+
+    remote.sort_by_key(|entry| entry.timestamp);
+    truncate_rebalance_cleanup_warning_entries(remote);
 }
 
 fn should_replace_rebalance_cleanup_warning(remote_at: Option<OffsetDateTime>, local_at: Option<OffsetDateTime>) -> bool {
@@ -3248,28 +3300,28 @@ mod rebalance_unit_tests {
     use super::rebalance_goal_reached;
     use super::{
         DiskError, GetObjectReader, HTTPRangeSpec, MigrationBackend, MigrationVersionResult, ObjectInfo, ObjectOptions,
-        RebalSaveOpt, RebalStatus, RebalanceBucketOutcome, RebalanceCleanupWarnings, RebalanceEntryOutcome, RebalanceInfo,
-        RebalanceMeta, RebalanceStats, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event,
-        apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
-        complete_rebalance_pools_at_goal, complete_rebalance_pools_with_empty_queue, defer_bucket_in_rebalance_queue,
-        ensure_rebalance_listing_disks_available, ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index,
-        has_deferred_rebalance_error, is_rebalance_stopped_terminal_event, is_transient_rebalance_error,
-        load_rebalance_bucket_configs, mark_rebalance_bucket_done, merge_rebalance_meta, migrate_entry_version,
-        migrate_entry_version_with_delete_marker, migrate_entry_version_with_retry_wait, next_rebal_bucket_from_stat,
-        parse_rebalance_max_attempts, rebalance_delete_marker_opts, rebalance_listing_retry_delay,
-        rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error,
-        rebalance_migration_retry_delay, record_rebalance_cleanup_warning_in_meta, resolve_load_rebalance_stats_update_result,
-        resolve_next_rebalance_bucket, resolve_rebalance_bucket_error, resolve_rebalance_bucket_result,
-        resolve_rebalance_entry_cleanup_delete_result, resolve_rebalance_file_info_versions_result,
-        resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result, resolve_rebalance_migrate_result_error,
-        resolve_rebalance_optional_bucket_config_result, resolve_rebalance_participants, resolve_rebalance_save_task_result,
-        resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error, resolve_rebalance_worker_result,
-        send_rebalance_done_signal, should_accept_rebalance_stats_update, should_cleanup_rebalance_source_entry,
-        should_count_rebalance_version_complete, should_defer_rebalance_entry_failure, should_ignore_rebalance_data_usage_cache,
-        should_pool_participate, should_preserve_rebalance_stopped_state, should_retry_rebalance_listing,
-        should_skip_rebalance_delete_marker, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
-        take_bucket_from_rebalance_queue, validate_start_rebalance_state, wait_rebalance_listing_retry,
-        with_rebalance_entry_context,
+        REBALANCE_CLEANUP_WARNING_ENTRY_LIMIT, RebalSaveOpt, RebalStatus, RebalanceBucketOutcome, RebalanceCleanupWarningEntry,
+        RebalanceCleanupWarnings, RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta, RebalanceStats, RebalanceTerminalEvent,
+        apply_rebalance_save_option, apply_rebalance_terminal_event, apply_stopped_at, classify_rebalance_terminal_event,
+        clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats, complete_rebalance_pools_at_goal,
+        complete_rebalance_pools_with_empty_queue, defer_bucket_in_rebalance_queue, ensure_rebalance_listing_disks_available,
+        ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, has_deferred_rebalance_error,
+        is_rebalance_stopped_terminal_event, is_transient_rebalance_error, load_rebalance_bucket_configs,
+        mark_rebalance_bucket_done, merge_rebalance_meta, migrate_entry_version, migrate_entry_version_with_delete_marker,
+        migrate_entry_version_with_retry_wait, next_rebal_bucket_from_stat, parse_rebalance_max_attempts,
+        rebalance_delete_marker_opts, rebalance_listing_retry_delay, rebalance_meta_load_no_data_error,
+        rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error, rebalance_migration_retry_delay,
+        record_rebalance_cleanup_warning_in_meta, resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket,
+        resolve_rebalance_bucket_error, resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
+        resolve_rebalance_file_info_versions_result, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
+        resolve_rebalance_migrate_result_error, resolve_rebalance_optional_bucket_config_result, resolve_rebalance_participants,
+        resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error,
+        resolve_rebalance_worker_result, send_rebalance_done_signal, should_accept_rebalance_stats_update,
+        should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete, should_defer_rebalance_entry_failure,
+        should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
+        should_retry_rebalance_listing, should_skip_rebalance_delete_marker, should_skip_start_rebalance,
+        stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue, validate_start_rebalance_state,
+        wait_rebalance_listing_retry, with_rebalance_entry_context,
     };
     use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -3313,6 +3365,20 @@ mod rebalance_unit_tests {
         participating: bool,
         #[serde(rename = "inf")]
         info: RebalanceInfo,
+    }
+
+    #[derive(Debug, Default, Serialize)]
+    struct LegacyRebalanceCleanupWarnings {
+        #[serde(rename = "count")]
+        count: u64,
+        #[serde(rename = "lastMsg")]
+        last_message: Option<String>,
+        #[serde(rename = "lastBucket")]
+        last_bucket: Option<String>,
+        #[serde(rename = "lastObject")]
+        last_object: Option<String>,
+        #[serde(rename = "lastAt")]
+        last_at: Option<OffsetDateTime>,
     }
 
     #[derive(Debug, Default, Serialize)]
@@ -4414,6 +4480,13 @@ mod rebalance_unit_tests {
                         last_bucket: Some("bucket-a".to_string()),
                         last_object: Some("local-object".to_string()),
                         last_at: Some(warning_at),
+                        entries: vec![RebalanceCleanupWarningEntry {
+                            bucket: "bucket-a".to_string(),
+                            object: "local-object".to_string(),
+                            message: "cleanup failed".to_string(),
+                            timestamp: Some(warning_at),
+                        }],
+                        ..Default::default()
                     },
                     ..Default::default()
                 },
@@ -4432,6 +4505,8 @@ mod rebalance_unit_tests {
         assert_eq!(remote.pool_stats[1].cleanup_warnings.count, 1);
         assert_eq!(remote.pool_stats[1].cleanup_warnings.last_message.as_deref(), Some("cleanup failed"));
         assert_eq!(remote.pool_stats[1].cleanup_warnings.last_at, Some(warning_at));
+        assert_eq!(remote.pool_stats[1].cleanup_warnings.entries.len(), 1);
+        assert_eq!(remote.pool_stats[1].cleanup_warnings.entries[0].object, "local-object");
     }
 
     #[test]
@@ -4643,6 +4718,25 @@ mod rebalance_unit_tests {
         assert_eq!(decoded.pool_stats.len(), 1);
         assert_eq!(decoded.pool_stats[0].cleanup_warnings, RebalanceCleanupWarnings::default());
         assert_eq!(decoded.pool_stats[0].info.status, RebalStatus::Started);
+    }
+
+    #[test]
+    fn test_rebalance_cleanup_warnings_deserializes_legacy_without_entries() {
+        let legacy = LegacyRebalanceCleanupWarnings {
+            count: 1,
+            last_message: Some("cleanup failed".to_string()),
+            last_bucket: Some("bucket-a".to_string()),
+            last_object: Some("obj.txt".to_string()),
+            last_at: Some(OffsetDateTime::from_unix_timestamp(1_000).unwrap()),
+        };
+        let data = rmp_serde::to_vec(&legacy).expect("legacy cleanup warning should serialize");
+
+        let decoded: RebalanceCleanupWarnings =
+            rmp_serde::from_slice(data.as_slice()).expect("legacy cleanup warning should deserialize");
+
+        assert_eq!(decoded.count, 1);
+        assert_eq!(decoded.last_message.as_deref(), Some("cleanup failed"));
+        assert_eq!(decoded.entries, Vec::<RebalanceCleanupWarningEntry>::new());
     }
 
     #[test]
@@ -6069,7 +6163,69 @@ mod rebalance_unit_tests {
         assert_eq!(meta.pool_stats[0].cleanup_warnings.last_bucket.as_deref(), Some("bucket-a"));
         assert_eq!(meta.pool_stats[0].cleanup_warnings.last_object.as_deref(), Some("obj.txt"));
         assert_eq!(meta.pool_stats[0].cleanup_warnings.last_at, Some(now));
+        assert_eq!(meta.pool_stats[0].cleanup_warnings.entries.len(), 1);
+        assert_eq!(meta.pool_stats[0].cleanup_warnings.entries[0].bucket, "bucket-a");
+        assert_eq!(meta.pool_stats[0].cleanup_warnings.entries[0].object, "obj.txt");
+        assert_eq!(meta.pool_stats[0].cleanup_warnings.entries[0].message, "cleanup failed");
+        assert_eq!(meta.pool_stats[0].cleanup_warnings.entries[0].timestamp, Some(now));
         assert_eq!(meta.last_refreshed_at, Some(now));
+    }
+
+    #[test]
+    fn test_record_rebalance_cleanup_warning_in_meta_tracks_multiple_warnings() {
+        let mut meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats::default()],
+            ..Default::default()
+        };
+
+        for i in 0..3 {
+            let now = OffsetDateTime::from_unix_timestamp(10_000 + i).unwrap();
+            record_rebalance_cleanup_warning_in_meta(
+                Some(&mut meta),
+                0,
+                "bucket-a",
+                format!("obj-{i}").as_str(),
+                format!("cleanup failed {i}"),
+                now,
+            )
+            .expect("cleanup warning should be recorded");
+        }
+
+        let warnings = &meta.pool_stats[0].cleanup_warnings;
+        assert_eq!(warnings.count, 3);
+        assert_eq!(warnings.entries.len(), 3);
+        assert_eq!(warnings.entries[0].object, "obj-0");
+        assert_eq!(warnings.entries[2].object, "obj-2");
+        assert_eq!(warnings.last_object.as_deref(), Some("obj-2"));
+        assert_eq!(warnings.last_message.as_deref(), Some("cleanup failed 2"));
+    }
+
+    #[test]
+    fn test_record_rebalance_cleanup_warning_in_meta_truncates_old_entries() {
+        let mut meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats::default()],
+            ..Default::default()
+        };
+
+        for i in 0..12 {
+            let now = OffsetDateTime::from_unix_timestamp(20_000 + i).unwrap();
+            record_rebalance_cleanup_warning_in_meta(
+                Some(&mut meta),
+                0,
+                "bucket-a",
+                format!("obj-{i}").as_str(),
+                format!("cleanup failed {i}"),
+                now,
+            )
+            .expect("cleanup warning should be recorded");
+        }
+
+        let warnings = &meta.pool_stats[0].cleanup_warnings;
+        assert_eq!(warnings.count, 12);
+        assert_eq!(warnings.entries.len(), REBALANCE_CLEANUP_WARNING_ENTRY_LIMIT);
+        assert_eq!(warnings.entries[0].object, "obj-2");
+        assert_eq!(warnings.entries[REBALANCE_CLEANUP_WARNING_ENTRY_LIMIT - 1].object, "obj-11");
+        assert_eq!(warnings.last_object.as_deref(), Some("obj-11"));
     }
 
     #[test]
@@ -6089,6 +6245,7 @@ mod rebalance_unit_tests {
                     last_bucket: Some("bucket-a".to_string()),
                     last_object: Some("obj.txt".to_string()),
                     last_at: Some(warning_at),
+                    ..Default::default()
                 },
                 ..Default::default()
             }],

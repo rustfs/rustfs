@@ -895,6 +895,12 @@ mod rebalance_handler_tests {
                     last_bucket: Some("bucket-a".to_string()),
                     last_object: Some("obj".to_string()),
                     last_at: Some(OffsetDateTime::from_unix_timestamp(1_001).unwrap()),
+                    entries: vec![rustfs_ecstore::rebalance::RebalanceCleanupWarningEntry {
+                        bucket: "bucket-a".to_string(),
+                        object: "obj".to_string(),
+                        message: "cleanup warning".to_string(),
+                        timestamp: Some(OffsetDateTime::from_unix_timestamp(1_001).unwrap()),
+                    }],
                 },
                 progress: Some(RebalPoolProgress {
                     num_objects: 3,
@@ -914,6 +920,8 @@ mod rebalance_handler_tests {
         assert!(json.contains("\"lastError\""));
         assert!(json.contains("\"cleanupWarnings\""));
         assert!(json.contains("\"lastMsg\":\"cleanup warning\""));
+        assert!(json.contains("\"entries\""));
+        assert!(json.contains("\"message\":\"cleanup warning\""));
         assert!(json.contains("\"stoppedAt\":null"));
     }
 
