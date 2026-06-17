@@ -150,6 +150,12 @@ enum RebalanceEntryOutcome {
     Deferred { last_error: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RebalanceCleanupDeleteOutcome {
+    Completed,
+    Deferred { last_error: String },
+}
+
 fn rebalance_delete_marker_opts(version: &FileInfo, version_id: Option<String>, src_pool_idx: usize) -> ObjectOptions {
     ObjectOptions {
         versioned: true,
@@ -2129,11 +2135,15 @@ fn resolve_rebalance_entry_cleanup_delete_result(
     result: Result<ObjectInfo>,
     bucket: &str,
     object_name: &str,
-) -> Result<Option<String>> {
+) -> Result<RebalanceCleanupDeleteOutcome> {
     match result {
-        Ok(_) => Ok(None),
-        Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => Ok(None),
-        Err(err) => Ok(Some(format!("rebalance cleanup delete failed for {bucket}/{object_name}: {err}"))),
+        Ok(_) => Ok(RebalanceCleanupDeleteOutcome::Completed),
+        Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {
+            Ok(RebalanceCleanupDeleteOutcome::Completed)
+        }
+        Err(err) => Ok(RebalanceCleanupDeleteOutcome::Deferred {
+            last_error: format!("deferred rebalance cleanup delete failure for {bucket}/{object_name}: {err}"),
+        }),
     }
 }
 
@@ -2995,7 +3005,7 @@ impl ECStore {
                 });
             }
 
-            let cleanup_warning = resolve_rebalance_entry_cleanup_delete_result(
+            let cleanup_outcome = resolve_rebalance_entry_cleanup_delete_result(
                 set.delete_object(
                     bucket.as_str(),
                     &encode_dir_object(&entry.name),
@@ -3010,24 +3020,21 @@ impl ECStore {
                 bucket.as_str(),
                 entry.name.as_str(),
             )?;
-            if let Some(message) = cleanup_warning {
-                warn!(
-                    event = EVENT_REBALANCE_ENTRY,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REBALANCE,
-                    pool_index,
-                    bucket = %bucket,
-                    object = %entry.name,
-                    stage = "cleanup_source",
-                    cleanup_status = "failed_ignored",
-                    error = %message,
-                    "Ignored rebalance source cleanup failure"
-                );
-                if let Err(err) = self
-                    .record_rebalance_cleanup_warning(pool_index, bucket.as_str(), entry.name.as_str(), message)
-                    .await
-                {
-                    error!(
+            match cleanup_outcome {
+                RebalanceCleanupDeleteOutcome::Completed => {
+                    debug!(
+                        event = EVENT_REBALANCE_ENTRY,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        pool_index,
+                        bucket = %bucket,
+                        object = %entry.name,
+                        state = "source_deleted",
+                        "Deleted rebalance source entry"
+                    );
+                }
+                RebalanceCleanupDeleteOutcome::Deferred { last_error } => {
+                    warn!(
                         event = EVENT_REBALANCE_ENTRY,
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_REBALANCE,
@@ -3035,21 +3042,41 @@ impl ECStore {
                         bucket = %bucket,
                         object = %entry.name,
                         stage = "cleanup_source",
-                        error = ?err,
-                        "Failed to record rebalance source cleanup warning"
+                        cleanup_status = "deferred",
+                        error = %last_error,
+                        "Deferred rebalance source cleanup failure"
                     );
+                    if let Err(err) = self
+                        .record_rebalance_cleanup_warning(pool_index, bucket.as_str(), entry.name.as_str(), last_error.clone())
+                        .await
+                    {
+                        error!(
+                            event = EVENT_REBALANCE_ENTRY,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_REBALANCE,
+                            pool_index,
+                            bucket = %bucket,
+                            object = %entry.name,
+                            stage = "cleanup_source",
+                            error = ?err,
+                            "Failed to record rebalance source cleanup warning"
+                        );
+                    }
+                    if let Err(err) = self.update_rebalance_last_error(pool_index, last_error.clone()).await {
+                        error!(
+                            event = EVENT_REBALANCE_ENTRY,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_REBALANCE,
+                            pool_index,
+                            bucket = %bucket,
+                            object = %entry.name,
+                            stage = "cleanup_source",
+                            error = ?err,
+                            "Failed to record rebalance source cleanup last error"
+                        );
+                    }
+                    return Ok(RebalanceEntryOutcome::Deferred { last_error });
                 }
-            } else {
-                debug!(
-                    event = EVENT_REBALANCE_ENTRY,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REBALANCE,
-                    pool_index,
-                    bucket = %bucket,
-                    object = %entry.name,
-                    state = "source_deleted",
-                    "Deleted rebalance source entry"
-                );
             }
         }
 
@@ -3453,18 +3480,18 @@ mod rebalance_unit_tests {
     use super::rebalance_goal_reached;
     use super::{
         DiskError, GetObjectReader, HTTPRangeSpec, MigrationBackend, MigrationVersionResult, ObjectInfo, ObjectOptions,
-        REBALANCE_CLEANUP_WARNING_ENTRY_LIMIT, RebalSaveOpt, RebalStatus, RebalanceBucketOutcome, RebalanceCleanupWarningEntry,
-        RebalanceCleanupWarnings, RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta, RebalanceStats, RebalanceTerminalEvent,
-        apply_rebalance_save_option, apply_rebalance_terminal_event, apply_stopped_at, classify_rebalance_terminal_event,
-        clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats, complete_rebalance_pools_at_goal,
-        complete_rebalance_pools_with_empty_queue, defer_bucket_in_rebalance_queue, ensure_rebalance_listing_disks_available,
-        ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, has_deferred_rebalance_error,
-        is_rebalance_stopped_terminal_event, is_transient_rebalance_error, load_rebalance_bucket_configs,
-        mark_rebalance_bucket_done, merge_rebalance_meta, migrate_entry_version, migrate_entry_version_with_delete_marker,
-        migrate_entry_version_with_retry_wait, next_rebal_bucket_from_stat, parse_rebalance_max_attempts,
-        rebalance_delete_marker_opts, rebalance_listing_retry_delay, rebalance_meta_load_no_data_error,
-        rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error, rebalance_migration_retry_delay,
-        record_rebalance_cleanup_warning_in_meta, refresh_missing_rebalance_pool_stats,
+        REBALANCE_CLEANUP_WARNING_ENTRY_LIMIT, RebalSaveOpt, RebalStatus, RebalanceBucketOutcome, RebalanceCleanupDeleteOutcome,
+        RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta,
+        RebalanceStats, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event, apply_stopped_at,
+        classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
+        complete_rebalance_pools_at_goal, complete_rebalance_pools_with_empty_queue, defer_bucket_in_rebalance_queue,
+        ensure_rebalance_listing_disks_available, ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index,
+        has_deferred_rebalance_error, is_rebalance_stopped_terminal_event, is_transient_rebalance_error,
+        load_rebalance_bucket_configs, mark_rebalance_bucket_done, merge_rebalance_meta, migrate_entry_version,
+        migrate_entry_version_with_delete_marker, migrate_entry_version_with_retry_wait, next_rebal_bucket_from_stat,
+        parse_rebalance_max_attempts, rebalance_delete_marker_opts, rebalance_listing_retry_delay,
+        rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error,
+        rebalance_migration_retry_delay, record_rebalance_cleanup_warning_in_meta, refresh_missing_rebalance_pool_stats,
         resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket, resolve_rebalance_bucket_error,
         resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
         resolve_rebalance_file_info_versions_result, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
@@ -5168,7 +5195,10 @@ mod rebalance_unit_tests {
     #[test]
     fn test_resolve_rebalance_entry_cleanup_delete_result_passthrough() {
         let result = resolve_rebalance_entry_cleanup_delete_result(Ok(ObjectInfo::default()), "bucket-a", "obj.txt");
-        assert_eq!(result.expect("successful cleanup should pass through"), None);
+        assert_eq!(
+            result.expect("successful cleanup should pass through"),
+            RebalanceCleanupDeleteOutcome::Completed
+        );
     }
 
     #[test]
@@ -5178,16 +5208,33 @@ mod rebalance_unit_tests {
             "bucket-a",
             "obj.txt",
         );
-        assert_eq!(result.expect("missing cleanup source should be ignored"), None);
+        assert_eq!(
+            result.expect("missing cleanup source should be ignored"),
+            RebalanceCleanupDeleteOutcome::Completed
+        );
     }
 
     #[test]
-    fn test_resolve_rebalance_entry_cleanup_delete_result_returns_warning_for_failures() {
-        let warning = resolve_rebalance_entry_cleanup_delete_result(Err(Error::SlowDown), "bucket-a", "obj.txt")
-            .expect("cleanup delete failures should be downgraded to warnings")
-            .expect("cleanup delete failure should return warning");
-        let message = warning.as_str();
-        assert!(message.contains("rebalance cleanup delete failed for bucket-a/obj.txt"));
+    fn test_resolve_rebalance_entry_cleanup_delete_result_ignores_version_not_found() {
+        let result = resolve_rebalance_entry_cleanup_delete_result(
+            Err(Error::VersionNotFound("bucket-a".to_string(), "obj.txt".to_string(), "vid-1".to_string())),
+            "bucket-a",
+            "obj.txt",
+        );
+        assert_eq!(
+            result.expect("missing cleanup source version should be ignored"),
+            RebalanceCleanupDeleteOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn test_resolve_rebalance_entry_cleanup_delete_result_defers_failures() {
+        let outcome = resolve_rebalance_entry_cleanup_delete_result(Err(Error::SlowDown), "bucket-a", "obj.txt")
+            .expect("cleanup delete failures should be retryable");
+        let RebalanceCleanupDeleteOutcome::Deferred { last_error } = outcome else {
+            panic!("cleanup failure should defer");
+        };
+        assert!(last_error.contains("deferred rebalance cleanup delete failure for bucket-a/obj.txt"));
     }
 
     #[test]

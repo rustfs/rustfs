@@ -1307,11 +1307,11 @@ Change cleanup delete result handling from warning-only completion to retryable 
 
 ### Implementation Steps
 
-- [ ] Change cleanup result resolution to return a typed outcome instead of optional warning text, or adjust the call site to treat optional warning as deferral.
-- [ ] Update tests that currently expect cleanup failures to be ignored.
-- [ ] Add a test that a transient cleanup failure returns `Deferred` and records the last error.
-- [ ] Add a test that not-found/version-not-found cleanup remains `Completed`.
-- [ ] Run:
+- [x] Change cleanup result resolution to return a typed outcome instead of optional warning text, or adjust the call site to treat optional warning as deferral.
+- [x] Update tests that currently expect cleanup failures to be ignored.
+- [x] Add a test that a transient cleanup failure returns `Deferred` and records the last error.
+- [x] Add a test that not-found/version-not-found cleanup remains `Completed`.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs-ecstore resolve_rebalance_entry_cleanup --lib
