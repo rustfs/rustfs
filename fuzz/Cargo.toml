@@ -12,6 +12,7 @@ cargo-fuzz = true
 [dependencies]
 arbitrary = "1"
 libfuzzer-sys = "0.4"
+rustfs = { path = "../rustfs", default-features = false }
 rustfs-ecstore = { path = "../crates/ecstore" }
 rustfs-filemeta = { path = "../crates/filemeta" }
 rustfs-utils = { path = "../crates/utils", features = ["compress", "path"] }
@@ -19,6 +20,13 @@ rustfs-utils = { path = "../crates/utils", features = ["compress", "path"] }
 [[bin]]
 name = "bucket_validation"
 path = "fuzz_targets/bucket_validation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive_extract"
+path = "fuzz_targets/archive_extract.rs"
 test = false
 doc = false
 bench = false
