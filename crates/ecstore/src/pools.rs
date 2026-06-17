@@ -1585,6 +1585,7 @@ impl ECStore {
     #[tracing::instrument(skip(self))]
     pub async fn decommission_cancel(&self, idx: usize) -> Result<()> {
         ensure_decommission_terminal_operation_supported(self.single_pool(), "cancel decommission")?;
+        ensure_local_decommission_pool_leaders(&self.endpoints(), &[idx])?;
 
         let should_reload_pool_meta = {
             let mut lock = self.pool_meta.write().await;
