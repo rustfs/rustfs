@@ -200,22 +200,6 @@ fn is_modified_since(mod_time: &OffsetDateTime, given_time: &OffsetDateTime) -> 
     mod_secs > given_secs
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct MultipartUploadResult {
-    pub upload_id: String,
-    pub checksum_algo: Option<String>,
-    pub checksum_type: Option<String>,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct PartInfo {
-    pub part_num: usize,
-    pub last_mod: Option<OffsetDateTime>,
-    pub size: usize,
-    pub etag: Option<String>,
-    pub actual_size: i64,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct CompletePart {
     pub part_num: usize,
@@ -869,113 +853,6 @@ pub struct ListObjectsV2Info {
 
     // List of prefixes for this request.
     pub prefixes: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct MultipartInfo {
-    // Name of the bucket.
-    pub bucket: String,
-
-    // Name of the object.
-    pub object: String,
-
-    // Upload ID identifying the multipart upload whose parts are being listed.
-    pub upload_id: String,
-
-    // Date and time at which the multipart upload was initiated.
-    pub initiated: Option<OffsetDateTime>,
-
-    // Any metadata set during InitMultipartUpload, including encryption headers.
-    pub user_defined: HashMap<String, String>,
-}
-
-// ListMultipartsInfo - represents bucket resources for incomplete multipart uploads.
-#[derive(Debug, Clone, Default)]
-pub struct ListMultipartsInfo {
-    // Together with upload-id-marker, this parameter specifies the multipart upload
-    // after which listing should begin.
-    pub key_marker: Option<String>,
-
-    // Together with key-marker, specifies the multipart upload after which listing
-    // should begin. If key-marker is not specified, the upload-id-marker parameter
-    // is ignored.
-    pub upload_id_marker: Option<String>,
-
-    // When a list is truncated, this element specifies the value that should be
-    // used for the key-marker request parameter in a subsequent request.
-    pub next_key_marker: Option<String>,
-
-    // When a list is truncated, this element specifies the value that should be
-    // used for the upload-id-marker request parameter in a subsequent request.
-    pub next_upload_id_marker: Option<String>,
-
-    // Maximum number of multipart uploads that could have been included in the
-    // response.
-    pub max_uploads: usize,
-
-    // Indicates whether the returned list of multipart uploads is truncated. A
-    // value of true indicates that the list was truncated. The list can be truncated
-    // if the number of multipart uploads exceeds the limit allowed or specified
-    // by max uploads.
-    pub is_truncated: bool,
-
-    // List of all pending uploads.
-    pub uploads: Vec<MultipartInfo>,
-
-    // When a prefix is provided in the request, The result contains only keys
-    // starting with the specified prefix.
-    pub prefix: String,
-
-    // A character used to truncate the object prefixes.
-    // NOTE: only supported delimiter is '/'.
-    pub delimiter: Option<String>,
-
-    // CommonPrefixes contains all (if there are any) keys between Prefix and the
-    // next occurrence of the string specified by delimiter.
-    pub common_prefixes: Vec<String>,
-    // encoding_type: String, // Not supported yet.
-}
-
-/// ListPartsInfo - represents list of all parts.
-#[derive(Debug, Clone, Default)]
-pub struct ListPartsInfo {
-    /// Name of the bucket.
-    pub bucket: String,
-
-    /// Name of the object.
-    pub object: String,
-
-    /// Upload ID identifying the multipart upload whose parts are being listed.
-    pub upload_id: String,
-
-    /// The class of storage used to store the object.
-    pub storage_class: String,
-
-    /// Part number after which listing begins.
-    pub part_number_marker: usize,
-
-    /// When a list is truncated, this element specifies the last part in the list,
-    /// as well as the value to use for the part-number-marker request parameter
-    /// in a subsequent request.
-    pub next_part_number_marker: usize,
-
-    /// Maximum number of parts that were allowed in the response.
-    pub max_parts: usize,
-
-    /// Indicates whether the returned list of parts is truncated.
-    pub is_truncated: bool,
-
-    /// List of all parts.
-    pub parts: Vec<PartInfo>,
-
-    /// Any metadata set during InitMultipartUpload, including encryption headers.
-    pub user_defined: HashMap<String, String>,
-
-    /// ChecksumAlgorithm if set
-    pub checksum_algorithm: String,
-
-    /// ChecksumType if set
-    pub checksum_type: String,
 }
 
 #[derive(Debug, Default, Clone)]

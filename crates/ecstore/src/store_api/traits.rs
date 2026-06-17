@@ -1,5 +1,5 @@
 use super::*;
-use rustfs_storage_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
+use rustfs_storage_api::{ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};
 
 #[async_trait::async_trait]
 pub trait ObjectIO: Send + Sync + Debug + 'static {
@@ -13,15 +13,6 @@ pub trait ObjectIO: Send + Sync + Debug + 'static {
     ) -> Result<GetObjectReader>;
 
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo>;
-}
-
-/// Bucket-level storage operations.
-#[async_trait::async_trait]
-pub trait BucketOperations: Send + Sync + Debug {
-    async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()>;
-    async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo>;
-    async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>>;
-    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()>;
 }
 
 /// Object-level storage operations (beyond basic I/O in ObjectIO).

@@ -51,6 +51,8 @@ SOURCE_IDS_FILE="${TMP_DIR}/source_ids.txt"
 REGISTER_IDS_FILE="${TMP_DIR}/register_ids.txt"
 LEGACY_STORAGE_API_HITS_FILE="${TMP_DIR}/legacy_storage_api_hits.txt"
 STORE_API_BUCKET_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_bucket_dto_reexports.txt"
+STORE_API_BUCKET_OPERATION_HITS_FILE="${TMP_DIR}/store_api_bucket_operation_hits.txt"
+STORE_API_MULTIPART_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_multipart_dto_reexports.txt"
 
 awk '
   /^## PR Types$/ {
@@ -181,8 +183,12 @@ require_source_line \
   "storage-api public admin contract re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
-  "pub use bucket::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};" \
-  "storage-api public bucket DTO re-export"
+  "pub use bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};" \
+  "storage-api public bucket contract re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
+  "pub use multipart::{ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};" \
+  "storage-api public multipart DTO re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
   "pub use error::{StorageErrorCode, StorageResult};" \
@@ -205,6 +211,26 @@ fi
 
 if [[ -s "$STORE_API_BUCKET_DTO_REEXPORTS_FILE" ]]; then
   report_failure "old ecstore store_api bucket DTO re-export reintroduced: $(paste -sd '; ' "$STORE_API_BUCKET_DTO_REEXPORTS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api::\{[^}]*\bBucketOperations\b|pub trait BucketOperations\b' \
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/traits.rs || true
+) >"$STORE_API_BUCKET_OPERATION_HITS_FILE"
+
+if [[ -s "$STORE_API_BUCKET_OPERATION_HITS_FILE" ]]; then
+  report_failure "old ecstore store_api BucketOperations path reintroduced: $(paste -sd '; ' "$STORE_API_BUCKET_OPERATION_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api::\{[^}]*\b(?:ListMultipartsInfo|ListPartsInfo|MultipartInfo|MultipartUploadResult|PartInfo)\b|pub struct (?:ListMultipartsInfo|ListPartsInfo|MultipartInfo|MultipartUploadResult|PartInfo)\b' \
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
+) >"$STORE_API_MULTIPART_DTO_REEXPORTS_FILE"
+
+if [[ -s "$STORE_API_MULTIPART_DTO_REEXPORTS_FILE" ]]; then
+  report_failure "old ecstore store_api multipart DTO path reintroduced: $(paste -sd '; ' "$STORE_API_MULTIPART_DTO_REEXPORTS_FILE")"
 fi
 
 require_source_contains \

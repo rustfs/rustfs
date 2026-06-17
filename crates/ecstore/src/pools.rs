@@ -38,7 +38,7 @@ use crate::error::{
 use crate::notification_sys::get_global_notification_sys;
 use crate::resolve_object_store_handle;
 use crate::set_disk::SetDisks;
-use crate::store_api::{BucketOperations, GetObjectReader, HealOperations, ObjectIO, ObjectOperations, ObjectOptions};
+use crate::store_api::{GetObjectReader, HealOperations, ObjectIO, ObjectOperations, ObjectOptions};
 use crate::{global::GLOBAL_LifecycleSys, sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
@@ -50,7 +50,7 @@ use rustfs_common::defer;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_concurrency::workers::Workers;
 use rustfs_filemeta::{FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
-use rustfs_storage_api::{BucketOptions, MakeBucketOptions, StorageAdminApi};
+use rustfs_storage_api::{BucketOperations, BucketOptions, MakeBucketOptions, StorageAdminApi};
 use rustfs_utils::path::{encode_dir_object, path_join, path_to_bucket_object, path_to_bucket_object_with_base_path};
 use s3s::dto::{BucketLifecycleConfiguration, DefaultRetention, ReplicationConfiguration};
 use serde::{Deserialize, Serialize};
@@ -2356,6 +2356,7 @@ impl ECStore {
         let mut pool_meta = self.pool_meta.write().await;
         if pool_meta.decommission_failed(idx) {
             pool_meta.save(self.pools.clone()).await?;
+            pool_meta.mark_decommission_progress_saved();
 
             drop(pool_meta);
 
@@ -2387,6 +2388,7 @@ impl ECStore {
         let mut pool_meta = self.pool_meta.write().await;
         if pool_meta.decommission_complete(idx) {
             pool_meta.save(self.pools.clone()).await?;
+            pool_meta.mark_decommission_progress_saved();
             drop(pool_meta);
             if let Some(notification_sys) = get_global_notification_sys() {
                 let stage = format!("complete_decommission for pool {idx}");
@@ -2432,6 +2434,7 @@ impl ECStore {
                         idx,
                         bucket.name.as_str(),
                     )?;
+                    pool_meta.mark_decommission_progress_saved();
                 }
             }
             return Ok(());
@@ -2459,6 +2462,7 @@ impl ECStore {
                     idx,
                     bucket.name.as_str(),
                 )?;
+                pool_meta.mark_decommission_progress_saved();
             }
 
             warn!("decommission: decommission_pool bucket_done {}", &bucket.name);

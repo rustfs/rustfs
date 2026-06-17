@@ -91,8 +91,9 @@ compatibility coverage from silently drifting during cleanup PRs.
 Required `rustfs-storage-api` public re-exports:
 
 - `pub use admin::{DiskSetSelector, StorageAdminApi};`
-- `pub use bucket::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};`
+- `pub use bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};`
 - `pub use error::{StorageErrorCode, StorageResult};`
+- `pub use multipart::{ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};`
 
 ECStore must keep compile-time coverage for both `StorageAdminApi` and the
 separate `NamespaceLocking` operation group.

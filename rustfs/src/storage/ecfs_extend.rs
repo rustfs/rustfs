@@ -25,8 +25,8 @@ use rustfs_ecstore::bucket::object_lock::objectlock_sys;
 use rustfs_ecstore::bucket::replication::ReplicationConfigurationExt;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::resolve_object_store_handle;
-use rustfs_ecstore::store_api::{BucketOperations, ObjectInfo, ObjectToDelete};
-use rustfs_storage_api::BucketOptions;
+use rustfs_ecstore::store_api::{ObjectInfo, ObjectToDelete};
+use rustfs_storage_api::{BucketOperations, BucketOptions};
 use rustfs_targets::EventName;
 use rustfs_targets::arn::{TargetID, TargetIDError};
 use rustfs_utils::http::{

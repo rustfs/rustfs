@@ -28,10 +28,9 @@ use rustfs_ecstore::{
     error::StorageError,
     notification_sys::get_global_notification_sys,
     rebalance::{DiskStat, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta},
-    store_api::BucketOperations,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_storage_api::{BucketOptions, StorageAdminApi};
+use rustfs_storage_api::{BucketOperations, BucketOptions, StorageAdminApi};
 use s3s::{
     Body, S3Request, S3Response, S3Result,
     header::{CONTENT_LENGTH, CONTENT_TYPE},
