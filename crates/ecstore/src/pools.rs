@@ -30,6 +30,7 @@ use crate::data_movement;
 use crate::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::disk::error::DiskError;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
+use crate::endpoints::EndpointServerPools;
 use crate::error::{Error, Result};
 use crate::error::{
     StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_object_not_found, is_err_operation_canceled,
@@ -174,6 +175,28 @@ fn split_decommission_buckets(buckets: Vec<DecomBucketInfo>) -> (Vec<DecomBucket
 fn ensure_decommission_not_rebalancing(rebalance_running: bool) -> Result<()> {
     if rebalance_running {
         return Err(Error::RebalanceAlreadyRunning);
+    }
+
+    Ok(())
+}
+
+fn ensure_local_decommission_pool_leaders(endpoints: &EndpointServerPools, indices: &[usize]) -> Result<()> {
+    for idx in indices {
+        let pool = endpoints
+            .as_ref()
+            .get(*idx)
+            .ok_or_else(|| invalid_decommission_pool_index_error(endpoints.as_ref().len(), *idx))?;
+        let endpoint = pool
+            .endpoints
+            .as_ref()
+            .first()
+            .ok_or_else(|| Error::other(format!("decommission pool {idx} has no configured endpoints")))?;
+
+        if !endpoint.is_local {
+            return Err(Error::other(format!(
+                "decommission for pool {idx} must run on the pool first endpoint {endpoint}"
+            )));
+        }
     }
 
     Ok(())
@@ -2731,6 +2754,7 @@ impl ECStore {
         validate_start_decommission_request(&indices, self.single_pool())?;
 
         ensure_decommission_not_rebalancing(self.is_rebalance_conflicting_with_decommission().await)?;
+        ensure_local_decommission_pool_leaders(&self.endpoints(), &indices)?;
 
         for idx in indices.iter().copied() {
             ensure_valid_decommission_pool_index(self.pools.len(), idx)?;
@@ -3807,9 +3831,10 @@ mod pools_tests {
         decommission_start_guard_state, dedup_indices, default_decommission_bucket_concurrency,
         ensure_decommission_cancel_allowed, ensure_decommission_listing_disks_available, ensure_decommission_not_rebalancing,
         ensure_decommission_start_allowed, ensure_decommission_terminal_operation_supported,
-        ensure_valid_decommission_pool_index, get_by_index, has_active_decommission_canceler, is_decommission_active,
-        is_decommission_cancel_terminal, load_decommission_entry_versions, mark_decommission_bucket_done,
-        require_decommission_store, resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
+        ensure_local_decommission_pool_leaders, ensure_valid_decommission_pool_index, get_by_index,
+        has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_terminal,
+        load_decommission_entry_versions, mark_decommission_bucket_done, require_decommission_store,
+        resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
         resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
         resolve_decommission_entry_reload_result, resolve_decommission_listing_worker_result,
         resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,
@@ -3822,6 +3847,8 @@ mod pools_tests {
         track_decommission_current_object, validate_start_decommission_request, with_decommission_entry_context,
     };
     use crate::data_movement;
+    use crate::disk::endpoint::Endpoint;
+    use crate::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::error::Error;
     use rustfs_filemeta::MetaCacheEntry;
     use rustfs_rio::Index;
@@ -3832,6 +3859,23 @@ mod pools_tests {
     use std::time::Duration as StdDuration;
     use time::{Duration, OffsetDateTime};
     use tokio_util::sync::CancellationToken;
+
+    fn decommission_test_pool_endpoint(idx: usize, is_local: bool) -> PoolEndpoints {
+        let port = 9000usize + idx;
+        let mut endpoint =
+            Endpoint::try_from(format!("http://127.0.0.1:{port}/disk").as_str()).expect("test endpoint should parse");
+        endpoint.is_local = is_local;
+        endpoint.pool_idx = i32::try_from(idx).expect("test pool index should fit i32");
+
+        PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: Endpoints::from(vec![endpoint]),
+            cmd_line: format!("pool-{idx}"),
+            platform: String::new(),
+        }
+    }
 
     #[test]
     fn test_dedup_indices_removes_duplicates_preserving_order() {
@@ -4730,6 +4774,43 @@ mod pools_tests {
     #[test]
     fn test_ensure_decommission_not_rebalancing_allows_idle() {
         assert!(ensure_decommission_not_rebalancing(false).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_local_decommission_pool_leaders_allows_local_first_endpoint() {
+        let endpoints = EndpointServerPools::from(vec![
+            decommission_test_pool_endpoint(0, false),
+            decommission_test_pool_endpoint(1, true),
+        ]);
+
+        assert!(ensure_local_decommission_pool_leaders(&endpoints, &[1]).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_local_decommission_pool_leaders_rejects_remote_first_endpoint() {
+        let endpoints = EndpointServerPools::from(vec![decommission_test_pool_endpoint(0, false)]);
+
+        let err = ensure_local_decommission_pool_leaders(&endpoints, &[0])
+            .expect_err("remote first endpoint should reject local decommission start");
+
+        assert!(err.to_string().contains("must run on the pool first endpoint"));
+    }
+
+    #[test]
+    fn test_ensure_local_decommission_pool_leaders_rejects_empty_endpoints() {
+        let endpoints = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: Endpoints::from(Vec::<Endpoint>::new()),
+            cmd_line: "pool-0".to_string(),
+            platform: String::new(),
+        }]);
+
+        let err = ensure_local_decommission_pool_leaders(&endpoints, &[0])
+            .expect_err("pool without endpoints should reject local decommission start");
+
+        assert!(err.to_string().contains("has no configured endpoints"));
     }
 
     #[test]
