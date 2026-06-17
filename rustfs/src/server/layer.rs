@@ -3089,8 +3089,8 @@ mod tests {
         assert_eq!(redact_sensitive_uri_query(&uri), "/rustfs/admin/v3/users?token=not-a-download-token");
     }
 
-    #[test]
-    fn request_logging_layer_emits_single_completion_event_with_standard_fields() {
+    #[tokio::test]
+    async fn request_logging_layer_emits_single_completion_event_with_standard_fields() {
         let writer = SharedWriter::default();
         let captured = writer.buffer.clone();
         let subscriber = Registry::default().with(
@@ -3102,25 +3102,25 @@ mod tests {
                 .with_writer(writer),
         );
 
-        tracing::subscriber::with_default(subscriber, || {
-            let mut service = tower::ServiceBuilder::new()
-                .layer(RequestContextLayer)
-                .layer(RequestLoggingLayer)
-                .service(StatusService::new(StatusCode::OK));
+        let _guard = tracing::subscriber::set_default(subscriber);
 
-            let mut request: Request<Full<Bytes>> = Request::builder()
-                .method(Method::GET)
-                .uri("/bucket/object.txt")
-                .header("x-request-id", "req-123")
-                .body(Full::from(Bytes::new()))
-                .expect("request");
-            request
-                .extensions_mut()
-                .insert(RemoteAddr("127.0.0.1:9000".parse().expect("socket addr")));
+        let mut service = tower::ServiceBuilder::new()
+            .layer(RequestContextLayer)
+            .layer(RequestLoggingLayer)
+            .service(StatusService::new(StatusCode::OK));
 
-            let response = futures::executor::block_on(service.call(request)).expect("response");
-            assert_eq!(response.status(), StatusCode::OK);
-        });
+        let mut request: Request<Full<Bytes>> = Request::builder()
+            .method(Method::GET)
+            .uri("/bucket/object.txt")
+            .header("x-request-id", "req-123")
+            .body(Full::from(Bytes::new()))
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(RemoteAddr("127.0.0.1:9000".parse().expect("socket addr")));
+
+        let response = service.call(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
 
         let output = String::from_utf8(captured.lock().expect("captured logs").clone()).expect("utf8 logs");
         assert_eq!(output.matches("HTTP request completed").count(), 1, "{output}");
@@ -3145,8 +3145,8 @@ mod tests {
         assert!(output.contains("duration_ms"), "{output}");
     }
 
-    #[test]
-    fn request_logging_layer_uses_request_context_trace_fields() {
+    #[tokio::test]
+    async fn request_logging_layer_uses_request_context_trace_fields() {
         let writer = SharedWriter::default();
         let captured = writer.buffer.clone();
         let subscriber = Registry::default().with(
@@ -3158,28 +3158,28 @@ mod tests {
                 .with_writer(writer),
         );
 
-        tracing::subscriber::with_default(subscriber, || {
-            let mut service = RequestLoggingLayer.layer(StatusService::new(StatusCode::INTERNAL_SERVER_ERROR));
+        let _guard = tracing::subscriber::set_default(subscriber);
 
-            let mut request = Request::builder()
-                .method(Method::GET)
-                .uri("/bucket/object.txt")
-                .body(())
-                .expect("request");
-            request.extensions_mut().insert(RequestContext {
-                request_id: "req-ctx".to_string(),
-                x_amz_request_id: "amz-ctx".to_string(),
-                trace_id: Some("trace-ctx".to_string()),
-                span_id: Some("span-ctx".to_string()),
-                start_time: Instant::now(),
-            });
-            request
-                .extensions_mut()
-                .insert(RemoteAddr("127.0.0.1:9000".parse().expect("socket addr")));
+        let mut service = RequestLoggingLayer.layer(StatusService::new(StatusCode::INTERNAL_SERVER_ERROR));
 
-            let response = futures::executor::block_on(service.call(request)).expect("response");
-            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri("/bucket/object.txt")
+            .body(())
+            .expect("request");
+        request.extensions_mut().insert(RequestContext {
+            request_id: "req-ctx".to_string(),
+            x_amz_request_id: "amz-ctx".to_string(),
+            trace_id: Some("trace-ctx".to_string()),
+            span_id: Some("span-ctx".to_string()),
+            start_time: Instant::now(),
         });
+        request
+            .extensions_mut()
+            .insert(RemoteAddr("127.0.0.1:9000".parse().expect("socket addr")));
+
+        let response = service.call(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
         let output = String::from_utf8(captured.lock().expect("captured logs").clone()).expect("utf8 logs");
         assert!(output.contains("http_request_completed"), "{output}");
