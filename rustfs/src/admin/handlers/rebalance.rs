@@ -26,8 +26,9 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_ecstore::{
     error::StorageError,
-    notification_sys::get_global_notification_sys,
+    notification_sys::{NotificationSys, get_global_notification_sys},
     rebalance::{DiskStat, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta},
+    store::ECStore,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_storage_api::{BucketOperations, BucketOptions, StorageAdminApi};
@@ -41,7 +42,7 @@ use s3s::{
     s3_error,
 };
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tracing::{error, info, warn};
 
@@ -75,6 +76,47 @@ fn log_rebalance_request_rejected(action: &str, reason: &str, request_id: &str, 
         remote_addr = %remote_addr,
         "admin rebalance state"
     );
+}
+
+fn rollback_result_label(result: &Result<(), String>) -> &'static str {
+    match result {
+        Ok(_) => "rollback_success",
+        Err(err) if err.contains("peer") => "rollback_partial",
+        Err(_) => "rollback_failed",
+    }
+}
+
+fn rebalance_start_rollback_error(start_err: &str, rollback_result: &Result<(), String>) -> String {
+    match rollback_result {
+        Ok(_) => format!("failed to propagate rebalance start: {start_err}; rollback result: rollback_success"),
+        Err(err) => format!(
+            "failed to propagate rebalance start: {start_err}; rollback result: {}; rollback error: {err}",
+            rollback_result_label(rollback_result)
+        ),
+    }
+}
+
+async fn rollback_cluster_rebalance_start(
+    store: &Arc<ECStore>,
+    notification_sys: Option<&NotificationSys>,
+    rebalance_id: &str,
+) -> Result<(), String> {
+    if let Some(notification_sys) = notification_sys {
+        return notification_sys
+            .stop_rebalance()
+            .await
+            .map_err(|err| format!("cluster stop_rebalance rollback for {rebalance_id} failed: {err}"));
+    }
+
+    store
+        .stop_rebalance()
+        .await
+        .map_err(|err| format!("local stop_rebalance rollback for {rebalance_id} failed: {err}"))?;
+    store
+        .save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt)
+        .await
+        .map_err(|err| format!("local rollback stop metadata save for {rebalance_id} failed: {err}"))?;
+    Ok(())
 }
 
 pub fn register_rebalance_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -353,7 +395,7 @@ impl Operation for RebalanceStart {
                 rebalance_id = %id,
                 "admin rebalance state"
             );
-            notification_sys.load_rebalance_meta(true).await.map_err(|err| {
+            if let Err(err) = notification_sys.load_rebalance_meta(true).await {
                 error!(
                     event = EVENT_ADMIN_REBALANCE_STATE,
                     component = LOG_COMPONENT_ADMIN,
@@ -367,8 +409,46 @@ impl Operation for RebalanceStart {
                     error = %err,
                     "admin rebalance state"
                 );
-                s3_error!(InternalError, "failed to propagate rebalance start: {}", err)
-            })?;
+
+                let start_err = err.to_string();
+                let rollback_result = rollback_cluster_rebalance_start(&store, Some(notification_sys), &id).await;
+                let rollback_label = rollback_result_label(&rollback_result);
+                match &rollback_result {
+                    Ok(_) => info!(
+                        event = EVENT_ADMIN_REBALANCE_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        action = "start",
+                        result = rollback_label,
+                        request_id = %request_id,
+                        actor = %actor,
+                        remote_addr = %remote_addr,
+                        rebalance_id = %id,
+                        propagation_error = %start_err,
+                        "admin rebalance state"
+                    ),
+                    Err(rollback_err) => error!(
+                        event = EVENT_ADMIN_REBALANCE_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        action = "start",
+                        result = rollback_label,
+                        request_id = %request_id,
+                        actor = %actor,
+                        remote_addr = %remote_addr,
+                        rebalance_id = %id,
+                        propagation_error = %start_err,
+                        rollback_error = %rollback_err,
+                        "admin rebalance state"
+                    ),
+                }
+
+                return Err(s3_error!(
+                    InternalError,
+                    "{}",
+                    rebalance_start_rollback_error(&start_err, &rollback_result)
+                ));
+            }
             info!(
                 event = EVENT_ADMIN_REBALANCE_STATE,
                 component = LOG_COMPONENT_ADMIN,
@@ -662,7 +742,7 @@ mod rebalance_handler_tests {
     use super::calculate_rebalance_progress;
     use super::{
         RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, build_rebalance_pool_statuses, rebalance_pool_used,
-        rebalance_remaining_buckets, rebalance_used_pct,
+        rebalance_remaining_buckets, rebalance_start_rollback_error, rebalance_used_pct, rollback_result_label,
     };
     use rustfs_ecstore::rebalance::{DiskStat, RebalStatus, RebalanceCleanupWarnings, RebalanceInfo, RebalanceStats};
     use time::OffsetDateTime;
@@ -676,6 +756,33 @@ mod rebalance_handler_tests {
 
         assert_eq!(elapsed, 50);
         assert_eq!(eta, 50);
+    }
+
+    #[test]
+    fn test_rebalance_start_rollback_error_reports_successful_rollback() {
+        let rollback_result = Ok(());
+        let message = rebalance_start_rollback_error("peer a failed", &rollback_result);
+
+        assert!(message.contains("failed to propagate rebalance start: peer a failed"));
+        assert!(message.contains("rollback result: rollback_success"));
+    }
+
+    #[test]
+    fn test_rebalance_start_rollback_error_reports_partial_peer_rollback() {
+        let rollback_result = Err("peer b stop_rebalance failed: timeout".to_string());
+        let message = rebalance_start_rollback_error("peer a failed", &rollback_result);
+
+        assert_eq!(rollback_result_label(&rollback_result), "rollback_partial");
+        assert!(message.contains("failed to propagate rebalance start: peer a failed"));
+        assert!(message.contains("rollback result: rollback_partial"));
+        assert!(message.contains("rollback error: peer b stop_rebalance failed: timeout"));
+    }
+
+    #[test]
+    fn test_rollback_result_label_reports_non_peer_failure_as_failed() {
+        let rollback_result = Err("local stop_rebalance failed: disk error".to_string());
+
+        assert_eq!(rollback_result_label(&rollback_result), "rollback_failed");
     }
 
     #[test]
