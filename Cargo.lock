@@ -9120,6 +9120,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "pprof-pyroscope-fork",
+ "proptest",
  "rand 0.10.1",
  "rcgen",
  "reqwest",

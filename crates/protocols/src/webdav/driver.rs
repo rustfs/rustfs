@@ -770,11 +770,20 @@ where
         let decoded_path = percent_decode_str(&path_str)
             .decode_utf8()
             .map_err(|_| FsError::GeneralFailure)?;
+
+        if decoded_path.chars().any(char::is_control) {
+            return Err(FsError::GeneralFailure);
+        }
+
         let cleaned_path = path::clean(&decoded_path);
         let (bucket, object) = path::path_to_bucket_object(&cleaned_path);
 
         if bucket.is_empty() {
             return Ok((String::new(), None));
+        }
+
+        if object.contains(path::GLOBAL_DIR_SUFFIX) {
+            return Err(FsError::GeneralFailure);
         }
 
         let key = if object.is_empty() { None } else { Some(object) };
@@ -1689,6 +1698,7 @@ mod tests {
     use dav_server::davpath::DavPath;
     use dav_server::fs::FsError;
     use futures_util::StreamExt;
+    use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
     use rustfs_credentials::Credentials;
     use rustfs_policy::auth::UserIdentity;
     use s3s::dto::*;
@@ -2184,6 +2194,58 @@ mod tests {
 
         assert_eq!(bucket, "bucket");
         assert_eq!(key.as_deref(), Some("file with spaces.txt"));
+    }
+
+    #[test]
+    fn parse_path_rejects_control_bytes_after_decode() {
+        let driver = driver();
+        let path = DavPath::new("/bucket/report%0Aname.txt").expect("path should parse");
+
+        let err = driver.parse_path(&path).expect_err("control bytes should be rejected");
+
+        assert_eq!(err, FsError::GeneralFailure);
+    }
+
+    #[test]
+    fn parse_path_rejects_internal_directory_marker() {
+        let driver = driver();
+        let path = DavPath::new("/bucket/__XLDIR__").expect("path should parse");
+
+        let err = driver
+            .parse_path(&path)
+            .expect_err("internal directory marker should be rejected");
+
+        assert_eq!(err, FsError::GeneralFailure);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn parse_path_never_leaks_control_bytes_or_traversal_in_ok_output(
+            input in proptest::prelude::any::<String>(),
+        ) {
+            let driver = driver();
+            let encoded = utf8_percent_encode(&input, NON_ALPHANUMERIC).to_string();
+            let Ok(path) = DavPath::new(&format!("/{encoded}")) else {
+                return Ok(());
+            };
+
+            match driver.parse_path(&path) {
+                Err(err) => {
+                    proptest::prop_assert_eq!(err, FsError::GeneralFailure);
+                }
+                Ok((bucket, key)) => {
+                    proptest::prop_assert!(!bucket.contains('/'));
+                    proptest::prop_assert!(!bucket.chars().any(char::is_control));
+
+                    if let Some(k) = key.as_deref() {
+                        proptest::prop_assert!(!k.chars().any(char::is_control));
+                        proptest::prop_assert!(!k.starts_with('/'));
+                        proptest::prop_assert!(!k.split('/').any(|segment| segment == ".."));
+                        proptest::prop_assert!(!k.contains(rustfs_utils::path::GLOBAL_DIR_SUFFIX));
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
