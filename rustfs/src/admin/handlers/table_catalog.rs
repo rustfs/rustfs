@@ -2460,12 +2460,8 @@ fn validate_added_snapshot(
         return Err(s3_error!(PreconditionFailed, "snapshot sequence number must advance"));
     }
 
-    let manifest_list = snapshot
-        .get("manifest-list")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| s3_error!(InvalidRequest, "snapshot manifest-list is required"))?;
-    if manifest_list.is_empty() {
-        return Err(s3_error!(InvalidRequest, "snapshot manifest-list is required"));
+    if !snapshot_has_manifest_references(snapshot) {
+        return Err(s3_error!(InvalidRequest, "snapshot manifest-list or manifests are required"));
     }
 
     let operation = snapshot
@@ -2478,6 +2474,25 @@ fn validate_added_snapshot(
     }
 
     Ok(())
+}
+
+fn snapshot_has_manifest_references(snapshot: &serde_json::Value) -> bool {
+    if snapshot
+        .get("manifest-list")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|manifest_list| !manifest_list.is_empty())
+    {
+        return true;
+    }
+    snapshot
+        .get("manifests")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|manifests| {
+            !manifests.is_empty()
+                && manifests
+                    .iter()
+                    .all(|manifest| manifest.as_str().is_some_and(|manifest| !manifest.is_empty()))
+        })
 }
 
 #[derive(Default)]
@@ -2503,6 +2518,10 @@ struct SnapshotFileChanges {
 impl SnapshotFileChanges {
     fn has_delete_or_row_level_change(&self) -> bool {
         !self.added_delete_files.is_empty() || !self.deleted_data_files.is_empty() || !self.deleted_delete_files.is_empty()
+    }
+
+    fn has_any_change(&self) -> bool {
+        !self.added_data_files.is_empty() || !self.added_delete_files.is_empty() || self.has_deleted_files()
     }
 
     fn has_deleted_files(&self) -> bool {
@@ -2568,7 +2587,11 @@ where
             {
                 return Err(s3_error!(InvalidRequest, "row-level snapshot operation requires a current snapshot"));
             }
-            if !changes.has_delete_or_row_level_change() {
+            if operation == "overwrite" {
+                if !changes.has_any_change() {
+                    return Err(s3_error!(InvalidRequest, "overwrite snapshot operation requires changed files"));
+                }
+            } else if !changes.has_delete_or_row_level_change() {
                 return Err(s3_error!(
                     InvalidRequest,
                     "row-level snapshot operation requires deleted data files or added delete files"
@@ -6791,6 +6814,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn row_level_conflict_allows_v1_manifest_snapshot() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
+        let table_location = created.metadata["location"]
+            .as_str()
+            .expect("created metadata should have table location");
+        let manifest = format!("{table_location}/metadata/manifest-10.avro");
+        let data_file = format!("{table_location}/data/part-10.parquet");
+        seed_test_manifest(&metadata_backend, "warehouse", &manifest, &[(&data_file, 0, 1, 10, 1)]).await;
+        let append_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 10,
+                        "sequence-number": 1,
+                        "timestamp-ms": 1234,
+                        "manifests": [
+                            manifest
+                        ],
+                        "summary": {
+                            "operation": "append"
+                        }
+                    }
+                },
+                {
+                    "action": "set-snapshot-ref",
+                    "ref-name": "main",
+                    "snapshot-id": 10,
+                    "type": "branch"
+                }
+            ]
+        }))
+        .expect("append request should parse");
+
+        let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
+            .await
+            .expect("v1 manifests snapshot should commit");
+
+        assert_eq!(commit.metadata["current-snapshot-id"], 10);
+        assert_eq!(commit.metadata["last-sequence-number"], 1);
+    }
+
+    #[tokio::test]
+    async fn row_level_conflict_allows_add_only_overwrite_snapshot() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
+        let table_location = created.metadata["location"]
+            .as_str()
+            .expect("created metadata should have table location");
+        let current_manifest_list = format!("{table_location}/metadata/snap-10.avro");
+        let current_data_file = format!("{table_location}/data/part-10.parquet");
+        seed_test_snapshot_manifest(
+            &metadata_backend,
+            "warehouse",
+            &current_manifest_list,
+            10,
+            1,
+            &[(&current_data_file, 0, 1, 10, 1)],
+        )
+        .await;
+        let append_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 10,
+                        "sequence-number": 1,
+                        "timestamp-ms": 1234,
+                        "manifest-list": current_manifest_list,
+                        "summary": {
+                            "operation": "append"
+                        }
+                    }
+                },
+                {
+                    "action": "set-snapshot-ref",
+                    "ref-name": "main",
+                    "snapshot-id": 10,
+                    "type": "branch"
+                }
+            ]
+        }))
+        .expect("append request should parse");
+        commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
+            .await
+            .expect("append commit should succeed");
+
+        let overwrite_manifest_list = format!("{table_location}/metadata/snap-11.avro");
+        let added_data_file = format!("{table_location}/data/part-11.parquet");
+        seed_test_snapshot_manifest(
+            &metadata_backend,
+            "warehouse",
+            &overwrite_manifest_list,
+            11,
+            2,
+            &[(&added_data_file, 0, 1, 11, 2)],
+        )
+        .await;
+        let overwrite_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "requirements": [
+                {
+                    "type": "assert-current-snapshot-id",
+                    "snapshot-id": 10
+                }
+            ],
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 11,
+                        "parent-snapshot-id": 10,
+                        "sequence-number": 2,
+                        "timestamp-ms": 2234,
+                        "manifest-list": overwrite_manifest_list,
+                        "summary": {
+                            "operation": "overwrite"
+                        }
+                    }
+                },
+                {
+                    "action": "set-snapshot-ref",
+                    "ref-name": "main",
+                    "snapshot-id": 11,
+                    "type": "branch"
+                }
+            ]
+        }))
+        .expect("overwrite request should parse");
+
+        let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", overwrite_request)
+            .await
+            .expect("add-only overwrite should pass conflict validation");
+
+        assert_eq!(commit.metadata["current-snapshot-id"], 11);
+        assert_eq!(commit.metadata["last-sequence-number"], 2);
+    }
+
+    #[tokio::test]
     async fn row_level_conflict_rejects_delete_of_non_current_file() {
         let store = TestTableCatalogStore::default();
         let metadata_backend = TestTableCatalogObjectBackend::default();
@@ -7957,6 +8123,27 @@ mod tests {
         backend
             .put_bytes(bucket, &manifest_key, test_manifest_avro_bytes(files))
             .await;
+        seed_test_manifest_data_files(backend, bucket, files).await;
+    }
+
+    async fn seed_test_manifest(
+        backend: &TestTableCatalogObjectBackend,
+        bucket: &str,
+        manifest_location: &str,
+        files: &[(&str, i32, i32, i64, i64)],
+    ) {
+        let manifest_key = test_snapshot_object_key(bucket, manifest_location);
+        backend
+            .put_bytes(bucket, &manifest_key, test_manifest_avro_bytes(files))
+            .await;
+        seed_test_manifest_data_files(backend, bucket, files).await;
+    }
+
+    async fn seed_test_manifest_data_files(
+        backend: &TestTableCatalogObjectBackend,
+        bucket: &str,
+        files: &[(&str, i32, i32, i64, i64)],
+    ) {
         for (file_path, _, status, _, _) in files {
             if *status != 2 {
                 let object_key = test_snapshot_object_key(bucket, file_path);
