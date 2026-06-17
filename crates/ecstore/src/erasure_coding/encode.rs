@@ -14,13 +14,13 @@
 
 use crate::disk::error::Error;
 use crate::disk::error_reduce::{
-    OBJECT_OP_IGNORED_ERRS, WriteQuorumFailureSummary, build_write_quorum_failure_summary, reduce_write_quorum_errs,
+    build_write_quorum_failure_summary, reduce_write_quorum_errs, WriteQuorumFailureSummary, OBJECT_OP_IGNORED_ERRS,
 };
 use crate::erasure_coding::BitrotWriterWrapper;
 use crate::erasure_coding::Erasure;
 use bytes::Bytes;
-use futures::StreamExt;
 use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use std::sync::Arc;
 use std::vec;
 use tokio::io::AsyncRead;
@@ -30,6 +30,10 @@ use tracing::error;
 const ENV_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES: &str = "RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES";
 const DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BLOCKS: usize = 32;
+
+/// Cached value of `RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES` env var.
+/// Read once at first use via `OnceLock` to avoid per-encode syscall.
+static CACHED_MAX_INFLIGHT_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 fn encode_channel_capacity(expanded_block_bytes: usize, max_inflight_bytes: usize) -> usize {
     if expanded_block_bytes == 0 {
@@ -273,10 +277,12 @@ impl Erasure {
 
         // Bound queued encoded blocks by memory budget to avoid per-request spikes.
         let expanded_block_bytes = self.shard_size().saturating_mul(self.total_shard_count());
-        let max_inflight_bytes = rustfs_utils::get_env_usize(
-            ENV_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES,
-            DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES,
-        );
+        let max_inflight_bytes = *CACHED_MAX_INFLIGHT_BYTES.get_or_init(|| {
+            rustfs_utils::get_env_usize(
+                ENV_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES,
+                DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES,
+            )
+        });
         let inflight_blocks = encode_channel_capacity(expanded_block_bytes, max_inflight_bytes);
         let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(inflight_blocks);
 
@@ -295,8 +301,8 @@ impl Erasure {
                             let res = erasure.encode_data(&encode_buf[..n]);
                             (res, encode_buf)
                         })
-                        .await
-                        .map_err(|err| std::io::Error::other(format!("EC encode task failed: {err}")))?;
+                            .await
+                            .map_err(|err| std::io::Error::other(format!("EC encode task failed: {err}")))?;
                         buf = returned_buf;
                         let res = res?;
                         let queued_bytes = queued_block_bytes(&res);
@@ -443,7 +449,7 @@ mod tests {
         ))];
 
         let erasure = Arc::new(Erasure::new(1, 0, 16));
-        let reader = tokio::io::BufReader::new(std::io::Cursor::new(b"small payload".to_vec()));
+        let reader = tokio::io::BufReader::new(Cursor::new(b"small payload".to_vec()));
         let (_reader, written) = erasure.encode(reader, &mut writers, 1).await.unwrap();
 
         assert_eq!(written, b"small payload".len());
@@ -482,7 +488,7 @@ mod tests {
         ))];
 
         let erasure = Arc::new(Erasure::new(1, 0, 0));
-        let reader = tokio::io::BufReader::new(std::io::Cursor::new(b"payload".to_vec()));
+        let reader = tokio::io::BufReader::new(Cursor::new(b"payload".to_vec()));
         let err = erasure
             .encode(reader, &mut writers, 1)
             .await
@@ -505,7 +511,7 @@ mod tests {
         ))];
 
         let erasure = Arc::new(Erasure::new(1, 0, 16));
-        let reader = tokio::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+        let reader = tokio::io::BufReader::new(Cursor::new(Vec::<u8>::new()));
         let (_reader, total) = erasure.encode_inline_small(reader, &mut writers, 1).await.unwrap();
 
         assert_eq!(total, 0);
@@ -537,7 +543,7 @@ mod tests {
 
         let payload = b"hello inline small";
         let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
-        let reader = tokio::io::BufReader::new(std::io::Cursor::new(payload.to_vec()));
+        let reader = tokio::io::BufReader::new(Cursor::new(payload.to_vec()));
         let (_reader, total) = erasure.encode_inline_small(reader, &mut writers, DATA_SHARDS).await.unwrap();
 
         assert_eq!(total, payload.len());
@@ -569,7 +575,7 @@ mod tests {
 
         let payload = b"hello single block";
         let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
-        let reader = tokio::io::BufReader::new(std::io::Cursor::new(payload.to_vec()));
+        let reader = tokio::io::BufReader::new(Cursor::new(payload.to_vec()));
         let (_reader, total) = erasure
             .encode_single_block_non_inline(reader, &mut writers, DATA_SHARDS)
             .await
@@ -603,7 +609,7 @@ mod tests {
 
         let payload = vec![1u8; BLOCK_SIZE + 1];
         let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
-        let reader = tokio::io::BufReader::new(std::io::Cursor::new(payload));
+        let reader = tokio::io::BufReader::new(Cursor::new(payload));
         let err = erasure
             .encode_single_block_non_inline(reader, &mut writers, DATA_SHARDS)
             .await

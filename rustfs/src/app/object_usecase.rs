@@ -477,7 +477,7 @@ fn should_use_small_eager_put_path(
     should_compress: bool,
     is_extract: bool,
 ) -> bool {
-    const SMALL_EAGER_PUT_MAX_SIZE: i64 = 8 * 1024;
+    const SMALL_EAGER_PUT_MAX_SIZE: i64 = 1024 * 1024;
 
     if is_extract || should_compress || server_side_encryption_requested {
         return false;
@@ -501,7 +501,7 @@ fn should_use_small_eager_put_path(
 /// Objects at or below this size bypass BytesPool and use direct allocation.
 /// This avoids Small-tier Mutex contention under high concurrency for tiny objects
 /// where the allocation cost is negligible (≤16KiB memcpy).
-const POOL_BYPASS_MAX_SIZE: usize = 16 * 1024;
+const POOL_BYPASS_MAX_SIZE: usize = 4 * 1024;
 
 async fn read_small_put_body_exact_pooled<R>(mut body: R, size: usize, pool: &BytesPool) -> S3Result<PooledBuffer>
 where
@@ -1956,7 +1956,9 @@ impl DefaultObjectUsecase {
         // Apply adaptive buffer sizing based on file size for optimal streaming performance.
         // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
         // Buffer sizes range from 32KB to 4MB depending on file size and configured workload profile.
-        let buffer_size = get_buffer_size_opt_in(size);
+        // Concurrency-aware adjustment reduces buffer size under high concurrency to lower memory pressure.
+        let base_buffer_size = get_buffer_size_opt_in(size);
+        let buffer_size = get_concurrency_aware_buffer_size(size, base_buffer_size);
 
         // Detect zero-copy opportunity before encryption/compression decisions
         // Zero-copy is beneficial for large unencrypted, uncompressed objects
@@ -5307,12 +5309,12 @@ mod tests {
     }
 
     #[test]
-    fn should_use_small_eager_put_path_allows_up_to_8k() {
+    fn should_use_small_eager_put_path_allows_up_to_1mb() {
         let headers = HeaderMap::new();
 
         assert!(should_use_small_eager_put_path(1024, &headers, false, false, false));
-        assert!(should_use_small_eager_put_path(8 * 1024, &headers, false, false, false));
-        assert!(!should_use_small_eager_put_path(8 * 1024 + 1, &headers, false, false, false));
+        assert!(should_use_small_eager_put_path(1024 * 1024, &headers, false, false, false));
+        assert!(!should_use_small_eager_put_path(1024 * 1024 + 1, &headers, false, false, false));
     }
 
     #[test]
@@ -5341,7 +5343,7 @@ mod tests {
         let headers = HeaderMap::new();
 
         assert!(!should_use_small_eager_put_path(0, &headers, false, false, false));
-        assert!(!should_use_small_eager_put_path(8 * 1024 + 1, &headers, false, false, false));
+        assert!(!should_use_small_eager_put_path(1024 * 1024 + 1, &headers, false, false, false));
     }
 
     #[tokio::test]
