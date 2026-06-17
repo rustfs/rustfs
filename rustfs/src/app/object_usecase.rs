@@ -477,7 +477,7 @@ fn should_use_small_eager_put_path(
     should_compress: bool,
     is_extract: bool,
 ) -> bool {
-    const SMALL_EAGER_PUT_MAX_SIZE: i64 = 256 * 1024;
+    const SMALL_EAGER_PUT_MAX_SIZE: i64 = 8 * 1024;
 
     if is_extract || should_compress || server_side_encryption_requested {
         return false;
@@ -497,6 +497,11 @@ fn should_use_small_eager_put_path(
 
     true
 }
+
+/// Objects at or below this size bypass BytesPool and use direct allocation.
+/// This avoids Small-tier Mutex contention under high concurrency for tiny objects
+/// where the allocation cost is negligible (≤16KiB memcpy).
+const POOL_BYPASS_MAX_SIZE: usize = 16 * 1024;
 
 async fn read_small_put_body_exact_pooled<R>(mut body: R, size: usize, pool: &BytesPool) -> S3Result<PooledBuffer>
 where
@@ -525,6 +530,37 @@ where
     }
 
     Ok(buf)
+}
+
+/// Read small PUT body into a directly-allocated buffer, bypassing BytesPool.
+/// Used for objects ≤16KiB where pool contention under high concurrency
+/// outweighs the allocation cost.
+async fn read_small_put_body_exact_direct<R>(mut body: R, size: usize) -> S3Result<std::io::Cursor<Vec<u8>>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = vec![0u8; size];
+    let mut filled = 0;
+
+    while filled < size {
+        let read = tokio::io::AsyncReadExt::read(&mut body, &mut buf[filled..size])
+            .await
+            .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
+        if read == 0 {
+            return Err(s3_error!(IncompleteBody));
+        }
+        filled += read;
+    }
+
+    let mut extra = [0u8; 1];
+    let extra_read = tokio::io::AsyncReadExt::read(&mut body, &mut extra)
+        .await
+        .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
+    if extra_read != 0 {
+        return Err(s3_error!(UnexpectedContent));
+    }
+
+    Ok(std::io::Cursor::new(buf))
 }
 
 fn object_seek_support_threshold() -> usize {
@@ -2097,15 +2133,29 @@ impl DefaultObjectUsecase {
             hrd
         } else {
             if use_small_eager_put_path {
-                let pool = get_concurrency_manager().bytes_pool();
-                let eager_body = read_small_put_body_exact_pooled(
-                    StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
-                    actual_size as usize,
-                    pool.as_ref(),
-                )
-                .await?;
-                let eager_reader = PooledBufferReader::new(eager_body, actual_size as usize);
-                HashReader::from_stream(eager_reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
+                if (actual_size as usize) <= POOL_BYPASS_MAX_SIZE {
+                    // Bypass BytesPool for very small objects to avoid Small-tier
+                    // Mutex contention under high concurrency. Direct allocation
+                    // for ≤16KiB is negligible cost.
+                    let eager_body = read_small_put_body_exact_direct(
+                        StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+                        actual_size as usize,
+                    )
+                    .await?;
+                    HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false)
+                        .map_err(ApiError::from)?
+                } else {
+                    let pool = get_concurrency_manager().bytes_pool();
+                    let eager_body = read_small_put_body_exact_pooled(
+                        StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+                        actual_size as usize,
+                        pool.as_ref(),
+                    )
+                    .await?;
+                    let eager_reader = PooledBufferReader::new(eager_body, actual_size as usize);
+                    HashReader::from_stream(eager_reader, size, actual_size, md5hex, sha256hex, false)
+                        .map_err(ApiError::from)?
+                }
             } else {
                 let body = tokio::io::BufReader::with_capacity(
                     buffer_size,
@@ -5257,11 +5307,12 @@ mod tests {
     }
 
     #[test]
-    fn should_use_small_eager_put_path_allows_plain_one_megabyte_and_below() {
+    fn should_use_small_eager_put_path_allows_up_to_8k() {
         let headers = HeaderMap::new();
 
         assert!(should_use_small_eager_put_path(1024, &headers, false, false, false));
-        assert!(should_use_small_eager_put_path(1024 * 1024, &headers, false, false, false));
+        assert!(should_use_small_eager_put_path(8 * 1024, &headers, false, false, false));
+        assert!(!should_use_small_eager_put_path(8 * 1024 + 1, &headers, false, false, false));
     }
 
     #[test]
@@ -5290,7 +5341,7 @@ mod tests {
         let headers = HeaderMap::new();
 
         assert!(!should_use_small_eager_put_path(0, &headers, false, false, false));
-        assert!(!should_use_small_eager_put_path(1024 * 1024 + 1, &headers, false, false, false));
+        assert!(!should_use_small_eager_put_path(8 * 1024 + 1, &headers, false, false, false));
     }
 
     #[tokio::test]
