@@ -1624,11 +1624,7 @@ impl ECStore {
 
         if should_reload_pool_meta && let Some(notification_sys) = get_global_notification_sys() {
             let stage = format!("decommission_cancel for pool {idx}");
-            if let Err(err) =
-                resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())
-            {
-                warn!("{err}");
-            }
+            resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())?;
         }
 
         Ok(())
@@ -1644,11 +1640,7 @@ impl ECStore {
             self.save_current_pool_meta().await?;
             if let Some(notification_sys) = get_global_notification_sys() {
                 let stage = format!("promote_queued_decommission for pool {idx}");
-                if let Err(err) =
-                    resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())
-                {
-                    warn!("{err}");
-                }
+                resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())?;
             }
         }
 
@@ -2580,20 +2572,19 @@ impl ECStore {
             pool_meta.decommission_failed(idx)
         };
 
+        let mut reload_result = Ok(());
         if should_reload_pool_meta {
             self.save_current_pool_meta().await?;
             {
                 let mut pool_meta = self.pool_meta.write().await;
                 pool_meta.mark_decommission_progress_saved();
             }
-            if let Some(notification_sys) = get_global_notification_sys() {
+            reload_result = if let Some(notification_sys) = get_global_notification_sys() {
                 let stage = format!("decommission_failed for pool {idx}");
-                if let Err(err) =
-                    resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())
-                {
-                    warn!("{err}");
-                }
-            }
+                resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())
+            } else {
+                Ok(())
+            };
         }
 
         let canceler = {
@@ -2603,6 +2594,8 @@ impl ECStore {
         if let Some(canceler) = canceler {
             canceler.cancel();
         }
+
+        reload_result?;
 
         Ok(())
     }
@@ -2616,20 +2609,19 @@ impl ECStore {
             pool_meta.decommission_complete(idx)
         };
 
+        let mut reload_result = Ok(());
         if should_reload_pool_meta {
             self.save_current_pool_meta().await?;
             {
                 let mut pool_meta = self.pool_meta.write().await;
                 pool_meta.mark_decommission_progress_saved();
             }
-            if let Some(notification_sys) = get_global_notification_sys() {
+            reload_result = if let Some(notification_sys) = get_global_notification_sys() {
                 let stage = format!("complete_decommission for pool {idx}");
-                if let Err(err) =
-                    resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())
-                {
-                    warn!("{err}");
-                }
-            }
+                resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())
+            } else {
+                Ok(())
+            };
         }
 
         let canceler = {
@@ -2639,6 +2631,8 @@ impl ECStore {
         if let Some(canceler) = canceler {
             canceler.cancel();
         }
+
+        reload_result?;
 
         Ok(())
     }
