@@ -1626,11 +1626,70 @@ Define strict parsing for high-risk admin APIs:
 3. Preserve compatibility for read-only status endpoints unless explicitly approved.
 4. Add tests for misspelled dangerous parameters.
 
+### Design Draft
+
+Strict query parsing should apply only to admin APIs that mutate distributed
+state or start/stop background workers:
+
+| Endpoint | Method | Query Contract |
+| --- | --- | --- |
+| `/v3/rebalance/start` | `POST` | No query parameters allowed. |
+| `/v3/rebalance/stop` | `POST` | No query parameters allowed. |
+| `/v3/pools/decommission` | `POST` | Allow only `pool` and `by-id`. |
+| `/v3/pools/cancel` | `POST` | Allow only `pool` and `by-id`. |
+
+Read-only endpoints such as `/v3/rebalance/status`, `/v3/pools/status`, and
+`/v3/pools/list` should retain the existing permissive behavior unless product
+approval explicitly includes them. This avoids breaking dashboards or scripts
+that attach harmless tracking parameters to status requests.
+
+The proposed error contract for dangerous endpoints:
+
+- Unknown query keys return `InvalidArgument`.
+- Misspelled known keys, such as `pooll` or `byid`, are treated as unknown keys
+  and return `InvalidArgument`.
+- Repeated keys are rejected unless the endpoint explicitly documents list
+  semantics. For the current decommission/cancel endpoints, repeated `pool` or
+  `by-id` should return `InvalidArgument`.
+- Empty required values continue to use the existing endpoint-specific invalid
+  pool or missing target errors after strict key validation passes.
+- Rejection logs must include request ID, actor, remote address, operation, and
+  the rejected query key when authentication has already succeeded.
+
+Implementation should use a small shared helper rather than adding
+endpoint-specific ad hoc parsing:
+
+1. Parse the raw query into key/value pairs while preserving duplicate keys.
+2. Validate the key set against the endpoint allow-list.
+3. Validate duplicate policy.
+4. Only then deserialize into the existing typed query struct.
+
+Tests should cover:
+
+- `POST /v3/pools/decommission?pooll=...` rejects before defaulting to an empty
+  `pool`;
+- `POST /v3/pools/cancel?byid=true` rejects instead of silently using
+  `by-id=false`;
+- `POST /v3/rebalance/start?dryRun=true` rejects because start accepts no query
+  keys;
+- read-only status endpoints keep current behavior unless included in the
+  approved endpoint list.
+
+Approval questions before code changes:
+
+- Should `by-id` accept only `true`/`false`, or keep the current
+  string-compare semantics where any non-`true` value is false?
+- Should repeated `pool` ever be accepted as an alternative to comma-separated
+  pool lists if multi-pool decommission is approved later?
+- Should unknown query rejection happen before or after authentication for these
+  admin endpoints? The safer audit path is after authentication, matching the
+  current contextual logging pattern.
+
 ### Implementation Steps
 
-- [ ] Document endpoint scope and error contract.
-- [ ] Do not change handler parsing until the endpoint list is approved.
-- [ ] Run:
+- [x] Document endpoint scope and error contract.
+- [x] Do not change handler parsing until the endpoint list is approved.
+- [x] Run:
 
 ```bash
 cargo fmt --all --check
