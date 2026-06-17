@@ -32,8 +32,8 @@ use crate::disk::error::DiskError;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::error::{
-    StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_data_movement_overwrite, is_err_object_not_found,
-    is_err_operation_canceled, is_err_version_not_found,
+    StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_object_not_found, is_err_operation_canceled,
+    is_err_version_not_found,
 };
 use crate::notification_sys::get_global_notification_sys;
 use crate::resolve_object_store_handle;
@@ -407,6 +407,12 @@ fn resolve_decommission_listing_worker_result(
 
 fn should_count_decommission_version_complete(ignore: bool, cleanup_ignored: bool, failure: bool) -> bool {
     cleanup_ignored || (!ignore && !failure)
+}
+
+fn is_decommission_copy_cleanup_safe_error(err: &Error) -> bool {
+    // DataMovementOverwriteErr only means source and destination pool resolved to
+    // the same pool. Without a target equivalence check it is not cleanup-safe.
+    is_err_object_not_found(err) || is_err_version_not_found(err)
 }
 
 fn should_cleanup_decommission_source_entry(decommissioned: usize, total_versions: usize, expired: usize) -> bool {
@@ -1681,7 +1687,7 @@ impl ECStore {
                     )
                     .await
                 {
-                    if is_err_object_not_found(&err) || is_err_version_not_found(&err) || is_err_data_movement_overwrite(&err) {
+                    if is_decommission_copy_cleanup_safe_error(&err) {
                         warn!(
                             event = EVENT_DECOMMISSION_ENTRY,
                             component = LOG_COMPONENT_ECSTORE,
@@ -1762,8 +1768,7 @@ impl ECStore {
                         )
                         .await
                     {
-                        if is_err_object_not_found(&err) || is_err_version_not_found(&err) || is_err_data_movement_overwrite(&err)
-                        {
+                        if is_decommission_copy_cleanup_safe_error(&err) {
                             ignore = true;
                             cleanup_ignored = true;
                             break;
@@ -1819,7 +1824,7 @@ impl ECStore {
                 let object_name = rd.object_info.name.clone();
 
                 if let Err(err) = self.clone().decommission_object(idx, bucket, rd).await {
-                    if is_err_object_not_found(&err) || is_err_version_not_found(&err) || is_err_data_movement_overwrite(&err) {
+                    if is_decommission_copy_cleanup_safe_error(&err) {
                         ignore = true;
                         cleanup_ignored = true;
                         break;
@@ -2773,6 +2778,33 @@ mod tests {
         assert_eq!(decommission_remaining_version_count(1, 0), 1);
         assert_eq!(decommission_remaining_version_count(2, 1), 1);
         assert_eq!(decommission_remaining_version_count(1, 1), 0);
+    }
+
+    #[test]
+    fn decommission_copy_cleanup_safe_error_accepts_missing_source_errors() {
+        assert!(is_decommission_copy_cleanup_safe_error(&Error::ObjectNotFound(
+            "bucket".to_string(),
+            "object".to_string()
+        )));
+        assert!(is_decommission_copy_cleanup_safe_error(&Error::VersionNotFound(
+            "bucket".to_string(),
+            "object".to_string(),
+            "version".to_string()
+        )));
+    }
+
+    #[test]
+    fn decommission_delete_marker_copy_error_rejects_data_movement_overwrite() {
+        let err = Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "version".to_string());
+
+        assert!(!is_decommission_copy_cleanup_safe_error(&err));
+    }
+
+    #[test]
+    fn decommission_remote_tiered_copy_error_rejects_data_movement_overwrite() {
+        let err = Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "version".to_string());
+
+        assert!(!is_decommission_copy_cleanup_safe_error(&err));
     }
 
     #[test]
