@@ -500,7 +500,7 @@ fn should_use_small_eager_put_path(
 
 /// Objects at or below this size bypass BytesPool and use direct allocation.
 /// This avoids Small-tier Mutex contention under high concurrency for tiny objects
-/// where the allocation cost is negligible (≤16KiB memcpy).
+/// where the allocation cost is negligible (≤4KiB memcpy).
 const POOL_BYPASS_MAX_SIZE: usize = 4 * 1024;
 
 async fn read_small_put_body_exact_pooled<R>(mut body: R, size: usize, pool: &BytesPool) -> S3Result<PooledBuffer>
@@ -533,7 +533,7 @@ where
 }
 
 /// Read small PUT body into a directly-allocated buffer, bypassing BytesPool.
-/// Used for objects ≤16KiB where pool contention under high concurrency
+/// Used for objects ≤4KiB where pool contention under high concurrency
 /// outweighs the allocation cost.
 async fn read_small_put_body_exact_direct<R>(mut body: R, size: usize) -> S3Result<std::io::Cursor<Vec<u8>>>
 where
@@ -2142,7 +2142,7 @@ impl DefaultObjectUsecase {
                 if (actual_size as usize) <= POOL_BYPASS_MAX_SIZE {
                     // Bypass BytesPool for very small objects to avoid Small-tier
                     // Mutex contention under high concurrency. Direct allocation
-                    // for ≤16KiB is negligible cost.
+                    // for ≤4KiB is negligible cost.
                     let eager_body = read_small_put_body_exact_direct(
                         StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
                         actual_size as usize,

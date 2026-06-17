@@ -1167,7 +1167,7 @@ impl ECStore {
                 Err(err) => errs.push(Some(err.into())),
             }
         }
-        rustfs_io_metrics::record_put_object_stage_duration(
+        rustfs_io_metrics::record_stage_duration(
             "store_list_objects_walk_internal",
             walk_started.elapsed().as_secs_f64() * 1000.0,
         );

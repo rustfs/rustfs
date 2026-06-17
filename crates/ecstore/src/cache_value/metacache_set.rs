@@ -187,13 +187,13 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                 let primary_walk_started = std::time::Instant::now();
                 match disk.walk_dir(wakl_opts, &mut wr).await {
                     Ok(_res) => {
-                        rustfs_io_metrics::record_put_object_stage_duration(
+                        rustfs_io_metrics::record_stage_duration(
                             "metacache_walk_dir_primary",
                             primary_walk_started.elapsed().as_secs_f64() * 1000.0,
                         );
                     }
                     Err(err) => {
-                        rustfs_io_metrics::record_put_object_stage_duration(
+                        rustfs_io_metrics::record_stage_duration(
                             "metacache_walk_dir_primary_failed",
                             primary_walk_started.elapsed().as_secs_f64() * 1000.0,
                         );
@@ -267,7 +267,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                     .await
                 {
                     Ok(_r) => {
-                        rustfs_io_metrics::record_put_object_stage_duration(
+                        rustfs_io_metrics::record_stage_duration(
                             "metacache_walk_dir_fallback",
                             fallback_walk_started.elapsed().as_secs_f64() * 1000.0,
                         );
@@ -275,7 +275,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                         last_err = None;
                     }
                     Err(err) => {
-                        rustfs_io_metrics::record_put_object_stage_duration(
+                        rustfs_io_metrics::record_stage_duration(
                             "metacache_walk_dir_fallback_failed",
                             fallback_walk_started.elapsed().as_secs_f64() * 1000.0,
                         );
@@ -559,7 +559,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
 
     let merge_started = std::time::Instant::now();
     if let Err(err) = revjob.await.map_err(std::io::Error::other)? {
-        rustfs_io_metrics::record_put_object_stage_duration(
+        rustfs_io_metrics::record_stage_duration(
             "metacache_merge_failed",
             merge_started.elapsed().as_secs_f64() * 1000.0,
         );
@@ -580,7 +580,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
 
         return Err(err);
     }
-    rustfs_io_metrics::record_put_object_stage_duration("metacache_merge", merge_started.elapsed().as_secs_f64() * 1000.0);
+    rustfs_io_metrics::record_stage_duration("metacache_merge", merge_started.elapsed().as_secs_f64() * 1000.0);
 
     // The merge consumer can finish successfully before every producer finishes
     // (for example after reaching EOF quorum while a tolerated drive is stalled,

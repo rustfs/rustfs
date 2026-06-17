@@ -465,6 +465,14 @@ pub fn record_put_object_stage_duration(stage: &'static str, duration_ms: f64) {
     histogram!("rustfs_s3_put_object_stage_duration_ms", "stage" => stage).record(duration_ms);
 }
 
+/// Record generic internal operation stage duration (non-PUT paths).
+/// Use this for metacache walks, listing, lifecycle, and other background
+/// operations that are NOT part of the PUT object hot path.
+#[inline(always)]
+pub fn record_stage_duration(stage: &'static str, duration_ms: f64) {
+    histogram!("rustfs_internal_stage_duration_ms", "stage" => stage).record(duration_ms);
+}
+
 /// Record ListObjects operation metrics.
 ///
 /// # Arguments
@@ -829,6 +837,10 @@ pub fn record_io_latency_p99(latency_ms: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Serialize tests that mutate the process-global PUT_STAGE_METRICS_ENABLED flag.
+    static METRICS_FLAG_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_record_zero_copy_read() {
@@ -867,25 +879,32 @@ mod tests {
 
     #[test]
     fn test_record_put_object_path_and_stage() {
-        // Enable stage metrics for testing
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_put_stage_metrics_enabled(true);
         record_put_object_path("small_eager");
         record_put_object_path("write_inline");
         record_put_object_stage_duration("ingress_prepare", 12.5);
         record_put_object_stage_duration("set_disk_encode", 8.0);
-        // Disable again to not affect other tests
         set_put_stage_metrics_enabled(false);
     }
 
     #[test]
     fn test_put_stage_metrics_disabled_by_default() {
-        // Default state should be disabled
-        assert!(!put_stage_metrics_enabled());
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_put_stage_metrics_enabled(false);
         // These should be no-ops (no panic, no recording)
         record_put_object_path("small_eager");
         record_put_object_stage_duration("set_disk_encode", 5.0);
         // Still disabled
         assert!(!put_stage_metrics_enabled());
+    }
+
+    #[test]
+    fn test_record_stage_duration_generic() {
+        // Generic stage duration should always record (no gating flag)
+        record_stage_duration("metacache_walk_dir_primary", 15.0);
+        record_stage_duration("store_list_objects_walk_internal", 8.5);
+        record_stage_duration("lifecycle_free_version_recovery_failed", 120.0);
     }
 
     #[test]
