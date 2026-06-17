@@ -14,6 +14,9 @@
 
 use std::fmt;
 use time::OffsetDateTime;
+use uuid::Uuid;
+
+const NULL_VERSION_MARKER: &str = "null";
 
 #[derive(Debug, Default, Clone)]
 pub struct HTTPPreconditions {
@@ -38,6 +41,30 @@ pub struct ObjectLockRetentionOptions {
     pub mode: Option<String>,
     pub retain_until: Option<OffsetDateTime>,
     pub bypass_governance: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionMarker {
+    Null,
+    Version(Uuid),
+}
+
+impl VersionMarker {
+    pub fn parse(marker: impl AsRef<str>) -> Result<Self, uuid::Error> {
+        let marker = marker.as_ref();
+        if marker == NULL_VERSION_MARKER {
+            Ok(Self::Null)
+        } else {
+            Ok(Self::Version(Uuid::parse_str(marker)?))
+        }
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub enum WalkVersionsSortOrder {
+    #[default]
+    Ascending,
+    Descending,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,6 +208,22 @@ mod tests {
         assert!(opts.mode.is_none());
         assert!(opts.retain_until.is_none());
         assert!(!opts.bypass_governance);
+    }
+
+    #[test]
+    fn version_marker_parses_null_and_uuid_markers() {
+        assert_eq!(VersionMarker::parse("null").expect("null marker should parse"), VersionMarker::Null);
+
+        let marker = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(
+            VersionMarker::parse(marker).expect("uuid marker should parse"),
+            VersionMarker::Version(Uuid::parse_str(marker).expect("test uuid should parse"))
+        );
+    }
+
+    #[test]
+    fn walk_versions_sort_order_defaults_to_ascending() {
+        assert!(matches!(WalkVersionsSortOrder::default(), WalkVersionsSortOrder::Ascending));
     }
 
     #[test]

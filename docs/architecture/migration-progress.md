@@ -5,17 +5,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-range-contracts`
-- Baseline: `overtrue/arch-object-option-contracts` at `5328e10a0f0cdda9cc17089956e17432f2875962`
+- Branch: `overtrue/arch-object-list-helper-contracts`
+- Baseline: `overtrue/arch-range-contracts` at `829bc62095f0fd853747cd6d7d77f8558baf24a2`
   over `origin/main` at `a9aba323c6512e6b99c3137258b97b6058075ce9`
 - PR type for this branch: `api-extraction`
 - Runtime behavior changes: no external behavior change expected.
-- Rust code changes: move the pure `HTTPRangeSpec` range contract and
-  `HTTPRangeError` into `rustfs-storage-api`, then keep ECStore object-info
-  adaptation at the ECStore boundary.
-- CI/script changes: extend migration guards for range helper public re-exports
-  and reject restoring the old ECStore-owned range helper definitions.
-- Docs changes: record the range contract extraction slice.
+- Rust code changes: move the pure `VersionMarker` and
+  `WalkVersionsSortOrder` list helper contracts into `rustfs-storage-api`,
+  then keep ECStore list/walk implementations and filemeta adaptation at the
+  ECStore boundary.
+- CI/script changes: extend migration guards for list helper public re-exports
+  and reject restoring the old ECStore-owned list helper definitions or
+  public re-exports.
+- Docs changes: record the list helper contract extraction slice.
 
 ## Phase 0 Tasks
 
@@ -577,6 +579,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration/layer guards, formatting, diff hygiene, Rust risk scan, and
     required three-expert review passed.
 
+- [x] `API-017` Move object list helper contracts.
+  - Completed slice: move `VersionMarker` and `WalkVersionsSortOrder` from
+    ECStore `store_api/types.rs` into `rustfs-storage-api`; keep
+    `versions_after_marker`, `WalkOptions`, `ObjectInfo`, list result DTOs,
+    readers, and storage list/walk implementations in ECStore.
+  - Acceptance: `rustfs-storage-api` exports the list helper contracts,
+    in-repo production code no longer imports them from
+    `rustfs_ecstore::store_api`, and migration guards reject restoring old
+    ECStore definitions or public re-exports.
+  - Must preserve: list-object-versions marker parsing, null version markers,
+    version marker application only to the first matching entry, walk sort
+    default, and ECStore-owned filemeta/list implementation behavior.
+  - Risk defense: only pure marker/sort contracts cross into
+    `rustfs-storage-api`; ECStore keeps filemeta conversion, list result DTOs,
+    walk options with filemeta filters, readers, lifecycle/replication coupling,
+    and storage implementation bodies.
+  - Verification: focused storage-api/ECStore/RustFS/downstream compile checks,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, and
+    required three-expert review passed.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -853,36 +875,39 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Pure multipart/object helper contracts now live in `rustfs-storage-api`; implementation-heavy object contracts and ECStore behavior stay in ECStore. |
-| Migration preservation | passed | The slice changes helper type ownership and import paths only; multipart completion mapping, HTTP precondition values, object-lock retention fields, and storage hot paths are unchanged. |
+| Quality/architecture | passed | Pure object list helper contracts now live in `rustfs-storage-api`; implementation-heavy list/walk contracts and ECStore behavior stay in ECStore. |
+| Migration preservation | passed | The slice changes helper type ownership and import paths only; null version marker parsing, first-entry version marker behavior, walk sort default, and ECStore filemeta/list behavior are unchanged. |
 | Testing/verification | passed | Focused storage-api/ECStore/RustFS/downstream compile checks, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
-Passed on `8d24d9133b31c0ca0de0fcd16ad06cd2fdc6f7ae`:
+Passed before push:
 
-- `cargo check -p rustfs-storage-api -p rustfs-ecstore -p rustfs-iam -p rustfs-scanner -p rustfs`: passed.
+- `cargo test -p rustfs-storage-api`: passed.
+- `cargo check --tests -p rustfs-storage-api -p rustfs-ecstore -p rustfs -p rustfs-iam -p rustfs-scanner`: passed.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
 - `cargo fmt --all --check`: passed.
 - `git diff --check`: passed.
 - Rust risk scan: no new production `unwrap`/`expect`, panic/todo markers,
-  `unsafe`, or process-spawning calls in added Rust lines.
+  `unsafe`, process-spawning calls, lossy casts, println/eprintln, or relaxed
+  ordering in added Rust lines; new `expect` calls are test-only assertions.
 - `make pre-commit`: passed.
 
 Notes:
 
-- This slice follows `rustfs/rustfs#3507` and keeps the old aggregate facade,
-  bucket DTO, multipart DTO, bucket operation contract, and object helper
-  contract guards active.
-- The shared object helper contracts are now owned by `rustfs-storage-api`;
-  ECStore keeps implementation-heavy object, list, reader, lock, lifecycle,
-  replication, rio, filemeta, and storage error contracts.
-- The slice does not alter object, multipart, or bucket runtime behavior.
+- This slice follows the range helper contract branch and keeps the old
+  aggregate facade, bucket DTO, multipart DTO, bucket operation contract, object
+  helper, range helper, and list helper contract guards active.
+- The shared list marker/sort helper contracts are now owned by
+  `rustfs-storage-api`; ECStore keeps implementation-heavy object/list result
+  DTOs, walk options with filemeta filters, readers, lifecycle/replication, rio,
+  filemeta, and storage error contracts.
+- The slice does not alter list, walk, object, multipart, or bucket runtime
+  behavior.
 
 ## Handoff Notes
 
-- Object helper contract cleanup is in progress on a branch current with
-  `origin/main`.
+- List helper contract cleanup is stacked on the range helper contract branch.
 - After this lands, remaining storage work can continue by extracting larger
   low-coupling DTO slices or by narrowing remaining operation-group consumers.

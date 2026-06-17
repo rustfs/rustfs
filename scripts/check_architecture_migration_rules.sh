@@ -55,6 +55,7 @@ STORE_API_BUCKET_OPERATION_HITS_FILE="${TMP_DIR}/store_api_bucket_operation_hits
 STORE_API_MULTIPART_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_multipart_dto_reexports.txt"
 STORE_API_OBJECT_HELPER_REEXPORTS_FILE="${TMP_DIR}/store_api_object_helper_reexports.txt"
 STORE_API_RANGE_HELPER_REEXPORTS_FILE="${TMP_DIR}/store_api_range_helper_reexports.txt"
+STORE_API_LIST_HELPER_REEXPORTS_FILE="${TMP_DIR}/store_api_list_helper_reexports.txt"
 
 awk '
   /^## PR Types$/ {
@@ -197,6 +198,10 @@ require_source_line \
   "storage-api public object helper contract re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
+  "pub use object::{VersionMarker, WalkVersionsSortOrder};" \
+  "storage-api public list helper contract re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
   "pub use error::{StorageErrorCode, StorageResult};" \
   "storage-api public error contract re-export"
 
@@ -257,6 +262,16 @@ fi
 
 if [[ -s "$STORE_API_RANGE_HELPER_REEXPORTS_FILE" ]]; then
   report_failure "old ecstore store_api range helper path reintroduced: $(paste -sd '; ' "$STORE_API_RANGE_HELPER_REEXPORTS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:VersionMarker|WalkVersionsSortOrder)\b|::(?:VersionMarker|WalkVersionsSortOrder)\b)|pub enum (?:VersionMarker|WalkVersionsSortOrder)\b' \
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
+) >"$STORE_API_LIST_HELPER_REEXPORTS_FILE"
+
+if [[ -s "$STORE_API_LIST_HELPER_REEXPORTS_FILE" ]]; then
+  report_failure "old ecstore store_api list helper path reintroduced: $(paste -sd '; ' "$STORE_API_LIST_HELPER_REEXPORTS_FILE")"
 fi
 
 require_source_contains \
