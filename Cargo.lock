@@ -9439,6 +9439,7 @@ dependencies = [
  "bytes",
  "crc-fast",
  "criterion",
+ "proptest",
  "regex",
  "rmp",
  "rmp-serde",
