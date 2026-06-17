@@ -39,6 +39,12 @@ The following externally reported issues were checked against the current code a
 - Last-delete-marker skip behavior exists in both decommission and rebalance and has helper-level tests, but lacks MinIO-compatible version-listing regression coverage after migration and cleanup. Covered by new R14.
 - R14 proof showed that deleting an absent key in a versioned bucket currently creates a delete-marker response without a version ID and `ListObjectVersions` does not report that only delete marker. Covered by new R17.
 - The admin handler accepts comma-separated decommission targets, but store validation rejects more than one target pool. This is conservative, but the MinIO compatibility contract is not documented. Covered by R15.
+- Source cleanup preflight still treats a prefix-list miss as safe cleanup. Prefix listing is not an exact object-version read, so cleanup should only proceed after exact source metadata verification, or after an explicit object/version not-found result. Covered by R18.
+- Transition and restore lookup paths still use the caller's `ObjectOptions` and only contain commented-out `skip_decommissioned` guidance. MinIO skips decommissioned pools for these lifecycle operations. Covered by R19.
+- Rebalance delete-marker migration still sets `skip_decommissioned` but not `skip_rebalancing`. MinIO uses `SkipRebalancing=true` for this path to avoid resolving the delete-marker write back to the source pool. Covered by R20.
+- Rebalance source cleanup failures are recorded as cleanup warnings and the entry still completes. Non not-found/version-not-found cleanup failures should defer the entry/bucket so retry can converge. Covered by R21.
+- Rebalance stop propagation can fail on a subset of peers, and terminal reload currently only loads metadata without cancelling any local worker that missed the stop RPC. Covered by R22 and R23.
+- The earlier suggestion that stop/rollback must carry an operation ID is not a MinIO compatibility requirement. The higher-value fix is terminal reload convergence plus propagation observability. Covered by R22 and R23.
 
 ## Execution Order
 
@@ -61,6 +67,15 @@ The following externally reported issues were checked against the current code a
 | 15 | R14 | F01 | P2 | Last delete marker migration semantics lack MinIO-compatible E2E proof |
 | 16 | R17 | Versioning compatibility | P2 | Versioned delete of absent key loses only-delete-marker version metadata |
 | 17 | R15 | Compatibility | P3 | Multi-pool decommission support is accepted by API shape but rejected by store |
+| 18 | R18 | Source cleanup safety | P1 | Prefix-list miss can allow cleanup without exact object-version verification |
+| 19 | R19 | Lifecycle pool selection | P1 | Transition/restore can select a decommissioning pool |
+| 20 | R20 | Delete marker placement | P1 | Rebalance delete-marker migration can select a rebalancing source pool |
+| 21 | R21 | Cleanup retry | P2 | Rebalance cleanup failure can mark an entry complete instead of retrying |
+| 22 | R22 | Stop convergence | P1 | Terminal rebalance reload does not cancel local workers that missed stop RPC |
+| 23 | R23 | Stop observability | P1 | Stop peer failures and terminal reload propagation are not visible enough |
+| 24 | R24 | Compatibility | P3 | Multi-pool decommission queue semantics need a product-approved design |
+| 25 | R25 | Compatibility | P3 | Rebalance single-coordinator semantics need a broader namespace-lock design |
+| 26 | R26 | Admin API hardening | P3 | Dangerous admin query parameters are not strictly deserialized |
 
 ## Shared Rules
 
@@ -1108,9 +1123,483 @@ git commit -m "fix(rebalance): save metadata refresh outside lock"
 
 ---
 
+## R18: Require Exact Source Version Verification Before Cleanup
+
+### Original Fix
+
+Source cleanup safety follow-up for decommission and rebalance.
+
+### Finding
+
+`ensure_source_cleanup_versions_unchanged()` uses `list_path()` with an object prefix and returns success when the exact object entry is not observed. A prefix-list miss is not the same as an explicit object not-found/version-not-found result. If listing truncation, filtering, cache behavior, or an unexpected prefix collision hides the exact entry, decommission or rebalance cleanup can delete the source without proving that the source versions still match the migrated snapshot.
+
+### Files
+
+- Modify: `crates/ecstore/src/data_movement.rs`
+- Modify if needed: `crates/ecstore/src/set_disk.rs`
+- Test: `crates/ecstore/src/data_movement.rs`
+- Test if needed: `crates/ecstore/src/set_disk.rs`
+
+### Design
+
+Use exact object metadata resolution for cleanup preflight:
+
+1. Read the exact object's version metadata from the source `SetDisks`.
+2. Treat only explicit object-not-found/version-not-found as already cleaned.
+3. Treat read quorum, decode, unexpected list/cache, and other errors as cleanup preflight failures.
+4. Compare the exact current versions against the expected migrated snapshot, allowing only the already-modeled lifecycle-expired identities.
+5. Keep decommission and rebalance call sites using the same helper.
+
+Do not rely on prefix listing to prove exact object absence.
+
+### Implementation Steps
+
+- [ ] Add an exact source metadata read helper that returns `Ok(None)` only for explicit object-not-found/version-not-found.
+- [ ] Replace the prefix-list based `load_source_cleanup_versions()` path with the exact helper.
+- [ ] Add a helper-level test that a miss from a non-exact source would fail closed instead of succeeding.
+- [ ] Add or update tests where explicit not-found remains idempotent.
+- [ ] Run:
+
+```bash
+cargo test -p rustfs-ecstore source_cleanup --lib
+cargo test -p rustfs-ecstore data_movement --lib
+cargo test -p rustfs-ecstore decommission --lib
+cargo test -p rustfs-ecstore rebalance --lib
+cargo fmt --all --check
+```
+
+### Acceptance Criteria
+
+- Source cleanup can proceed only after exact metadata equivalence or explicit not-found/version-not-found.
+- Prefix-list absence is no longer a success signal.
+- Existing lifecycle-expired allowed-missing behavior is preserved.
+
+### Commit
+
+```bash
+git add crates/ecstore/src/data_movement.rs crates/ecstore/src/set_disk.rs
+git commit -m "fix(data-movement): require exact cleanup preflight"
+```
+
+---
+
+## R19: Skip Decommissioned Pools for Transition and Restore
+
+### Original Fix
+
+MinIO compatibility follow-up for lifecycle transition and restore.
+
+### Finding
+
+`handle_transition_object()` and `handle_restore_transitioned_object()` still use the caller's `ObjectOptions` when locating the object across pools. The code contains commented-out `skip_decommissioned` guidance, but the option is not applied. MinIO explicitly uses `SkipDecommissioned=true` for these lifecycle operations, so RustFS can route transition/restore work to a pool that is being decommissioned.
+
+### Files
+
+- Modify: `crates/ecstore/src/store/object.rs`
+- Test: `crates/ecstore/src/store/object.rs`
+
+### Design
+
+Clone the incoming options for multi-pool lookup and operation dispatch:
+
+1. Set `skip_decommissioned = true`.
+2. Set `no_lock = true` only if this matches the existing MinIO-compatible lifecycle path and does not bypass a required RustFS lock; otherwise preserve caller `no_lock`.
+3. Use the same adjusted options for the pool lookup and the selected pool operation, so lookup and mutation target the same eligibility rules.
+4. Keep single-pool behavior unchanged.
+
+### Implementation Steps
+
+- [ ] Add a small helper that prepares transition/restore options for pool lookup.
+- [ ] Update `handle_transition_object()` to use the adjusted options on multi-pool paths.
+- [ ] Update `handle_restore_transitioned_object()` to use the adjusted options on multi-pool paths.
+- [ ] Add tests asserting transition and restore options set `skip_decommissioned` and preserve the intended `no_lock` behavior.
+- [ ] Run:
+
+```bash
+cargo test -p rustfs-ecstore transition --lib
+cargo test -p rustfs-ecstore restore --lib
+cargo fmt --all --check
+```
+
+### Acceptance Criteria
+
+- Transition and restore do not select decommissioned pools in multi-pool deployments.
+- Lookup and operation dispatch use consistent options.
+- Single-pool behavior is unchanged.
+
+### Commit
+
+```bash
+git add crates/ecstore/src/store/object.rs
+git commit -m "fix(lifecycle): skip decommissioned transition pools"
+```
+
+---
+
+## R20: Mark Rebalance Delete-marker Writes as Skip-rebalancing
+
+### Original Fix
+
+F01/R05: Rebalance delete-marker movement.
+
+### Finding
+
+`rebalance_delete_marker_opts()` sets `skip_decommissioned = true` but not `skip_rebalancing = true`. MinIO uses `SkipRebalancing=true` for rebalance delete-marker movement so placement does not resolve back to a source pool that is actively rebalancing.
+
+### Files
+
+- Modify: `crates/ecstore/src/rebalance.rs`
+- Test: `crates/ecstore/src/rebalance.rs`
+
+### Design
+
+Add `skip_rebalancing = true` to rebalance delete-marker options while preserving the existing `skip_decommissioned = true` guard. This is a narrow placement fix and should not change delete-marker payload or replication metadata.
+
+### Implementation Steps
+
+- [ ] Update `rebalance_delete_marker_opts()` to set `skip_rebalancing = true`.
+- [ ] Extend the existing helper test to assert both `skip_rebalancing` and `skip_decommissioned`.
+- [ ] Run:
+
+```bash
+cargo test -p rustfs-ecstore rebalance_delete_marker --lib
+cargo test -p rustfs-ecstore rebalance --lib
+cargo fmt --all --check
+```
+
+### Acceptance Criteria
+
+- Rebalance delete-marker movement skips pools that are currently rebalancing.
+- Existing decommission skip and delete-replication state are preserved.
+
+### Commit
+
+```bash
+git add crates/ecstore/src/rebalance.rs
+git commit -m "fix(rebalance): skip rebalancing delete marker targets"
+```
+
+---
+
+## R21: Defer Rebalance Entries on Source Cleanup Failure
+
+### Original Fix
+
+F14/R04: Rebalance cleanup tolerance and warning accounting.
+
+### Finding
+
+`rebalance_entry()` records non not-found source cleanup delete failures as cleanup warnings and then returns `Completed`. That prevents the bucket retry queue from converging cleanup later. For data safety and operational convergence, only object-not-found/version-not-found should be treated as already cleaned. Other cleanup failures should defer the entry and bucket.
+
+### Files
+
+- Modify: `crates/ecstore/src/rebalance.rs`
+- Test: `crates/ecstore/src/rebalance.rs`
+
+### Design
+
+Change cleanup delete result handling from warning-only completion to retryable deferral:
+
+1. Keep `Ok(_)`, object-not-found, and version-not-found as successful cleanup outcomes.
+2. For all other cleanup delete errors, record the last error and return `RebalanceEntryOutcome::Deferred`.
+3. Preserve cleanup warning accounting only for observability if it remains useful, but do not mark the entry complete.
+4. Ensure `wait_rebalance_entry_tasks()` and `defer_rebalance_bucket()` continue to put the bucket back on the queue.
+
+### Implementation Steps
+
+- [ ] Change cleanup result resolution to return a typed outcome instead of optional warning text, or adjust the call site to treat optional warning as deferral.
+- [ ] Update tests that currently expect cleanup failures to be ignored.
+- [ ] Add a test that a transient cleanup failure returns `Deferred` and records the last error.
+- [ ] Add a test that not-found/version-not-found cleanup remains `Completed`.
+- [ ] Run:
+
+```bash
+cargo test -p rustfs-ecstore resolve_rebalance_entry_cleanup --lib
+cargo test -p rustfs-ecstore rebalance --lib
+cargo fmt --all --check
+```
+
+### Acceptance Criteria
+
+- Non not-found cleanup failures do not mark entries or buckets complete.
+- Cleanup failure is retried through the existing deferred bucket path.
+- Cleanup warning/status remains visible without hiding incomplete cleanup.
+
+### Commit
+
+```bash
+git add crates/ecstore/src/rebalance.rs
+git commit -m "fix(rebalance): defer failed source cleanup"
+```
+
+---
+
+## R22: Cancel Local Rebalance Workers on Terminal Reload
+
+### Original Fix
+
+F05/R07: Rebalance distributed stop semantics.
+
+### Finding
+
+If a peer misses `stop_rebalance()` but later receives `load_rebalance_meta(start=false)`, the RPC handler loads stopped/stopping metadata but does not cancel the already-running local worker token. `next_rebal_bucket()` also does not explicitly stop bucket selection for stopped/stopping metadata. This can leave a peer worker running after terminal metadata has propagated.
+
+### Files
+
+- Modify: `crates/ecstore/src/rebalance.rs`
+- Modify: `rustfs/src/storage/rpc/node_service.rs`
+- Test: `crates/ecstore/src/rebalance.rs`
+- Test: `rustfs/src/storage/rpc/node_service.rs`
+
+### Design
+
+Make terminal reload authoritative for local workers:
+
+1. After loading rebalance metadata, detect terminal stop state (`stopped_at` set or pool status stopping/stopped).
+2. If terminal stop state is present, cancel any local in-memory worker token and keep metadata in stopping/stopped state.
+3. In `resolve_next_rebalance_bucket()`, return `Ok(None)` for stopped/stopping metadata before selecting any bucket.
+4. Keep `start_rebalance=true` behavior unchanged for active metadata.
+
+### Implementation Steps
+
+- [ ] Add a helper that applies terminal loaded metadata to the local cancel token.
+- [ ] Call it from `load_rebalance_meta()` after replacing in-memory metadata.
+- [ ] Harden `resolve_next_rebalance_bucket()` so stopped/stopping metadata returns no bucket.
+- [ ] Add tests for terminal reload cancelling an in-memory token.
+- [ ] Add tests for `next_rebal_bucket()` returning `None` when `stopped_at` or stopping status is present.
+- [ ] Run:
+
+```bash
+cargo test -p rustfs-ecstore load_rebalance_meta --lib
+cargo test -p rustfs-ecstore next_rebal_bucket --lib
+cargo test -p rustfs rebalance --lib
+cargo fmt --all --check
+```
+
+### Acceptance Criteria
+
+- A peer that missed stop RPC stops its local worker after terminal metadata reload.
+- Stopped/stopping rebalance metadata cannot hand out more buckets.
+- Active reload/start behavior remains unchanged.
+
+### Commit
+
+```bash
+git add crates/ecstore/src/rebalance.rs rustfs/src/storage/rpc/node_service.rs
+git commit -m "fix(rebalance): cancel workers on terminal reload"
+```
+
+---
+
+## R23: Expose Rebalance Stop Propagation Failures
+
+### Original Fix
+
+F05/R07: Rebalance distributed stop/status observability.
+
+### Finding
+
+`RebalanceStop` and `NotificationSys::stop_rebalance()` surface aggregate peer errors, but status does not expose enough detail about failed peers, last propagation time, or pending terminal reload. When stop partially fails, operators need to see which peers failed and whether terminal reload propagation has been attempted.
+
+### Files
+
+- Modify: `crates/ecstore/src/rebalance.rs`
+- Modify: `crates/ecstore/src/notification_sys.rs`
+- Modify: `rustfs/src/admin/handlers/rebalance.rs`
+- Test: `crates/ecstore/src/rebalance.rs`
+- Test: `rustfs/src/admin/handlers/rebalance.rs`
+
+### Design
+
+Add minimal propagation observability without changing stop semantics:
+
+1. Persist local stopped/stopping metadata even when peer stop propagation has failures.
+2. Attempt terminal `load_rebalance_meta(false)` after local stop is persisted, even if some peer stop RPCs failed.
+3. Record the last stop propagation attempt time and peer failure strings in rebalance metadata or status response.
+4. Expose pending/failed propagation in admin status.
+
+Do not add operation-id requirements for stop/rollback as a compatibility gate.
+
+### Implementation Steps
+
+- [ ] Add fields or a status-only structure for last stop propagation time and failed peer details.
+- [ ] Update stop handler to persist local stopped metadata before returning peer propagation errors.
+- [ ] Ensure terminal reload broadcast is attempted after local stop persistence.
+- [ ] Extend rebalance status serialization to include propagation failure details.
+- [ ] Add tests for partial peer failure visibility.
+- [ ] Run:
+
+```bash
+cargo test -p rustfs rebalance --lib
+cargo test -p rustfs-ecstore stop_rebalance --lib
+cargo fmt --all --check
+```
+
+### Acceptance Criteria
+
+- Partial stop propagation failures remain visible to clients/operators.
+- Local stopped/stopping metadata is persisted before stop returns.
+- Terminal reload propagation is attempted after stop persistence.
+- No operation-id compatibility requirement is introduced for stop.
+
+### Commit
+
+```bash
+git add crates/ecstore/src/rebalance.rs crates/ecstore/src/notification_sys.rs rustfs/src/admin/handlers/rebalance.rs
+git commit -m "fix(rebalance): expose stop propagation failures"
+```
+
+---
+
+## R24: Design Multi-pool Decommission Queue Compatibility
+
+### Original Fix
+
+R15 compatibility follow-up.
+
+### Finding
+
+RustFS currently rejects multiple decommission target pools in one request. MinIO supports submitting multiple pools and processing them serially. This is a compatibility gap, but implementing it safely requires a persisted queue, restart recovery, clear active/queued status, cancellation semantics, and one-active-pool-at-a-time worker scheduling.
+
+### Files
+
+- Modify: `docs/architecture/decommission-compatibility.md`
+- Modify: `docs/architecture/rebalance-decommission-followup-review-plan.md`
+- Code changes only after product approval.
+
+### Design
+
+Keep R24 as a design/product decision task unless the product requirement is explicitly approved:
+
+1. Define request semantics for comma-separated pools.
+2. Define persisted queued metadata shape and legacy decode compatibility.
+3. Define serial worker scheduling and restart recovery.
+4. Define cancel semantics for active and queued pools.
+5. Define status response shape for active/queued/completed pools.
+
+### Implementation Steps
+
+- [ ] Write or update a compatibility design section for queued multi-pool decommission.
+- [ ] Do not change store behavior until the design is approved.
+- [ ] Run:
+
+```bash
+cargo fmt --all --check
+```
+
+### Acceptance Criteria
+
+- Multi-pool decommission remains an explicit product decision.
+- Implementation is not mixed into P1 data safety work.
+
+### Commit
+
+```bash
+git add docs/architecture/decommission-compatibility.md docs/architecture/rebalance-decommission-followup-review-plan.md
+git commit -m "docs(decommission): plan multi-pool queue support"
+```
+
+---
+
+## R25: Design Rebalance Single-coordinator Start Semantics
+
+### Original Fix
+
+R13 rebalance start serialization.
+
+### Finding
+
+R13 serializes local start gates, but a stronger MinIO-like distributed single-coordinator model may require reading and writing `rebalance.bin` under a namespace lock immediately before start on every coordinator path. This is larger than the current local start guard and should be designed separately from P1 stop convergence.
+
+### Files
+
+- Modify: `docs/architecture/rebalance-decommission-followup-review-plan.md`
+- Code changes only after design approval.
+
+### Design
+
+Define whether RustFS should:
+
+1. Keep local start gate plus metadata merge as the supported contract.
+2. Add a `rebalance.bin` namespace-lock guarded check/init/start path.
+3. Elect or require a single admin coordinator for distributed rebalance starts.
+
+### Implementation Steps
+
+- [ ] Document the current R13 guarantee and the remaining distributed race model.
+- [ ] Propose the namespace-lock guarded start design with failure/rollback semantics.
+- [ ] Do not change start behavior until the design is approved.
+- [ ] Run:
+
+```bash
+cargo fmt --all --check
+```
+
+### Acceptance Criteria
+
+- The stronger coordinator model is scoped and reviewable before code changes.
+- P1 stop/reload fixes are not blocked by this broader compatibility design.
+
+### Commit
+
+```bash
+git add docs/architecture/rebalance-decommission-followup-review-plan.md
+git commit -m "docs(rebalance): plan coordinator start semantics"
+```
+
+---
+
+## R26: Design Strict Query Parsing for Dangerous Admin APIs
+
+### Original Fix
+
+Admin API hardening follow-up.
+
+### Finding
+
+Dangerous admin API query parameters can silently fall back when misspelled or unknown. Tightening this behavior may be compatibility-visible, so it should be designed and rolled out with clear endpoint coverage and error semantics.
+
+### Files
+
+- Modify: `docs/architecture/rebalance-decommission-followup-review-plan.md`
+- Code changes only after endpoint scope is approved.
+
+### Design
+
+Define strict parsing for high-risk admin APIs:
+
+1. Identify rebalance/decommission endpoints with destructive or stateful side effects.
+2. Define allowed query keys and unknown-key errors.
+3. Preserve compatibility for read-only status endpoints unless explicitly approved.
+4. Add tests for misspelled dangerous parameters.
+
+### Implementation Steps
+
+- [ ] Document endpoint scope and error contract.
+- [ ] Do not change handler parsing until the endpoint list is approved.
+- [ ] Run:
+
+```bash
+cargo fmt --all --check
+```
+
+### Acceptance Criteria
+
+- Strict query parsing is scoped to dangerous admin APIs.
+- Compatibility impact is explicit before implementation.
+
+### Commit
+
+```bash
+git add docs/architecture/rebalance-decommission-followup-review-plan.md
+git commit -m "docs(admin): plan strict query parsing"
+```
+
+---
+
 ## Follow-up Test Matrix
 
-Run after all R01-R16 tasks are complete:
+Run after all R01-R23 implementation tasks are complete:
 
 ```bash
 cargo test -p rustfs-ecstore rebalance --lib
@@ -1120,6 +1609,7 @@ cargo test -p rustfs-ecstore multipart --lib
 cargo test -p rustfs-ecstore metadata --lib
 cargo test -p rustfs-ecstore pool_meta --lib
 cargo test -p rustfs-ecstore update_rebalance_stats --lib
+cargo test -p rustfs-ecstore source_cleanup --lib
 cargo test -p rustfs rebalance --lib
 cargo test -p rustfs pools --lib
 cargo test -p e2e_test versioning -- --nocapture
@@ -1148,3 +1638,6 @@ After build-based verification, clean generated build artifacts to avoid unneces
 - R06 may require a product decision between rollback and durable degraded state. If that decision cannot be made during implementation, stop before code changes and record the trade-off.
 - R14 is a proof task first. If it demonstrates data loss or MinIO-incompatible behavior, create a separate implementation task instead of hiding behavior changes inside the test task.
 - R15 is documentation/test-only for the current single-pool contract. MinIO-like queued multi-pool decommission requires a separate product-approved task.
+- R18-R21 are data-safety fixes and should be completed before R22/R23 stop convergence unless a stop-specific regression is blocking the cluster.
+- R22 should precede R23 because terminal reload cancellation is the actual convergence mechanism; R23 makes partial failure visible.
+- R24-R26 are compatibility/design tasks. Do not mix their code changes into P1 data-safety commits without separate product approval.
