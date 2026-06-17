@@ -655,6 +655,54 @@ struct PersistedPoolDecommissionInfo {
     pub bytes_failed: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyPoolMeta {
+    pub version: u16,
+    pub pools: Vec<LegacyPoolStatus>,
+    pub dont_save: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyPoolStatus {
+    #[serde(rename = "id")]
+    pub id: usize,
+    #[serde(rename = "cmdline")]
+    pub cmd_line: String,
+    #[serde(rename = "lastUpdate", with = "time::serde::rfc3339")]
+    pub last_update: OffsetDateTime,
+    #[serde(rename = "decommissionInfo")]
+    pub decommission: Option<LegacyPoolDecommissionInfo>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyPoolDecommissionInfo {
+    #[serde(rename = "startTime", with = "time::serde::rfc3339::option")]
+    pub start_time: Option<OffsetDateTime>,
+    #[serde(rename = "startSize")]
+    pub start_size: usize,
+    #[serde(rename = "totalSize")]
+    pub total_size: usize,
+    #[serde(rename = "currentSize")]
+    pub current_size: usize,
+    #[serde(rename = "complete")]
+    pub complete: bool,
+    #[serde(rename = "failed")]
+    pub failed: bool,
+    #[serde(rename = "canceled")]
+    pub canceled: bool,
+    #[serde(rename = "objectsDecommissioned")]
+    pub items_decommissioned: usize,
+    #[serde(rename = "objectsDecommissionedFailed")]
+    pub items_decommission_failed: usize,
+    #[serde(rename = "bytesDecommissioned")]
+    pub bytes_done: usize,
+    #[serde(rename = "bytesDecommissionedFailed")]
+    pub bytes_failed: usize,
+}
+
 impl TryFrom<PersistedPoolMeta> for PoolMeta {
     type Error = Error;
 
@@ -667,10 +715,40 @@ impl TryFrom<PersistedPoolMeta> for PoolMeta {
     }
 }
 
+impl TryFrom<LegacyPoolMeta> for PoolMeta {
+    type Error = Error;
+
+    fn try_from(value: LegacyPoolMeta) -> Result<Self> {
+        let LegacyPoolMeta {
+            version,
+            pools,
+            dont_save: _,
+        } = value;
+        Ok(Self {
+            version,
+            pools: pools.into_iter().map(TryInto::try_into).collect::<Result<Vec<_>>>()?,
+            dont_save: false,
+        })
+    }
+}
+
 impl TryFrom<PersistedPoolStatus> for PoolStatus {
     type Error = Error;
 
     fn try_from(value: PersistedPoolStatus) -> Result<Self> {
+        Ok(Self {
+            id: value.id,
+            cmd_line: value.cmd_line,
+            last_update: value.last_update,
+            decommission: value.decommission.map(TryInto::try_into).transpose()?,
+        })
+    }
+}
+
+impl TryFrom<LegacyPoolStatus> for PoolStatus {
+    type Error = Error;
+
+    fn try_from(value: LegacyPoolStatus) -> Result<Self> {
         Ok(Self {
             id: value.id,
             cmd_line: value.cmd_line,
@@ -698,6 +776,33 @@ impl TryFrom<PersistedPoolDecommissionInfo> for PoolDecommissionInfo {
             bucket: value.bucket,
             prefix: value.prefix,
             object: value.object,
+            items_decommissioned: value.items_decommissioned,
+            items_decommission_failed: value.items_decommission_failed,
+            bytes_done: value.bytes_done,
+            bytes_failed: value.bytes_failed,
+            progress_save_item_baseline: value.items_decommissioned.saturating_add(value.items_decommission_failed),
+        })
+    }
+}
+
+impl TryFrom<LegacyPoolDecommissionInfo> for PoolDecommissionInfo {
+    type Error = Error;
+
+    fn try_from(value: LegacyPoolDecommissionInfo) -> Result<Self> {
+        validate_decommission_terminal_state(value.complete, value.failed, value.canceled)?;
+        Ok(Self {
+            start_time: value.start_time,
+            start_size: value.start_size,
+            total_size: value.total_size,
+            current_size: value.current_size,
+            complete: value.complete,
+            failed: value.failed,
+            canceled: value.canceled,
+            queued_buckets: Vec::new(),
+            decommissioned_buckets: Vec::new(),
+            bucket: String::new(),
+            prefix: String::new(),
+            object: String::new(),
             items_decommissioned: value.items_decommissioned,
             items_decommission_failed: value.items_decommission_failed,
             bytes_done: value.bytes_done,
@@ -755,20 +860,12 @@ impl PoolMeta {
         match rmp_serde::from_slice::<PersistedPoolMeta>(payload) {
             Ok(meta) => meta.try_into(),
             Err(persisted_err) => {
-                let mut legacy: PoolMeta = rmp_serde::from_slice(payload).map_err(|legacy_err| {
+                let legacy: LegacyPoolMeta = rmp_serde::from_slice(payload).map_err(|legacy_err| {
                     Error::other(format!(
                         "PoolMeta decode failed for both persisted and legacy formats: persisted={persisted_err}; legacy={legacy_err}"
                     ))
                 })?;
-                // Runtime-only flag must not be restored from on-disk payload.
-                legacy.dont_save = false;
-                for pool in &legacy.pools {
-                    if let Some(decommission) = &pool.decommission {
-                        validate_decommission_terminal_state(decommission.complete, decommission.failed, decommission.canceled)?;
-                    }
-                }
-                legacy.mark_decommission_progress_saved();
-                Ok(legacy)
+                legacy.try_into()
             }
         }
     }
@@ -3120,6 +3217,31 @@ mod tests {
         assert!(decommission.bucket.is_empty());
         assert!(decommission.prefix.is_empty());
         assert!(decommission.object.is_empty());
+    }
+
+    #[test]
+    fn pool_meta_decode_rejects_unknown_legacy_fields() {
+        #[derive(Serialize)]
+        struct LegacyPoolMetaWithUnknownField {
+            version: u16,
+            pools: Vec<LegacyPoolStatus>,
+            dont_save: bool,
+            unexpected: bool,
+        }
+
+        let payload = rmp_serde::to_vec_named(&LegacyPoolMetaWithUnknownField {
+            version: POOL_META_VERSION,
+            pools: Vec::new(),
+            dont_save: true,
+            unexpected: true,
+        })
+        .expect("legacy pool metadata with unknown field should serialize");
+
+        let err = PoolMeta::decode_pool_meta_payload(payload.as_slice())
+            .expect_err("unknown legacy pool metadata field should fail decode");
+        let rendered = err.to_string();
+        assert!(rendered.contains("PoolMeta decode failed for both persisted and legacy formats"));
+        assert!(rendered.contains("unknown field") || rendered.contains("missing field"));
     }
 
     #[test]
