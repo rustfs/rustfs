@@ -196,6 +196,44 @@ fn extract_request_host(headers: &HeaderMap, uri: &Uri) -> Option<String> {
         .or_else(|| uri.authority().map(|authority| authority.as_str().to_string()))
 }
 
+fn decoded_content_length_from_headers(headers: &HeaderMap) -> S3Result<Option<i64>> {
+    let Some(val) = headers.get(AMZ_DECODED_CONTENT_LENGTH) else {
+        return Ok(None);
+    };
+
+    match atoi::atoi::<i64>(val.as_bytes()) {
+        Some(x) => Ok(Some(x)),
+        None => Err(s3_error!(UnexpectedContent)),
+    }
+}
+
+fn request_uses_aws_chunked(headers: &HeaderMap) -> bool {
+    let has_aws_chunked = |header_name: &str| {
+        headers
+            .get(header_name)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.split(',').any(|part| part.trim().eq_ignore_ascii_case("aws-chunked")))
+    };
+
+    has_aws_chunked("content-encoding") || has_aws_chunked("transfer-encoding")
+}
+
+fn resolve_upload_part_size(headers: &HeaderMap, content_length: Option<i64>) -> S3Result<Option<i64>> {
+    let decoded_content_length = decoded_content_length_from_headers(headers)?;
+    let size = match (request_uses_aws_chunked(headers), decoded_content_length, content_length) {
+        (true, Some(decoded), _) => Some(decoded),
+        (_, _, Some(length)) => Some(length),
+        (_, Some(decoded), None) => Some(decoded),
+        _ => None,
+    };
+
+    if size == Some(-1) {
+        return Err(s3_error!(UnexpectedContent));
+    }
+
+    Ok(size)
+}
+
 fn build_complete_multipart_location(headers: &HeaderMap, uri: &Uri, bucket: &str, key: &str) -> String {
     let object_path = format!("/{}/{}", encode(bucket), encode_s3_path(key));
 
@@ -705,34 +743,26 @@ impl DefaultMultipartUsecase {
 
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
-        let mut size = content_length;
+        let mut size = resolve_upload_part_size(&req.headers, content_length)?;
         let mut body_stream = body.ok_or_else(|| s3_error!(IncompleteBody))?;
 
         if size.is_none() {
-            if let Some(val) = req.headers.get(AMZ_DECODED_CONTENT_LENGTH)
-                && let Some(x) = atoi::atoi::<i64>(val.as_bytes())
-            {
-                size = Some(x);
+            let mut total = 0i64;
+            let mut buffer = bytes::BytesMut::new();
+            while let Some(chunk) = body_stream.next().await {
+                let chunk = chunk.map_err(|e| ApiError::from(StorageError::other(e.to_string())))?;
+                total += chunk.len() as i64;
+                buffer.extend_from_slice(&chunk);
             }
 
-            if size.is_none() {
-                let mut total = 0i64;
-                let mut buffer = bytes::BytesMut::new();
-                while let Some(chunk) = body_stream.next().await {
-                    let chunk = chunk.map_err(|e| ApiError::from(StorageError::other(e.to_string())))?;
-                    total += chunk.len() as i64;
-                    buffer.extend_from_slice(&chunk);
-                }
-
-                if total <= 0 {
-                    return Err(s3_error!(UnexpectedContent));
-                }
-
-                size = Some(total);
-                let combined = buffer.freeze();
-                let stream = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(combined) });
-                body_stream = StreamingBlob::wrap(stream);
+            if total <= 0 {
+                return Err(s3_error!(UnexpectedContent));
             }
+
+            size = Some(total);
+            let combined = buffer.freeze();
+            let stream = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(combined) });
+            body_stream = StreamingBlob::wrap(stream);
         }
 
         // Get multipart info early to check if managed encryption will be applied
@@ -740,7 +770,7 @@ impl DefaultMultipartUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let opts = ObjectOptions::default();
+        let mut opts = ObjectOptions::default();
         let fi = store
             .get_multipart_info(&bucket, &key, &upload_id, &opts)
             .await
@@ -792,6 +822,7 @@ impl DefaultMultipartUsecase {
         if let Err(err) = reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), size < 0) {
             return Err(ApiError::from(err).into());
         }
+        opts.want_checksum = reader.checksum();
 
         let has_ssec = sse_customer_algorithm.is_some();
         // When SSE-C headers are present, skip managed-encryption metadata to avoid
@@ -1345,6 +1376,26 @@ mod tests {
         let location = build_complete_multipart_location(&HeaderMap::new(), &Uri::from_static("/"), "bucket", "nested/object");
 
         assert_eq!(location, "/bucket/nested/object");
+    }
+
+    #[test]
+    fn resolve_upload_part_size_uses_decoded_length_for_aws_chunked() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", HeaderValue::from_static("aws-chunked"));
+        headers.insert(AMZ_DECODED_CONTENT_LENGTH, HeaderValue::from_static("5242880"));
+
+        let size = resolve_upload_part_size(&headers, Some(5242962)).expect("decoded size should parse");
+
+        assert_eq!(size, Some(5242880));
+    }
+
+    #[test]
+    fn resolve_upload_part_size_preserves_regular_content_length() {
+        let headers = HeaderMap::new();
+
+        let size = resolve_upload_part_size(&headers, Some(5242880)).expect("regular size should parse");
+
+        assert_eq!(size, Some(5242880));
     }
 
     #[test]
