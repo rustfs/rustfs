@@ -31,7 +31,7 @@ use std::{
 };
 use tokio::{
     sync::{Mutex, Notify, RwLock},
-    time::interval,
+    time::{interval, sleep},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -47,6 +47,8 @@ const EVENT_HEAL_MANAGER_STATE: &str = "heal_manager_state";
 const EVENT_HEAL_QUEUE_ADMISSION: &str = "heal_queue_admission";
 const EVENT_HEAL_SCHEDULER_STATE: &str = "heal_scheduler_state";
 const EVENT_HEAL_QUEUE_STATE: &str = "heal_queue_state";
+const MAX_RECOVERABLE_HEAL_RETRIES: u32 = 3;
+const MAX_RECOVERABLE_HEAL_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 /// Priority queue wrapper for heal requests
 /// Uses BinaryHeap for priority-based ordering while maintaining FIFO for same-priority items
@@ -330,7 +332,11 @@ impl PriorityHealQueue {
 
     /// Create a deduplication key from a heal request
     fn make_dedup_key(request: &HealRequest) -> String {
-        match &request.heal_type {
+        Self::make_dedup_key_for_type(&request.heal_type)
+    }
+
+    fn make_dedup_key_for_type(heal_type: &HealType) -> String {
+        match heal_type {
             HealType::Object {
                 bucket,
                 object,
@@ -462,6 +468,74 @@ fn publish_active_heal_count(active_heals: &HashMap<String, Arc<HealTask>>) {
 
 fn publish_heal_queue_length(queue: &PriorityHealQueue) {
     crate::set_heal_queue_length(queue.len());
+}
+
+fn active_heals_contains_dedup_key(active_heals: &HashMap<String, Arc<HealTask>>, key: &str) -> bool {
+    active_heals
+        .values()
+        .any(|task| PriorityHealQueue::make_dedup_key_for_type(&task.heal_type) == key)
+}
+
+fn completed_status_is_retrying(status: &HealTaskStatus) -> bool {
+    matches!(status, HealTaskStatus::Retrying { .. })
+}
+
+fn retry_request_for_result(task: &HealTask, result: &Result<()>) -> Option<(HealRequest, Duration, String)> {
+    let Err(err) = result else {
+        return None;
+    };
+    if task.retry_attempts >= MAX_RECOVERABLE_HEAL_RETRIES {
+        return None;
+    }
+
+    let error = err.to_string();
+    if !is_recoverable_heal_error(err, &error) {
+        return None;
+    }
+
+    let request = task.retry_request();
+    let delay = recoverable_heal_retry_delay(request.retry_attempts);
+    Some((request, delay, error))
+}
+
+fn recoverable_heal_retry_delay(retry_attempt: u32) -> Duration {
+    let retry_attempt = retry_attempt.clamp(1, 5);
+    let delay = Duration::from_secs(2_u64.saturating_pow(retry_attempt));
+    delay.min(MAX_RECOVERABLE_HEAL_RETRY_DELAY)
+}
+
+fn is_recoverable_heal_error(err: &Error, error: &str) -> bool {
+    match err {
+        Error::TaskCancelled => false,
+        Error::TaskTimeout | Error::TransientSkip { .. } => true,
+        Error::TaskExecutionFailed { .. }
+        | Error::Storage(_)
+        | Error::Disk(_)
+        | Error::Io(_)
+        | Error::IO(_)
+        | Error::Anyhow(_)
+        | Error::Other(_) => is_recoverable_heal_error_message(error),
+        _ => false,
+    }
+}
+
+fn is_recoverable_heal_error_message(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "failed to acquire read lock",
+        "lock acquisition failed",
+        "lock acquisition timeout",
+        "remote lock rpc timed out",
+        "deadline has elapsed",
+        "timed out",
+        "transport error",
+        "network error",
+        "connection refused",
+        "operation canceled",
+        "quorum not reached",
+    ]
+    .iter()
+    .any(|pattern| error.contains(pattern))
 }
 
 /// Heal config
@@ -597,6 +671,14 @@ impl HealManager {
         }
     }
 
+    fn duplicate_admission_for_request(request: &HealRequest, config: &HealConfig) -> HealAdmissionResult {
+        if request.priority == HealPriority::Low && !config.low_priority_merge_enable {
+            HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped)
+        } else {
+            HealAdmissionResult::Merged
+        }
+    }
+
     /// Create new HealManager
     pub fn new(storage: Arc<dyn HealStorageAPI>, config: Option<HealConfig>) -> Self {
         let config = config.unwrap_or_default();
@@ -709,18 +791,55 @@ impl HealManager {
     /// Submit heal request
     pub async fn submit_heal_request(&self, request: HealRequest) -> Result<HealAdmissionResult> {
         let config = self.config.read().await;
+        let dedup_key = PriorityHealQueue::make_dedup_key(&request);
+
+        // Keep this lock order aligned with the scheduler so a request cannot
+        // slip between queued and active states while duplicate admission runs.
+        let active_heals = self.active_heals.lock().await;
+        if !request.force_start && active_heals_contains_dedup_key(&active_heals, &dedup_key) {
+            let admission = Self::duplicate_admission_for_request(&request, &config);
+
+            match admission {
+                HealAdmissionResult::Merged => {
+                    info!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                        request_id = %request.id,
+                        priority = ?request.priority,
+                        result = "merged_active_duplicate",
+                        "Heal queue admission decided"
+                    );
+                }
+                HealAdmissionResult::Dropped(reason) => {
+                    warn!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                        request_id = %request.id,
+                        priority = ?request.priority,
+                        reason = reason.as_str(),
+                        result = "dropped_active_duplicate",
+                        "Heal queue admission decided"
+                    );
+                }
+                HealAdmissionResult::Accepted | HealAdmissionResult::Full => {}
+            }
+
+            return Ok(admission);
+        }
+
         let mut queue = self.heal_queue.lock().await;
+        drop(active_heals);
 
         let queue_len = queue.len();
         publish_heal_queue_length(&queue);
         let queue_capacity = config.queue_size;
 
         if !request.force_start && queue.contains_key(&request) {
-            let admission = if request.priority == HealPriority::Low && !config.low_priority_merge_enable {
-                HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped)
-            } else {
-                HealAdmissionResult::Merged
-            };
+            let admission = Self::duplicate_admission_for_request(&request, &config);
 
             match admission {
                 HealAdmissionResult::Merged => {
@@ -904,6 +1023,16 @@ impl HealManager {
             }
         }
 
+        {
+            let mut completed_heals = self.completed_heals.lock().await;
+            prune_completed_heal_statuses(&mut completed_heals);
+            if let Some(completed) = completed_heals.get(task_id)
+                && completed_status_is_retrying(&completed.status)
+            {
+                return Ok(completed.status.clone());
+            }
+        }
+
         let queue = self.heal_queue.lock().await;
         if queue.contains_request_id(task_id) {
             return Ok(HealTaskStatus::Pending);
@@ -930,6 +1059,20 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: task.get_status().await,
                     result_items: task.get_result_items().await,
+                });
+            }
+        }
+
+        {
+            let mut completed_heals = self.completed_heals.lock().await;
+            prune_completed_heal_statuses(&mut completed_heals);
+            if let Some(completed) = completed_heals.get(task_id)
+                && heal_type_matches_path(&completed.heal_type, heal_path)
+                && completed_status_is_retrying(&completed.status)
+            {
+                return Ok(HealTaskReport {
+                    status: completed.status.clone(),
+                    result_items: completed.result_items.clone(),
                 });
             }
         }
@@ -978,6 +1121,17 @@ impl HealManager {
                 && heal_type_matches_path(&task.heal_type, heal_path)
             {
                 return Ok(task.get_status().await);
+            }
+        }
+
+        {
+            let mut completed_heals = self.completed_heals.lock().await;
+            prune_completed_heal_statuses(&mut completed_heals);
+            if let Some(completed) = completed_heals.get(task_id)
+                && heal_type_matches_path(&completed.heal_type, heal_path)
+                && completed_status_is_retrying(&completed.status)
+            {
+                return Ok(completed.status.clone());
             }
         }
 
@@ -1513,6 +1667,7 @@ impl HealManager {
                 publish_active_heal_count(&active_heals_guard);
                 update_task_running_metric_for_task(&active_heals_guard, task.as_ref());
                 let active_heals_clone = active_heals.clone();
+                let heal_queue_clone = heal_queue.clone();
                 let completed_heals_clone = completed_heals.clone();
                 let statistics_clone = statistics.clone();
                 let notify_clone = notify.clone();
@@ -1534,7 +1689,8 @@ impl HealManager {
                         "Heal scheduler task started"
                     );
                     let result = task.execute().await;
-                    match result {
+                    let retry_request = retry_request_for_result(task.as_ref(), &result);
+                    match &result {
                         Ok(_) => {
                             debug!(
                                 target: "rustfs::heal::manager",
@@ -1549,25 +1705,51 @@ impl HealManager {
                             );
                         }
                         Err(e) => {
-                            error!(
-                                target: "rustfs::heal::manager",
-                                event = EVENT_HEAL_SCHEDULER_STATE,
-                                component = LOG_COMPONENT_HEAL,
-                                subsystem = LOG_SUBSYSTEM_MANAGER,
-                                task_id,
-                                heal_type = %task_type_label_for_spawn,
-                                set = %task_set_label_for_spawn,
-                                state = "task_failed",
-                                error = %e,
-                                "Heal scheduler task failed"
-                            );
+                            let will_retry = retry_request.is_some();
+                            if will_retry {
+                                warn!(
+                                    target: "rustfs::heal::manager",
+                                    event = EVENT_HEAL_SCHEDULER_STATE,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                                    task_id,
+                                    heal_type = %task_type_label_for_spawn,
+                                    set = %task_set_label_for_spawn,
+                                    state = "task_retrying",
+                                    retry_attempt = task.retry_attempts.saturating_add(1),
+                                    error = %e,
+                                    "Heal scheduler task retrying"
+                                );
+                            } else {
+                                error!(
+                                    target: "rustfs::heal::manager",
+                                    event = EVENT_HEAL_SCHEDULER_STATE,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                                    task_id,
+                                    heal_type = %task_type_label_for_spawn,
+                                    set = %task_set_label_for_spawn,
+                                    state = "task_failed",
+                                    error = %e,
+                                    "Heal scheduler task failed"
+                                );
+                            }
                         }
                     }
+                    let retry_request_for_status = retry_request.as_ref().map(|(request, _, error)| HealTaskStatus::Retrying {
+                        error: error.clone(),
+                        retry_attempt: request.retry_attempts,
+                    });
+                    let retry_request_for_queue = retry_request;
                     let mut active_heals_guard = active_heals_clone.lock().await;
                     if let Some(completed_task) = active_heals_guard.remove(&task_id) {
                         publish_active_heal_count(&active_heals_guard);
                         update_task_running_metric_for_task(&active_heals_guard, completed_task.as_ref());
-                        let completed_status = completed_task.get_status().await;
+                        let completed_status = if let Some(status) = retry_request_for_status {
+                            status
+                        } else {
+                            completed_task.get_status().await
+                        };
                         let completed_status_entry = CompletedHealStatus {
                             heal_type: completed_task.heal_type.clone(),
                             status: completed_status.clone(),
@@ -1583,11 +1765,78 @@ impl HealManager {
                             HealTaskStatus::Completed => {
                                 stats.update_task_completion(true);
                             }
+                            HealTaskStatus::Retrying { .. } => {}
                             _ => {
                                 stats.update_task_completion(false);
                             }
                         }
                         stats.update_running_tasks(active_heals_guard.len() as u64);
+                    }
+
+                    if let Some((retry_request, retry_delay, retry_error)) = retry_request_for_queue {
+                        let retry_request_id = retry_request.id.clone();
+                        let retry_attempt = retry_request.retry_attempts;
+                        let retry_key = PriorityHealQueue::make_dedup_key(&retry_request);
+                        let retry_priority = retry_request.priority;
+                        let retry_active_heals = active_heals_clone.clone();
+                        let retry_heal_queue = heal_queue_clone.clone();
+                        let retry_notify = notify_clone.clone();
+                        tokio::spawn(async move {
+                            sleep(retry_delay).await;
+                            {
+                                let active_heals_guard = retry_active_heals.lock().await;
+                                if active_heals_contains_dedup_key(&active_heals_guard, &retry_key) {
+                                    info!(
+                                        target: "rustfs::heal::manager",
+                                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                                        component = LOG_COMPONENT_HEAL,
+                                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                                        request_id = %retry_request_id,
+                                        priority = ?retry_priority,
+                                        retry_attempt,
+                                        result = "retry_merged_active_duplicate",
+                                        "Heal retry admission decided"
+                                    );
+                                    return;
+                                }
+                            }
+
+                            let mut queue = retry_heal_queue.lock().await;
+                            let outcome = queue.push(retry_request);
+                            publish_heal_queue_length(&queue);
+                            match outcome {
+                                QueuePushOutcome::Accepted => {
+                                    info!(
+                                        target: "rustfs::heal::manager",
+                                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                                        component = LOG_COMPONENT_HEAL,
+                                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                                        request_id = %retry_request_id,
+                                        priority = ?retry_priority,
+                                        retry_attempt,
+                                        retry_delay_ms = retry_delay.as_millis(),
+                                        error = %retry_error,
+                                        result = "retry_enqueued",
+                                        "Heal retry admission decided"
+                                    );
+                                    drop(queue);
+                                    retry_notify.notify_one();
+                                }
+                                QueuePushOutcome::Merged => {
+                                    info!(
+                                        target: "rustfs::heal::manager",
+                                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                                        component = LOG_COMPONENT_HEAL,
+                                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                                        request_id = %retry_request_id,
+                                        priority = ?retry_priority,
+                                        retry_attempt,
+                                        result = "retry_merged_duplicate",
+                                        "Heal retry admission decided"
+                                    );
+                                }
+                            }
+                        });
                     }
                     notify_clone.notify_one();
                 });
@@ -2242,6 +2491,57 @@ mod tests {
                 .expect("duplicate request should produce admission result"),
             HealAdmissionResult::Merged
         );
+    }
+
+    #[tokio::test]
+    async fn test_submit_heal_request_returns_merged_for_active_duplicate() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage.clone(), None);
+        let active_request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+        let active_task = Arc::new(HealTask::from_request(active_request, storage));
+        manager.active_heals.lock().await.insert(active_task.id.clone(), active_task);
+
+        let duplicate_request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+
+        assert_eq!(
+            manager
+                .submit_heal_request(duplicate_request)
+                .await
+                .expect("active duplicate should produce admission result"),
+            HealAdmissionResult::Merged
+        );
+        assert_eq!(manager.get_queue_length().await, 0);
+    }
+
+    #[test]
+    fn test_retry_request_for_recoverable_lock_timeout() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let task = HealTask::from_request(HealRequest::object("bucket".to_string(), "object".to_string(), None), storage);
+        let result = Err(Error::TaskExecutionFailed {
+            message: "Failed to heal object bucket/object: Lock acquisition timeout".to_string(),
+        });
+
+        let (retry_request, retry_delay, retry_error) =
+            retry_request_for_result(&task, &result).expect("lock timeout should be retryable");
+
+        assert_eq!(retry_request.id, task.id);
+        assert_eq!(retry_request.retry_attempts, 1);
+        assert_eq!(retry_request.priority, task.priority);
+        assert!(retry_delay > Duration::ZERO);
+        assert!(retry_error.contains("Lock acquisition timeout"));
+    }
+
+    #[test]
+    fn test_retry_request_for_recoverable_error_stops_at_limit() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let mut request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+        request.retry_attempts = MAX_RECOVERABLE_HEAL_RETRIES;
+        let task = HealTask::from_request(request, storage);
+        let result = Err(Error::TaskExecutionFailed {
+            message: "Remote lock RPC timed out".to_string(),
+        });
+
+        assert!(retry_request_for_result(&task, &result).is_none());
     }
 
     #[tokio::test]
