@@ -58,7 +58,6 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    #[ignore = "RustFS currently omits only-delete-marker entries from ListObjectVersions; enable after product fix"]
     async fn test_versioning_only_delete_marker_has_minio_compatible_visibility_for_migration_proof() {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await.expect("create test environment");

@@ -215,6 +215,10 @@ fn resolve_latest_object_access(
     Ok((info, idx))
 }
 
+fn should_create_delete_marker_for_missing_object(opts: &ObjectOptions) -> bool {
+    opts.versioned && opts.version_id.is_none() && !opts.delete_marker && !opts.data_movement
+}
+
 fn version_aware_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> ObjectOptions {
     let mut lookup_opts = opts.clone();
     lookup_opts.no_lock = no_lock;
@@ -867,16 +871,17 @@ impl ECStore {
         }
 
         // Determine which pool contains it
-        let (mut pinfo, errs) = self
-            .get_pool_info_existing_with_opts(bucket, object, &gopts)
-            .await
-            .map_err(|e| {
-                if is_err_read_quorum(&e) {
-                    StorageError::ErasureWriteQuorum
-                } else {
-                    e
-                }
-            })?;
+        let (mut pinfo, errs) = match self.get_pool_info_existing_with_opts(bucket, object, &gopts).await {
+            Ok(res) => res,
+            Err(err) if is_err_read_quorum(&err) => return Err(StorageError::ErasureWriteQuorum),
+            Err(err) if is_err_object_not_found(&err) && should_create_delete_marker_for_missing_object(&opts) => {
+                let target_pool_idx = self.get_pool_idx_no_lock(bucket, object, 0).await?;
+                let mut obj = self.pools[target_pool_idx].delete_object(bucket, object, opts).await?;
+                obj.name = decode_dir_object(object);
+                return Ok(obj);
+            }
+            Err(err) => return Err(err),
+        };
 
         if pinfo.object_info.delete_marker && opts.version_id.is_none() {
             pinfo.object_info.name = decode_dir_object(object);
@@ -1618,6 +1623,39 @@ mod tests {
         let err = resolve_latest_object_access("bucket", "object", info, 2, &opts).unwrap_err();
 
         assert!(matches!(err, Error::MethodNotAllowed));
+    }
+
+    #[test]
+    fn should_create_delete_marker_for_missing_object_allows_latest_versioned_delete() {
+        let opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+
+        assert!(should_create_delete_marker_for_missing_object(&opts));
+    }
+
+    #[test]
+    fn should_create_delete_marker_for_missing_object_rejects_specialized_deletes() {
+        let version_delete = ObjectOptions {
+            versioned: true,
+            version_id: Some("vid-1".to_string()),
+            ..Default::default()
+        };
+        let delete_marker_replication = ObjectOptions {
+            versioned: true,
+            delete_marker: true,
+            ..Default::default()
+        };
+        let data_movement = ObjectOptions {
+            versioned: true,
+            data_movement: true,
+            ..Default::default()
+        };
+
+        assert!(!should_create_delete_marker_for_missing_object(&version_delete));
+        assert!(!should_create_delete_marker_for_missing_object(&delete_marker_replication));
+        assert!(!should_create_delete_marker_for_missing_object(&data_movement));
     }
 
     #[test]

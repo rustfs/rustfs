@@ -974,11 +974,11 @@ Do not change decommission/rebalance skip policy in this task; first make the un
 
 ### Implementation Steps
 
-- [ ] Reproduce the R14 ignored e2e by running it with `--ignored` and confirm it fails on missing only-delete-marker metadata.
-- [ ] Trace the versioned delete path for absent keys and identify where delete marker metadata is skipped or not assigned a version ID.
-- [ ] Add a focused unit/helper test if a cheap seam exists, then fix the delete path to persist the delete marker.
-- [ ] Unignore `test_versioning_only_delete_marker_has_minio_compatible_visibility_for_migration_proof`.
-- [ ] Run:
+- [x] Reproduce the R14 ignored e2e by running it with `--ignored` and confirm it fails on missing only-delete-marker metadata.
+- [x] Trace the versioned delete path for absent keys and identify where delete marker metadata is skipped or not assigned a version ID.
+- [x] Add a focused unit/helper test if a cheap seam exists, then fix the delete path to persist the delete marker.
+- [x] Unignore `test_versioning_only_delete_marker_has_minio_compatible_visibility_for_migration_proof`.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs-ecstore delete_marker --lib

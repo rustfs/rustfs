@@ -2169,7 +2169,7 @@ impl ObjectOperations for SetDisks {
         if let Some(err) = &gerr
             && goi.name.is_empty()
         {
-            if opts.delete_marker {
+            if should_create_delete_marker_for_missing_object(&opts) {
                 version_found = false;
             } else {
                 return Err(err.clone());
@@ -2230,7 +2230,7 @@ impl ObjectOperations for SetDisks {
                 fi.set_skip_tier_free_version();
             }
 
-            fi.version_id = if let Some(vid) = opts.version_id {
+            fi.version_id = if let Some(vid) = opts.version_id.as_ref() {
                 Some(Uuid::parse_str(vid.as_str())?)
             } else if opts.versioned {
                 Some(Uuid::new_v4())
@@ -2238,7 +2238,7 @@ impl ObjectOperations for SetDisks {
                 None
             };
 
-            self.delete_object_version(bucket, object, &fi, opts.delete_marker)
+            self.delete_object_version(bucket, object, &fi, should_create_delete_marker_for_missing_object(&opts))
                 .await
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
@@ -2798,8 +2798,12 @@ fn should_preserve_delete_replication_state(opts: &ObjectOptions) -> bool {
     }) || opts.version_purge_status() == VersionPurgeStatusType::Complete
 }
 
+fn should_create_delete_marker_for_missing_object(opts: &ObjectOptions) -> bool {
+    opts.delete_marker || (opts.versioned && opts.version_id.is_none() && !opts.data_movement)
+}
+
 fn resolve_delete_version_state(opts: &ObjectOptions, goi: &ObjectInfo, version_found: bool) -> (bool, bool) {
-    let mut mark_delete = goi.version_id.is_some();
+    let mut mark_delete = goi.version_id.is_some() || (opts.versioned && opts.version_id.is_none());
     let mut delete_marker = opts.versioned;
 
     if opts.version_id.is_some() {
@@ -5172,6 +5176,42 @@ mod tests {
 
         assert!(!mark_delete);
         assert!(delete_marker);
+    }
+
+    #[test]
+    fn resolve_delete_version_state_creates_marker_for_missing_latest_versioned_delete() {
+        let opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+
+        let (mark_delete, delete_marker) = resolve_delete_version_state(&opts, &ObjectInfo::default(), false);
+
+        assert!(mark_delete);
+        assert!(delete_marker);
+    }
+
+    #[test]
+    fn should_create_delete_marker_for_missing_object_rejects_data_movement_latest_delete() {
+        let opts = ObjectOptions {
+            versioned: true,
+            data_movement: true,
+            ..Default::default()
+        };
+
+        assert!(!should_create_delete_marker_for_missing_object(&opts));
+    }
+
+    #[test]
+    fn should_create_delete_marker_for_missing_object_allows_explicit_marker_creation() {
+        let opts = ObjectOptions {
+            versioned: true,
+            data_movement: true,
+            delete_marker: true,
+            ..Default::default()
+        };
+
+        assert!(should_create_delete_marker_for_missing_object(&opts));
     }
 
     #[test]
