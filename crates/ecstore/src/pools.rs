@@ -794,6 +794,32 @@ fn ensure_decommission_cancel_allowed(pool_present: bool, decommission_present: 
     Ok(())
 }
 
+fn ensure_decommission_clear_allowed(
+    pool_present: bool,
+    decommission_present: bool,
+    complete: bool,
+    failed: bool,
+    canceled: bool,
+) -> Result<()> {
+    if !pool_present {
+        return Err(Error::other("failed to clear decommission: target pool was not found"));
+    }
+
+    if !decommission_present {
+        return Err(StorageError::DecommissionNotStarted);
+    }
+
+    if complete {
+        return Err(StorageError::DecommissionNotStarted);
+    }
+
+    if !failed && !canceled {
+        return Err(StorageError::DecommissionAlreadyRunning);
+    }
+
+    Ok(())
+}
+
 fn ensure_decommission_terminal_operation_supported(single_pool: bool, operation: &str) -> Result<()> {
     if single_pool {
         return Err(Error::other(format!(
@@ -1273,6 +1299,28 @@ impl PoolMeta {
             false
         }
     }
+
+    pub fn clear_decommission(&mut self, idx: usize) -> Result<bool> {
+        let pool_count = self.pools.len();
+        ensure_valid_decommission_pool_index(pool_count, idx)?;
+
+        let Some(pool) = self.pools.get_mut(idx) else {
+            return Err(invalid_decommission_pool_index_error(pool_count, idx));
+        };
+
+        let (decommission_present, complete, failed, canceled) = pool
+            .decommission
+            .as_ref()
+            .map(|info| (true, info.complete, info.failed, info.canceled))
+            .unwrap_or((false, false, false, false));
+
+        ensure_decommission_clear_allowed(true, decommission_present, complete, failed, canceled)?;
+
+        pool.last_update = OffsetDateTime::now_utc();
+        pool.decommission = None;
+        Ok(true)
+    }
+
     pub fn decommission_complete(&mut self, idx: usize) -> bool {
         if let Some(stats) = self.pools.get_mut(idx) {
             if let Some(d) = &stats.decommission {
@@ -1900,6 +1948,32 @@ impl ECStore {
 
         if should_reload_pool_meta && let Some(notification_sys) = get_global_notification_sys() {
             let stage = format!("decommission_cancel for pool {idx}");
+            resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())?;
+        }
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn clear_decommission(&self, idx: usize) -> Result<()> {
+        ensure_decommission_terminal_operation_supported(self.single_pool(), "clear decommission")?;
+
+        let should_reload_pool_meta = {
+            let mut pool_meta = self.pool_meta.write().await;
+            pool_meta.clear_decommission(idx)?
+        };
+
+        {
+            let mut cancelers = self.decommission_cancelers.write().await;
+            take_and_cancel_decommission_canceler(cancelers.as_mut_slice(), idx);
+        }
+
+        if should_reload_pool_meta {
+            self.save_current_pool_meta().await?;
+        }
+
+        if should_reload_pool_meta && let Some(notification_sys) = get_global_notification_sys() {
+            let stage = format!("clear_decommission for pool {idx}");
             resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())?;
         }
 
@@ -4137,8 +4211,8 @@ mod pools_tests {
         bind_missing_decommission_cancelers, cancel_decommission_canceler, classify_decommission_terminal_state,
         count_decommission_item, decommission_cancel_signal_result, decommission_item_size, decommission_meta_bucket_options,
         decommission_start_guard_state, dedup_indices, default_decommission_bucket_concurrency,
-        ensure_decommission_cancel_allowed, ensure_decommission_listing_disks_available, ensure_decommission_not_rebalancing,
-        ensure_decommission_start_allowed, ensure_decommission_start_local_leader,
+        ensure_decommission_cancel_allowed, ensure_decommission_clear_allowed, ensure_decommission_listing_disks_available,
+        ensure_decommission_not_rebalancing, ensure_decommission_start_allowed, ensure_decommission_start_local_leader,
         ensure_decommission_start_rebalance_meta_allowed, ensure_decommission_terminal_operation_supported,
         ensure_local_decommission_pool_leaders, ensure_valid_decommission_pool_index, first_resumable_decommission_queue_indices,
         get_by_index, has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_requested,
@@ -5602,6 +5676,76 @@ mod pools_tests {
     #[test]
     fn test_ensure_decommission_cancel_allowed_allows_active() {
         assert!(ensure_decommission_cancel_allowed(true, true, false).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_decommission_clear_allowed_allows_failed_or_canceled() {
+        assert!(ensure_decommission_clear_allowed(true, true, false, true, false).is_ok());
+        assert!(ensure_decommission_clear_allowed(true, true, false, false, true).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_decommission_clear_allowed_rejects_active_or_completed() {
+        let active = ensure_decommission_clear_allowed(true, true, false, false, false)
+            .expect_err("active decommission should not be clearable");
+        assert!(matches!(active, Error::DecommissionAlreadyRunning));
+
+        let complete = ensure_decommission_clear_allowed(true, true, true, false, false)
+            .expect_err("completed decommission should not be clearable");
+        assert!(matches!(complete, Error::DecommissionNotStarted));
+    }
+
+    #[test]
+    fn test_pool_meta_clear_decommission_restores_failed_or_canceled_pool() {
+        for decommission in [
+            PoolDecommissionInfo {
+                failed: true,
+                ..Default::default()
+            },
+            PoolDecommissionInfo {
+                canceled: true,
+                ..Default::default()
+            },
+        ] {
+            let mut meta = PoolMeta {
+                pools: vec![PoolStatus {
+                    id: 0,
+                    cmd_line: "pool-0".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: Some(decommission),
+                }],
+                ..Default::default()
+            };
+
+            assert!(meta.is_suspended(0));
+            assert!(meta.clear_decommission(0).expect("terminal decommission should clear"));
+            assert!(meta.pools[0].decommission.is_none());
+            assert!(!meta.is_suspended(0));
+        }
+    }
+
+    #[test]
+    fn test_pool_meta_clear_decommission_rejects_active_or_completed_pool() {
+        for decommission in [
+            PoolDecommissionInfo::default(),
+            PoolDecommissionInfo {
+                complete: true,
+                ..Default::default()
+            },
+        ] {
+            let mut meta = PoolMeta {
+                pools: vec![PoolStatus {
+                    id: 0,
+                    cmd_line: "pool-0".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: Some(decommission),
+                }],
+                ..Default::default()
+            };
+
+            assert!(meta.clear_decommission(0).is_err());
+            assert!(meta.pools[0].decommission.is_some());
+        }
     }
 
     #[test]

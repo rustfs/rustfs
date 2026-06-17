@@ -234,6 +234,7 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::High,
     ),
     admin(HttpMethod::Post, "/rustfs/admin/v3/pools/cancel", DECOMMISSION, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/pools/clear", DECOMMISSION, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/rebalance/start", REBALANCE, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/v3/rebalance/status", REBALANCE, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Post, "/rustfs/admin/v3/rebalance/stop", REBALANCE, RouteRiskLevel::High),

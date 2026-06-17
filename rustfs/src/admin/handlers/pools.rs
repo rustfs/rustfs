@@ -306,6 +306,7 @@ fn operation_to_event(operation: &str) -> &'static str {
         "load pool status" => "query_pool_status",
         "start decommission" => "start_decommission",
         "cancel decommission" => "cancel_decommission",
+        "clear decommission" => "clear_decommission",
         _ => "pool_admin",
     }
 }
@@ -349,6 +350,12 @@ pub fn register_pool_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/pools/cancel").as_str(),
         AdminOperation(&CancelDecommission {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/pools/clear").as_str(),
+        AdminOperation(&ClearDecommission {}),
     )?;
 
     Ok(())
@@ -726,6 +733,111 @@ impl Operation for CancelDecommission {
             subsystem = LOG_SUBSYSTEM_POOL_ADMIN,
             operation = "cancel_decommission",
             action = "cancel_decommission",
+            result = "success",
+            request_id = %request_id,
+            actor = %actor,
+            remote_addr = %remote_addr,
+            pool_index = idx,
+            "admin response emitted"
+        );
+        Ok(S3Response::new((StatusCode::OK, Body::default())))
+    }
+}
+
+pub struct ClearDecommission {}
+
+#[async_trait::async_trait]
+impl Operation for ClearDecommission {
+    // POST <endpoint>/<admin-API>/pools/clear?pool=http://server{1...4}/disk{1...4}
+    // Clears failed/canceled decommission metadata only; already moved data is not rolled back.
+    #[tracing::instrument(skip_all)]
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let request_id = admin_request_id(&req.headers).unwrap_or_default().to_string();
+        let remote_addr = admin_remote_addr(&req).unwrap_or_default();
+        info!(
+            event = EVENT_ADMIN_REQUEST_STATE,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_POOL_ADMIN,
+            operation = "clear_decommission",
+            action = "clear_decommission",
+            state = "requested",
+            request_id = %request_id,
+            remote_addr = %remote_addr,
+            "admin pool request state"
+        );
+
+        let Some(input_cred) = req.credentials else {
+            return Err(pool_admin_missing_credentials_error_with_request(
+                "clear decommission",
+                &request_id,
+                &remote_addr,
+            ));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+        let actor = MaskedAccessKey(&input_cred.access_key).to_string();
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::DecommissionAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        )
+        .await?;
+        let audit = PoolAuditContext::new(&request_id, &actor, &remote_addr);
+
+        let Some(endpoints) = endpoints_from_context() else {
+            log_pool_request_rejected_with_context("clear_decommission", "not_implemented", &request_id, &actor, &remote_addr);
+            return Err(s3_error!(NotImplemented));
+        };
+
+        if endpoints.legacy() {
+            log_pool_request_rejected_with_context(
+                "clear_decommission",
+                "legacy_endpoints_not_supported",
+                &request_id,
+                &actor,
+                &remote_addr,
+            );
+            return Err(s3_error!(NotImplemented));
+        }
+
+        let query = parse_status_pool_query(&req.uri)
+            .map_err(|_| pool_admin_query_parse_error_with_audit("clear decommission", audit))?;
+
+        let is_byid = query.by_id.as_str() == "true";
+
+        let has_idx = {
+            if is_byid {
+                parse_pool_idx_by_id(&query.pool, endpoints.as_ref().len())
+            } else {
+                endpoints.get_pool_idx(&query.pool)
+            }
+        };
+
+        let Some(idx) = has_idx else {
+            return Err(pool_admin_pool_not_found_error_with_audit("clear decommission", &query.pool, audit));
+        };
+
+        let Some(store) = resolve_object_store_handle() else {
+            return Err(decommission_admin_not_initialized_error_with_audit("clear decommission", audit));
+        };
+
+        store
+            .clear_decommission(idx)
+            .await
+            .map_err(ApiError::from)
+            .map_err(|err| contextualize_admin_pool_api_error(err, "clear decommission", format!("pool {idx}")))?;
+
+        info!(
+            event = EVENT_ADMIN_RESPONSE_EMITTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_POOL_ADMIN,
+            operation = "clear_decommission",
+            action = "clear_decommission",
             result = "success",
             request_id = %request_id,
             actor = %actor,
