@@ -563,6 +563,7 @@ impl DefaultMultipartUsecase {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         result
     }
 
