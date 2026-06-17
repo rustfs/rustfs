@@ -4188,7 +4188,10 @@ dependencies = [
  "libfuzzer-sys",
  "rustfs-ecstore",
  "rustfs-filemeta",
+ "rustfs-policy",
+ "rustfs-security-governance",
  "rustfs-utils",
+ "serde_json",
 ]
 
 [[package]]
