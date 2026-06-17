@@ -2812,6 +2812,10 @@ impl ECStore {
             return Err(err);
         }
         if rx.is_cancelled() {
+            if let Err(err) = self.decommission_cancel(idx).await {
+                resolve_decommission_terminal_mark_after_error_result(self.decommission_failed(idx).await, idx, &err)?;
+                return Err(err);
+            }
             return Ok(());
         }
         let result = self.decommission_in_background(rx.clone(), idx).await;
@@ -5856,6 +5860,43 @@ mod pools_tests {
         assert!(!meta.is_suspended(0));
         assert!(meta.promote_queued_decommission(0));
         assert!(meta.is_suspended(0));
+    }
+
+    #[test]
+    fn test_pool_meta_promoted_queued_decommission_can_be_canceled() {
+        let mut meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: None,
+            }],
+            ..Default::default()
+        };
+
+        meta.queue_decommission(
+            0,
+            PoolSpaceInfo {
+                total: 100,
+                free: 10,
+                used: 90,
+            },
+        )
+        .expect("queued decommission should be stored");
+
+        assert!(pool_meta_has_active_decommission(&meta));
+        assert!(meta.promote_queued_decommission(0));
+        assert!(meta.decommission_cancel(0));
+
+        let info = meta.pools[0]
+            .decommission
+            .as_ref()
+            .expect("canceled decommission state should be kept for clear");
+        assert!(info.canceled);
+        assert!(!info.queued);
+        assert!(!info.failed);
+        assert!(!info.complete);
+        assert!(!pool_meta_has_active_decommission(&meta));
     }
 
     #[test]
