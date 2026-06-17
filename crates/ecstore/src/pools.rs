@@ -37,9 +37,10 @@ use crate::error::{
     is_err_version_not_found,
 };
 use crate::notification_sys::get_global_notification_sys;
+use crate::rebalance::{REBAL_META_NAME, RebalanceMeta, is_rebalance_conflicting_with_decommission};
 use crate::resolve_object_store_handle;
-use crate::set_disk::SetDisks;
-use crate::store_api::{GetObjectReader, HealOperations, ObjectIO, ObjectOperations, ObjectOptions};
+use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
+use crate::store_api::{GetObjectReader, HealOperations, NamespaceLocking, ObjectIO, ObjectOperations, ObjectOptions};
 use crate::{global::GLOBAL_LifecycleSys, sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
@@ -185,6 +186,10 @@ fn ensure_decommission_not_rebalancing(rebalance_running: bool) -> Result<()> {
     Ok(())
 }
 
+fn ensure_decommission_start_rebalance_meta_allowed(meta: Option<&RebalanceMeta>) -> Result<()> {
+    ensure_decommission_not_rebalancing(meta.is_some_and(is_rebalance_conflicting_with_decommission))
+}
+
 fn ensure_local_decommission_pool_leaders(endpoints: &EndpointServerPools, indices: &[usize]) -> Result<()> {
     for idx in indices {
         let pool = endpoints
@@ -216,6 +221,14 @@ fn decommission_meta_bucket_options() -> MakeBucketOptions {
 
 fn is_decommission_active(complete: bool, failed: bool, canceled: bool) -> bool {
     !complete && !failed && !canceled
+}
+
+pub(crate) fn pool_meta_has_active_decommission(meta: &PoolMeta) -> bool {
+    meta.pools.iter().any(|pool| {
+        pool.decommission
+            .as_ref()
+            .is_some_and(|info| is_decommission_active(info.complete, info.failed, info.canceled))
+    })
 }
 
 fn is_decommission_suspended(info: &PoolDecommissionInfo) -> bool {
@@ -420,6 +433,21 @@ fn resolve_decommission_pool_meta_reload_result(result: Result<()>, stage: &str)
 
 fn resolve_start_decommission_pool_meta_reload_result(result: Result<()>) -> Result<()> {
     resolve_decommission_pool_meta_reload_result(result, "start_decommission")
+}
+
+fn decommission_rebalance_meta_lock_error(err: rustfs_lock::LockError) -> Error {
+    match err {
+        rustfs_lock::LockError::QuorumNotReached { required, achieved } => Error::NamespaceLockQuorumUnavailable {
+            mode: "write",
+            bucket: RUSTFS_META_BUCKET.to_string(),
+            object: REBAL_META_NAME.to_string(),
+            required,
+            achieved,
+        },
+        other => Error::other(format!(
+            "failed to acquire rebalance metadata write lock before decommission start on {RUSTFS_META_BUCKET}/{REBAL_META_NAME}: {other}"
+        )),
+    }
 }
 
 fn rollback_start_decommission_pool_meta(pool_meta: &mut PoolMeta, previous_pool_meta: PoolMeta) {
@@ -1556,6 +1584,46 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
 impl ECStore {
     async fn save_current_pool_meta(&self) -> Result<()> {
         let _save_guard = self.pool_meta_save_gate.lock().await;
+        let snapshot = {
+            let pool_meta = self.pool_meta.read().await;
+            pool_meta.clone()
+        };
+        snapshot.save(self.pools.clone()).await
+    }
+
+    async fn save_current_pool_meta_for_decommission_start(&self) -> Result<()> {
+        let _save_guard = self.pool_meta_save_gate.lock().await;
+        let rebalance_pool = self
+            .pools
+            .first()
+            .cloned()
+            .ok_or_else(|| Error::other("decommission start rebalance metadata load failed: no storage pools available"))?;
+        let ns_lock = rebalance_pool.new_ns_lock(RUSTFS_META_BUCKET, REBAL_META_NAME).await?;
+        let _guard = ns_lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .map_err(decommission_rebalance_meta_lock_error)?;
+
+        let mut rebalance_meta = RebalanceMeta::new();
+        match rebalance_meta
+            .load_with_opts(
+                rebalance_pool,
+                ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(()) => ensure_decommission_start_rebalance_meta_allowed(Some(&rebalance_meta))?,
+            Err(Error::ConfigNotFound) => {}
+            Err(err) => {
+                return Err(Error::other(format!(
+                    "rebalance metadata load before decommission start save failed: {err}"
+                )));
+            }
+        }
+
         let snapshot = {
             let pool_meta = self.pool_meta.read().await;
             pool_meta.clone()
@@ -2837,7 +2905,7 @@ impl ECStore {
             previous_pool_meta
         };
 
-        if let Err(save_err) = self.save_current_pool_meta().await {
+        if let Err(save_err) = self.save_current_pool_meta_for_decommission_start().await {
             {
                 let mut pool_meta = self.pool_meta.write().await;
                 rollback_start_decommission_pool_meta(&mut pool_meta, previous_pool_meta);
@@ -3856,27 +3924,28 @@ mod pools_tests {
         decommission_cancel_signal_result, decommission_item_size, decommission_meta_bucket_options,
         decommission_start_guard_state, dedup_indices, default_decommission_bucket_concurrency,
         ensure_decommission_cancel_allowed, ensure_decommission_listing_disks_available, ensure_decommission_not_rebalancing,
-        ensure_decommission_start_allowed, ensure_decommission_terminal_operation_supported,
-        ensure_local_decommission_pool_leaders, ensure_valid_decommission_pool_index, get_by_index,
-        has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_terminal,
-        load_decommission_entry_versions, mark_decommission_bucket_done, require_decommission_store,
-        resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
-        resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
-        resolve_decommission_entry_reload_result, resolve_decommission_listing_worker_result,
-        resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,
-        resolve_decommission_preflight_heal_result, resolve_decommission_spawn_failure_result,
-        resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
-        resolve_decommission_update_after_result, resolve_start_decommission_pool_meta_reload_result,
-        rollback_start_decommission_pool_meta, run_decommission_buckets_bounded, should_cleanup_decommission_source_entry,
-        should_continue_decommission_queue, should_count_decommission_version_complete,
-        should_preserve_decommission_canceled_state, split_decommission_buckets, take_and_cancel_decommission_canceler,
-        take_decommission_canceler, track_decommission_current_object, validate_start_decommission_request,
-        with_decommission_entry_context,
+        ensure_decommission_start_allowed, ensure_decommission_start_rebalance_meta_allowed,
+        ensure_decommission_terminal_operation_supported, ensure_local_decommission_pool_leaders,
+        ensure_valid_decommission_pool_index, get_by_index, has_active_decommission_canceler, is_decommission_active,
+        is_decommission_cancel_terminal, load_decommission_entry_versions, mark_decommission_bucket_done,
+        pool_meta_has_active_decommission, require_decommission_store, resolve_decommission_bucket_done_save_result,
+        resolve_decommission_bucket_state, resolve_decommission_check_after_list_result,
+        resolve_decommission_entry_cleanup_delete_result, resolve_decommission_entry_reload_result,
+        resolve_decommission_listing_worker_result, resolve_decommission_optional_bucket_config_result,
+        resolve_decommission_pool_meta_reload_result, resolve_decommission_preflight_heal_result,
+        resolve_decommission_spawn_failure_result, resolve_decommission_terminal_mark_after_error_result,
+        resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result,
+        resolve_start_decommission_pool_meta_reload_result, rollback_start_decommission_pool_meta,
+        run_decommission_buckets_bounded, should_cleanup_decommission_source_entry, should_continue_decommission_queue,
+        should_count_decommission_version_complete, should_preserve_decommission_canceled_state, split_decommission_buckets,
+        take_and_cancel_decommission_canceler, take_decommission_canceler, track_decommission_current_object,
+        validate_start_decommission_request, with_decommission_entry_context,
     };
     use crate::data_movement;
     use crate::disk::endpoint::Endpoint;
     use crate::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::error::Error;
+    use crate::rebalance::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats};
     use rustfs_filemeta::MetaCacheEntry;
     use rustfs_rio::Index;
     use std::sync::{
@@ -4804,6 +4873,64 @@ mod pools_tests {
     }
 
     #[test]
+    fn test_ensure_decommission_start_rebalance_meta_allowed_rejects_active_rebalance() {
+        let meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let err = ensure_decommission_start_rebalance_meta_allowed(Some(&meta))
+            .expect_err("persisted active rebalance should block decommission start");
+
+        assert!(matches!(err, Error::RebalanceAlreadyRunning));
+    }
+
+    #[test]
+    fn test_ensure_decommission_start_rebalance_meta_allowed_rejects_stopping_rebalance() {
+        let meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats {
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    stopping: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let err = ensure_decommission_start_rebalance_meta_allowed(Some(&meta))
+            .expect_err("persisted stopping rebalance should block decommission start");
+
+        assert!(matches!(err, Error::RebalanceAlreadyRunning));
+    }
+
+    #[test]
+    fn test_ensure_decommission_start_rebalance_meta_allowed_allows_terminal_or_missing_rebalance() {
+        let terminal_meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Completed,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(ensure_decommission_start_rebalance_meta_allowed(Some(&terminal_meta)).is_ok());
+        assert!(ensure_decommission_start_rebalance_meta_allowed(None).is_ok());
+    }
+
+    #[test]
     fn test_ensure_local_decommission_pool_leaders_allows_local_first_endpoint() {
         let endpoints = EndpointServerPools::from(vec![
             decommission_test_pool_endpoint(0, false),
@@ -4853,6 +4980,72 @@ mod pools_tests {
         assert!(!is_decommission_active(true, false, false));
         assert!(!is_decommission_active(false, true, false));
         assert!(!is_decommission_active(false, false, true));
+    }
+
+    #[test]
+    fn test_pool_meta_has_active_decommission_counts_active_and_queued_states() {
+        let active_meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo::default()),
+            }],
+            ..Default::default()
+        };
+        let queued_meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    queued: true,
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+
+        assert!(pool_meta_has_active_decommission(&active_meta));
+        assert!(pool_meta_has_active_decommission(&queued_meta));
+    }
+
+    #[test]
+    fn test_pool_meta_has_active_decommission_ignores_terminal_states() {
+        let terminal_meta = PoolMeta {
+            pools: vec![
+                PoolStatus {
+                    id: 0,
+                    cmd_line: "pool-0".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: Some(PoolDecommissionInfo {
+                        complete: true,
+                        ..Default::default()
+                    }),
+                },
+                PoolStatus {
+                    id: 1,
+                    cmd_line: "pool-1".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: Some(PoolDecommissionInfo {
+                        failed: true,
+                        ..Default::default()
+                    }),
+                },
+                PoolStatus {
+                    id: 2,
+                    cmd_line: "pool-2".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: Some(PoolDecommissionInfo {
+                        canceled: true,
+                        ..Default::default()
+                    }),
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(!pool_meta_has_active_decommission(&terminal_meta));
     }
 
     #[test]

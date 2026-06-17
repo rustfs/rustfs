@@ -20,7 +20,7 @@ use crate::disk::error::DiskError;
 use crate::error::{Error, Result};
 use crate::error::{is_err_object_not_found, is_err_operation_canceled, is_err_version_not_found, is_network_or_host_down};
 use crate::global::get_global_endpoints;
-use crate::pools::ListCallback;
+use crate::pools::{ListCallback, PoolMeta, pool_meta_has_active_decommission};
 use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
 use crate::store::ECStore;
 use crate::store_api::{GetObjectReader, HTTPRangeSpec, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions};
@@ -50,7 +50,7 @@ use uuid::Uuid;
 
 const REBAL_META_FMT: u16 = 1; // Replace with actual format value
 const REBAL_META_VER: u16 = 1; // Replace with actual version value
-const REBAL_META_NAME: &str = "rebalance.bin";
+pub(crate) const REBAL_META_NAME: &str = "rebalance.bin";
 const DEFAULT_REBALANCE_MAX_ATTEMPTS: usize = 3;
 const REBALANCE_MAX_ATTEMPTS_ENV: &str = "RUSTFS_REBALANCE_MAX_ATTEMPTS";
 const REBALANCE_STOP_PROPAGATION_ERROR_PREFIX: &str = "rebalance stop propagation incomplete: ";
@@ -663,7 +663,7 @@ fn is_rebalance_in_progress(meta: &RebalanceMeta) -> bool {
     meta.pool_stats.iter().any(is_rebalance_pool_active)
 }
 
-fn is_rebalance_conflicting_with_decommission(meta: &RebalanceMeta) -> bool {
+pub(crate) fn is_rebalance_conflicting_with_decommission(meta: &RebalanceMeta) -> bool {
     is_rebalance_in_progress(meta)
 }
 
@@ -917,6 +917,20 @@ impl ECStore {
             Err(Error::ConfigNotFound) => {}
             Err(err) => return Err(Error::other(format!("rebalance meta load before save failed during {stage}: {err}"))),
         }
+
+        let pool_meta_pool = self
+            .pools
+            .first()
+            .cloned()
+            .ok_or_else(|| Error::other("rebalance start pool metadata load failed: no storage pools available"))?;
+        let mut persisted_pool_meta = PoolMeta::default();
+        persisted_pool_meta
+            .load(pool_meta_pool, self.pools.clone())
+            .await
+            .map_err(|err| {
+                Error::other(format!("pool metadata load before rebalance start save failed during {stage}: {err}"))
+            })?;
+        validate_rebalance_start_pool_meta(&persisted_pool_meta)?;
 
         local_snapshot.save_with_opts(pool, opts).await
     }
@@ -2687,6 +2701,14 @@ fn validate_rebalance_start_gate_state(decommission_running: bool, rebalance_run
     Ok(())
 }
 
+fn validate_rebalance_start_pool_meta(meta: &PoolMeta) -> Result<()> {
+    if pool_meta_has_active_decommission(meta) {
+        return Err(Error::DecommissionAlreadyRunning);
+    }
+
+    Ok(())
+}
+
 fn should_skip_start_rebalance(cancel_attached: bool, in_progress: bool) -> bool {
     cancel_attached && in_progress
 }
@@ -3747,13 +3769,14 @@ mod rebalance_unit_tests {
         should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
         should_retry_rebalance_listing, should_skip_rebalance_delete_marker, should_skip_start_rebalance,
         stop_rebalance_meta_snapshot, stop_rebalance_meta_snapshot_for_id, stop_rebalance_state,
-        take_bucket_from_rebalance_queue, validate_rebalance_start_gate_state, validate_start_rebalance_state,
-        wait_rebalance_listing_retry, with_rebalance_entry_context,
+        take_bucket_from_rebalance_queue, validate_rebalance_start_gate_state, validate_rebalance_start_pool_meta,
+        validate_start_rebalance_state, wait_rebalance_listing_retry, with_rebalance_entry_context,
     };
     use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
     use crate::disk::RUSTFS_META_BUCKET;
     use crate::error::{Error, Result};
+    use crate::pools::{PoolDecommissionInfo, PoolMeta, PoolStatus};
     use rustfs_filemeta::FileInfo;
     use rustfs_filemeta::TRANSITION_COMPLETE;
     use rustfs_rio::Index;
@@ -6226,6 +6249,63 @@ mod rebalance_unit_tests {
     #[test]
     fn test_validate_rebalance_start_gate_state_allows_idle_cluster() {
         assert!(validate_rebalance_start_gate_state(false, false).is_ok());
+    }
+
+    #[test]
+    fn test_validate_rebalance_start_pool_meta_rejects_active_decommission() {
+        let meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo::default()),
+            }],
+            ..Default::default()
+        };
+
+        let err =
+            validate_rebalance_start_pool_meta(&meta).expect_err("persisted active decommission should block rebalance start");
+
+        assert!(matches!(err, Error::DecommissionAlreadyRunning));
+    }
+
+    #[test]
+    fn test_validate_rebalance_start_pool_meta_rejects_queued_decommission() {
+        let meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    queued: true,
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+
+        let err =
+            validate_rebalance_start_pool_meta(&meta).expect_err("persisted queued decommission should block rebalance start");
+
+        assert!(matches!(err, Error::DecommissionAlreadyRunning));
+    }
+
+    #[test]
+    fn test_validate_rebalance_start_pool_meta_allows_terminal_decommission() {
+        let meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    complete: true,
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+
+        assert!(validate_rebalance_start_pool_meta(&meta).is_ok());
     }
 
     #[test]
