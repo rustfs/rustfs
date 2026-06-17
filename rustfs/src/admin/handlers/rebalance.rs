@@ -313,17 +313,20 @@ impl Operation for RebalanceStart {
 
         let buckets: Vec<String> = bucket_infos.into_iter().map(|bucket| bucket.name).collect();
 
-        let id = match store.init_rebalance_meta(buckets).await {
+        let id = match store.init_and_start_rebalance(buckets).await {
             Ok(id) => id,
+            Err(StorageError::DecommissionAlreadyRunning) => {
+                log_rebalance_request_rejected("start", "decommission_in_progress", &request_id, &actor, &remote_addr);
+                return Err(s3_error!(InvalidRequest, "cannot start rebalance while decommission is in progress"));
+            }
+            Err(StorageError::RebalanceAlreadyRunning) => {
+                log_rebalance_request_rejected("start", "rebalance_already_in_progress", &request_id, &actor, &remote_addr);
+                return Err(s3_error!(OperationAborted, "rebalance is already in progress"));
+            }
             Err(e) => {
-                return Err(s3_error!(InternalError, "failed to initialize rebalance metadata: {}", e));
+                return Err(s3_error!(InternalError, "failed to start rebalance: {}", e));
             }
         };
-
-        store
-            .start_rebalance()
-            .await
-            .map_err(|e| s3_error!(InternalError, "failed to start rebalance: {}", e))?;
 
         info!(
             event = EVENT_ADMIN_REBALANCE_STATE,

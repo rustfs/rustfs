@@ -924,6 +924,16 @@ impl ECStore {
 
     #[tracing::instrument(skip(self))]
     pub async fn init_rebalance_meta(&self, bucktes: Vec<String>) -> Result<String> {
+        let _start_guard = self.start_gate.lock().await;
+        validate_rebalance_start_gate_state(
+            self.is_decommission_running().await,
+            self.is_rebalance_conflicting_with_decommission().await,
+        )?;
+
+        self.init_rebalance_meta_unlocked(bucktes).await
+    }
+
+    async fn init_rebalance_meta_unlocked(&self, bucktes: Vec<String>) -> Result<String> {
         info!(
             event = EVENT_REBALANCE_STATE,
             component = LOG_COMPONENT_ECSTORE,
@@ -1005,6 +1015,31 @@ impl ECStore {
             let mut rebalance_meta = self.rebalance_meta.write().await;
             *rebalance_meta = Some(meta);
             drop(rebalance_meta);
+        }
+
+        Ok(id)
+    }
+
+    #[tracing::instrument(skip(self, bucktes))]
+    pub async fn init_and_start_rebalance(self: &Arc<Self>, bucktes: Vec<String>) -> Result<String> {
+        let _start_guard = self.start_gate.lock().await;
+
+        validate_rebalance_start_gate_state(
+            self.is_decommission_running().await,
+            self.is_rebalance_conflicting_with_decommission().await,
+        )?;
+
+        let id = self.init_rebalance_meta_unlocked(bucktes).await?;
+        if let Err(start_err) = self.start_rebalance_unlocked().await {
+            if let Err(rollback_err) = self.stop_rebalance().await {
+                return Err(Error::other(format!(
+                    "failed to start rebalance after metadata initialized for {id}: {start_err}; rollback failed: {rollback_err}"
+                )));
+            }
+
+            return Err(Error::other(format!(
+                "failed to start rebalance after metadata initialized for {id}; local metadata was rolled back: {start_err}"
+            )));
         }
 
         Ok(id)
@@ -1173,6 +1208,11 @@ impl ECStore {
 
     #[tracing::instrument(skip_all)]
     pub async fn start_rebalance(self: &Arc<Self>) -> Result<()> {
+        let _start_guard = self.start_gate.lock().await;
+        self.start_rebalance_unlocked().await
+    }
+
+    async fn start_rebalance_unlocked(self: &Arc<Self>) -> Result<()> {
         info!(
             event = EVENT_REBALANCE_STATE,
             component = LOG_COMPONENT_ECSTORE,
@@ -2426,6 +2466,17 @@ fn validate_start_rebalance_state(decommission_running: bool, meta_loaded: bool)
     Ok(())
 }
 
+fn validate_rebalance_start_gate_state(decommission_running: bool, rebalance_running: bool) -> Result<()> {
+    if decommission_running {
+        return Err(Error::DecommissionAlreadyRunning);
+    }
+    if rebalance_running {
+        return Err(Error::RebalanceAlreadyRunning);
+    }
+
+    Ok(())
+}
+
 fn should_skip_start_rebalance(cancel_attached: bool, in_progress: bool) -> bool {
     cancel_attached && in_progress
 }
@@ -3393,8 +3444,9 @@ mod rebalance_unit_tests {
         should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete, should_defer_rebalance_entry_failure,
         should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
         should_retry_rebalance_listing, should_skip_rebalance_delete_marker, should_skip_start_rebalance,
-        stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue, validate_start_rebalance_state,
-        wait_rebalance_listing_retry, with_rebalance_entry_context,
+        stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue,
+        validate_rebalance_start_gate_state, validate_start_rebalance_state, wait_rebalance_listing_retry,
+        with_rebalance_entry_context,
     };
     use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -5704,6 +5756,34 @@ mod rebalance_unit_tests {
     #[test]
     fn test_validate_start_rebalance_state_allows_loaded_meta() {
         validate_start_rebalance_state(false, true).expect("loaded rebalance meta should allow start");
+    }
+
+    #[test]
+    fn test_validate_rebalance_start_gate_state_rejects_running_decommission() {
+        let err =
+            validate_rebalance_start_gate_state(true, false).expect_err("running decommission should block rebalance start");
+
+        assert!(matches!(err, Error::DecommissionAlreadyRunning));
+    }
+
+    #[test]
+    fn test_validate_rebalance_start_gate_state_rejects_running_rebalance() {
+        let err = validate_rebalance_start_gate_state(false, true).expect_err("running rebalance should block duplicate start");
+
+        assert!(matches!(err, Error::RebalanceAlreadyRunning));
+    }
+
+    #[test]
+    fn test_validate_rebalance_start_gate_state_prefers_decommission_conflict() {
+        let err = validate_rebalance_start_gate_state(true, true)
+            .expect_err("decommission conflict should be reported before duplicate rebalance");
+
+        assert!(matches!(err, Error::DecommissionAlreadyRunning));
+    }
+
+    #[test]
+    fn test_validate_rebalance_start_gate_state_allows_idle_cluster() {
+        assert!(validate_rebalance_start_gate_state(false, false).is_ok());
     }
 
     #[test]

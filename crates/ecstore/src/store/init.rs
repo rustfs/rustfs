@@ -309,6 +309,7 @@ impl ECStore {
             pool_meta: RwLock::new(pool_meta),
             rebalance_meta: RwLock::new(None),
             decommission_cancelers,
+            start_gate: tokio::sync::Mutex::new(()),
 
             local_disk_map: GLOBAL_LOCAL_DISK_MAP.clone(),
             local_disk_id_map: GLOBAL_LOCAL_DISK_ID_MAP.clone(),

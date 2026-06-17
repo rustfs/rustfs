@@ -2588,6 +2588,7 @@ impl ECStore {
             space_infos.push((idx, pi));
         }
 
+        let _start_guard = self.start_gate.lock().await;
         ensure_decommission_not_rebalancing(self.is_rebalance_conflicting_with_decommission().await)?;
 
         let mut pool_meta = self.pool_meta.write().await;
