@@ -559,10 +559,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
 
     let merge_started = std::time::Instant::now();
     if let Err(err) = revjob.await.map_err(std::io::Error::other)? {
-        rustfs_io_metrics::record_stage_duration(
-            "metacache_merge_failed",
-            merge_started.elapsed().as_secs_f64() * 1000.0,
-        );
+        rustfs_io_metrics::record_stage_duration("metacache_merge_failed", merge_started.elapsed().as_secs_f64() * 1000.0);
         error!(
             event = EVENT_METACACHE_LISTING,
             component = LOG_COMPONENT_ECSTORE,
