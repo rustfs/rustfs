@@ -5,18 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-object-precondition-contracts`
-- Baseline: `overtrue/arch-object-list-helper-contracts` at `65b56e1fb4fa4c65c167e2f434bf5fcb2a0b0cd4f`
-  over `overtrue/arch-range-contracts` at `829bc62095f0fd853747cd6d7d77f8558baf24a2`
+- Branch: `overtrue/arch-list-response-contracts`
+- Baseline: `main` at `80ed63484bf62b916ceda17fd76b1092261fda77`
+  after the object precondition contract merge.
 - PR type for this branch: `api-extraction`
 - Runtime behavior changes: no external behavior change expected.
-- Rust code changes: move pure object HTTP precondition evaluation into
-  `rustfs-storage-api` as `ObjectPreconditionState`,
-  `ObjectPreconditionPart`, and `ObjectPreconditionError`, then keep
-  `ObjectOptions`, `ObjectInfo`, and ECStore error mapping in ECStore.
-- CI/script changes: extend migration guards for object precondition contract
-  public re-exports.
-- Docs changes: record the object precondition contract extraction slice.
+- Rust code changes: move object list response DTO contracts into
+  `rustfs-storage-api` as generic `ListObjectsInfo`,
+  `ListObjectsV2Info`, `ListObjectVersionsInfo`, and `ObjectInfoOrErr`,
+  then keep ECStore's existing public names as `ObjectInfo`/`Error` aliases.
+- CI/script changes: extend migration guards for list response contract public
+  re-exports and ECStore local-definition regressions.
+- Docs changes: record the object list response contract extraction slice.
 
 ## Phase 0 Tasks
 
@@ -619,6 +619,29 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
     and required three-expert review passed.
 
+- [x] `API-019` Move object list response contracts.
+  - Completed slice: move `ListObjectsInfo`, `ListObjectsV2Info`,
+    `ListObjectVersionsInfo`, and `ObjectInfoOrErr` from ECStore
+    `store_api/types.rs` into `rustfs-storage-api` as generic public
+    contracts, then keep ECStore's old public names as type aliases bound to
+    `ObjectInfo` and `Error`.
+  - Acceptance: `rustfs-storage-api` exports the generic list response
+    contracts, ECStore no longer defines local response structs for these
+    contracts, existing ECStore consumers keep their old import path, and
+    migration guards reject dropping the public storage-api re-export or
+    reintroducing local ECStore definitions.
+  - Must preserve: list v1/v2 truncation and marker fields, list-object-version
+    marker fields, object/prefix vectors, walk item/error channel shape, and
+    ECStore list/walk runtime behavior.
+  - Risk defense: only generic response containers cross into
+    `rustfs-storage-api`; ECStore keeps `ObjectInfo`, `ObjectOptions`,
+    `WalkOptions`, filemeta filters, object metadata adaptation, storage errors,
+    readers, lifecycle/replication coupling, and list/walk implementation
+    bodies.
+  - Verification: focused storage-api tests, ECStore/RustFS/downstream compile
+    checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    full pre-commit, and required three-expert review passed.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -895,16 +918,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Pure precondition decision state and result contracts now live in `rustfs-storage-api`; ECStore still owns object metadata adaptation and storage error mapping. |
-| Migration preservation | passed | Requested-part validation, ETag/date precondition priority, empty condition handling, and existing ECStore `Error` mapping are preserved. |
-| Testing/verification | passed | Focused storage-api/ECStore tests, compile checks, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Generic list response containers now live in `rustfs-storage-api`; ECStore still owns `ObjectInfo`, `Error`, walk options, and list implementation behavior. |
+| Migration preservation | passed | List v1/v2 fields, version-list fields, walk item/error channel shape, and existing ECStore public import paths are preserved through aliases. |
+| Testing/verification | passed | Focused storage-api tests, downstream compile checks, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
 Passed before push:
 
 - `cargo test -p rustfs-storage-api`: passed.
-- `cargo test -p rustfs-ecstore precondition_check_ignores_empty_etag_conditions`: passed.
 - `cargo check --tests -p rustfs-storage-api -p rustfs-ecstore -p rustfs -p rustfs-iam -p rustfs-scanner`: passed.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
@@ -913,25 +935,26 @@ Passed before push:
 - Rust risk scan: no new `unwrap`/`expect`, panic/todo markers, `unsafe`,
   process-spawning calls, lossy casts, println/eprintln, or relaxed ordering in
   added Rust lines.
-- `make pre-commit`: passed; nextest reported 6164 tests passed and 111
+- `make pre-commit`: passed; nextest reported 6191 tests passed and 111
   skipped, and doctests passed.
 
 Notes:
 
-- This slice follows the range helper contract branch and keeps the old
+- This slice follows the object precondition contract branch and keeps the old
   aggregate facade, bucket DTO, multipart DTO, bucket operation contract, object
-  helper, range helper, list helper, and object precondition contract guards
-  active.
-- The shared precondition helper contract is now owned by
-  `rustfs-storage-api`; ECStore keeps `ObjectOptions`, `ObjectInfo`, object
-  metadata adaptation, storage error mapping, readers, lifecycle/replication,
-  rio, filemeta, and implementation behavior.
-- The slice does not alter object, list, walk, multipart, bucket, or reader
-  runtime behavior.
+  helper, range helper, list helper, object precondition, and list response
+  contract guards active.
+- The shared list response containers are now owned by `rustfs-storage-api`;
+  ECStore keeps `ObjectInfo`, storage `Error`, `ObjectOptions`, `WalkOptions`,
+  object metadata adaptation, storage error mapping, readers,
+  lifecycle/replication, rio, filemeta, and implementation behavior.
+- The slice does not alter object, list, walk, multipart, bucket, delete, or
+  reader runtime behavior.
 
 ## Handoff Notes
 
-- Object precondition contract cleanup is stacked on the list helper contract
-  branch.
+- Object list response contract cleanup is stacked on the object precondition
+  contract branch.
 - After this lands, remaining storage work can continue by extracting larger
-  low-coupling DTO slices or by narrowing remaining operation-group consumers.
+  low-coupling DTO/consumer slices or by narrowing remaining operation-group
+  consumers.

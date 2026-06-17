@@ -154,6 +154,38 @@ pub enum WalkVersionsSortOrder {
     Descending,
 }
 
+#[derive(Debug, Default)]
+pub struct ListObjectsInfo<ObjectItem> {
+    pub is_truncated: bool,
+    pub next_marker: Option<String>,
+    pub objects: Vec<ObjectItem>,
+    pub prefixes: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct ListObjectsV2Info<ObjectItem> {
+    pub is_truncated: bool,
+    pub continuation_token: Option<String>,
+    pub next_continuation_token: Option<String>,
+    pub objects: Vec<ObjectItem>,
+    pub prefixes: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ListObjectVersionsInfo<ObjectItem> {
+    pub is_truncated: bool,
+    pub next_marker: Option<String>,
+    pub next_version_idmarker: Option<String>,
+    pub objects: Vec<ObjectItem>,
+    pub prefixes: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct ObjectInfoOrErr<ObjectItem, ListError> {
+    pub item: Option<ObjectItem>,
+    pub err: Option<ListError>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HTTPRangeError {
     InvalidRangeSpec(String),
@@ -384,6 +416,40 @@ mod tests {
     #[test]
     fn walk_versions_sort_order_defaults_to_ascending() {
         assert!(matches!(WalkVersionsSortOrder::default(), WalkVersionsSortOrder::Ascending));
+    }
+
+    #[test]
+    fn object_list_response_contracts_default_to_empty_collections() {
+        let v1 = ListObjectsInfo::<()>::default();
+        assert!(!v1.is_truncated);
+        assert!(v1.next_marker.is_none());
+        assert!(v1.objects.is_empty());
+        assert!(v1.prefixes.is_empty());
+
+        let v2 = ListObjectsV2Info::<()>::default();
+        assert!(!v2.is_truncated);
+        assert!(v2.continuation_token.is_none());
+        assert!(v2.next_continuation_token.is_none());
+        assert!(v2.objects.is_empty());
+        assert!(v2.prefixes.is_empty());
+
+        let versions = ListObjectVersionsInfo::<()>::default();
+        assert!(!versions.is_truncated);
+        assert!(versions.next_marker.is_none());
+        assert!(versions.next_version_idmarker.is_none());
+        assert!(versions.objects.is_empty());
+        assert!(versions.prefixes.is_empty());
+    }
+
+    #[test]
+    fn object_info_or_err_keeps_optional_item_and_error_slots() {
+        let item = ObjectInfoOrErr::<usize, &str> {
+            item: Some(7),
+            err: None,
+        };
+
+        assert_eq!(item.item, Some(7));
+        assert!(item.err.is_none());
     }
 
     #[test]
