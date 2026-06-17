@@ -29,6 +29,8 @@ fuzz/
   artifacts/
 ```
 
+Crash reproducers are written under `fuzz/artifacts/<target>/`.
+
 ## Targets
 
 - `bucket_validation`
