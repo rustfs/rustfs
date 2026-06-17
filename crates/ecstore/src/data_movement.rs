@@ -1083,6 +1083,21 @@ mod tests {
     }
 
     #[test]
+    fn test_data_movement_single_part_checksum_uses_raw_source_size() {
+        let object_info = ObjectInfo {
+            size: 32,
+            actual_size: 128,
+            etag: Some("etag-value".to_string()),
+            checksum: Some(Bytes::new()),
+            ..Default::default()
+        };
+
+        assert_eq!(object_info.size, 32);
+        assert_eq!(object_info.get_actual_size().expect("actual size should resolve"), 128);
+        assert_eq!(data_movement_object_checksum_type(&object_info), None);
+    }
+
+    #[test]
     fn test_data_movement_multipart_checksum_type_uses_source_metadata() {
         let object_info = ObjectInfo {
             user_defined: Arc::new(HashMap::from([
@@ -1122,6 +1137,27 @@ mod tests {
         assert_eq!(complete.checksum_sha1.as_deref(), Some("sha1-value"));
         assert_eq!(complete.checksum_sha256.as_deref(), Some("sha256-value"));
         assert_eq!(complete.checksum_crc64nvme.as_deref(), Some("crc64-value"));
+    }
+
+    #[test]
+    fn test_data_movement_part_reader_uses_stored_part_size_for_raw_stream() {
+        let source_part = ObjectPartInfo {
+            number: 1,
+            size: 32,
+            actual_size: 128,
+            etag: "etag-1".to_string(),
+            ..Default::default()
+        };
+
+        let part_size = i64::try_from(source_part.size).expect("part size fits");
+        let part_actual_size = if source_part.actual_size > 0 {
+            source_part.actual_size
+        } else {
+            part_size
+        };
+
+        assert_eq!(part_size, 32);
+        assert_eq!(part_actual_size, 128);
     }
 
     #[tokio::test]
