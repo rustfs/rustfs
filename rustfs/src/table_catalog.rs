@@ -72,6 +72,7 @@ pub(crate) const TABLE_METADATA_POINTER_VERSION: u16 = 1;
 pub(crate) const TABLE_CATALOG_ENTRY_VERSION: u16 = 1;
 pub(crate) const TABLE_MAINTENANCE_CONFIG_VERSION: u16 = 1;
 pub(crate) const TABLE_EXTERNAL_CATALOG_BRIDGE_VERSION: u16 = 1;
+pub(crate) const TABLE_CATALOG_BACKING_MANIFEST_VERSION: u16 = 1;
 pub(crate) const TABLE_METADATA_FILE_NAME_MAX_LEN: usize = 128;
 pub const TABLE_RESERVED_PREFIX: &str = BUCKET_TABLE_RESERVED_PREFIX;
 const WAREHOUSE_ROOT: &str = "warehouses";
@@ -843,6 +844,168 @@ pub(crate) struct TableCatalogExport {
     pub table_bucket: TableBucketEntry,
     pub namespace: NamespaceEntry,
     pub table: TableEntry,
+    pub backing_manifest: TableCatalogBackingManifest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableCatalogBackingManifest {
+    pub version: u16,
+    pub current: TableCatalogBackingProfile,
+    pub migration: TableCatalogBackingMigrationPlan,
+    pub ha: TableCatalogHaPolicy,
+    pub scale_validation: TableCatalogScaleValidation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableCatalogBackingProfile {
+    pub kind: TableCatalogBackingKind,
+    pub authority: TableCatalogAuthority,
+    pub consistency: TableCatalogConsistencyMode,
+    pub durability: TableCatalogDurabilityMode,
+    pub current_pointer_path: String,
+    pub wal: TableCatalogWalState,
+    pub snapshot: TableCatalogSnapshotState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogBackingKind {
+    ObjectBacked,
+    StrongKvWal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogAuthority {
+    RustfsSysObject,
+    LinearizableMetadataKv,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogConsistencyMode {
+    ConditionalObjectCas,
+    LinearizableCas,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogDurabilityMode {
+    StagedCommitLogBeforePointerUpdate,
+    WalBeforeStateMachineApply,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableCatalogWalState {
+    pub status: TableCatalogWalStatus,
+    pub commit_log_prefix: String,
+    pub idempotency_index_prefix: String,
+    pub committed_generation: u64,
+    pub staged_before_table_update_count: usize,
+    pub finalization_required_count: usize,
+    pub idempotency_repair_required_count: usize,
+    pub manual_review_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogWalStatus {
+    Recoverable,
+    RecoveryRequired,
+    ManualReviewRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableCatalogSnapshotState {
+    pub export_api: String,
+    pub includes_table_bucket: bool,
+    pub includes_namespace: bool,
+    pub includes_table_pointer: bool,
+    pub includes_backing_manifest: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableCatalogBackingMigrationPlan {
+    pub source_kind: TableCatalogBackingKind,
+    pub target_kind: TableCatalogBackingKind,
+    pub status: TableCatalogBackingMigrationStatus,
+    pub required_steps: Vec<TableCatalogBackingMigrationStep>,
+    pub blockers: Vec<TableCatalogBackingMigrationBlocker>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogBackingMigrationStatus {
+    ReadyToSnapshot,
+    RecoveryRequired,
+    ManualReviewRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogBackingMigrationStep {
+    SnapshotCatalogExport,
+    ReplayCommitLog,
+    VerifyCurrentPointer,
+    EnableSingleWriterFencing,
+    CutOverLinearizableReads,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogBackingMigrationBlocker {
+    CommitRecoveryRequired,
+    CommitManualReviewRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableCatalogHaPolicy {
+    pub writer_region_model: TableCatalogHaWriterModel,
+    pub read_replica_strategy: TableCatalogReadReplicaStrategy,
+    pub commit_read_requirement: TableCatalogCommitReadRequirement,
+    pub active_active_supported: bool,
+    pub failover_requires_operator_promotion: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogHaWriterModel {
+    SingleActiveWriterRegion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogReadReplicaStrategy {
+    ReadOnlyReplicasForListAndLoad,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogCommitReadRequirement {
+    LinearizableLeaderRead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableCatalogScaleValidation {
+    pub status: TableCatalogScaleValidationStatus,
+    pub benchmark_required: bool,
+    pub required_scenarios: Vec<TableCatalogScaleValidationScenario>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogScaleValidationStatus {
+    MatrixPublished,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogScaleValidationScenario {
+    ConcurrentCommitCas,
+    CommitLogRecoveryReplay,
+    MigrationSnapshotReplay,
+    ReadReplicaStaleReadGuard,
+    ClientConformanceMatrix,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -899,6 +1062,7 @@ pub(crate) struct TableCatalogDiagnosticsReport {
     pub recovery_status: TableCatalogRecoveryStatus,
     pub recommended_actions: Vec<TableCatalogRecoveryAction>,
     pub commit_recovery: TableCommitRecoveryReport,
+    pub backing_manifest: TableCatalogBackingManifest,
     pub orphan_metadata_candidate_locations: Vec<String>,
 }
 
@@ -1366,6 +1530,15 @@ impl TableCatalogObjectPaths {
         )
     }
 
+    pub fn commit_idempotency_entries_prefix(&self, table_bucket: &str, table_id: &str) -> String {
+        format!(
+            "{}{}/{}/",
+            self.table_bucket_root_prefix(table_bucket),
+            COMMIT_IDEMPOTENCY_ROOT,
+            table_catalog_path_hash(table_id)
+        )
+    }
+
     fn table_bucket_root_prefix(&self, table_bucket: &str) -> String {
         format!("{}/{}/{}/", self.catalog_root, TABLE_BUCKET_ROOT, table_catalog_path_hash(table_bucket))
     }
@@ -1375,6 +1548,99 @@ impl TableCatalogObjectPaths {
 pub(crate) struct ObjectTableCatalogStore<B> {
     backend: B,
     paths: TableCatalogObjectPaths,
+}
+
+fn table_catalog_backing_manifest(
+    paths: &TableCatalogObjectPaths,
+    namespace: &Namespace,
+    table: &IdentifierSegment,
+    entry: &TableEntry,
+    commit_recovery: &TableCommitRecoveryReport,
+) -> TableCatalogBackingManifest {
+    let recovery_required = commit_recovery.staged_before_table_update_count > 0
+        || commit_recovery.finalization_required_count > 0
+        || commit_recovery.idempotency_repair_required_count > 0;
+    let manual_review_required = commit_recovery.manual_review_count > 0;
+    let wal_status = if manual_review_required {
+        TableCatalogWalStatus::ManualReviewRequired
+    } else if recovery_required {
+        TableCatalogWalStatus::RecoveryRequired
+    } else {
+        TableCatalogWalStatus::Recoverable
+    };
+    let migration_status = if manual_review_required {
+        TableCatalogBackingMigrationStatus::ManualReviewRequired
+    } else if recovery_required {
+        TableCatalogBackingMigrationStatus::RecoveryRequired
+    } else {
+        TableCatalogBackingMigrationStatus::ReadyToSnapshot
+    };
+    let mut blockers = Vec::new();
+    if recovery_required {
+        blockers.push(TableCatalogBackingMigrationBlocker::CommitRecoveryRequired);
+    }
+    if manual_review_required {
+        blockers.push(TableCatalogBackingMigrationBlocker::CommitManualReviewRequired);
+    }
+
+    TableCatalogBackingManifest {
+        version: TABLE_CATALOG_BACKING_MANIFEST_VERSION,
+        current: TableCatalogBackingProfile {
+            kind: TableCatalogBackingKind::ObjectBacked,
+            authority: TableCatalogAuthority::RustfsSysObject,
+            consistency: TableCatalogConsistencyMode::ConditionalObjectCas,
+            durability: TableCatalogDurabilityMode::StagedCommitLogBeforePointerUpdate,
+            current_pointer_path: paths.table_entry_path(&entry.table_bucket, namespace, table),
+            wal: TableCatalogWalState {
+                status: wal_status,
+                commit_log_prefix: paths.commit_log_entries_prefix(&entry.table_bucket, &entry.table_id),
+                idempotency_index_prefix: paths.commit_idempotency_entries_prefix(&entry.table_bucket, &entry.table_id),
+                committed_generation: entry.generation,
+                staged_before_table_update_count: commit_recovery.staged_before_table_update_count,
+                finalization_required_count: commit_recovery.finalization_required_count,
+                idempotency_repair_required_count: commit_recovery.idempotency_repair_required_count,
+                manual_review_count: commit_recovery.manual_review_count,
+            },
+            snapshot: TableCatalogSnapshotState {
+                export_api: "GET /iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export".to_string(),
+                includes_table_bucket: true,
+                includes_namespace: true,
+                includes_table_pointer: true,
+                includes_backing_manifest: true,
+            },
+        },
+        migration: TableCatalogBackingMigrationPlan {
+            source_kind: TableCatalogBackingKind::ObjectBacked,
+            target_kind: TableCatalogBackingKind::StrongKvWal,
+            status: migration_status,
+            required_steps: vec![
+                TableCatalogBackingMigrationStep::SnapshotCatalogExport,
+                TableCatalogBackingMigrationStep::ReplayCommitLog,
+                TableCatalogBackingMigrationStep::VerifyCurrentPointer,
+                TableCatalogBackingMigrationStep::EnableSingleWriterFencing,
+                TableCatalogBackingMigrationStep::CutOverLinearizableReads,
+            ],
+            blockers,
+        },
+        ha: TableCatalogHaPolicy {
+            writer_region_model: TableCatalogHaWriterModel::SingleActiveWriterRegion,
+            read_replica_strategy: TableCatalogReadReplicaStrategy::ReadOnlyReplicasForListAndLoad,
+            commit_read_requirement: TableCatalogCommitReadRequirement::LinearizableLeaderRead,
+            active_active_supported: false,
+            failover_requires_operator_promotion: true,
+        },
+        scale_validation: TableCatalogScaleValidation {
+            status: TableCatalogScaleValidationStatus::MatrixPublished,
+            benchmark_required: true,
+            required_scenarios: vec![
+                TableCatalogScaleValidationScenario::ConcurrentCommitCas,
+                TableCatalogScaleValidationScenario::CommitLogRecoveryReplay,
+                TableCatalogScaleValidationScenario::MigrationSnapshotReplay,
+                TableCatalogScaleValidationScenario::ReadReplicaStaleReadGuard,
+                TableCatalogScaleValidationScenario::ClientConformanceMatrix,
+            ],
+        },
+    }
 }
 
 impl<B> ObjectTableCatalogStore<B>
@@ -2473,11 +2739,14 @@ where
                 table.as_str()
             )));
         };
+        let commit_recovery = self.table_commit_recovery_report_for_entry(&table_entry, 0).await?;
+        let backing_manifest = table_catalog_backing_manifest(&self.paths, &namespace, &table, &table_entry, &commit_recovery);
 
         Ok(TableCatalogExport {
             table_bucket: table_bucket_entry,
             namespace: namespace_entry,
             table: table_entry,
+            backing_manifest,
         })
     }
 
@@ -2550,6 +2819,8 @@ where
 
         let commit_recovery = self.plan_table_commit_recovery(table_bucket, namespace, table).await?;
         let (recovery_status, recommended_actions) = table_catalog_recovery_summary(&current_metadata_status, &commit_recovery);
+        let backing_manifest =
+            table_catalog_backing_manifest(&self.paths, &parsed_namespace, &parsed_table, &catalog.table, &commit_recovery);
 
         Ok(TableCatalogDiagnosticsReport {
             catalog,
@@ -2557,6 +2828,7 @@ where
             recovery_status,
             recommended_actions,
             commit_recovery,
+            backing_manifest,
             orphan_metadata_candidate_locations,
         })
     }
@@ -10146,6 +10418,104 @@ mod tests {
         assert_eq!(export.table.metadata_location, current);
         assert_eq!(export.table.version_token, "token-v1");
         assert_eq!(export.table.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn export_catalog_entry_includes_backing_migration_manifest() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+
+        let export = store.export_table_catalog_entry(bucket, "sales", "orders").await.unwrap();
+
+        assert_eq!(export.backing_manifest.version, TABLE_CATALOG_BACKING_MANIFEST_VERSION);
+        assert_eq!(export.backing_manifest.current.kind, TableCatalogBackingKind::ObjectBacked);
+        assert_eq!(export.backing_manifest.current.authority, TableCatalogAuthority::RustfsSysObject);
+        assert_eq!(
+            export.backing_manifest.current.consistency,
+            TableCatalogConsistencyMode::ConditionalObjectCas
+        );
+        assert_eq!(export.backing_manifest.current.wal.finalization_required_count, 0);
+        assert_eq!(export.backing_manifest.migration.target_kind, TableCatalogBackingKind::StrongKvWal);
+        assert_eq!(
+            export.backing_manifest.migration.status,
+            TableCatalogBackingMigrationStatus::ReadyToSnapshot
+        );
+        assert!(
+            export
+                .backing_manifest
+                .migration
+                .required_steps
+                .contains(&TableCatalogBackingMigrationStep::ReplayCommitLog)
+        );
+        assert_eq!(
+            export.backing_manifest.ha.writer_region_model,
+            TableCatalogHaWriterModel::SingleActiveWriterRegion
+        );
+        assert!(!export.backing_manifest.ha.active_active_supported);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_backing_manifest_requires_recovery_before_migration() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let commit_path = TableCatalogObjectPaths::default().commit_log_entry_path(bucket, "table-id", "commit-1");
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+        store
+            .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
+            .await
+            .unwrap();
+        backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+        backend
+            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &commit_path, 2)
+            .await;
+
+        store
+            .commit_table(TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                commit_id: "commit-1".to_string(),
+                idempotency_key: None,
+                operation: "append".to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current_metadata,
+                new_metadata_location: new_metadata,
+                requirements: Vec::new(),
+                writer: None,
+            })
+            .await
+            .unwrap();
+
+        let diagnostics = store.diagnose_table_catalog(bucket, "sales", "orders", 0).await.unwrap();
+
+        assert_eq!(diagnostics.backing_manifest.current.wal.finalization_required_count, 1);
+        assert_eq!(
+            diagnostics.backing_manifest.migration.status,
+            TableCatalogBackingMigrationStatus::RecoveryRequired
+        );
+        assert!(
+            diagnostics
+                .backing_manifest
+                .migration
+                .blockers
+                .contains(&TableCatalogBackingMigrationBlocker::CommitRecoveryRequired)
+        );
     }
 
     #[tokio::test]

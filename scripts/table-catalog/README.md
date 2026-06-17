@@ -125,6 +125,7 @@ PyIceberg, PyArrow, or boto3:
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-client-matrix
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-vendor-profiles
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-unsupported-inventory
+python3 scripts/table-catalog/pyiceberg_smoke.py --print-production-readiness
 ```
 
 Use these outputs when updating release notes, PR descriptions, or follow-up
@@ -143,6 +144,9 @@ The smoke test also probes catalog-backed advanced Iceberg surfaces:
   execution checks
 - catalog diagnostics exposes the table recovery and consistency state used by
   operators
+- catalog export and diagnostics expose the current catalog backing manifest,
+  recoverable commit-log WAL state, strong backing migration target, single
+  active writer HA policy, and scale validation matrix
 
 ## Client Matrix
 
