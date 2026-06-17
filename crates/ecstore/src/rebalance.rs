@@ -161,18 +161,6 @@ fn rebalance_delete_marker_opts(version: &FileInfo, version_id: Option<String>, 
     }
 }
 
-fn rebalance_remote_tiered_opts(version: &FileInfo, version_id: Option<String>, src_pool_idx: usize) -> ObjectOptions {
-    ObjectOptions {
-        versioned: version_id.is_some(),
-        version_id,
-        mod_time: version.mod_time,
-        user_defined: version.metadata.clone(),
-        src_pool_idx,
-        data_movement: true,
-        ..Default::default()
-    }
-}
-
 #[async_trait::async_trait]
 pub(crate) trait MigrationBackend: Send + Sync {
     async fn get_object_reader_for_migration(
@@ -239,7 +227,7 @@ where
     F: FnMut(usize, String, GetObjectReader) -> Fut + Send,
     Fut: Future<Output = Result<()>> + Send,
 {
-    migrate_entry_version_with_retry_wait(
+    migrate_entry_version_with_delete_marker(
         set,
         bucket,
         pool_index,
@@ -248,6 +236,40 @@ where
         max_attempts,
         ignore_data_usage_cache,
         transfer,
+        |bucket, object, opts| async move { set.delete_object_for_migration(&bucket, &object, opts).await },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn migrate_entry_version_with_delete_marker<Backend, F, Fut, D, DFut>(
+    set: &Backend,
+    bucket: String,
+    pool_index: usize,
+    version: &FileInfo,
+    version_id: Option<String>,
+    max_attempts: usize,
+    ignore_data_usage_cache: bool,
+    transfer: F,
+    move_delete_marker: D,
+) -> MigrationVersionResult
+where
+    Backend: MigrationBackend + ?Sized,
+    F: FnMut(usize, String, GetObjectReader) -> Fut + Send,
+    Fut: Future<Output = Result<()>> + Send,
+    D: FnMut(String, String, ObjectOptions) -> DFut + Send,
+    DFut: Future<Output = Result<ObjectInfo>> + Send,
+{
+    migrate_entry_version_with_delete_marker_and_retry_wait(
+        set,
+        bucket,
+        pool_index,
+        version,
+        version_id,
+        max_attempts,
+        ignore_data_usage_cache,
+        transfer,
+        move_delete_marker,
         sleep_rebalance_migration_retry,
     )
     .await
@@ -262,13 +284,50 @@ async fn migrate_entry_version_with_retry_wait<Backend, F, Fut, W, WFut>(
     version_id: Option<String>,
     max_attempts: usize,
     ignore_data_usage_cache: bool,
+    transfer: F,
+    wait_retry: W,
+) -> MigrationVersionResult
+where
+    Backend: MigrationBackend + ?Sized,
+    F: FnMut(usize, String, GetObjectReader) -> Fut + Send,
+    Fut: Future<Output = Result<()>> + Send,
+    W: FnMut(Duration) -> WFut + Send,
+    WFut: Future<Output = ()> + Send,
+{
+    migrate_entry_version_with_delete_marker_and_retry_wait(
+        set,
+        bucket,
+        pool_index,
+        version,
+        version_id,
+        max_attempts,
+        ignore_data_usage_cache,
+        transfer,
+        |bucket, object, opts| async move { set.delete_object_for_migration(&bucket, &object, opts).await },
+        wait_retry,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn migrate_entry_version_with_delete_marker_and_retry_wait<Backend, F, Fut, D, DFut, W, WFut>(
+    set: &Backend,
+    bucket: String,
+    pool_index: usize,
+    version: &FileInfo,
+    version_id: Option<String>,
+    max_attempts: usize,
+    ignore_data_usage_cache: bool,
     mut transfer: F,
+    mut move_delete_marker: D,
     mut wait_retry: W,
 ) -> MigrationVersionResult
 where
     Backend: MigrationBackend + ?Sized,
     F: FnMut(usize, String, GetObjectReader) -> Fut + Send,
     Fut: Future<Output = Result<()>> + Send,
+    D: FnMut(String, String, ObjectOptions) -> DFut + Send,
+    DFut: Future<Output = Result<ObjectInfo>> + Send,
     W: FnMut(Duration) -> WFut + Send,
     WFut: Future<Output = ()> + Send,
 {
@@ -280,57 +339,26 @@ where
             ignored: true,
             cleanup_ignored: false,
             failed: false,
-            stage: None,
+            stage: Some("data_usage_cache"),
             error: None,
         };
     }
 
     if version.is_remote() {
-        if let Err(err) = set
-            .move_remote_version_for_migration(
-                &bucket,
-                &version.name,
-                version,
-                &rebalance_remote_tiered_opts(version, version_id, pool_index),
-            )
-            .await
-        {
-            if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
-                return MigrationVersionResult {
-                    moved: false,
-                    ignored: true,
-                    cleanup_ignored: true,
-                    failed: false,
-                    stage: Some("move_remote_version"),
-                    error: None,
-                };
-            }
-
-            return MigrationVersionResult {
-                moved: false,
-                ignored: false,
-                cleanup_ignored: false,
-                failed: true,
-                stage: Some("move_remote_version"),
-                error: Some(err),
-            };
-        }
-
         return MigrationVersionResult {
-            moved: true,
-            ignored: false,
+            moved: false,
+            ignored: true,
             cleanup_ignored: false,
             failed: false,
-            stage: None,
+            stage: Some("remote_tiered"),
             error: None,
         };
     }
 
     if version.deleted {
-        if let Err(err) = set
-            .delete_object_for_migration(&bucket, &version.name, rebalance_delete_marker_opts(version, version_id, pool_index))
-            .await
-        {
+        let object = version.name.clone();
+        let opts = rebalance_delete_marker_opts(version, version_id, pool_index);
+        if let Err(err) = move_delete_marker(bucket.clone(), object, opts).await {
             if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
                 return MigrationVersionResult {
                     moved: false,
@@ -2139,6 +2167,15 @@ fn should_count_rebalance_version_complete(result: &MigrationVersionResult) -> b
     result.cleanup_ignored || (result.moved && !result.failed)
 }
 
+fn rebalance_ignored_reason(result: &MigrationVersionResult) -> &'static str {
+    match result.stage {
+        Some("remote_tiered") => "remote_tiered_skipped",
+        Some("data_usage_cache") => "data_usage_cache",
+        _ if result.cleanup_ignored => "already_deleted",
+        _ => "skipped_without_cleanup",
+    }
+}
+
 fn should_cleanup_rebalance_source_entry(rebalanced: usize, total_versions: usize) -> bool {
     rebalanced == total_versions
 }
@@ -2618,7 +2655,11 @@ impl ECStore {
                 let store = self.clone();
                 async move { store.rebalance_object(src_pool_idx, bucket, rd).await }
             };
-            let result = migrate_entry_version(
+            let mut move_delete_marker = |bucket: String, object: String, opts: ObjectOptions| {
+                let store = self.clone();
+                async move { store.rebalance_delete_marker(bucket, object, opts).await }
+            };
+            let result = migrate_entry_version_with_delete_marker(
                 set.as_ref(),
                 bucket.clone(),
                 pool_index,
@@ -2627,6 +2668,7 @@ impl ECStore {
                 rebalance_max_attempts(),
                 should_ignore_rebalance_data_usage_cache(bucket.as_str()),
                 &mut transfer,
+                &mut move_delete_marker,
             )
             .await;
 
@@ -2642,7 +2684,7 @@ impl ECStore {
                     bucket = %bucket,
                     object = %version.name,
                     state = "skipped",
-                    reason = "already_deleted",
+                    reason = rebalance_ignored_reason(&result),
                     "Skipped rebalance version"
                 );
                 continue;
@@ -2779,6 +2821,11 @@ impl ECStore {
     #[tracing::instrument(skip(self, rd))]
     async fn rebalance_object(self: Arc<Self>, pool_idx: usize, bucket: String, rd: GetObjectReader) -> Result<()> {
         data_movement::migrate_object(self, pool_idx, bucket, rd, "rebalance_object").await
+    }
+
+    #[tracing::instrument(skip(self, opts))]
+    async fn rebalance_delete_marker(self: Arc<Self>, bucket: String, object: String, opts: ObjectOptions) -> Result<ObjectInfo> {
+        self.delete_object(bucket.as_str(), object.as_str(), opts).await
     }
 
     async fn update_rebalance_last_error(&self, pool_idx: usize, message: String) -> Result<()> {
@@ -3175,20 +3222,21 @@ mod rebalance_unit_tests {
         ensure_rebalance_listing_disks_available, ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index,
         has_deferred_rebalance_error, is_rebalance_stopped_terminal_event, is_transient_rebalance_error,
         load_rebalance_bucket_configs, mark_rebalance_bucket_done, merge_rebalance_meta, migrate_entry_version,
-        migrate_entry_version_with_retry_wait, next_rebal_bucket_from_stat, parse_rebalance_max_attempts,
-        rebalance_delete_marker_opts, rebalance_listing_retry_delay, rebalance_meta_load_no_data_error,
-        rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error, rebalance_migration_retry_delay,
-        record_rebalance_cleanup_warning_in_meta, resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket,
-        resolve_rebalance_bucket_error, resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
-        resolve_rebalance_file_info_versions_result, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
-        resolve_rebalance_migrate_result_error, resolve_rebalance_optional_bucket_config_result, resolve_rebalance_participants,
-        resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error,
-        resolve_rebalance_worker_result, send_rebalance_done_signal, should_accept_rebalance_stats_update,
-        should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete, should_defer_rebalance_entry_failure,
-        should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
-        should_retry_rebalance_listing, should_skip_rebalance_delete_marker, should_skip_start_rebalance,
-        stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue, validate_start_rebalance_state,
-        wait_rebalance_listing_retry, with_rebalance_entry_context,
+        migrate_entry_version_with_delete_marker, migrate_entry_version_with_retry_wait, next_rebal_bucket_from_stat,
+        parse_rebalance_max_attempts, rebalance_delete_marker_opts, rebalance_listing_retry_delay,
+        rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error,
+        rebalance_migration_retry_delay, record_rebalance_cleanup_warning_in_meta, resolve_load_rebalance_stats_update_result,
+        resolve_next_rebalance_bucket, resolve_rebalance_bucket_error, resolve_rebalance_bucket_result,
+        resolve_rebalance_entry_cleanup_delete_result, resolve_rebalance_file_info_versions_result,
+        resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result, resolve_rebalance_migrate_result_error,
+        resolve_rebalance_optional_bucket_config_result, resolve_rebalance_participants, resolve_rebalance_save_task_result,
+        resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error, resolve_rebalance_worker_result,
+        send_rebalance_done_signal, should_accept_rebalance_stats_update, should_cleanup_rebalance_source_entry,
+        should_count_rebalance_version_complete, should_defer_rebalance_entry_failure, should_ignore_rebalance_data_usage_cache,
+        should_pool_participate, should_preserve_rebalance_stopped_state, should_retry_rebalance_listing,
+        should_skip_rebalance_delete_marker, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
+        take_bucket_from_rebalance_queue, validate_start_rebalance_state, wait_rebalance_listing_retry,
+        with_rebalance_entry_context,
     };
     use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -3385,7 +3433,7 @@ mod rebalance_unit_tests {
     }
 
     #[tokio::test]
-    async fn test_migrate_entry_version_remote_version_is_moved_without_transfer() {
+    async fn test_migrate_entry_version_remote_tiered_is_skipped_without_cleanup() {
         let backend = MigrationBackendSpy::new(None, Some(Ok(ObjectInfo::default())), Some(Ok(())));
         let version = version_remote();
         let transfer_count = Arc::new(AtomicUsize::new(0));
@@ -3412,97 +3460,20 @@ mod rebalance_unit_tests {
         )
         .await;
 
-        assert!(!result.ignored);
-        assert!(!result.cleanup_ignored);
-        assert!(result.moved);
-        assert!(!result.failed);
-        assert!(result.error.is_none());
-        assert_eq!(transfer_count.load(Ordering::SeqCst), 0);
-        assert_eq!(backend.move_remote_calls(), 1);
-        assert_eq!(backend.get_calls(), 0);
-        assert_eq!(backend.delete_calls(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_migrate_entry_version_remote_not_found_is_cleanup_ignored() {
-        let backend = MigrationBackendSpy::new(
-            None,
-            Some(Ok(ObjectInfo::default())),
-            Some(Err(Error::ObjectNotFound("bucket".to_string(), "object.bin".to_string()))),
-        );
-        let version = version_remote();
-        let transfer_count = Arc::new(AtomicUsize::new(0));
-        let mut transfer = {
-            let transfer_count = transfer_count.clone();
-            move |_, _, _| {
-                let transfer_count = transfer_count.clone();
-                async move {
-                    transfer_count.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                }
-            }
-        };
-
-        let result = migrate_entry_version(
-            &backend,
-            "bucket".to_string(),
-            0,
-            &version,
-            version.version_id.map(|v| v.to_string()),
-            3,
-            false,
-            &mut transfer,
-        )
-        .await;
-
         assert!(result.ignored);
-        assert!(result.cleanup_ignored);
+        assert!(!result.cleanup_ignored);
         assert!(!result.moved);
         assert!(!result.failed);
+        assert_eq!(result.stage, Some("remote_tiered"));
         assert!(result.error.is_none());
         assert_eq!(transfer_count.load(Ordering::SeqCst), 0);
-        assert_eq!(backend.move_remote_calls(), 1);
+        assert_eq!(backend.move_remote_calls(), 0);
         assert_eq!(backend.get_calls(), 0);
         assert_eq!(backend.delete_calls(), 0);
     }
 
     #[tokio::test]
-    async fn test_migrate_entry_version_remote_overwrite_is_not_ignored() {
-        let backend = MigrationBackendSpy::new(
-            None,
-            None,
-            Some(Err(Error::DataMovementOverwriteErr(
-                "bucket".to_string(),
-                "object.bin".to_string(),
-                "vid-1".to_string(),
-            ))),
-        );
-        let version = version_remote();
-        let mut transfer = |_, _, _| async move { Ok(()) };
-
-        let result = migrate_entry_version(
-            &backend,
-            "bucket".to_string(),
-            0,
-            &version,
-            Some("vid-1".to_string()),
-            3,
-            false,
-            &mut transfer,
-        )
-        .await;
-
-        assert!(result.failed);
-        assert!(!result.ignored);
-        assert!(!result.cleanup_ignored);
-        assert!(!result.moved);
-        assert_eq!(result.stage, Some("move_remote_version"));
-        assert!(matches!(result.error, Some(Error::DataMovementOverwriteErr(_, _, _))));
-        assert_eq!(backend.move_remote_calls(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_migrate_entry_version_remote_failure_is_reported() {
+    async fn test_migrate_entry_version_remote_tiered_does_not_call_backend_move() {
         let backend = MigrationBackendSpy::new(None, Some(Ok(ObjectInfo::default())), Some(Err(Error::SlowDown)));
         let version = version_remote();
         let transfer_count = Arc::new(AtomicUsize::new(0));
@@ -3529,13 +3500,14 @@ mod rebalance_unit_tests {
         )
         .await;
 
-        assert!(!result.ignored);
+        assert!(result.ignored);
         assert!(!result.cleanup_ignored);
         assert!(!result.moved);
-        assert!(result.failed);
-        assert!(matches!(result.error, Some(Error::SlowDown)));
+        assert!(!result.failed);
+        assert_eq!(result.stage, Some("remote_tiered"));
+        assert!(result.error.is_none());
         assert_eq!(transfer_count.load(Ordering::SeqCst), 0);
-        assert_eq!(backend.move_remote_calls(), 1);
+        assert_eq!(backend.move_remote_calls(), 0);
         assert_eq!(backend.get_calls(), 0);
         assert_eq!(backend.delete_calls(), 0);
     }
@@ -3565,6 +3537,75 @@ mod rebalance_unit_tests {
         assert!(result.error.is_none());
         assert_eq!(backend.get_calls(), 0);
         assert_eq!(backend.delete_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_entry_version_deleted_version_uses_target_delete_marker_mover() {
+        let backend = MigrationBackendSpy::new(None, Some(Err(Error::SlowDown)), None);
+        let version = version_deleted();
+        let move_delete_marker_count = Arc::new(AtomicUsize::new(0));
+        let mut transfer = |_, _, _| async move { Ok(()) };
+        let mut move_delete_marker = {
+            let move_delete_marker_count = move_delete_marker_count.clone();
+            move |_bucket: String, _object: String, _opts: ObjectOptions| {
+                let move_delete_marker_count = move_delete_marker_count.clone();
+                async move {
+                    move_delete_marker_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(ObjectInfo::default())
+                }
+            }
+        };
+
+        let result = migrate_entry_version_with_delete_marker(
+            &backend,
+            "bucket".to_string(),
+            1,
+            &version,
+            version.version_id.map(|v| v.to_string()),
+            3,
+            false,
+            &mut transfer,
+            &mut move_delete_marker,
+        )
+        .await;
+
+        assert!(!result.ignored);
+        assert!(!result.cleanup_ignored);
+        assert!(result.moved);
+        assert!(!result.failed);
+        assert!(result.error.is_none());
+        assert_eq!(move_delete_marker_count.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.get_calls(), 0);
+        assert_eq!(backend.delete_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_entry_version_deleted_version_target_failure_blocks_completion() {
+        let backend = MigrationBackendSpy::new(None, Some(Ok(ObjectInfo::default())), None);
+        let version = version_deleted();
+        let mut transfer = |_, _, _| async move { Ok(()) };
+        let mut move_delete_marker = |_bucket: String, _object: String, _opts: ObjectOptions| async move { Err(Error::SlowDown) };
+
+        let result = migrate_entry_version_with_delete_marker(
+            &backend,
+            "bucket".to_string(),
+            1,
+            &version,
+            version.version_id.map(|v| v.to_string()),
+            3,
+            false,
+            &mut transfer,
+            &mut move_delete_marker,
+        )
+        .await;
+
+        assert!(result.failed);
+        assert!(!result.ignored);
+        assert!(!result.cleanup_ignored);
+        assert!(!result.moved);
+        assert_eq!(result.stage, Some("delete_marker"));
+        assert!(matches!(result.error, Some(Error::SlowDown)));
+        assert_eq!(backend.delete_calls(), 0);
     }
 
     #[tokio::test]
