@@ -692,6 +692,11 @@ impl Operation for RebalanceStop {
             return Err(s3_error!(InternalError, "object layer is not initialized"));
         };
 
+        store
+            .load_rebalance_meta()
+            .await
+            .map_err(|e| s3_error!(InternalError, "failed to load rebalance metadata before stop: {}", e))?;
+
         if !store.is_rebalance_conflicting_with_decommission().await {
             log_rebalance_request_rejected("stop", "rebalance_not_started", &request_id, &actor, &remote_addr);
             return Err(s3_error!(NoSuchResource, "pool rebalance is not started"));
