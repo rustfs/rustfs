@@ -61,6 +61,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       MAX_TOTAL_TIME: 60
       ARTIFACT_ROOT: artifacts
+      RUSTFLAGS: "--cfg tokio_unstable -C target-feature=-crt-static"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -120,6 +121,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       MAX_TOTAL_TIME: 300
       ARTIFACT_ROOT: artifacts
+      RUSTFLAGS: "--cfg tokio_unstable -C target-feature=-crt-static"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
