@@ -208,6 +208,8 @@ to_bps() {
     return
   fi
 
+  # Normalize "123MiB/s" → "123 MiB/s" when no space separator exists.
+  human="$(echo "$human" | sed -E 's/^([0-9]+(\.[0-9]+)?)([A-Za-zµ])/\1 \3/')"
   number="$(echo "$human" | awk '{print $1}')"
   unit="$(echo "$human" | awk '{print $2}')"
   case "$unit" in
@@ -235,6 +237,8 @@ to_ms() {
     return
   fi
 
+  # Normalize "50ms" → "50 ms" when no space separator exists.
+  human="$(echo "$human" | sed -E 's/^([0-9]+(\.[0-9]+)?)([A-Za-zµ])/\1 \3/')"
   number="$(echo "$human" | awk '{print $1}')"
   unit="$(echo "$human" | awk '{print $2}')"
   case "$unit" in

@@ -1957,6 +1957,10 @@ impl DefaultObjectUsecase {
         // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
         // Buffer sizes range from 32KB to 4MB depending on file size and configured workload profile.
         // Concurrency-aware adjustment reduces buffer size under high concurrency to lower memory pressure.
+        // TODO: get_concurrency_aware_buffer_size reads ACTIVE_GET_REQUESTS (GET concurrency tracker),
+        // not PUT concurrency. Under pure PUT load the counter stays zero so buffers never shrink;
+        // unrelated GET load can shrink PUT buffers instead. Fix by adding ACTIVE_PUT_REQUESTS +
+        // PutObjectGuard and using PUT concurrency here. See PR #3514 review comment.
         let base_buffer_size = get_buffer_size_opt_in(size);
         let buffer_size = get_concurrency_aware_buffer_size(size, base_buffer_size);
 
