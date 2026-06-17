@@ -53,6 +53,7 @@ const REBAL_META_VER: u16 = 1; // Replace with actual version value
 const REBAL_META_NAME: &str = "rebalance.bin";
 const DEFAULT_REBALANCE_MAX_ATTEMPTS: usize = 3;
 const REBALANCE_MAX_ATTEMPTS_ENV: &str = "RUSTFS_REBALANCE_MAX_ATTEMPTS";
+const REBALANCE_STOP_PROPAGATION_ERROR_PREFIX: &str = "rebalance stop propagation incomplete: ";
 const REBALANCE_LISTING_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const REBALANCE_MIGRATION_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const REBALANCE_MIGRATION_LOCK_RETRY_CAP: Duration = Duration::from_secs(10);
@@ -587,6 +588,25 @@ pub struct RebalanceCleanupWarnings {
     pub entries: Vec<RebalanceCleanupWarningEntry>,
 }
 
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RebalanceStopPropagationRecord {
+    #[serde(rename = "stopAttemptAt", default)]
+    pub stop_attempt_at: Option<OffsetDateTime>,
+    #[serde(rename = "stopFailures", default)]
+    pub stop_failures: Vec<String>,
+    #[serde(rename = "terminalReloadAttemptAt", default)]
+    pub terminal_reload_attempt_at: Option<OffsetDateTime>,
+    #[serde(rename = "terminalReloadFailures", default)]
+    pub terminal_reload_failures: Vec<String>,
+}
+
+impl RebalanceStopPropagationRecord {
+    pub fn has_failures(&self) -> bool {
+        !self.stop_failures.is_empty() || !self.terminal_reload_failures.is_empty()
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct DiskStat {
@@ -649,6 +669,29 @@ fn rebalance_meta_decode_error(err: rmp_serde::decode::Error) -> Error {
 
 fn invalid_rebalance_meta_error(message: impl fmt::Display) -> Error {
     Error::other(format!("rebalance metadata load failed: {message}"))
+}
+
+pub fn encode_rebalance_stop_propagation_record(record: &RebalanceStopPropagationRecord) -> String {
+    match serde_json::to_string(record) {
+        Ok(payload) => format!("{REBALANCE_STOP_PROPAGATION_ERROR_PREFIX}{payload}"),
+        Err(err) => {
+            let payload = serde_json::json!({
+                "encodeError": err.to_string(),
+                "stopFailures": [],
+                "terminalReloadFailures": [],
+            });
+            format!("{REBALANCE_STOP_PROPAGATION_ERROR_PREFIX}{payload}")
+        }
+    }
+}
+
+pub fn decode_rebalance_stop_propagation_record(message: &str) -> Option<RebalanceStopPropagationRecord> {
+    let payload = message.strip_prefix(REBALANCE_STOP_PROPAGATION_ERROR_PREFIX)?;
+    serde_json::from_str(payload).ok()
+}
+
+fn is_rebalance_stop_propagation_error(message: Option<&str>) -> bool {
+    message.is_some_and(|message| message.starts_with(REBALANCE_STOP_PROPAGATION_ERROR_PREFIX))
 }
 
 fn validate_rebalance_cleanup_warnings(warnings: &RebalanceCleanupWarnings, pool_index: usize) -> Result<()> {
@@ -1216,6 +1259,29 @@ impl ECStore {
                 self.save_rebalance_meta_with_merge(pool, &meta_to_save, "stop_rebalance")
                     .await,
                 "stop_rebalance",
+            )?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn record_rebalance_stop_propagation(self: &Arc<Self>, record: RebalanceStopPropagationRecord) -> Result<()> {
+        if !record.has_failures() {
+            return Ok(());
+        }
+
+        let encoded_error = encode_rebalance_stop_propagation_record(&record);
+        let meta_to_save = {
+            let mut rebalance_meta = self.rebalance_meta.write().await;
+            record_rebalance_stop_propagation_snapshot(rebalance_meta.as_mut(), encoded_error, OffsetDateTime::now_utc())
+        };
+
+        if let Some(meta_to_save) = meta_to_save {
+            let pool = clone_first_arc(self.pools.as_slice(), "record_rebalance_stop_propagation: no pools available")?;
+            resolve_rebalance_meta_save_result(
+                self.save_rebalance_meta_with_merge(pool, &meta_to_save, "record_rebalance_stop_propagation")
+                    .await,
+                "record_rebalance_stop_propagation",
             )?;
         }
 
@@ -2665,6 +2731,16 @@ fn should_replace_rebalance_cleanup_warning(remote_at: Option<OffsetDateTime>, l
     }
 }
 
+fn merge_rebalance_stop_propagation_error(remote: Option<String>, local: Option<String>) -> Option<String> {
+    if is_rebalance_stop_propagation_error(local.as_deref()) {
+        local
+    } else if is_rebalance_stop_propagation_error(remote.as_deref()) {
+        remote
+    } else {
+        None
+    }
+}
+
 fn merge_rebalance_pool_stats(remote: &mut RebalanceStats, local: &RebalanceStats) {
     remote.init_free_space = remote.init_free_space.max(local.init_free_space);
     remote.init_capacity = remote.init_capacity.max(local.init_capacity);
@@ -2707,7 +2783,8 @@ fn merge_rebalance_pool_stats(remote: &mut RebalanceStats, local: &RebalanceStat
             if remote.info.status != RebalStatus::Failed {
                 remote.info.status = RebalStatus::Stopped;
                 remote.info.end_time = local.info.end_time.or(remote.info.end_time);
-                remote.info.last_error = None;
+                remote.info.last_error =
+                    merge_rebalance_stop_propagation_error(remote.info.last_error.clone(), local.info.last_error.clone());
             }
         }
         RebalStatus::Completed => {
@@ -2761,7 +2838,9 @@ fn mark_started_rebalance_pools_stopped(meta: &mut RebalanceMeta, stop_time: Off
             pool_stat.info.status = RebalStatus::Stopped;
             pool_stat.info.stopping = false;
             pool_stat.info.end_time.get_or_insert(stop_time);
-            pool_stat.info.last_error = None;
+            if !is_rebalance_stop_propagation_error(pool_stat.info.last_error.as_deref()) {
+                pool_stat.info.last_error = None;
+            }
         }
     }
 }
@@ -2795,6 +2874,22 @@ fn stop_rebalance_state(meta: &mut RebalanceMeta, now: OffsetDateTime) {
 fn stop_rebalance_meta_snapshot(meta: Option<&mut RebalanceMeta>, now: OffsetDateTime) -> Option<RebalanceMeta> {
     meta.map(|meta| {
         stop_rebalance_state(meta, now);
+        meta.last_refreshed_at = Some(now);
+        meta.clone()
+    })
+}
+
+fn record_rebalance_stop_propagation_snapshot(
+    meta: Option<&mut RebalanceMeta>,
+    encoded_error: String,
+    now: OffsetDateTime,
+) -> Option<RebalanceMeta> {
+    meta.map(|meta| {
+        for pool_stat in meta.pool_stats.iter_mut() {
+            if pool_stat.participating || pool_stat.info.stopping || pool_stat.info.status == RebalStatus::Stopped {
+                pool_stat.info.last_error = Some(encoded_error.clone());
+            }
+        }
         meta.last_refreshed_at = Some(now);
         meta.clone()
     })
@@ -3531,17 +3626,19 @@ mod rebalance_unit_tests {
         DiskError, GetObjectReader, HTTPRangeSpec, MigrationBackend, MigrationVersionResult, ObjectInfo, ObjectOptions,
         REBALANCE_CLEANUP_WARNING_ENTRY_LIMIT, RebalSaveOpt, RebalStatus, RebalanceBucketOutcome, RebalanceCleanupDeleteOutcome,
         RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta,
-        RebalanceStats, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event, apply_stopped_at,
-        cancel_rebalance_worker_for_terminal_reload, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc,
-        clone_rebalance_pool_stats, complete_rebalance_pools_at_goal, complete_rebalance_pools_with_empty_queue,
-        defer_bucket_in_rebalance_queue, ensure_rebalance_listing_disks_available, ensure_rebalance_not_decommissioning,
-        ensure_valid_rebalance_pool_index, has_deferred_rebalance_error, is_rebalance_stopped_terminal_event,
-        is_terminal_rebalance_reload, is_transient_rebalance_error, load_rebalance_bucket_configs, mark_rebalance_bucket_done,
-        merge_rebalance_meta, migrate_entry_version, migrate_entry_version_with_delete_marker,
-        migrate_entry_version_with_retry_wait, next_rebal_bucket_from_stat, parse_rebalance_max_attempts,
-        rebalance_delete_marker_opts, rebalance_listing_retry_delay, rebalance_meta_load_no_data_error,
-        rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error, rebalance_migration_retry_delay,
-        record_rebalance_cleanup_warning_in_meta, refresh_missing_rebalance_pool_stats,
+        RebalanceStats, RebalanceStopPropagationRecord, RebalanceTerminalEvent, apply_rebalance_save_option,
+        apply_rebalance_terminal_event, apply_stopped_at, cancel_rebalance_worker_for_terminal_reload,
+        classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
+        complete_rebalance_pools_at_goal, complete_rebalance_pools_with_empty_queue, decode_rebalance_stop_propagation_record,
+        defer_bucket_in_rebalance_queue, encode_rebalance_stop_propagation_record, ensure_rebalance_listing_disks_available,
+        ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, has_deferred_rebalance_error,
+        is_rebalance_stop_propagation_error, is_rebalance_stopped_terminal_event, is_terminal_rebalance_reload,
+        is_transient_rebalance_error, load_rebalance_bucket_configs, mark_rebalance_bucket_done,
+        mark_started_rebalance_pools_stopped, merge_rebalance_meta, migrate_entry_version,
+        migrate_entry_version_with_delete_marker, migrate_entry_version_with_retry_wait, next_rebal_bucket_from_stat,
+        parse_rebalance_max_attempts, rebalance_delete_marker_opts, rebalance_listing_retry_delay,
+        rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error,
+        rebalance_migration_retry_delay, record_rebalance_cleanup_warning_in_meta, refresh_missing_rebalance_pool_stats,
         resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket, resolve_rebalance_bucket_error,
         resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
         resolve_rebalance_file_info_versions_result, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
@@ -6895,6 +6992,51 @@ mod rebalance_unit_tests {
         assert!(!meta.pool_stats[1].info.stopping);
         assert_eq!(meta.pool_stats[1].info.end_time, Some(now));
         assert_eq!(meta.pool_stats[1].info.last_error.as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn test_rebalance_stop_propagation_record_round_trips_from_error() {
+        let stop_attempt = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+        let reload_attempt = OffsetDateTime::from_unix_timestamp(1_010).unwrap();
+        let record = RebalanceStopPropagationRecord {
+            stop_attempt_at: Some(stop_attempt),
+            stop_failures: vec!["peer node-a stop_rebalance failed: timeout".to_string()],
+            terminal_reload_attempt_at: Some(reload_attempt),
+            terminal_reload_failures: vec!["peer node-b load_rebalance_meta(start=false) failed: timeout".to_string()],
+        };
+
+        let encoded = encode_rebalance_stop_propagation_record(&record);
+        let decoded = decode_rebalance_stop_propagation_record(&encoded).expect("encoded stop propagation record should decode");
+
+        assert_eq!(decoded, record);
+        assert!(is_rebalance_stop_propagation_error(Some(&encoded)));
+    }
+
+    #[test]
+    fn test_mark_started_rebalance_pools_stopped_preserves_stop_propagation_error() {
+        let stop_time = OffsetDateTime::from_unix_timestamp(2_000).unwrap();
+        let encoded_error = encode_rebalance_stop_propagation_record(&RebalanceStopPropagationRecord {
+            stop_attempt_at: Some(stop_time),
+            stop_failures: vec!["peer node-a stop_rebalance failed: timeout".to_string()],
+            ..Default::default()
+        });
+        let mut meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    last_error: Some(encoded_error.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        mark_started_rebalance_pools_stopped(&mut meta, stop_time);
+
+        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Stopped);
+        assert_eq!(meta.pool_stats[0].info.last_error.as_deref(), Some(encoded_error.as_str()));
     }
 
     #[test]

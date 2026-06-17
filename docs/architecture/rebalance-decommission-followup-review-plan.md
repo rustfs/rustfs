@@ -1422,12 +1422,12 @@ Do not add operation-id requirements for stop/rollback as a compatibility gate.
 
 ### Implementation Steps
 
-- [ ] Add fields or a status-only structure for last stop propagation time and failed peer details.
-- [ ] Update stop handler to persist local stopped metadata before returning peer propagation errors.
-- [ ] Ensure terminal reload broadcast is attempted after local stop persistence.
-- [ ] Extend rebalance status serialization to include propagation failure details.
-- [ ] Add tests for partial peer failure visibility.
-- [ ] Run:
+- [x] Add fields or a status-only structure for last stop propagation time and failed peer details.
+- [x] Update stop handler to persist local stopped metadata before returning peer propagation errors.
+- [x] Ensure terminal reload broadcast is attempted after local stop persistence.
+- [x] Extend rebalance status serialization to include propagation failure details.
+- [x] Add tests for partial peer failure visibility.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs rebalance --lib

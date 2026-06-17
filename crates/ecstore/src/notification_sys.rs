@@ -510,6 +510,12 @@ impl NotificationSys {
 
     #[tracing::instrument(skip(self))]
     pub async fn load_rebalance_meta(&self, start: bool) -> Result<()> {
+        let failures = self.load_rebalance_meta_failures(start).await?;
+        aggregate_notification_failures("load_rebalance_meta", failures)
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn load_rebalance_meta_failures(&self, start: bool) -> Result<Vec<String>> {
         let operation = format!("load_rebalance_meta(start={start})");
         let mut failures = Vec::new();
         let mut futures = Vec::with_capacity(self.peer_clients.len());
@@ -564,10 +570,15 @@ impl NotificationSys {
             }
         }
 
-        aggregate_notification_failures("load_rebalance_meta", failures)
+        Ok(failures)
     }
 
     pub async fn stop_rebalance(&self) -> Result<()> {
+        let failures = self.stop_rebalance_failures().await?;
+        aggregate_notification_failures("stop_rebalance", failures)
+    }
+
+    pub async fn stop_rebalance_failures(&self) -> Result<Vec<String>> {
         info!(
             event = EVENT_NOTIFICATION_PEER_PROPAGATION,
             component = LOG_COMPONENT_ECSTORE,
@@ -671,16 +682,15 @@ impl NotificationSys {
             }
         }
 
-        aggregate_notification_failures("stop_rebalance", failures)?;
         info!(
             event = EVENT_NOTIFICATION_PEER_PROPAGATION,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_NOTIFICATION,
             action = "stop_rebalance",
-            result = "success",
+            result = if failures.is_empty() { "success" } else { "partial_failure" },
             "notification peer propagation"
         );
-        Ok(())
+        Ok(failures)
     }
 
     pub async fn load_bucket_metadata(&self, bucket: &str) -> Result<()> {

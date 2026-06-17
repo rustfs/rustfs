@@ -27,7 +27,10 @@ use matchit::Params;
 use rustfs_ecstore::{
     error::StorageError,
     notification_sys::{NotificationSys, get_global_notification_sys},
-    rebalance::{DiskStat, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta},
+    rebalance::{
+        DiskStat, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStopPropagationRecord,
+        decode_rebalance_stop_propagation_record,
+    },
     store::ECStore,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
@@ -185,12 +188,28 @@ pub struct RebalancePoolStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RebalanceStopPropagationStatus {
+    #[serde(rename = "lastAttemptAt", with = "offsetdatetime_rfc3339")]
+    pub last_attempt_at: Option<OffsetDateTime>,
+    #[serde(rename = "failedPeers")]
+    pub failed_peers: Vec<String>,
+    #[serde(rename = "terminalReloadAttemptAt", with = "offsetdatetime_rfc3339")]
+    pub terminal_reload_attempt_at: Option<OffsetDateTime>,
+    #[serde(rename = "terminalReloadFailedPeers")]
+    pub terminal_reload_failed_peers: Vec<String>,
+    #[serde(rename = "pendingTerminalReload")]
+    pub pending_terminal_reload: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RebalanceAdminStatus {
     pub id: String, // Identifies the ongoing rebalance operation by a UUID
     #[serde(rename = "pools")]
     pub pools: Vec<RebalancePoolStatus>, // Contains all pools, including inactive
     #[serde(rename = "stoppedAt", with = "offsetdatetime_rfc3339")]
     pub stopped_at: Option<OffsetDateTime>, // Optional timestamp when rebalance was stopped
+    #[serde(rename = "stopPropagation")]
+    pub stop_propagation: RebalanceStopPropagationStatus,
 }
 
 fn calculate_rebalance_progress(
@@ -293,6 +312,32 @@ fn build_rebalance_pool_statuses(
             status
         })
         .collect()
+}
+
+fn build_rebalance_stop_propagation_status(meta: &RebalanceMeta) -> RebalanceStopPropagationStatus {
+    let record = meta
+        .pool_stats
+        .iter()
+        .filter_map(|pool_stat| pool_stat.info.last_error.as_deref())
+        .find_map(decode_rebalance_stop_propagation_record);
+
+    if let Some(record) = record {
+        let last_attempt_at = record.stop_attempt_at.or(meta.stopped_at);
+        let terminal_reload_attempt_at = record.terminal_reload_attempt_at;
+        return RebalanceStopPropagationStatus {
+            pending_terminal_reload: last_attempt_at.is_some() && terminal_reload_attempt_at.is_none(),
+            last_attempt_at,
+            failed_peers: record.stop_failures,
+            terminal_reload_attempt_at,
+            terminal_reload_failed_peers: record.terminal_reload_failures,
+        };
+    }
+
+    RebalanceStopPropagationStatus {
+        last_attempt_at: meta.stopped_at,
+        pending_terminal_reload: false,
+        ..Default::default()
+    }
 }
 
 pub struct RebalanceStart {}
@@ -558,6 +603,7 @@ impl Operation for RebalanceStatus {
             id: meta.id.clone(),
             stopped_at: meta.stopped_at,
             pools: build_rebalance_pool_statuses(now, stop_time, meta.percent_free_goal, &meta.pool_stats, &disk_stats),
+            stop_propagation: build_rebalance_stop_propagation_status(&meta),
         };
 
         let data = serde_json::to_string(&admin_status)
@@ -630,9 +676,12 @@ impl Operation for RebalanceStop {
             return Err(s3_error!(NoSuchResource, "pool rebalance is not started"));
         }
 
-        if let Some(notification_sys) = get_global_notification_sys() {
-            notification_sys
-                .stop_rebalance()
+        let notification_sys = get_global_notification_sys();
+        let stop_attempt_at = OffsetDateTime::now_utc();
+        let mut stop_failures = Vec::new();
+        if let Some(notification_sys) = notification_sys {
+            stop_failures = notification_sys
+                .stop_rebalance_failures()
                 .await
                 .map_err(|e| s3_error!(InternalError, "failed to stop rebalance via notification system: {}", e))?;
         } else {
@@ -659,7 +708,10 @@ impl Operation for RebalanceStop {
             remote_addr = %remote_addr,
             "admin rebalance state"
         );
-        if let Some(notification_sys) = get_global_notification_sys() {
+
+        let mut terminal_reload_attempt_at = None;
+        let mut terminal_reload_failures = Vec::new();
+        if let Some(notification_sys) = notification_sys {
             info!(
                 event = EVENT_ADMIN_REBALANCE_STATE,
                 component = LOG_COMPONENT_ADMIN,
@@ -671,33 +723,64 @@ impl Operation for RebalanceStop {
                 remote_addr = %remote_addr,
                 "admin rebalance state"
             );
-            notification_sys.load_rebalance_meta(false).await.map_err(|err| {
-                error!(
-                    event = EVENT_ADMIN_REBALANCE_STATE,
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_REBALANCE,
-                    action = "stop",
-                    result = "propagation_failed",
-                    request_id = %request_id,
-                    actor = %actor,
-                    remote_addr = %remote_addr,
-                    error = %err,
-                    "admin rebalance state"
-                );
-                s3_error!(InternalError, "failed to propagate rebalance stop metadata: {}", err)
-            })?;
-            info!(
+            terminal_reload_attempt_at = Some(OffsetDateTime::now_utc());
+            match notification_sys.load_rebalance_meta_failures(false).await {
+                Ok(failures) => {
+                    terminal_reload_failures = failures;
+                    if terminal_reload_failures.is_empty() {
+                        info!(
+                            event = EVENT_ADMIN_REBALANCE_STATE,
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_REBALANCE,
+                            action = "stop",
+                            state = "propagation_completed",
+                            result = "success",
+                            request_id = %request_id,
+                            actor = %actor,
+                            remote_addr = %remote_addr,
+                            "admin rebalance state"
+                        );
+                    }
+                }
+                Err(err) => {
+                    terminal_reload_failures.push(format!("terminal rebalance reload propagation failed: {err}"));
+                }
+            }
+        }
+
+        if !stop_failures.is_empty() || !terminal_reload_failures.is_empty() {
+            let record = RebalanceStopPropagationRecord {
+                stop_attempt_at: Some(stop_attempt_at),
+                stop_failures: stop_failures.clone(),
+                terminal_reload_attempt_at,
+                terminal_reload_failures: terminal_reload_failures.clone(),
+            };
+            store
+                .record_rebalance_stop_propagation(record)
+                .await
+                .map_err(|e| s3_error!(InternalError, "failed to persist rebalance stop propagation metadata: {}", e))?;
+
+            error!(
                 event = EVENT_ADMIN_REBALANCE_STATE,
                 component = LOG_COMPONENT_ADMIN,
                 subsystem = LOG_SUBSYSTEM_REBALANCE,
                 action = "stop",
-                state = "propagation_completed",
-                result = "success",
+                result = "propagation_failed",
                 request_id = %request_id,
                 actor = %actor,
                 remote_addr = %remote_addr,
+                stop_failure_count = stop_failures.len(),
+                terminal_reload_failure_count = terminal_reload_failures.len(),
                 "admin rebalance state"
             );
+            let mut failures = Vec::new();
+            failures.extend(stop_failures);
+            failures.extend(terminal_reload_failures);
+            return Err(s3_error!(
+                InternalError,
+                "rebalance stop propagation incomplete after local stop was persisted: {}",
+                failures.join("; ")
+            ));
         }
 
         let mut header = HeaderMap::new();
@@ -744,10 +827,14 @@ mod rebalance_handler_tests {
     use super::build_rebalance_pool_progress;
     use super::calculate_rebalance_progress;
     use super::{
-        RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, build_rebalance_pool_statuses, rebalance_pool_used,
-        rebalance_remaining_buckets, rebalance_start_rollback_error, rebalance_used_pct, rollback_result_label,
+        RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, RebalanceStopPropagationStatus,
+        build_rebalance_pool_statuses, build_rebalance_stop_propagation_status, rebalance_pool_used, rebalance_remaining_buckets,
+        rebalance_start_rollback_error, rebalance_used_pct, rollback_result_label,
     };
-    use rustfs_ecstore::rebalance::{DiskStat, RebalStatus, RebalanceCleanupWarnings, RebalanceInfo, RebalanceStats};
+    use rustfs_ecstore::rebalance::{
+        DiskStat, RebalStatus, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta, RebalanceStats,
+        RebalanceStopPropagationRecord, encode_rebalance_stop_propagation_record,
+    };
     use time::OffsetDateTime;
 
     #[test]
@@ -1113,6 +1200,7 @@ mod rebalance_handler_tests {
         let status = RebalanceAdminStatus {
             id: "id-1".to_string(),
             stopped_at: None,
+            stop_propagation: RebalanceStopPropagationStatus::default(),
             pools: vec![RebalancePoolStatus {
                 id: 0,
                 status: "Started".to_string(),
@@ -1154,6 +1242,8 @@ mod rebalance_handler_tests {
         assert!(json.contains("\"entries\""));
         assert!(json.contains("\"message\":\"cleanup warning\""));
         assert!(json.contains("\"stoppedAt\":null"));
+        assert!(json.contains("\"stopPropagation\""));
+        assert!(json.contains("\"pendingTerminalReload\":false"));
     }
 
     #[test]
@@ -1162,6 +1252,10 @@ mod rebalance_handler_tests {
         let status = RebalanceAdminStatus {
             id: "id-2".to_string(),
             stopped_at: Some(stopped),
+            stop_propagation: RebalanceStopPropagationStatus {
+                last_attempt_at: Some(stopped),
+                ..Default::default()
+            },
             pools: vec![RebalancePoolStatus {
                 id: 0,
                 status: "Stopped".to_string(),
@@ -1176,5 +1270,45 @@ mod rebalance_handler_tests {
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"stoppedAt\""));
         assert!(json.contains("1970-01-01T00:16:40Z"));
+        assert!(json.contains("\"lastAttemptAt\":\"1970-01-01T00:16:40Z\""));
+    }
+
+    #[test]
+    fn test_rebalance_status_exposes_stop_propagation_failures() {
+        let stop_attempt = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+        let reload_attempt = OffsetDateTime::from_unix_timestamp(1_010).unwrap();
+        let encoded_error = encode_rebalance_stop_propagation_record(&RebalanceStopPropagationRecord {
+            stop_attempt_at: Some(stop_attempt),
+            stop_failures: vec!["peer node-a stop_rebalance failed: timeout".to_string()],
+            terminal_reload_attempt_at: Some(reload_attempt),
+            terminal_reload_failures: vec!["peer node-b load_rebalance_meta(start=false) failed: timeout".to_string()],
+        });
+        let meta = RebalanceMeta {
+            stopped_at: Some(stop_attempt),
+            id: "id-3".to_string(),
+            percent_free_goal: 0.3,
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    stopping: true,
+                    last_error: Some(encoded_error),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let status = build_rebalance_stop_propagation_status(&meta);
+
+        assert_eq!(status.last_attempt_at, Some(stop_attempt));
+        assert_eq!(status.terminal_reload_attempt_at, Some(reload_attempt));
+        assert!(!status.pending_terminal_reload);
+        assert_eq!(status.failed_peers, vec!["peer node-a stop_rebalance failed: timeout"]);
+        assert_eq!(
+            status.terminal_reload_failed_peers,
+            vec!["peer node-b load_rebalance_meta(start=false) failed: timeout"]
+        );
     }
 }
