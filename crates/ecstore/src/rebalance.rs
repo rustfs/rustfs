@@ -159,6 +159,7 @@ fn rebalance_delete_marker_opts(version: &FileInfo, version_id: Option<String>, 
         data_movement: true,
         delete_marker: true,
         skip_decommissioned: true,
+        skip_rebalancing: true,
         delete_replication: version.replication_state_internal.clone(),
         ..Default::default()
     }
@@ -3677,6 +3678,7 @@ mod rebalance_unit_tests {
         assert!(opts.data_movement);
         assert!(opts.delete_marker);
         assert!(opts.skip_decommissioned);
+        assert!(opts.skip_rebalancing);
         assert_eq!(opts.src_pool_idx, 7);
         assert_eq!(opts.version_id.as_deref(), Some("version-id"));
         assert_eq!(opts.mod_time, Some(mod_time));

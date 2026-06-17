@@ -1257,9 +1257,9 @@ Add `skip_rebalancing = true` to rebalance delete-marker options while preservin
 
 ### Implementation Steps
 
-- [ ] Update `rebalance_delete_marker_opts()` to set `skip_rebalancing = true`.
-- [ ] Extend the existing helper test to assert both `skip_rebalancing` and `skip_decommissioned`.
-- [ ] Run:
+- [x] Update `rebalance_delete_marker_opts()` to set `skip_rebalancing = true`.
+- [x] Extend the existing helper test to assert both `skip_rebalancing` and `skip_decommissioned`.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs-ecstore rebalance_delete_marker --lib
