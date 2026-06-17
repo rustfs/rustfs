@@ -946,9 +946,24 @@ impl ECStore {
             "Loading rebalance metadata"
         );
         let pool = clone_first_arc(&self.pools, "rebalanceMeta: no pools available")?;
-        if resolve_rebalance_meta_load_result(meta.load(pool).await)? {
+        if resolve_rebalance_meta_load_result(meta.load(pool.clone()).await)? {
+            let meta_to_save;
             {
                 let mut rebalance_meta = self.rebalance_meta.write().await;
+                let has_live_worker = rebalance_meta.as_ref().is_some_and(|current| current.cancel.is_some());
+                let healed_stopping_without_worker =
+                    heal_rebalance_stopping_without_worker(&mut meta, has_live_worker, OffsetDateTime::now_utc());
+                if healed_stopping_without_worker {
+                    debug!(
+                        event = EVENT_REBALANCE_STATE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        state = "metadata_healed",
+                        reason = "stopping_without_live_worker",
+                        "Healed rebalance metadata stopping state without a live worker"
+                    );
+                }
+                meta_to_save = healed_stopping_without_worker.then(|| meta.clone());
 
                 if cancel_rebalance_worker_for_terminal_reload(rebalance_meta.as_mut(), &meta) {
                     debug!(
@@ -964,6 +979,14 @@ impl ECStore {
                 *rebalance_meta = Some(meta);
 
                 drop(rebalance_meta);
+            }
+
+            if let Some(meta_to_save) = meta_to_save {
+                resolve_rebalance_meta_save_result(
+                    self.save_rebalance_meta_with_merge(pool, &meta_to_save, "load_rebalance_meta heal stopping without worker")
+                        .await,
+                    "load_rebalance_meta heal stopping without worker",
+                )?;
             }
 
             resolve_load_rebalance_stats_update_result(self.update_rebalance_stats().await)?;
@@ -1154,14 +1177,17 @@ impl ECStore {
 
         let id = self.init_rebalance_meta_unlocked(bucktes).await?;
         if let Err(start_err) = self.start_rebalance_unlocked().await {
-            if let Err(rollback_err) = self.stop_rebalance_for_id(Some(&id)).await {
+            if let Err(rollback_err) = self
+                .rollback_rebalance_start_without_worker_for_id(Some(&id), start_err.to_string())
+                .await
+            {
                 return Err(Error::other(format!(
                     "failed to start rebalance after metadata initialized for {id}: {start_err}; rollback failed: {rollback_err}"
                 )));
             }
 
             return Err(Error::other(format!(
-                "failed to start rebalance after metadata initialized for {id}; local metadata was rolled back: {start_err}"
+                "failed to start rebalance after metadata initialized for {id}; local metadata was finalized as failed: {start_err}"
             )));
         }
 
@@ -1335,6 +1361,33 @@ impl ECStore {
                 self.save_rebalance_meta_with_merge(pool, &meta_to_save, "stop_rebalance")
                     .await,
                 "stop_rebalance",
+            )?;
+        }
+
+        Ok(())
+    }
+
+    async fn rollback_rebalance_start_without_worker_for_id(
+        self: &Arc<Self>,
+        expected_id: Option<&str>,
+        start_error: String,
+    ) -> Result<()> {
+        let meta_to_save = {
+            let mut rebalance_meta = self.rebalance_meta.write().await;
+            rollback_rebalance_start_meta_snapshot_for_id(
+                rebalance_meta.as_mut(),
+                OffsetDateTime::now_utc(),
+                expected_id,
+                start_error,
+            )
+        };
+
+        if let Some(meta_to_save) = meta_to_save {
+            let pool = clone_first_arc(self.pools.as_slice(), "rollback_rebalance_start: no pools available")?;
+            resolve_rebalance_meta_save_result(
+                self.save_rebalance_meta_with_merge(pool, &meta_to_save, "rollback_rebalance_start")
+                    .await,
+                "rollback_rebalance_start",
             )?;
         }
 
@@ -2985,8 +3038,48 @@ fn stop_rebalance_meta_snapshot_for_id(
     })
 }
 
+fn rollback_rebalance_start_meta_snapshot_for_id(
+    meta: Option<&mut RebalanceMeta>,
+    now: OffsetDateTime,
+    expected_id: Option<&str>,
+    start_error: String,
+) -> Option<RebalanceMeta> {
+    meta.and_then(|meta| {
+        if let Some(expected_id) = expected_id
+            && !expected_id.is_empty()
+            && meta.id != expected_id
+        {
+            return None;
+        }
+
+        clear_rebalance_cancel_token(Some(meta));
+        meta.stopped_at.get_or_insert(now);
+        meta.last_refreshed_at = Some(now);
+        for pool_stat in meta.pool_stats.iter_mut() {
+            if pool_stat.info.status == RebalStatus::Started {
+                pool_stat.info.status = RebalStatus::Failed;
+                pool_stat.info.stopping = false;
+                pool_stat.info.end_time.get_or_insert(now);
+                pool_stat.info.last_error = Some(start_error.clone());
+            }
+        }
+        Some(meta.clone())
+    })
+}
+
 fn stop_rebalance_meta_snapshot(meta: Option<&mut RebalanceMeta>, now: OffsetDateTime) -> Option<RebalanceMeta> {
     stop_rebalance_meta_snapshot_for_id(meta, now, None)
+}
+
+fn heal_rebalance_stopping_without_worker(meta: &mut RebalanceMeta, has_live_worker: bool, now: OffsetDateTime) -> bool {
+    if has_live_worker || !meta.pool_stats.iter().any(|pool_stat| pool_stat.info.stopping) {
+        return false;
+    }
+
+    meta.stopped_at.get_or_insert(now);
+    meta.last_refreshed_at = Some(now);
+    mark_started_rebalance_pools_stopped(meta, now);
+    true
 }
 
 fn record_rebalance_stop_propagation_snapshot(
@@ -3751,11 +3844,11 @@ mod rebalance_unit_tests {
         clone_rebalance_pool_stats, complete_rebalance_pools_at_goal, complete_rebalance_pools_with_empty_queue,
         decode_rebalance_stop_propagation_record, defer_bucket_in_rebalance_queue, encode_rebalance_stop_propagation_record,
         ensure_rebalance_listing_disks_available, ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index,
-        has_deferred_rebalance_error, is_rebalance_stop_propagation_error, is_rebalance_stopped_terminal_event,
-        is_terminal_rebalance_reload, is_transient_rebalance_error, load_rebalance_bucket_configs, mark_rebalance_bucket_done,
-        mark_started_rebalance_pools_stopped, merge_rebalance_meta, migrate_entry_version,
-        migrate_entry_version_with_delete_marker, migrate_entry_version_with_retry_wait, next_rebal_bucket_from_stat,
-        parse_rebalance_max_attempts, rebalance_delete_marker_opts, rebalance_listing_retry_delay,
+        has_deferred_rebalance_error, heal_rebalance_stopping_without_worker, is_rebalance_stop_propagation_error,
+        is_rebalance_stopped_terminal_event, is_terminal_rebalance_reload, is_transient_rebalance_error,
+        load_rebalance_bucket_configs, mark_rebalance_bucket_done, mark_started_rebalance_pools_stopped, merge_rebalance_meta,
+        migrate_entry_version, migrate_entry_version_with_delete_marker, migrate_entry_version_with_retry_wait,
+        next_rebal_bucket_from_stat, parse_rebalance_max_attempts, rebalance_delete_marker_opts, rebalance_listing_retry_delay,
         rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error,
         rebalance_migration_retry_delay, rebalance_object_migration_read_opts, rebalance_source_cleanup_opts,
         record_rebalance_cleanup_warning_in_meta, refresh_missing_rebalance_pool_stats,
@@ -3764,11 +3857,11 @@ mod rebalance_unit_tests {
         resolve_rebalance_file_info_versions_result, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
         resolve_rebalance_migrate_result_error, resolve_rebalance_optional_bucket_config_result, resolve_rebalance_participants,
         resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error,
-        resolve_rebalance_worker_result, send_rebalance_done_signal, should_accept_rebalance_stats_update,
-        should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete, should_defer_rebalance_entry_failure,
-        should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
-        should_retry_rebalance_listing, should_skip_rebalance_delete_marker, should_skip_start_rebalance,
-        stop_rebalance_meta_snapshot, stop_rebalance_meta_snapshot_for_id, stop_rebalance_state,
+        resolve_rebalance_worker_result, rollback_rebalance_start_meta_snapshot_for_id, send_rebalance_done_signal,
+        should_accept_rebalance_stats_update, should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete,
+        should_defer_rebalance_entry_failure, should_ignore_rebalance_data_usage_cache, should_pool_participate,
+        should_preserve_rebalance_stopped_state, should_retry_rebalance_listing, should_skip_rebalance_delete_marker,
+        should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_meta_snapshot_for_id, stop_rebalance_state,
         take_bucket_from_rebalance_queue, validate_rebalance_start_gate_state, validate_rebalance_start_pool_meta,
         validate_start_rebalance_state, wait_rebalance_listing_retry, with_rebalance_entry_context,
     };
@@ -7485,6 +7578,106 @@ mod rebalance_unit_tests {
         let snapshot = stop_rebalance_meta_snapshot_for_id(Some(&mut meta), OffsetDateTime::now_utc(), Some("id-a"));
 
         assert!(snapshot.is_some());
+    }
+
+    #[test]
+    fn test_rollback_rebalance_start_meta_snapshot_marks_started_pools_failed() {
+        let now = OffsetDateTime::from_unix_timestamp(70_000).unwrap();
+        let mut meta = RebalanceMeta {
+            id: "id-a".to_string(),
+            cancel: Some(CancellationToken::new()),
+            pool_stats: vec![
+                RebalanceStats {
+                    participating: true,
+                    info: RebalanceInfo {
+                        status: RebalStatus::Started,
+                        stopping: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                RebalanceStats {
+                    info: RebalanceInfo {
+                        status: RebalStatus::Completed,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let snapshot =
+            rollback_rebalance_start_meta_snapshot_for_id(Some(&mut meta), now, Some("id-a"), "start failed".to_string())
+                .expect("matching rollback id should return snapshot");
+
+        assert!(meta.cancel.is_none());
+        assert_eq!(meta.stopped_at, Some(now));
+        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Failed);
+        assert!(!meta.pool_stats[0].info.stopping);
+        assert_eq!(meta.pool_stats[0].info.end_time, Some(now));
+        assert_eq!(meta.pool_stats[0].info.last_error.as_deref(), Some("start failed"));
+        assert_eq!(meta.pool_stats[1].info.status, RebalStatus::Completed);
+        assert_eq!(snapshot.pool_stats[0].info.status, RebalStatus::Failed);
+    }
+
+    #[test]
+    fn test_rollback_rebalance_start_meta_snapshot_ignores_mismatched_id() {
+        let mut meta = RebalanceMeta {
+            id: "id-b".to_string(),
+            ..Default::default()
+        };
+
+        let snapshot = rollback_rebalance_start_meta_snapshot_for_id(
+            Some(&mut meta),
+            OffsetDateTime::now_utc(),
+            Some("id-a"),
+            "start failed".to_string(),
+        );
+
+        assert!(snapshot.is_none());
+        assert_eq!(meta.id, "id-b");
+    }
+
+    #[test]
+    fn test_heal_rebalance_stopping_without_worker_marks_started_pools_stopped() {
+        let now = OffsetDateTime::from_unix_timestamp(80_000).unwrap();
+        let mut meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    stopping: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(heal_rebalance_stopping_without_worker(&mut meta, false, now));
+        assert_eq!(meta.stopped_at, Some(now));
+        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Stopped);
+        assert!(!meta.pool_stats[0].info.stopping);
+        assert_eq!(meta.pool_stats[0].info.end_time, Some(now));
+    }
+
+    #[test]
+    fn test_heal_rebalance_stopping_without_worker_keeps_live_worker_state() {
+        let mut meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats {
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    stopping: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(!heal_rebalance_stopping_without_worker(&mut meta, true, OffsetDateTime::now_utc()));
+        assert!(meta.pool_stats[0].info.stopping);
     }
 
     #[test]
