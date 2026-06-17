@@ -52,8 +52,8 @@ use crate::{
     event_notification::{EventArgs, send_event},
     global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id, is_dist_erasure},
     store_api::{
-        CompletePart, DeletedObject, GetObjectReader, HTTPRangeSpec, HealOperations, ListObjectsV2Info, ListOperations,
-        MultipartOperations, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, PutObjReader,
+        DeletedObject, GetObjectReader, HTTPRangeSpec, HealOperations, ListObjectsV2Info, ListOperations, MultipartOperations,
+        NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, PutObjReader,
     },
     store_init::load_format_erasure,
 };
@@ -86,8 +86,8 @@ use rustfs_object_capacity::capacity_scope::{
 };
 use rustfs_s3_types::EventName;
 use rustfs_storage_api::{
-    BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, ListMultipartsInfo, ListPartsInfo, MakeBucketOptions,
-    MultipartInfo, MultipartUploadResult, PartInfo,
+    BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, ListMultipartsInfo, ListPartsInfo,
+    MakeBucketOptions, MultipartInfo, MultipartUploadResult, PartInfo,
 };
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
@@ -4974,7 +4974,7 @@ mod tests {
     use crate::disk::health_state::RuntimeDriveHealthState;
     use crate::endpoints::SetupType;
     use crate::global::{is_dist_erasure, is_erasure, is_erasure_sd, update_erasure_type};
-    use crate::store_api::{CompletePart, ObjectInfo};
+    use crate::store_api::ObjectInfo;
     use crate::store_init::save_format_file;
     use crate::store_list_objects::ListPathOptions;
     use rustfs_filemeta::ErasureInfo;
@@ -4982,6 +4982,7 @@ mod tests {
     use rustfs_filemeta::ReplicationState;
     use rustfs_lock::client::local::LocalClient;
     use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
+    use rustfs_storage_api::CompletePart;
     use serial_test::serial;
     use std::collections::HashMap;
     use tempfile::TempDir;
@@ -6672,7 +6673,7 @@ mod tests {
             ..Default::default()
         };
         let opts = ObjectOptions {
-            object_lock_retention: Some(crate::store_api::ObjectLockRetentionOptions {
+            object_lock_retention: Some(rustfs_storage_api::ObjectLockRetentionOptions {
                 mode: Some(s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string()),
                 retain_until: Some(requested_until),
                 bypass_governance: true,
@@ -6707,7 +6708,7 @@ mod tests {
             ..Default::default()
         };
         let opts = ObjectOptions {
-            object_lock_retention: Some(crate::store_api::ObjectLockRetentionOptions {
+            object_lock_retention: Some(rustfs_storage_api::ObjectLockRetentionOptions {
                 mode: Some(s3s::dto::ObjectLockRetentionMode::GOVERNANCE.to_string()),
                 retain_until: Some(requested_until),
                 bypass_governance: true,

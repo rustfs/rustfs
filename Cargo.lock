@@ -9504,6 +9504,7 @@ dependencies = [
  "rustfs-io-metrics",
  "rustfs-madmin",
  "rustfs-policy",
+ "rustfs-storage-api",
  "rustfs-utils",
  "serde",
  "serde_json",

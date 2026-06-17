@@ -93,6 +93,8 @@ use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_for_post_object};
 use rustfs_s3select_api::object_store::bytes_stream;
+#[cfg(test)]
+use rustfs_storage_api::HTTPPreconditions;
 use rustfs_targets::{
     EventName, extract_params_header, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
 };
@@ -4897,7 +4899,7 @@ mod tests {
         let opts = ObjectOptions {
             version_id: Some(version_id.clone()),
             no_lock: true,
-            http_preconditions: Some(rustfs_ecstore::store_api::HTTPPreconditions {
+            http_preconditions: Some(HTTPPreconditions {
                 if_none_match: Some("\"etag\"".to_string()),
                 if_match: Some("\"other\"".to_string()),
                 ..Default::default()

@@ -31,8 +31,9 @@ use s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE;
 
 use crate::auth::UNSIGNED_PAYLOAD;
 use crate::auth::UNSIGNED_PAYLOAD_TRAILER;
-use rustfs_ecstore::store_api::{HTTPPreconditions, HTTPRangeSpec, ObjectOptions};
+use rustfs_ecstore::store_api::{HTTPRangeSpec, ObjectOptions};
 use rustfs_policy::service_type::ServiceType;
+use rustfs_storage_api::HTTPPreconditions;
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use rustfs_utils::http::AMZ_CONTENT_SHA256;
 use rustfs_utils::path::is_dir_object;

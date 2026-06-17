@@ -4145,7 +4145,7 @@ mod tests {
                 &bucket,
                 object,
                 &upload.upload_id,
-                vec![crate::store_api::CompletePart {
+                vec![rustfs_storage_api::CompletePart {
                     part_num: 1,
                     etag: second_part.etag.clone(),
                     checksum_crc32: None,
