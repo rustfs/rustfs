@@ -49,7 +49,30 @@
 #[macro_use]
 extern crate metrics;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Global switch for detailed per-stage PUT metrics (path label, stage durations).
+/// When `false`, `record_put_object_path` and `record_put_object_stage_duration`
+/// become no-ops, and callers can skip the `Instant::now()` syscalls entirely.
+///
+/// Set to `true` during startup when OTEL metric export is enabled.
+static PUT_STAGE_METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable detailed per-stage PUT metrics.
+///
+/// Called once during startup, typically gated by `rustfs_obs::observability_metric_enabled()`.
+pub fn set_put_stage_metrics_enabled(enabled: bool) {
+    PUT_STAGE_METRICS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Returns `true` if detailed per-stage PUT metrics are enabled.
+///
+/// Callers should check this before calling `Instant::now()` for stage timing
+/// to avoid unnecessary syscalls when metrics are disabled.
+#[inline(always)]
+pub fn put_stage_metrics_enabled() -> bool {
+    PUT_STAGE_METRICS_ENABLED.load(Ordering::Relaxed)
+}
 
 // Public modules
 pub mod adaptive_ttl;
@@ -409,9 +432,9 @@ pub fn record_get_object(duration_ms: f64, size_bytes: i64) {
 ///
 /// * `duration_ms` - Operation duration in milliseconds
 /// * `size_bytes` - Object size in bytes
-/// * `zero_copy_enabled` - Whether zero-copy was enabled for this operation
+/// * `zero_copy_eligible` - Whether the request was eligible for a zero-copy path
 #[inline(always)]
-pub fn record_put_object(duration_ms: f64, size_bytes: i64, zero_copy_enabled: bool) {
+pub fn record_put_object(duration_ms: f64, size_bytes: i64, zero_copy_eligible: bool) {
     counter!("rustfs_s3_put_object_total").increment(1);
     histogram!("rustfs_s3_put_object_duration_ms").record(duration_ms);
 
@@ -419,9 +442,35 @@ pub fn record_put_object(duration_ms: f64, size_bytes: i64, zero_copy_enabled: b
         histogram!("rustfs_s3_put_object_size_bytes").record(size_bytes as f64);
     }
 
-    if zero_copy_enabled {
+    if zero_copy_eligible {
+        // Backward-compatible alias for historical dashboards.
         counter!("rustfs_s3_put_object_zero_copy_enabled_total").increment(1);
+        counter!("rustfs_s3_put_object_zero_copy_eligible_total").increment(1);
     }
+}
+
+#[inline(always)]
+pub fn record_put_object_path(path: &'static str) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_s3_put_object_path_total", "path" => path).increment(1);
+}
+
+#[inline(always)]
+pub fn record_put_object_stage_duration(stage: &'static str, duration_ms: f64) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    histogram!("rustfs_s3_put_object_stage_duration_ms", "stage" => stage).record(duration_ms);
+}
+
+/// Record generic internal operation stage duration (non-PUT paths).
+/// Use this for metacache walks, listing, lifecycle, and other background
+/// operations that are NOT part of the PUT object hot path.
+#[inline(always)]
+pub fn record_stage_duration(stage: &'static str, duration_ms: f64) {
+    histogram!("rustfs_internal_stage_duration_ms", "stage" => stage).record(duration_ms);
 }
 
 /// Record ListObjects operation metrics.
@@ -788,6 +837,10 @@ pub fn record_io_latency_p99(latency_ms: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Serialize tests that mutate the process-global PUT_STAGE_METRICS_ENABLED flag.
+    static METRICS_FLAG_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_record_zero_copy_read() {
@@ -822,6 +875,36 @@ mod tests {
     fn test_record_put_object() {
         record_put_object(200.0, 1024 * 1024, true);
         record_put_object(100.0, 512, false);
+    }
+
+    #[test]
+    fn test_record_put_object_path_and_stage() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_put_stage_metrics_enabled(true);
+        record_put_object_path("small_eager");
+        record_put_object_path("write_inline");
+        record_put_object_stage_duration("ingress_prepare", 12.5);
+        record_put_object_stage_duration("set_disk_encode", 8.0);
+        set_put_stage_metrics_enabled(false);
+    }
+
+    #[test]
+    fn test_put_stage_metrics_disabled_by_default() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_put_stage_metrics_enabled(false);
+        // These should be no-ops (no panic, no recording)
+        record_put_object_path("small_eager");
+        record_put_object_stage_duration("set_disk_encode", 5.0);
+        // Still disabled
+        assert!(!put_stage_metrics_enabled());
+    }
+
+    #[test]
+    fn test_record_stage_duration_generic() {
+        // Generic stage duration should always record (no gating flag)
+        record_stage_duration("metacache_walk_dir_primary", 15.0);
+        record_stage_duration("store_list_objects_walk_internal", 8.5);
+        record_stage_duration("lifecycle_free_version_recovery_failed", 120.0);
     }
 
     #[test]
