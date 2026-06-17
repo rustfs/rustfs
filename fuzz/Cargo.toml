@@ -12,14 +12,13 @@ cargo-fuzz = true
 [dependencies]
 arbitrary = "1"
 libfuzzer-sys = "0.4"
-rustfs = { path = "../rustfs", default-features = false }
 rustfs-ecstore = { path = "../crates/ecstore" }
 rustfs-filemeta = { path = "../crates/filemeta" }
 rustfs-utils = { path = "../crates/utils", features = ["compress", "path"] }
 
 [[bin]]
-name = "copy_source_range"
-path = "fuzz_targets/copy_source_range.rs"
+name = "bucket_validation"
+path = "fuzz_targets/bucket_validation.rs"
 test = false
 doc = false
 bench = false

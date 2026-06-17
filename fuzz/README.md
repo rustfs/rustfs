@@ -31,10 +31,10 @@ fuzz/
 
 ## Targets
 
+- `bucket_validation`
+  - Exercises RustFS bucket-name and bucket/object argument validation without pulling in the full `rustfs` binary crate graph.
 - `path_containment`
   - Exercises object-path acceptance and containment invariants using public path helpers.
-- `copy_source_range`
-  - Exercises `rustfs::storage::options::parse_copy_source_range`.
 - `local_metadata`
   - Exercises `rustfs-filemeta` metadata decoding and `rustfs-utils` block decompression.
 
