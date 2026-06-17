@@ -24,6 +24,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "archive_extract"
+path = "fuzz_targets/archive_extract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "local_metadata"
 path = "fuzz_targets/local_metadata.rs"
 test = false

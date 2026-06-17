@@ -990,7 +990,7 @@ fn contains_parent_dir_component(path: &str) -> bool {
     path.split(['/', '\\']).any(|component| component == "..")
 }
 
-fn validate_extract_relative_path(path: &str) -> S3Result<()> {
+pub fn validate_extract_relative_path(path: &str) -> S3Result<()> {
     let path = Path::new(path);
     if path
         .components()
@@ -1014,7 +1014,7 @@ fn normalize_snowball_prefix(prefix: &str) -> S3Result<Option<String>> {
     Ok(Some(normalized.to_string()))
 }
 
-fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: bool) -> S3Result<String> {
+pub fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: bool) -> S3Result<String> {
     validate_extract_relative_path(path)?;
     let path = path.trim_matches('/');
     let mut key = match prefix {

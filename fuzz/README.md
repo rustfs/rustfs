@@ -33,6 +33,8 @@ fuzz/
 
 - `bucket_validation`
   - Exercises RustFS bucket-name and bucket/object argument validation without pulling in the full `rustfs` binary crate graph.
+- `archive_extract`
+  - Exercises archive entry path normalization, prefix application, and bucket-namespace containment checks.
 - `path_containment`
   - Exercises object-path acceptance and containment invariants using public path helpers.
 - `local_metadata`
