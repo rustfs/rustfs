@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use http::{HeaderMap, StatusCode};
+use http::{HeaderMap, StatusCode, Uri};
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_utils::{
@@ -21,7 +21,6 @@ use rustfs_utils::{
 };
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Deserialize;
-use serde_urlencoded::from_bytes;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -462,6 +461,37 @@ pub struct StatusPoolQuery {
     pub by_id: String,
 }
 
+fn parse_status_pool_query(uri: &Uri) -> Result<StatusPoolQuery, ()> {
+    let mut parsed = StatusPoolQuery::default();
+    let mut seen = HashSet::with_capacity(2);
+    let Some(query) = uri.query() else {
+        return Ok(parsed);
+    };
+
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        match key.as_ref() {
+            "pool" => {
+                if !seen.insert("pool") {
+                    return Err(());
+                }
+                parsed.pool = value.into_owned();
+            }
+            "by-id" => {
+                if !seen.insert("by-id") {
+                    return Err(());
+                }
+                match value.as_ref() {
+                    "true" | "false" => parsed.by_id = value.into_owned(),
+                    _ => return Err(()),
+                }
+            }
+            _ => return Err(()),
+        }
+    }
+
+    Ok(parsed)
+}
+
 pub struct StatusPool {}
 
 #[async_trait::async_trait]
@@ -489,15 +519,7 @@ impl Operation for StatusPool {
         )
         .await?;
 
-        let query = {
-            if let Some(query) = req.uri.query() {
-                let input: StatusPoolQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| pool_admin_query_parse_error("load pool status"))?;
-                input
-            } else {
-                StatusPoolQuery::default()
-            }
-        };
+        let query = parse_status_pool_query(&req.uri).map_err(|_| pool_admin_query_parse_error("load pool status"))?;
 
         let usecase = DefaultAdminUsecase::from_global();
         let pools_status = usecase
@@ -606,15 +628,8 @@ impl Operation for StartDecommission {
         }
         validate_start_decommission_guards(decommission_running, rebalance_running)?;
 
-        let query = {
-            if let Some(query) = req.uri.query() {
-                let input: StatusPoolQuery = from_bytes(query.as_bytes())
-                    .map_err(|_e| pool_admin_query_parse_error_with_audit("start decommission", audit))?;
-                input
-            } else {
-                StatusPoolQuery::default()
-            }
-        };
+        let query = parse_status_pool_query(&req.uri)
+            .map_err(|_| pool_admin_query_parse_error_with_audit("start decommission", audit))?;
         let is_byid = query.by_id.as_str() == "true";
 
         let pools: Vec<&str> = query.pool.split(",").collect();
@@ -734,15 +749,8 @@ impl Operation for CancelDecommission {
             return Err(s3_error!(NotImplemented));
         }
 
-        let query = {
-            if let Some(query) = req.uri.query() {
-                let input: StatusPoolQuery = from_bytes(query.as_bytes())
-                    .map_err(|_e| pool_admin_query_parse_error_with_audit("cancel decommission", audit))?;
-                input
-            } else {
-                StatusPoolQuery::default()
-            }
-        };
+        let query = parse_status_pool_query(&req.uri)
+            .map_err(|_| pool_admin_query_parse_error_with_audit("cancel decommission", audit))?;
 
         let is_byid = query.by_id.as_str() == "true";
 
@@ -789,7 +797,7 @@ impl Operation for CancelDecommission {
 mod pools_handler_tests {
     use super::{
         PoolAuditContext, contextualize_admin_pool_api_error, decommission_admin_not_initialized_error,
-        decommission_admin_not_initialized_error_with_audit, dedup_indices, parse_pool_idx_by_id,
+        decommission_admin_not_initialized_error_with_audit, dedup_indices, parse_pool_idx_by_id, parse_status_pool_query,
         pool_admin_missing_credentials_error, pool_admin_missing_credentials_error_with_request, pool_admin_pool_index_error,
         pool_admin_pool_index_error_with_audit, pool_admin_pool_not_found_error, pool_admin_pool_not_found_error_with_audit,
         pool_admin_pool_parse_error, pool_admin_pool_parse_error_with_audit, pool_admin_query_parse_error,
@@ -804,6 +812,33 @@ mod pools_handler_tests {
     #[test]
     fn test_parse_pool_idx_by_id_rejects_out_of_range() {
         assert_eq!(parse_pool_idx_by_id("4", 4), None);
+    }
+
+    #[test]
+    fn test_parse_status_pool_query_rejects_unknown_duplicate_and_invalid_bool() {
+        let unknown = "/rustfs/admin/v3/pools/status?pool=0&force=true"
+            .parse()
+            .expect("uri should parse");
+        assert!(parse_status_pool_query(&unknown).is_err());
+
+        let duplicate = "/rustfs/admin/v3/pools/status?pool=0&pool=1"
+            .parse()
+            .expect("uri should parse");
+        assert!(parse_status_pool_query(&duplicate).is_err());
+
+        let invalid_bool = "/rustfs/admin/v3/pools/status?by-id=yes".parse().expect("uri should parse");
+        assert!(parse_status_pool_query(&invalid_bool).is_err());
+    }
+
+    #[test]
+    fn test_parse_status_pool_query_accepts_expected_keys() {
+        let uri = "/rustfs/admin/v3/pools/status?pool=pool-a&by-id=true"
+            .parse()
+            .expect("uri should parse");
+        let query = parse_status_pool_query(&uri).expect("valid query should parse");
+
+        assert_eq!(query.pool, "pool-a");
+        assert_eq!(query.by_id, "true");
     }
 
     #[test]

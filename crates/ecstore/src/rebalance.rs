@@ -871,6 +871,36 @@ impl ECStore {
         merged.save_with_opts(pool, opts).await
     }
 
+    async fn save_new_rebalance_meta<S: ObjectIO + NamespaceLocking>(
+        &self,
+        pool: Arc<S>,
+        local_snapshot: &RebalanceMeta,
+        stage: &str,
+    ) -> Result<()> {
+        let ns_lock = pool.new_ns_lock(crate::disk::RUSTFS_META_BUCKET, REBAL_META_NAME).await?;
+        let _guard = ns_lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .map_err(rebalance_meta_lock_error)?;
+
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let mut persisted = RebalanceMeta::new();
+        match persisted.load_with_opts(pool.clone(), opts.clone()).await {
+            Ok(()) => {
+                if is_rebalance_conflicting_with_decommission(&persisted) {
+                    return Err(Error::RebalanceAlreadyRunning);
+                }
+            }
+            Err(Error::ConfigNotFound) => {}
+            Err(err) => return Err(Error::other(format!("rebalance meta load before save failed during {stage}: {err}"))),
+        }
+
+        local_snapshot.save_with_opts(pool, opts).await
+    }
+
     #[tracing::instrument(skip_all)]
     pub async fn load_rebalance_meta(&self) -> Result<()> {
         let mut meta = RebalanceMeta::new();
@@ -1055,7 +1085,7 @@ impl ECStore {
 
         let pool = clone_first_arc(&self.pools, "init_rebalance_meta: no pools available")?;
         resolve_rebalance_meta_save_result(
-            self.save_rebalance_meta_with_merge(pool, &meta, "init_rebalance_meta").await,
+            self.save_new_rebalance_meta(pool, &meta, "init_rebalance_meta").await,
             "init_rebalance_meta",
         )?;
 
