@@ -50,7 +50,6 @@ use rmp_serde::Deserializer;
 use rmp_serde::Serializer;
 use rustfs_common::defer;
 use rustfs_common::heal_channel::HealOpts;
-use rustfs_concurrency::workers::Workers;
 use rustfs_filemeta::{FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
 use rustfs_storage_api::{BucketOperations, BucketOptions, MakeBucketOptions, StorageAdminApi};
 use rustfs_utils::path::{encode_dir_object, path_join, path_to_bucket_object, path_to_bucket_object_with_base_path};
@@ -67,6 +66,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use time::{Duration, OffsetDateTime};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -582,6 +582,16 @@ where
         return Err(err);
     }
 
+    Ok(())
+}
+
+async fn wait_decommission_worker_drain(workers: &Semaphore, limit: usize) -> Result<()> {
+    let permits = u32::try_from(limit)
+        .map_err(|_| Error::other(format!("decommission worker limit {limit} exceeds semaphore drain capacity")))?;
+    let _drain = workers
+        .acquire_many(permits)
+        .await
+        .map_err(|err| Error::other(format!("decommission worker drain failed: {err}")))?;
     Ok(())
 }
 
@@ -1863,7 +1873,7 @@ impl ECStore {
     }
 
     #[allow(unused_assignments, clippy::too_many_arguments)]
-    #[tracing::instrument(skip(self, set, wk, lifecycle_config, lock_retention, replication_config))]
+    #[tracing::instrument(skip(self, set, _worker_permit, lifecycle_config, lock_retention, replication_config))]
     async fn decommission_entry(
         self: &Arc<Self>,
         rx: CancellationToken,
@@ -1871,7 +1881,7 @@ impl ECStore {
         entry: MetaCacheEntry,
         bucket: String,
         set: Arc<SetDisks>,
-        wk: Arc<Workers>,
+        _worker_permit: OwnedSemaphorePermit,
         lifecycle_config: Option<BucketLifecycleConfiguration>,
         lock_retention: Option<DefaultRetention>,
         replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
@@ -1886,7 +1896,6 @@ impl ECStore {
             state = "started",
             "Decommission entry started"
         );
-        wk.give().await;
         if entry.is_dir() {
             debug!(
                 event = EVENT_DECOMMISSION_ENTRY,
@@ -2265,7 +2274,11 @@ impl ECStore {
         pool: Arc<Sets>,
         bi: DecomBucketInfo,
     ) -> Result<()> {
-        let wk = Workers::new(pool.disk_set.len() * 2).map_err(Error::other)?;
+        let worker_limit = pool.disk_set.len() * 2;
+        if worker_limit == 0 {
+            return Err(Error::other("decommission worker limit must be greater than zero"));
+        }
+        let workers = Arc::new(Semaphore::new(worker_limit));
         let entry_error = Arc::new(tokio::sync::Mutex::new(None::<Error>));
         let mut listing_workers = Vec::with_capacity(pool.disk_set.len());
 
@@ -2289,7 +2302,11 @@ impl ECStore {
         }
 
         for (set_idx, set) in pool.disk_set.iter().enumerate() {
-            wk.clone().take().await;
+            let listing_permit = workers
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|err| Error::other(format!("decommission listing worker permit acquire failed: {err}")))?;
 
             debug!(
                 event = EVENT_DECOMMISSION_BUCKET,
@@ -2305,7 +2322,7 @@ impl ECStore {
             let decommission_entry: ListCallback = Arc::new({
                 let this = Arc::clone(self);
                 let bucket = bi.name.clone();
-                let wk = wk.clone();
+                let workers = workers.clone();
                 let set = set.clone();
                 let lifecycle_config = lifecycle_config.clone();
                 let lock_retention = lock_retention.clone();
@@ -2315,7 +2332,7 @@ impl ECStore {
                 move |entry: MetaCacheEntry| {
                     let this = this.clone();
                     let bucket = bucket.clone();
-                    let wk = wk.clone();
+                    let workers = workers.clone();
                     let set = set.clone();
                     let lifecycle_config = lifecycle_config.clone();
                     let lock_retention = lock_retention.clone();
@@ -2324,7 +2341,19 @@ impl ECStore {
                     let callback_rx = callback_rx.clone();
 
                     Box::pin(async move {
-                        wk.take().await;
+                        let worker_permit = match workers.clone().acquire_owned().await {
+                            Ok(permit) => permit,
+                            Err(err) => {
+                                let err = Error::other(format!("decommission entry worker permit acquire failed: {err}"));
+                                error!("decommission_pool: decommission_entry failed: {err}");
+                                let mut first_err = entry_error.lock().await;
+                                if first_err.is_none() {
+                                    *first_err = Some(err);
+                                    callback_rx.cancel();
+                                }
+                                return;
+                            }
+                        };
                         let entry_rx = callback_rx.clone();
                         if let Err(err) = this
                             .decommission_entry(
@@ -2333,7 +2362,7 @@ impl ECStore {
                                 entry,
                                 bucket,
                                 set,
-                                wk,
+                                worker_permit,
                                 lifecycle_config,
                                 lock_retention,
                                 replication_config,
@@ -2355,8 +2384,8 @@ impl ECStore {
             let rx_clone = rx.clone();
             let bi = bi.clone();
             let set_id = set_idx;
-            let wk_clone = wk.clone();
             let worker = tokio::spawn(async move {
+                let _listing_permit = listing_permit;
                 loop {
                     if rx_clone.is_cancelled() {
                         debug!(
@@ -2429,8 +2458,6 @@ impl ECStore {
                         }
                     }
                 }
-
-                wk_clone.give().await;
             });
             listing_workers.push((set_id, worker));
         }
@@ -2449,14 +2476,13 @@ impl ECStore {
         for (set_id, worker) in listing_workers {
             if let Err(err) = resolve_decommission_listing_worker_result(set_id, worker.await) {
                 rx.cancel();
-                wk.give().await;
                 if listing_worker_error.is_none() {
                     listing_worker_error = Some(err);
                 }
             }
         }
 
-        wk.wait().await;
+        wait_decommission_worker_drain(&workers, worker_limit).await?;
 
         if let Some(err) = listing_worker_error {
             return Err(err);
@@ -3939,7 +3965,7 @@ mod pools_tests {
         run_decommission_buckets_bounded, should_cleanup_decommission_source_entry, should_continue_decommission_queue,
         should_count_decommission_version_complete, should_preserve_decommission_canceled_state, split_decommission_buckets,
         take_and_cancel_decommission_canceler, take_decommission_canceler, track_decommission_current_object,
-        validate_start_decommission_request, with_decommission_entry_context,
+        validate_start_decommission_request, wait_decommission_worker_drain, with_decommission_entry_context,
     };
     use crate::data_movement;
     use crate::disk::endpoint::Endpoint;
@@ -3954,6 +3980,7 @@ mod pools_tests {
     };
     use std::time::Duration as StdDuration;
     use time::{Duration, OffsetDateTime};
+    use tokio::sync::Semaphore;
     use tokio_util::sync::CancellationToken;
 
     fn decommission_test_pool_endpoint(idx: usize, is_local: bool) -> PoolEndpoints {
@@ -4136,6 +4163,31 @@ mod pools_tests {
         assert!(matches!(err, Error::OperationCanceled));
         assert!(rx.is_cancelled());
         assert_eq!(started.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_wait_decommission_worker_drain_waits_for_entry_permit() {
+        let workers = Arc::new(Semaphore::new(1));
+        let permit = workers
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("test worker permit should acquire");
+
+        let drain = tokio::spawn({
+            let workers = workers.clone();
+            async move { wait_decommission_worker_drain(&workers, 1).await }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished(), "drain should wait while a worker permit is held");
+
+        drop(permit);
+        let result = tokio::time::timeout(StdDuration::from_secs(1), drain)
+            .await
+            .expect("drain should finish after permit release")
+            .expect("drain task should not panic");
+        assert!(result.is_ok());
     }
 
     #[test]
