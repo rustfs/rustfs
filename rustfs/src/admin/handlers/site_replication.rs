@@ -50,7 +50,6 @@ use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::config::com::{delete_config, read_config, save_config};
 use rustfs_ecstore::error::Error as StorageError;
 use rustfs_ecstore::global::{get_global_deployment_id, get_global_endpoints_opt, get_global_region, global_rustfs_port};
-use rustfs_ecstore::store_api::BucketOperations;
 use rustfs_iam::error::is_err_no_such_service_account;
 use rustfs_iam::store::{MappedPolicy, UserType};
 use rustfs_iam::sys::{
@@ -71,7 +70,7 @@ use rustfs_policy::policy::{
 };
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
-use rustfs_storage_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};
+use rustfs_storage_api::{BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};
 use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, load_global_outbound_tls_generation, load_global_outbound_tls_state};
 use rustfs_utils::http::get_source_scheme;
 use rustls_pki_types::pem::PemObject;

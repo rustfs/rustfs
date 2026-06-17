@@ -52,8 +52,8 @@ use crate::{
     event_notification::{EventArgs, send_event},
     global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id, is_dist_erasure},
     store_api::{
-        BucketOperations, CompletePart, DeletedObject, GetObjectReader, HTTPRangeSpec, HealOperations, ListObjectsV2Info,
-        ListOperations, MultipartOperations, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, PutObjReader,
+        CompletePart, DeletedObject, GetObjectReader, HTTPRangeSpec, HealOperations, ListObjectsV2Info, ListOperations,
+        MultipartOperations, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, PutObjReader,
     },
     store_init::load_format_erasure,
 };
@@ -86,8 +86,8 @@ use rustfs_object_capacity::capacity_scope::{
 };
 use rustfs_s3_types::EventName;
 use rustfs_storage_api::{
-    BucketInfo, BucketOptions, DeleteBucketOptions, ListMultipartsInfo, ListPartsInfo, MakeBucketOptions, MultipartInfo,
-    MultipartUploadResult, PartInfo,
+    BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, ListMultipartsInfo, ListPartsInfo, MakeBucketOptions,
+    MultipartInfo, MultipartUploadResult, PartInfo,
 };
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
@@ -1667,6 +1667,8 @@ impl NamespaceLocking for SetDisks {
 
 #[async_trait::async_trait]
 impl BucketOperations for SetDisks {
+    type Error = Error;
+
     #[tracing::instrument(skip(self))]
     async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
         unimplemented!()
