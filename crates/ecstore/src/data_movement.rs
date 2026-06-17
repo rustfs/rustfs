@@ -297,7 +297,7 @@ struct SourceCleanupPartIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct SourceCleanupVersionIdentity {
+pub(crate) struct SourceCleanupVersionIdentity {
     name: String,
     version_id: Option<uuid::Uuid>,
     deleted: bool,
@@ -326,7 +326,7 @@ fn source_cleanup_part_identity(part: &ObjectPartInfo) -> SourceCleanupPartIdent
     }
 }
 
-fn source_cleanup_version_identity(version: &FileInfo) -> SourceCleanupVersionIdentity {
+pub(crate) fn source_cleanup_version_identity(version: &FileInfo) -> SourceCleanupVersionIdentity {
     let mut parts: Vec<_> = version.parts.iter().map(source_cleanup_part_identity).collect();
     parts.sort();
 
@@ -355,7 +355,38 @@ fn source_cleanup_version_identities(fivs: &FileInfoVersions) -> Vec<SourceClean
 }
 
 fn source_cleanup_versions_match(expected: &FileInfoVersions, current: &FileInfoVersions) -> bool {
-    source_cleanup_version_identities(expected) == source_cleanup_version_identities(current)
+    source_cleanup_versions_match_with_allowed_missing(expected, current, &[])
+}
+
+fn source_cleanup_versions_match_with_allowed_missing(
+    expected: &FileInfoVersions,
+    current: &FileInfoVersions,
+    allowed_missing: &[SourceCleanupVersionIdentity],
+) -> bool {
+    let mut expected_counts = BTreeMap::new();
+    for identity in source_cleanup_version_identities(expected) {
+        *expected_counts.entry(identity).or_insert(0usize) += 1;
+    }
+
+    for identity in source_cleanup_version_identities(current) {
+        let Some(count) = expected_counts.get_mut(&identity) else {
+            return false;
+        };
+
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            expected_counts.remove(&identity);
+        }
+    }
+
+    let mut allowed_counts = BTreeMap::new();
+    for identity in allowed_missing.iter().cloned() {
+        *allowed_counts.entry(identity).or_insert(0usize) += 1;
+    }
+
+    expected_counts
+        .into_iter()
+        .all(|(identity, count)| allowed_counts.get(&identity).copied().unwrap_or_default() >= count)
 }
 
 fn source_cleanup_preflight_error(op_label: &str, bucket: &str, object: &str, err: impl std::fmt::Display) -> Error {
@@ -425,13 +456,14 @@ pub(crate) async fn ensure_source_cleanup_versions_unchanged(
     bucket: &str,
     object: &str,
     expected: &FileInfoVersions,
+    allowed_missing: &[SourceCleanupVersionIdentity],
     op_label: &str,
 ) -> Result<()> {
     let Some(current) = load_source_cleanup_versions(set, bucket, object, op_label).await? else {
         return Ok(());
     };
 
-    if source_cleanup_versions_match(expected, &current) {
+    if source_cleanup_versions_match_with_allowed_missing(expected, &current, allowed_missing) {
         return Ok(());
     }
 
@@ -946,6 +978,39 @@ mod tests {
         ]);
 
         assert!(!source_cleanup_versions_match(&expected, &current));
+    }
+
+    #[test]
+    fn test_decommission_cleanup_preflight_accepts_allowed_expired_missing_version() {
+        let migrated = cleanup_test_file_info("object.txt", Uuid::from_u128(1), "migrated");
+        let expired = cleanup_test_file_info("object.txt", Uuid::from_u128(2), "expired");
+        let expected = cleanup_test_versions(vec![migrated.clone(), expired.clone()]);
+        let current = cleanup_test_versions(vec![migrated]);
+        let allowed_missing = vec![source_cleanup_version_identity(&expired)];
+
+        assert!(source_cleanup_versions_match_with_allowed_missing(&expected, &current, &allowed_missing));
+    }
+
+    #[test]
+    fn test_decommission_cleanup_preflight_rejects_unexpected_missing_version() {
+        let migrated = cleanup_test_file_info("object.txt", Uuid::from_u128(1), "migrated");
+        let protected = cleanup_test_file_info("object.txt", Uuid::from_u128(2), "protected");
+        let expected = cleanup_test_versions(vec![migrated.clone(), protected]);
+        let current = cleanup_test_versions(vec![migrated]);
+
+        assert!(!source_cleanup_versions_match_with_allowed_missing(&expected, &current, &[]));
+    }
+
+    #[test]
+    fn test_decommission_cleanup_preflight_rejects_new_version_with_allowed_missing() {
+        let migrated = cleanup_test_file_info("object.txt", Uuid::from_u128(1), "migrated");
+        let expired = cleanup_test_file_info("object.txt", Uuid::from_u128(2), "expired");
+        let new_version = cleanup_test_file_info("object.txt", Uuid::from_u128(3), "new-version");
+        let expected = cleanup_test_versions(vec![migrated.clone(), expired.clone()]);
+        let current = cleanup_test_versions(vec![migrated, new_version]);
+        let allowed_missing = vec![source_cleanup_version_identity(&expired)];
+
+        assert!(!source_cleanup_versions_match_with_allowed_missing(&expected, &current, &allowed_missing));
     }
 
     #[test]

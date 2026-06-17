@@ -2958,6 +2958,7 @@ impl ECStore {
                 bucket.as_str(),
                 entry.name.as_str(),
                 &fivs,
+                &[],
                 "rebalance",
             )
             .await

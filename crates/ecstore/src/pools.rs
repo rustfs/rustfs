@@ -1648,6 +1648,7 @@ impl ECStore {
 
         let mut decommissioned: usize = 0;
         let mut expired: usize = 0;
+        let mut cleanup_preflight_allowed_missing = Vec::new();
 
         for version in fivs.versions.iter() {
             if should_skip_lifecycle_for_data_movement(
@@ -1663,6 +1664,7 @@ impl ECStore {
             .await
             {
                 expired += 1;
+                cleanup_preflight_allowed_missing.push(data_movement::source_cleanup_version_identity(version));
                 continue;
             }
 
@@ -1907,6 +1909,7 @@ impl ECStore {
                 bucket.as_str(),
                 entry.name.as_str(),
                 &fivs,
+                &cleanup_preflight_allowed_missing,
                 "decommission",
             )
             .await
