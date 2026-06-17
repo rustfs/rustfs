@@ -1209,11 +1209,11 @@ Clone the incoming options for multi-pool lookup and operation dispatch:
 
 ### Implementation Steps
 
-- [ ] Add a small helper that prepares transition/restore options for pool lookup.
-- [ ] Update `handle_transition_object()` to use the adjusted options on multi-pool paths.
-- [ ] Update `handle_restore_transitioned_object()` to use the adjusted options on multi-pool paths.
-- [ ] Add tests asserting transition and restore options set `skip_decommissioned` and preserve the intended `no_lock` behavior.
-- [ ] Run:
+- [x] Add a small helper that prepares transition/restore options for pool lookup.
+- [x] Update `handle_transition_object()` to use the adjusted options on multi-pool paths.
+- [x] Update `handle_restore_transitioned_object()` to use the adjusted options on multi-pool paths.
+- [x] Add tests asserting transition and restore options set `skip_decommissioned` and preserve the intended `no_lock` behavior.
+- [x] Run:
 
 ```bash
 cargo test -p rustfs-ecstore transition --lib

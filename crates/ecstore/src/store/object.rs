@@ -237,6 +237,12 @@ fn data_movement_pool_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> Object
     lookup_opts
 }
 
+fn transition_restore_pool_opts(opts: &ObjectOptions) -> ObjectOptions {
+    let mut lookup_opts = opts.clone();
+    lookup_opts.skip_decommissioned = true;
+    lookup_opts
+}
+
 fn effective_object_actual_size(info: &ObjectInfo) -> Option<i64> {
     info.get_actual_size().ok()
 }
@@ -1135,11 +1141,12 @@ impl ECStore {
             return self.pools[0].transition_object(bucket, &object, opts).await;
         }
 
-        //opts.skip_decommissioned = true;
-        //opts.no_lock = true;
-        let (_, idx) = self.get_latest_accessible_object_info_with_idx(bucket, &object, opts).await?;
+        let opts = transition_restore_pool_opts(opts);
+        let (_, idx) = self
+            .get_latest_accessible_object_info_with_idx(bucket, &object, &opts)
+            .await?;
 
-        self.pools[idx].transition_object(bucket, &object, opts).await
+        self.pools[idx].transition_object(bucket, &object, &opts).await
     }
 
     #[instrument(skip(self))]
@@ -1154,15 +1161,14 @@ impl ECStore {
             return self.pools[0].clone().restore_transitioned_object(bucket, &object, opts).await;
         }
 
-        //opts.skip_decommissioned = true;
-        //opts.nolock = true;
+        let opts = transition_restore_pool_opts(opts);
         let (_, idx) = self
-            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), opts)
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &opts)
             .await?;
 
         self.pools[idx]
             .clone()
-            .restore_transitioned_object(bucket, &object, opts)
+            .restore_transitioned_object(bucket, &object, &opts)
             .await
     }
 
@@ -1748,6 +1754,29 @@ mod tests {
         assert!(lookup_opts.metadata_chg);
         assert!(lookup_opts.skip_decommissioned);
         assert!(lookup_opts.skip_rebalancing);
+    }
+
+    #[test]
+    fn transition_restore_pool_opts_skips_decommissioned_and_preserves_locking() {
+        let lookup_opts = transition_restore_pool_opts(&ObjectOptions {
+            no_lock: false,
+            skip_decommissioned: false,
+            ..Default::default()
+        });
+
+        assert!(lookup_opts.skip_decommissioned);
+        assert!(!lookup_opts.no_lock);
+    }
+
+    #[test]
+    fn transition_restore_pool_opts_preserves_existing_no_lock() {
+        let lookup_opts = transition_restore_pool_opts(&ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        });
+
+        assert!(lookup_opts.skip_decommissioned);
+        assert!(lookup_opts.no_lock);
     }
 
     #[tokio::test]
