@@ -28,7 +28,7 @@ use std::sync::{
 };
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, BufReader, ReadBuf};
-use tracing::error;
+use tracing::{error, info};
 
 type SharedDataMovementStream = Arc<Mutex<Box<dyn AsyncRead + Unpin + Send + Sync>>>;
 
@@ -252,6 +252,8 @@ fn is_equivalent_data_movement_object(source: &ObjectInfo, target: &ObjectInfo) 
         && source.etag == target.etag
         && source.checksum == target.checksum
         && source.mod_time == target.mod_time
+        && source.storage_class == target.storage_class
+        && source.user_defined == target.user_defined
 }
 
 fn should_check_data_movement_resume_target(src_pool_idx: usize, target_pool_idx: usize) -> bool {
@@ -324,6 +326,32 @@ async fn should_treat_data_movement_overwrite_as_complete(
         src_pool_idx,
         target_pool_idx,
     )
+}
+
+async fn should_treat_data_movement_overwrite_as_complete_in_any_target_pool(
+    store: &ECStore,
+    src_pool_idx: usize,
+    bucket: &str,
+    object_info: &ObjectInfo,
+    err: &Error,
+) -> Result<bool> {
+    if !should_check_data_movement_overwrite_resume(err) {
+        return Ok(false);
+    }
+
+    for target_pool_idx in 0..store.pools.len() {
+        if target_pool_idx == src_pool_idx {
+            continue;
+        }
+
+        if should_treat_data_movement_overwrite_as_complete(store, src_pool_idx, target_pool_idx, bucket, object_info, err)
+            .await?
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn data_movement_part_stage_error(
@@ -482,6 +510,11 @@ pub(crate) async fn migrate_object(
                 )
                 .await?
                 {
+                    info!(
+                        "{op_label}: complete_multipart_upload overwrite resolved by equivalent target for {}/{}",
+                        bucket.as_str(),
+                        object_info.name.as_str()
+                    );
                     mark_multipart_upload_completed(&abort_multipart_flag);
                     return Ok(());
                 }
@@ -553,6 +586,23 @@ pub(crate) async fn migrate_object(
         )
         .await
     {
+        if should_treat_data_movement_overwrite_as_complete_in_any_target_pool(
+            store.as_ref(),
+            pool_idx,
+            bucket.as_str(),
+            &object_info,
+            &err,
+        )
+        .await?
+        {
+            info!(
+                "{op_label}: put_object overwrite resolved by equivalent target for {}/{}",
+                bucket.as_str(),
+                object_info.name.as_str()
+            );
+            return Ok(());
+        }
+
         error!("{op_label}: put_object err {:?}", &err);
         return Err(data_movement_stage_error(
             op_label,
@@ -1070,6 +1120,41 @@ mod tests {
     }
 
     #[test]
+    fn test_is_equivalent_data_movement_object_rejects_user_metadata_mismatch() {
+        let source = ObjectInfo {
+            version_id: Some(Uuid::nil()),
+            size: 128,
+            etag: Some("etag-value".to_string()),
+            user_defined: Arc::new(HashMap::from([("x-amz-meta-key".to_string(), "source".to_string())])),
+            storage_class: Some("STANDARD_IA".to_string()),
+            ..Default::default()
+        };
+        let target = ObjectInfo {
+            user_defined: Arc::new(HashMap::from([("x-amz-meta-key".to_string(), "target".to_string())])),
+            ..source.clone()
+        };
+
+        assert!(!is_equivalent_data_movement_object(&source, &target));
+    }
+
+    #[test]
+    fn test_is_equivalent_data_movement_object_rejects_storage_class_mismatch() {
+        let source = ObjectInfo {
+            version_id: Some(Uuid::nil()),
+            size: 128,
+            etag: Some("etag-value".to_string()),
+            storage_class: Some("STANDARD_IA".to_string()),
+            ..Default::default()
+        };
+        let target = ObjectInfo {
+            storage_class: Some("STANDARD".to_string()),
+            ..source.clone()
+        };
+
+        assert!(!is_equivalent_data_movement_object(&source, &target));
+    }
+
+    #[test]
     fn test_is_equivalent_data_movement_object_uses_effective_actual_size() {
         let source = ObjectInfo {
             size: 128,
@@ -1105,6 +1190,24 @@ mod tests {
     }
 
     #[test]
+    fn test_rebalance_overwrite_resume_accepts_equivalent_target_version() {
+        let source = ObjectInfo {
+            version_id: Some(Uuid::from_u128(1)),
+            size: 128,
+            etag: Some("etag-value".to_string()),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            user_defined: Arc::new(HashMap::from([("x-amz-meta-key".to_string(), "value".to_string())])),
+            ..Default::default()
+        };
+        let err = Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "version".to_string());
+
+        let should_resume = resolve_data_movement_overwrite_resume_result(&err, Ok(Some(source.clone())), &source, 2, 3)
+            .expect("rebalance overwrite should converge when the target version is equivalent");
+
+        assert!(should_resume);
+    }
+
+    #[test]
     fn test_resolve_data_movement_overwrite_resume_result_rejects_source_pool_target() {
         let source = ObjectInfo {
             version_id: Some(Uuid::nil()),
@@ -1117,6 +1220,27 @@ mod tests {
 
         let should_resume = resolve_data_movement_overwrite_resume_result(&err, Ok(Some(source.clone())), &source, 0, 0)
             .expect("source-pool target should be rejected before target lookup");
+
+        assert!(!should_resume);
+    }
+
+    #[test]
+    fn test_rebalance_overwrite_resume_rejects_different_target_version() {
+        let source = ObjectInfo {
+            version_id: Some(Uuid::from_u128(1)),
+            size: 128,
+            etag: Some("etag-value".to_string()),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let target = ObjectInfo {
+            version_id: Some(Uuid::from_u128(2)),
+            ..source.clone()
+        };
+        let err = Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "version".to_string());
+
+        let should_resume = resolve_data_movement_overwrite_resume_result(&err, Ok(Some(target)), &source, 2, 3)
+            .expect("rebalance overwrite should evaluate a different target version");
 
         assert!(!should_resume);
     }
