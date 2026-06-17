@@ -164,22 +164,6 @@ macro_rules! log_pool_request_rejected {
     };
 }
 
-macro_rules! log_pool_request_rejected_with_pool {
-    ($operation:expr, $reason:expr, $pool:expr) => {
-        warn!(
-            event = EVENT_ADMIN_REQUEST_REJECTED,
-            component = LOG_COMPONENT_ADMIN_API,
-            subsystem = LOG_SUBSYSTEM_POOL_ADMIN,
-            operation = $operation,
-            action = $operation,
-            result = "rejected",
-            reason = $reason,
-            pool = $pool,
-            "admin request rejected"
-        );
-    };
-}
-
 macro_rules! log_pool_request_failed {
     ($operation:expr, $reason:expr, $err:expr) => {
         error!(
@@ -241,15 +225,6 @@ fn contextualize_admin_pool_api_error(
     }
 }
 
-fn decommission_admin_not_initialized_error(operation: &str) -> S3Error {
-    log_pool_request_failed!(
-        operation_to_event(operation),
-        "object_layer_not_initialized",
-        "object layer not initialized"
-    );
-    S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to {operation}: object layer not initialized"))
-}
-
 fn decommission_admin_not_initialized_error_with_audit(operation: &str, audit: PoolAuditContext<'_>) -> S3Error {
     error!(
         event = EVENT_ADMIN_REQUEST_FAILED,
@@ -299,22 +274,9 @@ fn pool_admin_query_parse_error_with_audit(operation: &str, audit: PoolAuditCont
     S3Error::with_message(S3ErrorCode::InvalidArgument, format!("Failed to {operation}: invalid query parameters"))
 }
 
-fn pool_admin_pool_parse_error(operation: &str, pool: &str) -> S3Error {
-    log_pool_request_rejected_with_pool!(operation_to_event(operation), "invalid_pool", pool);
-    S3Error::with_message(S3ErrorCode::InvalidArgument, format!("Failed to {operation}: invalid pool `{pool}`"))
-}
-
 fn pool_admin_pool_parse_error_with_audit(operation: &str, pool: &str, audit: PoolAuditContext<'_>) -> S3Error {
     log_pool_request_rejected_with_pool_audit(operation_to_event(operation), "invalid_pool", pool, audit);
     S3Error::with_message(S3ErrorCode::InvalidArgument, format!("Failed to {operation}: invalid pool `{pool}`"))
-}
-
-fn pool_admin_pool_not_found_error(operation: &str, pool: &str) -> S3Error {
-    log_pool_request_rejected_with_pool!(operation_to_event(operation), "pool_not_found", pool);
-    S3Error::with_message(
-        S3ErrorCode::InvalidArgument,
-        format!("Failed to {operation}: pool `{pool}` was not found"),
-    )
 }
 
 fn pool_admin_pool_not_found_error_with_audit(operation: &str, pool: &str, audit: PoolAuditContext<'_>) -> S3Error {
@@ -322,24 +284,6 @@ fn pool_admin_pool_not_found_error_with_audit(operation: &str, pool: &str, audit
     S3Error::with_message(
         S3ErrorCode::InvalidArgument,
         format!("Failed to {operation}: pool `{pool}` was not found"),
-    )
-}
-
-fn pool_admin_pool_index_error(operation: &str, idx: usize, pool_count: usize) -> S3Error {
-    warn!(
-        event = EVENT_ADMIN_REQUEST_REJECTED,
-        component = LOG_COMPONENT_ADMIN_API,
-        subsystem = LOG_SUBSYSTEM_POOL_ADMIN,
-        operation = operation_to_event(operation),
-        result = "rejected",
-        reason = "pool_index_out_of_range",
-        pool_index = idx,
-        pool_count,
-        "admin request rejected"
-    );
-    S3Error::with_message(
-        S3ErrorCode::InvalidArgument,
-        format!("Failed to {operation}: pool index {idx} is out of range for {pool_count} pools"),
     )
 }
 
@@ -796,11 +740,10 @@ impl Operation for CancelDecommission {
 #[cfg(test)]
 mod pools_handler_tests {
     use super::{
-        PoolAuditContext, contextualize_admin_pool_api_error, decommission_admin_not_initialized_error,
-        decommission_admin_not_initialized_error_with_audit, dedup_indices, parse_pool_idx_by_id, parse_status_pool_query,
-        pool_admin_missing_credentials_error, pool_admin_missing_credentials_error_with_request, pool_admin_pool_index_error,
-        pool_admin_pool_index_error_with_audit, pool_admin_pool_not_found_error, pool_admin_pool_not_found_error_with_audit,
-        pool_admin_pool_parse_error, pool_admin_pool_parse_error_with_audit, pool_admin_query_parse_error,
+        PoolAuditContext, contextualize_admin_pool_api_error, decommission_admin_not_initialized_error_with_audit, dedup_indices,
+        parse_pool_idx_by_id, parse_status_pool_query, pool_admin_missing_credentials_error,
+        pool_admin_missing_credentials_error_with_request, pool_admin_pool_index_error_with_audit,
+        pool_admin_pool_not_found_error_with_audit, pool_admin_pool_parse_error_with_audit, pool_admin_query_parse_error,
         pool_admin_query_parse_error_with_audit, validate_start_decommission_guards,
     };
 
@@ -907,22 +850,6 @@ mod pools_handler_tests {
     }
 
     #[test]
-    fn test_decommission_admin_not_initialized_error_formats_start_context() {
-        let err = decommission_admin_not_initialized_error("start decommission");
-
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
-        assert_eq!(err.message(), Some("Failed to start decommission: object layer not initialized"));
-    }
-
-    #[test]
-    fn test_decommission_admin_not_initialized_error_formats_cancel_context() {
-        let err = decommission_admin_not_initialized_error("cancel decommission");
-
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
-        assert_eq!(err.message(), Some("Failed to cancel decommission: object layer not initialized"));
-    }
-
-    #[test]
     fn test_decommission_admin_not_initialized_error_with_audit_preserves_response_contract() {
         let audit = PoolAuditContext::new("req-1", "access-key", "127.0.0.1:9000");
         let err = decommission_admin_not_initialized_error_with_audit("start decommission", audit);
@@ -982,31 +909,12 @@ mod pools_handler_tests {
     }
 
     #[test]
-    fn test_pool_admin_pool_parse_error_formats_pool_context() {
-        let err = pool_admin_pool_parse_error("start decommission", "pool-x");
-
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
-        assert_eq!(err.message(), Some("Failed to start decommission: invalid pool `pool-x`"));
-    }
-
-    #[test]
     fn test_pool_admin_pool_parse_error_with_audit_preserves_response_contract() {
         let audit = PoolAuditContext::new("req-1", "access-key", "127.0.0.1:9000");
         let err = pool_admin_pool_parse_error_with_audit("start decommission", "pool-x", audit);
 
         assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("Failed to start decommission: invalid pool `pool-x`"));
-    }
-
-    #[test]
-    fn test_pool_admin_pool_index_error_formats_range_context() {
-        let err = pool_admin_pool_index_error("start decommission", 4, 2);
-
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
-        assert_eq!(
-            err.message(),
-            Some("Failed to start decommission: pool index 4 is out of range for 2 pools")
-        );
     }
 
     #[test]
@@ -1019,14 +927,6 @@ mod pools_handler_tests {
             err.message(),
             Some("Failed to start decommission: pool index 4 is out of range for 2 pools")
         );
-    }
-
-    #[test]
-    fn test_pool_admin_pool_not_found_error_formats_cancel_context() {
-        let err = pool_admin_pool_not_found_error("cancel decommission", "pool-x");
-
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
-        assert_eq!(err.message(), Some("Failed to cancel decommission: pool `pool-x` was not found"));
     }
 
     #[test]
