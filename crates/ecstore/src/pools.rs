@@ -303,6 +303,33 @@ fn ensure_decommission_start_local_leader(endpoints: &EndpointServerPools, indic
     Ok(())
 }
 
+fn build_decommission_start_state(
+    pi: PoolSpaceInfo,
+    queued: bool,
+    now: OffsetDateTime,
+    previous: Option<&PoolDecommissionInfo>,
+) -> PoolDecommissionInfo {
+    let mut info = PoolDecommissionInfo {
+        start_time: if queued { None } else { Some(now) },
+        start_size: pi.free,
+        total_size: pi.total,
+        current_size: pi.free,
+        queued,
+        ..Default::default()
+    };
+
+    if let Some(previous) = previous
+        && (previous.failed || previous.canceled)
+    {
+        info.decommissioned_buckets = previous.decommissioned_buckets.clone();
+        info.items_decommissioned = previous.items_decommissioned;
+        info.bytes_done = previous.bytes_done;
+        info.mark_progress_saved();
+    }
+
+    info
+}
+
 fn spawn_decommission_index_cancelers(
     store: Arc<ECStore>,
     rx: CancellationToken,
@@ -1284,16 +1311,10 @@ impl PoolMeta {
         let decommission_complete = pool.decommission.as_ref().is_some_and(|info| info.complete);
         ensure_decommission_start_allowed(true, decommission_active, decommission_complete)?;
 
+        let previous = pool.decommission.as_ref();
         let now = OffsetDateTime::now_utc();
         pool.last_update = now;
-        pool.decommission = Some(PoolDecommissionInfo {
-            start_time: if queued { None } else { Some(now) },
-            start_size: pi.free,
-            total_size: pi.total,
-            current_size: pi.free,
-            queued,
-            ..Default::default()
-        });
+        pool.decommission = Some(build_decommission_start_state(pi, queued, now, previous));
 
         Ok(())
     }
@@ -1562,17 +1583,18 @@ impl PoolDecommissionInfo {
     }
 
     pub fn bucket_push(&mut self, bucket: &DecomBucketInfo) {
-        for b in self.queued_buckets.iter() {
-            if self.is_bucket_decommissioned(b) {
-                return;
-            }
+        let bucket_key = bucket.to_string();
+        if self.is_bucket_decommissioned(&bucket_key) {
+            return;
+        }
 
-            if b == &bucket.to_string() {
+        for b in self.queued_buckets.iter() {
+            if b == &bucket_key {
                 return;
             }
         }
 
-        self.queued_buckets.push(bucket.to_string());
+        self.queued_buckets.push(bucket_key);
 
         self.bucket = bucket.name.clone();
         self.prefix = bucket.prefix.clone();
@@ -5651,6 +5673,116 @@ mod pools_tests {
         assert!(!meta.is_suspended(0));
         assert!(meta.promote_queued_decommission(0));
         assert!(meta.is_suspended(0));
+    }
+
+    #[test]
+    fn test_pool_meta_decommission_retry_preserves_completed_bucket_progress() {
+        let mut meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    failed: true,
+                    decommissioned_buckets: vec!["bucket-done".to_string()],
+                    queued_buckets: vec!["bucket-pending".to_string()],
+                    bucket: "bucket-pending".to_string(),
+                    prefix: "prefix".to_string(),
+                    object: "object.txt".to_string(),
+                    items_decommissioned: 7,
+                    items_decommission_failed: 3,
+                    bytes_done: 1024,
+                    bytes_failed: 256,
+                    progress_save_item_baseline: 10,
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+
+        meta.decommission(
+            0,
+            PoolSpaceInfo {
+                total: 200,
+                free: 50,
+                used: 150,
+            },
+        )
+        .expect("failed decommission should be restartable");
+        meta.queue_buckets(
+            0,
+            vec![
+                DecomBucketInfo {
+                    name: "bucket-done".to_string(),
+                    prefix: String::new(),
+                },
+                DecomBucketInfo {
+                    name: "bucket-pending".to_string(),
+                    prefix: String::new(),
+                },
+            ],
+        );
+
+        let info = meta.pools[0]
+            .decommission
+            .as_ref()
+            .expect("decommission info should be rebuilt");
+        assert!(!info.failed);
+        assert!(!info.canceled);
+        assert!(!info.complete);
+        assert_eq!(info.decommissioned_buckets, vec!["bucket-done".to_string()]);
+        assert_eq!(info.queued_buckets, vec!["bucket-pending".to_string()]);
+        assert_eq!(info.items_decommissioned, 7);
+        assert_eq!(info.items_decommission_failed, 0);
+        assert_eq!(info.bytes_done, 1024);
+        assert_eq!(info.bytes_failed, 0);
+        assert_eq!(info.items_since_last_progress_save(), 0);
+        assert_eq!(info.start_size, 50);
+        assert_eq!(info.total_size, 200);
+        assert_eq!(info.current_size, 50);
+        assert_eq!(info.bucket, "bucket-pending");
+        assert!(info.prefix.is_empty());
+        assert!(info.object.is_empty());
+        assert!(info.start_time.is_some());
+    }
+
+    #[test]
+    fn test_pool_meta_queued_decommission_retry_preserves_canceled_completed_buckets() {
+        let mut meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    canceled: true,
+                    decommissioned_buckets: vec!["bucket-done".to_string()],
+                    items_decommissioned: 5,
+                    bytes_done: 512,
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+
+        meta.queue_decommission(
+            0,
+            PoolSpaceInfo {
+                total: 100,
+                free: 25,
+                used: 75,
+            },
+        )
+        .expect("canceled queued decommission should be restartable");
+
+        let info = meta.pools[0]
+            .decommission
+            .as_ref()
+            .expect("decommission info should be rebuilt");
+        assert!(info.queued);
+        assert!(info.start_time.is_none());
+        assert_eq!(info.decommissioned_buckets, vec!["bucket-done".to_string()]);
+        assert_eq!(info.items_decommissioned, 5);
+        assert_eq!(info.bytes_done, 512);
     }
 
     #[test]
