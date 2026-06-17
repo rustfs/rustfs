@@ -2144,8 +2144,7 @@ impl DefaultObjectUsecase {
                         actual_size as usize,
                     )
                     .await?;
-                    HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false)
-                        .map_err(ApiError::from)?
+                    HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
                 } else {
                     let pool = get_concurrency_manager().bytes_pool();
                     let eager_body = read_small_put_body_exact_pooled(
@@ -2155,8 +2154,7 @@ impl DefaultObjectUsecase {
                     )
                     .await?;
                     let eager_reader = PooledBufferReader::new(eager_body, actual_size as usize);
-                    HashReader::from_stream(eager_reader, size, actual_size, md5hex, sha256hex, false)
-                        .map_err(ApiError::from)?
+                    HashReader::from_stream(eager_reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
                 }
             } else {
                 let body = tokio::io::BufReader::with_capacity(

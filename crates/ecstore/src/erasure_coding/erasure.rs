@@ -632,14 +632,10 @@ impl Erasure {
     where
         R: AsyncRead + Send + Sync + Unpin,
         F: FnMut(io::Result<Vec<Bytes>>) -> Fut + Send,
-        Fut: Future<Output=Result<(), E>> + Send,
+        Fut: Future<Output = Result<(), E>> + Send,
     {
         if self.block_size == 0 {
-            on_block(Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "erasure block_size must be non-zero",
-            )))
-                .await?;
+            on_block(Err(io::Error::new(io::ErrorKind::InvalidInput, "erasure block_size must be non-zero"))).await?;
             return Ok(0);
         }
 
@@ -658,7 +654,7 @@ impl Erasure {
                         let res = erasure.encode_data(&encode_buf[..n]);
                         (res, encode_buf)
                     })
-                        .await
+                    .await
                     {
                         Ok(result) => result,
                         Err(err) => {

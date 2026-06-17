@@ -14,13 +14,13 @@
 
 use crate::disk::error::Error;
 use crate::disk::error_reduce::{
-    build_write_quorum_failure_summary, reduce_write_quorum_errs, WriteQuorumFailureSummary, OBJECT_OP_IGNORED_ERRS,
+    OBJECT_OP_IGNORED_ERRS, WriteQuorumFailureSummary, build_write_quorum_failure_summary, reduce_write_quorum_errs,
 };
 use crate::erasure_coding::BitrotWriterWrapper;
 use crate::erasure_coding::Erasure;
 use bytes::Bytes;
-use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use std::sync::Arc;
 use std::vec;
 use tokio::io::AsyncRead;
@@ -301,8 +301,8 @@ impl Erasure {
                             let res = erasure.encode_data(&encode_buf[..n]);
                             (res, encode_buf)
                         })
-                            .await
-                            .map_err(|err| std::io::Error::other(format!("EC encode task failed: {err}")))?;
+                        .await
+                        .map_err(|err| std::io::Error::other(format!("EC encode task failed: {err}")))?;
                         buf = returned_buf;
                         let res = res?;
                         let queued_bytes = queued_block_bytes(&res);
