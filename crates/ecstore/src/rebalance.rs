@@ -1401,6 +1401,8 @@ impl ECStore {
                 reason = "no_participants",
                 "Skipped rebalance start because no pools are participating"
             );
+            let mut rebalance_meta = self.rebalance_meta.write().await;
+            clear_rebalance_cancel_token(rebalance_meta.as_mut());
             return Ok(());
         }
 
@@ -1473,6 +1475,8 @@ impl ECStore {
                 reason = "no_local_participants",
                 "Skipped rebalance start because no local pools are participating"
             );
+            let mut rebalance_meta = self.rebalance_meta.write().await;
+            clear_rebalance_cancel_token(rebalance_meta.as_mut());
             return Ok(());
         }
 
@@ -2889,10 +2893,19 @@ fn apply_stopped_at(meta: &mut RebalanceMeta, now: OffsetDateTime) {
     mark_started_rebalance_pools_stopping(meta);
 }
 
-fn stop_rebalance_state(meta: &mut RebalanceMeta, now: OffsetDateTime) {
+fn clear_rebalance_cancel_token(meta: Option<&mut RebalanceMeta>) -> bool {
+    let Some(meta) = meta else {
+        return false;
+    };
     if let Some(cancel_tx) = meta.cancel.take() {
         cancel_tx.cancel();
+        return true;
     }
+    false
+}
+
+fn stop_rebalance_state(meta: &mut RebalanceMeta, now: OffsetDateTime) {
+    clear_rebalance_cancel_token(Some(meta));
 
     if meta.stopped_at.is_none() && is_rebalance_in_progress(meta) {
         apply_stopped_at(meta, now);
@@ -3658,12 +3671,12 @@ mod rebalance_unit_tests {
         RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta,
         RebalanceStats, RebalanceStopPropagationRecord, RebalanceTerminalEvent, apply_rebalance_save_option,
         apply_rebalance_terminal_event, apply_stopped_at, cancel_rebalance_worker_for_terminal_reload,
-        classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
-        complete_rebalance_pools_at_goal, complete_rebalance_pools_with_empty_queue, decode_rebalance_stop_propagation_record,
-        defer_bucket_in_rebalance_queue, encode_rebalance_stop_propagation_record, ensure_rebalance_listing_disks_available,
-        ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, has_deferred_rebalance_error,
-        is_rebalance_stop_propagation_error, is_rebalance_stopped_terminal_event, is_terminal_rebalance_reload,
-        is_transient_rebalance_error, load_rebalance_bucket_configs, mark_rebalance_bucket_done,
+        classify_rebalance_terminal_event, clear_rebalance_cancel_token, clone_arc_by_index, clone_first_arc,
+        clone_rebalance_pool_stats, complete_rebalance_pools_at_goal, complete_rebalance_pools_with_empty_queue,
+        decode_rebalance_stop_propagation_record, defer_bucket_in_rebalance_queue, encode_rebalance_stop_propagation_record,
+        ensure_rebalance_listing_disks_available, ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index,
+        has_deferred_rebalance_error, is_rebalance_stop_propagation_error, is_rebalance_stopped_terminal_event,
+        is_terminal_rebalance_reload, is_transient_rebalance_error, load_rebalance_bucket_configs, mark_rebalance_bucket_done,
         mark_started_rebalance_pools_stopped, merge_rebalance_meta, migrate_entry_version,
         migrate_entry_version_with_delete_marker, migrate_entry_version_with_retry_wait, next_rebal_bucket_from_stat,
         parse_rebalance_max_attempts, rebalance_delete_marker_opts, rebalance_listing_retry_delay,
@@ -7103,6 +7116,25 @@ mod rebalance_unit_tests {
         assert!(cancel_rebalance_worker_for_terminal_reload(Some(&mut local), &loaded));
         assert!(cancel_clone.is_cancelled());
         assert!(local.cancel.is_none());
+    }
+
+    #[test]
+    fn test_clear_rebalance_cancel_token_cancels_and_removes_token() {
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let mut meta = RebalanceMeta {
+            cancel: Some(cancel),
+            ..Default::default()
+        };
+
+        assert!(clear_rebalance_cancel_token(Some(&mut meta)));
+        assert!(cancel_clone.is_cancelled());
+        assert!(meta.cancel.is_none());
+    }
+
+    #[test]
+    fn test_clear_rebalance_cancel_token_ignores_missing_meta() {
+        assert!(!clear_rebalance_cancel_token(None));
     }
 
     #[test]
