@@ -2356,6 +2356,7 @@ impl ECStore {
         let mut pool_meta = self.pool_meta.write().await;
         if pool_meta.decommission_failed(idx) {
             pool_meta.save(self.pools.clone()).await?;
+            pool_meta.mark_decommission_progress_saved();
 
             drop(pool_meta);
 
@@ -2387,6 +2388,7 @@ impl ECStore {
         let mut pool_meta = self.pool_meta.write().await;
         if pool_meta.decommission_complete(idx) {
             pool_meta.save(self.pools.clone()).await?;
+            pool_meta.mark_decommission_progress_saved();
             drop(pool_meta);
             if let Some(notification_sys) = get_global_notification_sys() {
                 let stage = format!("complete_decommission for pool {idx}");
@@ -2432,6 +2434,7 @@ impl ECStore {
                         idx,
                         bucket.name.as_str(),
                     )?;
+                    pool_meta.mark_decommission_progress_saved();
                 }
             }
             return Ok(());
@@ -2459,6 +2462,7 @@ impl ECStore {
                     idx,
                     bucket.name.as_str(),
                 )?;
+                pool_meta.mark_decommission_progress_saved();
             }
 
             warn!("decommission: decommission_pool bucket_done {}", &bucket.name);
