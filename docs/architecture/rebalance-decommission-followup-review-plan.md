@@ -37,6 +37,7 @@ The following externally reported issues were checked against the current code a
 - Rebalance stats refresh holds a `rebalance_meta` read guard across `save_rebalance_meta_with_merge(...).await`. Covered by R16.
 - Data movement metadata equivalence did not explicitly include user-visible `x-amz-tagging`/`expires` fields that are cleaned out of `user_defined`. Covered by expanded R03.
 - Last-delete-marker skip behavior exists in both decommission and rebalance and has helper-level tests, but lacks MinIO-compatible version-listing regression coverage after migration and cleanup. Covered by new R14.
+- R14 proof showed that deleting an absent key in a versioned bucket currently creates a delete-marker response without a version ID and `ListObjectVersions` does not report that only delete marker. Covered by new R17.
 - The admin handler accepts comma-separated decommission targets, but store validation rejects more than one target pool. This is conservative, but the MinIO compatibility contract is not documented. Covered by R15.
 
 ## Execution Order
@@ -58,7 +59,8 @@ The following externally reported issues were checked against the current code a
 | 13 | R09 | F12 | P2 | Decommission rejected-request logs lack complete audit context |
 | 14 | R10 | F13 | P2 | Legacy pool metadata fallback can bypass unknown-field hardening |
 | 15 | R14 | F01 | P2 | Last delete marker migration semantics lack MinIO-compatible E2E proof |
-| 16 | R15 | Compatibility | P3 | Multi-pool decommission support is accepted by API shape but rejected by store |
+| 16 | R17 | Versioning compatibility | P2 | Versioned delete of absent key loses only-delete-marker version metadata |
+| 17 | R15 | Compatibility | P3 | Multi-pool decommission support is accepted by API shape but rejected by store |
 
 ## Shared Rules
 
@@ -937,6 +939,65 @@ cargo fmt --all --check
 ```bash
 git add crates/e2e_test/src
 git commit -m "test(data-movement): cover delete marker migration"
+```
+
+---
+
+## R17: Preserve Only-delete-marker Version Metadata
+
+### Original Fix
+
+Compatibility follow-up discovered by R14.
+
+### Finding
+
+R14 proved a MinIO-incompatible versioning gap before exercising migration: in a versioned bucket, deleting an absent key returns success but does not expose a durable delete-marker version. The delete response lacks `version_id`, and `ListObjectVersions` does not report the only delete marker. Because decommission and rebalance intentionally skip a last remaining delete marker without replication, this baseline gap means migration cleanup can remove or ignore the only user-visible version metadata without an active failing default test.
+
+### Files
+
+- Modify: `crates/ecstore/src/store/object.rs`
+- Modify if needed: `crates/ecstore/src/set_disk.rs`
+- Test: `crates/e2e_test/src/delete_marker_migration_semantics_test.rs`
+- Test if cheaper seam exists: `crates/ecstore/src/store/object.rs`
+
+### Design
+
+Make versioned deletion of an absent key persist and expose an S3/MinIO-compatible delete marker:
+
+1. When bucket versioning is enabled and the target key has no existing data version, create a delete marker with a real version ID.
+2. Ensure `ListObjectVersions` reports that delete marker as the latest version.
+3. Preserve current-object `GET` delete-marker not-found semantics.
+4. Keep delete-marker-plus-history behavior unchanged.
+5. Unignore the R14 only-delete-marker compatibility test once the behavior is fixed.
+
+Do not change decommission/rebalance skip policy in this task; first make the underlying versioning semantics compatible and verifiable.
+
+### Implementation Steps
+
+- [ ] Reproduce the R14 ignored e2e by running it with `--ignored` and confirm it fails on missing only-delete-marker metadata.
+- [ ] Trace the versioned delete path for absent keys and identify where delete marker metadata is skipped or not assigned a version ID.
+- [ ] Add a focused unit/helper test if a cheap seam exists, then fix the delete path to persist the delete marker.
+- [ ] Unignore `test_versioning_only_delete_marker_has_minio_compatible_visibility_for_migration_proof`.
+- [ ] Run:
+
+```bash
+cargo test -p rustfs-ecstore delete_marker --lib
+cargo test -p e2e_test delete_marker_migration_semantics -- --nocapture
+cargo fmt --all --check
+```
+
+### Acceptance Criteria
+
+- Deleting an absent key in an enabled versioned bucket returns a delete-marker version ID.
+- `ListObjectVersions` reports the only delete marker as latest.
+- Current-object `GET` still returns delete-marker not-found semantics.
+- The R14 only-delete-marker compatibility proof runs by default and passes.
+
+### Commit
+
+```bash
+git add crates/ecstore/src/store/object.rs crates/e2e_test/src/delete_marker_migration_semantics_test.rs
+git commit -m "fix(versioning): persist only delete markers"
 ```
 
 ---
