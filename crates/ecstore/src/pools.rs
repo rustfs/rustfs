@@ -2136,16 +2136,12 @@ impl ECStore {
                 ));
             }
 
-            let ok = match resolve_decommission_update_after_result(
-                pool_meta.update_after(idx, DECOMMISSION_PROGRESS_SAVE_INTERVAL),
-            ) {
+            match resolve_decommission_update_after_result(pool_meta.update_after(idx, DECOMMISSION_PROGRESS_SAVE_INTERVAL)) {
                 Ok(ok) => ok,
                 Err(err) => {
                     return Err(with_decommission_entry_context("update_after", bucket.as_str(), entry.name.as_str(), err));
                 }
-            };
-
-            ok
+            }
         };
 
         if should_save_progress {
@@ -2847,67 +2843,67 @@ impl ECStore {
             return Err(save_err);
         }
 
-        if let Some(notification_sys) = get_global_notification_sys() {
-            if let Err(err) = resolve_start_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await) {
-                warn!(
-                    event = EVENT_DECOMMISSION_STATE,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_POOLS,
-                    state = "start_failed",
-                    stage = "reload_pool_meta",
-                    error = %err,
-                    "Decommission start failed after pool metadata save"
-                );
+        if let Some(notification_sys) = get_global_notification_sys()
+            && let Err(err) = resolve_start_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await)
+        {
+            warn!(
+                event = EVENT_DECOMMISSION_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                state = "start_failed",
+                stage = "reload_pool_meta",
+                error = %err,
+                "Decommission start failed after pool metadata save"
+            );
 
-                {
-                    let mut pool_meta = self.pool_meta.write().await;
-                    rollback_start_decommission_pool_meta(&mut pool_meta, previous_pool_meta.clone());
-                }
-                if let Err(rollback_save_err) = self.save_current_pool_meta().await {
-                    error!(
-                        event = EVENT_DECOMMISSION_STATE,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_POOLS,
-                        state = "rollback_failed",
-                        stage = "save_pool_meta",
-                        error = %rollback_save_err,
-                        original_error = %err,
-                        "Decommission rollback failed after pool metadata reload failure"
-                    );
-                    return Err(Error::other(format!(
-                        "{err}; decommission start rollback save failed: {rollback_save_err}"
-                    )));
-                }
-
-                if let Err(rollback_reload_err) = resolve_decommission_pool_meta_reload_result(
-                    notification_sys.reload_pool_meta().await,
-                    "start_decommission_rollback",
-                ) {
-                    error!(
-                        event = EVENT_DECOMMISSION_STATE,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_POOLS,
-                        state = "rollback_partial",
-                        stage = "reload_pool_meta",
-                        error = %rollback_reload_err,
-                        original_error = %err,
-                        "Decommission rollback metadata reload failed after local rollback save"
-                    );
-                    return Err(Error::other(format!(
-                        "{err}; decommission start rollback saved locally but peer reload failed: {rollback_reload_err}"
-                    )));
-                }
-
-                warn!(
-                    event = EVENT_DECOMMISSION_STATE,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_POOLS,
-                    state = "rollback_success",
-                    original_error = %err,
-                    "Decommission start rolled back after pool metadata reload failure"
-                );
-                return Err(Error::other(format!("{err}; decommission start rollback succeeded")));
+            {
+                let mut pool_meta = self.pool_meta.write().await;
+                rollback_start_decommission_pool_meta(&mut pool_meta, previous_pool_meta.clone());
             }
+            if let Err(rollback_save_err) = self.save_current_pool_meta().await {
+                error!(
+                    event = EVENT_DECOMMISSION_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    state = "rollback_failed",
+                    stage = "save_pool_meta",
+                    error = %rollback_save_err,
+                    original_error = %err,
+                    "Decommission rollback failed after pool metadata reload failure"
+                );
+                return Err(Error::other(format!(
+                    "{err}; decommission start rollback save failed: {rollback_save_err}"
+                )));
+            }
+
+            if let Err(rollback_reload_err) = resolve_decommission_pool_meta_reload_result(
+                notification_sys.reload_pool_meta().await,
+                "start_decommission_rollback",
+            ) {
+                error!(
+                    event = EVENT_DECOMMISSION_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    state = "rollback_partial",
+                    stage = "reload_pool_meta",
+                    error = %rollback_reload_err,
+                    original_error = %err,
+                    "Decommission rollback metadata reload failed after local rollback save"
+                );
+                return Err(Error::other(format!(
+                    "{err}; decommission start rollback saved locally but peer reload failed: {rollback_reload_err}"
+                )));
+            }
+
+            warn!(
+                event = EVENT_DECOMMISSION_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                state = "rollback_success",
+                original_error = %err,
+                "Decommission start rolled back after pool metadata reload failure"
+            );
+            return Err(Error::other(format!("{err}; decommission start rollback succeeded")));
         }
 
         Ok(())

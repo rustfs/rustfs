@@ -4888,7 +4888,6 @@ mod rebalance_unit_tests {
                             message: "cleanup failed".to_string(),
                             timestamp: Some(warning_at),
                         }],
-                        ..Default::default()
                     },
                     ..Default::default()
                 },
