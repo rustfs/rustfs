@@ -21,14 +21,16 @@ use crate::store_api::{
 use bytes::Bytes;
 use rustfs_filemeta::{FileInfo, FileInfoVersions, ObjectPartInfo};
 use rustfs_rio::{ChecksumType, EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex};
+use rustfs_utils::http::AMZ_OBJECT_TAGGING;
 use rustfs_utils::path::encode_dir_object;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::task::{Context, Poll};
+use time::format_description::well_known::Rfc3339;
 use tokio::io::{AsyncRead, BufReader, ReadBuf};
 use tracing::{error, info};
 
@@ -188,12 +190,25 @@ fn data_movement_new_multipart_opts(object_info: &ObjectInfo, src_pool_idx: usiz
     ObjectOptions {
         versioned: object_info.version_id.is_some(),
         version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
-        user_defined: (*object_info.user_defined).clone(),
+        user_defined: data_movement_user_defined(object_info),
         preserve_etag: object_info.etag.clone(),
         src_pool_idx,
         data_movement: true,
         ..Default::default()
     }
+}
+
+fn data_movement_user_defined(object_info: &ObjectInfo) -> HashMap<String, String> {
+    let mut user_defined = (*object_info.user_defined).clone();
+    if !object_info.user_tags.is_empty() {
+        user_defined.insert(AMZ_OBJECT_TAGGING.to_string(), (*object_info.user_tags).clone());
+    }
+    if let Some(expires) = object_info.expires
+        && let Ok(expires) = expires.format(&Rfc3339)
+    {
+        user_defined.insert("expires".to_string(), expires);
+    }
+    user_defined
 }
 
 fn data_movement_complete_multipart_opts(object_info: &ObjectInfo, src_pool_idx: usize) -> ObjectOptions {
@@ -215,7 +230,7 @@ fn data_movement_put_object_opts(object_info: &ObjectInfo, src_pool_idx: usize) 
         data_movement: true,
         version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
         mod_time: object_info.mod_time,
-        user_defined: (*object_info.user_defined).clone(),
+        user_defined: data_movement_user_defined(object_info),
         preserve_etag: object_info.etag.clone(),
         ..Default::default()
     }
@@ -1316,6 +1331,38 @@ mod tests {
             new_multipart_opts.user_defined.get(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str()),
             Some(&"ON".to_string())
         );
+    }
+
+    #[test]
+    fn test_data_movement_opts_preserve_tags_and_expires() {
+        let expires = OffsetDateTime::from_unix_timestamp(2_000).expect("valid timestamp");
+        let object_info = ObjectInfo {
+            user_defined: Arc::new(HashMap::from([("x-amz-meta-key".to_string(), "value".to_string())])),
+            user_tags: Arc::new("tag=value".to_string()),
+            expires: Some(expires),
+            ..Default::default()
+        };
+
+        let put_opts = data_movement_put_object_opts(&object_info, 1);
+        let multipart_opts = data_movement_new_multipart_opts(&object_info, 1);
+
+        assert_eq!(
+            put_opts
+                .user_defined
+                .get(rustfs_utils::http::AMZ_OBJECT_TAGGING)
+                .map(String::as_str),
+            Some("tag=value")
+        );
+        assert_eq!(
+            multipart_opts
+                .user_defined
+                .get(rustfs_utils::http::AMZ_OBJECT_TAGGING)
+                .map(String::as_str),
+            Some("tag=value")
+        );
+        assert!(put_opts.user_defined.contains_key("expires"));
+        assert!(multipart_opts.user_defined.contains_key("expires"));
+        assert_eq!(put_opts.user_defined.get("x-amz-meta-key").map(String::as_str), Some("value"));
     }
 
     #[test]
