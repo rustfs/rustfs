@@ -251,6 +251,16 @@ fn effective_actual_size(info: &ObjectInfo) -> Option<i64> {
     info.get_actual_size().ok()
 }
 
+fn is_equivalent_data_movement_part(source: &ObjectPartInfo, target: &ObjectPartInfo) -> bool {
+    source.number == target.number
+        && source.etag == target.etag
+        && source.size == target.size
+        && source.actual_size == target.actual_size
+        && source.mod_time == target.mod_time
+        && source.index == target.index
+        && source.checksums == target.checksums
+}
+
 fn is_equivalent_data_movement_object(source: &ObjectInfo, target: &ObjectInfo) -> bool {
     source.version_id == target.version_id
         && source.delete_marker == target.delete_marker
@@ -261,6 +271,18 @@ fn is_equivalent_data_movement_object(source: &ObjectInfo, target: &ObjectInfo) 
         && source.mod_time == target.mod_time
         && source.storage_class == target.storage_class
         && source.user_defined == target.user_defined
+        && source.user_tags == target.user_tags
+        && source.expires == target.expires
+        && source.replication_status_internal == target.replication_status_internal
+        && source.replication_status == target.replication_status
+        && source.version_purge_status_internal == target.version_purge_status_internal
+        && source.version_purge_status == target.version_purge_status
+        && source.parts.len() == target.parts.len()
+        && source
+            .parts
+            .iter()
+            .zip(target.parts.iter())
+            .all(|(source_part, target_part)| is_equivalent_data_movement_part(source_part, target_part))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1397,6 +1419,96 @@ mod tests {
         };
 
         assert!(is_equivalent_data_movement_object(&source, &target));
+    }
+
+    fn overwrite_equivalence_source() -> ObjectInfo {
+        let part = ObjectPartInfo {
+            number: 1,
+            etag: "part-etag".to_string(),
+            size: 128,
+            actual_size: 128,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            index: Some(Bytes::from_static(&[1, 2, 3])),
+            checksums: Some(HashMap::from([(ChecksumType::CRC32C.to_string(), "part-checksum".to_string())])),
+            ..Default::default()
+        };
+
+        ObjectInfo {
+            version_id: Some(Uuid::from_u128(1)),
+            size: 128,
+            actual_size: 128,
+            etag: Some("etag-value".to_string()),
+            checksum: Some(Bytes::from_static(b"object-checksum")),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            user_defined: Arc::new(HashMap::from([("x-amz-meta-key".to_string(), "value".to_string())])),
+            user_tags: Arc::new("tag=value".to_string()),
+            expires: Some(OffsetDateTime::from_unix_timestamp(2_000).expect("valid expires timestamp")),
+            storage_class: Some("STANDARD_IA".to_string()),
+            replication_status_internal: Some("arn:minio:replication:target=COMPLETED;".to_string()),
+            replication_status: rustfs_filemeta::ReplicationStatusType::Completed,
+            version_purge_status_internal: Some("arn:minio:replication:target=PENDING;".to_string()),
+            version_purge_status: rustfs_filemeta::VersionPurgeStatusType::Pending,
+            parts: Arc::new(vec![part]),
+            ..Default::default()
+        }
+    }
+
+    fn overwrite_resume_for_target(source: &ObjectInfo, target: ObjectInfo) -> bool {
+        let err = Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "version".to_string());
+        resolve_data_movement_overwrite_resume_result(&err, Ok(Some(target)), source, 0, 1)
+            .expect("overwrite target should be evaluated")
+    }
+
+    #[test]
+    fn test_data_movement_overwrite_resume_accepts_full_equivalence() {
+        let source = overwrite_equivalence_source();
+
+        assert!(overwrite_resume_for_target(&source, source.clone()));
+    }
+
+    #[test]
+    fn test_data_movement_overwrite_resume_rejects_missing_part_checksum() {
+        let source = overwrite_equivalence_source();
+        let mut target = source.clone();
+        let mut parts = target.parts.as_ref().clone();
+        parts[0].checksums = None;
+        target.parts = Arc::new(parts);
+
+        assert!(!overwrite_resume_for_target(&source, target));
+    }
+
+    #[test]
+    fn test_data_movement_overwrite_resume_rejects_version_purge_mismatch() {
+        let source = overwrite_equivalence_source();
+        let target = ObjectInfo {
+            version_purge_status_internal: Some("arn:minio:replication:target=COMPLETE;".to_string()),
+            version_purge_status: rustfs_filemeta::VersionPurgeStatusType::Complete,
+            ..source.clone()
+        };
+
+        assert!(!overwrite_resume_for_target(&source, target));
+    }
+
+    #[test]
+    fn test_data_movement_overwrite_resume_rejects_tag_mismatch() {
+        let source = overwrite_equivalence_source();
+        let target = ObjectInfo {
+            user_tags: Arc::new(String::new()),
+            ..source.clone()
+        };
+
+        assert!(!overwrite_resume_for_target(&source, target));
+    }
+
+    #[test]
+    fn test_data_movement_overwrite_resume_rejects_expires_mismatch() {
+        let source = overwrite_equivalence_source();
+        let target = ObjectInfo {
+            expires: None,
+            ..source.clone()
+        };
+
+        assert!(!overwrite_resume_for_target(&source, target));
     }
 
     #[test]
