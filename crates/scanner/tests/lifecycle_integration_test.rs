@@ -1020,7 +1020,7 @@ mod serial_tests {
                 multipart_bucket.as_str(),
                 multipart_object,
                 &upload.upload_id,
-                vec![rustfs_ecstore::store_api::CompletePart {
+                vec![rustfs_storage_api::CompletePart {
                     part_num: 1,
                     etag: part.etag.clone(),
                     ..Default::default()
@@ -1165,12 +1165,12 @@ mod serial_tests {
                 object_name,
                 &upload.upload_id,
                 vec![
-                    rustfs_ecstore::store_api::CompletePart {
+                    rustfs_storage_api::CompletePart {
                         part_num: 1,
                         etag: uploaded_part1.etag.clone(),
                         ..Default::default()
                     },
-                    rustfs_ecstore::store_api::CompletePart {
+                    rustfs_storage_api::CompletePart {
                         part_num: 2,
                         etag: uploaded_part2.etag.clone(),
                         ..Default::default()
