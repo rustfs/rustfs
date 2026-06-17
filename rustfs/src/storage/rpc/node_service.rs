@@ -136,6 +136,19 @@ fn background_rebalance_start_error_message(result: rustfs_ecstore::error::Resul
     result.err().map(|err| format!("start_rebalance failed: {err}"))
 }
 
+fn stop_rebalance_response(result: rustfs_ecstore::error::Result<()>) -> StopRebalanceResponse {
+    match result {
+        Ok(_) => StopRebalanceResponse {
+            success: true,
+            error_info: None,
+        },
+        Err(err) => StopRebalanceResponse {
+            success: false,
+            error_info: Some(err.to_string()),
+        },
+    }
+}
+
 #[path = "bucket.rs"]
 mod bucket;
 #[path = "disk.rs"]
@@ -993,11 +1006,7 @@ impl Node for NodeService {
             }));
         };
 
-        let _ = store.stop_rebalance().await;
-        Ok(Response::new(StopRebalanceResponse {
-            success: true,
-            error_info: None,
-        }))
+        Ok(Response::new(stop_rebalance_response(store.stop_rebalance().await)))
     }
 
     #[tracing::instrument(skip_all, fields(start_rebalance))]
@@ -1022,21 +1031,22 @@ impl Node for NodeService {
 
         if start_rebalance {
             log_background_rebalance_task_spawned!(start_rebalance);
-            let store = store.clone();
-            spawn(async move {
-                if let Some(message) = background_rebalance_start_error_message(store.start_rebalance().await) {
-                    error!(
-                        event = EVENT_RPC_BACKGROUND_TASK_FAILED,
-                        component = LOG_COMPONENT_STORAGE,
-                        subsystem = LOG_SUBSYSTEM_REBALANCE,
-                        operation = "start_rebalance",
-                        state = "failed",
-                        start_rebalance,
-                        error = %message,
-                        "node rpc background task failed"
-                    );
-                }
-            });
+            if let Some(message) = background_rebalance_start_error_message(store.start_rebalance().await) {
+                error!(
+                    event = EVENT_RPC_BACKGROUND_TASK_FAILED,
+                    component = LOG_COMPONENT_STORAGE,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    operation = "start_rebalance",
+                    state = "failed",
+                    start_rebalance,
+                    error = %message,
+                    "node rpc background task failed"
+                );
+                return Ok(Response::new(LoadRebalanceMetaResponse {
+                    success: false,
+                    error_info: Some(message),
+                }));
+            }
         }
 
         Ok(Response::new(LoadRebalanceMetaResponse {
@@ -2381,6 +2391,22 @@ mod tests {
 
         assert!(message.contains("start_rebalance failed"));
         assert!(message.contains("boom"));
+    }
+
+    #[test]
+    fn test_stop_rebalance_response_reports_local_stop_error() {
+        let response = stop_rebalance_response(Err(rustfs_ecstore::error::Error::other("boom")));
+
+        assert!(!response.success);
+        assert!(response.error_info.as_deref().is_some_and(|message| message.contains("boom")));
+    }
+
+    #[test]
+    fn test_stop_rebalance_response_reports_success() {
+        let response = stop_rebalance_response(Ok(()));
+
+        assert!(response.success);
+        assert!(response.error_info.is_none());
     }
 
     #[tokio::test]

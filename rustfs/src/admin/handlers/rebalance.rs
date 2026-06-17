@@ -303,7 +303,7 @@ impl Operation for RebalanceStart {
                 state = "propagation_started",
                 "admin rebalance state"
             );
-            if let Err(err) = notification_sys.load_rebalance_meta(true).await {
+            notification_sys.load_rebalance_meta(true).await.map_err(|err| {
                 info!(
                     event = EVENT_ADMIN_REBALANCE_STATE,
                     component = LOG_COMPONENT_ADMIN,
@@ -313,7 +313,8 @@ impl Operation for RebalanceStart {
                     error = %err,
                     "admin rebalance state"
                 );
-            }
+                s3_error!(InternalError, "failed to propagate rebalance start: {}", err)
+            })?;
             info!(
                 event = EVENT_ADMIN_REBALANCE_STATE,
                 component = LOG_COMPONENT_ADMIN,
@@ -495,7 +496,7 @@ impl Operation for RebalanceStop {
                 state = "propagation_started",
                 "admin rebalance state"
             );
-            if let Err(err) = notification_sys.load_rebalance_meta(false).await {
+            notification_sys.load_rebalance_meta(false).await.map_err(|err| {
                 info!(
                     event = EVENT_ADMIN_REBALANCE_STATE,
                     component = LOG_COMPONENT_ADMIN,
@@ -505,7 +506,8 @@ impl Operation for RebalanceStop {
                     error = %err,
                     "admin rebalance state"
                 );
-            }
+                s3_error!(InternalError, "failed to propagate rebalance stop metadata: {}", err)
+            })?;
             info!(
                 event = EVENT_ADMIN_REBALANCE_STATE,
                 component = LOG_COMPONENT_ADMIN,

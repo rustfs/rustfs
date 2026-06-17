@@ -565,9 +565,7 @@ impl NotificationSys {
             }
         }
 
-        if let Err(err) = aggregate_notification_failures("stop_rebalance", failures) {
-            warn!("{err}");
-        }
+        aggregate_notification_failures("stop_rebalance", failures)?;
         warn!("notification stop_rebalance stop_rebalance done");
         Ok(())
     }
@@ -1092,6 +1090,34 @@ mod tests {
         assert!(msg.contains("2 failure(s)"));
         assert!(msg.contains("peer-1 failed"));
         assert!(msg.contains("local save failed"));
+    }
+
+    #[test]
+    fn load_rebalance_meta_aggregate_failures_return_error() {
+        let err = aggregate_notification_failures(
+            "load_rebalance_meta(start=true)",
+            vec!["peer[0] load_rebalance_meta failed: peer is not reachable".to_string()],
+        )
+        .expect_err("load_rebalance_meta peer failures must be returned");
+
+        let msg = err.to_string();
+        assert!(msg.contains("load_rebalance_meta(start=true)"));
+        assert!(msg.contains("1 failure(s)"));
+        assert!(msg.contains("peer[0]"));
+    }
+
+    #[test]
+    fn stop_rebalance_aggregate_failures_return_error() {
+        let err = aggregate_notification_failures(
+            "stop_rebalance",
+            vec!["peer[0] stop_rebalance failed: peer is not reachable".to_string()],
+        )
+        .expect_err("stop_rebalance peer failures must be returned");
+
+        let msg = err.to_string();
+        assert!(msg.contains("stop_rebalance"));
+        assert!(msg.contains("1 failure(s)"));
+        assert!(msg.contains("peer[0]"));
     }
 
     #[tokio::test]
