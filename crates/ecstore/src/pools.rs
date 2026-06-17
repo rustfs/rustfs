@@ -390,6 +390,10 @@ fn resolve_start_decommission_pool_meta_reload_result(result: Result<()>) -> Res
     resolve_decommission_pool_meta_reload_result(result, "start_decommission")
 }
 
+fn rollback_start_decommission_pool_meta(pool_meta: &mut PoolMeta, previous_pool_meta: PoolMeta) {
+    *pool_meta = previous_pool_meta;
+}
+
 fn ensure_pool_not_left_in_cmdline_after_decommission(position: usize, cmd_line: &str, completed: bool) -> Result<()> {
     if completed {
         return Err(Error::other(format!(
@@ -2597,6 +2601,7 @@ impl ECStore {
             ensure_decommission_start_allowed(pool_present, decommission_active)?;
         }
 
+        let previous_pool_meta = pool_meta.clone();
         for (idx, pi) in space_infos {
             pool_meta.decommission(idx, pi)?;
             pool_meta.queue_buckets(idx, decom_buckets.clone());
@@ -2605,7 +2610,7 @@ impl ECStore {
         pool_meta.save(self.pools.clone()).await?;
 
         if let Some(notification_sys) = get_global_notification_sys() {
-            resolve_start_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await).map_err(|err| {
+            if let Err(err) = resolve_start_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await) {
                 warn!(
                     event = EVENT_DECOMMISSION_STATE,
                     component = LOG_COMPONENT_ECSTORE,
@@ -2615,8 +2620,53 @@ impl ECStore {
                     error = %err,
                     "Decommission start failed after pool metadata save"
                 );
-                err
-            })?;
+
+                rollback_start_decommission_pool_meta(&mut pool_meta, previous_pool_meta);
+                if let Err(rollback_save_err) = pool_meta.save(self.pools.clone()).await {
+                    error!(
+                        event = EVENT_DECOMMISSION_STATE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_POOLS,
+                        state = "rollback_failed",
+                        stage = "save_pool_meta",
+                        error = %rollback_save_err,
+                        original_error = %err,
+                        "Decommission rollback failed after pool metadata reload failure"
+                    );
+                    return Err(Error::other(format!(
+                        "{err}; decommission start rollback save failed: {rollback_save_err}"
+                    )));
+                }
+
+                if let Err(rollback_reload_err) = resolve_decommission_pool_meta_reload_result(
+                    notification_sys.reload_pool_meta().await,
+                    "start_decommission_rollback",
+                ) {
+                    error!(
+                        event = EVENT_DECOMMISSION_STATE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_POOLS,
+                        state = "rollback_partial",
+                        stage = "reload_pool_meta",
+                        error = %rollback_reload_err,
+                        original_error = %err,
+                        "Decommission rollback metadata reload failed after local rollback save"
+                    );
+                    return Err(Error::other(format!(
+                        "{err}; decommission start rollback saved locally but peer reload failed: {rollback_reload_err}"
+                    )));
+                }
+
+                warn!(
+                    event = EVENT_DECOMMISSION_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    state = "rollback_success",
+                    original_error = %err,
+                    "Decommission start rolled back after pool metadata reload failure"
+                );
+                return Err(Error::other(format!("{err}; decommission start rollback succeeded")));
+            }
         }
 
         Ok(())
@@ -3522,10 +3572,10 @@ mod pools_tests {
         resolve_decommission_preflight_heal_result, resolve_decommission_spawn_failure_result,
         resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
         resolve_decommission_update_after_result, resolve_start_decommission_pool_meta_reload_result,
-        run_decommission_buckets_bounded, should_cleanup_decommission_source_entry, should_continue_decommission_queue,
-        should_count_decommission_version_complete, should_preserve_decommission_canceled_state, split_decommission_buckets,
-        take_decommission_canceler, track_decommission_current_object, validate_start_decommission_request,
-        with_decommission_entry_context,
+        rollback_start_decommission_pool_meta, run_decommission_buckets_bounded, should_cleanup_decommission_source_entry,
+        should_continue_decommission_queue, should_count_decommission_version_complete,
+        should_preserve_decommission_canceled_state, split_decommission_buckets, take_decommission_canceler,
+        track_decommission_current_object, validate_start_decommission_request, with_decommission_entry_context,
     };
     use crate::data_movement;
     use crate::error::Error;
@@ -3726,6 +3776,31 @@ mod pools_tests {
     fn test_pool_meta_is_suspended_returns_false_for_out_of_range() {
         let meta = PoolMeta::default();
         assert!(!meta.is_suspended(1));
+    }
+
+    #[test]
+    fn test_rollback_start_decommission_pool_meta_clears_active_state() {
+        let previous = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: None,
+            }],
+            ..Default::default()
+        };
+        let mut active = previous.clone();
+        active.pools[0].decommission = Some(PoolDecommissionInfo::default());
+
+        assert!(active.is_suspended(0));
+        let (_, decommission_active) = decommission_start_guard_state(active.pools.first());
+        assert!(decommission_active);
+
+        rollback_start_decommission_pool_meta(&mut active, previous);
+
+        assert!(!active.is_suspended(0));
+        let (_, decommission_active) = decommission_start_guard_state(active.pools.first());
+        assert!(!decommission_active);
     }
 
     #[test]
