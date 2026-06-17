@@ -52,8 +52,8 @@ use crate::{
     event_notification::{EventArgs, send_event},
     global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id, is_dist_erasure},
     store_api::{
-        DeletedObject, GetObjectReader, HealOperations, ListObjectsV2Info, ListOperations, MultipartOperations, NamespaceLocking,
-        ObjectIO, ObjectInfo, ObjectOperations, PutObjReader,
+        DeletedObject, GetObjectReader, HealOperations, ListObjectsV2Info, MultipartOperations, NamespaceLocking, ObjectIO,
+        ObjectInfo, ObjectOperations, PutObjReader,
     },
     store_init::load_format_erasure,
 };
@@ -2985,7 +2985,15 @@ impl SetDisks {
 }
 
 #[async_trait::async_trait]
-impl ListOperations for SetDisks {
+impl rustfs_storage_api::ListOperations for SetDisks {
+    type Error = Error;
+    type ListObjectsV2Info = ListObjectsV2Info;
+    type ListObjectVersionsInfo = ListObjectVersionsInfo;
+    type ObjectInfoOrErr = ObjectInfoOrErr;
+    type WalkOptions = WalkOptions;
+    type WalkCancellation = CancellationToken;
+    type WalkResultSender = Sender<ObjectInfoOrErr>;
+
     #[tracing::instrument(skip(self))]
     async fn list_objects_v2(
         self: Arc<Self>,

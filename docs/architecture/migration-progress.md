@@ -5,17 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-walk-options-contracts`
-- Baseline: `main` at `604379d62fab481b73d1848bfbd045a684031441`
-  after the table catalog row-level conflict hardening merge.
+- Branch: `overtrue/arch-list-operations-contracts`
+- Baseline: `main` at `36f7ad6936d03b9593880b5c4958f47b2a039fc9`
+  after the walk options contract merge.
 - PR type for this branch: `api-extraction`
 - Runtime behavior changes: no external behavior change expected.
-- Rust code changes: move `WalkOptions` into `rustfs-storage-api` as a generic
-  filter-container contract, then keep ECStore's existing public name as a
-  `FileInfo` filter alias.
-- CI/script changes: extend migration guards for the `WalkOptions` public
+- Rust code changes: move `ListOperations` into `rustfs-storage-api` as a
+  generic operation contract with associated ECStore-bound types, then keep
+  ECStore's existing public name as a fixed associated-type compatibility
+  subtrait.
+- CI/script changes: extend migration guards for the `ListOperations` public
   re-export and ECStore local-definition regressions.
-- Docs changes: record the walk options contract extraction slice.
+- Docs changes: record the list operations contract extraction slice.
 
 ## Phase 0 Tasks
 
@@ -661,6 +662,28 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
     full pre-commit, and required three-expert review passed.
 
+- [x] `API-021` Move list operations contract.
+  - Completed slice: move `ListOperations` from ECStore `store_api/traits.rs`
+    into `rustfs-storage-api` as a generic public operation contract over list
+    response, walk option, cancellation, sender, and error associated types;
+    keep ECStore's old public `ListOperations` name as a fixed associated-type
+    compatibility subtrait.
+  - Acceptance: `rustfs-storage-api` exports `ListOperations`, ECStore no
+    longer defines local list operation method signatures, existing ECStore
+    generic bounds keep the old import path, and migration guards reject
+    dropping the public storage-api re-export or reintroducing local ECStore
+    list method definitions.
+  - Must preserve: list v2 pagination, list-object-versions pagination, walk
+    channel shape, cancellation token usage, ECStore public compatibility
+    bounds, and all ECStore list/walk runtime behavior.
+  - Risk defense: only the trait contract crosses into `rustfs-storage-api`;
+    ECStore keeps the concrete associated type bindings, response aliases,
+    walk option alias, object metadata conversion, storage errors, lifecycle
+    and replication coupling, and implementation bodies.
+  - Verification: focused storage-api tests, ECStore/RustFS/downstream compile
+    checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    full pre-commit, and required three-expert review passed.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -937,8 +960,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Generic `WalkOptions` now lives in `rustfs-storage-api`; ECStore still owns the concrete `FileInfo` filter binding and list/walk implementation behavior. |
-| Migration preservation | passed | Filter optionality, marker/default fields, version sort default, include-free-versions flag, and existing ECStore public import path are preserved through an alias. |
+| Quality/architecture | passed | Generic `ListOperations` now lives in `rustfs-storage-api`; ECStore still owns the concrete associated type bindings and implementation behavior. |
+| Migration preservation | passed | List v2, list-object-versions, walk channel/cancellation shape, and existing ECStore generic bound import path are preserved through a compatibility subtrait. |
 | Testing/verification | passed | Focused storage-api tests, downstream compile checks, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
@@ -954,25 +977,26 @@ Passed before push:
 - Rust risk scan: no new `unwrap`/`expect`, panic/todo markers, `unsafe`,
   process-spawning calls, lossy casts, println/eprintln, or relaxed ordering in
   added Rust lines.
-- `make pre-commit`: passed; nextest reported 6203 tests passed and 111
+- `make pre-commit`: passed; nextest reported 6204 tests passed and 111
   skipped, and doctests passed.
 
 Notes:
 
-- This slice follows the object list response contract branch and keeps the old
+- This slice follows the walk options contract branch and keeps the old
   aggregate facade, bucket DTO, multipart DTO, bucket operation contract, object
   helper, range helper, list helper, object precondition, list response, and
   walk options contract guards active.
-- The shared walk options container is now owned by `rustfs-storage-api`;
-  ECStore keeps the concrete `FileInfo` filter alias, `ObjectInfo`, storage
-  `Error`, `ObjectOptions`, object metadata adaptation, storage error mapping,
-  readers, lifecycle/replication, rio, filemeta, and implementation behavior.
-- The slice does not alter object, list, walk, multipart, bucket, delete, or
-  reader runtime behavior.
+- The shared list operations contract is now owned by `rustfs-storage-api`;
+  ECStore keeps the concrete associated type bindings, response aliases,
+  `WalkOptions` alias, `ObjectInfo`, storage `Error`, `ObjectOptions`, object
+  metadata adaptation, storage error mapping, readers, lifecycle/replication,
+  rio, filemeta, and implementation behavior.
+- The slice does not alter object, list, walk, multipart, bucket, delete,
+  namespace-lock, or reader runtime behavior.
 
 ## Handoff Notes
 
-- Walk options contract cleanup is stacked on the object list response contract
+- List operations contract cleanup is stacked on the walk options contract
   branch.
 - After this lands, remaining storage work can continue by extracting larger
   low-coupling DTO/consumer slices or by narrowing remaining operation-group
