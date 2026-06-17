@@ -835,7 +835,7 @@ impl ECStore {
             let target_pool_idx =
                 resolve_data_movement_resume_target_pool(selected_target_pool_idx, resume_target_pool_idx, opts.src_pool_idx);
 
-            if opts.src_pool_idx == selected_target_pool_idx {
+            if !should_check_data_movement_resume_target(opts.src_pool_idx, target_pool_idx) {
                 if let Ok((source_pool_info, _)) = existing_pool_info
                     && opts.delete_marker
                     && is_data_movement_delete_marker(&source_pool_info.object_info)
@@ -861,9 +861,7 @@ impl ECStore {
                 ));
             }
 
-            let mut obj = self.pools[selected_target_pool_idx]
-                .delete_object(bucket, object, opts)
-                .await?;
+            let mut obj = self.pools[target_pool_idx].delete_object(bucket, object, opts).await?;
             obj.name = decode_dir_object(obj.name.as_str());
             return Ok(obj);
         }
@@ -1365,6 +1363,7 @@ mod tests {
     fn data_movement_resume_target_uses_resolved_non_source_pool_when_selected_is_source() {
         let target_pool_idx = resolve_data_movement_resume_target_pool(1, Some(3), 1);
         assert_eq!(target_pool_idx, 3);
+        assert!(should_check_data_movement_resume_target(1, target_pool_idx));
     }
 
     #[test]
