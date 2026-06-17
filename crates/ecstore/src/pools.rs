@@ -1135,7 +1135,7 @@ impl PoolMeta {
         }
     }
 
-    pub async fn update_after(&mut self, idx: usize, pools: Vec<Arc<Sets>>, duration: Duration) -> Result<bool> {
+    pub fn update_after(&mut self, idx: usize, duration: Duration) -> Result<bool> {
         let pool_count = self.pools.len();
         ensure_valid_decommission_pool_index(pool_count, idx)?;
 
@@ -1156,14 +1156,6 @@ impl PoolMeta {
                 return Err(invalid_decommission_pool_index_error(pool_count, idx));
             };
             pool.last_update = now;
-            self.save(pools).await?;
-            let Some(pool) = self.pools.get_mut(idx) else {
-                return Err(invalid_decommission_pool_index_error(pool_count, idx));
-            };
-            if let Some(info) = pool.decommission.as_mut() {
-                info.mark_progress_saved();
-            }
-
             return Ok(true);
         }
 
@@ -1483,6 +1475,15 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
 }
 
 impl ECStore {
+    async fn save_current_pool_meta(&self) -> Result<()> {
+        let _save_guard = self.pool_meta_save_gate.lock().await;
+        let snapshot = {
+            let pool_meta = self.pool_meta.read().await;
+            pool_meta.clone()
+        };
+        snapshot.save(self.pools.clone()).await
+    }
+
     pub async fn status(&self, idx: usize) -> Result<PoolStatus> {
         let space_info = self.get_decommission_pool_space_info(idx).await?;
 
@@ -1525,26 +1526,25 @@ impl ECStore {
     pub async fn decommission_cancel(&self, idx: usize) -> Result<()> {
         ensure_decommission_terminal_operation_supported(self.single_pool(), "cancel decommission")?;
 
-        let mut lock = self.pool_meta.write().await;
-        let (pool_present, decommission_present, terminal) = if let Some(pool) = lock.pools.get(idx) {
-            if let Some(info) = pool.decommission.as_ref() {
-                (true, true, is_decommission_cancel_terminal(info.complete, info.failed, info.canceled))
+        let should_reload_pool_meta = {
+            let mut lock = self.pool_meta.write().await;
+            let (pool_present, decommission_present, terminal) = if let Some(pool) = lock.pools.get(idx) {
+                if let Some(info) = pool.decommission.as_ref() {
+                    (true, true, is_decommission_cancel_terminal(info.complete, info.failed, info.canceled))
+                } else {
+                    (true, false, false)
+                }
             } else {
-                (true, false, false)
-            }
-        } else {
-            (false, false, false)
+                (false, false, false)
+            };
+
+            ensure_decommission_cancel_allowed(pool_present, decommission_present, terminal)?;
+            lock.decommission_cancel(idx)
         };
 
-        ensure_decommission_cancel_allowed(pool_present, decommission_present, terminal)?;
-
-        let should_reload_pool_meta = if lock.decommission_cancel(idx) {
-            lock.save(self.pools.clone()).await?;
-            true
-        } else {
-            false
-        };
-        drop(lock);
+        if should_reload_pool_meta {
+            self.save_current_pool_meta().await?;
+        }
 
         let canceler = {
             let mut cancelers = self.decommission_cancelers.write().await;
@@ -2041,7 +2041,7 @@ impl ECStore {
             );
         }
 
-        {
+        let should_save_progress = {
             let mut pool_meta = self.pool_meta.write().await;
 
             if let Err(err) = track_decommission_current_object(&mut pool_meta, idx, bucket.as_str(), entry.name.as_str()) {
@@ -2054,9 +2054,7 @@ impl ECStore {
             }
 
             let ok = match resolve_decommission_update_after_result(
-                pool_meta
-                    .update_after(idx, self.pools.clone(), DECOMMISSION_PROGRESS_SAVE_INTERVAL)
-                    .await,
+                pool_meta.update_after(idx, DECOMMISSION_PROGRESS_SAVE_INTERVAL),
             ) {
                 Ok(ok) => ok,
                 Err(err) => {
@@ -2064,9 +2062,18 @@ impl ECStore {
                 }
             };
 
-            drop(pool_meta);
-            if ok
-                && let Some(notification_sys) = get_global_notification_sys()
+            ok
+        };
+
+        if should_save_progress {
+            self.save_current_pool_meta()
+                .await
+                .map_err(|err| with_decommission_entry_context("update_after", bucket.as_str(), entry.name.as_str(), err))?;
+            {
+                let mut pool_meta = self.pool_meta.write().await;
+                pool_meta.mark_decommission_progress_saved();
+            }
+            if let Some(notification_sys) = get_global_notification_sys()
                 && let Err(err) = resolve_decommission_entry_reload_result(
                     notification_sys.reload_pool_meta().await,
                     bucket.as_str(),
@@ -2479,13 +2486,17 @@ impl ECStore {
     pub async fn decommission_failed(&self, idx: usize) -> Result<()> {
         ensure_decommission_terminal_operation_supported(self.single_pool(), "mark decommission failed")?;
 
-        let mut pool_meta = self.pool_meta.write().await;
-        if pool_meta.decommission_failed(idx) {
-            pool_meta.save(self.pools.clone()).await?;
-            pool_meta.mark_decommission_progress_saved();
+        let should_reload_pool_meta = {
+            let mut pool_meta = self.pool_meta.write().await;
+            pool_meta.decommission_failed(idx)
+        };
 
-            drop(pool_meta);
-
+        if should_reload_pool_meta {
+            self.save_current_pool_meta().await?;
+            {
+                let mut pool_meta = self.pool_meta.write().await;
+                pool_meta.mark_decommission_progress_saved();
+            }
             if let Some(notification_sys) = get_global_notification_sys() {
                 let stage = format!("decommission_failed for pool {idx}");
                 if let Err(err) =
@@ -2511,11 +2522,17 @@ impl ECStore {
     pub async fn complete_decommission(&self, idx: usize) -> Result<()> {
         ensure_decommission_terminal_operation_supported(self.single_pool(), "complete decommission")?;
 
-        let mut pool_meta = self.pool_meta.write().await;
-        if pool_meta.decommission_complete(idx) {
-            pool_meta.save(self.pools.clone()).await?;
-            pool_meta.mark_decommission_progress_saved();
-            drop(pool_meta);
+        let should_reload_pool_meta = {
+            let mut pool_meta = self.pool_meta.write().await;
+            pool_meta.decommission_complete(idx)
+        };
+
+        if should_reload_pool_meta {
+            self.save_current_pool_meta().await?;
+            {
+                let mut pool_meta = self.pool_meta.write().await;
+                pool_meta.mark_decommission_progress_saved();
+            }
             if let Some(notification_sys) = get_global_notification_sys() {
                 let stage = format!("complete_decommission for pool {idx}");
                 if let Err(err) =
@@ -2552,14 +2569,14 @@ impl ECStore {
         if is_decommissioned {
             warn!("decommission: already done, moving on {}", bucket.to_string());
 
-            {
+            let bucket_done = {
                 let mut pool_meta = self.pool_meta.write().await;
-                if mark_decommission_bucket_done(&mut pool_meta, idx, &bucket)? {
-                    resolve_decommission_bucket_done_save_result(
-                        pool_meta.save(self.pools.clone()).await,
-                        idx,
-                        bucket.name.as_str(),
-                    )?;
+                mark_decommission_bucket_done(&mut pool_meta, idx, &bucket)?
+            };
+            if bucket_done {
+                resolve_decommission_bucket_done_save_result(self.save_current_pool_meta().await, idx, bucket.name.as_str())?;
+                {
+                    let mut pool_meta = self.pool_meta.write().await;
                     pool_meta.mark_decommission_progress_saved();
                 }
             }
@@ -2580,19 +2597,17 @@ impl ECStore {
             return Err(err);
         }
 
-        {
+        let bucket_done = {
             let mut pool_meta = self.pool_meta.write().await;
-            if mark_decommission_bucket_done(&mut pool_meta, idx, &bucket)? {
-                resolve_decommission_bucket_done_save_result(
-                    pool_meta.save(self.pools.clone()).await,
-                    idx,
-                    bucket.name.as_str(),
-                )?;
-                pool_meta.mark_decommission_progress_saved();
-            }
-
-            warn!("decommission: decommission_pool bucket_done {}", &bucket.name);
+            mark_decommission_bucket_done(&mut pool_meta, idx, &bucket)?
+        };
+        if bucket_done {
+            resolve_decommission_bucket_done_save_result(self.save_current_pool_meta().await, idx, bucket.name.as_str())?;
+            let mut pool_meta = self.pool_meta.write().await;
+            pool_meta.mark_decommission_progress_saved();
         }
+
+        warn!("decommission: decommission_pool bucket_done {}", &bucket.name);
 
         Ok(())
     }
@@ -2695,19 +2710,33 @@ impl ECStore {
         let _start_guard = self.start_gate.lock().await;
         ensure_decommission_not_rebalancing(self.is_rebalance_conflicting_with_decommission().await)?;
 
-        let mut pool_meta = self.pool_meta.write().await;
-        for idx in indices.iter().copied() {
-            let (pool_present, decommission_active) = decommission_start_guard_state(pool_meta.pools.get(idx));
-            ensure_decommission_start_allowed(pool_present, decommission_active)?;
-        }
+        let previous_pool_meta = {
+            let mut pool_meta = self.pool_meta.write().await;
+            for idx in indices.iter().copied() {
+                let (pool_present, decommission_active) = decommission_start_guard_state(pool_meta.pools.get(idx));
+                ensure_decommission_start_allowed(pool_present, decommission_active)?;
+            }
 
-        let previous_pool_meta = pool_meta.clone();
-        for (idx, pi) in space_infos {
-            pool_meta.decommission(idx, pi)?;
-            pool_meta.queue_buckets(idx, decom_buckets.clone());
-        }
+            let previous_pool_meta = pool_meta.clone();
+            for (idx, pi) in space_infos {
+                pool_meta.decommission(idx, pi)?;
+                pool_meta.queue_buckets(idx, decom_buckets.clone());
+            }
+            previous_pool_meta
+        };
 
-        pool_meta.save(self.pools.clone()).await?;
+        if let Err(save_err) = self.save_current_pool_meta().await {
+            {
+                let mut pool_meta = self.pool_meta.write().await;
+                rollback_start_decommission_pool_meta(&mut pool_meta, previous_pool_meta);
+            }
+            if let Err(rollback_save_err) = self.save_current_pool_meta().await {
+                return Err(Error::other(format!(
+                    "decommission start pool metadata save failed: {save_err}; rollback save failed: {rollback_save_err}"
+                )));
+            }
+            return Err(save_err);
+        }
 
         if let Some(notification_sys) = get_global_notification_sys() {
             if let Err(err) = resolve_start_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await) {
@@ -2721,8 +2750,11 @@ impl ECStore {
                     "Decommission start failed after pool metadata save"
                 );
 
-                rollback_start_decommission_pool_meta(&mut pool_meta, previous_pool_meta);
-                if let Err(rollback_save_err) = pool_meta.save(self.pools.clone()).await {
+                {
+                    let mut pool_meta = self.pool_meta.write().await;
+                    rollback_start_decommission_pool_meta(&mut pool_meta, previous_pool_meta.clone());
+                }
+                if let Err(rollback_save_err) = self.save_current_pool_meta().await {
                     error!(
                         event = EVENT_DECOMMISSION_STATE,
                         component = LOG_COMPONENT_ECSTORE,
@@ -4500,18 +4532,17 @@ mod pools_tests {
         assert!(!should_cleanup_decommission_source_entry(2, 2, 1));
     }
 
-    #[tokio::test]
-    async fn test_pool_meta_update_after_rejects_out_of_range_index() {
+    #[test]
+    fn test_pool_meta_update_after_rejects_out_of_range_index() {
         let mut meta = PoolMeta::default();
         let err = meta
-            .update_after(1, Vec::new(), Duration::seconds(1))
-            .await
+            .update_after(1, Duration::seconds(1))
             .expect_err("out-of-range index should fail");
         assert!(err.to_string().contains("invalid decommission pool index 1 for 0 pools"));
     }
 
-    #[tokio::test]
-    async fn test_pool_meta_update_after_rejects_when_decommission_missing() {
+    #[test]
+    fn test_pool_meta_update_after_rejects_when_decommission_missing() {
         let mut meta = PoolMeta {
             pools: vec![PoolStatus {
                 id: 0,
@@ -4523,8 +4554,7 @@ mod pools_tests {
         };
 
         let err = meta
-            .update_after(0, Vec::new(), Duration::seconds(1))
-            .await
+            .update_after(0, Duration::seconds(1))
             .expect_err("pool without decommission should fail");
         assert!(
             err.to_string()
@@ -4532,8 +4562,8 @@ mod pools_tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_pool_meta_update_after_skips_before_time_and_item_thresholds() {
+    #[test]
+    fn test_pool_meta_update_after_skips_before_time_and_item_thresholds() {
         let mut meta = PoolMeta {
             pools: vec![PoolStatus {
                 id: 0,
@@ -4548,8 +4578,7 @@ mod pools_tests {
         };
 
         let saved = meta
-            .update_after(0, Vec::new(), DECOMMISSION_PROGRESS_SAVE_INTERVAL)
-            .await
+            .update_after(0, DECOMMISSION_PROGRESS_SAVE_INTERVAL)
             .expect("valid decommission state should update");
 
         assert!(!saved);
@@ -4557,8 +4586,8 @@ mod pools_tests {
         assert_eq!(info.items_since_last_progress_save(), DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD - 1);
     }
 
-    #[tokio::test]
-    async fn test_pool_meta_update_after_saves_when_item_threshold_reached() {
+    #[test]
+    fn test_pool_meta_update_after_requests_save_when_item_threshold_reached() {
         let mut meta = PoolMeta {
             pools: vec![PoolStatus {
                 id: 0,
@@ -4573,17 +4602,16 @@ mod pools_tests {
         };
 
         let saved = meta
-            .update_after(0, Vec::new(), DECOMMISSION_PROGRESS_SAVE_INTERVAL)
-            .await
+            .update_after(0, DECOMMISSION_PROGRESS_SAVE_INTERVAL)
             .expect("item threshold should save progress");
 
         assert!(saved);
         let info = meta.pools[0].decommission.as_ref().expect("decommission info should exist");
-        assert_eq!(info.items_since_last_progress_save(), 0);
+        assert_eq!(info.items_since_last_progress_save(), DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD);
     }
 
-    #[tokio::test]
-    async fn test_pool_meta_update_after_saves_when_time_threshold_reached() {
+    #[test]
+    fn test_pool_meta_update_after_requests_save_when_time_threshold_reached() {
         let mut meta = PoolMeta {
             pools: vec![PoolStatus {
                 id: 0,
@@ -4598,13 +4626,12 @@ mod pools_tests {
         };
 
         let saved = meta
-            .update_after(0, Vec::new(), DECOMMISSION_PROGRESS_SAVE_INTERVAL)
-            .await
+            .update_after(0, DECOMMISSION_PROGRESS_SAVE_INTERVAL)
             .expect("time threshold should save progress");
 
         assert!(saved);
         let info = meta.pools[0].decommission.as_ref().expect("decommission info should exist");
-        assert_eq!(info.items_since_last_progress_save(), 0);
+        assert_eq!(info.items_since_last_progress_save(), 1);
     }
 
     #[test]

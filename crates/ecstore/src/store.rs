@@ -192,6 +192,12 @@ pub struct ECStore {
     /// or `decommission_cancelers`. The guarded sections may perform bounded
     /// async metadata work so check/init/start cannot race across operations.
     pub(crate) start_gate: Mutex<()>,
+    /// Serializes full-document pool metadata saves.
+    ///
+    /// Lock order: acquire `pool_meta_save_gate` without holding `pool_meta`.
+    /// The saver then clones the latest `pool_meta` under a short read lock and
+    /// releases it before awaiting disk writes.
+    pub(crate) pool_meta_save_gate: Mutex<()>,
 
     // Phase 2 migration pending - do not use directly.
     /// Local disk maps (migrated from GLOBAL_LOCAL_DISK_MAP/ID_MAP/SET_DRIVES)
