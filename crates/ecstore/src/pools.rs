@@ -133,6 +133,11 @@ fn cancel_decommission_canceler(canceler: Option<CancellationToken>) -> bool {
     }
 }
 
+fn take_and_cancel_decommission_canceler(cancelers: &mut [Option<CancellationToken>], idx: usize) -> bool {
+    let canceler = take_decommission_canceler(cancelers, idx);
+    cancel_decommission_canceler(canceler)
+}
+
 fn ensure_decommission_routines_scheduled(bound_count: usize, expected_count: usize) -> Result<()> {
     if bound_count == 0 || bound_count != expected_count {
         return Err(Error::other(format!(
@@ -1617,15 +1622,11 @@ impl ECStore {
             lock.decommission_cancel(idx)
         };
 
-        if should_reload_pool_meta {
-            self.save_current_pool_meta().await?;
-        }
-
-        let canceler = {
+        let canceled_worker = {
             let mut cancelers = self.decommission_cancelers.write().await;
-            take_decommission_canceler(cancelers.as_mut_slice(), idx)
+            take_and_cancel_decommission_canceler(cancelers.as_mut_slice(), idx)
         };
-        if !cancel_decommission_canceler(canceler) {
+        if !canceled_worker {
             warn!(
                 event = EVENT_DECOMMISSION_STATE,
                 component = LOG_COMPONENT_ECSTORE,
@@ -1635,6 +1636,10 @@ impl ECStore {
                 reason = "no_active_canceler",
                 "Decommission cancel skipped"
             );
+        }
+
+        if should_reload_pool_meta {
+            self.save_current_pool_meta().await?;
         }
 
         if should_reload_pool_meta && let Some(notification_sys) = get_global_notification_sys() {
@@ -2596,6 +2601,11 @@ impl ECStore {
             pool_meta.decommission_failed(idx)
         };
 
+        {
+            let mut cancelers = self.decommission_cancelers.write().await;
+            take_and_cancel_decommission_canceler(cancelers.as_mut_slice(), idx);
+        }
+
         let mut reload_result = Ok(());
         if should_reload_pool_meta {
             self.save_current_pool_meta().await?;
@@ -2609,14 +2619,6 @@ impl ECStore {
             } else {
                 Ok(())
             };
-        }
-
-        let canceler = {
-            let mut cancelers = self.decommission_cancelers.write().await;
-            cancelers.get_mut(idx).and_then(Option::take)
-        };
-        if let Some(canceler) = canceler {
-            canceler.cancel();
         }
 
         reload_result?;
@@ -2633,6 +2635,11 @@ impl ECStore {
             pool_meta.decommission_complete(idx)
         };
 
+        {
+            let mut cancelers = self.decommission_cancelers.write().await;
+            take_and_cancel_decommission_canceler(cancelers.as_mut_slice(), idx);
+        }
+
         let mut reload_result = Ok(());
         if should_reload_pool_meta {
             self.save_current_pool_meta().await?;
@@ -2646,14 +2653,6 @@ impl ECStore {
             } else {
                 Ok(())
             };
-        }
-
-        let canceler = {
-            let mut cancelers = self.decommission_cancelers.write().await;
-            cancelers.get_mut(idx).and_then(Option::take)
-        };
-        if let Some(canceler) = canceler {
-            canceler.cancel();
         }
 
         reload_result?;
@@ -3870,8 +3869,9 @@ mod pools_tests {
         resolve_decommission_update_after_result, resolve_start_decommission_pool_meta_reload_result,
         rollback_start_decommission_pool_meta, run_decommission_buckets_bounded, should_cleanup_decommission_source_entry,
         should_continue_decommission_queue, should_count_decommission_version_complete,
-        should_preserve_decommission_canceled_state, split_decommission_buckets, take_decommission_canceler,
-        track_decommission_current_object, validate_start_decommission_request, with_decommission_entry_context,
+        should_preserve_decommission_canceled_state, split_decommission_buckets, take_and_cancel_decommission_canceler,
+        take_decommission_canceler, track_decommission_current_object, validate_start_decommission_request,
+        with_decommission_entry_context,
     };
     use crate::data_movement;
     use crate::disk::endpoint::Endpoint;
@@ -5266,6 +5266,24 @@ mod pools_tests {
     #[test]
     fn test_cancel_decommission_canceler_returns_false_when_missing() {
         assert!(!cancel_decommission_canceler(None));
+    }
+
+    #[test]
+    fn test_take_and_cancel_decommission_canceler_clears_slot() {
+        let token = CancellationToken::new();
+        let mut cancelers = vec![Some(token.clone())];
+
+        assert!(take_and_cancel_decommission_canceler(cancelers.as_mut_slice(), 0));
+        assert!(cancelers[0].is_none());
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn test_take_and_cancel_decommission_canceler_missing_slot_is_false() {
+        let mut cancelers = vec![None];
+
+        assert!(!take_and_cancel_decommission_canceler(cancelers.as_mut_slice(), 0));
+        assert!(cancelers[0].is_none());
     }
 
     #[test]
