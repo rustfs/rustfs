@@ -251,8 +251,42 @@ fn decommission_admin_not_initialized_error(operation: &str) -> S3Error {
     S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to {operation}: object layer not initialized"))
 }
 
+fn decommission_admin_not_initialized_error_with_audit(operation: &str, audit: PoolAuditContext<'_>) -> S3Error {
+    error!(
+        event = EVENT_ADMIN_REQUEST_FAILED,
+        component = LOG_COMPONENT_ADMIN_API,
+        subsystem = LOG_SUBSYSTEM_POOL_ADMIN,
+        operation = operation_to_event(operation),
+        action = operation_to_event(operation),
+        result = "failed",
+        reason = "object_layer_not_initialized",
+        request_id = %audit.request_id,
+        actor = %audit.actor,
+        remote_addr = %audit.remote_addr,
+        error = "object layer not initialized",
+        "admin request failed"
+    );
+    S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to {operation}: object layer not initialized"))
+}
+
 fn pool_admin_missing_credentials_error(operation: &str) -> S3Error {
     log_pool_request_rejected!(operation_to_event(operation), "missing_credentials");
+    S3Error::with_message(S3ErrorCode::InvalidRequest, format!("Failed to {operation}: missing credentials"))
+}
+
+fn pool_admin_missing_credentials_error_with_request(operation: &str, request_id: &str, remote_addr: &str) -> S3Error {
+    warn!(
+        event = EVENT_ADMIN_REQUEST_REJECTED,
+        component = LOG_COMPONENT_ADMIN_API,
+        subsystem = LOG_SUBSYSTEM_POOL_ADMIN,
+        operation = operation_to_event(operation),
+        action = operation_to_event(operation),
+        result = "rejected",
+        reason = "missing_credentials",
+        request_id = %request_id,
+        remote_addr = %remote_addr,
+        "admin request rejected"
+    );
     S3Error::with_message(S3ErrorCode::InvalidRequest, format!("Failed to {operation}: missing credentials"))
 }
 
@@ -509,7 +543,11 @@ impl Operation for StartDecommission {
         );
 
         let Some(input_cred) = req.credentials else {
-            return Err(pool_admin_missing_credentials_error("start decommission"));
+            return Err(pool_admin_missing_credentials_error_with_request(
+                "start decommission",
+                &request_id,
+                &remote_addr,
+            ));
         };
 
         let (cred, owner) =
@@ -544,7 +582,7 @@ impl Operation for StartDecommission {
         }
 
         let Some(store) = resolve_object_store_handle() else {
-            return Err(decommission_admin_not_initialized_error("start decommission"));
+            return Err(decommission_admin_not_initialized_error_with_audit("start decommission", audit));
         };
 
         let decommission_running = store.is_decommission_running().await;
@@ -658,7 +696,11 @@ impl Operation for CancelDecommission {
         );
 
         let Some(input_cred) = req.credentials else {
-            return Err(pool_admin_missing_credentials_error("cancel decommission"));
+            return Err(pool_admin_missing_credentials_error_with_request(
+                "cancel decommission",
+                &request_id,
+                &remote_addr,
+            ));
         };
 
         let (cred, owner) =
@@ -717,7 +759,7 @@ impl Operation for CancelDecommission {
         };
 
         let Some(store) = resolve_object_store_handle() else {
-            return Err(decommission_admin_not_initialized_error("cancel decommission"));
+            return Err(decommission_admin_not_initialized_error_with_audit("cancel decommission", audit));
         };
 
         store
@@ -746,8 +788,9 @@ impl Operation for CancelDecommission {
 #[cfg(test)]
 mod pools_handler_tests {
     use super::{
-        PoolAuditContext, contextualize_admin_pool_api_error, decommission_admin_not_initialized_error, dedup_indices,
-        parse_pool_idx_by_id, pool_admin_missing_credentials_error, pool_admin_pool_index_error,
+        PoolAuditContext, contextualize_admin_pool_api_error, decommission_admin_not_initialized_error,
+        decommission_admin_not_initialized_error_with_audit, dedup_indices, parse_pool_idx_by_id,
+        pool_admin_missing_credentials_error, pool_admin_missing_credentials_error_with_request, pool_admin_pool_index_error,
         pool_admin_pool_index_error_with_audit, pool_admin_pool_not_found_error, pool_admin_pool_not_found_error_with_audit,
         pool_admin_pool_parse_error, pool_admin_pool_parse_error_with_audit, pool_admin_query_parse_error,
         pool_admin_query_parse_error_with_audit, validate_start_decommission_guards,
@@ -845,6 +888,15 @@ mod pools_handler_tests {
     }
 
     #[test]
+    fn test_decommission_admin_not_initialized_error_with_audit_preserves_response_contract() {
+        let audit = PoolAuditContext::new("req-1", "access-key", "127.0.0.1:9000");
+        let err = decommission_admin_not_initialized_error_with_audit("start decommission", audit);
+
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("Failed to start decommission: object layer not initialized"));
+    }
+
+    #[test]
     fn test_pool_admin_missing_credentials_error_formats_list_context() {
         let err = pool_admin_missing_credentials_error("list pools");
 
@@ -858,6 +910,14 @@ mod pools_handler_tests {
 
         assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("Failed to start decommission: missing credentials"));
+    }
+
+    #[test]
+    fn test_pool_admin_missing_credentials_error_with_request_preserves_response_contract() {
+        let err = pool_admin_missing_credentials_error_with_request("cancel decommission", "req-1", "127.0.0.1:9000");
+
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("Failed to cancel decommission: missing credentials"));
     }
 
     #[test]
