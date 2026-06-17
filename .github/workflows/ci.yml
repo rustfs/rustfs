@@ -127,6 +127,14 @@ jobs:
           cargo nextest run --all --exclude e2e_test
           cargo test --all --doc
 
+      - name: Run rebalance/decommission migration proofs
+        run: |
+          cargo test -p rustfs-ecstore data_movement --lib
+          cargo test -p rustfs-ecstore rebalance --lib
+          cargo test -p rustfs-ecstore decommission --lib
+          cargo test -p rustfs-ecstore source_cleanup --lib
+          cargo test -p rustfs-ecstore delete_marker --lib
+
       - name: Check code formatting
         run: cargo fmt --all --check
 
