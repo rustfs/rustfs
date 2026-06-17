@@ -117,6 +117,28 @@ fn bind_decommission_cancelers(
     bound
 }
 
+fn bind_missing_decommission_cancelers(
+    indices: &[usize],
+    parent: &CancellationToken,
+    cancelers: &mut [Option<CancellationToken>],
+) -> Vec<(usize, CancellationToken)> {
+    let mut bound = Vec::with_capacity(indices.len());
+
+    for idx in indices {
+        let Some(slot) = cancelers.get_mut(*idx) else {
+            continue;
+        };
+        if slot.is_some() {
+            break;
+        }
+        let token = parent.child_token();
+        *slot = Some(token.clone());
+        bound.push((*idx, token));
+    }
+
+    bound
+}
+
 fn take_decommission_canceler(cancelers: &mut [Option<CancellationToken>], idx: usize) -> Option<CancellationToken> {
     cancelers.get_mut(idx).and_then(Option::take)
 }
@@ -192,24 +214,140 @@ fn ensure_decommission_start_rebalance_meta_allowed(meta: Option<&RebalanceMeta>
 
 fn ensure_local_decommission_pool_leaders(endpoints: &EndpointServerPools, indices: &[usize]) -> Result<()> {
     for idx in indices {
-        let pool = endpoints
-            .as_ref()
-            .get(*idx)
-            .ok_or_else(|| invalid_decommission_pool_index_error(endpoints.as_ref().len(), *idx))?;
-        let endpoint = pool
-            .endpoints
-            .as_ref()
-            .first()
-            .ok_or_else(|| Error::other(format!("decommission pool {idx} has no configured endpoints")))?;
-
-        if !endpoint.is_local {
-            return Err(Error::other(format!(
-                "decommission for pool {idx} must run on the pool first endpoint {endpoint}"
-            )));
-        }
+        ensure_local_decommission_pool_leader(endpoints, *idx)?;
     }
 
     Ok(())
+}
+
+fn ensure_local_decommission_pool_leader(endpoints: &EndpointServerPools, idx: usize) -> Result<()> {
+    let pool = endpoints
+        .as_ref()
+        .get(idx)
+        .ok_or_else(|| invalid_decommission_pool_index_error(endpoints.as_ref().len(), idx))?;
+    let endpoint = pool
+        .endpoints
+        .as_ref()
+        .first()
+        .ok_or_else(|| Error::other(format!("decommission pool {idx} has no configured endpoints")))?;
+
+    if !endpoint.is_local {
+        return Err(Error::other(format!(
+            "decommission for pool {idx} must run on the pool first endpoint {endpoint}"
+        )));
+    }
+
+    Ok(())
+}
+
+fn decommission_pool_first_endpoint_is_local(endpoints: &EndpointServerPools, idx: usize) -> Result<bool> {
+    let pool = endpoints
+        .as_ref()
+        .get(idx)
+        .ok_or_else(|| invalid_decommission_pool_index_error(endpoints.as_ref().len(), idx))?;
+    let endpoint = pool
+        .endpoints
+        .as_ref()
+        .first()
+        .ok_or_else(|| Error::other(format!("decommission pool {idx} has no configured endpoints")))?;
+
+    Ok(endpoint.is_local)
+}
+
+pub(crate) fn local_decommission_queue_prefix(endpoints: &EndpointServerPools, indices: &[usize]) -> Result<Vec<usize>> {
+    let mut local = Vec::with_capacity(indices.len());
+
+    for idx in indices {
+        if decommission_pool_first_endpoint_is_local(endpoints, *idx)? {
+            local.push(*idx);
+        } else {
+            break;
+        }
+    }
+
+    Ok(local)
+}
+
+fn first_resumable_decommission_queue_indices(meta: &PoolMeta) -> Vec<usize> {
+    let mut indices = Vec::new();
+    for (idx, pool) in meta.pools.iter().enumerate() {
+        if let Some(decommission) = &pool.decommission {
+            if decommission.complete || decommission.canceled {
+                continue;
+            }
+            indices.push(idx);
+        }
+    }
+
+    indices
+}
+
+fn missing_decommission_worker_prefix(indices: &[usize], cancelers: &[Option<CancellationToken>]) -> Vec<usize> {
+    let mut missing = Vec::with_capacity(indices.len());
+
+    for idx in indices {
+        if cancelers.get(*idx).and_then(Option::as_ref).is_some() {
+            break;
+        }
+        missing.push(*idx);
+    }
+
+    missing
+}
+
+fn ensure_decommission_start_local_leader(endpoints: &EndpointServerPools, indices: &[usize]) -> Result<()> {
+    if let Some(first) = indices.first() {
+        ensure_local_decommission_pool_leader(endpoints, *first)?;
+    }
+
+    Ok(())
+}
+
+fn spawn_decommission_index_cancelers(
+    store: Arc<ECStore>,
+    rx: CancellationToken,
+    index_cancelers: Vec<(usize, CancellationToken)>,
+) {
+    tokio::spawn(async move {
+        let mut stop_queue = false;
+
+        for (idx, canceler) in index_cancelers {
+            if stop_queue || rx.is_cancelled() {
+                canceler.cancel();
+                if let Err(err) = store.decommission_cancel(idx).await {
+                    warn!(
+                        event = EVENT_DECOMMISSION_STATE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_POOLS,
+                        pool_index = idx,
+                        state = "queued_cancel_failed",
+                        error = %err,
+                        "Failed to cancel queued decommission"
+                    );
+                }
+                continue;
+            }
+
+            if let Err(err) = store.do_decommission_in_routine(canceler, idx).await {
+                error!(
+                    event = EVENT_DECOMMISSION_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = idx,
+                    state = "routine_failed",
+                    error = %err,
+                    "Decommission routine failed"
+                );
+                stop_queue = true;
+                continue;
+            }
+
+            stop_queue = {
+                let pool_meta = store.pool_meta.read().await;
+                !should_continue_decommission_queue(&pool_meta, idx)
+            };
+        }
+    });
 }
 
 fn decommission_meta_bucket_options() -> MakeBucketOptions {
@@ -1808,47 +1946,33 @@ impl ECStore {
 
         ensure_decommission_routines_scheduled(index_cancelers.len(), indices.len())?;
 
-        tokio::spawn(async move {
-            let mut stop_queue = false;
+        spawn_decommission_index_cancelers(store, rx, index_cancelers);
 
-            for (idx, canceler) in index_cancelers {
-                if stop_queue || rx.is_cancelled() {
-                    canceler.cancel();
-                    if let Err(err) = store.decommission_cancel(idx).await {
-                        warn!(
-                            event = EVENT_DECOMMISSION_STATE,
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_POOLS,
-                            pool_index = idx,
-                            state = "queued_cancel_failed",
-                            error = %err,
-                            "Failed to cancel queued decommission"
-                        );
-                    }
-                    continue;
-                }
+        Ok(())
+    }
 
-                if let Err(err) = store.do_decommission_in_routine(canceler, idx).await {
-                    error!(
-                        event = EVENT_DECOMMISSION_STATE,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_POOLS,
-                        pool_index = idx,
-                        state = "routine_failed",
-                        error = %err,
-                        "Decommission routine failed"
-                    );
-                    stop_queue = true;
-                    continue;
-                }
+    pub async fn spawn_missing_local_decommission_routines(self: &Arc<Self>) -> Result<()> {
+        let indices = {
+            let pool_meta = self.pool_meta.read().await;
+            first_resumable_decommission_queue_indices(&pool_meta)
+        };
+        let indices = local_decommission_queue_prefix(&self.endpoints(), &indices)?;
+        if indices.is_empty() {
+            return Ok(());
+        }
 
-                stop_queue = {
-                    let pool_meta = store.pool_meta.read().await;
-                    !should_continue_decommission_queue(&pool_meta, idx)
-                };
-            }
-        });
+        let rx = CancellationToken::new();
+        let index_cancelers = {
+            let mut cancelers = self.decommission_cancelers.write().await;
+            let missing = missing_decommission_worker_prefix(indices.as_slice(), cancelers.as_slice());
+            bind_missing_decommission_cancelers(missing.as_slice(), &rx, cancelers.as_mut_slice())
+        };
 
+        if index_cancelers.is_empty() {
+            return Ok(());
+        }
+
+        spawn_decommission_index_cancelers(self.clone(), rx, index_cancelers);
         Ok(())
     }
 
@@ -1869,9 +1993,10 @@ impl ECStore {
         ensure_decommission_not_rebalancing(self.is_rebalance_conflicting_with_decommission().await)?;
 
         let store = require_decommission_store(resolve_object_store_handle(), "start decommission")?;
+        let local_indices = local_decommission_queue_prefix(&self.endpoints(), &indices)?;
 
         self.start_decommission(indices.clone()).await?;
-        if let Err(err) = self.spawn_decommission_routines(store, rx, indices.clone()).await {
+        if let Err(err) = self.spawn_decommission_routines(store, rx, local_indices).await {
             let mut rollback_err: Option<Error> = None;
             for idx in indices {
                 if let Err(cancel_err) = self.decommission_cancel(idx).await {
@@ -2904,7 +3029,7 @@ impl ECStore {
         validate_start_decommission_request(&indices, self.single_pool())?;
 
         ensure_decommission_not_rebalancing(self.is_rebalance_conflicting_with_decommission().await)?;
-        ensure_local_decommission_pool_leaders(&self.endpoints(), &indices)?;
+        ensure_decommission_start_local_leader(&self.endpoints(), &indices)?;
 
         for idx in indices.iter().copied() {
             ensure_valid_decommission_pool_index(self.pools.len(), idx)?;
@@ -3987,16 +4112,17 @@ mod pools_tests {
     use super::{
         DECOMMISSION_PROGRESS_SAVE_INTERVAL, DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD, DecomBucketInfo,
         DecommissionTerminalState, PoolDecommissionInfo, PoolMeta, PoolSpaceInfo, PoolStatus, bind_decommission_cancelers,
-        cancel_decommission_canceler, classify_decommission_terminal_state, count_decommission_item,
-        decommission_cancel_signal_result, decommission_item_size, decommission_meta_bucket_options,
+        bind_missing_decommission_cancelers, cancel_decommission_canceler, classify_decommission_terminal_state,
+        count_decommission_item, decommission_cancel_signal_result, decommission_item_size, decommission_meta_bucket_options,
         decommission_start_guard_state, dedup_indices, default_decommission_bucket_concurrency,
         ensure_decommission_cancel_allowed, ensure_decommission_listing_disks_available, ensure_decommission_not_rebalancing,
-        ensure_decommission_start_allowed, ensure_decommission_start_rebalance_meta_allowed,
-        ensure_decommission_terminal_operation_supported, ensure_local_decommission_pool_leaders,
-        ensure_valid_decommission_pool_index, get_by_index, has_active_decommission_canceler, is_decommission_active,
-        is_decommission_cancel_requested, is_decommission_cancel_terminal, load_decommission_entry_versions,
-        mark_decommission_bucket_done, pool_meta_has_active_decommission, require_decommission_store,
-        resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
+        ensure_decommission_start_allowed, ensure_decommission_start_local_leader,
+        ensure_decommission_start_rebalance_meta_allowed, ensure_decommission_terminal_operation_supported,
+        ensure_local_decommission_pool_leaders, ensure_valid_decommission_pool_index, first_resumable_decommission_queue_indices,
+        get_by_index, has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_requested,
+        is_decommission_cancel_terminal, load_decommission_entry_versions, local_decommission_queue_prefix,
+        mark_decommission_bucket_done, missing_decommission_worker_prefix, pool_meta_has_active_decommission,
+        require_decommission_store, resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
         resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
         resolve_decommission_entry_reload_result, resolve_decommission_listing_worker_result,
         resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,
@@ -4039,6 +4165,15 @@ mod pools_tests {
             endpoints: Endpoints::from(vec![endpoint]),
             cmd_line: format!("pool-{idx}"),
             platform: String::new(),
+        }
+    }
+
+    fn decommission_test_pool_status(idx: usize, decommission: Option<PoolDecommissionInfo>) -> PoolStatus {
+        PoolStatus {
+            id: idx,
+            cmd_line: format!("pool-{idx}"),
+            last_update: OffsetDateTime::now_utc(),
+            decommission,
         }
     }
 
@@ -5590,6 +5725,112 @@ mod pools_tests {
         assert!(!replacement.is_cancelled());
         parent.cancel();
         assert!(replacement.is_cancelled());
+    }
+
+    #[test]
+    fn test_bind_missing_decommission_cancelers_stops_at_existing_slot() {
+        let parent = CancellationToken::new();
+        let existing = CancellationToken::new();
+        let mut cancelers = vec![None, Some(existing.clone()), None];
+
+        let bound = bind_missing_decommission_cancelers(&[0, 1, 2], &parent, cancelers.as_mut_slice());
+
+        assert_eq!(bound.len(), 1);
+        assert_eq!(bound[0].0, 0);
+        assert!(cancelers[0].is_some());
+        assert!(cancelers[1].is_some());
+        assert!(cancelers[2].is_none());
+        assert!(!existing.is_cancelled());
+    }
+
+    #[test]
+    fn test_local_decommission_queue_prefix_stops_at_remote_leader() {
+        let endpoints = EndpointServerPools::from(vec![
+            decommission_test_pool_endpoint(0, true),
+            decommission_test_pool_endpoint(1, true),
+            decommission_test_pool_endpoint(2, false),
+            decommission_test_pool_endpoint(3, true),
+        ]);
+
+        let local = local_decommission_queue_prefix(&endpoints, &[0, 1, 2, 3]).expect("prefix should resolve");
+
+        assert_eq!(local, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_local_decommission_queue_prefix_empty_when_first_leader_remote() {
+        let endpoints = EndpointServerPools::from(vec![
+            decommission_test_pool_endpoint(0, false),
+            decommission_test_pool_endpoint(1, true),
+        ]);
+
+        let local = local_decommission_queue_prefix(&endpoints, &[0, 1]).expect("prefix should resolve");
+
+        assert!(local.is_empty());
+    }
+
+    #[test]
+    fn test_decommission_start_local_leader_allows_remote_queued_pool() {
+        let endpoints = EndpointServerPools::from(vec![
+            decommission_test_pool_endpoint(0, true),
+            decommission_test_pool_endpoint(1, false),
+        ]);
+
+        assert!(ensure_decommission_start_local_leader(&endpoints, &[0, 1]).is_ok());
+    }
+
+    #[test]
+    fn test_decommission_start_local_leader_rejects_remote_active_pool() {
+        let endpoints = EndpointServerPools::from(vec![decommission_test_pool_endpoint(0, false)]);
+
+        let err = ensure_decommission_start_local_leader(&endpoints, &[0]).expect_err("remote active pool should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("decommission for pool 0 must run on the pool first endpoint")
+        );
+    }
+
+    #[test]
+    fn test_missing_decommission_worker_prefix_stops_at_active_worker() {
+        let cancelers = vec![None, Some(CancellationToken::new()), None];
+
+        let missing = missing_decommission_worker_prefix(&[0, 1, 2], cancelers.as_slice());
+
+        assert_eq!(missing, vec![0]);
+    }
+
+    #[test]
+    fn test_first_resumable_decommission_queue_indices_skips_terminal_states() {
+        let meta = PoolMeta {
+            pools: vec![
+                decommission_test_pool_status(
+                    0,
+                    Some(PoolDecommissionInfo {
+                        complete: true,
+                        ..Default::default()
+                    }),
+                ),
+                decommission_test_pool_status(
+                    1,
+                    Some(PoolDecommissionInfo {
+                        canceled: true,
+                        ..Default::default()
+                    }),
+                ),
+                decommission_test_pool_status(
+                    2,
+                    Some(PoolDecommissionInfo {
+                        queued: true,
+                        ..Default::default()
+                    }),
+                ),
+                decommission_test_pool_status(3, None),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(first_resumable_decommission_queue_indices(&meta), vec![2]);
     }
 
     #[test]

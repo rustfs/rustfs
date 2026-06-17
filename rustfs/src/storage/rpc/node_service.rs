@@ -987,10 +987,16 @@ impl Node for NodeService {
             }));
         };
         match store.reload_pool_meta().await {
-            Ok(_) => Ok(Response::new(ReloadPoolMetaResponse {
-                success: true,
-                error_info: None,
-            })),
+            Ok(_) => match store.spawn_missing_local_decommission_routines().await {
+                Ok(_) => Ok(Response::new(ReloadPoolMetaResponse {
+                    success: true,
+                    error_info: None,
+                })),
+                Err(err) => Ok(Response::new(ReloadPoolMetaResponse {
+                    success: false,
+                    error_info: Some(err.to_string()),
+                })),
+            },
             Err(err) => Ok(Response::new(ReloadPoolMetaResponse {
                 success: false,
                 error_info: Some(err.to_string()),

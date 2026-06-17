@@ -18,6 +18,7 @@ use crate::global::{
     GLOBAL_EventNotifier, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr,
     get_global_bucket_monitor, is_dist_erasure, is_first_cluster_node_local,
 };
+use crate::pools::local_decommission_queue_prefix;
 use tracing::{debug, error, info, warn};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -436,18 +437,16 @@ impl ECStore {
             }
         }
 
-        if !pool_indices.is_empty() {
-            let idx = pool_indices[0];
-            if should_resume_local_decommission(&endpoints, idx)? {
-                let store = self.clone();
+        let local_pool_indices = local_decommission_queue_prefix(&endpoints, &pool_indices)?;
+        if !local_pool_indices.is_empty() {
+            let store = self.clone();
 
-                tokio::spawn(async move {
-                    if !wait_for_local_decommission_resume_delay(&rx, LOCAL_DECOMMISSION_INITIAL_RESUME_DELAY).await {
-                        return;
-                    }
-                    resume_local_decommission_after_init(store, rx, pool_indices).await;
-                });
-            }
+            tokio::spawn(async move {
+                if !wait_for_local_decommission_resume_delay(&rx, LOCAL_DECOMMISSION_INITIAL_RESUME_DELAY).await {
+                    return;
+                }
+                resume_local_decommission_after_init(store, rx, local_pool_indices).await;
+            });
         }
 
         let num_nodes = get_global_endpoints().get_nodes().len() as u64;
