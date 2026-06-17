@@ -198,6 +198,10 @@ require_source_line \
   "storage-api public object helper contract re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
+  "pub use object::{ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState};" \
+  "storage-api public object precondition contract re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
   "pub use object::{VersionMarker, WalkVersionsSortOrder};" \
   "storage-api public list helper contract re-export"
 require_source_line \
@@ -246,7 +250,7 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:HTTPPreconditions|ObjectLockRetentionOptions)\b|::(?:HTTPPreconditions|ObjectLockRetentionOptions)\b)|pub struct (?:HTTPPreconditions|ObjectLockRetentionOptions)\b' \
+  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:HTTPPreconditions|ObjectLockRetentionOptions|ObjectPreconditionError|ObjectPreconditionPart|ObjectPreconditionState)\b|::(?:HTTPPreconditions|ObjectLockRetentionOptions|ObjectPreconditionError|ObjectPreconditionPart|ObjectPreconditionState)\b)|pub (?:enum ObjectPreconditionError|struct (?:HTTPPreconditions|ObjectLockRetentionOptions|ObjectPreconditionPart|ObjectPreconditionState))\b' \
     crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
 ) >"$STORE_API_OBJECT_HELPER_REEXPORTS_FILE"
 
