@@ -53,13 +53,13 @@ use rustfs_ecstore::rio::{DecryptReader, EncryptReader, HardLimitReader, boxed_r
 use rustfs_ecstore::rio::{HashReader, WritePlan};
 use rustfs_ecstore::set_disk::is_valid_storage_class;
 use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::{HTTPRangeSpec, ObjectIO, ObjectOptions, PutObjReader};
 use rustfs_ecstore::store_api::{MultipartOperations, ObjectOperations};
+use rustfs_ecstore::store_api::{ObjectIO, ObjectOptions, PutObjReader};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_s3_ops::S3Operation;
 #[cfg(test)]
 use rustfs_storage_api::HTTPPreconditions;
-use rustfs_storage_api::{CompletePart, MultipartUploadResult};
+use rustfs_storage_api::{CompletePart, HTTPRangeSpec, MultipartUploadResult};
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{

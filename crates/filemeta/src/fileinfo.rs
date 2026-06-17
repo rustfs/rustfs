@@ -680,3 +680,213 @@ pub fn is_restored_object_on_disk(meta: &HashMap<String, String>) -> bool {
     }
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::collection::{hash_map, vec};
+    use proptest::prelude::*;
+
+    fn small_string_strategy() -> impl Strategy<Value = String> {
+        proptest::string::string_regex("[A-Za-z0-9._/-]{0,16}").expect("small string regex should compile")
+    }
+
+    fn small_required_string_strategy() -> impl Strategy<Value = String> {
+        proptest::string::string_regex("[A-Za-z0-9._/-]{1,16}").expect("required string regex should compile")
+    }
+
+    fn bytes_strategy(max_len: usize) -> impl Strategy<Value = Bytes> {
+        vec(any::<u8>(), 0..=max_len).prop_map(Bytes::from)
+    }
+
+    fn uuid_strategy() -> impl Strategy<Value = Uuid> {
+        any::<[u8; 16]>().prop_map(Uuid::from_bytes)
+    }
+
+    fn optional_uuid_strategy() -> impl Strategy<Value = Option<Uuid>> {
+        proptest::option::of(uuid_strategy())
+    }
+
+    fn timestamp_strategy() -> impl Strategy<Value = OffsetDateTime> {
+        (0i64..=4_102_444_800i64)
+            .prop_map(|seconds| OffsetDateTime::from_unix_timestamp(seconds).expect("bounded timestamp should be valid"))
+    }
+
+    fn optional_timestamp_strategy() -> impl Strategy<Value = Option<OffsetDateTime>> {
+        proptest::option::of(timestamp_strategy())
+    }
+
+    fn hash_algorithm_strategy() -> impl Strategy<Value = HashAlgorithm> {
+        prop_oneof![
+            Just(HashAlgorithm::SHA256),
+            Just(HashAlgorithm::HighwayHash256),
+            Just(HashAlgorithm::HighwayHash256S),
+            Just(HashAlgorithm::HighwayHash256SLegacy),
+            Just(HashAlgorithm::BLAKE2b512),
+            Just(HashAlgorithm::Md5),
+            Just(HashAlgorithm::None),
+        ]
+    }
+
+    fn checksum_info_strategy() -> impl Strategy<Value = ChecksumInfo> {
+        (0usize..=4, hash_algorithm_strategy(), bytes_strategy(32)).prop_map(|(part_number, algorithm, hash)| ChecksumInfo {
+            part_number,
+            algorithm,
+            hash,
+        })
+    }
+
+    fn erasure_info_strategy() -> impl Strategy<Value = ErasureInfo> {
+        (1usize..=4, 0usize..=3, 2usize..=4096)
+            .prop_flat_map(|(data_blocks, parity_blocks, block_size)| {
+                let total_blocks = data_blocks + parity_blocks;
+                (
+                    Just(data_blocks),
+                    Just(parity_blocks),
+                    Just(block_size),
+                    0usize..=total_blocks,
+                    vec(1usize..=(total_blocks.max(1)), total_blocks),
+                    vec(checksum_info_strategy(), 0..=3),
+                    small_required_string_strategy(),
+                )
+            })
+            .prop_map(
+                |(data_blocks, parity_blocks, block_size, index, distribution, checksums, algorithm)| ErasureInfo {
+                    algorithm,
+                    data_blocks,
+                    parity_blocks,
+                    block_size,
+                    index,
+                    distribution,
+                    checksums,
+                },
+            )
+    }
+
+    fn object_part_info_strategy() -> impl Strategy<Value = ObjectPartInfo> {
+        (
+            small_string_strategy(),
+            0usize..=8,
+            0usize..=4096,
+            -1_000_000i64..=1_000_000i64,
+            optional_timestamp_strategy(),
+            proptest::option::of(bytes_strategy(16)),
+            proptest::option::of(hash_map(small_string_strategy(), small_string_strategy(), 0..=3)),
+            proptest::option::of(small_string_strategy()),
+        )
+            .prop_map(|(etag, number, size, actual_size, mod_time, index, checksums, error)| ObjectPartInfo {
+                etag,
+                number,
+                size,
+                actual_size,
+                mod_time,
+                index,
+                checksums,
+                error,
+            })
+    }
+
+    fn file_info_strategy() -> impl Strategy<Value = FileInfo> {
+        (
+            (
+                small_string_strategy(),
+                small_string_strategy(),
+                optional_uuid_strategy(),
+                any::<bool>(),
+                any::<bool>(),
+                small_string_strategy(),
+                small_string_strategy(),
+                small_string_strategy(),
+                optional_uuid_strategy(),
+                any::<bool>(),
+            ),
+            (
+                optional_uuid_strategy(),
+                optional_timestamp_strategy(),
+                -1_000_000i64..=1_000_000i64,
+                proptest::option::of(any::<u32>()),
+                proptest::option::of(any::<u64>()),
+                hash_map(small_string_strategy(), small_string_strategy(), 0..=4),
+                vec(object_part_info_strategy(), 0..=3),
+                erasure_info_strategy(),
+                any::<bool>(),
+                proptest::option::of(bytes_strategy(32)),
+            ),
+            (
+                0usize..=4,
+                optional_timestamp_strategy(),
+                any::<bool>(),
+                0usize..=4,
+                proptest::option::of(bytes_strategy(32)),
+                any::<bool>(),
+                any::<bool>(),
+            ),
+        )
+            .prop_map(|(head, middle, tail)| {
+                let (
+                    volume,
+                    name,
+                    version_id,
+                    is_latest,
+                    deleted,
+                    transition_status,
+                    transitioned_objname,
+                    transition_tier,
+                    transition_version_id,
+                    expire_restored,
+                ) = head;
+                let (data_dir, mod_time, size, mode, written_by_version, metadata, parts, erasure, mark_deleted, data) = middle;
+                let (num_versions, successor_mod_time, fresh, idx, checksum, versioned, uses_legacy_checksum) = tail;
+
+                FileInfo {
+                    volume,
+                    name,
+                    version_id,
+                    is_latest,
+                    deleted,
+                    transition_status,
+                    transitioned_objname,
+                    transition_tier,
+                    transition_version_id,
+                    expire_restored,
+                    data_dir,
+                    mod_time,
+                    size,
+                    mode,
+                    written_by_version,
+                    metadata,
+                    parts,
+                    erasure,
+                    mark_deleted,
+                    replication_state_internal: None,
+                    data,
+                    num_versions,
+                    successor_mod_time,
+                    fresh,
+                    idx,
+                    checksum,
+                    versioned,
+                    uses_legacy_checksum,
+                }
+            })
+    }
+
+    proptest! {
+        #[test]
+        fn fileinfo_msgpack_round_trips(value in file_info_strategy()) {
+            let encoded = value
+                .marshal_msg()
+                .expect("FileInfo should serialize in the property roundtrip test");
+            let decoded = FileInfo::unmarshal(&encoded)
+                .expect("FileInfo should deserialize in the property roundtrip test");
+
+            prop_assert_eq!(decoded, value);
+        }
+
+        #[test]
+        fn fileinfo_unmarshal_never_panics(input in vec(any::<u8>(), 0..=1024)) {
+            let result = std::panic::catch_unwind(|| FileInfo::unmarshal(&input));
+            prop_assert!(result.is_ok(), "FileInfo::unmarshal panicked for arbitrary input");
+        }
+    }
+}
