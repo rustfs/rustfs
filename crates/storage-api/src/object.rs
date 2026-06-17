@@ -44,6 +44,93 @@ pub struct ObjectLockRetentionOptions {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectPreconditionPart {
+    pub number: usize,
+    pub exists: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectPreconditionState<'a> {
+    pub etag: Option<&'a str>,
+    pub mod_time: Option<OffsetDateTime>,
+    pub requested_part: Option<ObjectPreconditionPart>,
+}
+
+impl ObjectPreconditionState<'_> {
+    pub fn check(self, preconditions: Option<&HTTPPreconditions>) -> Result<(), ObjectPreconditionError> {
+        if let Some(part) = self.requested_part
+            && part.number > 1
+            && !part.exists
+        {
+            return Err(ObjectPreconditionError::InvalidPartNumber(part.number));
+        }
+
+        let Some(preconditions) = preconditions else {
+            return Ok(());
+        };
+
+        let has_valid_mod_time = self.mod_time.is_some_and(|t| t != OffsetDateTime::UNIX_EPOCH);
+        let if_none_match = preconditions.if_none_match_value();
+        let if_match = preconditions.if_match_value();
+
+        if let Some(if_none_match) = if_none_match
+            && let Some(etag) = self.etag
+            && etag_matches(etag, if_none_match)
+        {
+            return Err(ObjectPreconditionError::NotModified);
+        }
+
+        if has_valid_mod_time
+            && let Some(if_modified_since) = &preconditions.if_modified_since
+            && let Some(mod_time) = &self.mod_time
+            && !is_modified_since(mod_time, if_modified_since)
+        {
+            return Err(ObjectPreconditionError::NotModified);
+        }
+
+        if let Some(if_match) = if_match {
+            if let Some(etag) = self.etag {
+                if !etag_matches(etag, if_match) {
+                    return Err(ObjectPreconditionError::PreconditionFailed);
+                }
+            } else {
+                return Err(ObjectPreconditionError::PreconditionFailed);
+            }
+        }
+
+        if has_valid_mod_time
+            && if_match.is_none()
+            && let Some(if_unmodified_since) = &preconditions.if_unmodified_since
+            && let Some(mod_time) = &self.mod_time
+            && is_modified_since(mod_time, if_unmodified_since)
+        {
+            return Err(ObjectPreconditionError::PreconditionFailed);
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectPreconditionError {
+    InvalidPartNumber(usize),
+    NotModified,
+    PreconditionFailed,
+}
+
+impl fmt::Display for ObjectPreconditionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPartNumber(part_number) => write!(f, "invalid part number {part_number}"),
+            Self::NotModified => f.write_str("object not modified"),
+            Self::PreconditionFailed => f.write_str("object precondition failed"),
+        }
+    }
+}
+
+impl std::error::Error for ObjectPreconditionError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VersionMarker {
     Null,
     Version(Uuid),
@@ -185,6 +272,16 @@ fn non_empty_condition_value(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
+fn etag_matches(object_etag: &str, condition_etag: &str) -> bool {
+    let object_etag = object_etag.trim_matches('"');
+    let condition_etag = condition_etag.trim_matches('"');
+    condition_etag == "*" || object_etag == condition_etag
+}
+
+fn is_modified_since(mod_time: &OffsetDateTime, given_time: &OffsetDateTime) -> bool {
+    mod_time.unix_timestamp() > given_time.unix_timestamp()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +305,69 @@ mod tests {
         assert!(opts.mode.is_none());
         assert!(opts.retain_until.is_none());
         assert!(!opts.bypass_governance);
+    }
+
+    #[test]
+    fn object_precondition_state_rejects_missing_requested_part() {
+        let state = ObjectPreconditionState {
+            requested_part: Some(ObjectPreconditionPart {
+                number: 3,
+                exists: false,
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(state.check(None), Err(ObjectPreconditionError::InvalidPartNumber(3)));
+    }
+
+    #[test]
+    fn object_precondition_state_keeps_existing_etag_priority() {
+        let preconditions = HTTPPreconditions {
+            if_match: Some("\"other\"".to_owned()),
+            if_none_match: Some("\"abc\"".to_owned()),
+            ..Default::default()
+        };
+        let state = ObjectPreconditionState {
+            etag: Some("\"abc\""),
+            ..Default::default()
+        };
+
+        assert_eq!(state.check(Some(&preconditions)), Err(ObjectPreconditionError::NotModified));
+    }
+
+    #[test]
+    fn object_precondition_state_requires_etag_for_if_match() {
+        let preconditions = HTTPPreconditions {
+            if_match: Some("\"abc\"".to_owned()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            ObjectPreconditionState::default().check(Some(&preconditions)),
+            Err(ObjectPreconditionError::PreconditionFailed)
+        );
+    }
+
+    #[test]
+    fn object_precondition_state_checks_modification_dates() {
+        let mod_time = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(100);
+        let preconditions = HTTPPreconditions {
+            if_modified_since: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(100)),
+            ..Default::default()
+        };
+        let state = ObjectPreconditionState {
+            mod_time: Some(mod_time),
+            ..Default::default()
+        };
+
+        assert_eq!(state.check(Some(&preconditions)), Err(ObjectPreconditionError::NotModified));
+
+        let preconditions = HTTPPreconditions {
+            if_unmodified_since: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(99)),
+            ..Default::default()
+        };
+
+        assert_eq!(state.check(Some(&preconditions)), Err(ObjectPreconditionError::PreconditionFailed));
     }
 
     #[test]

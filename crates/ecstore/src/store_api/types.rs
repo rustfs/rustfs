@@ -1,5 +1,8 @@
 use super::*;
-use rustfs_storage_api::{HTTPPreconditions, ObjectLockRetentionOptions, VersionMarker, WalkVersionsSortOrder};
+use rustfs_storage_api::{
+    HTTPPreconditions, ObjectLockRetentionOptions, ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState,
+    VersionMarker, WalkVersionsSortOrder,
+};
 
 #[derive(Debug, Default, Clone)]
 pub struct ObjectOptions {
@@ -102,74 +105,28 @@ impl ObjectOptions {
     }
 
     pub fn precondition_check(&self, obj_info: &ObjectInfo) -> Result<()> {
-        let has_valid_mod_time = obj_info.mod_time.is_some_and(|t| t != OffsetDateTime::UNIX_EPOCH);
-
-        if let Some(part_number) = self.part_number
-            && part_number > 1
-            && !obj_info.parts.is_empty()
-        {
-            let part_found = obj_info.parts.iter().any(|pi| pi.number == part_number);
-            if !part_found {
-                return Err(Error::InvalidPartNumber(part_number));
+        let requested_part = self.part_number.and_then(|part_number| {
+            if part_number > 1 && !obj_info.parts.is_empty() {
+                Some(ObjectPreconditionPart {
+                    number: part_number,
+                    exists: obj_info.parts.iter().any(|pi| pi.number == part_number),
+                })
+            } else {
+                None
             }
-        }
+        });
+        let state = ObjectPreconditionState {
+            etag: obj_info.etag.as_deref(),
+            mod_time: obj_info.mod_time,
+            requested_part,
+        };
 
-        if let Some(pre) = &self.http_preconditions {
-            let if_none_match = pre.if_none_match_value();
-            let if_match = pre.if_match_value();
-
-            if let Some(if_none_match) = if_none_match
-                && let Some(etag) = &obj_info.etag
-                && is_etag_equal(etag, if_none_match)
-            {
-                return Err(Error::NotModified);
-            }
-
-            if has_valid_mod_time
-                && let Some(if_modified_since) = &pre.if_modified_since
-                && let Some(mod_time) = &obj_info.mod_time
-                && !is_modified_since(mod_time, if_modified_since)
-            {
-                return Err(Error::NotModified);
-            }
-
-            if let Some(if_match) = if_match {
-                if let Some(etag) = &obj_info.etag {
-                    if !is_etag_equal(etag, if_match) {
-                        return Err(Error::PreconditionFailed);
-                    }
-                } else {
-                    return Err(Error::PreconditionFailed);
-                }
-            }
-            if has_valid_mod_time
-                && if_match.is_none()
-                && let Some(if_unmodified_since) = &pre.if_unmodified_since
-                && let Some(mod_time) = &obj_info.mod_time
-                && is_modified_since(mod_time, if_unmodified_since)
-            {
-                return Err(Error::PreconditionFailed);
-            }
-        }
-
-        Ok(())
+        state.check(self.http_preconditions.as_ref()).map_err(|err| match err {
+            ObjectPreconditionError::InvalidPartNumber(part_number) => Error::InvalidPartNumber(part_number),
+            ObjectPreconditionError::NotModified => Error::NotModified,
+            ObjectPreconditionError::PreconditionFailed => Error::PreconditionFailed,
+        })
     }
-}
-
-fn is_etag_equal(etag1: &str, etag2: &str) -> bool {
-    let e1 = etag1.trim_matches('"');
-    let e2 = etag2.trim_matches('"');
-    // Handle wildcard "*" - matches any ETag (per HTTP/1.1 RFC 7232)
-    if e2 == "*" {
-        return true;
-    }
-    e1 == e2
-}
-
-fn is_modified_since(mod_time: &OffsetDateTime, given_time: &OffsetDateTime) -> bool {
-    let mod_secs = mod_time.unix_timestamp();
-    let given_secs = given_time.unix_timestamp();
-    mod_secs > given_secs
 }
 
 #[derive(Debug, Default)]
