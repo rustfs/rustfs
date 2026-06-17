@@ -533,7 +533,7 @@ pub async fn get_object(
     container: &str,
     object: &str,
     credentials: &Credentials,
-    range: Option<rustfs_ecstore::store_api::HTTPRangeSpec>,
+    range: Option<rustfs_storage_api::HTTPRangeSpec>,
 ) -> SwiftResult<rustfs_ecstore::store_api::GetObjectReader> {
     use rustfs_ecstore::store_api::GetObjectReader;
 
@@ -1032,8 +1032,8 @@ pub fn parse_copy_from_header(copy_from: &str) -> SwiftResult<(String, String)> 
 /// assert_eq!(range.end, 1023);
 /// ```
 #[allow(dead_code)] // Handler integration: Range header
-pub fn parse_range_header(range_str: &str) -> SwiftResult<rustfs_ecstore::store_api::HTTPRangeSpec> {
-    use rustfs_ecstore::store_api::HTTPRangeSpec;
+pub fn parse_range_header(range_str: &str) -> SwiftResult<rustfs_storage_api::HTTPRangeSpec> {
+    use rustfs_storage_api::HTTPRangeSpec;
 
     if !range_str.starts_with("bytes=") {
         return Err(SwiftError::BadRequest("Range header must start with 'bytes='".to_string()));
