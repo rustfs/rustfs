@@ -266,6 +266,9 @@ jobs:
       - name: Setup Rust toolchain for s3s-e2e installation
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Run delete-marker migration proof
+        run: cargo test -p e2e_test delete_marker_migration_semantics -- --nocapture --test-threads=1
+
       - name: Install s3s-e2e test tool
         uses: taiki-e/cache-cargo-install-action@v2
         with:
