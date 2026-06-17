@@ -573,12 +573,12 @@ impl NotificationSys {
         Ok(failures)
     }
 
-    pub async fn stop_rebalance(&self) -> Result<()> {
-        let failures = self.stop_rebalance_failures().await?;
+    pub async fn stop_rebalance(&self, expected_rebalance_id: Option<&str>) -> Result<()> {
+        let failures = self.stop_rebalance_failures(expected_rebalance_id).await?;
         aggregate_notification_failures("stop_rebalance", failures)
     }
 
-    pub async fn stop_rebalance_failures(&self) -> Result<Vec<String>> {
+    pub async fn stop_rebalance_failures(&self, expected_rebalance_id: Option<&str>) -> Result<Vec<String>> {
         info!(
             event = EVENT_NOTIFICATION_PEER_PROPAGATION,
             component = LOG_COMPONENT_ECSTORE,
@@ -607,7 +607,7 @@ impl NotificationSys {
             if let Some(client) = client {
                 let host = client.grid_host.clone();
                 futures.push(async move {
-                    let result = client.stop_rebalance().await;
+                    let result = client.stop_rebalance(expected_rebalance_id).await;
                     (host, result)
                 });
             } else {
@@ -651,7 +651,7 @@ impl NotificationSys {
             }
         }
 
-        match store.stop_rebalance().await {
+        match store.stop_rebalance_for_id(expected_rebalance_id).await {
             Ok(_) => {
                 if let Err(err) = store.save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt).await {
                     error!(

@@ -998,7 +998,7 @@ impl Node for NodeService {
         }
     }
 
-    async fn stop_rebalance(&self, _request: Request<StopRebalanceRequest>) -> Result<Response<StopRebalanceResponse>, Status> {
+    async fn stop_rebalance(&self, request: Request<StopRebalanceRequest>) -> Result<Response<StopRebalanceResponse>, Status> {
         let Some(store) = resolve_object_store_handle() else {
             return Ok(Response::new(StopRebalanceResponse {
                 success: false,
@@ -1006,7 +1006,12 @@ impl Node for NodeService {
             }));
         };
 
-        Ok(Response::new(stop_rebalance_response(store.stop_rebalance().await)))
+        let expected_rebalance_id = request.into_inner().expected_rebalance_id;
+        let expected_rebalance_id = (!expected_rebalance_id.is_empty()).then_some(expected_rebalance_id);
+
+        Ok(Response::new(stop_rebalance_response(
+            store.stop_rebalance_for_id(expected_rebalance_id.as_deref()).await,
+        )))
     }
 
     #[tracing::instrument(skip_all, fields(start_rebalance))]
@@ -2351,7 +2356,9 @@ mod tests {
     async fn test_stop_rebalance() {
         let service = create_test_node_service();
 
-        let request = Request::new(StopRebalanceRequest {});
+        let request = Request::new(StopRebalanceRequest {
+            expected_rebalance_id: String::new(),
+        });
 
         let response = service.stop_rebalance(request).await;
         assert!(response.is_ok());

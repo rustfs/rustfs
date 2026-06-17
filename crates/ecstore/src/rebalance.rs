@@ -1140,7 +1140,7 @@ impl ECStore {
 
         let id = self.init_rebalance_meta_unlocked(bucktes).await?;
         if let Err(start_err) = self.start_rebalance_unlocked().await {
-            if let Err(rollback_err) = self.stop_rebalance().await {
+            if let Err(rollback_err) = self.stop_rebalance_for_id(Some(&id)).await {
                 return Err(Error::other(format!(
                     "failed to start rebalance after metadata initialized for {id}: {start_err}; rollback failed: {rollback_err}"
                 )));
@@ -1281,6 +1281,13 @@ impl ECStore {
             .is_some_and(is_rebalance_conflicting_with_decommission)
     }
 
+    pub async fn current_rebalance_id(&self) -> Option<String> {
+        let rebalance_meta = self.rebalance_meta.read().await;
+        rebalance_meta
+            .as_ref()
+            .and_then(|meta| (!meta.id.is_empty()).then(|| meta.id.clone()))
+    }
+
     pub async fn is_pool_rebalancing(&self, pool_index: usize) -> bool {
         let rebalance_meta = self.rebalance_meta.read().await;
         if let Some(ref meta) = *rebalance_meta {
@@ -1298,9 +1305,14 @@ impl ECStore {
 
     #[tracing::instrument(skip(self))]
     pub async fn stop_rebalance(self: &Arc<Self>) -> Result<()> {
+        self.stop_rebalance_for_id(None).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn stop_rebalance_for_id(self: &Arc<Self>, expected_id: Option<&str>) -> Result<()> {
         let meta_to_save = {
             let mut rebalance_meta = self.rebalance_meta.write().await;
-            stop_rebalance_meta_snapshot(rebalance_meta.as_mut(), OffsetDateTime::now_utc())
+            stop_rebalance_meta_snapshot_for_id(rebalance_meta.as_mut(), OffsetDateTime::now_utc(), expected_id)
         };
 
         if let Some(meta_to_save) = meta_to_save {
@@ -2865,7 +2877,6 @@ fn merge_rebalance_meta(remote: &mut RebalanceMeta, local: &RebalanceMeta) {
     }
 
     if !local.id.is_empty() && remote.id != local.id {
-        *remote = local.clone();
         return;
     }
 
@@ -2934,12 +2945,26 @@ fn stop_rebalance_state(meta: &mut RebalanceMeta, now: OffsetDateTime) {
     }
 }
 
-fn stop_rebalance_meta_snapshot(meta: Option<&mut RebalanceMeta>, now: OffsetDateTime) -> Option<RebalanceMeta> {
-    meta.map(|meta| {
+fn stop_rebalance_meta_snapshot_for_id(
+    meta: Option<&mut RebalanceMeta>,
+    now: OffsetDateTime,
+    expected_id: Option<&str>,
+) -> Option<RebalanceMeta> {
+    meta.and_then(|meta| {
+        if let Some(expected_id) = expected_id
+            && !expected_id.is_empty()
+            && meta.id != expected_id
+        {
+            return None;
+        }
         stop_rebalance_state(meta, now);
         meta.last_refreshed_at = Some(now);
-        meta.clone()
+        Some(meta.clone())
     })
+}
+
+fn stop_rebalance_meta_snapshot(meta: Option<&mut RebalanceMeta>, now: OffsetDateTime) -> Option<RebalanceMeta> {
+    stop_rebalance_meta_snapshot_for_id(meta, now, None)
 }
 
 fn record_rebalance_stop_propagation_snapshot(
@@ -3721,9 +3746,9 @@ mod rebalance_unit_tests {
         should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete, should_defer_rebalance_entry_failure,
         should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
         should_retry_rebalance_listing, should_skip_rebalance_delete_marker, should_skip_start_rebalance,
-        stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue,
-        validate_rebalance_start_gate_state, validate_start_rebalance_state, wait_rebalance_listing_retry,
-        with_rebalance_entry_context,
+        stop_rebalance_meta_snapshot, stop_rebalance_meta_snapshot_for_id, stop_rebalance_state,
+        take_bucket_from_rebalance_queue, validate_rebalance_start_gate_state, validate_start_rebalance_state,
+        wait_rebalance_listing_retry, with_rebalance_entry_context,
     };
     use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -4852,6 +4877,37 @@ mod rebalance_unit_tests {
         let message = err.to_string();
         assert!(message.contains("rebalance meta save failed during init_rebalance_meta"));
         assert!(message.contains(Error::SlowDown.to_string().as_str()));
+    }
+
+    #[test]
+    fn test_merge_rebalance_meta_preserves_remote_when_ids_conflict() {
+        let mut remote = RebalanceMeta {
+            id: "id-b".to_string(),
+            last_refreshed_at: Some(OffsetDateTime::from_unix_timestamp(200).expect("valid timestamp")),
+            ..Default::default()
+        };
+        let local = RebalanceMeta {
+            id: "id-a".to_string(),
+            last_refreshed_at: Some(OffsetDateTime::from_unix_timestamp(100).expect("valid timestamp")),
+            ..Default::default()
+        };
+
+        merge_rebalance_meta(&mut remote, &local);
+
+        assert_eq!(remote.id, "id-b");
+    }
+
+    #[test]
+    fn test_merge_rebalance_meta_accepts_local_when_remote_id_empty() {
+        let mut remote = RebalanceMeta::new();
+        let local = RebalanceMeta {
+            id: "id-a".to_string(),
+            ..Default::default()
+        };
+
+        merge_rebalance_meta(&mut remote, &local);
+
+        assert_eq!(remote.id, "id-a");
     }
 
     #[test]
@@ -7316,6 +7372,39 @@ mod rebalance_unit_tests {
     fn test_stop_rebalance_meta_snapshot_returns_none_when_meta_missing() {
         let now = OffsetDateTime::from_unix_timestamp(50_000).unwrap();
         assert!(stop_rebalance_meta_snapshot(None, now).is_none());
+    }
+
+    #[test]
+    fn test_stop_rebalance_meta_snapshot_ignores_mismatched_operation_id() {
+        let mut meta = RebalanceMeta {
+            id: "id-b".to_string(),
+            ..Default::default()
+        };
+
+        let snapshot = stop_rebalance_meta_snapshot_for_id(Some(&mut meta), OffsetDateTime::now_utc(), Some("id-a"));
+
+        assert!(snapshot.is_none());
+        assert_eq!(meta.id, "id-b");
+    }
+
+    #[test]
+    fn test_stop_rebalance_meta_snapshot_accepts_matching_operation_id() {
+        let mut meta = RebalanceMeta {
+            id: "id-a".to_string(),
+            ..Default::default()
+        };
+        meta.pool_stats.push(RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let snapshot = stop_rebalance_meta_snapshot_for_id(Some(&mut meta), OffsetDateTime::now_utc(), Some("id-a"));
+
+        assert!(snapshot.is_some());
     }
 
     #[test]

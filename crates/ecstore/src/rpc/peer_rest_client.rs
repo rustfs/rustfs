@@ -916,11 +916,13 @@ impl PeerRestClient {
         .await
     }
 
-    pub async fn stop_rebalance(&self) -> Result<()> {
+    pub async fn stop_rebalance(&self, expected_rebalance_id: Option<&str>) -> Result<()> {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(StopRebalanceRequest {});
+                let request = Request::new(StopRebalanceRequest {
+                    expected_rebalance_id: expected_rebalance_id.unwrap_or_default().to_string(),
+                });
 
                 let response = client.stop_rebalance(request).await?.into_inner();
                 if !response.success {

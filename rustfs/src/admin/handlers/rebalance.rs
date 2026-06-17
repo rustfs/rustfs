@@ -111,7 +111,7 @@ async fn rollback_cluster_rebalance_start(
     let stop_attempt_at = OffsetDateTime::now_utc();
     if let Some(notification_sys) = notification_sys {
         let stop_failures = notification_sys
-            .stop_rebalance_failures()
+            .stop_rebalance_failures(Some(rebalance_id))
             .await
             .map_err(|err| format!("cluster stop_rebalance rollback for {rebalance_id} failed: {err}"))?;
         if !stop_failures.is_empty() {
@@ -133,7 +133,7 @@ async fn rollback_cluster_rebalance_start(
     }
 
     store
-        .stop_rebalance()
+        .stop_rebalance_for_id(Some(rebalance_id))
         .await
         .map_err(|err| format!("local stop_rebalance rollback for {rebalance_id} failed: {err}"))?;
     store
@@ -696,6 +696,7 @@ impl Operation for RebalanceStop {
             .load_rebalance_meta()
             .await
             .map_err(|e| s3_error!(InternalError, "failed to load rebalance metadata before stop: {}", e))?;
+        let expected_rebalance_id = store.current_rebalance_id().await;
 
         if !store.is_rebalance_conflicting_with_decommission().await {
             log_rebalance_request_rejected("stop", "rebalance_not_started", &request_id, &actor, &remote_addr);
@@ -707,12 +708,12 @@ impl Operation for RebalanceStop {
         let mut stop_failures = Vec::new();
         if let Some(notification_sys) = notification_sys {
             stop_failures = notification_sys
-                .stop_rebalance_failures()
+                .stop_rebalance_failures(expected_rebalance_id.as_deref())
                 .await
                 .map_err(|e| s3_error!(InternalError, "failed to stop rebalance via notification system: {}", e))?;
         } else {
             store
-                .stop_rebalance()
+                .stop_rebalance_for_id(expected_rebalance_id.as_deref())
                 .await
                 .map_err(|e| s3_error!(InternalError, "failed to stop rebalance: {}", e))?;
 
