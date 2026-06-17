@@ -2634,7 +2634,7 @@ fn rebalance_ignored_reason(result: &MigrationVersionResult) -> &'static str {
 }
 
 fn should_cleanup_rebalance_source_entry(rebalanced: usize, total_versions: usize) -> bool {
-    rebalanced == total_versions
+    total_versions > 0 && rebalanced == total_versions
 }
 
 fn should_skip_rebalance_delete_marker(version: &FileInfo, remaining_versions: usize, replication_configured: bool) -> bool {
@@ -6106,6 +6106,11 @@ mod rebalance_unit_tests {
     #[test]
     fn test_should_cleanup_rebalance_source_entry_rejects_versions_only_expired_by_lifecycle() {
         assert!(!should_cleanup_rebalance_source_entry(2, 3));
+    }
+
+    #[test]
+    fn test_should_cleanup_rebalance_source_entry_rejects_empty_version_set() {
+        assert!(!should_cleanup_rebalance_source_entry(0, 0));
     }
 
     #[test]
