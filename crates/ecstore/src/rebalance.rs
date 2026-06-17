@@ -2943,6 +2943,7 @@ impl ECStore {
     #[tracing::instrument(skip(self, set))]
     async fn rebalance_entry(
         self: Arc<Self>,
+        rx: CancellationToken,
         bucket: String,
         pool_index: usize,
         entry: MetaCacheEntry,
@@ -2981,6 +2982,9 @@ impl ECStore {
             );
             return Ok(RebalanceEntryOutcome::Completed);
         }
+        if rx.is_cancelled() {
+            return Err(Error::OperationCanceled);
+        }
 
         if self.check_if_rebalance_done(pool_index).await {
             debug!(
@@ -3007,6 +3011,10 @@ impl ECStore {
         let mut expired: usize = 0;
         let mut stats_updates = Vec::with_capacity(fivs.versions.len());
         for version in fivs.versions.iter() {
+            if rx.is_cancelled() {
+                return Err(Error::OperationCanceled);
+            }
+
             if crate::pools::should_skip_lifecycle_for_data_movement(
                 self.clone(),
                 &bucket,
@@ -3158,6 +3166,10 @@ impl ECStore {
         )?;
 
         if should_cleanup_rebalance_source_entry(rebalanced, fivs.versions.len()) {
+            if rx.is_cancelled() {
+                return Err(Error::OperationCanceled);
+            }
+
             if let Err(err) = data_movement::ensure_source_cleanup_versions_unchanged(
                 set.clone(),
                 bucket.as_str(),
@@ -3381,7 +3393,9 @@ impl ECStore {
                                 state = "task_started",
                                 "Started rebalance entry task"
                             );
-                            let result = this.rebalance_entry(bucket, pool_index, entry, set, bucket_configs).await;
+                            let result = this
+                                .rebalance_entry(callback_rx.clone(), bucket, pool_index, entry, set, bucket_configs)
+                                .await;
                             if let Err(err) = &result {
                                 error!("rebalance_entry: rebalance entry failed: {err}");
                                 let mut first_err = entry_error.lock().await;

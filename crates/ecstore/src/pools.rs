@@ -1781,6 +1781,7 @@ impl ECStore {
     #[tracing::instrument(skip(self, set, wk, lifecycle_config, lock_retention, replication_config))]
     async fn decommission_entry(
         self: &Arc<Self>,
+        rx: CancellationToken,
         idx: usize,
         entry: MetaCacheEntry,
         bucket: String,
@@ -1814,6 +1815,7 @@ impl ECStore {
             );
             return Ok(());
         }
+        decommission_cancel_signal_result(rx.is_cancelled())?;
 
         let mut fivs = load_decommission_entry_versions(&entry, &bucket, "file_info_versions")?;
 
@@ -1825,6 +1827,8 @@ impl ECStore {
         let mut cleanup_preflight_allowed_missing = Vec::new();
 
         for version in fivs.versions.iter() {
+            decommission_cancel_signal_result(rx.is_cancelled())?;
+
             if should_skip_lifecycle_for_data_movement(
                 self.clone(),
                 &bucket,
@@ -2078,6 +2082,8 @@ impl ECStore {
         }
 
         if should_cleanup_decommission_source_entry(decommissioned, fivs.versions.len(), expired) {
+            decommission_cancel_signal_result(rx.is_cancelled())?;
+
             data_movement::ensure_source_cleanup_versions_unchanged(
                 set.clone(),
                 bucket.as_str(),
@@ -2242,8 +2248,19 @@ impl ECStore {
 
                     Box::pin(async move {
                         wk.take().await;
+                        let entry_rx = callback_rx.clone();
                         if let Err(err) = this
-                            .decommission_entry(idx, entry, bucket, set, wk, lifecycle_config, lock_retention, replication_config)
+                            .decommission_entry(
+                                entry_rx,
+                                idx,
+                                entry,
+                                bucket,
+                                set,
+                                wk,
+                                lifecycle_config,
+                                lock_retention,
+                                replication_config,
+                            )
                             .await
                         {
                             error!("decommission_pool: decommission_entry failed: {err}");
