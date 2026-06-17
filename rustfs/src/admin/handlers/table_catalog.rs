@@ -288,7 +288,7 @@ struct PutTableRefRequest {
     writer: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeleteTableRefRequest {
     #[serde(default, rename = "expected-snapshot-id")]
@@ -1061,6 +1061,20 @@ async fn read_json_body<T: DeserializeOwned>(mut input: Body) -> S3Result<T> {
     serde_json::from_slice(&body).map_err(|err| s3_error!(InvalidRequest, "invalid JSON: {}", err))
 }
 
+async fn read_json_body_or_default<T>(mut input: Body) -> S3Result<T>
+where
+    T: Default + DeserializeOwned,
+{
+    let body = input
+        .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
+        .await
+        .map_err(|err| s3_error!(InvalidRequest, "failed to read request body: {}", err))?;
+    if body.is_empty() {
+        return Ok(T::default());
+    }
+    serde_json::from_slice(&body).map_err(|err| s3_error!(InvalidRequest, "invalid JSON: {}", err))
+}
+
 fn warehouse_from_params(params: &Params<'_, '_>) -> S3Result<String> {
     let warehouse = params.get("warehouse").unwrap_or("");
     if warehouse.is_empty() {
@@ -1729,7 +1743,8 @@ fn view_entry_from_create_view_request(
     let view_uuid = Uuid::new_v4().to_string();
     let warehouse_location = request.location.unwrap_or_else(|| format!("s3://{bucket}/views/{view_id}"));
     validate_table_location_in_bucket(bucket, &warehouse_location)?;
-    let metadata_location = crate::table_catalog::default_view_metadata_file_path(namespace, &view, "00001.metadata.json");
+    let metadata_location =
+        crate::table_catalog::default_view_metadata_file_path(namespace, &view, &next_metadata_file_name(1, &view_id));
 
     let entry = crate::table_catalog::ViewEntry {
         version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
@@ -2008,6 +2023,7 @@ fn validate_table_commit_requirements(metadata: &serde_json::Value, requirements
                 )?;
             }
             "assert-ref-snapshot-id" => validate_ref_snapshot_requirement(metadata, requirement)?,
+            "assert-current-snapshot-id" => validate_current_snapshot_requirement(metadata, requirement)?,
             _ => return Err(s3_error!(NotImplemented, "unsupported commit requirement: {requirement_type}")),
         }
     }
@@ -2066,6 +2082,24 @@ fn validate_ref_snapshot_requirement(metadata: &serde_json::Value, requirement: 
         .ok_or_else(|| s3_error!(InvalidRequest, "assert-ref-snapshot-id requires snapshot-id"))?;
     if actual != Some(expected) {
         return Err(s3_error!(PreconditionFailed, "commit requirement failed: snapshot ref changed"));
+    }
+    Ok(())
+}
+
+fn validate_current_snapshot_requirement(metadata: &serde_json::Value, requirement: &serde_json::Value) -> S3Result<()> {
+    let actual = metadata.get("current-snapshot-id").and_then(serde_json::Value::as_i64);
+    if requirement.get("snapshot-id").is_some_and(serde_json::Value::is_null) {
+        if actual.is_some() {
+            return Err(s3_error!(PreconditionFailed, "commit requirement failed: current snapshot exists"));
+        }
+        return Ok(());
+    }
+    let expected = requirement
+        .get("snapshot-id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| s3_error!(InvalidRequest, "assert-current-snapshot-id requires snapshot-id"))?;
+    if actual != Some(expected) {
+        return Err(s3_error!(PreconditionFailed, "commit requirement failed: current snapshot changed"));
     }
     Ok(())
 }
@@ -2381,21 +2415,71 @@ fn apply_add_snapshot_update(metadata: &mut serde_json::Value, update: &serde_js
         .get("timestamp-ms")
         .and_then(serde_json::Value::as_i64)
         .unwrap_or_else(current_time_millis);
+    validate_added_snapshot(metadata, &snapshot, snapshot_id, sequence_number)?;
     ensure_array_field(metadata, "snapshots")?.push(snapshot);
     let object = metadata_object_mut(metadata)?;
-    let current_sequence_number = object
-        .get("last-sequence-number")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or_default();
-    object.insert(
-        "last-sequence-number".to_string(),
-        serde_json::Value::from(current_sequence_number.max(sequence_number)),
-    );
+    object.insert("last-sequence-number".to_string(), serde_json::Value::from(sequence_number));
     object.insert("current-snapshot-id".to_string(), serde_json::Value::from(snapshot_id));
     ensure_array_field(metadata, "snapshot-log")?.push(serde_json::json!({
         "timestamp-ms": timestamp_ms,
         "snapshot-id": snapshot_id
     }));
+    Ok(())
+}
+
+fn validate_added_snapshot(
+    metadata: &serde_json::Value,
+    snapshot: &serde_json::Value,
+    snapshot_id: i64,
+    sequence_number: i64,
+) -> S3Result<()> {
+    if metadata
+        .get("snapshots")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|snapshots| {
+            snapshots
+                .iter()
+                .any(|snapshot| snapshot.get("snapshot-id").and_then(serde_json::Value::as_i64) == Some(snapshot_id))
+        })
+    {
+        return Err(s3_error!(PreconditionFailed, "snapshot id already exists"));
+    }
+
+    let current_snapshot_id = metadata.get("current-snapshot-id").and_then(serde_json::Value::as_i64);
+    if let Some(parent_snapshot_id) = snapshot.get("parent-snapshot-id").and_then(serde_json::Value::as_i64)
+        && Some(parent_snapshot_id) != current_snapshot_id
+    {
+        return Err(s3_error!(PreconditionFailed, "snapshot parent no longer matches current snapshot"));
+    }
+
+    let current_sequence_number = metadata
+        .get("last-sequence-number")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_default();
+    if sequence_number <= current_sequence_number {
+        return Err(s3_error!(PreconditionFailed, "snapshot sequence number must advance"));
+    }
+
+    let manifest_list = snapshot
+        .get("manifest-list")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| s3_error!(InvalidRequest, "snapshot manifest-list is required"))?;
+    if manifest_list.is_empty() {
+        return Err(s3_error!(InvalidRequest, "snapshot manifest-list is required"));
+    }
+
+    let operation = snapshot
+        .get("summary")
+        .and_then(|summary| summary.get("operation"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| s3_error!(InvalidRequest, "snapshot summary.operation is required"))?;
+    if operation != "append" {
+        return Err(s3_error!(
+            NotImplemented,
+            "snapshot operation {operation} requires row-level conflict validation"
+        ));
+    }
+
     Ok(())
 }
 
@@ -4024,7 +4108,7 @@ impl Operation for DeleteTableRefHandler {
         let ref_name = ref_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
-        let request = read_json_body::<DeleteTableRefRequest>(req.input).await?;
+        let request = read_json_body_or_default::<DeleteTableRefRequest>(req.input).await?;
         let metadata_backend = table_catalog_backend()?;
         let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
         let response =
@@ -6131,6 +6215,138 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_conflict_requirements_validate_current_snapshot_id() {
+        let metadata = serde_json::json!({
+            "current-snapshot-id": 10
+        });
+
+        let matching = vec![serde_json::json!({
+            "type": "assert-current-snapshot-id",
+            "snapshot-id": 10
+        })];
+        validate_table_commit_requirements(&metadata, &matching).expect("matching current snapshot should pass");
+
+        let stale = vec![serde_json::json!({
+            "type": "assert-current-snapshot-id",
+            "snapshot-id": 9
+        })];
+        assert!(validate_table_commit_requirements(&metadata, &stale).is_err());
+
+        let no_snapshot_metadata = serde_json::json!({});
+        let create_like = vec![serde_json::json!({
+            "type": "assert-current-snapshot-id",
+            "snapshot-id": null
+        })];
+        validate_table_commit_requirements(&no_snapshot_metadata, &create_like)
+            .expect("null current snapshot requirement should pass when no current snapshot exists");
+    }
+
+    #[test]
+    fn snapshot_conflict_rejects_stale_parent_or_sequence_number() {
+        let metadata = serde_json::json!({
+            "current-snapshot-id": 10,
+            "last-sequence-number": 4,
+            "snapshots": [
+                {
+                    "snapshot-id": 10,
+                    "sequence-number": 4,
+                    "timestamp-ms": 1234,
+                    "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro",
+                    "summary": {
+                        "operation": "append"
+                    }
+                }
+            ],
+            "snapshot-log": [],
+            "metadata-log": []
+        });
+
+        let stale_parent = vec![serde_json::json!({
+            "action": "add-snapshot",
+            "snapshot": {
+                "snapshot-id": 11,
+                "parent-snapshot-id": 9,
+                "sequence-number": 5,
+                "timestamp-ms": 2234,
+                "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-11.avro",
+                "summary": {
+                    "operation": "append"
+                }
+            }
+        })];
+        assert!(apply_table_commit_updates(metadata.clone(), &stale_parent, "metadata/00001.metadata.json").is_err());
+
+        let stale_sequence = vec![serde_json::json!({
+            "action": "add-snapshot",
+            "snapshot": {
+                "snapshot-id": 11,
+                "parent-snapshot-id": 10,
+                "sequence-number": 4,
+                "timestamp-ms": 2234,
+                "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-11.avro",
+                "summary": {
+                    "operation": "append"
+                }
+            }
+        })];
+        assert!(apply_table_commit_updates(metadata, &stale_sequence, "metadata/00001.metadata.json").is_err());
+    }
+
+    #[test]
+    fn snapshot_conflict_rejects_non_append_snapshot_operations() {
+        let metadata = serde_json::json!({
+            "current-snapshot-id": 10,
+            "last-sequence-number": 4,
+            "snapshots": [
+                {
+                    "snapshot-id": 10,
+                    "sequence-number": 4,
+                    "timestamp-ms": 1234,
+                    "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro",
+                    "summary": {
+                        "operation": "append"
+                    }
+                }
+            ],
+            "snapshot-log": [],
+            "metadata-log": []
+        });
+
+        for operation in ["overwrite", "delete", "replace"] {
+            let updates = vec![serde_json::json!({
+                "action": "add-snapshot",
+                "snapshot": {
+                    "snapshot-id": 11,
+                    "parent-snapshot-id": 10,
+                    "sequence-number": 5,
+                    "timestamp-ms": 2234,
+                    "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-11.avro",
+                    "summary": {
+                        "operation": operation
+                    }
+                }
+            })];
+            assert!(
+                apply_table_commit_updates(metadata.clone(), &updates, "metadata/00001.metadata.json").is_err(),
+                "{operation} snapshot commits should fail closed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bodyless_ref_delete_uses_default_request_options() {
+        let request: DeleteTableRefRequest = read_json_body_or_default(Body::empty())
+            .await
+            .expect("bodyless ref delete should use default request options");
+
+        assert!(request.expected_snapshot_id.is_none());
+        assert!(!request.force);
+        assert!(request.commit_id.is_none());
+        assert!(request.idempotency_key.is_none());
+        assert!(request.writer.is_none());
+    }
+
+    #[test]
     fn table_updates_reject_unknown_actions() {
         let metadata = serde_json::json!({
             "metadata-log": []
@@ -6327,6 +6543,43 @@ mod tests {
             .await
             .expect("views should list after drop");
         assert!(listed.identifiers.is_empty());
+
+        let recreate_request: CreateViewRequest = serde_json::from_value(serde_json::json!({
+            "name": "recent_events",
+            "schema": {
+                "type": "struct",
+                "schema-id": 0,
+                "fields": [
+                    {
+                        "id": 1,
+                        "name": "id",
+                        "required": true,
+                        "type": "long"
+                    }
+                ]
+            },
+            "view-version": {
+                "version-id": 1,
+                "schema-id": 0,
+                "summary": {
+                    "engine-name": "spark"
+                },
+                "default-catalog": "warehouse",
+                "default-namespace": ["analytics"],
+                "representations": [
+                    {
+                        "type": "sql",
+                        "sql": "SELECT id FROM analytics.events WHERE id > 100",
+                        "dialect": "spark"
+                    }
+                ]
+            }
+        }))
+        .expect("standard recreate view request should parse");
+        let recreated = create_view_response(&store, &metadata_backend, "warehouse", &namespace, recreate_request, true)
+            .await
+            .expect("dropped view name should be reusable");
+        assert_ne!(recreated.metadata_location, created.metadata_location);
     }
 
     #[tokio::test]
