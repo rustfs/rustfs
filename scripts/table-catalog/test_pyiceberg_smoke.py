@@ -313,7 +313,7 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         capabilities = {entry["capability"] for entry in inventory}
 
         self.assertIn("credential-vending", capabilities)
-        self.assertIn("iceberg-views", capabilities)
+        self.assertIn("row-level-delete-update-merge", capabilities)
         self.assertIn("background-maintenance-worker", capabilities)
         for entry in inventory:
             self.assertIn("status", entry)

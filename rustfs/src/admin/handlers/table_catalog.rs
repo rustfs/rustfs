@@ -39,7 +39,7 @@ use rustfs_policy::{
 };
 use s3s::{Body, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration as StdDuration, Instant};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
@@ -2473,14 +2473,363 @@ fn validate_added_snapshot(
         .and_then(|summary| summary.get("operation"))
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| s3_error!(InvalidRequest, "snapshot summary.operation is required"))?;
-    if operation != "append" {
-        return Err(s3_error!(
-            NotImplemented,
-            "snapshot operation {operation} requires row-level conflict validation"
-        ));
+    if !matches!(operation, "append" | "overwrite" | "delete" | "replace") {
+        return Err(s3_error!(NotImplemented, "unsupported snapshot operation: {operation}"));
     }
 
     Ok(())
+}
+
+#[derive(Default)]
+struct SnapshotLiveFiles {
+    data_files: BTreeSet<String>,
+    delete_files: BTreeSet<String>,
+}
+
+impl SnapshotLiveFiles {
+    fn contains(&self, location: &str) -> bool {
+        self.data_files.contains(location) || self.delete_files.contains(location)
+    }
+}
+
+#[derive(Default)]
+struct SnapshotFileChanges {
+    added_data_files: BTreeSet<String>,
+    added_delete_files: BTreeSet<String>,
+    deleted_data_files: BTreeSet<String>,
+    deleted_delete_files: BTreeSet<String>,
+}
+
+impl SnapshotFileChanges {
+    fn has_delete_or_row_level_change(&self) -> bool {
+        !self.added_delete_files.is_empty() || !self.deleted_data_files.is_empty() || !self.deleted_delete_files.is_empty()
+    }
+
+    fn has_deleted_files(&self) -> bool {
+        !self.deleted_data_files.is_empty() || !self.deleted_delete_files.is_empty()
+    }
+}
+
+async fn validate_table_snapshot_commit_conflicts<B>(
+    metadata_backend: &B,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &crate::table_catalog::IdentifierSegment,
+    entry: &crate::table_catalog::TableEntry,
+    current_metadata: &serde_json::Value,
+    updates: &[serde_json::Value],
+) -> S3Result<()>
+where
+    B: crate::table_catalog::TableCatalogObjectBackend + ?Sized,
+{
+    let Some(snapshot) = added_snapshot_update(updates)? else {
+        return Ok(());
+    };
+    let snapshot_id = snapshot
+        .get("snapshot-id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| s3_error!(InvalidRequest, "snapshot-id must be an integer"))?;
+    let sequence_number = snapshot
+        .get("sequence-number")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| s3_error!(InvalidRequest, "snapshot sequence-number must be an integer"))?;
+    let operation = snapshot
+        .get("summary")
+        .and_then(|summary| summary.get("operation"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| s3_error!(InvalidRequest, "snapshot summary.operation is required"))?;
+
+    let current_live_files =
+        load_current_snapshot_live_files(metadata_backend, bucket, namespace, table, entry, current_metadata).await?;
+    let changes =
+        load_snapshot_file_changes(metadata_backend, bucket, namespace, table, entry, snapshot, snapshot_id, sequence_number)
+            .await?;
+
+    for location in changes.added_data_files.iter().chain(changes.added_delete_files.iter()) {
+        if current_live_files.contains(location) {
+            return Err(s3_error!(
+                PreconditionFailed,
+                "commit requirement failed: added file already exists in current snapshot"
+            ));
+        }
+    }
+
+    match operation {
+        "append" => {
+            if changes.has_deleted_files() || !changes.added_delete_files.is_empty() {
+                return Err(s3_error!(InvalidRequest, "append snapshot cannot delete data files or add delete files"));
+            }
+        }
+        "overwrite" | "delete" | "replace" => {
+            if current_metadata
+                .get("current-snapshot-id")
+                .and_then(serde_json::Value::as_i64)
+                .is_none()
+            {
+                return Err(s3_error!(InvalidRequest, "row-level snapshot operation requires a current snapshot"));
+            }
+            if !changes.has_delete_or_row_level_change() {
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "row-level snapshot operation requires deleted data files or added delete files"
+                ));
+            }
+            for location in changes.deleted_data_files.iter().chain(changes.deleted_delete_files.iter()) {
+                if !current_live_files.contains(location) {
+                    return Err(s3_error!(PreconditionFailed, "commit requirement failed: deleted file is not current"));
+                }
+            }
+        }
+        _ => return Err(s3_error!(NotImplemented, "unsupported snapshot operation: {operation}")),
+    }
+
+    Ok(())
+}
+
+fn added_snapshot_update(updates: &[serde_json::Value]) -> S3Result<Option<&serde_json::Value>> {
+    let mut snapshot = None;
+    for update in updates {
+        if update.get("action").and_then(serde_json::Value::as_str) != Some("add-snapshot") {
+            continue;
+        }
+        if snapshot.is_some() {
+            return Err(s3_error!(InvalidRequest, "standard commit supports one add-snapshot update"));
+        }
+        snapshot = Some(
+            update
+                .get("snapshot")
+                .ok_or_else(|| s3_error!(InvalidRequest, "add-snapshot requires snapshot"))?,
+        );
+    }
+    Ok(snapshot)
+}
+
+async fn load_current_snapshot_live_files<B>(
+    metadata_backend: &B,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &crate::table_catalog::IdentifierSegment,
+    entry: &crate::table_catalog::TableEntry,
+    current_metadata: &serde_json::Value,
+) -> S3Result<SnapshotLiveFiles>
+where
+    B: crate::table_catalog::TableCatalogObjectBackend + ?Sized,
+{
+    let Some(current_snapshot_id) = current_metadata
+        .get("current-snapshot-id")
+        .and_then(serde_json::Value::as_i64)
+    else {
+        return Ok(SnapshotLiveFiles::default());
+    };
+    let snapshot = current_metadata
+        .get("snapshots")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|snapshots| {
+            snapshots
+                .iter()
+                .find(|snapshot| snapshot.get("snapshot-id").and_then(serde_json::Value::as_i64) == Some(current_snapshot_id))
+        })
+        .ok_or_else(|| s3_error!(InvalidRequest, "current snapshot metadata is missing"))?;
+
+    let mut live_files = SnapshotLiveFiles::default();
+    for reference in read_snapshot_manifest_references(metadata_backend, bucket, namespace, table, entry, snapshot).await? {
+        let status = reference
+            .entry_status
+            .ok_or_else(|| s3_error!(InvalidRequest, "manifest entry status is required"))?;
+        match status {
+            0 | 1 => match reference.object_kind {
+                crate::table_catalog::TableMetadataMaintenanceObjectKind::DataFile => {
+                    live_files.data_files.insert(reference.location);
+                }
+                crate::table_catalog::TableMetadataMaintenanceObjectKind::DeleteFile => {
+                    live_files.delete_files.insert(reference.location);
+                }
+                _ => {}
+            },
+            2 => {}
+            _ => return Err(s3_error!(InvalidRequest, "manifest entry status is unsupported")),
+        }
+    }
+    Ok(live_files)
+}
+
+async fn load_snapshot_file_changes<B>(
+    metadata_backend: &B,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &crate::table_catalog::IdentifierSegment,
+    entry: &crate::table_catalog::TableEntry,
+    snapshot: &serde_json::Value,
+    snapshot_id: i64,
+    sequence_number: i64,
+) -> S3Result<SnapshotFileChanges>
+where
+    B: crate::table_catalog::TableCatalogObjectBackend + ?Sized,
+{
+    let mut changes = SnapshotFileChanges::default();
+    for reference in read_snapshot_manifest_references(metadata_backend, bucket, namespace, table, entry, snapshot).await? {
+        let status = reference
+            .entry_status
+            .ok_or_else(|| s3_error!(InvalidRequest, "manifest entry status is required"))?;
+        if matches!(status, 1 | 2) {
+            if reference.snapshot_id != Some(snapshot_id) || reference.sequence_number != Some(sequence_number) {
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "manifest changed entries must belong to the committed snapshot"
+                ));
+            }
+        }
+
+        match (status, reference.object_kind) {
+            (0, _) => {}
+            (1, crate::table_catalog::TableMetadataMaintenanceObjectKind::DataFile) => {
+                changes.added_data_files.insert(reference.location);
+            }
+            (1, crate::table_catalog::TableMetadataMaintenanceObjectKind::DeleteFile) => {
+                changes.added_delete_files.insert(reference.location);
+            }
+            (2, crate::table_catalog::TableMetadataMaintenanceObjectKind::DataFile) => {
+                changes.deleted_data_files.insert(reference.location);
+            }
+            (2, crate::table_catalog::TableMetadataMaintenanceObjectKind::DeleteFile) => {
+                changes.deleted_delete_files.insert(reference.location);
+            }
+            _ => return Err(s3_error!(InvalidRequest, "manifest entry status is unsupported")),
+        }
+    }
+    Ok(changes)
+}
+
+async fn read_snapshot_manifest_references<B>(
+    metadata_backend: &B,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &crate::table_catalog::IdentifierSegment,
+    entry: &crate::table_catalog::TableEntry,
+    snapshot: &serde_json::Value,
+) -> S3Result<Vec<crate::table_catalog::ManifestDataFileReference>>
+where
+    B: crate::table_catalog::TableCatalogObjectBackend + ?Sized,
+{
+    let manifest_locations = snapshot_manifest_locations(metadata_backend, bucket, namespace, table, entry, snapshot).await?;
+    let mut references = Vec::new();
+    for manifest_location in manifest_locations {
+        let manifest_key = table_commit_object_key(
+            bucket,
+            namespace,
+            table,
+            entry,
+            &manifest_location,
+            crate::table_catalog::TableMetadataMaintenanceObjectKind::ManifestFile,
+        )?;
+        let manifest_object = metadata_backend
+            .read_object(bucket, &manifest_key)
+            .await
+            .map_err(catalog_store_error)?
+            .ok_or_else(|| s3_error!(InvalidRequest, "snapshot manifest object is missing"))?;
+        let file_references =
+            crate::table_catalog::data_file_references_from_manifest_avro(&manifest_object.data).map_err(catalog_store_error)?;
+        for reference in file_references {
+            validate_manifest_data_file_reference(metadata_backend, bucket, namespace, table, entry, &reference).await?;
+            references.push(reference);
+        }
+    }
+    Ok(references)
+}
+
+async fn snapshot_manifest_locations<B>(
+    metadata_backend: &B,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &crate::table_catalog::IdentifierSegment,
+    entry: &crate::table_catalog::TableEntry,
+    snapshot: &serde_json::Value,
+) -> S3Result<Vec<String>>
+where
+    B: crate::table_catalog::TableCatalogObjectBackend + ?Sized,
+{
+    if let Some(manifest_list_location) = snapshot.get("manifest-list").and_then(serde_json::Value::as_str) {
+        let manifest_list_key = table_commit_object_key(
+            bucket,
+            namespace,
+            table,
+            entry,
+            manifest_list_location,
+            crate::table_catalog::TableMetadataMaintenanceObjectKind::ManifestList,
+        )?;
+        let manifest_list_object = metadata_backend
+            .read_object(bucket, &manifest_list_key)
+            .await
+            .map_err(catalog_store_error)?
+            .ok_or_else(|| s3_error!(InvalidRequest, "snapshot manifest-list object is missing"))?;
+        let references = crate::table_catalog::manifest_list_references_from_manifest_list_avro(&manifest_list_object.data)
+            .map_err(catalog_store_error)?;
+        if references.is_empty() {
+            return Err(s3_error!(InvalidRequest, "snapshot manifest-list must reference at least one manifest"));
+        }
+        return Ok(references.into_iter().map(|reference| reference.manifest_path).collect());
+    }
+
+    let Some(manifests) = snapshot.get("manifests").and_then(serde_json::Value::as_array) else {
+        return Err(s3_error!(InvalidRequest, "snapshot manifest-list is required"));
+    };
+    if manifests.is_empty() {
+        return Err(s3_error!(InvalidRequest, "snapshot manifests must reference at least one manifest"));
+    }
+    manifests
+        .iter()
+        .map(|manifest| {
+            manifest
+                .as_str()
+                .filter(|manifest| !manifest.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| s3_error!(InvalidRequest, "snapshot manifest location must be a string"))
+        })
+        .collect()
+}
+
+async fn validate_manifest_data_file_reference<B>(
+    metadata_backend: &B,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &crate::table_catalog::IdentifierSegment,
+    entry: &crate::table_catalog::TableEntry,
+    reference: &crate::table_catalog::ManifestDataFileReference,
+) -> S3Result<()>
+where
+    B: crate::table_catalog::TableCatalogObjectBackend + ?Sized,
+{
+    table_commit_object_key(bucket, namespace, table, entry, &reference.location, reference.object_kind.clone())?;
+    let object_key = crate::table_catalog::table_catalog_object_key_from_location(bucket, &reference.location)
+        .ok_or_else(|| s3_error!(InvalidRequest, "manifest data file location is invalid"))?;
+    if !metadata_backend
+        .object_exists(bucket, &object_key)
+        .await
+        .map_err(catalog_store_error)?
+    {
+        return Err(s3_error!(InvalidRequest, "manifest referenced data file is missing"));
+    }
+    Ok(())
+}
+
+fn table_commit_object_key(
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &crate::table_catalog::IdentifierSegment,
+    entry: &crate::table_catalog::TableEntry,
+    location: &str,
+    expected_kind: crate::table_catalog::TableMetadataMaintenanceObjectKind,
+) -> S3Result<String> {
+    let object_key = crate::table_catalog::table_catalog_object_key_from_location(bucket, location)
+        .ok_or_else(|| s3_error!(InvalidRequest, "snapshot object location is invalid"))?;
+    let warehouse_object_prefix = crate::table_catalog::table_warehouse_object_prefix(entry).map_err(catalog_store_error)?;
+    let object_kind =
+        crate::table_catalog::table_maintenance_object_kind(namespace, table, Some(&warehouse_object_prefix), &object_key)
+            .ok_or_else(|| s3_error!(InvalidRequest, "snapshot object is outside the table warehouse"))?;
+    if object_kind != expected_kind {
+        return Err(s3_error!(InvalidRequest, "snapshot object kind does not match manifest metadata"));
+    }
+    Ok(object_key)
 }
 
 fn apply_set_snapshot_ref_update(metadata: &mut serde_json::Value, update: &serde_json::Value) -> S3Result<()> {
@@ -3152,14 +3501,24 @@ where
     else {
         return Err(s3_error!(InvalidRequest, "table not found"));
     };
+    let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
+        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
     let current_metadata = read_table_metadata_json(metadata_backend, bucket, &current.metadata_location).await?;
     validate_table_commit_requirements(&current_metadata, &request.requirements)?;
     let expected_metadata = current_metadata.clone();
     let next_metadata = apply_table_commit_updates(current_metadata, &request.updates, &current.metadata_location)?;
     validate_metadata_table_location_in_bucket(bucket, &next_metadata)?;
     validate_metadata_matches_current_metadata(&expected_metadata, &next_metadata)?;
-    let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
-        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
+    validate_table_snapshot_commit_conflicts(
+        metadata_backend,
+        bucket,
+        namespace,
+        &table_name,
+        &current,
+        &expected_metadata,
+        &request.updates,
+    )
+    .await?;
     let (commit_id, metadata_file_token) = standard_commit_ids(request.commit_id);
     let next_generation = current.generation.saturating_add(1);
     let next_metadata_location = crate::table_catalog::default_table_metadata_file_path(
@@ -5252,6 +5611,12 @@ mod tests {
             .as_str()
             .expect("created metadata should have table uuid")
             .to_string();
+        let table_location = created.metadata["location"]
+            .as_str()
+            .expect("created metadata should have table location");
+        let manifest_list = format!("{table_location}/metadata/snap-10.avro");
+        let data_file = format!("{table_location}/data/part-10.parquet");
+        seed_test_snapshot_manifest(&metadata_backend, "warehouse", &manifest_list, 10, 1, &[(&data_file, 0, 1, 10, 1)]).await;
 
         let commit_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
             "requirements": [
@@ -5277,7 +5642,7 @@ mod tests {
                         "snapshot-id": 10,
                         "sequence-number": 1,
                         "timestamp-ms": 1234,
-                        "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro",
+                        "manifest-list": manifest_list,
                         "summary": {
                             "operation": "append"
                         }
@@ -6293,7 +6658,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_conflict_rejects_non_append_snapshot_operations() {
+    fn snapshot_conflict_rejects_unknown_snapshot_operations() {
         let metadata = serde_json::json!({
             "current-snapshot-id": 10,
             "last-sequence-number": 4,
@@ -6312,25 +6677,456 @@ mod tests {
             "metadata-log": []
         });
 
-        for operation in ["overwrite", "delete", "replace"] {
-            let updates = vec![serde_json::json!({
-                "action": "add-snapshot",
-                "snapshot": {
+        let updates = vec![serde_json::json!({
+            "action": "add-snapshot",
+            "snapshot": {
+                "snapshot-id": 11,
+                "parent-snapshot-id": 10,
+                "sequence-number": 5,
+                "timestamp-ms": 2234,
+                "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-11.avro",
+                "summary": {
+                    "operation": "unknown"
+                }
+            }
+        })];
+        assert!(apply_table_commit_updates(metadata, &updates, "metadata/00001.metadata.json").is_err());
+    }
+
+    #[tokio::test]
+    async fn row_level_conflict_allows_overwrite_when_deleted_file_is_current() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
+        let table_location = created.metadata["location"]
+            .as_str()
+            .expect("created metadata should have table location");
+        let current_manifest_list = format!("{table_location}/metadata/snap-10.avro");
+        let old_data_file = format!("{table_location}/data/part-10.parquet");
+        seed_test_snapshot_manifest(
+            &metadata_backend,
+            "warehouse",
+            &current_manifest_list,
+            10,
+            1,
+            &[(&old_data_file, 0, 1, 10, 1)],
+        )
+        .await;
+        let append_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 10,
+                        "sequence-number": 1,
+                        "timestamp-ms": 1234,
+                        "manifest-list": current_manifest_list,
+                        "summary": {
+                            "operation": "append"
+                        }
+                    }
+                },
+                {
+                    "action": "set-snapshot-ref",
+                    "ref-name": "main",
+                    "snapshot-id": 10,
+                    "type": "branch"
+                }
+            ]
+        }))
+        .expect("append request should parse");
+        commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
+            .await
+            .expect("append commit should succeed");
+
+        let overwrite_manifest_list = format!("{table_location}/metadata/snap-11.avro");
+        let replacement_data_file = format!("{table_location}/data/part-11.parquet");
+        seed_test_snapshot_manifest(
+            &metadata_backend,
+            "warehouse",
+            &overwrite_manifest_list,
+            11,
+            2,
+            &[(&old_data_file, 0, 2, 11, 2), (&replacement_data_file, 0, 1, 11, 2)],
+        )
+        .await;
+        let overwrite_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "requirements": [
+                {
+                    "type": "assert-current-snapshot-id",
+                    "snapshot-id": 10
+                }
+            ],
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 11,
+                        "parent-snapshot-id": 10,
+                        "sequence-number": 2,
+                        "timestamp-ms": 2234,
+                        "manifest-list": overwrite_manifest_list,
+                        "summary": {
+                            "operation": "overwrite"
+                        }
+                    }
+                },
+                {
+                    "action": "set-snapshot-ref",
+                    "ref-name": "main",
                     "snapshot-id": 11,
-                    "parent-snapshot-id": 10,
-                    "sequence-number": 5,
-                    "timestamp-ms": 2234,
-                    "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-11.avro",
-                    "summary": {
-                        "operation": operation
+                    "type": "branch"
+                }
+            ]
+        }))
+        .expect("overwrite request should parse");
+
+        let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", overwrite_request)
+            .await
+            .expect("overwrite commit should pass manifest conflict validation");
+
+        assert_eq!(commit.metadata["current-snapshot-id"], 11);
+        assert_eq!(commit.metadata["last-sequence-number"], 2);
+    }
+
+    #[tokio::test]
+    async fn row_level_conflict_rejects_delete_of_non_current_file() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
+        let table_location = created.metadata["location"]
+            .as_str()
+            .expect("created metadata should have table location");
+        let current_manifest_list = format!("{table_location}/metadata/snap-10.avro");
+        let current_data_file = format!("{table_location}/data/part-10.parquet");
+        seed_test_snapshot_manifest(
+            &metadata_backend,
+            "warehouse",
+            &current_manifest_list,
+            10,
+            1,
+            &[(&current_data_file, 0, 1, 10, 1)],
+        )
+        .await;
+        let append_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 10,
+                        "sequence-number": 1,
+                        "timestamp-ms": 1234,
+                        "manifest-list": current_manifest_list,
+                        "summary": {
+                            "operation": "append"
+                        }
+                    }
+                },
+                {
+                    "action": "set-snapshot-ref",
+                    "ref-name": "main",
+                    "snapshot-id": 10,
+                    "type": "branch"
+                }
+            ]
+        }))
+        .expect("append request should parse");
+        commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
+            .await
+            .expect("append commit should succeed");
+        let committed = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+
+        let stale_data_file = format!("{table_location}/data/stale.parquet");
+        let stale_key = test_snapshot_object_key("warehouse", &stale_data_file);
+        metadata_backend.put_bytes("warehouse", &stale_key, b"stale".to_vec()).await;
+        let overwrite_manifest_list = format!("{table_location}/metadata/snap-11.avro");
+        seed_test_snapshot_manifest(
+            &metadata_backend,
+            "warehouse",
+            &overwrite_manifest_list,
+            11,
+            2,
+            &[(&stale_data_file, 0, 2, 11, 2)],
+        )
+        .await;
+        let overwrite_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "requirements": [
+                {
+                    "type": "assert-current-snapshot-id",
+                    "snapshot-id": 10
+                }
+            ],
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 11,
+                        "parent-snapshot-id": 10,
+                        "sequence-number": 2,
+                        "timestamp-ms": 2234,
+                        "manifest-list": overwrite_manifest_list,
+                        "summary": {
+                            "operation": "overwrite"
+                        }
                     }
                 }
-            })];
-            assert!(
-                apply_table_commit_updates(metadata.clone(), &updates, "metadata/00001.metadata.json").is_err(),
-                "{operation} snapshot commits should fail closed"
-            );
-        }
+            ]
+        }))
+        .expect("overwrite request should parse");
+
+        let error = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", overwrite_request)
+            .await
+            .expect_err("stale row-level delete should conflict");
+
+        assert_eq!(error.code(), &s3s::S3ErrorCode::PreconditionFailed);
+        let unchanged = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should still exist");
+        assert_eq!(unchanged.metadata_location, committed.metadata_location);
+        assert_eq!(unchanged.version_token, committed.version_token);
+        assert_eq!(unchanged.generation, committed.generation);
+    }
+
+    #[tokio::test]
+    async fn row_level_conflict_rejects_append_with_delete_files() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
+        let table_location = created.metadata["location"]
+            .as_str()
+            .expect("created metadata should have table location");
+        let current = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+        let manifest_list = format!("{table_location}/metadata/snap-10.avro");
+        let delete_file = format!("{table_location}/delete/delete-10.parquet");
+        seed_test_snapshot_manifest(&metadata_backend, "warehouse", &manifest_list, 10, 1, &[(&delete_file, 1, 1, 10, 1)]).await;
+        let append_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 10,
+                        "sequence-number": 1,
+                        "timestamp-ms": 1234,
+                        "manifest-list": manifest_list,
+                        "summary": {
+                            "operation": "append"
+                        }
+                    }
+                }
+            ]
+        }))
+        .expect("append request should parse");
+
+        let error = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
+            .await
+            .expect_err("append must not add delete files");
+
+        assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+        let unchanged = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should still exist");
+        assert_eq!(unchanged.metadata_location, current.metadata_location);
+        assert_eq!(unchanged.version_token, current.version_token);
+        assert_eq!(unchanged.generation, current.generation);
+    }
+
+    #[tokio::test]
+    async fn row_level_conflict_rejects_missing_manifest_before_pointer_update() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
+        let table_location = created.metadata["location"]
+            .as_str()
+            .expect("created metadata should have table location");
+        let current_manifest_list = format!("{table_location}/metadata/snap-10.avro");
+        let current_data_file = format!("{table_location}/data/part-10.parquet");
+        seed_test_snapshot_manifest(
+            &metadata_backend,
+            "warehouse",
+            &current_manifest_list,
+            10,
+            1,
+            &[(&current_data_file, 0, 1, 10, 1)],
+        )
+        .await;
+        let append_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 10,
+                        "sequence-number": 1,
+                        "timestamp-ms": 1234,
+                        "manifest-list": current_manifest_list,
+                        "summary": {
+                            "operation": "append"
+                        }
+                    }
+                },
+                {
+                    "action": "set-snapshot-ref",
+                    "ref-name": "main",
+                    "snapshot-id": 10,
+                    "type": "branch"
+                }
+            ]
+        }))
+        .expect("append request should parse");
+        commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
+            .await
+            .expect("append commit should succeed");
+        let committed = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+        let missing_manifest_list = format!("{table_location}/metadata/missing-snap-11.avro");
+        let overwrite_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "requirements": [
+                {
+                    "type": "assert-current-snapshot-id",
+                    "snapshot-id": 10
+                }
+            ],
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 11,
+                        "parent-snapshot-id": 10,
+                        "sequence-number": 2,
+                        "timestamp-ms": 2234,
+                        "manifest-list": missing_manifest_list,
+                        "summary": {
+                            "operation": "overwrite"
+                        }
+                    }
+                }
+            ]
+        }))
+        .expect("overwrite request should parse");
+
+        let error = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", overwrite_request)
+            .await
+            .expect_err("missing manifest-list should fail before pointer update");
+
+        assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+        let unchanged = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should still exist");
+        assert_eq!(unchanged.metadata_location, committed.metadata_location);
+        assert_eq!(unchanged.version_token, committed.version_token);
+        assert_eq!(unchanged.generation, committed.generation);
+    }
+
+    #[tokio::test]
+    async fn row_level_conflict_rejects_manifest_outside_table_warehouse() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
+        let table_location = created.metadata["location"]
+            .as_str()
+            .expect("created metadata should have table location");
+        let current_manifest_list = format!("{table_location}/metadata/snap-10.avro");
+        let current_data_file = format!("{table_location}/data/part-10.parquet");
+        seed_test_snapshot_manifest(
+            &metadata_backend,
+            "warehouse",
+            &current_manifest_list,
+            10,
+            1,
+            &[(&current_data_file, 0, 1, 10, 1)],
+        )
+        .await;
+        let append_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 10,
+                        "sequence-number": 1,
+                        "timestamp-ms": 1234,
+                        "manifest-list": current_manifest_list,
+                        "summary": {
+                            "operation": "append"
+                        }
+                    }
+                },
+                {
+                    "action": "set-snapshot-ref",
+                    "ref-name": "main",
+                    "snapshot-id": 10,
+                    "type": "branch"
+                }
+            ]
+        }))
+        .expect("append request should parse");
+        commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
+            .await
+            .expect("append commit should succeed");
+        let committed = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+        let outside_manifest_list = "s3://warehouse/tables/other-table/metadata/snap-11.avro";
+        let overwrite_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "requirements": [
+                {
+                    "type": "assert-current-snapshot-id",
+                    "snapshot-id": 10
+                }
+            ],
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 11,
+                        "parent-snapshot-id": 10,
+                        "sequence-number": 2,
+                        "timestamp-ms": 2234,
+                        "manifest-list": outside_manifest_list,
+                        "summary": {
+                            "operation": "overwrite"
+                        }
+                    }
+                }
+            ]
+        }))
+        .expect("overwrite request should parse");
+
+        let error = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", overwrite_request)
+            .await
+            .expect_err("outside manifest-list should fail before pointer update");
+
+        assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+        let unchanged = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should still exist");
+        assert_eq!(unchanged.metadata_location, committed.metadata_location);
+        assert_eq!(unchanged.version_token, committed.version_token);
+        assert_eq!(unchanged.generation, committed.generation);
     }
 
     #[tokio::test]
@@ -6587,7 +7383,13 @@ mod tests {
         let store = TestTableCatalogStore::default();
         let metadata_backend = TestTableCatalogObjectBackend::default();
         let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
-        create_standard_events_table(&store, &metadata_backend, &namespace).await;
+        let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
+        let table_location = created.metadata["location"]
+            .as_str()
+            .expect("created metadata should have table location");
+        let manifest_list = format!("{table_location}/metadata/snap-10.avro");
+        let data_file = format!("{table_location}/data/part-10.parquet");
+        seed_test_snapshot_manifest(&metadata_backend, "warehouse", &manifest_list, 10, 1, &[(&data_file, 0, 1, 10, 1)]).await;
 
         let append_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
             "updates": [
@@ -6597,7 +7399,7 @@ mod tests {
                         "snapshot-id": 10,
                         "sequence-number": 1,
                         "timestamp-ms": 1234,
-                        "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro",
+                        "manifest-list": manifest_list,
                         "summary": {
                             "operation": "append"
                         }
@@ -7009,6 +7811,17 @@ mod tests {
     }
 
     impl TestTableCatalogObjectBackend {
+        async fn put_bytes(&self, bucket: &str, object: &str, data: Vec<u8>) {
+            self.objects.lock().await.insert(
+                (bucket.to_string(), object.to_string()),
+                crate::table_catalog::TableCatalogObject {
+                    data,
+                    etag: Some("etag".to_string()),
+                    mod_time: None,
+                },
+            );
+        }
+
         async fn put_json(&self, bucket: &str, object: &str, value: serde_json::Value) {
             self.put_json_with_mod_time(bucket, object, value, None).await;
         }
@@ -7029,6 +7842,126 @@ mod tests {
                     mod_time,
                 },
             );
+        }
+    }
+
+    fn test_snapshot_object_key(bucket: &str, location: &str) -> String {
+        crate::table_catalog::table_catalog_object_key_from_location(bucket, location)
+            .expect("test snapshot object location should be valid")
+    }
+
+    fn test_manifest_list_avro_bytes(manifest_paths: &[&str], sequence_number: i64, snapshot_id: i64) -> Vec<u8> {
+        let schema = apache_avro::Schema::parse_str(
+            r#"
+            {
+              "type": "record",
+              "name": "manifest_file",
+              "fields": [
+                {"name": "manifest_path", "type": "string"},
+                {"name": "sequence_number", "type": "long"},
+                {"name": "added_snapshot_id", "type": "long"}
+              ]
+            }
+            "#,
+        )
+        .expect("manifest list avro schema should parse");
+        let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+        for manifest_path in manifest_paths {
+            writer
+                .append(apache_avro::types::Value::Record(vec![
+                    (
+                        "manifest_path".to_string(),
+                        apache_avro::types::Value::String((*manifest_path).to_string()),
+                    ),
+                    ("sequence_number".to_string(), apache_avro::types::Value::Long(sequence_number)),
+                    ("added_snapshot_id".to_string(), apache_avro::types::Value::Long(snapshot_id)),
+                ]))
+                .expect("manifest list record should append");
+        }
+        writer.into_inner().expect("manifest list avro bytes should flush")
+    }
+
+    fn test_manifest_avro_bytes(files: &[(&str, i32, i32, i64, i64)]) -> Vec<u8> {
+        let schema = apache_avro::Schema::parse_str(
+            r#"
+            {
+              "type": "record",
+              "name": "manifest_entry",
+              "fields": [
+                {"name": "status", "type": "int"},
+                {"name": "snapshot_id", "type": "long"},
+                {"name": "sequence_number", "type": "long"},
+                {"name": "file_sequence_number", "type": "long"},
+                {
+                  "name": "data_file",
+                  "type": {
+                    "type": "record",
+                    "name": "data_file",
+                    "fields": [
+                      {"name": "content", "type": "int"},
+                      {"name": "file_path", "type": "string"},
+                      {"name": "record_count", "type": "long"},
+                      {"name": "file_size_in_bytes", "type": "long"}
+                    ]
+                  }
+                }
+              ]
+            }
+            "#,
+        )
+        .expect("manifest avro schema should parse");
+        let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+        for (file_path, content, status, snapshot_id, sequence_number) in files {
+            writer
+                .append(apache_avro::types::Value::Record(vec![
+                    ("status".to_string(), apache_avro::types::Value::Int(*status)),
+                    ("snapshot_id".to_string(), apache_avro::types::Value::Long(*snapshot_id)),
+                    ("sequence_number".to_string(), apache_avro::types::Value::Long(*sequence_number)),
+                    ("file_sequence_number".to_string(), apache_avro::types::Value::Long(*sequence_number)),
+                    (
+                        "data_file".to_string(),
+                        apache_avro::types::Value::Record(vec![
+                            ("content".to_string(), apache_avro::types::Value::Int(*content)),
+                            ("file_path".to_string(), apache_avro::types::Value::String((*file_path).to_string())),
+                            ("record_count".to_string(), apache_avro::types::Value::Long(1)),
+                            ("file_size_in_bytes".to_string(), apache_avro::types::Value::Long(1)),
+                        ]),
+                    ),
+                ]))
+                .expect("manifest record should append");
+        }
+        writer.into_inner().expect("manifest avro bytes should flush")
+    }
+
+    async fn seed_test_snapshot_manifest(
+        backend: &TestTableCatalogObjectBackend,
+        bucket: &str,
+        manifest_list_location: &str,
+        snapshot_id: i64,
+        sequence_number: i64,
+        files: &[(&str, i32, i32, i64, i64)],
+    ) {
+        let manifest_location = manifest_list_location
+            .rsplit_once('/')
+            .map(|(prefix, name)| format!("{prefix}/manifest-{name}"))
+            .expect("manifest list location should include a file name");
+        let manifest_key = test_snapshot_object_key(bucket, &manifest_location);
+        let manifest_list_key = test_snapshot_object_key(bucket, manifest_list_location);
+        backend
+            .put_bytes(
+                bucket,
+                &manifest_list_key,
+                test_manifest_list_avro_bytes(&[&manifest_location], sequence_number, snapshot_id),
+            )
+            .await;
+        backend
+            .put_bytes(bucket, &manifest_key, test_manifest_avro_bytes(files))
+            .await;
+        for (file_path, _, status, _, _) in files {
+            if *status != 2 {
+                let object_key = test_snapshot_object_key(bucket, file_path);
+                backend.put_bytes(bucket, &object_key, b"data".to_vec()).await;
+            }
         }
     }
 

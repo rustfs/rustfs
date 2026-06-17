@@ -163,7 +163,7 @@ current unsupported inventory is:
 - snapshot expiration dry-run planning and manual catalog commit: supported through metadata maintenance reports
 - automatic maintenance scheduling: external scheduler hook supported through the worker run endpoint; built-in periodic scheduling is not claimed
 - compaction rewrite: controlled run-once support for unpartitioned Parquet binpack through metadata maintenance; built-in periodic scheduling, sort compaction, delete-file rewrite, and row-level compaction are not claimed
-- row-level delete/update/merge commits: standard catalog commit validates append snapshot lineage and fails closed for non-append snapshot operations until full row-level conflict detection is implemented
+- row-level delete/update/merge commits: standard catalog commit validates append, overwrite, delete, and replace snapshot manifests for table-warehouse scope, referenced object existence, current-live-file deletes, and stale add/delete conflicts; end-to-end SQL DML client coverage remains a compatibility validation item
 - external catalog bridges: metadata import/register is supported, but Polaris/Glue/DLF/Hive synchronization is unsupported
 - multi-table transactions: not a short-term production claim
 

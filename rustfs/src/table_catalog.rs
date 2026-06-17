@@ -920,7 +920,7 @@ fn table_warehouse_object_prefix_from_location(table_bucket: &str, warehouse_loc
     normalize_warehouse_object_prefix(object_prefix)
 }
 
-fn table_warehouse_object_prefix(entry: &TableEntry) -> TableCatalogStoreResult<String> {
+pub(crate) fn table_warehouse_object_prefix(entry: &TableEntry) -> TableCatalogStoreResult<String> {
     table_warehouse_object_prefix_from_location(&entry.table_bucket, &entry.warehouse_location)
 }
 
@@ -4034,7 +4034,9 @@ fn manifest_paths_from_manifest_list_avro(data: &[u8]) -> TableCatalogStoreResul
         .collect())
 }
 
-fn manifest_list_references_from_manifest_list_avro(data: &[u8]) -> TableCatalogStoreResult<Vec<ManifestListReference>> {
+pub(crate) fn manifest_list_references_from_manifest_list_avro(
+    data: &[u8],
+) -> TableCatalogStoreResult<Vec<ManifestListReference>> {
     let reader = apache_avro::Reader::new(data)
         .map_err(|err| TableCatalogStoreError::Invalid(format!("failed to read manifest list Avro: {err}")))?;
     let mut manifest_paths = Vec::new();
@@ -4060,7 +4062,7 @@ fn file_references_from_manifest_avro(data: &[u8]) -> TableCatalogStoreResult<Ve
         .collect())
 }
 
-fn data_file_references_from_manifest_avro(data: &[u8]) -> TableCatalogStoreResult<Vec<ManifestDataFileReference>> {
+pub(crate) fn data_file_references_from_manifest_avro(data: &[u8]) -> TableCatalogStoreResult<Vec<ManifestDataFileReference>> {
     let reader = apache_avro::Reader::new(data)
         .map_err(|err| TableCatalogStoreError::Invalid(format!("failed to read manifest Avro: {err}")))?;
     let mut files = Vec::new();
@@ -4135,7 +4137,7 @@ fn avro_i64_value(value: &apache_avro::types::Value) -> Option<i64> {
     }
 }
 
-fn table_catalog_object_key_from_location(table_bucket: &str, location: &str) -> Option<String> {
+pub(crate) fn table_catalog_object_key_from_location(table_bucket: &str, location: &str) -> Option<String> {
     let object = if let Some(location) = location.strip_prefix("s3://") {
         let (bucket, object) = location.split_once('/')?;
         if bucket != table_bucket {
@@ -4158,7 +4160,7 @@ fn table_catalog_object_key_from_location(table_bucket: &str, location: &str) ->
     Some(object.to_string())
 }
 
-fn table_maintenance_object_kind(
+pub(crate) fn table_maintenance_object_kind(
     namespace: &Namespace,
     table: &IdentifierSegment,
     warehouse_object_prefix: Option<&str>,
@@ -4706,21 +4708,23 @@ struct CompactedDataFile {
     file_sequence_number: i64,
 }
 
-struct ManifestDataFileReference {
-    location: String,
-    object_kind: TableMetadataMaintenanceObjectKind,
-    entry_status: Option<i32>,
-    snapshot_id: Option<i64>,
-    sequence_number: Option<i64>,
-    file_sequence_number: Option<i64>,
-    record_count: Option<u64>,
-    file_size_bytes: Option<u64>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManifestDataFileReference {
+    pub location: String,
+    pub object_kind: TableMetadataMaintenanceObjectKind,
+    pub entry_status: Option<i32>,
+    pub snapshot_id: Option<i64>,
+    pub sequence_number: Option<i64>,
+    pub file_sequence_number: Option<i64>,
+    pub record_count: Option<u64>,
+    pub file_size_bytes: Option<u64>,
 }
 
-struct ManifestListReference {
-    manifest_path: String,
-    sequence_number: Option<i64>,
-    added_snapshot_id: Option<i64>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManifestListReference {
+    pub manifest_path: String,
+    pub sequence_number: Option<i64>,
+    pub added_snapshot_id: Option<i64>,
 }
 
 struct CompactionManifestListSummary<'a> {

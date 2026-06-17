@@ -158,9 +158,9 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
     },
     {
         "capability": "row-level-delete-update-merge",
-        "status": "fail-closed-conflict-validation",
+        "status": "catalog-conflict-validation-supported",
         "roadmap_area": "row-level-conflict-detection",
-        "expected_behavior": "standard catalog commit validates append snapshot lineage and rejects non-append snapshot operations until full position/equality delete, overwrite, update, and merge conflict detection is implemented",
+        "expected_behavior": "standard catalog commit validates append, overwrite, delete, and replace snapshot manifests for table-warehouse scope, referenced object existence, current-live-file deletes, and stale add/delete conflicts; end-to-end SQL DML client coverage remains a compatibility validation item",
     },
     {
         "capability": "external-catalog-bridge",
