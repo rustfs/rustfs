@@ -1479,9 +1479,9 @@ Keep R24 as a design/product decision task unless the product requirement is exp
 
 ### Implementation Steps
 
-- [ ] Write or update a compatibility design section for queued multi-pool decommission.
-- [ ] Do not change store behavior until the design is approved.
-- [ ] Run:
+- [x] Write or update a compatibility design section for queued multi-pool decommission.
+- [x] Do not change store behavior until the design is approved.
+- [x] Run:
 
 ```bash
 cargo fmt --all --check
