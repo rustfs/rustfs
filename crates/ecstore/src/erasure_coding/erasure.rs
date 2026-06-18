@@ -687,9 +687,41 @@ impl Erasure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::collection::{btree_set, vec};
+    use proptest::prelude::*;
 
     fn optional_shards(shards: &[Bytes]) -> Vec<Option<Vec<u8>>> {
         shards.iter().map(|shard| Some(shard.to_vec())).collect()
+    }
+
+    fn recover_data(shards: &[Option<Vec<u8>>], data_shards: usize, original_len: usize) -> Vec<u8> {
+        let mut recovered = Vec::new();
+        for shard in shards.iter().take(data_shards) {
+            recovered.extend_from_slice(
+                shard
+                    .as_ref()
+                    .expect("reconstructed data shard should be present after decode_data_and_parity"),
+            );
+        }
+        recovered.truncate(original_len);
+        recovered
+    }
+
+    fn erasure_recoverability_case_strategy()
+    -> impl Strategy<Value = (usize, usize, usize, bool, Vec<u8>, std::collections::BTreeSet<usize>)> {
+        (2usize..=8, 1usize..=4, prop::sample::select(vec![64usize, 256, 1024]), any::<bool>()).prop_flat_map(
+            |(data_shards, parity_shards, block_size, uses_legacy)| {
+                let total_shards = data_shards + parity_shards;
+                (
+                    Just(data_shards),
+                    Just(parity_shards),
+                    Just(block_size),
+                    Just(uses_legacy),
+                    vec(any::<u8>(), 0..=4096),
+                    btree_set(0usize..total_shards, 0..=parity_shards),
+                )
+            },
+        )
     }
 
     fn assert_owned_encode_matches_borrowed(erasure: &Erasure, data: Vec<u8>) {
@@ -835,6 +867,38 @@ mod tests {
     fn test_shard_file_size_cases2() {
         let erasure = Erasure::new(12, 4, 1024 * 1024);
         assert_eq!(erasure.shard_file_size(1572864), 131073);
+    }
+
+    proptest! {
+        #[test]
+        fn decode_data_and_parity_round_trips_bounded_recoverability(
+            (data_shards, parity_shards, block_size, uses_legacy, data, missing_indices) in
+                erasure_recoverability_case_strategy(),
+        ) {
+            let erasure = Erasure::new_with_options(data_shards, parity_shards, block_size, uses_legacy);
+            let encoded = erasure.encode_data(&data)
+                .expect("encode_data should succeed for bounded recoverability property cases");
+            let mut shards = optional_shards(&encoded);
+
+            for index in &missing_indices {
+                shards[*index] = None;
+            }
+
+            erasure.decode_data_and_parity(&mut shards)
+                .expect("decode_data_and_parity should recover when missing shard count does not exceed parity");
+
+            let recovered = recover_data(&shards, data_shards, data.len());
+            prop_assert_eq!(recovered, data);
+
+            for (index, shard) in shards.iter().enumerate() {
+                prop_assert_eq!(
+                    shard.as_deref(),
+                    Some(encoded[index].as_ref()),
+                    "reconstructed shard {} should match the original encoded shard",
+                    index
+                );
+            }
+        }
     }
 
     #[test]

@@ -24,7 +24,8 @@ use crate::config::com::{delete_config, read_config, save_config};
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result};
 use crate::store::ECStore;
-use crate::store_api::{ListOperations, ObjectIO, ObjectOperations};
+use crate::store_api::{ObjectIO, ObjectOperations};
+use rustfs_storage_api::ListOperations as _;
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";

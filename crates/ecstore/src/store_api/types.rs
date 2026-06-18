@@ -1,29 +1,14 @@
 use super::*;
+use rustfs_storage_api::{
+    HTTPPreconditions, ObjectLockRetentionOptions, ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState,
+    VersionMarker,
+};
 
-#[derive(Debug, Default, Clone)]
-pub struct HTTPPreconditions {
-    pub if_match: Option<String>,
-    pub if_none_match: Option<String>,
-    pub if_modified_since: Option<OffsetDateTime>,
-    pub if_unmodified_since: Option<OffsetDateTime>,
-}
-
-impl HTTPPreconditions {
-    pub(crate) fn if_match_value(&self) -> Option<&str> {
-        non_empty_condition_value(self.if_match.as_deref())
-    }
-
-    pub(crate) fn if_none_match_value(&self) -> Option<&str> {
-        non_empty_condition_value(self.if_none_match.as_deref())
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct ObjectLockRetentionOptions {
-    pub mode: Option<String>,
-    pub retain_until: Option<OffsetDateTime>,
-    pub bypass_governance: bool,
-}
+pub type ListObjectsInfo = rustfs_storage_api::ListObjectsInfo<ObjectInfo>;
+pub type ListObjectsV2Info = rustfs_storage_api::ListObjectsV2Info<ObjectInfo>;
+pub type ListObjectVersionsInfo = rustfs_storage_api::ListObjectVersionsInfo<ObjectInfo>;
+pub type ObjectInfoOrErr = rustfs_storage_api::ObjectInfoOrErr<ObjectInfo, Error>;
+pub type WalkOptions = rustfs_storage_api::WalkOptions<WalkFilter>;
 
 #[derive(Debug, Default, Clone)]
 pub struct ObjectOptions {
@@ -127,103 +112,27 @@ impl ObjectOptions {
     }
 
     pub fn precondition_check(&self, obj_info: &ObjectInfo) -> Result<()> {
-        let has_valid_mod_time = obj_info.mod_time.is_some_and(|t| t != OffsetDateTime::UNIX_EPOCH);
-
-        if let Some(part_number) = self.part_number
-            && part_number > 1
-            && !obj_info.parts.is_empty()
-        {
-            let part_found = obj_info.parts.iter().any(|pi| pi.number == part_number);
-            if !part_found {
-                return Err(Error::InvalidPartNumber(part_number));
+        let requested_part = self.part_number.and_then(|part_number| {
+            if part_number > 1 && !obj_info.parts.is_empty() {
+                Some(ObjectPreconditionPart {
+                    number: part_number,
+                    exists: obj_info.parts.iter().any(|pi| pi.number == part_number),
+                })
+            } else {
+                None
             }
-        }
+        });
+        let state = ObjectPreconditionState {
+            etag: obj_info.etag.as_deref(),
+            mod_time: obj_info.mod_time,
+            requested_part,
+        };
 
-        if let Some(pre) = &self.http_preconditions {
-            let if_none_match = pre.if_none_match_value();
-            let if_match = pre.if_match_value();
-
-            if let Some(if_none_match) = if_none_match
-                && let Some(etag) = &obj_info.etag
-                && is_etag_equal(etag, if_none_match)
-            {
-                return Err(Error::NotModified);
-            }
-
-            if has_valid_mod_time
-                && let Some(if_modified_since) = &pre.if_modified_since
-                && let Some(mod_time) = &obj_info.mod_time
-                && !is_modified_since(mod_time, if_modified_since)
-            {
-                return Err(Error::NotModified);
-            }
-
-            if let Some(if_match) = if_match {
-                if let Some(etag) = &obj_info.etag {
-                    if !is_etag_equal(etag, if_match) {
-                        return Err(Error::PreconditionFailed);
-                    }
-                } else {
-                    return Err(Error::PreconditionFailed);
-                }
-            }
-            if has_valid_mod_time
-                && if_match.is_none()
-                && let Some(if_unmodified_since) = &pre.if_unmodified_since
-                && let Some(mod_time) = &obj_info.mod_time
-                && is_modified_since(mod_time, if_unmodified_since)
-            {
-                return Err(Error::PreconditionFailed);
-            }
-        }
-
-        Ok(())
-    }
-}
-
-fn non_empty_condition_value(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|value| !value.is_empty())
-}
-
-fn is_etag_equal(etag1: &str, etag2: &str) -> bool {
-    let e1 = etag1.trim_matches('"');
-    let e2 = etag2.trim_matches('"');
-    // Handle wildcard "*" - matches any ETag (per HTTP/1.1 RFC 7232)
-    if e2 == "*" {
-        return true;
-    }
-    e1 == e2
-}
-
-fn is_modified_since(mod_time: &OffsetDateTime, given_time: &OffsetDateTime) -> bool {
-    let mod_secs = mod_time.unix_timestamp();
-    let given_secs = given_time.unix_timestamp();
-    mod_secs > given_secs
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct CompletePart {
-    pub part_num: usize,
-    pub etag: Option<String>,
-    // pub size: Option<usize>,
-    pub checksum_crc32: Option<String>,
-    pub checksum_crc32c: Option<String>,
-    pub checksum_sha1: Option<String>,
-    pub checksum_sha256: Option<String>,
-    pub checksum_crc64nvme: Option<String>,
-}
-
-impl From<s3s::dto::CompletedPart> for CompletePart {
-    fn from(value: s3s::dto::CompletedPart) -> Self {
-        Self {
-            part_num: value.part_number.unwrap_or_default() as usize,
-            etag: value.e_tag.map(|v| v.value().to_owned()),
-            checksum_crc32: value.checksum_crc32,
-            checksum_crc32c: value.checksum_crc32c,
-            checksum_sha1: value.checksum_sha1,
-            checksum_sha256: value.checksum_sha256,
-            checksum_crc64nvme: value.checksum_crc64nvme,
-        }
+        state.check(self.http_preconditions.as_ref()).map_err(|err| match err {
+            ObjectPreconditionError::InvalidPartNumber(part_number) => Error::InvalidPartNumber(part_number),
+            ObjectPreconditionError::NotModified => Error::NotModified,
+            ObjectPreconditionError::PreconditionFailed => Error::PreconditionFailed,
+        })
     }
 }
 
@@ -795,12 +704,6 @@ impl ObjectInfo {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VersionMarker {
-    Null,
-    Version(Uuid),
-}
-
 fn versions_after_marker(file_infos: &rustfs_filemeta::FileInfoVersions, marker: VersionMarker) -> &[FileInfo] {
     let marker_idx = match marker {
         VersionMarker::Null => file_infos.versions.iter().position(|version| version.version_id.is_none()),
@@ -810,50 +713,6 @@ fn versions_after_marker(file_infos: &rustfs_filemeta::FileInfoVersions, marker:
     marker_idx
         .map(|idx| &file_infos.versions[idx + 1..])
         .unwrap_or(&file_infos.versions)
-}
-
-#[derive(Debug, Default)]
-pub struct ListObjectsInfo {
-    // Indicates whether the returned list objects response is truncated. A
-    // value of true indicates that the list was truncated. The list can be truncated
-    // if the number of objects exceeds the limit allowed or specified
-    // by max keys.
-    pub is_truncated: bool,
-
-    // When response is truncated (the IsTruncated element value in the response
-    // is true), you can use the key name in this field as marker in the subsequent
-    // request to get next set of objects.
-    pub next_marker: Option<String>,
-
-    // List of objects info for this request.
-    pub objects: Vec<ObjectInfo>,
-
-    // List of prefixes for this request.
-    pub prefixes: Vec<String>,
-}
-
-#[derive(Debug, Default)]
-pub struct ListObjectsV2Info {
-    // Indicates whether the returned list objects response is truncated. A
-    // value of true indicates that the list was truncated. The list can be truncated
-    // if the number of objects exceeds the limit allowed or specified
-    // by max keys.
-    pub is_truncated: bool,
-
-    // When response is truncated (the IsTruncated element value in the response
-    // is true), you can use the key name in this field as marker in the subsequent
-    // request to get next set of objects.
-    //
-    // NOTE: This element is returned only if you have delimiter request parameter
-    // specified.
-    pub continuation_token: Option<String>,
-    pub next_continuation_token: Option<String>,
-
-    // List of objects info for this request.
-    pub objects: Vec<ObjectInfo>,
-
-    // List of prefixes for this request.
-    pub prefixes: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -909,40 +768,7 @@ impl DeletedObject {
     }
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct ListObjectVersionsInfo {
-    pub is_truncated: bool,
-    pub next_marker: Option<String>,
-    pub next_version_idmarker: Option<String>,
-    pub objects: Vec<ObjectInfo>,
-    pub prefixes: Vec<String>,
-}
-
 type WalkFilter = fn(&FileInfo) -> bool;
-
-#[derive(Clone, Default)]
-pub struct WalkOptions {
-    pub filter: Option<WalkFilter>,           // return WalkFilter returns 'true/false'
-    pub marker: Option<String>,               // set to skip until this object
-    pub latest_only: bool,                    // returns only latest versions for all matching objects
-    pub ask_disks: String,                    // dictates how many disks are being listed
-    pub versions_sort: WalkVersionsSortOrder, // sort order for versions of the same object; default: Ascending order in ModTime
-    pub limit: usize,                         // maximum number of items, 0 means no limit
-    pub include_free_versions: bool,          // include persisted tier free-version cleanup records
-}
-
-#[derive(Clone, Default, PartialEq, Eq)]
-pub enum WalkVersionsSortOrder {
-    #[default]
-    Ascending,
-    Descending,
-}
-
-#[derive(Debug)]
-pub struct ObjectInfoOrErr {
-    pub item: Option<ObjectInfo>,
-    pub err: Option<Error>,
-}
 
 #[cfg(test)]
 mod tests {

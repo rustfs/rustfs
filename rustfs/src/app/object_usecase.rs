@@ -78,9 +78,7 @@ use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object
 use rustfs_ecstore::rio::{DynReader, HashReader, WritePlan, wrap_reader};
 use rustfs_ecstore::set_disk::{get_lock_acquire_timeout, is_valid_storage_class};
 use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::{
-    HTTPRangeSpec, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader,
-};
+use rustfs_ecstore::store_api::{NamespaceLocking, ObjectInfo, ObjectOptions, ObjectToDelete, PutObjReader};
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateTargetDecision, ReplicationState, ReplicationStatusType,
     ReplicationType, RestoreStatusOps, VersionPurgeStatusType, parse_restore_obj_status, replication_statuses_map,
@@ -93,6 +91,9 @@ use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_for_post_object};
 use rustfs_s3select_api::object_store::bytes_stream;
+#[cfg(test)]
+use rustfs_storage_api::HTTPPreconditions;
+use rustfs_storage_api::{HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
 use rustfs_targets::{
     EventName, extract_params_header, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
 };
@@ -1583,7 +1584,17 @@ impl DefaultObjectUsecase {
         if let Some(part_number) = part_number
             && rs.is_none()
         {
-            rs = HTTPRangeSpec::from_object_info(&info, part_number);
+            rs = HTTPRangeSpec::from_part_sizes(
+                info.size,
+                part_number,
+                info.parts.iter().map(|part| {
+                    if part.actual_size > 0 {
+                        part.actual_size
+                    } else {
+                        i64::try_from(part.size).unwrap_or(i64::MAX)
+                    }
+                }),
+            );
         }
 
         validate_sse_headers_for_read(&info.user_defined, &req.headers)?;
@@ -4897,7 +4908,7 @@ mod tests {
         let opts = ObjectOptions {
             version_id: Some(version_id.clone()),
             no_lock: true,
-            http_preconditions: Some(rustfs_ecstore::store_api::HTTPPreconditions {
+            http_preconditions: Some(HTTPPreconditions {
                 if_none_match: Some("\"etag\"".to_string()),
                 if_match: Some("\"other\"".to_string()),
                 ..Default::default()

@@ -53,6 +53,11 @@ LEGACY_STORAGE_API_HITS_FILE="${TMP_DIR}/legacy_storage_api_hits.txt"
 STORE_API_BUCKET_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_bucket_dto_reexports.txt"
 STORE_API_BUCKET_OPERATION_HITS_FILE="${TMP_DIR}/store_api_bucket_operation_hits.txt"
 STORE_API_MULTIPART_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_multipart_dto_reexports.txt"
+STORE_API_OBJECT_HELPER_REEXPORTS_FILE="${TMP_DIR}/store_api_object_helper_reexports.txt"
+STORE_API_RANGE_HELPER_REEXPORTS_FILE="${TMP_DIR}/store_api_range_helper_reexports.txt"
+STORE_API_LIST_HELPER_REEXPORTS_FILE="${TMP_DIR}/store_api_list_helper_reexports.txt"
+STORE_API_LIST_RESPONSE_REEXPORTS_FILE="${TMP_DIR}/store_api_list_response_reexports.txt"
+STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE="${TMP_DIR}/store_api_object_operation_local_method_hits.txt"
 
 awk '
   /^## PR Types$/ {
@@ -187,8 +192,28 @@ require_source_line \
   "storage-api public bucket contract re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
-  "pub use multipart::{ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};" \
+  "pub use multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};" \
   "storage-api public multipart DTO re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
+  "pub use object::{HTTPPreconditions, HTTPRangeError, HTTPRangeSpec, ObjectLockRetentionOptions};" \
+  "storage-api public object helper contract re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
+  "pub use object::{ListObjectVersionsInfo, ListObjectsInfo, ListObjectsV2Info, ListOperations, ObjectInfoOrErr};" \
+  "storage-api public list response contract re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
+  "pub use object::{MultipartOperations, ObjectIO, ObjectOperations};" \
+  "storage-api public object operation contract re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
+  "pub use object::{ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState};" \
+  "storage-api public object precondition contract re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
+  "pub use object::{VersionMarker, WalkOptions, WalkVersionsSortOrder};" \
+  "storage-api public list helper contract re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
   "pub use error::{StorageErrorCode, StorageResult};" \
@@ -225,7 +250,7 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api::\{[^}]*\b(?:ListMultipartsInfo|ListPartsInfo|MultipartInfo|MultipartUploadResult|PartInfo)\b|pub struct (?:ListMultipartsInfo|ListPartsInfo|MultipartInfo|MultipartUploadResult|PartInfo)\b' \
+  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api::\{[^}]*\b(?:CompletePart|ListMultipartsInfo|ListPartsInfo|MultipartInfo|MultipartUploadResult|PartInfo)\b|pub struct (?:CompletePart|ListMultipartsInfo|ListPartsInfo|MultipartInfo|MultipartUploadResult|PartInfo)\b' \
     crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
 ) >"$STORE_API_MULTIPART_DTO_REEXPORTS_FILE"
 
@@ -233,6 +258,68 @@ if [[ -s "$STORE_API_MULTIPART_DTO_REEXPORTS_FILE" ]]; then
   report_failure "old ecstore store_api multipart DTO path reintroduced: $(paste -sd '; ' "$STORE_API_MULTIPART_DTO_REEXPORTS_FILE")"
 fi
 
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:HTTPPreconditions|ObjectLockRetentionOptions|ObjectPreconditionError|ObjectPreconditionPart|ObjectPreconditionState)\b|::(?:HTTPPreconditions|ObjectLockRetentionOptions|ObjectPreconditionError|ObjectPreconditionPart|ObjectPreconditionState)\b)|pub (?:enum ObjectPreconditionError|struct (?:HTTPPreconditions|ObjectLockRetentionOptions|ObjectPreconditionPart|ObjectPreconditionState))\b' \
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
+) >"$STORE_API_OBJECT_HELPER_REEXPORTS_FILE"
+
+if [[ -s "$STORE_API_OBJECT_HELPER_REEXPORTS_FILE" ]]; then
+  report_failure "old ecstore store_api object helper path reintroduced: $(paste -sd '; ' "$STORE_API_OBJECT_HELPER_REEXPORTS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:HTTPRangeError|HTTPRangeSpec)\b|::(?:HTTPRangeError|HTTPRangeSpec)\b)|pub (?:enum HTTPRangeError|struct HTTPRangeSpec)\b' \
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs crates/ecstore/src/store_api/readers.rs || true
+) >"$STORE_API_RANGE_HELPER_REEXPORTS_FILE"
+
+if [[ -s "$STORE_API_RANGE_HELPER_REEXPORTS_FILE" ]]; then
+  report_failure "old ecstore store_api range helper path reintroduced: $(paste -sd '; ' "$STORE_API_RANGE_HELPER_REEXPORTS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:VersionMarker|WalkOptions|WalkVersionsSortOrder)\b|::(?:VersionMarker|WalkOptions|WalkVersionsSortOrder)\b)|pub (?:enum (?:VersionMarker|WalkVersionsSortOrder)|struct WalkOptions)\b' \
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
+) >"$STORE_API_LIST_HELPER_REEXPORTS_FILE"
+
+if [[ -s "$STORE_API_LIST_HELPER_REEXPORTS_FILE" ]]; then
+  report_failure "old ecstore store_api list helper path reintroduced: $(paste -sd '; ' "$STORE_API_LIST_HELPER_REEXPORTS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:ListObjectVersionsInfo|ListObjectsInfo|ListObjectsV2Info|ListOperations|ObjectInfoOrErr)\b|::(?:ListObjectVersionsInfo|ListObjectsInfo|ListObjectsV2Info|ListOperations|ObjectInfoOrErr)\b)|pub struct (?:ListObjectVersionsInfo|ListObjectsInfo|ListObjectsV2Info|ObjectInfoOrErr)\b' \
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
+) >"$STORE_API_LIST_RESPONSE_REEXPORTS_FILE"
+
+if [[ -s "$STORE_API_LIST_RESPONSE_REEXPORTS_FILE" ]]; then
+  report_failure "old ecstore store_api list response path reintroduced: $(paste -sd '; ' "$STORE_API_LIST_RESPONSE_REEXPORTS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'async fn (get_object_reader|put_object|get_object_info|verify_object_integrity|copy_object|delete_object_version|delete_object|delete_objects|put_object_metadata|get_object_tags|put_object_tags|delete_object_tags|add_partial|transition_object|restore_transitioned_object|list_multipart_uploads|new_multipart_upload|copy_object_part|put_object_part|get_multipart_info|list_object_parts|abort_multipart_upload|complete_multipart_upload)\b' \
+    crates/ecstore/src/store_api/traits.rs || true
+) >"$STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE"
+
+if [[ -s "$STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE" ]]; then
+  report_failure "old ecstore object/multipart operation method signatures reintroduced: $(paste -sd '; ' "$STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE")"
+fi
+
+require_source_contains \
+  "crates/ecstore/src/store_api/traits.rs" \
+  "rustfs_storage_api::ObjectIO<" \
+  "ECStore ObjectIO compatibility binding"
+require_source_contains \
+  "crates/ecstore/src/store_api/traits.rs" \
+  "rustfs_storage_api::ObjectOperations<" \
+  "ECStore ObjectOperations compatibility binding"
+require_source_contains \
+  "crates/ecstore/src/store_api/traits.rs" \
+  "rustfs_storage_api::MultipartOperations<" \
+  "ECStore MultipartOperations compatibility binding"
 require_source_contains \
   "crates/ecstore/src/store_api/traits.rs" \
   "pub trait NamespaceLocking: Send + Sync + Debug + 'static" \

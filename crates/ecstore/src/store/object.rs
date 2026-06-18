@@ -21,6 +21,7 @@ use rustfs_io_metrics::{
     record_object_lock_diag_acquire_duration, record_object_lock_diag_hold_duration, record_object_lock_diag_slow_acquire,
     record_object_lock_diag_slow_hold,
 };
+use rustfs_storage_api::{ObjectIO as _, ObjectOperations as _};
 use std::{
     fmt,
     pin::Pin,
@@ -1274,7 +1275,8 @@ impl ECStore {
     }
 
     pub(super) async fn handle_verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        let get_object_reader = <Self as ObjectIO>::get_object_reader(self, bucket, object, None, HeaderMap::new(), opts).await?;
+        let get_object_reader =
+            <Self as rustfs_storage_api::ObjectIO>::get_object_reader(self, bucket, object, None, HeaderMap::new(), opts).await?;
         // Stream to sink to avoid loading entire object into memory during verification
         let mut reader = get_object_reader.stream;
         tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;

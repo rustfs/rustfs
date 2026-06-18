@@ -23,11 +23,11 @@ use crate::global::get_global_endpoints;
 use crate::pools::{ListCallback, PoolMeta, pool_meta_has_active_decommission};
 use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
 use crate::store::ECStore;
-use crate::store_api::{GetObjectReader, HTTPRangeSpec, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions};
+use crate::store_api::{GetObjectReader, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOptions};
 use http::HeaderMap;
 use rand::RngExt as _;
 use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
-use rustfs_storage_api::StorageAdminApi;
+use rustfs_storage_api::{HTTPRangeSpec, ObjectIO as _, ObjectOperations as _, StorageAdminApi};
 use rustfs_utils::path::encode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -3902,7 +3902,7 @@ mod rebalance_unit_tests {
     use super::percent_free_ratio;
     use super::rebalance_goal_reached;
     use super::{
-        DiskError, GetObjectReader, HTTPRangeSpec, MigrationBackend, MigrationVersionResult, ObjectInfo, ObjectOptions,
+        DiskError, GetObjectReader, MigrationBackend, MigrationVersionResult, ObjectInfo, ObjectOptions,
         REBALANCE_CLEANUP_WARNING_ENTRY_LIMIT, RebalSaveOpt, RebalStatus, RebalanceBucketOutcome, RebalanceCleanupDeleteOutcome,
         RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta,
         RebalanceStats, RebalanceStopPropagationRecord, RebalanceTerminalEvent, apply_rebalance_save_option,
@@ -3944,6 +3944,7 @@ mod rebalance_unit_tests {
     use rustfs_filemeta::FileInfo;
     use rustfs_filemeta::TRANSITION_COMPLETE;
     use rustfs_rio::Index;
+    use rustfs_storage_api::HTTPRangeSpec;
     use s3s::dto::ReplicationConfiguration;
     use serde::Serialize;
     use std::fs;

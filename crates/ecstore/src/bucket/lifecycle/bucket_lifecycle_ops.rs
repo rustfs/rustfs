@@ -37,10 +37,7 @@ use crate::global::GLOBAL_LocalNodeName;
 use crate::global::{GLOBAL_LifecycleSys, GLOBAL_TierConfigMgr, get_global_deployment_id};
 use crate::set_disk::{MAX_PARTS_COUNT, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, SetDisks};
 use crate::store::ECStore;
-use crate::store_api::{
-    GetObjectReader, HTTPRangeSpec, ListOperations, MultipartOperations, ObjectInfo, ObjectOperations, ObjectOptions,
-    ObjectToDelete,
-};
+use crate::store_api::{GetObjectReader, ObjectInfo, ObjectOptions, ObjectToDelete};
 use crate::tier::warm_backend::WarmBackendGetOpts;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use futures::Future;
@@ -61,6 +58,7 @@ use rustfs_filemeta::{
     VersionPurgeStatusType, get_file_info, is_restored_object_on_disk,
 };
 use rustfs_s3_types::EventName;
+use rustfs_storage_api::{HTTPRangeSpec, ListOperations as _, MultipartOperations as _, ObjectOperations as _};
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
 use s3s::dto::{
     BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, ReplicationConfiguration, RestoreRequest,
@@ -2872,12 +2870,12 @@ mod tests {
     use crate::error::is_err_invalid_upload_id;
     use crate::set_disk::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
     use crate::store::ECStore;
-    use crate::store_api::{MultipartOperations, ObjectInfo, ObjectOptions, PutObjReader};
+    use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader};
     use futures::FutureExt;
     use rustfs_common::metrics::{IlmAction, global_metrics};
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
     use rustfs_filemeta::{ReplicateDecision, VersionPurgeStatusType};
-    use rustfs_storage_api::{BucketOperations, BucketOptions, MakeBucketOptions};
+    use rustfs_storage_api::{BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations as _};
     use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, Timestamp};
     use serial_test::serial;
     use sha2::{Digest, Sha256};
@@ -4145,7 +4143,7 @@ mod tests {
                 &bucket,
                 object,
                 &upload.upload_id,
-                vec![crate::store_api::CompletePart {
+                vec![rustfs_storage_api::CompletePart {
                     part_num: 1,
                     etag: second_part.etag.clone(),
                     checksum_crc32: None,

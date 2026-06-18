@@ -28,9 +28,8 @@ use crate::{
     global::{GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_lock_clients, is_dist_erasure},
     set_disk::SetDisks,
     store_api::{
-        CompletePart, DeletedObject, GetObjectReader, HTTPRangeSpec, HealOperations, ListObjectVersionsInfo, ListObjectsV2Info,
-        ListOperations, MultipartOperations, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions,
-        ObjectToDelete, PutObjReader,
+        DeletedObject, GetObjectReader, HealOperations, ListObjectVersionsInfo, ListObjectsV2Info, NamespaceLocking, ObjectInfo,
+        ObjectOptions, ObjectToDelete, PutObjReader,
     },
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
 };
@@ -48,10 +47,13 @@ use rustfs_filemeta::FileInfo;
 use rustfs_lock::NamespaceLockWrapper;
 use rustfs_lock::client::LockClient;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
+use rustfs_storage_api::CompletePart;
+use rustfs_storage_api::HTTPRangeSpec;
 use rustfs_storage_api::{
     BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, ListMultipartsInfo, ListPartsInfo, MakeBucketOptions,
     MultipartInfo, MultipartUploadResult, PartInfo,
 };
+use rustfs_storage_api::{ObjectIO as _, ObjectOperations as _};
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
@@ -401,7 +403,15 @@ fn apply_delete_objects_results(
 }
 
 #[async_trait::async_trait]
-impl ObjectIO for Sets {
+impl rustfs_storage_api::ObjectIO for Sets {
+    type Error = Error;
+    type RangeSpec = HTTPRangeSpec;
+    type HeaderMap = HeaderMap;
+    type ObjectOptions = ObjectOptions;
+    type ObjectInfo = ObjectInfo;
+    type GetObjectReader = GetObjectReader;
+    type PutObjectReader = PutObjReader;
+
     #[tracing::instrument(level = "debug", skip(self, object, h, opts))]
     async fn get_object_reader(
         &self,
@@ -446,7 +456,14 @@ impl BucketOperations for Sets {
 }
 
 #[async_trait::async_trait]
-impl ObjectOperations for Sets {
+impl rustfs_storage_api::ObjectOperations for Sets {
+    type Error = Error;
+    type ObjectInfo = ObjectInfo;
+    type ObjectOptions = ObjectOptions;
+    type FileInfo = FileInfo;
+    type ObjectToDelete = ObjectToDelete;
+    type DeletedObject = DeletedObject;
+
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.get_disks_by_key(object).get_object_info(bucket, object, opts).await
     }
@@ -645,7 +662,15 @@ impl ObjectOperations for Sets {
 }
 
 #[async_trait::async_trait]
-impl ListOperations for Sets {
+impl rustfs_storage_api::ListOperations for Sets {
+    type Error = Error;
+    type ListObjectsV2Info = ListObjectsV2Info;
+    type ListObjectVersionsInfo = ListObjectVersionsInfo;
+    type ObjectInfoOrErr = ObjectInfoOrErr;
+    type WalkOptions = WalkOptions;
+    type WalkCancellation = CancellationToken;
+    type WalkResultSender = tokio::sync::mpsc::Sender<ObjectInfoOrErr>;
+
     #[tracing::instrument(skip(self))]
     async fn list_objects_v2(
         self: Arc<Self>,
@@ -687,7 +712,18 @@ impl ListOperations for Sets {
 }
 
 #[async_trait::async_trait]
-impl MultipartOperations for Sets {
+impl rustfs_storage_api::MultipartOperations for Sets {
+    type Error = Error;
+    type ObjectInfo = ObjectInfo;
+    type ObjectOptions = ObjectOptions;
+    type PutObjectReader = PutObjReader;
+    type CompletePart = CompletePart;
+    type ListMultipartsInfo = ListMultipartsInfo;
+    type MultipartUploadResult = MultipartUploadResult;
+    type PartInfo = PartInfo;
+    type MultipartInfo = MultipartInfo;
+    type ListPartsInfo = ListPartsInfo;
+
     #[tracing::instrument(skip(self))]
     async fn list_multipart_uploads(
         &self,

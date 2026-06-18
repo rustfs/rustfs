@@ -1,151 +1,133 @@
 use super::*;
-use rustfs_storage_api::{ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};
+use rustfs_storage_api::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};
 
-#[async_trait::async_trait]
-pub trait ObjectIO: Send + Sync + Debug + 'static {
-    async fn get_object_reader(
-        &self,
-        bucket: &str,
-        object: &str,
-        range: Option<HTTPRangeSpec>,
-        h: HeaderMap,
-        opts: &ObjectOptions,
-    ) -> Result<GetObjectReader>;
+pub trait ObjectIO:
+    rustfs_storage_api::ObjectIO<
+        Error = Error,
+        RangeSpec = HTTPRangeSpec,
+        HeaderMap = HeaderMap,
+        ObjectOptions = ObjectOptions,
+        ObjectInfo = ObjectInfo,
+        GetObjectReader = GetObjectReader,
+        PutObjectReader = PutObjReader,
+    > + Send
+    + Sync
+    + Debug
+    + 'static
+{
+}
 
-    async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo>;
+impl<T> ObjectIO for T where
+    T: rustfs_storage_api::ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        > + Send
+        + Sync
+        + Debug
+        + 'static
+{
 }
 
 /// Object-level storage operations (beyond basic I/O in ObjectIO).
-#[async_trait::async_trait]
-#[allow(clippy::too_many_arguments)]
-pub trait ObjectOperations: Send + Sync + Debug {
-    async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
-    async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()>;
-    async fn copy_object(
-        &self,
-        src_bucket: &str,
-        src_object: &str,
-        dst_bucket: &str,
-        dst_object: &str,
-        src_info: &mut ObjectInfo,
-        src_opts: &ObjectOptions,
-        dst_opts: &ObjectOptions,
-    ) -> Result<ObjectInfo>;
-    async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()>;
-    async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo>;
-    async fn delete_objects(
-        &self,
-        bucket: &str,
-        objects: Vec<ObjectToDelete>,
-        opts: ObjectOptions,
-    ) -> (Vec<DeletedObject>, Vec<Option<Error>>);
-    async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
-    async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String>;
-    async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
-    async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
-    async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()>;
-    async fn transition_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()>;
-    async fn restore_transitioned_object(self: Arc<Self>, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()>;
+pub trait ObjectOperations:
+    rustfs_storage_api::ObjectOperations<
+        Error = Error,
+        ObjectInfo = ObjectInfo,
+        ObjectOptions = ObjectOptions,
+        FileInfo = FileInfo,
+        ObjectToDelete = ObjectToDelete,
+        DeletedObject = DeletedObject,
+    > + Send
+    + Sync
+    + Debug
+{
+}
+
+impl<T> ObjectOperations for T where
+    T: rustfs_storage_api::ObjectOperations<
+            Error = Error,
+            ObjectInfo = ObjectInfo,
+            ObjectOptions = ObjectOptions,
+            FileInfo = FileInfo,
+            ObjectToDelete = ObjectToDelete,
+            DeletedObject = DeletedObject,
+        > + Send
+        + Sync
+        + Debug
+{
 }
 
 /// Listing and walking operations.
-#[async_trait::async_trait]
-#[allow(clippy::too_many_arguments)]
-pub trait ListOperations: Send + Sync + Debug {
-    async fn list_objects_v2(
-        self: Arc<Self>,
-        bucket: &str,
-        prefix: &str,
-        continuation_token: Option<String>,
-        delimiter: Option<String>,
-        max_keys: i32,
-        fetch_owner: bool,
-        start_after: Option<String>,
-        incl_deleted: bool,
-    ) -> Result<ListObjectsV2Info>;
+pub trait ListOperations:
+    rustfs_storage_api::ListOperations<
+        Error = Error,
+        ListObjectsV2Info = ListObjectsV2Info,
+        ListObjectVersionsInfo = ListObjectVersionsInfo,
+        ObjectInfoOrErr = ObjectInfoOrErr,
+        WalkOptions = WalkOptions,
+        WalkCancellation = CancellationToken,
+        WalkResultSender = tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+    > + Send
+    + Sync
+    + Debug
+{
+}
 
-    async fn list_object_versions(
-        self: Arc<Self>,
-        bucket: &str,
-        prefix: &str,
-        marker: Option<String>,
-        version_marker: Option<String>,
-        delimiter: Option<String>,
-        max_keys: i32,
-    ) -> Result<ListObjectVersionsInfo>;
-
-    async fn walk(
-        self: Arc<Self>,
-        rx: CancellationToken,
-        bucket: &str,
-        prefix: &str,
-        result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
-        opts: WalkOptions,
-    ) -> Result<()>;
+impl<T> ListOperations for T where
+    T: rustfs_storage_api::ListOperations<
+            Error = Error,
+            ListObjectsV2Info = ListObjectsV2Info,
+            ListObjectVersionsInfo = ListObjectVersionsInfo,
+            ObjectInfoOrErr = ObjectInfoOrErr,
+            WalkOptions = WalkOptions,
+            WalkCancellation = CancellationToken,
+            WalkResultSender = tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+        > + Send
+        + Sync
+        + Debug
+{
 }
 
 /// Multipart upload operations.
-#[async_trait::async_trait]
-#[allow(clippy::too_many_arguments)]
-pub trait MultipartOperations: Send + Sync + Debug {
-    async fn list_multipart_uploads(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        key_marker: Option<String>,
-        upload_id_marker: Option<String>,
-        delimiter: Option<String>,
-        max_uploads: usize,
-    ) -> Result<ListMultipartsInfo>;
-    async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult>;
-    async fn copy_object_part(
-        &self,
-        src_bucket: &str,
-        src_object: &str,
-        dst_bucket: &str,
-        dst_object: &str,
-        upload_id: &str,
-        part_id: usize,
-        start_offset: i64,
-        length: i64,
-        src_info: &ObjectInfo,
-        src_opts: &ObjectOptions,
-        dst_opts: &ObjectOptions,
-    ) -> Result<()>;
-    async fn put_object_part(
-        &self,
-        bucket: &str,
-        object: &str,
-        upload_id: &str,
-        part_id: usize,
-        data: &mut PutObjReader,
-        opts: &ObjectOptions,
-    ) -> Result<PartInfo>;
-    async fn get_multipart_info(
-        &self,
-        bucket: &str,
-        object: &str,
-        upload_id: &str,
-        opts: &ObjectOptions,
-    ) -> Result<MultipartInfo>;
-    async fn list_object_parts(
-        &self,
-        bucket: &str,
-        object: &str,
-        upload_id: &str,
-        part_number_marker: Option<usize>,
-        max_parts: usize,
-        opts: &ObjectOptions,
-    ) -> Result<ListPartsInfo>;
-    async fn abort_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str, opts: &ObjectOptions) -> Result<()>;
-    async fn complete_multipart_upload(
-        self: Arc<Self>,
-        bucket: &str,
-        object: &str,
-        upload_id: &str,
-        uploaded_parts: Vec<CompletePart>,
-        opts: &ObjectOptions,
-    ) -> Result<ObjectInfo>;
+pub trait MultipartOperations:
+    rustfs_storage_api::MultipartOperations<
+        Error = Error,
+        ObjectInfo = ObjectInfo,
+        ObjectOptions = ObjectOptions,
+        PutObjectReader = PutObjReader,
+        CompletePart = CompletePart,
+        ListMultipartsInfo = ListMultipartsInfo,
+        MultipartUploadResult = MultipartUploadResult,
+        PartInfo = PartInfo,
+        MultipartInfo = MultipartInfo,
+        ListPartsInfo = ListPartsInfo,
+    > + Send
+    + Sync
+    + Debug
+{
+}
+
+impl<T> MultipartOperations for T where
+    T: rustfs_storage_api::MultipartOperations<
+            Error = Error,
+            ObjectInfo = ObjectInfo,
+            ObjectOptions = ObjectOptions,
+            PutObjectReader = PutObjReader,
+            CompletePart = CompletePart,
+            ListMultipartsInfo = ListMultipartsInfo,
+            MultipartUploadResult = MultipartUploadResult,
+            PartInfo = PartInfo,
+            MultipartInfo = MultipartInfo,
+            ListPartsInfo = ListPartsInfo,
+        > + Send
+        + Sync
+        + Debug
+{
 }
 
 /// Healing and repair operations.

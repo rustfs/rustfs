@@ -21,8 +21,9 @@ use super::types::Container;
 use super::{SwiftError, SwiftResult};
 use rustfs_credentials::Credentials;
 use rustfs_ecstore::resolve_object_store_handle;
-use rustfs_ecstore::store_api::ListOperations;
-use rustfs_storage_api::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
+use rustfs_storage_api::{
+    BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, ListOperations as _, MakeBucketOptions,
+};
 use s3s::dto::{Tag, Tagging};
 use sha2::{Digest, Sha256};
 use tracing::{debug, error};

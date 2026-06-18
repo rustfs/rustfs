@@ -53,11 +53,14 @@ use rustfs_ecstore::rio::{DecryptReader, EncryptReader, HardLimitReader, boxed_r
 use rustfs_ecstore::rio::{HashReader, WritePlan};
 use rustfs_ecstore::set_disk::is_valid_storage_class;
 use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::{CompletePart, HTTPRangeSpec, ObjectIO, ObjectOptions, PutObjReader};
-use rustfs_ecstore::store_api::{MultipartOperations, ObjectOperations};
+use rustfs_ecstore::store_api::{ObjectOptions, PutObjReader};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_s3_ops::S3Operation;
-use rustfs_storage_api::MultipartUploadResult;
+#[cfg(test)]
+use rustfs_storage_api::HTTPPreconditions;
+use rustfs_storage_api::{
+    CompletePart, HTTPRangeSpec, MultipartOperations as _, MultipartUploadResult, ObjectIO as _, ObjectOperations as _,
+};
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
@@ -144,6 +147,21 @@ fn normalize_complete_multipart_parts(parts: Vec<CompletePart>) -> S3Result<Vec<
 
     validate_complete_multipart_parts(&deduped_reversed)?;
     Ok(deduped_reversed)
+}
+
+fn complete_part_from_s3(value: CompletedPart) -> CompletePart {
+    CompletePart {
+        part_num: value
+            .part_number
+            .and_then(|part_num| usize::try_from(part_num).ok())
+            .unwrap_or_default(),
+        etag: value.e_tag.map(|v| v.value().to_owned()),
+        checksum_crc32: value.checksum_crc32,
+        checksum_crc32c: value.checksum_crc32c,
+        checksum_sha1: value.checksum_sha1,
+        checksum_sha256: value.checksum_sha256,
+        checksum_crc64nvme: value.checksum_crc64nvme,
+    }
 }
 
 async fn validate_table_catalog_object_mutation(bucket: &str, key: &str) -> S3Result<()> {
@@ -380,7 +398,7 @@ impl DefaultMultipartUsecase {
             .parts
             .unwrap_or_default()
             .into_iter()
-            .map(CompletePart::from)
+            .map(complete_part_from_s3)
             .collect::<Vec<_>>();
 
         let uploaded_parts = normalize_complete_multipart_parts(uploaded_parts_vec)?;
@@ -1403,7 +1421,7 @@ mod tests {
         let opts = ObjectOptions {
             version_id: Some(Uuid::new_v4().to_string()),
             no_lock: true,
-            http_preconditions: Some(rustfs_ecstore::store_api::HTTPPreconditions {
+            http_preconditions: Some(HTTPPreconditions {
                 if_none_match: Some("*".to_string()),
                 if_match: Some("\"etag\"".to_string()),
                 ..Default::default()

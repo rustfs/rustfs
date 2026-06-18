@@ -1069,7 +1069,7 @@ pub async fn store_data_usage_in_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_ecstore::store_api::{GetObjectReader, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader};
+    use rustfs_ecstore::store_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
     use serial_test::serial;
     use std::collections::HashMap;
     use std::io::Cursor;
@@ -1119,12 +1119,20 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ObjectIO for MemoryConfigStore {
+    impl rustfs_storage_api::ObjectIO for MemoryConfigStore {
+        type Error = rustfs_ecstore::error::Error;
+        type RangeSpec = rustfs_storage_api::HTTPRangeSpec;
+        type HeaderMap = http::HeaderMap;
+        type ObjectOptions = ObjectOptions;
+        type ObjectInfo = ObjectInfo;
+        type GetObjectReader = GetObjectReader;
+        type PutObjectReader = PutObjReader;
+
         async fn get_object_reader(
             &self,
             bucket: &str,
             object: &str,
-            _range: Option<rustfs_ecstore::store_api::HTTPRangeSpec>,
+            _range: Option<rustfs_storage_api::HTTPRangeSpec>,
             _h: http::HeaderMap,
             _opts: &ObjectOptions,
         ) -> rustfs_ecstore::error::Result<GetObjectReader> {

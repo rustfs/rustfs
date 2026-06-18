@@ -28,7 +28,7 @@ use rustfs_ecstore::{
     global::GLOBAL_TierConfigMgr,
     pools::path2_bucket_object_with_base_path,
     store::ECStore,
-    store_api::{ListOperations, MultipartOperations, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader},
+    store_api::{ObjectOptions, PutObjReader},
     tier::{
         tier_config::{TierConfig, TierMinIO, TierType},
         warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
@@ -38,7 +38,9 @@ use rustfs_filemeta::FileMeta;
 use rustfs_scanner::scanner::init_data_scanner;
 use rustfs_scanner::scanner_folder::ScannerItem;
 use rustfs_scanner::scanner_io::ScannerIODisk;
-use rustfs_storage_api::{BucketOperations, MakeBucketOptions};
+use rustfs_storage_api::{
+    BucketOperations, ListOperations as _, MakeBucketOptions, MultipartOperations as _, ObjectIO as _, ObjectOperations as _,
+};
 use rustfs_utils::path::path_join_buf;
 use s3s::dto::RestoreRequest;
 use serial_test::serial;
@@ -1020,7 +1022,7 @@ mod serial_tests {
                 multipart_bucket.as_str(),
                 multipart_object,
                 &upload.upload_id,
-                vec![rustfs_ecstore::store_api::CompletePart {
+                vec![rustfs_storage_api::CompletePart {
                     part_num: 1,
                     etag: part.etag.clone(),
                     ..Default::default()
@@ -1165,12 +1167,12 @@ mod serial_tests {
                 object_name,
                 &upload.upload_id,
                 vec![
-                    rustfs_ecstore::store_api::CompletePart {
+                    rustfs_storage_api::CompletePart {
                         part_num: 1,
                         etag: uploaded_part1.etag.clone(),
                         ..Default::default()
                     },
-                    rustfs_ecstore::store_api::CompletePart {
+                    rustfs_storage_api::CompletePart {
                         part_num: 2,
                         etag: uploaded_part2.etag.clone(),
                         ..Default::default()

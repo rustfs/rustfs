@@ -1217,7 +1217,7 @@ mod tests {
     use crate::error::{Error, Result};
     use crate::global::{is_dist_erasure, is_erasure, is_erasure_sd, update_erasure_type};
     use crate::set_disk::SetDisks;
-    use crate::store_api::{GetObjectReader, HTTPRangeSpec, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader};
+    use crate::store_api::{GetObjectReader, NamespaceLocking, ObjectInfo, ObjectOptions, PutObjReader};
     use http::HeaderMap;
     use rustfs_config::audit::{AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
     use rustfs_config::notify::{
@@ -1231,7 +1231,7 @@ mod tests {
     use rustfs_lock::client::LockClient;
     use rustfs_lock::client::local::LocalClient;
     use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
-    use rustfs_storage_api::StorageAdminApi;
+    use rustfs_storage_api::{HTTPRangeSpec, StorageAdminApi};
     use serde_json::Value;
     use serial_test::serial;
     use std::collections::HashMap;
@@ -1408,7 +1408,15 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ObjectIO for LockingConfigStorage {
+    impl rustfs_storage_api::ObjectIO for LockingConfigStorage {
+        type Error = Error;
+        type RangeSpec = HTTPRangeSpec;
+        type HeaderMap = HeaderMap;
+        type ObjectOptions = ObjectOptions;
+        type ObjectInfo = ObjectInfo;
+        type GetObjectReader = GetObjectReader;
+        type PutObjectReader = PutObjReader;
+
         async fn get_object_reader(
             &self,
             bucket: &str,

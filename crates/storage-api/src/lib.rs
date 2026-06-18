@@ -18,8 +18,14 @@ pub mod admin;
 pub mod bucket;
 pub mod error;
 pub mod multipart;
+pub mod object;
 
 pub use admin::{DiskSetSelector, StorageAdminApi};
 pub use bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};
 pub use error::{StorageErrorCode, StorageResult};
-pub use multipart::{ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};
+pub use multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};
+pub use object::{HTTPPreconditions, HTTPRangeError, HTTPRangeSpec, ObjectLockRetentionOptions};
+pub use object::{ListObjectVersionsInfo, ListObjectsInfo, ListObjectsV2Info, ListOperations, ObjectInfoOrErr};
+pub use object::{MultipartOperations, ObjectIO, ObjectOperations};
+pub use object::{ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState};
+pub use object::{VersionMarker, WalkOptions, WalkVersionsSortOrder};

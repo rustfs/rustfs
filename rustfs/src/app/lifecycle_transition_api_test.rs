@@ -29,14 +29,17 @@ use rustfs_ecstore::{
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     global::GLOBAL_TierConfigMgr,
     store::ECStore,
-    store_api::{ListOperations, MultipartOperations, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader},
+    store_api::{ObjectOptions, PutObjReader},
     tier::{
         tier_config::{TierConfig, TierType},
         warm_backend::{WarmBackend, WarmBackendGetOpts},
     },
 };
 use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
-use rustfs_storage_api::{BucketOperations, BucketOptions, MakeBucketOptions};
+use rustfs_storage_api::{
+    BucketOperations, BucketOptions, ListOperations as _, MakeBucketOptions, MultipartOperations as _, ObjectIO as _,
+    ObjectOperations as _,
+};
 use rustfs_utils::http::{SUFFIX_FORCE_DELETE, insert_header};
 use s3s::{S3Request, dto::*};
 use serial_test::serial;

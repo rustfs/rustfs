@@ -14,7 +14,7 @@
 
 use super::*;
 use crate::config::get_global_storage_class;
-use rustfs_storage_api::StorageAdminApi;
+use rustfs_storage_api::{ObjectOperations as _, StorageAdminApi};
 
 struct LatestObjectInfoCandidate {
     info: Option<ObjectInfo>,

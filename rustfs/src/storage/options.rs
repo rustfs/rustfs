@@ -31,8 +31,9 @@ use s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE;
 
 use crate::auth::UNSIGNED_PAYLOAD;
 use crate::auth::UNSIGNED_PAYLOAD_TRAILER;
-use rustfs_ecstore::store_api::{HTTPPreconditions, HTTPRangeSpec, ObjectOptions};
+use rustfs_ecstore::store_api::ObjectOptions;
 use rustfs_policy::service_type::ServiceType;
+use rustfs_storage_api::{HTTPPreconditions, HTTPRangeSpec};
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use rustfs_utils::http::AMZ_CONTENT_SHA256;
 use rustfs_utils::path::is_dir_object;
@@ -616,9 +617,17 @@ pub fn parse_copy_source_range(range_str: &str) -> S3Result<HTTPRangeSpec> {
                 .parse::<i64>()
                 .map_err(|_| s3_error!(InvalidArgument, "Invalid range format"))?;
 
+            if length <= 0 {
+                return Err(s3_error!(InvalidArgument, "Invalid range format"));
+            }
+
+            let start = length
+                .checked_neg()
+                .ok_or_else(|| s3_error!(InvalidArgument, "Invalid range format"))?;
+
             Ok(HTTPRangeSpec {
                 is_suffix_length: true,
-                start: -length,
+                start,
                 end: -1,
             })
         } else {
@@ -776,6 +785,7 @@ fn get_content_sha256_cksum(headers: &HeaderMap<HeaderValue>, service_type: Serv
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
     use temp_env;
 
     use super::*;
@@ -1559,5 +1569,28 @@ mod tests {
         assert!(parse_copy_source_range("bytes=").is_err());
         assert!(parse_copy_source_range("bytes=abc-def").is_err());
         assert!(parse_copy_source_range("bytes=100-50").is_err()); // start > end
+        assert!(parse_copy_source_range("bytes=-0").is_err());
+        assert!(parse_copy_source_range("bytes=--9223372036854775808").is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn parse_copy_source_range_never_panics_and_preserves_output_invariants(
+            input in any::<String>(),
+        ) {
+            match std::panic::catch_unwind(|| parse_copy_source_range(&input)) {
+                Ok(Ok(spec)) => {
+                    if spec.is_suffix_length {
+                        prop_assert_eq!(spec.end, -1);
+                        prop_assert!(spec.start < 0);
+                    } else {
+                        prop_assert!(spec.start >= 0);
+                        prop_assert!(spec.end == -1 || spec.end >= spec.start);
+                    }
+                }
+                Ok(Err(_)) => {}
+                Err(_) => prop_assert!(false, "parse_copy_source_range panicked for input {:?}", input),
+            }
+        }
     }
 }
