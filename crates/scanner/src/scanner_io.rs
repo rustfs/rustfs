@@ -26,22 +26,6 @@ use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{Metric, Metrics, emit_scan_bucket_drive_complete, emit_scan_bucket_drive_partial, global_metrics};
 #[cfg(test)]
 use rustfs_config::{ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS};
-use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
-use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState;
-use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle;
-use rustfs_ecstore::bucket::metadata_sys::{get_lifecycle_config, get_object_lock_config, get_replication_config};
-use rustfs_ecstore::bucket::replication::{ReplicationConfig, ReplicationConfigurationExt};
-use rustfs_ecstore::bucket::versioning::VersioningApi as _;
-use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::config::storageclass;
-use rustfs_ecstore::disk::STORAGE_FORMAT_FILE;
-use rustfs_ecstore::disk::error::DiskError;
-use rustfs_ecstore::disk::{Disk, DiskAPI};
-use rustfs_ecstore::error::{Error, StorageError};
-use rustfs_ecstore::global::GLOBAL_TierConfigMgr;
-use rustfs_ecstore::resolve_object_store_handle;
-use rustfs_ecstore::set_disk::SetDisks;
-use rustfs_ecstore::{error::Result, store::ECStore};
 use rustfs_filemeta::FileMeta;
 use rustfs_storage_api::{BucketInfo, BucketOperations, BucketOptions, DiskSetSelector, StorageAdminApi};
 use rustfs_utils::path::path_join_buf;
@@ -59,6 +43,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use crate::ScannerObjectInfo as ObjectInfo;
+use crate::storage_compat::{
+    BucketTargetSys, BucketVersioningSys, Disk, DiskAPI, DiskError, ECStore, EcstoreError as Error, EcstoreResult as Result,
+    GLOBAL_ExpiryState, GLOBAL_TierConfigMgr, Lifecycle, ReplicationConfig, ReplicationConfigurationExt, STORAGE_FORMAT_FILE,
+    SetDisks, StorageError, VersioningApi as _, get_lifecycle_config, get_object_lock_config, get_replication_config,
+    resolve_scanner_object_store_handle, storageclass,
+};
 
 pub(crate) const SCANNER_SKIP_FILE_ERROR: &str = "skip file";
 const LOG_COMPONENT_SCANNER: &str = "scanner";
@@ -1433,7 +1423,7 @@ impl ScannerIODisk for Disk {
 
         // TODO: object lock
 
-        let Some(ecstore) = resolve_object_store_handle() else {
+        let Some(ecstore) = resolve_scanner_object_store_handle() else {
             error!(
                 target: "rustfs::scanner::io",
                 event = EVENT_SCANNER_DISK_BUCKET_STATE,
@@ -1529,8 +1519,7 @@ impl ScannerIODisk for Disk {
 mod tests {
     use super::*;
     use crate::scanner_folder::ScannerItem;
-    use rustfs_ecstore::disk::{DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, new_disk};
-    use rustfs_ecstore::pools::path2_bucket_object_with_base_path;
+    use crate::storage_compat::{DiskOption, Endpoint, new_disk, path2_bucket_object_with_base_path};
     use serial_test::serial;
     use temp_env::with_var;
     use uuid::Uuid;

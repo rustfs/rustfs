@@ -21,13 +21,14 @@ use crate::{Error, Result};
 use futures::{StreamExt, future::join_all, stream::FuturesUnordered};
 use metrics::gauge;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
-use rustfs_ecstore::disk::DiskStore;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
 use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
+
+use super::storage_compat::DiskStore;
 
 const LOG_COMPONENT_HEAL: &str = "heal";
 const LOG_SUBSYSTEM_ERASURE_HEALER: &str = "erasure_healer";

@@ -20,9 +20,6 @@ use crate::heal::{
 use crate::{Error, Result};
 use metrics::{counter, gauge};
 use rustfs_common::heal_channel::{HealAdmissionDropReason, HealAdmissionResult, HealRequestSource};
-use rustfs_ecstore::disk::DiskAPI;
-use rustfs_ecstore::disk::error::DiskError;
-use rustfs_ecstore::global::GLOBAL_LOCAL_DISK_MAP;
 use rustfs_madmin::heal_commands::HealResultItem;
 use std::{
     collections::{BinaryHeap, HashMap},
@@ -35,6 +32,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+use super::storage_compat::{DiskAPI, DiskError, GLOBAL_LOCAL_DISK_MAP};
 
 const KEEP_HEAL_TASK_STATUS_DURATION: Duration = Duration::from_secs(10 * 60);
 const LOG_COMPONENT_HEAL: &str = "heal";
@@ -2286,9 +2285,10 @@ mod tests {
     use crate::heal::storage::{HealObjectInfo, HealStorageAPI};
     use crate::heal::task::{HealOptions, HealPriority, HealRequest, HealTask, HealType};
     use rustfs_common::heal_channel::{HealOpts, HealRequestSource};
-    use rustfs_ecstore::disk::{DiskStore, endpoint::Endpoint};
     use rustfs_madmin::heal_commands::HealResultItem;
     use rustfs_storage_api::BucketInfo;
+
+    use super::super::storage_compat::{DiskStore, Endpoint};
 
     struct MockStorage;
 
