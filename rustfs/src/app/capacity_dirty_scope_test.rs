@@ -18,10 +18,10 @@ use rustfs_ecstore::{
     disk::endpoint::Endpoint,
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     store::ECStore,
-    store_api::{HealOperations, ObjectOptions, PutObjReader},
+    store_api::{ObjectOptions, PutObjReader},
 };
 use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
-use rustfs_storage_api::{BucketOperations, BucketOptions, MakeBucketOptions, ObjectIO as _};
+use rustfs_storage_api::{BucketOperations, BucketOptions, HealOperations as _, MakeBucketOptions, ObjectIO as _};
 use serial_test::serial;
 use std::{
     collections::HashSet,

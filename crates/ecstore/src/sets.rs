@@ -28,8 +28,8 @@ use crate::{
     global::{GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_lock_clients, is_dist_erasure},
     set_disk::SetDisks,
     store_api::{
-        DeletedObject, GetObjectReader, HealOperations, ListObjectVersionsInfo, ListObjectsV2Info, NamespaceLocking, ObjectInfo,
-        ObjectOptions, ObjectToDelete, PutObjReader,
+        DeletedObject, GetObjectReader, ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo, ObjectOptions, ObjectToDelete,
+        PutObjReader,
     },
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
 };
@@ -826,7 +826,11 @@ impl rustfs_storage_api::MultipartOperations for Sets {
 }
 
 #[async_trait::async_trait]
-impl HealOperations for Sets {
+impl rustfs_storage_api::HealOperations for Sets {
+    type Error = Error;
+    type HealResultItem = HealResultItem;
+    type HealOptions = HealOpts;
+
     #[tracing::instrument(skip(self))]
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
         let (disks, _) = init_storage_disks_with_errors(
@@ -938,7 +942,10 @@ impl HealOperations for Sets {
 }
 
 #[async_trait::async_trait]
-impl NamespaceLocking for Sets {
+impl rustfs_storage_api::NamespaceLocking for Sets {
+    type Error = Error;
+    type NamespaceLock = NamespaceLockWrapper;
+
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         self.disk_set[0].new_ns_lock(bucket, object).await
     }
