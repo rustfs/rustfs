@@ -14,8 +14,6 @@
 
 use http::HeaderMap;
 pub(crate) mod ecstore {
-    #![allow(unused_imports)]
-
     pub(crate) use rustfs_ecstore::{
         bucket, cache_value, config, data_usage, disk, error, global, pools, resolve_object_store_handle, set_disk, store,
         store_api, store_utils,

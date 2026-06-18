@@ -13,8 +13,6 @@
 // limitations under the License.
 
 pub(crate) mod ecstore {
-    #![allow(unused_imports)]
-
     pub(crate) use rustfs_ecstore::{data_usage, disk, error, global, store, store_api};
 }
 pub(crate) use self::ecstore::{

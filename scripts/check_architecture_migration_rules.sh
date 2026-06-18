@@ -61,6 +61,7 @@ STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_list_c
 STORE_API_EXTERNAL_OPERATION_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_operation_consumer_hits.txt"
 STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE="${TMP_DIR}/store_api_object_operation_local_method_hits.txt"
 DIRECT_ECSTORE_IMPORT_HITS_FILE="${TMP_DIR}/direct_ecstore_import_hits.txt"
+PRODUCTION_UNUSED_COMPAT_ALLOW_HITS_FILE="${TMP_DIR}/production_unused_compat_allow_hits.txt"
 
 awk '
   /^## PR Types$/ {
@@ -332,6 +333,19 @@ fi
 
 if [[ -s "$DIRECT_ECSTORE_IMPORT_HITS_FILE" ]]; then
   report_failure "direct rustfs_ecstore imports outside compatibility boundaries are forbidden: $(paste -sd '; ' "$DIRECT_ECSTORE_IMPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading '#!\[allow\(unused_imports\)\]' \
+    rustfs/src crates/*/src fuzz/fuzz_targets \
+    --glob '*storage_compat.rs' \
+    --glob '!crates/ecstore/**' \
+    --glob '!crates/e2e_test/**' || true
+) >"$PRODUCTION_UNUSED_COMPAT_ALLOW_HITS_FILE"
+
+if [[ -s "$PRODUCTION_UNUSED_COMPAT_ALLOW_HITS_FILE" ]]; then
+  report_failure "production storage compatibility boundaries must not hide unused ECStore re-exports: $(paste -sd '; ' "$PRODUCTION_UNUSED_COMPAT_ALLOW_HITS_FILE")"
 fi
 
 (
