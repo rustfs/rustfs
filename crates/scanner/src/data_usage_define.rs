@@ -33,7 +33,7 @@ use rustfs_ecstore::{
     config::{com::save_config, storageclass},
     disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
     error::{Error, Result as StorageResult, StorageError},
-    store_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
+    store_api::{GetObjectReader, ObjectInfo, ObjectOptions, ObjectToDelete, PutObjReader},
 };
 use rustfs_storage_api::{HTTPRangeSpec, ObjectIO};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
@@ -60,6 +60,12 @@ const LOG_SUBSYSTEM_CACHE: &str = "cache";
 const EVENT_SCANNER_CACHE_LOAD_STATE: &str = "scanner_cache_load_state";
 const EVENT_SCANNER_CACHE_SAVE_STATE: &str = "scanner_cache_save_state";
 static CACHE_SAVE_METRICS_ONCE: Once = Once::new();
+
+pub type ScannerGetObjectReader = GetObjectReader;
+pub type ScannerObjectInfo = ObjectInfo;
+pub type ScannerObjectOptions = ObjectOptions;
+pub type ScannerObjectToDelete = ObjectToDelete;
+pub type ScannerPutObjReader = PutObjReader;
 
 pub trait ScannerObjectIO:
     ObjectIO<

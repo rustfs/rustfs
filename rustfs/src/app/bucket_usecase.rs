@@ -23,6 +23,7 @@ use crate::app::context::{
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
+use crate::storage::StorageObjectInfo as ObjectInfo;
 use crate::storage::access::{ReqInfo, authorize_request, req_info_ref};
 use crate::storage::helper::{OperationHelper, spawn_background_with_context};
 use crate::storage::s3_api::bucket::{
@@ -57,7 +58,6 @@ use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::notification_sys::get_global_notification_sys;
 use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::ObjectInfo;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::{
     action::{Action, S3Action},

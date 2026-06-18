@@ -22,7 +22,6 @@ use rustfs_audit::{
     entity::{ApiDetails, ApiDetailsBuilder, AuditEntryBuilder},
     global::AuditLogger,
 };
-use rustfs_ecstore::store_api::ObjectInfo;
 use rustfs_io_metrics::record_s3_op;
 use rustfs_notify::{EventArgsBuilder, notifier_global};
 use rustfs_s3_ops::{S3Operation, operation_matches_event_name};
@@ -36,6 +35,8 @@ use serde_json::Value;
 use std::future::Future;
 use tokio::runtime::{Builder, Handle};
 use tracing::{Instrument, info_span, warn};
+
+use crate::storage::StorageObjectInfo as ObjectInfo;
 
 /// Schedules an asynchronous task on the current runtime;
 /// if there is no runtime, creates a minimal runtime execution on a new thread.
