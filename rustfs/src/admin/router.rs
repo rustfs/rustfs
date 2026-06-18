@@ -14,6 +14,8 @@
 
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
+use crate::admin::storage_compat::GLOBAL_BOOT_TIME;
+use crate::admin::storage_compat::PeerRestClient;
 use crate::admin::storage_compat::bucket::bandwidth::monitor::BandwidthDetails;
 use crate::admin::storage_compat::bucket::bucket_target_sys::{
     BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, TargetClient,
@@ -28,10 +30,8 @@ use crate::admin::storage_compat::bucket::target::{BucketTarget, BucketTargetTyp
 use crate::admin::storage_compat::bucket::versioning::VersioningApi;
 use crate::admin::storage_compat::bucket::versioning_sys::BucketVersioningSys;
 use crate::admin::storage_compat::config::com::read_config_without_migrate;
-use crate::admin::storage_compat::global::GLOBAL_BOOT_TIME;
-use crate::admin::storage_compat::global::{get_global_bucket_monitor, get_global_deployment_id, get_global_region};
-use crate::admin::storage_compat::notification_sys::get_global_notification_sys;
-use crate::admin::storage_compat::rpc::PeerRestClient;
+use crate::admin::storage_compat::get_global_notification_sys;
+use crate::admin::storage_compat::{get_global_bucket_monitor, get_global_deployment_id, get_global_region};
 use crate::app::context::resolve_object_store_handle;
 use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::auth::{check_key_valid, get_session_token};
@@ -1420,9 +1420,7 @@ async fn ensure_replication_bucket_exists(bucket: &str) -> S3Result<()> {
 async fn ensure_replication_config_exists(bucket: &str) -> S3Result<()> {
     match metadata_sys::get_replication_config(bucket).await {
         Ok(_) => Ok(()),
-        Err(crate::admin::storage_compat::error::StorageError::ConfigNotFound) => {
-            Err(s3_error!(ReplicationConfigurationNotFoundError))
-        }
+        Err(crate::admin::storage_compat::StorageError::ConfigNotFound) => Err(s3_error!(ReplicationConfigurationNotFoundError)),
         Err(err) => Err(ApiError::from(err).into()),
     }
 }
@@ -2062,7 +2060,7 @@ async fn source_bucket_requires_object_lock(bucket: &str) -> S3Result<bool> {
             .object_lock_enabled
             .as_ref()
             .is_some_and(|state| state.as_str() == s3s::dto::ObjectLockEnabled::ENABLED)),
-        Err(crate::admin::storage_compat::error::StorageError::ConfigNotFound) => Ok(false),
+        Err(crate::admin::storage_compat::StorageError::ConfigNotFound) => Ok(false),
         Err(err) => Err(ApiError::from(err).into()),
     }
 }

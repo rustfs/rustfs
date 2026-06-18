@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::admin::router::Operation;
-use crate::admin::storage_compat::rpc::PeerRestClient;
+use crate::admin::storage_compat::PeerRestClient;
 use crate::app::context::resolve_endpoints_handle;
 use http::StatusCode;
 use hyper::Uri;

@@ -18,7 +18,7 @@ use crate::admin::storage_compat::{
     bucket::lifecycle::tier_last_day_stats::DailyAllTierStats,
     client::admin_handler_utils::AdminError,
     config::storageclass,
-    notification_sys::get_global_notification_sys,
+    get_global_notification_sys,
     tier::{
         tier::{ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_MISSING_CREDENTIALS},
         tier_admin::TierCreds,

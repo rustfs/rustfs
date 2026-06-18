@@ -14,12 +14,8 @@
 
 use crate::startup_fs_guard::enforce_unsupported_fs_policy;
 use crate::storage_compat::{
-    bucket::replication::init_background_replication,
-    config as ecconfig,
-    endpoints::EndpointServerPools,
-    set_global_endpoints,
-    store::{ECStore, init_local_disks, init_lock_clients, prewarm_local_disk_id_map},
-    update_erasure_type,
+    ECStore, EndpointServerPools, bucket::replication::init_background_replication, config as ecconfig, init_local_disks,
+    init_lock_clients, prewarm_local_disk_id_map, set_global_endpoints, update_erasure_type,
 };
 use rustfs_common::{GlobalReadiness, SystemStage};
 use std::{

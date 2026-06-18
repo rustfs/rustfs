@@ -22,6 +22,7 @@ use crate::storage::helper::OperationHelper;
 use crate::storage::options::get_opts;
 use crate::storage::s3_api::acl;
 use crate::storage::storage_compat::{
+    StorageError,
     bucket::{
         metadata::{
             BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_VERSIONING_CONFIG,
@@ -35,7 +36,7 @@ use crate::storage::storage_compat::{
         versioning::VersioningApi,
         versioning_sys::BucketVersioningSys,
     },
-    error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
+    is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
 };
 use crate::storage::{parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled};
 use crate::table_catalog;

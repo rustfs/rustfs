@@ -48,6 +48,7 @@ use metrics::{counter, histogram};
 use pin_project_lite::pin_project;
 use rustfs_object_capacity::capacity_manager::get_capacity_manager;
 // Performance metrics recording (with zero-copy-metrics integration)
+use crate::app::storage_compat::ECStore;
 use crate::app::storage_compat::bucket::quota::checker::QuotaChecker;
 use crate::app::storage_compat::bucket::{
     lifecycle::{
@@ -73,12 +74,11 @@ use crate::app::storage_compat::client::object_api_utils::to_s3s_etag;
 use crate::app::storage_compat::compress::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
 use crate::app::storage_compat::config::storageclass;
 use crate::app::storage_compat::disk::{error::DiskError, error_reduce::is_all_buckets_not_found};
-use crate::app::storage_compat::error::{
+use crate::app::storage_compat::rio::{DynReader, HashReader, WritePlan, wrap_reader};
+use crate::app::storage_compat::{
     Error as EcstoreError, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
 };
-use crate::app::storage_compat::rio::{DynReader, HashReader, WritePlan, wrap_reader};
-use crate::app::storage_compat::set_disk::{get_lock_acquire_timeout, is_valid_storage_class};
-use crate::app::storage_compat::store::ECStore;
+use crate::app::storage_compat::{get_lock_acquire_timeout, is_valid_storage_class};
 use rustfs_concurrency::GetObjectQueueSnapshot;
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateTargetDecision, ReplicationState, ReplicationStatusType,
@@ -1539,7 +1539,7 @@ impl DefaultObjectUsecase {
     #[allow(clippy::too_many_arguments)]
     async fn prepare_get_object_read(
         req: &S3Request<GetObjectInput>,
-        store: &crate::app::storage_compat::store::ECStore,
+        store: &crate::app::storage_compat::ECStore,
         manager: &ConcurrencyManager,
         bucket: &str,
         key: &str,
@@ -2340,7 +2340,7 @@ impl DefaultObjectUsecase {
         maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
 
         // Fast in-memory update for immediate quota and admin usage consistency
-        crate::app::storage_compat::data_usage::record_bucket_object_write_memory(
+        crate::app::storage_compat::record_bucket_object_write_memory(
             &bucket,
             previous_current_size,
             obj_info.size.max(0) as u64,
@@ -3303,12 +3303,8 @@ impl DefaultObjectUsecase {
 
         // Update quota tracking after successful copy
         if has_bucket_metadata {
-            crate::app::storage_compat::data_usage::record_bucket_object_write_memory(
-                &bucket,
-                previous_current_size,
-                oi.size.max(0) as u64,
-            )
-            .await;
+            crate::app::storage_compat::record_bucket_object_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64)
+                .await;
         }
 
         let raw_dest_version = oi.version_id.map(|v| v.to_string());
@@ -3585,7 +3581,7 @@ impl DefaultObjectUsecase {
                     );
                 }
                 let size = object_sizes[i].max(0) as u64;
-                crate::app::storage_compat::data_usage::record_bucket_object_delete_memory(
+                crate::app::storage_compat::record_bucket_object_delete_memory(
                     &bucket,
                     size,
                     existing_object_infos[i].is_some() && object_to_delete[i].version_id.is_none(),
@@ -3823,7 +3819,7 @@ impl DefaultObjectUsecase {
         }
 
         // Fast in-memory update for immediate quota and admin usage consistency
-        crate::app::storage_compat::data_usage::record_bucket_object_delete_memory(
+        crate::app::storage_compat::record_bucket_object_delete_memory(
             &bucket,
             obj_info.size.max(0) as u64,
             opts.version_id.is_none(),

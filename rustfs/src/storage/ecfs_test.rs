@@ -18,8 +18,8 @@ mod tests {
     use crate::server::cors;
     use crate::storage::ecfs::{FS, validate_object_lock_configuration_input};
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
+    use crate::storage::storage_compat::DEFAULT_READ_BUFFER_SIZE;
     use crate::storage::storage_compat::bucket::{metadata::BucketMetadata, metadata_sys};
-    use crate::storage::storage_compat::set_disk::DEFAULT_READ_BUFFER_SIZE;
     use crate::storage::{
         StorageObjectInfo as ObjectInfo, apply_cors_headers, apply_default_lock_retention_metadata, check_preconditions,
         get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, is_etag_equal, matches_origin_pattern, parse_etag,

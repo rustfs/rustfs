@@ -18,12 +18,12 @@ use crate::admin::service::config::{
     apply_dynamic_config_for_subsystem, is_dynamic_config_subsystem, signal_config_snapshot_reload, signal_dynamic_config_reload,
     validate_server_config,
 };
+use crate::admin::storage_compat::RUSTFS_META_BUCKET;
 use crate::admin::storage_compat::config::com::STORAGE_CLASS_SUB_SYS;
 use crate::admin::storage_compat::config::com::{
     delete_config, read_config, read_config_without_migrate, save_config, save_server_config,
 };
 use crate::admin::storage_compat::config::storageclass::{INLINE_BLOCK_ENV, OPTIMIZE_ENV, RRS_ENV, STANDARD_ENV};
-use crate::admin::storage_compat::disk::RUSTFS_META_BUCKET;
 use crate::admin::utils::{encode_compatible_admin_payload, is_compat_admin_request, read_compatible_admin_body};
 use crate::app::context::resolve_object_store_handle;
 use crate::auth::{check_key_valid, get_session_token};
@@ -711,7 +711,7 @@ fn success_response(config_applied: bool) -> S3Result<S3Response<(StatusCode, Bo
     Ok(S3Response::with_headers((StatusCode::OK, Body::default()), headers))
 }
 
-fn object_store() -> S3Result<std::sync::Arc<crate::admin::storage_compat::store::ECStore>> {
+fn object_store() -> S3Result<std::sync::Arc<crate::admin::storage_compat::ECStore>> {
     resolve_object_store_handle().ok_or_else(|| s3_error!(InternalError, "server storage not initialized"))
 }
 

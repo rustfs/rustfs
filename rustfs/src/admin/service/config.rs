@@ -15,7 +15,7 @@
 use crate::admin::storage_compat::config::com::{STORAGE_CLASS_SUB_SYS, read_config_without_migrate};
 use crate::admin::storage_compat::config::set_global_storage_class;
 use crate::admin::storage_compat::config::storageclass;
-use crate::admin::storage_compat::notification_sys::get_global_notification_sys;
+use crate::admin::storage_compat::get_global_notification_sys;
 use crate::app::context::resolve_object_store_handle;
 use rustfs_audit::reload_audit_config;
 use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_WEBHOOK_SUB_SYS};

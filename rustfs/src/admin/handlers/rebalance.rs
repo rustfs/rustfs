@@ -13,8 +13,7 @@
 // limitations under the License.
 
 use crate::admin::storage_compat::{
-    error::StorageError,
-    notification_sys::get_global_notification_sys,
+    StorageError, get_global_notification_sys,
     rebalance::{DiskStat, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta},
 };
 use crate::{

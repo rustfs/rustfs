@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::app::storage_compat::EndpointServerPools;
 use crate::app::storage_compat::bucket::metadata_sys::BucketMetadataSys;
-use crate::app::storage_compat::endpoints::EndpointServerPools;
 use crate::app::storage_compat::tier::tier::TierConfigMgr;
 use crate::config::RustFSBufferConfig;
 use async_trait::async_trait;
