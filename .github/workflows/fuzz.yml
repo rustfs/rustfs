@@ -1,0 +1,154 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Fuzz
+
+on:
+  pull_request:
+    paths:
+      - "fuzz/**"
+      - "scripts/fuzz/**"
+      - ".github/workflows/fuzz.yml"
+      - "crates/ecstore/**"
+      - "crates/filemeta/**"
+      - "crates/utils/**"
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Which fuzz profile to run"
+        required: false
+        default: "both"
+        type: choice
+        options:
+          - smoke
+          - nightly
+          - both
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  pr-fuzz-smoke:
+    name: PR Fuzz Smoke
+    if: >
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' &&
+        (github.event.inputs.profile == 'smoke' || github.event.inputs.profile == 'both'))
+    runs-on: ubicloud-standard-4
+    timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      MAX_TOTAL_TIME: 60
+      ARTIFACT_ROOT: artifacts
+      RUSTFLAGS: "--cfg tokio_unstable -C target-feature=-crt-static"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: nightly
+          cache-shared-key: fuzz-smoke-${{ hashFiles('fuzz/Cargo.lock') }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Run path_containment smoke target
+        env:
+          FUZZ_TARGET: path_containment
+        run: ./scripts/fuzz/run_ci_targets.sh
+
+      - name: Run bucket_validation smoke target
+        env:
+          FUZZ_TARGET: bucket_validation
+        run: ./scripts/fuzz/run_ci_targets.sh
+
+      - name: Run local_metadata smoke target
+        env:
+          FUZZ_TARGET: local_metadata
+        run: ./scripts/fuzz/run_ci_targets.sh
+
+      - name: Run bounded fuzz smoke targets
+        if: ${{ false }}
+        run: ./scripts/fuzz/run_ci_targets.sh
+
+      - name: Upload fuzz smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: fuzz-smoke-${{ github.run_number }}
+          path: |
+            fuzz/artifacts/**
+            fuzz/corpus/**
+          if-no-files-found: ignore
+          retention-days: 7
+
+  nightly-fuzz-corpus:
+    name: Nightly Fuzz Corpus
+    if: >
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+        (github.event.inputs.profile == 'nightly' || github.event.inputs.profile == 'both'))
+    runs-on: ubicloud-standard-4
+    timeout-minutes: 180
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      MAX_TOTAL_TIME: 300
+      ARTIFACT_ROOT: artifacts
+      RUSTFLAGS: "--cfg tokio_unstable -C target-feature=-crt-static"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: nightly
+          cache-shared-key: fuzz-nightly-${{ hashFiles('fuzz/Cargo.lock') }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Run nightly fuzz targets
+        run: ./scripts/fuzz/run_nightly_targets.sh
+
+      - name: Upload nightly fuzz artifacts
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: fuzz-nightly-${{ github.run_number }}
+          path: |
+            fuzz/artifacts/**
+            fuzz/corpus/**
+          if-no-files-found: ignore
+          retention-days: 30
