@@ -154,6 +154,7 @@ python3 scripts/table-catalog/failure_coverage.py \
   --warehouse rustfs-s3table-smoke \
   --namespace smoke \
   --table events \
+  --rest-path /iceberg \
   --print-failure-probes
 ```
 
@@ -162,6 +163,10 @@ object rejection, diagnostics/recovery for finalization gaps, maintenance stale
 plan rejection, and external catalog sync conflicts. These steps are meant to be
 run against a prepared live table and should be recorded with the exact RustFS
 build and client versions used.
+
+`--rest-path` defaults to `/iceberg` and generated probe paths include the
+mounted catalog prefix, for example `/iceberg/v1/{warehouse}/...`. Use
+`--rest-path /_iceberg` to generate paths for the compatibility alias.
 
 The smoke test also probes catalog-backed advanced Iceberg surfaces:
 

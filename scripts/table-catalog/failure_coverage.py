@@ -76,8 +76,20 @@ def production_failure_matrix() -> list[dict[str, str]]:
     ]
 
 
-def table_path(warehouse: str, namespace: str, table: str, suffix: str = "") -> str:
-    base = f"/v1/{warehouse}/namespaces/{namespace}/tables/{table}"
+def catalog_prefix(rest_path: str) -> str:
+    stripped = rest_path.strip()
+    if not stripped:
+        raise ValueError("REST catalog path cannot be empty")
+    if not stripped.startswith("/"):
+        stripped = f"/{stripped}"
+    stripped = stripped.rstrip("/")
+    if not stripped.endswith("/v1"):
+        stripped = f"{stripped}/v1"
+    return stripped
+
+
+def table_path(warehouse: str, namespace: str, table: str, suffix: str = "", rest_path: str = "/iceberg") -> str:
+    base = f"{catalog_prefix(rest_path)}/{warehouse}/namespaces/{namespace}/tables/{table}"
     return f"{base}{suffix}"
 
 
@@ -101,8 +113,8 @@ def probe_step(
     return step
 
 
-def failure_probe_plan(warehouse: str, namespace: str, table: str) -> list[dict[str, Any]]:
-    table_endpoint = table_path(warehouse, namespace, table)
+def failure_probe_plan(warehouse: str, namespace: str, table: str, rest_path: str = "/iceberg") -> list[dict[str, Any]]:
+    table_endpoint = table_path(warehouse, namespace, table, rest_path=rest_path)
     return [
         probe_step(
             "stale-token-commit-conflict",
@@ -112,6 +124,9 @@ def failure_probe_plan(warehouse: str, namespace: str, table: str) -> list[dict[
             "stale expected version token is rejected and current metadata pointer remains unchanged",
             {
                 "identifier": {"namespace": [namespace], "name": table},
+                "expected-version-token": "stale-token-from-previous-load",
+                "expected-metadata-location": "current-metadata-location-from-load-table",
+                "new-metadata-location": f"s3://{warehouse}/tables/table-id/metadata/conflict_probe.metadata.json",
                 "requirements": [
                     {
                         "type": "assert-current-snapshot-id",
@@ -124,10 +139,6 @@ def failure_probe_plan(warehouse: str, namespace: str, table: str) -> list[dict[
                         "schema-id": 0,
                     }
                 ],
-                "base": {
-                    "metadata-location": f"s3://{warehouse}/tables/table-id/metadata/stale.metadata.json",
-                    "version-token": "stale-token",
-                },
             },
         ),
         probe_step(
@@ -138,23 +149,22 @@ def failure_probe_plan(warehouse: str, namespace: str, table: str) -> list[dict[
             "new metadata object must exist before the catalog pointer can advance",
             {
                 "identifier": {"namespace": [namespace], "name": table},
+                "expected-version-token": "current-version-token-from-load-table",
+                "expected-metadata-location": "current-metadata-location-from-load-table",
                 "new-metadata-location": f"s3://{warehouse}/tables/table-id/metadata/does_not_exist.metadata.json",
-                "base": {
-                    "version-token": "current-token-from-load-table",
-                },
             },
         ),
         probe_step(
             "diagnostics-after-finalization-gap",
             "GET",
-            table_path(warehouse, namespace, table, "/catalog/diagnostics"),
+            table_path(warehouse, namespace, table, "/catalog/diagnostics", rest_path),
             "200",
             "diagnostics should surface recoverable commit-log/idempotency gaps with operator actions",
         ),
         probe_step(
             "recovery-repairs-idempotency-index",
             "POST",
-            table_path(warehouse, namespace, table, "/catalog/recovery"),
+            table_path(warehouse, namespace, table, "/catalog/recovery", rest_path),
             "200",
             "recovery should repair stale or missing idempotency indexes without moving the table pointer",
             {
@@ -164,7 +174,7 @@ def failure_probe_plan(warehouse: str, namespace: str, table: str) -> list[dict[
         probe_step(
             "maintenance-stale-plan-rejected",
             "POST",
-            table_path(warehouse, namespace, table, "/maintenance/metadata"),
+            table_path(warehouse, namespace, table, "/maintenance/metadata", rest_path),
             "409",
             "stale maintenance plans must not delete or commit after the current pointer changes",
             {
@@ -175,7 +185,7 @@ def failure_probe_plan(warehouse: str, namespace: str, table: str) -> list[dict[
         probe_step(
             "external-sync-conflict",
             "POST",
-            table_path(warehouse, namespace, table, "/catalog/import"),
+            table_path(warehouse, namespace, table, "/catalog/import", rest_path),
             "409",
             "external catalog sync conflicts must leave pointer, token, and generation unchanged",
             {
@@ -191,6 +201,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warehouse", default="rustfs-s3table-smoke")
     parser.add_argument("--namespace", default="smoke")
     parser.add_argument("--table", default="events")
+    parser.add_argument("--rest-path", default="/iceberg")
     parser.add_argument("--print-failure-matrix", action="store_true")
     parser.add_argument("--print-failure-probes", action="store_true")
     return parser.parse_args(argv)
@@ -222,6 +233,7 @@ def run(args: argparse.Namespace, output: StringIO | None = None) -> None:
                     warehouse=args.warehouse,
                     namespace=args.namespace,
                     table=args.table,
+                    rest_path=args.rest_path,
                 )
             },
             output,

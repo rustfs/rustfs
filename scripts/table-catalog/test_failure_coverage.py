@@ -39,17 +39,22 @@ class FailureCoverageTest(unittest.TestCase):
 
         self.assertEqual(
             by_name["stale-token-commit-conflict"]["path"],
-            "/v1/lake/namespaces/sales/tables/orders",
+            "/iceberg/v1/lake/namespaces/sales/tables/orders",
         )
         self.assertEqual(by_name["stale-token-commit-conflict"]["method"], "POST")
         self.assertEqual(by_name["stale-token-commit-conflict"]["expected_status"], "409")
+        self.assertIn("expected-version-token", by_name["stale-token-commit-conflict"]["body"])
+        self.assertIn("expected-metadata-location", by_name["stale-token-commit-conflict"]["body"])
+        self.assertIn("new-metadata-location", by_name["stale-token-commit-conflict"]["body"])
+        self.assertNotIn("base", by_name["stale-token-commit-conflict"]["body"])
         self.assertEqual(
             by_name["diagnostics-after-finalization-gap"]["path"],
-            "/v1/lake/namespaces/sales/tables/orders/catalog/diagnostics",
+            "/iceberg/v1/lake/namespaces/sales/tables/orders/catalog/diagnostics",
         )
         self.assertEqual(by_name["diagnostics-after-finalization-gap"]["method"], "GET")
         self.assertEqual(by_name["recovery-repairs-idempotency-index"]["method"], "POST")
         self.assertIn("does_not_exist.metadata.json", json.dumps(by_name["missing-metadata-object-rejected"]))
+        self.assertNotIn("base", by_name["missing-metadata-object-rejected"]["body"])
 
     def test_cli_prints_failure_matrix_and_probe_plan(self) -> None:
         matrix_payload = failure_coverage.cli_json(["--print-failure-matrix"])
@@ -66,6 +71,8 @@ class FailureCoverageTest(unittest.TestCase):
                 "sales",
                 "--table",
                 "orders",
+                "--rest-path",
+                "/_iceberg",
                 "--print-failure-probes",
             ]
         )
@@ -73,6 +80,10 @@ class FailureCoverageTest(unittest.TestCase):
 
         self.assertIn("failure_probe_plan", probe_document)
         self.assertTrue(probe_document["failure_probe_plan"])
+        self.assertEqual(
+            probe_document["failure_probe_plan"][0]["path"],
+            "/_iceberg/v1/lake/namespaces/sales/tables/orders",
+        )
 
 
 if __name__ == "__main__":
