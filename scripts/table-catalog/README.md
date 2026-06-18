@@ -124,6 +124,7 @@ PyIceberg, PyArrow, or boto3:
 ```bash
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-client-matrix
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-engine-compatibility
+python3 scripts/table-catalog/pyiceberg_smoke.py --print-production-failure-coverage
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-vendor-profiles
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-unsupported-inventory
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-production-readiness
@@ -142,6 +143,25 @@ python3 scripts/table-catalog/engine_compatibility.py --print-engine-matrix
 python3 scripts/table-catalog/engine_compatibility.py --print-spark-config
 python3 scripts/table-catalog/engine_compatibility.py --print-spark-sql --cleanup
 ```
+
+The production failure helper records the negative coverage required before
+calling a release production-ready and can generate REST probe steps for a live
+RustFS endpoint:
+
+```bash
+python3 scripts/table-catalog/failure_coverage.py --print-failure-matrix
+python3 scripts/table-catalog/failure_coverage.py \
+  --warehouse rustfs-s3table-smoke \
+  --namespace smoke \
+  --table events \
+  --print-failure-probes
+```
+
+The generated probe plan covers stale-token commit conflicts, missing metadata
+object rejection, diagnostics/recovery for finalization gaps, maintenance stale
+plan rejection, and external catalog sync conflicts. These steps are meant to be
+run against a prepared live table and should be recorded with the exact RustFS
+build and client versions used.
 
 The smoke test also probes catalog-backed advanced Iceberg surfaces:
 
@@ -169,6 +189,34 @@ The smoke test also probes catalog-backed advanced Iceberg surfaces:
 | StarRocks Iceberg REST catalog | Documented, not automated | external catalog read-path reference only |
 | Databend | Documented, not automated | S3 data-plane reference only; Iceberg REST catalog integration is not claimed |
 | Snowflake/Open Catalog integrations | Documented, not automated | reference only |
+
+## Production Failure Coverage
+
+Production failure coverage is tracked separately from positive client
+conformance. Positive smoke tests prove a client can create and use a table;
+failure probes prove RustFS does not silently advance table state when something
+goes wrong.
+
+The current failure matrix covers:
+
+- stale commit tokens and stale base metadata returning a conflict without
+  advancing the table pointer
+- post-CAS finalization gaps surfacing through diagnostics and safe recovery
+  repair without pointer movement
+- missing metadata, manifest, data, or delete objects failing closed before a
+  commit or maintenance operation advances state
+- concurrent writers producing a single winning CAS and retryable conflicts
+- table catalog and ordinary S3 object permission denials preventing data-plane
+  bypass
+- stale maintenance plans failing closed before object deletion or catalog
+  commit
+- external catalog sync conflicts leaving pointer, token, and generation
+  unchanged
+- backing migration remaining blocked until WAL/recovery replay is clean
+
+Do not promote a failure case from `probe-required` or `load-test-required` to
+an automated claim until the live probe or stress harness is repeatable and its
+RustFS build, client version, and expected response shape are recorded.
 
 ## Vendor Profile References
 
