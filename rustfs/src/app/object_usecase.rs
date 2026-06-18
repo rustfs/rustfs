@@ -78,9 +78,7 @@ use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object
 use rustfs_ecstore::rio::{DynReader, HashReader, WritePlan, wrap_reader};
 use rustfs_ecstore::set_disk::{get_lock_acquire_timeout, is_valid_storage_class};
 use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::{
-    NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader,
-};
+use rustfs_ecstore::store_api::{NamespaceLocking, ObjectInfo, ObjectOptions, ObjectToDelete, PutObjReader};
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateTargetDecision, ReplicationState, ReplicationStatusType,
     ReplicationType, RestoreStatusOps, VersionPurgeStatusType, parse_restore_obj_status, replication_statuses_map,
@@ -95,7 +93,7 @@ use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_fo
 use rustfs_s3select_api::object_store::bytes_stream;
 #[cfg(test)]
 use rustfs_storage_api::HTTPPreconditions;
-use rustfs_storage_api::HTTPRangeSpec;
+use rustfs_storage_api::{HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
 use rustfs_targets::{
     EventName, extract_params_header, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
 };
@@ -990,7 +988,7 @@ fn contains_parent_dir_component(path: &str) -> bool {
     path.split(['/', '\\']).any(|component| component == "..")
 }
 
-fn validate_extract_relative_path(path: &str) -> S3Result<()> {
+pub fn validate_extract_relative_path(path: &str) -> S3Result<()> {
     let path = Path::new(path);
     if path
         .components()
@@ -1014,7 +1012,7 @@ fn normalize_snowball_prefix(prefix: &str) -> S3Result<Option<String>> {
     Ok(Some(normalized.to_string()))
 }
 
-fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: bool) -> S3Result<String> {
+pub fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: bool) -> S3Result<String> {
     validate_extract_relative_path(path)?;
     let path = path.trim_matches('/');
     let mut key = match prefix {
@@ -2401,6 +2399,7 @@ impl DefaultObjectUsecase {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
 
         // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
         let manager = get_capacity_manager();
@@ -3331,6 +3330,7 @@ impl DefaultObjectUsecase {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         result
     }
 
@@ -3646,6 +3646,8 @@ impl DefaultObjectUsecase {
             .map(|context| context.notify())
             .unwrap_or_else(default_notify_interface);
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
+        let deleted_any = delete_results.iter().any(|result| result.delete_object.is_some());
+        let notify_bucket = bucket.clone();
         spawn_background_with_context(request_context, async move {
             let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Notify);
             for res in delete_results {
@@ -3653,10 +3655,10 @@ impl DefaultObjectUsecase {
                     let event_name = delete_event_name_for_marker(dobj.delete_marker);
                     let event_args = EventArgsBuilder::new(
                         event_name,
-                        bucket.clone(),
+                        notify_bucket.clone(),
                         ObjectInfo {
                             name: dobj.object_name.clone(),
-                            bucket: bucket.clone(),
+                            bucket: notify_bucket.clone(),
                             ..Default::default()
                         },
                     )
@@ -3674,6 +3676,9 @@ impl DefaultObjectUsecase {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        if deleted_any {
+            rustfs_scanner::record_dirty_usage_bucket(&bucket);
+        }
         // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
         let manager = get_capacity_manager();
         manager.record_write_operation().await;
@@ -3842,6 +3847,7 @@ impl DefaultObjectUsecase {
             let manager = get_capacity_manager();
             manager.record_write_operation().await;
             let _ = helper.complete(&result);
+            rustfs_scanner::record_dirty_usage_bucket(&bucket);
             return result;
         }
 
@@ -3910,6 +3916,7 @@ impl DefaultObjectUsecase {
         let manager = get_capacity_manager();
         manager.record_write_operation().await;
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         result
     }
 
@@ -4625,6 +4632,7 @@ impl DefaultObjectUsecase {
         let host = get_request_host(&req.headers);
         let port = get_request_port(&req.headers);
         let user_agent = get_request_user_agent(&req.headers);
+        let mut wrote_any_entry = false;
 
         while let Some(entry) = entries.next().await {
             let mut f = match entry {
@@ -4791,6 +4799,10 @@ impl DefaultObjectUsecase {
                     return Err(ApiError::from(e).into());
                 }
             };
+            if !wrote_any_entry {
+                rustfs_scanner::record_dirty_usage_bucket(&bucket);
+                wrote_any_entry = true;
+            }
 
             let _manager = get_concurrency_manager();
             let _fpath_clone = fpath.clone();

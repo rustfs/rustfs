@@ -800,6 +800,7 @@ impl DefaultBucketUsecase {
         counter!("rustfs_create_bucket_total").increment(1);
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         result
     }
 
@@ -832,6 +833,7 @@ impl DefaultBucketUsecase {
             )
             .await
             .map_err(ApiError::from)?;
+        rustfs_scanner::clear_dirty_usage_bucket(&input.bucket);
 
         if let Err(err) = site_replication_delete_bucket_hook(&input.bucket, force).await {
             warn!(bucket = %input.bucket, error = ?err, "site replication delete bucket hook failed");
