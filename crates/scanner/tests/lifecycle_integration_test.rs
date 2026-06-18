@@ -28,7 +28,7 @@ use rustfs_ecstore::{
     global::GLOBAL_TierConfigMgr,
     pools::path2_bucket_object_with_base_path,
     store::ECStore,
-    store_api::{ListOperations, MultipartOperations, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader},
+    store_api::{MultipartOperations, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader},
     tier::{
         tier_config::{TierConfig, TierMinIO, TierType},
         warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
@@ -38,6 +38,7 @@ use rustfs_filemeta::FileMeta;
 use rustfs_scanner::scanner::init_data_scanner;
 use rustfs_scanner::scanner_folder::ScannerItem;
 use rustfs_scanner::scanner_io::ScannerIODisk;
+use rustfs_storage_api::ListOperations as _;
 use rustfs_storage_api::{BucketOperations, MakeBucketOptions};
 use rustfs_utils::path::path_join_buf;
 use s3s::dto::RestoreRequest;

@@ -54,6 +54,9 @@ STORE_API_BUCKET_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_bucket_dto_reexports.t
 STORE_API_BUCKET_OPERATION_HITS_FILE="${TMP_DIR}/store_api_bucket_operation_hits.txt"
 STORE_API_MULTIPART_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_multipart_dto_reexports.txt"
 STORE_API_OBJECT_HELPER_REEXPORTS_FILE="${TMP_DIR}/store_api_object_helper_reexports.txt"
+STORE_API_RANGE_HELPER_REEXPORTS_FILE="${TMP_DIR}/store_api_range_helper_reexports.txt"
+STORE_API_LIST_HELPER_REEXPORTS_FILE="${TMP_DIR}/store_api_list_helper_reexports.txt"
+STORE_API_LIST_RESPONSE_REEXPORTS_FILE="${TMP_DIR}/store_api_list_response_reexports.txt"
 
 awk '
   /^## PR Types$/ {
@@ -192,8 +195,20 @@ require_source_line \
   "storage-api public multipart DTO re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
-  "pub use object::{HTTPPreconditions, ObjectLockRetentionOptions};" \
+  "pub use object::{HTTPPreconditions, HTTPRangeError, HTTPRangeSpec, ObjectLockRetentionOptions};" \
   "storage-api public object helper contract re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
+  "pub use object::{ListObjectVersionsInfo, ListObjectsInfo, ListObjectsV2Info, ListOperations, ObjectInfoOrErr};" \
+  "storage-api public list response contract re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
+  "pub use object::{ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState};" \
+  "storage-api public object precondition contract re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
+  "pub use object::{VersionMarker, WalkOptions, WalkVersionsSortOrder};" \
+  "storage-api public list helper contract re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
   "pub use error::{StorageErrorCode, StorageResult};" \
@@ -240,12 +255,42 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api::\{[^}]*\b(?:HTTPPreconditions|ObjectLockRetentionOptions)\b|pub struct (?:HTTPPreconditions|ObjectLockRetentionOptions)\b' \
+  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:HTTPPreconditions|ObjectLockRetentionOptions|ObjectPreconditionError|ObjectPreconditionPart|ObjectPreconditionState)\b|::(?:HTTPPreconditions|ObjectLockRetentionOptions|ObjectPreconditionError|ObjectPreconditionPart|ObjectPreconditionState)\b)|pub (?:enum ObjectPreconditionError|struct (?:HTTPPreconditions|ObjectLockRetentionOptions|ObjectPreconditionPart|ObjectPreconditionState))\b' \
     crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
 ) >"$STORE_API_OBJECT_HELPER_REEXPORTS_FILE"
 
 if [[ -s "$STORE_API_OBJECT_HELPER_REEXPORTS_FILE" ]]; then
   report_failure "old ecstore store_api object helper path reintroduced: $(paste -sd '; ' "$STORE_API_OBJECT_HELPER_REEXPORTS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:HTTPRangeError|HTTPRangeSpec)\b|::(?:HTTPRangeError|HTTPRangeSpec)\b)|pub (?:enum HTTPRangeError|struct HTTPRangeSpec)\b' \
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs crates/ecstore/src/store_api/readers.rs || true
+) >"$STORE_API_RANGE_HELPER_REEXPORTS_FILE"
+
+if [[ -s "$STORE_API_RANGE_HELPER_REEXPORTS_FILE" ]]; then
+  report_failure "old ecstore store_api range helper path reintroduced: $(paste -sd '; ' "$STORE_API_RANGE_HELPER_REEXPORTS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:VersionMarker|WalkOptions|WalkVersionsSortOrder)\b|::(?:VersionMarker|WalkOptions|WalkVersionsSortOrder)\b)|pub (?:enum (?:VersionMarker|WalkVersionsSortOrder)|struct WalkOptions)\b' \
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
+) >"$STORE_API_LIST_HELPER_REEXPORTS_FILE"
+
+if [[ -s "$STORE_API_LIST_HELPER_REEXPORTS_FILE" ]]; then
+  report_failure "old ecstore store_api list helper path reintroduced: $(paste -sd '; ' "$STORE_API_LIST_HELPER_REEXPORTS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:ListObjectVersionsInfo|ListObjectsInfo|ListObjectsV2Info|ListOperations|ObjectInfoOrErr)\b|::(?:ListObjectVersionsInfo|ListObjectsInfo|ListObjectsV2Info|ListOperations|ObjectInfoOrErr)\b)|pub struct (?:ListObjectVersionsInfo|ListObjectsInfo|ListObjectsV2Info|ObjectInfoOrErr)\b' \
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
+) >"$STORE_API_LIST_RESPONSE_REEXPORTS_FILE"
+
+if [[ -s "$STORE_API_LIST_RESPONSE_REEXPORTS_FILE" ]]; then
+  report_failure "old ecstore store_api list response path reintroduced: $(paste -sd '; ' "$STORE_API_LIST_RESPONSE_REEXPORTS_FILE")"
 fi
 
 require_source_contains \

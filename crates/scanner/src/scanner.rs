@@ -1124,7 +1124,7 @@ mod tests {
             &self,
             bucket: &str,
             object: &str,
-            _range: Option<rustfs_ecstore::store_api::HTTPRangeSpec>,
+            _range: Option<rustfs_storage_api::HTTPRangeSpec>,
             _h: http::HeaderMap,
             _opts: &ObjectOptions,
         ) -> rustfs_ecstore::error::Result<GetObjectReader> {

@@ -23,7 +23,7 @@ use crate::{
 use futures::future::join_all;
 use rustfs_credentials::get_global_action_cred;
 use rustfs_ecstore::error::{StorageError, classify_system_path_failure_reason};
-use rustfs_ecstore::store_api::{ListOperations as _, ObjectInfoOrErr, WalkOptions};
+use rustfs_ecstore::store_api::{ObjectInfoOrErr, WalkOptions};
 use rustfs_ecstore::{
     config::{
         RUSTFS_CONFIG_PREFIX,
@@ -35,6 +35,7 @@ use rustfs_ecstore::{
 use rustfs_io_metrics::record_system_path_failure;
 use rustfs_policy::{auth::UserIdentity, policy::PolicyDoc};
 use rustfs_storage_api::HTTPPreconditions;
+use rustfs_storage_api::ListOperations as _;
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use serde::{Serialize, de::DeserializeOwned};
 use std::sync::{LazyLock, Mutex};

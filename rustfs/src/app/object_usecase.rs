@@ -79,7 +79,7 @@ use rustfs_ecstore::rio::{DynReader, HashReader, WritePlan, wrap_reader};
 use rustfs_ecstore::set_disk::{get_lock_acquire_timeout, is_valid_storage_class};
 use rustfs_ecstore::store::ECStore;
 use rustfs_ecstore::store_api::{
-    HTTPRangeSpec, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader,
+    NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader,
 };
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateTargetDecision, ReplicationState, ReplicationStatusType,
@@ -95,6 +95,7 @@ use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_fo
 use rustfs_s3select_api::object_store::bytes_stream;
 #[cfg(test)]
 use rustfs_storage_api::HTTPPreconditions;
+use rustfs_storage_api::HTTPRangeSpec;
 use rustfs_targets::{
     EventName, extract_params_header, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
 };
@@ -1585,7 +1586,17 @@ impl DefaultObjectUsecase {
         if let Some(part_number) = part_number
             && rs.is_none()
         {
-            rs = HTTPRangeSpec::from_object_info(&info, part_number);
+            rs = HTTPRangeSpec::from_part_sizes(
+                info.size,
+                part_number,
+                info.parts.iter().map(|part| {
+                    if part.actual_size > 0 {
+                        part.actual_size
+                    } else {
+                        i64::try_from(part.size).unwrap_or(i64::MAX)
+                    }
+                }),
+            );
         }
 
         validate_sse_headers_for_read(&info.user_defined, &req.headers)?;

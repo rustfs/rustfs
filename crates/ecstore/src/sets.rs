@@ -28,9 +28,8 @@ use crate::{
     global::{GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_lock_clients, is_dist_erasure},
     set_disk::SetDisks,
     store_api::{
-        DeletedObject, GetObjectReader, HTTPRangeSpec, HealOperations, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
-        MultipartOperations, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete,
-        PutObjReader,
+        DeletedObject, GetObjectReader, HealOperations, ListObjectVersionsInfo, ListObjectsV2Info, MultipartOperations,
+        NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader,
     },
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
 };
@@ -49,6 +48,7 @@ use rustfs_lock::NamespaceLockWrapper;
 use rustfs_lock::client::LockClient;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_storage_api::CompletePart;
+use rustfs_storage_api::HTTPRangeSpec;
 use rustfs_storage_api::{
     BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, ListMultipartsInfo, ListPartsInfo, MakeBucketOptions,
     MultipartInfo, MultipartUploadResult, PartInfo,
@@ -646,7 +646,15 @@ impl ObjectOperations for Sets {
 }
 
 #[async_trait::async_trait]
-impl ListOperations for Sets {
+impl rustfs_storage_api::ListOperations for Sets {
+    type Error = Error;
+    type ListObjectsV2Info = ListObjectsV2Info;
+    type ListObjectVersionsInfo = ListObjectVersionsInfo;
+    type ObjectInfoOrErr = ObjectInfoOrErr;
+    type WalkOptions = WalkOptions;
+    type WalkCancellation = CancellationToken;
+    type WalkResultSender = tokio::sync::mpsc::Sender<ObjectInfoOrErr>;
+
     #[tracing::instrument(skip(self))]
     async fn list_objects_v2(
         self: Arc<Self>,
