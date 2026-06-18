@@ -1,0 +1,2 @@
+bucket
+nested/path.txt

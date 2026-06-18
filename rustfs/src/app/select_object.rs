@@ -10,13 +10,13 @@ use datafusion::arrow::{
 };
 use futures::StreamExt;
 use http::{StatusCode, header::RANGE};
-use rustfs_ecstore::store_api::ObjectOperations;
 use rustfs_s3select_api::{
     QueryError,
     object_store::{INVALID_SCAN_RANGE_MESSAGE, validate_scan_range_bounds},
     query::{Context, Query},
 };
 use rustfs_s3select_query::get_global_db;
+use rustfs_storage_api::ObjectOperations as _;
 use s3s::dto::*;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::sync::Arc;

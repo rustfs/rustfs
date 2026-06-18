@@ -500,6 +500,8 @@ pub enum AdminAction {
     SetBucketTargetAction,
     #[strum(serialize = "admin:GetBucketTarget")]
     GetBucketTargetAction,
+    #[strum(serialize = "admin:GetMetrics")]
+    GetMetricsAction,
     #[strum(serialize = "admin:ReplicationDiff")]
     ReplicationDiff,
     #[strum(serialize = "admin:GetReplicationMetrics")]
@@ -656,6 +658,7 @@ impl AdminAction {
                 | AdminAction::SetBucketQuotaAdminAction
                 | AdminAction::SetBucketTargetAction
                 | AdminAction::GetBucketTargetAction
+                | AdminAction::GetMetricsAction
                 | AdminAction::ReplicationDiff
                 | AdminAction::GetReplicationMetricsAction
                 | AdminAction::ImportBucketMetadataAction
@@ -818,6 +821,11 @@ mod tests {
     #[test]
     fn test_get_replication_metrics_admin_action_is_valid() {
         assert!(AdminAction::GetReplicationMetricsAction.is_valid());
+    }
+
+    #[test]
+    fn test_get_metrics_admin_action_is_valid() {
+        assert!(AdminAction::GetMetricsAction.is_valid());
     }
 
     #[test]

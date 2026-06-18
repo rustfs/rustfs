@@ -33,8 +33,9 @@ use rustfs_ecstore::{
     config::{com::save_config, storageclass},
     disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
     error::{Error, Result as StorageResult, StorageError},
-    store_api::{ObjectIO, ObjectInfo, ObjectOptions},
+    store_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
 };
+use rustfs_storage_api::{HTTPRangeSpec, ObjectIO};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use tokio::time::{Duration, Instant, sleep, timeout};
 use tracing::warn;
@@ -59,6 +60,32 @@ const LOG_SUBSYSTEM_CACHE: &str = "cache";
 const EVENT_SCANNER_CACHE_LOAD_STATE: &str = "scanner_cache_load_state";
 const EVENT_SCANNER_CACHE_SAVE_STATE: &str = "scanner_cache_save_state";
 static CACHE_SAVE_METRICS_ONCE: Once = Once::new();
+
+pub trait ScannerObjectIO:
+    ObjectIO<
+        Error = Error,
+        RangeSpec = HTTPRangeSpec,
+        HeaderMap = HeaderMap,
+        ObjectOptions = ObjectOptions,
+        ObjectInfo = ObjectInfo,
+        GetObjectReader = GetObjectReader,
+        PutObjectReader = PutObjReader,
+    >
+{
+}
+
+impl<T> ScannerObjectIO for T where
+    T: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >
+{
+}
 
 pub const DATA_USAGE_SCAN_CHECKPOINT_VERSION: u16 = 1;
 
@@ -616,7 +643,7 @@ impl DataUsageCache {
     /// Only backend errors are returned as errors.
     /// The loader is optimistic and has no locking, but tries 5 times before giving up.
     /// If the object is not found, a nil error with empty data usage cache is returned.
-    pub async fn load<S: ObjectIO>(&mut self, store: Arc<S>, name: &str) -> StorageResult<()> {
+    pub async fn load<S: ScannerObjectIO>(&mut self, store: Arc<S>, name: &str) -> StorageResult<()> {
         // By default, empty data usage cache
         *self = DataUsageCache::default();
 
@@ -671,7 +698,7 @@ impl DataUsageCache {
     }
     // Inner load function that attempts to load from a specific path
     // Returns (should_retry, cache_option, error_option)
-    async fn try_load_inner<S: ObjectIO>(
+    async fn try_load_inner<S: ScannerObjectIO>(
         store: Arc<S>,
         load_name: &str,
         timeout_duration: Duration,
@@ -866,7 +893,7 @@ impl DataUsageCache {
         Err(last_err.unwrap_or_else(|| StorageError::other("Failed to save data usage cache".to_string())))
     }
 
-    async fn save_path_with_retry<S: ObjectIO>(
+    async fn save_path_with_retry<S: ScannerObjectIO>(
         store: Arc<S>,
         path: &str,
         buf: &[u8],
@@ -889,7 +916,7 @@ impl DataUsageCache {
         .await
     }
 
-    pub async fn save<S: ObjectIO>(&self, store: Arc<S>, name: &str) -> StorageResult<()> {
+    pub async fn save<S: ScannerObjectIO>(&self, store: Arc<S>, name: &str) -> StorageResult<()> {
         let mut buf = Vec::new();
         self.serialize(&mut rmp_serde::Serializer::new(&mut buf))?;
         let timeout_duration = Self::cache_save_timeout();

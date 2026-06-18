@@ -25,6 +25,7 @@ REQUIRED_STORAGE_CREDENTIAL_KEYS = (
     "s3.session-token",
 )
 TABLE_MAINTENANCE_CONFIG_VERSION = 1
+IDENTIFIER_SEGMENT_MAX_LEN = 64
 
 PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
     "rustfs": {
@@ -559,6 +560,18 @@ def safe_probe_segment(namespace: str, table: str) -> str:
     return "".join(char if char.isalnum() or char in {"-", "_", "."} else "-" for char in source)
 
 
+def safe_ref_segment(namespace: str, table: str) -> str:
+    source = f"smoke-{namespace}-{table}".lower()
+    segment = "".join(
+        char if char.isascii() and (char.isalnum() or char in {"-", "_"}) else "-"
+        for char in source
+    )
+    segment = segment.strip("-_")
+    if not segment:
+        return "smoke"
+    return segment[:IDENTIFIER_SEGMENT_MAX_LEN].rstrip("-_") or "smoke"
+
+
 def scope_probe_keys(object_prefix: str, namespace: str, table: str) -> tuple[str, str]:
     segment = safe_probe_segment(namespace, table)
     suffix = f"{segment}-{int(time.time())}.txt"
@@ -792,21 +805,40 @@ def run_metadata_location_probe(args: argparse.Namespace, deps: RuntimeDeps, tab
 
 
 def run_table_ref_probe(args: argparse.Namespace, deps: RuntimeDeps, snapshot_id: int) -> None:
-    ref_name = f"smoke-{safe_probe_segment(args.namespace, args.table)}"
+    ref_name = safe_ref_segment(args.namespace, args.table)
     ref_body = {
         "snapshot-id": snapshot_id,
         "type": "tag",
         "max-ref-age-ms": 86_400_000,
     }
+    force_deleted = False
     signed_rest_request(args, deps, "PUT", table_ref_endpoint_path(args, ref_name), ref_body)
-    refs = signed_rest_request(args, deps, "GET", table_ref_endpoint_path(args))
-    if refs.get("refs", {}).get(ref_name, {}).get("snapshot-id") != snapshot_id:
-        raise RuntimeError("table refs endpoint did not return the smoke tag")
-    signed_rest_request_expect_error(args, deps, "DELETE", table_ref_endpoint_path(args, ref_name), expected_statuses={400})
-    signed_rest_request(args, deps, "DELETE", table_ref_endpoint_path(args, ref_name), {"force": True})
-    refs = signed_rest_request(args, deps, "GET", table_ref_endpoint_path(args))
-    if ref_name in refs.get("refs", {}):
-        raise RuntimeError("table refs endpoint still returned the deleted smoke tag")
+    try:
+        refs = signed_rest_request(args, deps, "GET", table_ref_endpoint_path(args))
+        if refs.get("refs", {}).get(ref_name, {}).get("snapshot-id") != snapshot_id:
+            raise RuntimeError("table refs endpoint did not return the smoke tag")
+        unforced_delete = signed_rest_request_expect_error(
+            args,
+            deps,
+            "DELETE",
+            table_ref_endpoint_path(args, ref_name),
+            {},
+            expected_statuses={400},
+        )
+        if "force is required" not in unforced_delete.response_body.lower():
+            raise RuntimeError("unforced table ref delete did not report the retention force requirement")
+        signed_rest_request(args, deps, "DELETE", table_ref_endpoint_path(args, ref_name), {"force": True})
+        force_deleted = True
+        refs = signed_rest_request(args, deps, "GET", table_ref_endpoint_path(args))
+        if ref_name in refs.get("refs", {}):
+            raise RuntimeError("table refs endpoint still returned the deleted smoke tag")
+    finally:
+        if not force_deleted:
+            try:
+                signed_rest_request(args, deps, "DELETE", table_ref_endpoint_path(args, ref_name), {"force": True})
+            except RestRequestError as error:
+                if error.status_code != 404:
+                    raise
 
 
 def smoke_view_request(args: argparse.Namespace, view_name: str, version_id: int, sql: str) -> dict[str, Any]:

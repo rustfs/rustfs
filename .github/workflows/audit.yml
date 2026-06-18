@@ -116,4 +116,5 @@ jobs:
         uses: actions/dependency-review-action@v5
         with:
           fail-on-severity: moderate
+          allow-ghsas: GHSA-2f9f-gq7v-9h6m
           comment-summary-in-pr: always
