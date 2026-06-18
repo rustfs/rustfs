@@ -14,6 +14,14 @@
 
 use super::{GroupInfo, MappedPolicy, Store, UserType};
 use crate::error::{Error, Result, is_err_config_not_found, is_err_no_such_group};
+use crate::storage_compat::ecstore::error::{Error as EcstoreError, StorageError, classify_system_path_failure_reason};
+use crate::storage_compat::ecstore::{
+    config::{
+        RUSTFS_CONFIG_PREFIX,
+        com::{delete_config, read_config_no_lock, read_config_with_metadata, save_config, save_config_with_opts},
+    },
+    store::ECStore,
+};
 use crate::{
     cache::{Cache, CacheEntity},
     error::{is_err_no_such_policy, is_err_no_such_user},
@@ -22,14 +30,6 @@ use crate::{
 };
 use futures::future::join_all;
 use rustfs_credentials::get_global_action_cred;
-use rustfs_ecstore::error::{Error as EcstoreError, StorageError, classify_system_path_failure_reason};
-use rustfs_ecstore::{
-    config::{
-        RUSTFS_CONFIG_PREFIX,
-        com::{delete_config, read_config_no_lock, read_config_with_metadata, save_config, save_config_with_opts},
-    },
-    store::ECStore,
-};
 use rustfs_io_metrics::record_system_path_failure;
 use rustfs_policy::{auth::UserIdentity, policy::PolicyDoc};
 use rustfs_storage_api::{HTTPPreconditions, ListOperations as _, ObjectInfoOrErr as StorageObjectInfoOrErr};
@@ -589,7 +589,7 @@ impl ObjectStore {
 
         match read_config_no_lock(self.object_api.clone(), &probe_path).await {
             Ok(_) => Ok(()),
-            Err(rustfs_ecstore::error::StorageError::ConfigNotFound) => Err(Error::other(format!(
+            Err(crate::storage_compat::ecstore::error::StorageError::ConfigNotFound) => Err(Error::other(format!(
                 "Storage metadata not ready: probe object '{}' not found (expected IAM config to be initialized)",
                 probe_path
             ))),

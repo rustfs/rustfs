@@ -17,14 +17,14 @@ use super::handles::{
     default_bucket_metadata_interface, default_endpoints_interface, default_kms_runtime_interface,
     default_server_config_interface, default_tier_config_interface,
 };
+use crate::app::storage_compat::ecstore::bucket::metadata_sys::BucketMetadataSys;
+use crate::app::storage_compat::ecstore::endpoints::EndpointServerPools;
+use crate::app::storage_compat::ecstore::new_object_layer_fn;
+use crate::app::storage_compat::ecstore::store::ECStore;
+use crate::app::storage_compat::ecstore::tier::tier::TierConfigMgr;
 #[cfg(test)]
 use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
-use rustfs_ecstore::bucket::metadata_sys::BucketMetadataSys;
-use rustfs_ecstore::endpoints::EndpointServerPools;
-use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::tier::tier::TierConfigMgr;
 use rustfs_kms::KmsServiceManager;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -126,11 +126,11 @@ mod tests {
         BucketMetadataInterface, BufferConfigInterface, EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface,
         ServerConfigInterface, TierConfigInterface,
     };
+    use crate::app::storage_compat::ecstore::disk::endpoint::Endpoint;
+    use crate::app::storage_compat::ecstore::endpoints::{Endpoints, PoolEndpoints};
+    use crate::app::storage_compat::ecstore::new_object_layer_fn;
+    use crate::app::storage_compat::ecstore::store::init_local_disks;
     use crate::config::{RustFSBufferConfig, WorkloadProfile};
-    use rustfs_ecstore::disk::endpoint::Endpoint;
-    use rustfs_ecstore::endpoints::{Endpoints, PoolEndpoints};
-    use rustfs_ecstore::new_object_layer_fn;
-    use rustfs_ecstore::store::init_local_disks;
     use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
     use std::path::PathBuf;
     use tempfile::TempDir;

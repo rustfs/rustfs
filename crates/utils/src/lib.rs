@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "egress")]
+pub mod egress;
 #[cfg(feature = "ip")]
 pub mod ip;
 #[cfg(feature = "net")]
@@ -20,6 +22,8 @@ pub mod net;
 #[cfg(feature = "http")]
 pub mod http;
 
+#[cfg(feature = "egress")]
+pub use egress::*;
 #[cfg(feature = "net")]
 pub use net::*;
 

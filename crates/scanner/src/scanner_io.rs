@@ -26,22 +26,6 @@ use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{Metric, Metrics, emit_scan_bucket_drive_complete, emit_scan_bucket_drive_partial, global_metrics};
 #[cfg(test)]
 use rustfs_config::{ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS};
-use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
-use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState;
-use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle;
-use rustfs_ecstore::bucket::metadata_sys::{get_lifecycle_config, get_object_lock_config, get_replication_config};
-use rustfs_ecstore::bucket::replication::{ReplicationConfig, ReplicationConfigurationExt};
-use rustfs_ecstore::bucket::versioning::VersioningApi as _;
-use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::config::storageclass;
-use rustfs_ecstore::disk::STORAGE_FORMAT_FILE;
-use rustfs_ecstore::disk::error::DiskError;
-use rustfs_ecstore::disk::{Disk, DiskAPI};
-use rustfs_ecstore::error::{Error, StorageError};
-use rustfs_ecstore::global::GLOBAL_TierConfigMgr;
-use rustfs_ecstore::resolve_object_store_handle;
-use rustfs_ecstore::set_disk::SetDisks;
-use rustfs_ecstore::{error::Result, store::ECStore};
 use rustfs_filemeta::FileMeta;
 use rustfs_storage_api::{BucketInfo, BucketOperations, BucketOptions, DiskSetSelector, StorageAdminApi};
 use rustfs_utils::path::path_join_buf;
@@ -59,6 +43,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use crate::ScannerObjectInfo as ObjectInfo;
+use crate::storage_compat::{
+    BucketTargetSys, BucketVersioningSys, Disk, DiskAPI, DiskError, ECStore, EcstoreError as Error, EcstoreResult as Result,
+    GLOBAL_ExpiryState, GLOBAL_TierConfigMgr, Lifecycle, ReplicationConfig, ReplicationConfigurationExt, STORAGE_FORMAT_FILE,
+    SetDisks, StorageError, VersioningApi as _, get_lifecycle_config, get_object_lock_config, get_replication_config,
+    resolve_scanner_object_store_handle, storageclass,
+};
 
 pub(crate) const SCANNER_SKIP_FILE_ERROR: &str = "skip file";
 const LOG_COMPONENT_SCANNER: &str = "scanner";
@@ -101,13 +91,22 @@ fn dirty_usage_buckets() -> MutexGuard<'static, DirtyUsageBuckets> {
     DIRTY_USAGE_BUCKETS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn usize_to_u64_saturated(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 pub fn record_dirty_usage_bucket(bucket: &str) {
     if bucket.is_empty() {
         return;
     }
 
     let generation = DIRTY_USAGE_BUCKET_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
-    dirty_usage_buckets().insert(bucket.to_string(), generation);
+    let pending_buckets = {
+        let mut dirty_buckets = dirty_usage_buckets();
+        dirty_buckets.insert(bucket.to_string(), generation);
+        dirty_buckets.len()
+    };
+    global_metrics().record_scanner_dirty_usage_pending(usize_to_u64_saturated(pending_buckets));
 }
 
 pub fn clear_dirty_usage_bucket(bucket: &str) {
@@ -115,32 +114,44 @@ pub fn clear_dirty_usage_bucket(bucket: &str) {
         return;
     }
 
-    dirty_usage_buckets().remove(bucket);
+    let pending_buckets = {
+        let mut dirty_buckets = dirty_usage_buckets();
+        dirty_buckets.remove(bucket);
+        dirty_buckets.len()
+    };
+    global_metrics().record_scanner_dirty_usage_clear(usize_to_u64_saturated(pending_buckets));
 }
 
 fn snapshot_dirty_usage_buckets(buckets: &[BucketInfo]) -> DirtyUsageBuckets {
-    let dirty_buckets = dirty_usage_buckets();
-    buckets
-        .iter()
-        .filter_map(|bucket| {
-            dirty_buckets
-                .get(&bucket.name)
-                .map(|generation| (bucket.name.clone(), *generation))
-        })
-        .collect()
+    let snapshot = {
+        let dirty_buckets = dirty_usage_buckets();
+        buckets
+            .iter()
+            .filter_map(|bucket| {
+                dirty_buckets
+                    .get(&bucket.name)
+                    .map(|generation| (bucket.name.clone(), *generation))
+            })
+            .collect::<DirtyUsageBuckets>()
+    };
+    global_metrics().record_scanner_dirty_usage_cycle_snapshot(usize_to_u64_saturated(snapshot.len()));
+    snapshot
 }
 
 fn clear_dirty_usage_buckets(snapshot: &DirtyUsageBuckets) {
-    if snapshot.is_empty() {
-        return;
-    }
-
-    let mut dirty_buckets = dirty_usage_buckets();
-    for (bucket, generation) in snapshot {
-        if dirty_buckets.get(bucket).is_some_and(|current| current == generation) {
-            dirty_buckets.remove(bucket);
+    let (cleared_buckets, pending_buckets) = {
+        let mut dirty_buckets = dirty_usage_buckets();
+        let mut cleared_buckets = 0usize;
+        for (bucket, generation) in snapshot {
+            if dirty_buckets.get(bucket).is_some_and(|current| current == generation) {
+                dirty_buckets.remove(bucket);
+                cleared_buckets += 1;
+            }
         }
-    }
+        (cleared_buckets, dirty_buckets.len())
+    };
+    global_metrics()
+        .record_scanner_dirty_usage_cycle_clear(usize_to_u64_saturated(cleared_buckets), usize_to_u64_saturated(pending_buckets));
 }
 
 #[cfg(test)]
@@ -1433,7 +1444,7 @@ impl ScannerIODisk for Disk {
 
         // TODO: object lock
 
-        let Some(ecstore) = resolve_object_store_handle() else {
+        let Some(ecstore) = resolve_scanner_object_store_handle() else {
             error!(
                 target: "rustfs::scanner::io",
                 event = EVENT_SCANNER_DISK_BUCKET_STATE,
@@ -1529,8 +1540,7 @@ impl ScannerIODisk for Disk {
 mod tests {
     use super::*;
     use crate::scanner_folder::ScannerItem;
-    use rustfs_ecstore::disk::{DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, new_disk};
-    use rustfs_ecstore::pools::path2_bucket_object_with_base_path;
+    use crate::storage_compat::{DiskOption, Endpoint, new_disk, path2_bucket_object_with_base_path};
     use serial_test::serial;
     use temp_env::with_var;
     use uuid::Uuid;

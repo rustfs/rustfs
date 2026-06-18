@@ -41,7 +41,7 @@ mod storage_compat;
 pub use bucket_config_manager::NotifyBucketConfigManager;
 pub use config_manager::{NotifyConfigManager, runtime_target_id_for_subsystem};
 pub use error::{LifecycleError, NotificationError};
-pub use event::{Event, EventArgs, EventArgsBuilder};
+pub use event::{Event, EventArgs, EventArgsBuilder, NotifyObjectInfo};
 pub use event_bridge::{LiveEventHistory, NotifyEventBridge};
 pub use global::{
     initialize, initialize_live_events, is_notification_system_initialized, notification_metrics_snapshot, notification_system,
@@ -55,4 +55,3 @@ pub use runtime_facade::NotifyRuntimeFacade;
 pub use runtime_view::NotifyRuntimeView;
 pub use services::NotifyServices;
 pub use status_view::NotifyStatusView;
-pub use storage_compat::NotifyObjectInfo;

@@ -21,27 +21,24 @@
 //! and convert them to the Stats structs used by collectors.
 
 use crate::metrics::collectors::{
-    BucketReplicationBandwidthStats, BucketReplicationStats, BucketReplicationTargetStats, BucketStats, BucketUsageStats,
-    ClusterConfigStats, ClusterHealthStats, ClusterStats, ClusterUsageStats, CpuStats, DiskStats, DriveCountStats,
-    DriveDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmStats, MemoryStats, NetworkStats, ProcessStats,
-    ProcessStatusType, ReplicationStats, ResourceStats, ScannerStats,
+    BucketReplicationBandwidthStats, BucketReplicationStats, BucketStats, BucketUsageStats, ClusterConfigStats,
+    ClusterHealthStats, ClusterStats, ClusterUsageStats, CpuStats, DiskStats, DriveCountStats, DriveDetailedStats,
+    ErasureSetStats, HostNetworkStats, IamStats, IlmStats, MemoryStats, NetworkStats, ProcessStats, ProcessStatusType,
+    ReplicationStats, ResourceStats, ScannerStats,
+};
+use crate::storage_compat::{
+    load_obs_data_usage_from_backend, obs_bucket_quota_limit_bytes, obs_bucket_replication_bandwidth_stats,
+    obs_bucket_replication_detail_stats, obs_ilm_runtime_snapshot, obs_site_replication_stats, obs_total_usable_capacity_bytes,
+    obs_total_usable_capacity_free_bytes, resolve_obs_object_store_handle,
 };
 use chrono::Utc;
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::global_metrics;
-use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::{GLOBAL_ExpiryState, GLOBAL_TransitionState};
-use rustfs_ecstore::bucket::metadata_sys::get_quota_config;
-use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
-use rustfs_ecstore::data_usage::load_data_usage_from_backend;
-use rustfs_ecstore::global::get_global_bucket_monitor;
-use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
-use rustfs_ecstore::resolve_object_store_handle;
 use rustfs_iam::{get_global_iam_sys, oidc::oidc_plugin_authn_metrics_snapshot};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_io_metrics::{ProcessStatusSnapshot, snapshot_process_resource_and_system};
 use rustfs_storage_api::{BucketOperations, BucketOptions, StorageAdminApi};
 use std::collections::HashMap;
-use std::time::Duration;
 use sysinfo::{Networks, System};
 use tracing::{instrument, warn};
 
@@ -151,15 +148,15 @@ pub struct ProcessMetricBundle {
 
 /// Collect cluster and cluster-health statistics from a single storage snapshot.
 pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthStats) {
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = resolve_obs_object_store_handle() else {
         return (ClusterStats::default(), ClusterHealthStats::default());
     };
 
     let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
     let raw_capacity: u64 = storage_info.disks.iter().map(|d| d.total_space).sum();
     let used: u64 = storage_info.disks.iter().map(|d| d.used_space).sum();
-    let usable_capacity = get_total_usable_capacity(&storage_info.disks, &storage_info) as u64;
-    let free = get_total_usable_capacity_free(&storage_info.disks, &storage_info) as u64;
+    let usable_capacity = obs_total_usable_capacity_bytes(&storage_info);
+    let free = obs_total_usable_capacity_free_bytes(&storage_info);
     let stale_capacity_drives = storage_info
         .disks
         .iter()
@@ -178,7 +175,7 @@ pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthS
         .count() as u64;
 
     // Get bucket and object counts from data usage info.
-    let (buckets_count, objects_count) = match load_data_usage_from_backend(store.clone()).await {
+    let (buckets_count, objects_count) = match load_obs_data_usage_from_backend(store.clone()).await {
         Ok(data_usage) => (data_usage.buckets_count, data_usage.objects_total_count),
         Err(e) => {
             warn!(event = EVENT_METRICS_COLLECTOR_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_COLLECTOR, collector = "cluster_stats", result = "data_usage_load_failed", error = %e, "metrics collector state changed");
@@ -241,12 +238,12 @@ pub async fn collect_cluster_health_stats() -> ClusterHealthStats {
 
 /// Collect bucket statistics from the storage layer.
 pub async fn collect_bucket_stats() -> Vec<BucketStats> {
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = resolve_obs_object_store_handle() else {
         return Vec::new();
     };
 
     // Load data usage info from backend to get bucket sizes and object counts
-    let data_usage = match load_data_usage_from_backend(store.clone()).await {
+    let data_usage = match load_obs_data_usage_from_backend(store.clone()).await {
         Ok(info) => Some(info),
         Err(e) => {
             warn!(event = EVENT_METRICS_COLLECTOR_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_COLLECTOR, collector = "bucket_stats", result = "data_usage_load_failed", error = %e, "metrics collector state changed");
@@ -284,10 +281,7 @@ pub async fn collect_bucket_stats() -> Vec<BucketStats> {
             .unwrap_or((0, 0));
 
         // Get quota from bucket metadata
-        let quota_bytes = match get_quota_config(&bucket.name).await {
-            Ok((quota, _)) => quota.get_quota_limit().unwrap_or(0),
-            Err(_) => 0, // No quota configured or error
-        };
+        let quota_bytes = obs_bucket_quota_limit_bytes(&bucket.name).await;
 
         stats.push(BucketStats {
             name: bucket.name,
@@ -302,26 +296,24 @@ pub async fn collect_bucket_stats() -> Vec<BucketStats> {
 
 /// Collect bucket replication bandwidth stats from the global monitor.
 pub fn collect_bucket_replication_bandwidth_stats() -> Vec<BucketReplicationBandwidthStats> {
-    let Some(monitor) = get_global_bucket_monitor() else {
+    let Some(bandwidth_stats) = obs_bucket_replication_bandwidth_stats() else {
         return Vec::new();
     };
 
-    monitor
-        .get_report(|_| true)
-        .bucket_stats
+    bandwidth_stats
         .into_iter()
-        .map(|(opts, details)| {
-            let target_arn = opts.replication_arn;
-            let limit_bytes_per_sec = u64::try_from(details.limit_bytes_per_sec).unwrap_or_else(|_| {
-                warn!(event = EVENT_METRICS_COLLECTOR_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_COLLECTOR, collector = "bucket_replication_bandwidth", result = "invalid_limit_value", target_arn = ?target_arn, limit_value = details.limit_bytes_per_sec, "metrics collector state changed");
+        .map(|stat| {
+            let target_arn = stat.target_arn;
+            let limit_bytes_per_sec = u64::try_from(stat.limit_bytes_per_sec).unwrap_or_else(|_| {
+                warn!(event = EVENT_METRICS_COLLECTOR_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_COLLECTOR, collector = "bucket_replication_bandwidth", result = "invalid_limit_value", target_arn = ?target_arn, limit_value = stat.limit_bytes_per_sec, "metrics collector state changed");
                 0
             });
 
             BucketReplicationBandwidthStats {
-                bucket: opts.name,
+                bucket: stat.bucket,
                 target_arn,
                 limit_bytes_per_sec,
-                current_bandwidth_bytes_per_sec: details.current_bandwidth_bytes_per_sec,
+                current_bandwidth_bytes_per_sec: stat.current_bandwidth_bytes_per_sec,
             }
         })
         .collect()
@@ -329,127 +321,12 @@ pub fn collect_bucket_replication_bandwidth_stats() -> Vec<BucketReplicationBand
 
 /// Collect bucket and target level replication stats from the global replication runtime.
 pub async fn collect_bucket_replication_detail_stats() -> Vec<BucketReplicationStats> {
-    let Some(stats) = GLOBAL_REPLICATION_STATS.get() else {
-        return Vec::new();
-    };
-
-    let all_bucket_stats = stats.get_all().await;
-    let mut buckets = Vec::with_capacity(all_bucket_stats.len());
-
-    for (bucket, bucket_stats) in all_bucket_stats {
-        let proxy = stats.get_proxy_stats(&bucket).await;
-        let mut total_failed_bytes = 0u64;
-        let mut total_failed_count = 0u64;
-        let mut last_min_failed_bytes = 0u64;
-        let mut last_min_failed_count = 0u64;
-        let mut last_hour_failed_bytes = 0u64;
-        let mut last_hour_failed_count = 0u64;
-        let mut sent_bytes = 0u64;
-        let mut sent_count = 0u64;
-        let mut targets = Vec::with_capacity(bucket_stats.stats.len());
-
-        for (target_arn, target_stats) in bucket_stats.stats {
-            total_failed_bytes += target_stats.fail_stats.size.max(0) as u64;
-            total_failed_count += target_stats.fail_stats.count.max(0) as u64;
-
-            let last_min = target_stats.fail_stats.recent_since(Duration::from_secs(60));
-            last_min_failed_bytes += last_min.size.max(0) as u64;
-            last_min_failed_count += last_min.count.max(0) as u64;
-
-            let last_hour = target_stats.fail_stats.recent_since(Duration::from_secs(60 * 60));
-            last_hour_failed_bytes += last_hour.size.max(0) as u64;
-            last_hour_failed_count += last_hour.count.max(0) as u64;
-
-            sent_bytes += target_stats.replicated_size.max(0) as u64;
-            sent_count += target_stats.replicated_count.max(0) as u64;
-
-            targets.push(BucketReplicationTargetStats {
-                target_arn,
-                bandwidth_limit_bytes_per_sec: target_stats.bandwidth_limit_bytes_per_sec.max(0) as u64,
-                current_bandwidth_bytes_per_sec: target_stats.current_bandwidth_bytes_per_sec,
-                latency_ms: target_stats.latency.curr,
-            });
-        }
-
-        buckets.push(BucketReplicationStats {
-            bucket,
-            total_failed_bytes,
-            total_failed_count,
-            last_min_failed_bytes,
-            last_min_failed_count,
-            last_hour_failed_bytes,
-            last_hour_failed_count,
-            sent_bytes,
-            sent_count,
-            proxied_get_requests_total: proxy.get_total.max(0) as u64,
-            proxied_get_requests_failures: proxy.get_failed.max(0) as u64,
-            proxied_head_requests_total: proxy.head_total.max(0) as u64,
-            proxied_head_requests_failures: proxy.head_failed.max(0) as u64,
-            proxied_put_requests_total: proxy.put_total.max(0) as u64,
-            proxied_put_requests_failures: proxy.put_failed.max(0) as u64,
-            proxied_put_tagging_requests_total: proxy.put_tag_total.max(0) as u64,
-            proxied_put_tagging_requests_failures: proxy.put_tag_failed.max(0) as u64,
-            proxied_get_tagging_requests_total: proxy.get_tag_total.max(0) as u64,
-            proxied_get_tagging_requests_failures: proxy.get_tag_failed.max(0) as u64,
-            proxied_delete_tagging_requests_total: proxy.delete_tag_total.max(0) as u64,
-            proxied_delete_tagging_requests_failures: proxy.delete_tag_failed.max(0) as u64,
-            targets,
-        });
-    }
-
-    buckets
+    obs_bucket_replication_detail_stats().await
 }
 
 /// Collect site-level replication stats from the global replication runtime.
 pub async fn collect_replication_stats() -> ReplicationStats {
-    let Some(stats) = GLOBAL_REPLICATION_STATS.get() else {
-        return ReplicationStats::default();
-    };
-
-    let site_metrics = stats.get_sr_metrics_for_node().await;
-    let current_active_workers = u64::try_from(site_metrics.active_workers.curr).unwrap_or(0);
-
-    let bandwidth_stats = collect_bucket_replication_bandwidth_stats();
-    let current_data_transfer_rate = bandwidth_stats
-        .iter()
-        .map(|stat| stat.current_bandwidth_bytes_per_sec)
-        .sum::<f64>();
-
-    let all_bucket_stats = stats.get_all().await;
-    let average_data_transfer_rate = all_bucket_stats
-        .values()
-        .flat_map(|bucket| bucket.stats.values())
-        .map(|stat| stat.xfer_rate_lrg.avg + stat.xfer_rate_sml.avg)
-        .sum::<f64>();
-    let max_data_transfer_rate = all_bucket_stats
-        .values()
-        .flat_map(|bucket| bucket.stats.values())
-        .map(|stat| stat.xfer_rate_lrg.peak + stat.xfer_rate_sml.peak)
-        .sum::<f64>();
-    let recent_backlog_count = stats
-        .mrf_stats
-        .values()
-        .copied()
-        .filter(|value| *value > 0)
-        .sum::<i64>()
-        .try_into()
-        .unwrap_or(0);
-
-    ReplicationStats {
-        average_active_workers: site_metrics.active_workers.avg,
-        average_queued_bytes: site_metrics.queued.avg.bytes,
-        average_queued_count: site_metrics.queued.avg.count,
-        average_data_transfer_rate,
-        active_workers: current_active_workers,
-        current_data_transfer_rate,
-        last_minute_queued_bytes: site_metrics.queued.last_minute.bytes.max(0) as u64,
-        last_minute_queued_count: site_metrics.queued.last_minute.count.max(0) as u64,
-        max_active_workers: u64::try_from(site_metrics.active_workers.max).unwrap_or(0),
-        max_queued_bytes: site_metrics.queued.max.bytes.max(0) as u64,
-        max_queued_count: site_metrics.queued.max.count.max(0) as u64,
-        max_data_transfer_rate,
-        recent_backlog_count,
-    }
+    obs_site_replication_stats().await
 }
 
 /// Collect disk statistics from the storage layer.
@@ -522,7 +399,7 @@ pub fn collect_system_memory_stats() -> MemoryStats {
 
 /// Collect node disk stats and drive stats from a single storage snapshot.
 pub async fn collect_disk_and_system_drive_stats() -> (Vec<DiskStats>, Vec<DriveDetailedStats>, DriveCountStats) {
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = resolve_obs_object_store_handle() else {
         return (Vec::new(), Vec::new(), DriveCountStats::default());
     };
 
@@ -710,7 +587,7 @@ pub fn collect_internode_network_stats() -> Option<NetworkStats> {
 
 /// Collect cluster config metrics from backend parity configuration.
 pub async fn collect_cluster_config_stats() -> Option<ClusterConfigStats> {
-    let store = resolve_object_store_handle()?;
+    let store = resolve_obs_object_store_handle()?;
     let backend = StorageAdminApi::backend_info(store.as_ref()).await;
 
     Some(ClusterConfigStats {
@@ -721,7 +598,7 @@ pub async fn collect_cluster_config_stats() -> Option<ClusterConfigStats> {
 
 /// Collect cluster erasure set metrics from storage and backend topology info.
 pub async fn collect_erasure_set_stats() -> Vec<ErasureSetStats> {
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = resolve_obs_object_store_handle() else {
         return Vec::new();
     };
 
@@ -800,8 +677,8 @@ pub async fn collect_iam_stats() -> Option<IamStats> {
 /// builds cluster totals plus per-bucket distributions from the returned
 /// histograms. It does not trigger an inline object-data rescan.
 pub async fn collect_cluster_usage_metric_stats() -> Option<(ClusterUsageStats, Vec<BucketUsageStats>)> {
-    let store = resolve_object_store_handle()?;
-    let data_usage = load_data_usage_from_backend(store.clone()).await.ok()?;
+    let store = resolve_obs_object_store_handle()?;
+    let data_usage = load_obs_data_usage_from_backend(store.clone()).await.ok()?;
     let mut buckets = Vec::with_capacity(data_usage.buckets_usage.len());
 
     for (bucket_name, usage) in &data_usage.buckets_usage {
@@ -809,10 +686,7 @@ pub async fn collect_cluster_usage_metric_stats() -> Option<(ClusterUsageStats, 
             continue;
         }
 
-        let quota_bytes = match get_quota_config(bucket_name).await {
-            Ok((quota, _)) => quota.get_quota_limit().unwrap_or(0),
-            Err(_) => 0,
-        };
+        let quota_bytes = obs_bucket_quota_limit_bytes(bucket_name).await;
 
         buckets.push(BucketUsageStats {
             bucket: bucket_name.clone(),
@@ -869,26 +743,19 @@ pub async fn collect_cluster_usage_metric_stats() -> Option<(ClusterUsageStats, 
 
 /// Collect ILM metrics from the current lifecycle runtime state.
 pub async fn collect_ilm_metric_stats() -> Option<IlmStats> {
-    let expiry_pending_tasks = GLOBAL_ExpiryState.read().await.pending_tasks() as u64;
-    let transition_active_tasks = GLOBAL_TransitionState.active_tasks().max(0) as u64;
-    let transition_pending_tasks = GLOBAL_TransitionState.pending_tasks() as u64;
-    let transition_missed_immediate_tasks = GLOBAL_TransitionState.missed_immediate_tasks().max(0) as u64;
-    let transition_queue_full_tasks = GLOBAL_TransitionState.queue_full_tasks().max(0) as u64;
-    let transition_queue_send_timeout_tasks = GLOBAL_TransitionState.queue_send_timeout_tasks().max(0) as u64;
-    let transition_compensation_scheduled_tasks = GLOBAL_TransitionState.compensation_scheduled_tasks().max(0) as u64;
-    let transition_compensation_running_tasks = GLOBAL_TransitionState.compensation_running_tasks().max(0) as u64;
+    let ilm = obs_ilm_runtime_snapshot().await;
     let metrics = global_metrics().report().await;
     let versions_scanned = metrics.life_time_ilm.values().copied().sum();
 
     Some(IlmStats {
-        expiry_pending_tasks,
-        transition_active_tasks,
-        transition_pending_tasks,
-        transition_missed_immediate_tasks,
-        transition_queue_full_tasks,
-        transition_queue_send_timeout_tasks,
-        transition_compensation_scheduled_tasks,
-        transition_compensation_running_tasks,
+        expiry_pending_tasks: ilm.expiry_pending_tasks,
+        transition_active_tasks: ilm.transition_active_tasks,
+        transition_pending_tasks: ilm.transition_pending_tasks,
+        transition_missed_immediate_tasks: ilm.transition_missed_immediate_tasks,
+        transition_queue_full_tasks: ilm.transition_queue_full_tasks,
+        transition_queue_send_timeout_tasks: ilm.transition_queue_send_timeout_tasks,
+        transition_compensation_scheduled_tasks: ilm.transition_compensation_scheduled_tasks,
+        transition_compensation_running_tasks: ilm.transition_compensation_running_tasks,
         versions_scanned,
     })
 }

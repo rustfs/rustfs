@@ -14,7 +14,7 @@
 
 use super::{module_switch::resolve_notify_module_state, refresh_persisted_module_switches_from_store};
 use crate::app::context::resolve_server_config;
-use rustfs_ecstore::event_notification::{EventArgs as EcstoreEventArgs, register_event_dispatch_hook};
+use crate::storage_compat::ecstore::event_notification::{EventArgs as EcstoreEventArgs, register_event_dispatch_hook};
 use rustfs_notify::EventArgs as NotifyEventArgs;
 use rustfs_s3_types::EventName;
 use std::net::SocketAddr;
@@ -59,7 +59,7 @@ fn convert_ecstore_event_args(args: EcstoreEventArgs) -> Option<NotifyEventArgs>
     Some(NotifyEventArgs {
         event_name,
         bucket_name: args.bucket_name,
-        object: args.object,
+        object: args.object.into(),
         req_params,
         resp_elements,
         version_id,

@@ -34,8 +34,8 @@ use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
 use crate::global::{GLOBAL_LocalNodeName, GLOBAL_TierConfigMgr};
 use crate::store_api::ListObjectVersionsInfo;
+use crate::store_api::ObjectOptions;
 use crate::store_api::{ObjectInfoOrErr, WalkOptions};
-use crate::store_api::{ObjectOptions, ObjectToDelete};
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::{
         LifecycleOps, gen_transition_objname, get_transitioned_object_reader, put_restore_opts,
@@ -51,10 +51,7 @@ use crate::{
     // event::name::EventName,
     event_notification::{EventArgs, send_event},
     global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id, is_dist_erasure},
-    store_api::{
-        DeletedObject, GetObjectReader, ListObjectsV2Info, MultipartOperations, ObjectIO, ObjectInfo, ObjectOperations,
-        PutObjReader,
-    },
+    store_api::{GetObjectReader, ListObjectsV2Info, MultipartOperations, ObjectIO, ObjectInfo, ObjectOperations, PutObjReader},
     store_init::load_format_erasure,
 };
 use bytes::Bytes;
@@ -87,8 +84,8 @@ use rustfs_object_capacity::capacity_scope::{
 use rustfs_s3_types::EventName;
 use rustfs_storage_api::HTTPRangeSpec;
 use rustfs_storage_api::{
-    BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, ListMultipartsInfo, ListPartsInfo,
-    MakeBucketOptions, MultipartInfo, MultipartUploadResult, PartInfo,
+    BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, ListMultipartsInfo,
+    ListPartsInfo, MakeBucketOptions, MultipartInfo, MultipartUploadResult, ObjectToDelete, PartInfo,
 };
 use rustfs_storage_api::{MultipartOperations as _, NamespaceLocking as _, ObjectIO as _, ObjectOperations as _};
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;

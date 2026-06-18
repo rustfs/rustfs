@@ -69,6 +69,7 @@
 //! }
 //! ```
 
+use crate::storage::storage_compat::ecstore::error::StorageError;
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit},
@@ -81,7 +82,6 @@ use http::{HeaderMap, HeaderValue};
 use rand::Rng;
 #[cfg(feature = "rio-v2")]
 use rand::RngExt;
-use rustfs_ecstore::error::StorageError;
 use rustfs_kms::{DataKey, service_manager::get_global_encryption_service, types::ObjectEncryptionContext};
 use rustfs_utils::get_env_opt_str;
 use s3s::S3ErrorCode;
@@ -128,8 +128,8 @@ const SEALED_KEY_SIZE: usize = DARE_HEADER_SIZE + 32 + DARE_TAG_SIZE;
 const OBJECT_KEY_DERIVATION_CONTEXT: &[u8] = b"object-encryption-key generation";
 
 use crate::error::ApiError;
-use rustfs_ecstore::bucket::metadata_sys;
-use rustfs_ecstore::error::Error;
+use crate::storage::storage_compat::ecstore::bucket::metadata_sys;
+use crate::storage::storage_compat::ecstore::error::Error;
 use rustfs_utils::http::headers::{
     AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
     AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5, AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT,
@@ -745,17 +745,29 @@ pub struct ManagedSealedKey {
 }
 
 impl EncryptionMaterial {
-    pub fn write_encryption(&self, multipart_part_number: Option<usize>) -> rustfs_ecstore::rio::WriteEncryption {
+    pub fn write_encryption(
+        &self,
+        multipart_part_number: Option<usize>,
+    ) -> crate::storage::storage_compat::ecstore::rio::WriteEncryption {
         match (self.key_kind, multipart_part_number) {
             (EncryptionKeyKind::Object, Some(part_number)) => {
-                rustfs_ecstore::rio::WriteEncryption::multipart_object_key(self.key_bytes, part_number as u32)
+                crate::storage::storage_compat::ecstore::rio::WriteEncryption::multipart_object_key(
+                    self.key_bytes,
+                    part_number as u32,
+                )
             }
-            (EncryptionKeyKind::Object, None) => rustfs_ecstore::rio::WriteEncryption::singlepart_object_key(self.key_bytes),
+            (EncryptionKeyKind::Object, None) => {
+                crate::storage::storage_compat::ecstore::rio::WriteEncryption::singlepart_object_key(self.key_bytes)
+            }
             (EncryptionKeyKind::Direct, Some(part_number)) => {
-                rustfs_ecstore::rio::WriteEncryption::multipart(self.key_bytes, self.base_nonce, part_number)
+                crate::storage::storage_compat::ecstore::rio::WriteEncryption::multipart(
+                    self.key_bytes,
+                    self.base_nonce,
+                    part_number,
+                )
             }
             (EncryptionKeyKind::Direct, None) => {
-                rustfs_ecstore::rio::WriteEncryption::singlepart(self.key_bytes, self.base_nonce)
+                crate::storage::storage_compat::ecstore::rio::WriteEncryption::singlepart(self.key_bytes, self.base_nonce)
             }
         }
     }
@@ -1876,30 +1888,27 @@ impl TestSseDekProvider {
     }
 
     /// Create a local SSE DEK provider for SSE-S3 when KMS is not configured.
-    /// Uses RUSTFS_SSE_S3_MASTER_KEY (base64 32-byte) if set; otherwise a built-in default.
-    /// Allows PUT/GET to work without KMS (backward compatible).
-    pub fn new_for_local_sse() -> Self {
-        let master_key = match get_env_opt_str("RUSTFS_SSE_S3_MASTER_KEY") {
-            Some(v) if !v.trim().is_empty() => match BASE64_STANDARD.decode(v.trim()) {
-                Ok(decoded) if decoded.len() == 32 => {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&decoded[..32]);
-                    tracing::info!("Using RUSTFS_SSE_S3_MASTER_KEY for SSE-S3 (KMS not configured)");
-                    arr
-                }
-                _ => {
-                    tracing::warn!("RUSTFS_SSE_S3_MASTER_KEY invalid (expected base64 32 bytes); using default for SSE-S3");
-                    [0u8; 32]
-                }
-            },
-            _ => {
-                tracing::debug!(
-                    "KMS not configured; using built-in default key for SSE-S3 (set RUSTFS_SSE_S3_MASTER_KEY for production)"
-                );
-                [0u8; 32]
-            }
+    /// Requires RUSTFS_SSE_S3_MASTER_KEY to be a valid base64-encoded 32-byte key.
+    pub fn new_for_local_sse() -> Result<Self, ApiError> {
+        let Some(raw_value) = get_env_opt_str("RUSTFS_SSE_S3_MASTER_KEY").filter(|value| !value.trim().is_empty()) else {
+            return Err(ApiError::from(StorageError::other(
+                "SSE-S3 requires RUSTFS_SSE_S3_MASTER_KEY to be set to a base64-encoded 32-byte key when KMS is not configured",
+            )));
         };
-        Self { master_key }
+
+        let decoded = BASE64_STANDARD.decode(raw_value.trim()).map_err(|err| {
+            ApiError::from(StorageError::other(format!(
+                "RUSTFS_SSE_S3_MASTER_KEY must be valid base64 for SSE-S3 when KMS is not configured: {err}"
+            )))
+        })?;
+        let master_key: [u8; 32] = decoded.try_into().map_err(|_| {
+            ApiError::from(StorageError::other(
+                "RUSTFS_SSE_S3_MASTER_KEY must decode to exactly 32 bytes for SSE-S3 when KMS is not configured",
+            ))
+        })?;
+
+        tracing::info!("Using RUSTFS_SSE_S3_MASTER_KEY for SSE-S3 (KMS not configured)");
+        Ok(Self { master_key })
     }
 
     // Simple encryption of DEK
@@ -1908,7 +1917,9 @@ impl TestSseDekProvider {
         let key = Key::<Aes256Gcm>::from(cmk_value);
 
         let cipher = Aes256Gcm::new(&key);
-        let nonce = Nonce::from([0u8; 12]);
+        let mut nonce_bytes = [0u8; 12];
+        rand::rng().fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from(nonce_bytes);
         let ciphertext = cipher
             .encrypt(&nonce, dek.as_slice())
             .map_err(|_| ApiError::from(StorageError::other("Failed to encrypt DEK")))?;
@@ -2038,7 +2049,7 @@ pub async fn get_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiError>
         Arc::new(TestSseDekProvider::new())
     } else {
         debug!("Using local SSE-S3 provider (KMS not configured)");
-        Arc::new(TestSseDekProvider::new_for_local_sse())
+        Arc::new(TestSseDekProvider::new_for_local_sse()?)
     };
 
     let mut slot = GLOBAL_SSE_DEK_PROVIDER
@@ -2334,12 +2345,17 @@ mod tests {
     use http::HeaderValue;
     use rustfs_rio::{DecryptReader, EncryptReader};
     use std::sync::OnceLock;
+    use temp_env::async_with_vars;
     use tokio::sync::Mutex;
 
     static SSE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     async fn lock_sse_test_state() -> tokio::sync::MutexGuard<'static, ()> {
         SSE_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().await
+    }
+
+    fn local_sse_master_key_b64() -> String {
+        BASE64_STANDARD.encode([0x24u8; 32])
     }
 
     #[test]
@@ -2961,26 +2977,41 @@ mod tests {
 
     #[tokio::test]
     async fn test_sse_encryption_omits_kms_header_for_sse_s3_objects() {
-        let request = EncryptionRequest {
-            bucket: "test-bucket",
-            key: "test-key",
-            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
-            ssekms_key_id: None,
-            ssekms_context: None,
-            sse_customer_algorithm: None,
-            sse_customer_key: None,
-            sse_customer_key_md5: None,
-            content_size: 1024,
-        };
+        let _guard = lock_sse_test_state().await;
+        reset_sse_dek_provider();
+        let local_sse_master_key = local_sse_master_key_b64();
 
-        let material = sse_encryption(request).await.expect("sse-s3 encryption should succeed");
-        let material = material.expect("managed sse-s3 encryption should return material");
-        let metadata = encryption_material_to_metadata(&material);
+        async_with_vars(
+            [
+                ("__RUSTFS_SSE_SIMPLE_CMK", None::<&str>),
+                ("RUSTFS_SSE_S3_MASTER_KEY", Some(local_sse_master_key.as_str())),
+            ],
+            async {
+                let request = EncryptionRequest {
+                    bucket: "test-bucket",
+                    key: "test-key",
+                    server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+                    ssekms_key_id: None,
+                    ssekms_context: None,
+                    sse_customer_algorithm: None,
+                    sse_customer_key: None,
+                    sse_customer_key_md5: None,
+                    content_size: 1024,
+                };
 
-        assert_eq!(material.kms_key_id, None);
-        assert_eq!(metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("AES256"));
-        assert!(!metadata.contains_key("x-amz-server-side-encryption-aws-kms-key-id"));
-        assert_eq!(metadata.get(INTERNAL_ENCRYPTION_KEY_ID_HEADER).map(String::as_str), Some("default"));
+                let material = sse_encryption(request).await.expect("sse-s3 encryption should succeed");
+                let material = material.expect("managed sse-s3 encryption should return material");
+                let metadata = encryption_material_to_metadata(&material);
+
+                assert_eq!(material.kms_key_id, None);
+                assert_eq!(metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("AES256"));
+                assert!(!metadata.contains_key("x-amz-server-side-encryption-aws-kms-key-id"));
+                assert_eq!(metadata.get(INTERNAL_ENCRYPTION_KEY_ID_HEADER).map(String::as_str), Some("default"));
+            },
+        )
+        .await;
+
+        reset_sse_dek_provider();
     }
 
     #[test]
@@ -3037,51 +3068,63 @@ mod tests {
         if let Some(manager) = rustfs_kms::get_global_kms_service_manager() {
             let _ = manager.stop().await;
         }
+        let local_sse_master_key = local_sse_master_key_b64();
 
-        let request = EncryptionRequest {
-            bucket: "bucket",
-            key: "object",
-            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
-            ssekms_key_id: None,
-            ssekms_context: None,
-            sse_customer_algorithm: None,
-            sse_customer_key: None,
-            sse_customer_key_md5: None,
-            content_size: 4096,
-        };
+        async_with_vars(
+            [
+                ("__RUSTFS_SSE_SIMPLE_CMK", None::<&str>),
+                ("RUSTFS_SSE_S3_MASTER_KEY", Some(local_sse_master_key.as_str())),
+            ],
+            async {
+                let request = EncryptionRequest {
+                    bucket: "bucket",
+                    key: "object",
+                    server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+                    ssekms_key_id: None,
+                    ssekms_context: None,
+                    sse_customer_algorithm: None,
+                    sse_customer_key: None,
+                    sse_customer_key_md5: None,
+                    content_size: 4096,
+                };
 
-        let material = sse_encryption(request)
-            .await
-            .expect("managed sse encryption")
-            .expect("managed sse material");
-        assert_eq!(material.key_kind, EncryptionKeyKind::Object);
+                let material = sse_encryption(request)
+                    .await
+                    .expect("managed sse encryption")
+                    .expect("managed sse material");
+                assert_eq!(material.key_kind, EncryptionKeyKind::Object);
 
-        let metadata = encryption_material_to_metadata(&material);
-        assert!(!metadata.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER));
-        assert!(!metadata.contains_key(INTERNAL_ENCRYPTION_IV_HEADER));
+                let metadata = encryption_material_to_metadata(&material);
+                assert!(!metadata.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER));
+                assert!(!metadata.contains_key(INTERNAL_ENCRYPTION_IV_HEADER));
 
-        let sealing_iv = metadata
-            .get(MINIO_INTERNAL_ENCRYPTION_IV_HEADER)
-            .expect("minio sealing iv should be stored");
-        let sealed_key = metadata
-            .get(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER)
-            .expect("minio sealed key should be stored");
-        assert_eq!(BASE64_STANDARD.decode(sealing_iv).expect("decode iv").len(), SEALED_KEY_IV_SIZE);
-        assert_eq!(BASE64_STANDARD.decode(sealed_key).expect("decode sealed key").len(), SEALED_KEY_SIZE);
+                let sealing_iv = metadata
+                    .get(MINIO_INTERNAL_ENCRYPTION_IV_HEADER)
+                    .expect("minio sealing iv should be stored");
+                let sealed_key = metadata
+                    .get(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER)
+                    .expect("minio sealed key should be stored");
+                assert_eq!(BASE64_STANDARD.decode(sealing_iv).expect("decode iv").len(), SEALED_KEY_IV_SIZE);
+                assert_eq!(BASE64_STANDARD.decode(sealed_key).expect("decode sealed key").len(), SEALED_KEY_SIZE);
 
-        let decrypted = sse_decryption(DecryptionRequest {
-            bucket: "bucket",
-            key: "object",
-            metadata: &metadata,
-            sse_customer_key: None,
-            sse_customer_key_md5: None,
-        })
-        .await
-        .expect("managed sse decryption")
-        .expect("managed decryption material");
+                let decrypted = sse_decryption(DecryptionRequest {
+                    bucket: "bucket",
+                    key: "object",
+                    metadata: &metadata,
+                    sse_customer_key: None,
+                    sse_customer_key_md5: None,
+                })
+                .await
+                .expect("managed sse decryption")
+                .expect("managed decryption material");
 
-        assert_eq!(decrypted.key_kind, EncryptionKeyKind::Object);
-        assert_eq!(decrypted.key_bytes, material.key_bytes);
+                assert_eq!(decrypted.key_kind, EncryptionKeyKind::Object);
+                assert_eq!(decrypted.key_bytes, material.key_bytes);
+            },
+        )
+        .await;
+
+        reset_sse_dek_provider();
     }
 
     #[cfg(feature = "rio-v2")]
@@ -3379,6 +3422,97 @@ mod tests {
         );
 
         println!("✅ Different nonces produce different ciphertext - test passed!");
+    }
+
+    #[test]
+    fn test_encrypt_dek_uses_random_nonce_prefixes() {
+        let dek = [0x11u8; 32];
+        let cmk = [0x22u8; 32];
+
+        let encrypted_a = TestSseDekProvider::encrypt_dek(dek, cmk).expect("first DEK wrap should succeed");
+        let encrypted_b = TestSseDekProvider::encrypt_dek(dek, cmk).expect("second DEK wrap should succeed");
+
+        let nonce_a = encrypted_a.split(':').next().expect("wrapped DEK should contain nonce");
+        let nonce_b = encrypted_b.split(':').next().expect("wrapped DEK should contain nonce");
+
+        assert_ne!(nonce_a, nonce_b, "each DEK wrap should use a distinct nonce prefix");
+    }
+
+    #[test]
+    fn test_decrypt_dek_accepts_legacy_zero_nonce_payload() {
+        let dek = [0x33u8; 32];
+        let cmk = [0x44u8; 32];
+        let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(cmk));
+        let legacy_nonce = Nonce::from([0u8; 12]);
+        let ciphertext = cipher
+            .encrypt(&legacy_nonce, dek.as_slice())
+            .expect("legacy wrap should succeed");
+        let legacy_payload = format!("{}:{}", BASE64_STANDARD.encode(legacy_nonce), BASE64_STANDARD.encode(ciphertext));
+
+        let decrypted = TestSseDekProvider::decrypt_dek(&legacy_payload, cmk).expect("legacy payload should remain decryptable");
+        assert_eq!(decrypted, dek);
+    }
+
+    #[tokio::test]
+    async fn test_sse_encryption_fails_closed_without_local_sse_master_key() {
+        let _guard = lock_sse_test_state().await;
+        reset_sse_dek_provider();
+        async_with_vars(
+            [
+                ("__RUSTFS_SSE_SIMPLE_CMK", None::<&str>),
+                ("RUSTFS_SSE_S3_MASTER_KEY", None::<&str>),
+            ],
+            async {
+                let err = sse_encryption(EncryptionRequest {
+                    bucket: "test-bucket",
+                    key: "test-key",
+                    server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+                    ssekms_key_id: None,
+                    ssekms_context: None,
+                    sse_customer_algorithm: None,
+                    sse_customer_key: None,
+                    sse_customer_key_md5: None,
+                    content_size: 1024,
+                })
+                .await
+                .expect_err("SSE-S3 should fail closed without a configured local master key");
+
+                assert!(err.message.contains("RUSTFS_SSE_S3_MASTER_KEY"));
+            },
+        )
+        .await;
+        reset_sse_dek_provider();
+    }
+
+    #[tokio::test]
+    async fn test_sse_encryption_fails_closed_with_invalid_local_sse_master_key() {
+        let _guard = lock_sse_test_state().await;
+        reset_sse_dek_provider();
+        async_with_vars(
+            [
+                ("__RUSTFS_SSE_SIMPLE_CMK", None::<&str>),
+                ("RUSTFS_SSE_S3_MASTER_KEY", Some("not-base64")),
+            ],
+            async {
+                let err = sse_encryption(EncryptionRequest {
+                    bucket: "test-bucket",
+                    key: "test-key",
+                    server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+                    ssekms_key_id: None,
+                    ssekms_context: None,
+                    sse_customer_algorithm: None,
+                    sse_customer_key: None,
+                    sse_customer_key_md5: None,
+                    content_size: 1024,
+                })
+                .await
+                .expect_err("SSE-S3 should fail closed with an invalid local master key");
+
+                assert!(err.message.contains("valid base64"));
+            },
+        )
+        .await;
+        reset_sse_dek_provider();
     }
 
     #[tokio::test]
