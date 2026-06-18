@@ -74,11 +74,13 @@ use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::compress::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
 use rustfs_ecstore::config::storageclass;
 use rustfs_ecstore::disk::{error::DiskError, error_reduce::is_all_buckets_not_found};
-use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
+use rustfs_ecstore::error::{
+    Error as EcstoreError, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
+};
 use rustfs_ecstore::rio::{DynReader, HashReader, WritePlan, wrap_reader};
 use rustfs_ecstore::set_disk::{get_lock_acquire_timeout, is_valid_storage_class};
 use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::{NamespaceLocking, ObjectInfo, ObjectOptions, ObjectToDelete, PutObjReader};
+use rustfs_ecstore::store_api::{ObjectInfo, ObjectOptions, ObjectToDelete, PutObjReader};
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateTargetDecision, ReplicationState, ReplicationStatusType,
     ReplicationType, RestoreStatusOps, VersionPurgeStatusType, parse_restore_obj_status, replication_statuses_map,
@@ -93,7 +95,7 @@ use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_fo
 use rustfs_s3select_api::object_store::bytes_stream;
 #[cfg(test)]
 use rustfs_storage_api::HTTPPreconditions;
-use rustfs_storage_api::{HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
+use rustfs_storage_api::{HTTPRangeSpec, NamespaceLocking, ObjectIO as _, ObjectOperations as _};
 use rustfs_targets::{
     EventName, extract_params_header, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
 };
@@ -876,11 +878,10 @@ fn copy_namespace_lock_error(bucket: &str, object: &str, mode: &'static str, err
     }
 }
 
-async fn acquire_self_copy_namespace_lock<S: NamespaceLocking + ?Sized>(
-    store: &S,
-    bucket: &str,
-    object: &str,
-) -> S3Result<NamespaceLockGuard> {
+async fn acquire_self_copy_namespace_lock<S>(store: &S, bucket: &str, object: &str) -> S3Result<NamespaceLockGuard>
+where
+    S: NamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper> + ?Sized,
+{
     let object = encode_dir_object(object);
     let lock = store.new_ns_lock(bucket, &object).await.map_err(ApiError::from)?;
     lock.get_write_lock(get_lock_acquire_timeout())
