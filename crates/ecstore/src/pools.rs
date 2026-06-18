@@ -721,6 +721,13 @@ fn is_decommission_cancel_requested(cancel_signal: bool, pool: Option<&PoolStatu
             .is_some_and(|info| info.canceled)
 }
 
+fn should_skip_canceled_decommission_routine(cancel_signal: bool, pool: Option<&PoolStatus>) -> bool {
+    cancel_signal
+        && pool
+            .and_then(|pool| pool.decommission.as_ref())
+            .is_some_and(|info| info.canceled)
+}
+
 async fn run_decommission_buckets_bounded<F>(
     rx: CancellationToken,
     buckets: Vec<DecomBucketInfo>,
@@ -2818,6 +2825,21 @@ impl ECStore {
             return Err(err);
         }
         if rx.is_cancelled() {
+            let already_canceled = {
+                let pool_meta = self.pool_meta.read().await;
+                should_skip_canceled_decommission_routine(true, pool_meta.pools.get(idx))
+            };
+            if already_canceled {
+                warn!(
+                    event = EVENT_DECOMMISSION_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = idx,
+                    state = "canceled_preserved",
+                    "Decommission routine skipped because pool is already canceled"
+                );
+                return Ok(());
+            }
             if let Err(err) = self.decommission_cancel(idx).await {
                 resolve_decommission_terminal_mark_after_error_result(self.decommission_failed(idx).await, idx, &err)?;
                 return Err(err);
@@ -4276,9 +4298,10 @@ mod pools_tests {
         resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result,
         resolve_start_decommission_pool_meta_reload_result, rollback_start_decommission_pool_meta,
         run_decommission_buckets_bounded, should_cleanup_decommission_source_entry, should_continue_decommission_queue,
-        should_count_decommission_version_complete, should_preserve_decommission_canceled_state, split_decommission_buckets,
-        take_and_cancel_decommission_canceler, take_decommission_canceler, track_decommission_current_object,
-        validate_start_decommission_request, wait_decommission_worker_drain, with_decommission_entry_context,
+        should_count_decommission_version_complete, should_preserve_decommission_canceled_state,
+        should_skip_canceled_decommission_routine, split_decommission_buckets, take_and_cancel_decommission_canceler,
+        take_decommission_canceler, track_decommission_current_object, validate_start_decommission_request,
+        wait_decommission_worker_drain, with_decommission_entry_context,
     };
     use crate::data_movement;
     use crate::disk::endpoint::Endpoint;
@@ -5678,6 +5701,30 @@ mod pools_tests {
 
         assert!(!is_decommission_cancel_requested(false, Some(&pool)));
         assert!(!is_decommission_cancel_requested(false, None));
+    }
+
+    #[test]
+    fn test_skip_canceled_decommission_routine_only_for_terminal_canceled_state() {
+        let canceled = PoolStatus {
+            id: 0,
+            cmd_line: "pool-0".to_string(),
+            last_update: OffsetDateTime::UNIX_EPOCH,
+            decommission: Some(PoolDecommissionInfo {
+                canceled: true,
+                ..Default::default()
+            }),
+        };
+        let active = PoolStatus {
+            id: 1,
+            cmd_line: "pool-1".to_string(),
+            last_update: OffsetDateTime::UNIX_EPOCH,
+            decommission: Some(PoolDecommissionInfo::default()),
+        };
+
+        assert!(should_skip_canceled_decommission_routine(true, Some(&canceled)));
+        assert!(!should_skip_canceled_decommission_routine(false, Some(&canceled)));
+        assert!(!should_skip_canceled_decommission_routine(true, Some(&active)));
+        assert!(!should_skip_canceled_decommission_routine(true, None));
     }
 
     #[test]
