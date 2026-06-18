@@ -13,6 +13,22 @@
 // limitations under the License.
 #![allow(unused_variables, unused_mut, unused_must_use)]
 
+use crate::admin::storage_compat::ecstore::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState;
+use crate::admin::storage_compat::ecstore::{
+    bucket::lifecycle::tier_last_day_stats::DailyAllTierStats,
+    client::admin_handler_utils::AdminError,
+    config::storageclass,
+    notification_sys::get_global_notification_sys,
+    tier::{
+        tier::{ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_MISSING_CREDENTIALS},
+        tier_admin::TierCreds,
+        tier_config::{TierConfig, TierType},
+        tier_handlers::{
+            ERR_TIER_ALREADY_EXISTS, ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_NAME_NOT_UPPERCASE,
+            ERR_TIER_NOT_FOUND,
+        },
+    },
+};
 use crate::{
     admin::{
         auth::validate_admin_request,
@@ -30,22 +46,6 @@ use matchit::Params;
 use percent_encoding::percent_decode_str;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_data_usage::TierStats;
-use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState;
-use rustfs_ecstore::{
-    bucket::lifecycle::tier_last_day_stats::DailyAllTierStats,
-    client::admin_handler_utils::AdminError,
-    config::storageclass,
-    notification_sys::get_global_notification_sys,
-    tier::{
-        tier::{ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_MISSING_CREDENTIALS},
-        tier_admin::TierCreds,
-        tier_config::{TierConfig, TierType},
-        tier_handlers::{
-            ERR_TIER_ALREADY_EXISTS, ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_NAME_NOT_UPPERCASE,
-            ERR_TIER_NOT_FOUND,
-        },
-    },
-};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{
     Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
@@ -941,9 +941,9 @@ impl Operation for ClearTier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::storage_compat::ecstore::bucket::lifecycle::tier_last_day_stats::LastDayTierStats;
     use http::Uri;
     use matchit::Router;
-    use rustfs_ecstore::bucket::lifecycle::tier_last_day_stats::LastDayTierStats;
 
     #[test]
     fn resolve_tier_name_prefers_path_parameter() {

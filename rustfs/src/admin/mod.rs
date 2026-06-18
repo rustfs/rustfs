@@ -23,6 +23,7 @@ pub(crate) mod route_policy;
 pub mod router;
 pub mod service;
 pub mod site_replication_identity;
+pub(crate) mod storage_compat;
 pub mod utils;
 
 #[cfg(test)]

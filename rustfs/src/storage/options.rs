@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::storage::storage_compat::ecstore::bucket::versioning_sys::BucketVersioningSys;
+use crate::storage::storage_compat::ecstore::error::Result;
+use crate::storage::storage_compat::ecstore::error::StorageError;
 use http::header::{IF_MATCH, IF_NONE_MATCH};
 use http::{HeaderMap, HeaderValue};
-use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::error::Result;
-use rustfs_ecstore::error::StorageError;
 use rustfs_utils::http::{
     AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
     AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,

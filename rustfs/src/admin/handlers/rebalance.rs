@@ -12,6 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::storage_compat::ecstore::{
+    error::StorageError,
+    notification_sys::{NotificationSys, get_global_notification_sys},
+    rebalance::{
+        DiskStat, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStopPropagationRecord,
+        decode_rebalance_stop_propagation_record,
+    },
+    store::ECStore,
+};
 use crate::{
     admin::{
         auth::validate_admin_request,
@@ -24,15 +33,6 @@ use crate::{
 use http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use hyper::Method;
 use matchit::Params;
-use rustfs_ecstore::{
-    error::StorageError,
-    notification_sys::{NotificationSys, get_global_notification_sys},
-    rebalance::{
-        DiskStat, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStopPropagationRecord,
-        decode_rebalance_stop_propagation_record,
-    },
-    store::ECStore,
-};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_storage_api::{BucketOperations, BucketOptions, StorageAdminApi};
 use rustfs_utils::{
@@ -301,7 +301,7 @@ fn build_rebalance_pool_progress(
     now: OffsetDateTime,
     stop_time: Option<OffsetDateTime>,
     percent_free_goal: f64,
-    ps: &rustfs_ecstore::rebalance::RebalanceStats,
+    ps: &crate::admin::storage_compat::ecstore::rebalance::RebalanceStats,
 ) -> Option<RebalPoolProgress> {
     let total_bytes_to_rebal = ps.init_capacity as f64 * percent_free_goal - ps.init_free_space as f64;
     let terminal_time = ps.info.end_time.or(stop_time);
@@ -344,7 +344,7 @@ fn build_rebalance_pool_statuses(
     now: OffsetDateTime,
     stop_time: Option<OffsetDateTime>,
     percent_free_goal: f64,
-    pool_stats: &[rustfs_ecstore::rebalance::RebalanceStats],
+    pool_stats: &[crate::admin::storage_compat::ecstore::rebalance::RebalanceStats],
     disk_stats: &[DiskStat],
 ) -> Vec<RebalancePoolStatus> {
     pool_stats
@@ -908,7 +908,7 @@ mod rebalance_handler_tests {
         rebalance_pool_used, rebalance_query_present, rebalance_remaining_buckets, rebalance_rollback_failure_message,
         rebalance_rollback_stop_failure_message, rebalance_start_rollback_error, rebalance_used_pct, rollback_result_label,
     };
-    use rustfs_ecstore::rebalance::{
+    use crate::admin::storage_compat::ecstore::rebalance::{
         DiskStat, RebalStatus, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta, RebalanceStats,
         RebalanceStopPropagationRecord, encode_rebalance_stop_propagation_record,
     };
