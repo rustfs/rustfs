@@ -166,9 +166,9 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
     },
     {
         "capability": "external-catalog-bridge",
-        "status": "metadata-import-only",
+        "status": "operator-sync-supported",
         "roadmap_area": "external-catalog",
-        "expected_behavior": "catalog import/register supports an existing Iceberg metadata location, while Polaris, Glue, DLF, and Hive synchronization remain unsupported",
+        "expected_behavior": "catalog import/register and operator-supplied external metadata pointer sync are supported for Polaris, Glue, DLF, and Hive identity boundaries; online vendor SDK polling and policy mirroring are not claimed",
     },
     {
         "capability": "multi-table-transactions",

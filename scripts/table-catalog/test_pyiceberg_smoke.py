@@ -747,6 +747,8 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         self.assertIn("background-maintenance-worker", capabilities)
         self.assertIn("external-catalog-bridge", capabilities)
         self.assertIn("multi-table-transactions", capabilities)
+        external_bridge = next(entry for entry in inventory if entry["capability"] == "external-catalog-bridge")
+        self.assertEqual(external_bridge["status"], "operator-sync-supported")
         for entry in inventory:
             self.assertIn("status", entry)
             self.assertIn("roadmap_area", entry)
