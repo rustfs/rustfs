@@ -3153,9 +3153,7 @@ fn rollback_rebalance_start_meta_snapshot_for_id(
 }
 
 fn stop_rebalance_meta_snapshot(meta: Option<&mut RebalanceMeta>, now: OffsetDateTime) -> Option<RebalanceMeta> {
-    let Some(meta) = meta else {
-        return None;
-    };
+    let meta = meta?;
     stop_rebalance_state(meta, now);
     meta.last_refreshed_at = Some(now);
     Some(meta.clone())
@@ -3987,12 +3985,18 @@ mod rebalance_unit_tests {
     };
     use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
-    use crate::disk::RUSTFS_META_BUCKET;
     use crate::disk::endpoint::Endpoint;
+    use crate::disk::{DiskOption, RUSTFS_META_BUCKET};
     use crate::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::error::{Error, Result};
+    use crate::global::{
+        GLOBAL_EventNotifier, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr,
+    };
     use crate::pools::{PoolDecommissionInfo, PoolMeta, PoolStatus};
+    use crate::rpc::S3PeerSys;
+    use crate::sets::Sets;
     use crate::store::ECStore;
+    use crate::store_init::{check_disk_fatal_errs, connect_load_init_formats, ec_drives_no_config, init_disks};
     use rustfs_filemeta::FileInfo;
     use rustfs_filemeta::TRANSITION_COMPLETE;
     use rustfs_rio::Index;
@@ -4002,12 +4006,12 @@ mod rebalance_unit_tests {
     use std::collections::HashMap;
     use std::fs;
     use std::io::Cursor;
-    use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, OnceLock};
     use tempfile::TempDir;
     use time::OffsetDateTime;
-    use tokio::sync::mpsc;
+    use tokio::sync::{RwLock, mpsc};
     use tokio::time::Duration;
     use tokio_util::sync::CancellationToken;
 
@@ -4091,16 +4095,58 @@ mod rebalance_unit_tests {
         }
 
         let endpoint_pools = EndpointServerPools::from(pools);
-        crate::store::init_local_disks(endpoint_pools.clone())
-            .await
-            .expect("initialize local disks for rebalance store test");
-        let store = ECStore::new(
-            "127.0.0.1:0".parse().expect("test address should parse"),
-            endpoint_pools,
-            CancellationToken::new(),
-        )
-        .await
-        .expect("create rebalance test store");
+        let mut disk_map = HashMap::with_capacity(pool_count);
+        let mut store_pools = Vec::with_capacity(pool_count);
+        let mut deployment_id = None;
+        let mut common_parity_drives = 0;
+
+        for (pool_idx, pool_eps) in endpoint_pools.as_ref().iter().enumerate() {
+            if common_parity_drives == 0 {
+                common_parity_drives =
+                    ec_drives_no_config(pool_eps.drives_per_set).expect("derive parity for rebalance store test");
+            }
+
+            let (disks, errs) = init_disks(
+                &pool_eps.endpoints,
+                &DiskOption {
+                    cleanup: true,
+                    health_check: false,
+                },
+            )
+            .await;
+            check_disk_fatal_errs(&errs).expect("initialize disks for rebalance store test");
+
+            let fm = connect_load_init_formats(true, &disks, pool_eps.set_count, pool_eps.drives_per_set, deployment_id)
+                .await
+                .expect("initialize format metadata for rebalance store test");
+            deployment_id = Some(fm.id);
+
+            let sets = Sets::new(disks.clone(), pool_eps, &fm, pool_idx, common_parity_drives)
+                .await
+                .expect("create rebalance test sets");
+            store_pools.push(sets);
+            disk_map.insert(pool_idx, disks);
+        }
+
+        let mut pool_meta = PoolMeta::new(&store_pools, &PoolMeta::default());
+        pool_meta.dont_save = true;
+        let store = Arc::new(ECStore {
+            id: deployment_id.expect("deployment id should be initialized for rebalance store test"),
+            disk_map,
+            pools: store_pools,
+            peer_sys: S3PeerSys::new(&endpoint_pools),
+            pool_meta: RwLock::new(pool_meta),
+            rebalance_meta: RwLock::new(None),
+            decommission_cancelers: RwLock::new(vec![None; pool_count]),
+            start_gate: tokio::sync::Mutex::new(()),
+            pool_meta_save_gate: tokio::sync::Mutex::new(()),
+            local_disk_map: GLOBAL_LOCAL_DISK_MAP.clone(),
+            local_disk_id_map: GLOBAL_LOCAL_DISK_ID_MAP.clone(),
+            local_disk_set_drives: GLOBAL_LOCAL_DISK_SET_DRIVES.clone(),
+            tier_config_mgr: GLOBAL_TierConfigMgr.clone(),
+            event_notifier: GLOBAL_EventNotifier.clone(),
+            bucket_monitor: OnceLock::new(),
+        });
 
         (temp_dir, store)
     }

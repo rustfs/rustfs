@@ -2043,14 +2043,12 @@ impl ECStore {
             );
         }
 
-        if should_save_pool_meta {
-            if let Err(err) = self.save_current_pool_meta().await {
-                if let Some(previous_pool_meta) = previous_pool_meta {
-                    let mut pool_meta = self.pool_meta.write().await;
-                    rollback_decommission_pool_meta(&mut pool_meta, previous_pool_meta);
-                }
-                return Err(err);
+        if should_save_pool_meta && let Err(err) = self.save_current_pool_meta().await {
+            if let Some(previous_pool_meta) = previous_pool_meta {
+                let mut pool_meta = self.pool_meta.write().await;
+                rollback_decommission_pool_meta(&mut pool_meta, previous_pool_meta);
             }
+            return Err(err);
         }
 
         if should_reload_pool_meta && let Some(notification_sys) = get_global_notification_sys() {
@@ -2077,14 +2075,12 @@ impl ECStore {
             take_and_cancel_decommission_canceler(cancelers.as_mut_slice(), idx);
         }
 
-        if should_reload_pool_meta {
-            if let Err(err) = self.save_current_pool_meta().await {
-                if let Some(previous_pool_meta) = previous_pool_meta {
-                    let mut pool_meta = self.pool_meta.write().await;
-                    rollback_decommission_pool_meta(&mut pool_meta, previous_pool_meta);
-                }
-                return Err(err);
+        if should_reload_pool_meta && let Err(err) = self.save_current_pool_meta().await {
+            if let Some(previous_pool_meta) = previous_pool_meta {
+                let mut pool_meta = self.pool_meta.write().await;
+                rollback_decommission_pool_meta(&mut pool_meta, previous_pool_meta);
             }
+            return Err(err);
         }
 
         if should_reload_pool_meta && let Some(notification_sys) = get_global_notification_sys() {
