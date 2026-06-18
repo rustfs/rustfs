@@ -844,6 +844,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     formatting, diff hygiene, direct Swift import scan, Rust risk scan, full
     pre-commit, and required three-expert review passed.
 
+- [x] `API-029` Clean scanner and heal ECStore runtime boundaries.
+  - Current branch: `overtrue/arch-scanner-heal-runtime-boundaries`.
+  - Completed slice: move scanner and heal direct ECStore runtime, disk,
+    metadata, lifecycle, replication, config, and error imports behind their
+    crate-local compatibility modules.
+  - Acceptance: direct `rustfs_ecstore` references in `crates/scanner/src` and
+    `crates/heal/src` are limited to scanner/heal compatibility boundary
+    modules; scanner/heal business modules consume local compatibility names.
+  - Must preserve: scanner cache load/save behavior, lifecycle and replication
+    scan behavior, disk bucket scan inventory lookup, heal object/bucket/format
+    behavior, resume state storage, heal channel test contracts, and existing
+    ECStore-owned concrete types.
+  - Risk defense: this slice changes import ownership and thin compatibility
+    boundaries only; it does not alter scanner scheduling, heal scheduling,
+    object I/O logic, disk operations, metadata serialization, or error
+    mapping.
+  - Verification: focused scanner/heal compile/tests, direct import scans,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, full
+    pre-commit, and required three-expert review passed.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -1114,25 +1134,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 1. `pure-move`/`consumer-migration`: continue larger cleanup slices with the
    loss-prevention guards active for remaining storage compatibility contracts
-   such as scanner/heal runtime boundaries.
+   around app/storage/admin runtime boundaries.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Swift account, container, object, and versioning modules now use Swift-local storage compatibility wrappers for ECStore resolver and bucket metadata access. |
-| Migration preservation | passed | ECStore remains the owner of object-store resolution and bucket metadata persistence; Swift metadata tags, ACL tags, versioning tags, and object read/write/copy semantics are preserved. |
-| Testing/verification | passed | Focused Swift compile/tests, migration/layer guards, direct Swift import scan, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Scanner and heal source modules now use crate-local compatibility boundaries for ECStore runtime, disk, metadata, lifecycle, replication, config, and error imports. |
+| Migration preservation | passed | ECStore remains the owner of scanner/heal backing types and behavior; scanner cache/lifecycle/replication scans and heal object/bucket/format/resume semantics are preserved. |
+| Testing/verification | passed | Focused scanner/heal compile/tests, direct source import scans, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
 Passed before push:
 
-- `cargo check --tests -p rustfs-protocols`: passed.
-- `cargo test -p rustfs-protocols`: passed; 13 passed.
-- `rg -n 'rustfs_ecstore|resolve_object_store_handle|metadata_sys'
-  crates/protocols/src/swift/*.rs`: remaining matches are deliberate Swift
-  compatibility boundary definitions.
+- `cargo check --tests -p rustfs-scanner -p rustfs-heal`: passed.
+- `cargo test -p rustfs-scanner -p rustfs-heal`: passed.
+- `rg -n 'rustfs_ecstore' crates/scanner/src --glob '*.rs'`: remaining matches
+  are deliberate scanner compatibility boundary definitions.
+- `rg -n 'rustfs_ecstore' crates/heal/src --glob '*.rs'`: remaining matches are
+  deliberate heal compatibility boundary definitions.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
 - `cargo fmt --all --check`: passed.
@@ -1144,15 +1165,15 @@ Passed before push:
 
 Notes:
 
-- This slice builds on the merged API-027 compatibility cleanup.
-- Direct Swift ECStore resolver and bucket metadata access now remains only in
-  the Swift compatibility boundary.
-- The slice does not alter Swift account/container metadata behavior, object
-  read/write/copy behavior, versioning behavior, ACL behavior, or ECStore
+- This slice builds on the merged API-028 compatibility cleanup.
+- Direct scanner/heal ECStore imports now remain only in their compatibility
+  boundary modules.
+- The slice does not alter scanner runtime behavior, heal runtime behavior,
+  object I/O behavior, disk operations, metadata serialization, or ECStore
   definitions.
 
 ## Handoff Notes
 
-- Continue with larger consumer-migration batches around scanner/heal runtime
-  boundaries; keep ECStore-owned behavior in ECStore until concrete behavior is
-  isolated enough for a pure-move slice.
+- Continue with larger consumer-migration batches around app/storage/admin
+  runtime boundaries; keep ECStore-owned behavior in ECStore until concrete
+  behavior is isolated enough for a pure-move slice.

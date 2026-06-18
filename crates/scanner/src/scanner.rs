@@ -39,20 +39,17 @@ use rustfs_config::{
     ENV_SCANNER_CYCLE_MAX_OBJECTS,
 };
 use rustfs_config::{ENV_SCANNER_CYCLE, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS};
-use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle as _;
-use rustfs_ecstore::bucket::metadata_sys::{get_lifecycle_config, get_replication_config};
-use rustfs_ecstore::bucket::replication::ReplicationConfigurationExt as _;
-use rustfs_ecstore::config::com::{read_config, save_config};
-use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
-use rustfs_ecstore::error::Error as EcstoreError;
-use rustfs_ecstore::global::is_erasure_sd;
-use rustfs_ecstore::store::ECStore;
 use rustfs_storage_api::{BucketOperations, BucketOptions, NamespaceLocking as _};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
+
+use crate::storage_compat::{
+    ECStore, EcstoreError, Lifecycle as _, RUSTFS_META_BUCKET, ReplicationConfigurationExt as _, get_lifecycle_config,
+    get_replication_config, is_erasure_sd, read_config, replace_bucket_usage_memory_from_info, save_config,
+};
 
 const LOG_COMPONENT_SCANNER: &str = "scanner";
 const LOG_SUBSYSTEM_RUNTIME: &str = "runtime";
@@ -1059,7 +1056,7 @@ pub async fn store_data_usage_in_backend(
                 "Scanner data usage save failed"
             );
         } else {
-            rustfs_ecstore::data_usage::replace_bucket_usage_memory_from_info(&data_usage_info).await;
+            replace_bucket_usage_memory_from_info(&data_usage_info).await;
         }
         done_save();
 
@@ -1070,6 +1067,7 @@ pub async fn store_data_usage_in_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage_compat::EcstoreResult;
     use crate::{
         ScannerGetObjectReader as GetObjectReader, ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions,
         ScannerPutObjReader as PutObjReader,
@@ -1124,7 +1122,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl rustfs_storage_api::ObjectIO for MemoryConfigStore {
-        type Error = rustfs_ecstore::error::Error;
+        type Error = EcstoreError;
         type RangeSpec = rustfs_storage_api::HTTPRangeSpec;
         type HeaderMap = http::HeaderMap;
         type ObjectOptions = ObjectOptions;
@@ -1139,12 +1137,12 @@ mod tests {
             _range: Option<rustfs_storage_api::HTTPRangeSpec>,
             _h: http::HeaderMap,
             _opts: &ObjectOptions,
-        ) -> rustfs_ecstore::error::Result<GetObjectReader> {
+        ) -> EcstoreResult<GetObjectReader> {
             let objects = self.objects.lock().await;
             let data = objects
                 .get(&memory_config_key(bucket, object))
                 .cloned()
-                .ok_or(rustfs_ecstore::error::Error::FileNotFound)?;
+                .ok_or(EcstoreError::FileNotFound)?;
 
             Ok(GetObjectReader {
                 stream: Box::new(Cursor::new(data)),
@@ -1158,7 +1156,7 @@ mod tests {
             object: &str,
             data: &mut PutObjReader,
             _opts: &ObjectOptions,
-        ) -> rustfs_ecstore::error::Result<ObjectInfo> {
+        ) -> EcstoreResult<ObjectInfo> {
             let mut buf = Vec::new();
             data.stream.read_to_end(&mut buf).await?;
             self.objects.lock().await.insert(memory_config_key(bucket, object), buf);

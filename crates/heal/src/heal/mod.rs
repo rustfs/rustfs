@@ -19,7 +19,7 @@ pub mod manager;
 pub mod progress;
 pub mod resume;
 pub mod storage;
-mod storage_compat;
+pub(crate) mod storage_compat;
 pub mod task;
 pub mod utils;
 
