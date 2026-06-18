@@ -19,10 +19,12 @@ use rustfs_ecstore::{
     disk::{DiskStore, endpoint::Endpoint},
     error::StorageError,
     store::ECStore,
-    store_api::{HealOperations, ObjectIO, ObjectOperations, ObjectOptions},
+    store_api::{HealOperations, ObjectOptions},
 };
 use rustfs_madmin::heal_commands::HealResultItem;
-use rustfs_storage_api::{BucketInfo, BucketOperations, DiskSetSelector, ListOperations as _, StorageAdminApi};
+use rustfs_storage_api::{
+    BucketInfo, BucketOperations, DiskSetSelector, ListOperations as _, ObjectIO as _, ObjectOperations as _, StorageAdminApi,
+};
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 

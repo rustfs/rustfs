@@ -5,18 +5,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-list-operations-contracts`
-- Baseline: `main` at `36f7ad6936d03b9593880b5c4958f47b2a039fc9`
-  after the walk options contract merge.
+- Branch: `overtrue/arch-object-operation-contracts`
+- Baseline: `main` at `3fb4cb3d65a2e037fc2e5ede32bf81c1f15c9fb7`
+  after the list operations contract merge.
 - PR type for this branch: `api-extraction`
 - Runtime behavior changes: no external behavior change expected.
-- Rust code changes: move `ListOperations` into `rustfs-storage-api` as a
-  generic operation contract with associated ECStore-bound types, then keep
-  ECStore's existing public name as a fixed associated-type compatibility
-  subtrait.
-- CI/script changes: extend migration guards for the `ListOperations` public
-  re-export and ECStore local-definition regressions.
-- Docs changes: record the list operations contract extraction slice.
+- Rust code changes: move `ObjectIO`, `ObjectOperations`, and
+  `MultipartOperations` into `rustfs-storage-api` as generic operation
+  contracts with associated ECStore-bound types, then keep ECStore's existing
+  public names as fixed associated-type compatibility subtraits.
+- CI/script changes: extend migration guards for the object/multipart operation
+  public re-exports and ECStore local-method regressions.
+- Docs changes: record the object and multipart operation contract extraction
+  slice.
 
 ## Phase 0 Tasks
 
@@ -684,6 +685,31 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
     full pre-commit, and required three-expert review passed.
 
+- [x] `API-022` Move object and multipart operation contracts.
+  - Completed slice: move `ObjectIO`, `ObjectOperations`, and
+    `MultipartOperations` from ECStore `store_api/traits.rs` into
+    `rustfs-storage-api` as generic public operation contracts over ECStore
+    reader, option, metadata, multipart DTO, file-info, delete, header, range,
+    and error associated types; keep ECStore's old public trait names as fixed
+    associated-type compatibility subtraits.
+  - Acceptance: `rustfs-storage-api` exports the object and multipart
+    operation contracts, ECStore no longer defines local object/multipart method
+    signatures, existing ECStore generic bounds keep the old import path, and
+    migration guards reject dropping the public storage-api re-export or
+    reintroducing local ECStore object/multipart method definitions.
+  - Must preserve: object reader/writer behavior, object metadata/tag/delete
+    behavior, multipart create/copy/part/list/complete/abort behavior, ECStore
+    public compatibility bounds, and all ECStore object/multipart runtime
+    behavior.
+  - Risk defense: only the trait contracts cross into `rustfs-storage-api`;
+    ECStore keeps the concrete associated type bindings, readers,
+    `ObjectInfo`, `ObjectOptions`, `PutObjReader`, filemeta adaptation, storage
+    errors, lifecycle/replication/rio/compression/encryption coupling, and
+    implementation bodies.
+  - Verification: focused storage-api tests, ECStore/RustFS/downstream compile
+    checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    full pre-commit, and required three-expert review passed.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -960,8 +986,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Generic `ListOperations` now lives in `rustfs-storage-api`; ECStore still owns the concrete associated type bindings and implementation behavior. |
-| Migration preservation | passed | List v2, list-object-versions, walk channel/cancellation shape, and existing ECStore generic bound import path are preserved through a compatibility subtrait. |
+| Quality/architecture | passed | Generic object I/O, object operation, and multipart operation traits now live in `rustfs-storage-api`; ECStore still owns concrete type bindings and implementations. |
+| Migration preservation | passed | Object read/write, metadata/tag/delete, multipart, and existing ECStore generic bound import paths are preserved through compatibility subtraits. |
 | Testing/verification | passed | Focused storage-api tests, downstream compile checks, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
@@ -969,7 +995,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 Passed before push:
 
 - `cargo test -p rustfs-storage-api`: passed.
-- `cargo check --tests -p rustfs-storage-api -p rustfs-ecstore -p rustfs -p rustfs-iam -p rustfs-scanner -p rustfs-protocols`: passed.
+- `cargo check --tests -p rustfs-storage-api -p rustfs-ecstore -p rustfs -p rustfs-scanner -p rustfs-protocols`: passed.
+- `cargo check --tests -p rustfs-heal -p rustfs-protocols`: passed.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
 - `cargo fmt --all --check`: passed.
@@ -982,22 +1009,23 @@ Passed before push:
 
 Notes:
 
-- This slice follows the walk options contract branch and keeps the old
+- This slice follows the list operations contract branch and keeps the old
   aggregate facade, bucket DTO, multipart DTO, bucket operation contract, object
   helper, range helper, list helper, object precondition, list response, and
-  walk options contract guards active.
-- The shared list operations contract is now owned by `rustfs-storage-api`;
-  ECStore keeps the concrete associated type bindings, response aliases,
-  `WalkOptions` alias, `ObjectInfo`, storage `Error`, `ObjectOptions`, object
-  metadata adaptation, storage error mapping, readers, lifecycle/replication,
-  rio, filemeta, and implementation behavior.
+  walk/list operation contract guards active.
+- The shared object and multipart operation contracts are now owned by
+  `rustfs-storage-api`; ECStore keeps the concrete associated type bindings,
+  readers, `ObjectInfo`, `ObjectOptions`, `PutObjReader`, filemeta adaptation,
+  storage error mapping, lifecycle/replication, rio, compression/encryption,
+  and implementation behavior.
 - The slice does not alter object, list, walk, multipart, bucket, delete,
-  namespace-lock, or reader runtime behavior.
+  namespace-lock, reader, or tag/metadata runtime behavior.
 
 ## Handoff Notes
 
-- List operations contract cleanup is stacked on the walk options contract
+- Object and multipart operation contract cleanup is stacked on the list
+  operations contract
   branch.
 - After this lands, remaining storage work can continue by extracting larger
-  low-coupling DTO/consumer slices or by narrowing remaining operation-group
-  consumers.
+  low-coupling object metadata/option/reader slices or by narrowing remaining
+  operation-group consumers.

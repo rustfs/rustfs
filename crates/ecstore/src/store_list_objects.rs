@@ -22,9 +22,7 @@ use crate::error::{
     Error, Result, StorageError, is_all_not_found, is_all_volume_not_found, is_err_bucket_not_found, to_object_err,
 };
 use crate::set_disk::SetDisks;
-use crate::store_api::{
-    ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectInfoOrErr, ObjectOperations, ObjectOptions, WalkOptions,
-};
+use crate::store_api::{ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectInfoOrErr, ObjectOptions, WalkOptions};
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{store::ECStore, store_api::ListObjectsV2Info};
 use futures::future::join_all;
@@ -33,7 +31,7 @@ use rustfs_filemeta::{
     MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry, MetadataResolutionParams,
     merge_file_meta_versions,
 };
-use rustfs_storage_api::{VersionMarker, WalkVersionsSortOrder};
+use rustfs_storage_api::{ObjectOperations as _, VersionMarker, WalkVersionsSortOrder};
 use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
