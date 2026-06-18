@@ -92,14 +92,17 @@ Required `rustfs-storage-api` public re-exports:
 
 - `pub use admin::{DiskSetSelector, StorageAdminApi};`
 - `pub use bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};`
+- `pub use capability::{CapabilitySnapshotError, CapabilityState, CapabilityStatus};`
 - `pub use error::{StorageErrorCode, StorageResult};`
 - `pub use multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};`
+- `pub use observability::{MemorySamplingState, ObservabilitySnapshot, ObservabilitySnapshotProvider, PlatformSupport, UserspaceProfilingCapability};`
 - `pub use object::{HTTPPreconditions, HTTPRangeError, HTTPRangeSpec, ObjectLockRetentionOptions};`
 - `pub use object::{ExpirationOptions, TransitionedObject};`
 - `pub use object::{HealOperations, MultipartOperations, NamespaceLocking, ObjectIO, ObjectOperations};`
 - `pub use object::{ListObjectVersionsInfo, ListObjectsInfo, ListObjectsV2Info, ListOperations, ObjectInfoOrErr};`
 - `pub use object::{ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState};`
 - `pub use object::{VersionMarker, WalkOptions, WalkVersionsSortOrder};`
+- `pub use topology::{DiskCapabilities, TopologyCapabilities, TopologyDisk, TopologyLabels, TopologyPool, TopologySet, TopologySnapshot, TopologySnapshotProvider};`
 
 ECStore must keep compile-time coverage for `StorageAdminApi`, `HealOperations`,
 and the separate `NamespaceLocking` operation group.

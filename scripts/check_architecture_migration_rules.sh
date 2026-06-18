@@ -210,8 +210,16 @@ require_source_line \
   "storage-api public bucket contract re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
+  "pub use capability::{CapabilitySnapshotError, CapabilityState, CapabilityStatus};" \
+  "storage-api public capability contract re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
   "pub use multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};" \
   "storage-api public multipart DTO re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
+  "pub use observability::{" \
+  "storage-api public observability contract re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
   "pub use object::{HTTPPreconditions, HTTPRangeError, HTTPRangeSpec, ObjectLockRetentionOptions};" \
@@ -244,6 +252,10 @@ require_source_line \
   "crates/storage-api/src/lib.rs" \
   "pub use error::{StorageErrorCode, StorageResult};" \
   "storage-api public error contract re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
+  "pub use topology::{" \
+  "storage-api public topology contract re-export"
 
 (
   cd "$ROOT_DIR"
