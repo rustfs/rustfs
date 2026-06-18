@@ -18,7 +18,10 @@
 //! keeping the response format explicitly NDJSON. It is not a Prometheus text
 //! exposition endpoint.
 
+use crate::admin::auth::validate_admin_request;
 use crate::admin::router::Operation;
+use crate::auth::{check_key_valid, get_session_token};
+use crate::server::RemoteAddr;
 use crate::storage::request_context::spawn_traced;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -28,6 +31,7 @@ use matchit::Params;
 use rustfs_ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
 use rustfs_madmin::metrics::RealtimeMetrics;
 use rustfs_madmin::utils::parse_duration;
+use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::stream::{ByteStream, DynByteStream};
 use s3s::{Body, S3Request, S3Response, S3Result, StdError, s3_error};
@@ -178,14 +182,32 @@ impl ByteStream for MetricsStream {}
 
 pub struct MetricsHandler {}
 
+async fn authorize_metrics_request(req: &S3Request<Body>) -> S3Result<()> {
+    let Some(input_cred) = req.credentials.as_ref() else {
+        return Err(s3_error!(AccessDenied, "Signature is required"));
+    };
+
+    let (cred, owner) =
+        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+
+    validate_admin_request(
+        &req.headers,
+        &cred,
+        owner,
+        false,
+        vec![Action::AdminAction(AdminAction::GetMetricsAction)],
+        remote_addr,
+    )
+    .await
+}
+
 #[async_trait::async_trait]
 impl Operation for MetricsHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         debug!("handle MetricsHandler, uri: {:?}, params: {:?}", req.uri, params);
-        let Some(_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
-        };
-        debug!("validated console metrics request credentials");
+        authorize_metrics_request(&req).await?;
+        debug!("validated console metrics admin authorization");
 
         let mp = extract_metrics_init_params(&req.uri);
         debug!("mp: {:?}", mp);
@@ -266,10 +288,28 @@ impl Operation for MetricsHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONSOLE_METRICS_CONTENT_TYPE, DEFAULT_METRICS_SAMPLES, MAX_METRICS_SAMPLES, extract_metrics_init_params,
+        CONSOLE_METRICS_CONTENT_TYPE, DEFAULT_METRICS_SAMPLES, MAX_METRICS_SAMPLES, MetricsHandler, extract_metrics_init_params,
         resolve_sample_count,
     };
-    use http::Uri;
+    use crate::admin::router::Operation;
+    use http::{Extensions, HeaderMap, Uri};
+    use hyper::Method;
+    use matchit::Params;
+    use s3s::{Body, S3ErrorCode, S3Request};
+
+    fn build_metrics_request(uri: &'static str) -> S3Request<Body> {
+        S3Request {
+            input: Body::empty(),
+            method: Method::GET,
+            uri: Uri::from_static(uri),
+            headers: HeaderMap::new(),
+            extensions: Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
 
     #[test]
     fn metrics_params_default_to_single_sample() {
@@ -298,5 +338,19 @@ mod tests {
     #[test]
     fn metrics_handler_uses_ndjson_content_type() {
         assert_eq!(CONSOLE_METRICS_CONTENT_TYPE, "application/x-ndjson");
+    }
+
+    #[tokio::test]
+    async fn metrics_handler_rejects_missing_credentials() {
+        let result = MetricsHandler {}
+            .call(build_metrics_request("/rustfs/admin/v3/metrics"), Params::new())
+            .await;
+        let err = match result {
+            Ok(_) => panic!("metrics handler must reject unauthenticated requests"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.message(), Some("Signature is required"));
     }
 }
