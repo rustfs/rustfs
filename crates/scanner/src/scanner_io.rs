@@ -17,7 +17,7 @@ use crate::scanner_folder::{ScannerItem, scan_data_folder};
 use crate::sleeper::SCANNER_SLEEPER;
 use crate::{
     DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, DataUsageCache, DataUsageCacheInfo, DataUsageEntry, DataUsageEntryInfo,
-    DataUsageInfo, ScannerError, SizeSummary, TierStats,
+    DataUsageInfo, ScannerError, ScannerObjectIO, SizeSummary, TierStats,
 };
 use futures::future::join_all;
 use metrics::counter;
@@ -41,7 +41,7 @@ use rustfs_ecstore::error::{Error, StorageError};
 use rustfs_ecstore::global::GLOBAL_TierConfigMgr;
 use rustfs_ecstore::resolve_object_store_handle;
 use rustfs_ecstore::set_disk::SetDisks;
-use rustfs_ecstore::store_api::{ObjectIO, ObjectInfo};
+use rustfs_ecstore::store_api::ObjectInfo;
 use rustfs_ecstore::{error::Result, store::ECStore};
 use rustfs_filemeta::FileMeta;
 use rustfs_storage_api::{BucketInfo, BucketOperations, BucketOptions, DiskSetSelector, StorageAdminApi};
@@ -407,7 +407,7 @@ async fn send_cache_root_entry_info(
     bucket_result_tx.lock().await.send(cache_root_entry_info(cache)).await
 }
 
-async fn persist_and_publish_cache_snapshot<S: ObjectIO>(
+async fn persist_and_publish_cache_snapshot<S: ScannerObjectIO>(
     store: Arc<S>,
     updates: &mpsc::Sender<DataUsageCache>,
     cache_snapshot: DataUsageCache,
