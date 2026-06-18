@@ -48,6 +48,20 @@ pub struct ObjectLockRetentionOptions {
     pub bypass_governance: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ExpirationOptions {
+    pub expire: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct TransitionedObject {
+    pub name: String,
+    pub version_id: String,
+    pub tier: String,
+    pub free_version: bool,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectPreconditionPart {
     pub number: usize,
@@ -795,6 +809,19 @@ mod tests {
 
         assert_eq!(object.version_purge_status(), VersionPurgeStatusType::Empty);
         assert_eq!(object.delete_marker_replication_status(), ReplicationStatusType::Empty);
+    }
+
+    #[test]
+    fn lifecycle_helper_defaults_preserve_existing_contracts() {
+        let expiration = ExpirationOptions::default();
+        let transitioned = TransitionedObject::default();
+
+        assert!(!expiration.expire);
+        assert!(transitioned.name.is_empty());
+        assert!(transitioned.version_id.is_empty());
+        assert!(transitioned.tier.is_empty());
+        assert!(!transitioned.free_version);
+        assert!(transitioned.status.is_empty());
     }
 
     #[derive(Debug)]

@@ -1267,9 +1267,9 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bucket::lifecycle::bucket_lifecycle_ops::TransitionedObject;
     use crate::bucket::lifecycle::core::TRANSITION_COMPLETE;
     use bytes::Bytes;
+    use rustfs_storage_api::TransitionedObject;
     use std::io::Cursor;
     use tokio::io::AsyncReadExt;
 

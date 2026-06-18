@@ -18,11 +18,7 @@ use crate::config::storageclass;
 use crate::error::{Error, Result};
 use crate::rio::{HashReader, LimitReader};
 use crate::store_utils::clean_metadata;
-use crate::{
-    bucket::lifecycle::bucket_lifecycle_audit::LcAuditEvent,
-    bucket::lifecycle::lifecycle::ExpirationOptions,
-    bucket::lifecycle::{bucket_lifecycle_ops::TransitionedObject, lifecycle::TransitionOptions},
-};
+use crate::{bucket::lifecycle::bucket_lifecycle_audit::LcAuditEvent, bucket::lifecycle::lifecycle::TransitionOptions};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
 use rustfs_common::heal_channel::HealOpts;
@@ -34,7 +30,7 @@ use rustfs_filemeta::{
 use rustfs_lock::NamespaceLockWrapper;
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_rio::Checksum;
-use rustfs_storage_api::HTTPRangeSpec;
+use rustfs_storage_api::{ExpirationOptions, HTTPRangeSpec, TransitionedObject};
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, AMZ_RESTORE, AMZ_STORAGE_CLASS};
