@@ -21,7 +21,7 @@ use crate::storage::access::has_bypass_governance_header;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::get_opts;
 use crate::storage::s3_api::acl;
-use crate::storage::storage_compat::ecstore::{
+use crate::storage::storage_compat::{
     bucket::{
         metadata::{
             BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_VERSIONING_CONFIG,

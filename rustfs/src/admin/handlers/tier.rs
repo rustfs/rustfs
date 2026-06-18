@@ -13,8 +13,8 @@
 // limitations under the License.
 #![allow(unused_variables, unused_mut, unused_must_use)]
 
-use crate::admin::storage_compat::ecstore::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState;
-use crate::admin::storage_compat::ecstore::{
+use crate::admin::storage_compat::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState;
+use crate::admin::storage_compat::{
     bucket::lifecycle::tier_last_day_stats::DailyAllTierStats,
     client::admin_handler_utils::AdminError,
     config::storageclass,
@@ -916,7 +916,7 @@ impl Operation for ClearTier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::storage_compat::ecstore::bucket::lifecycle::tier_last_day_stats::LastDayTierStats;
+    use crate::admin::storage_compat::bucket::lifecycle::tier_last_day_stats::LastDayTierStats;
     use http::Uri;
     use matchit::Router;
 

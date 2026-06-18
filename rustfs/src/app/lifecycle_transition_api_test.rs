@@ -14,7 +14,7 @@
 
 use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};
 use crate::app::bucket_usecase::DefaultBucketUsecase;
-use crate::app::storage_compat::ecstore::{
+use crate::app::storage_compat::{
     bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, OBJECT_LOCK_CONFIG},
     bucket::metadata_sys,
     client::object_api_utils::to_s3s_etag,
@@ -113,7 +113,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
 
     let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
 
-    crate::app::storage_compat::ecstore::store::init_local_disks(endpoint_pools.clone())
+    crate::app::storage_compat::store::init_local_disks(endpoint_pools.clone())
         .await
         .unwrap();
 
@@ -132,7 +132,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     let buckets = buckets_list.into_iter().map(|v| v.name).collect();
     metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
 
-    crate::app::storage_compat::ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+    crate::app::storage_compat::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
 
     let _ = GLOBAL_ENV.set((disk_paths.clone(), ecstore.clone()));
 
@@ -932,7 +932,7 @@ async fn delete_transitioned_object_removes_remote_tier_copy_via_usecase() {
         .expect("Failed to set lifecycle configuration");
     let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
 
-    crate::app::storage_compat::ecstore::bucket::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(
+    crate::app::storage_compat::bucket::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(
         ecstore.clone(),
         bucket.as_str(),
     )
@@ -992,7 +992,7 @@ async fn lifecycle_transition_marks_dirty_disks_for_capacity_manager() {
         .expect("Failed to set lifecycle configuration");
     let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
 
-    crate::app::storage_compat::ecstore::bucket::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(
+    crate::app::storage_compat::bucket::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(
         ecstore.clone(),
         bucket.as_str(),
     )

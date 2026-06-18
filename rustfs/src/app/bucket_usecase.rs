@@ -20,7 +20,7 @@ use crate::admin::handlers::site_replication::{
 use crate::app::context::{
     AppContext, default_notify_interface, get_global_app_context, resolve_object_store_handle_for_context,
 };
-use crate::app::storage_compat::ecstore::bucket::{
+use crate::app::storage_compat::bucket::{
     bucket_target_sys::BucketTargetSys,
     lifecycle::bucket_lifecycle_ops::{
         enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects, validate_transition_tier,
@@ -38,10 +38,10 @@ use crate::app::storage_compat::ecstore::bucket::{
     versioning::VersioningApi,
     versioning_sys::BucketVersioningSys,
 };
-use crate::app::storage_compat::ecstore::client::object_api_utils::to_s3s_etag;
-use crate::app::storage_compat::ecstore::error::StorageError;
-use crate::app::storage_compat::ecstore::notification_sys::get_global_notification_sys;
-use crate::app::storage_compat::ecstore::store::ECStore;
+use crate::app::storage_compat::client::object_api_utils::to_s3s_etag;
+use crate::app::storage_compat::error::StorageError;
+use crate::app::storage_compat::notification_sys::get_global_notification_sys;
+use crate::app::storage_compat::store::ECStore;
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
@@ -1628,9 +1628,7 @@ impl DefaultBucketUsecase {
             }
         };
 
-        if let Err(err) =
-            crate::app::storage_compat::ecstore::bucket::lifecycle::lifecycle::Lifecycle::validate(&input_cfg, &rcfg).await
-        {
+        if let Err(err) = crate::app::storage_compat::bucket::lifecycle::lifecycle::Lifecycle::validate(&input_cfg, &rcfg).await {
             return Err(s3_error!(InvalidArgument, "{err}"));
         }
 
@@ -2280,7 +2278,7 @@ mod tests {
         BucketTargets {
             targets: arns
                 .iter()
-                .map(|arn| crate::app::storage_compat::ecstore::bucket::target::BucketTarget {
+                .map(|arn| crate::app::storage_compat::bucket::target::BucketTarget {
                     arn: (*arn).to_string(),
                     target_type: BucketTargetType::ReplicationService,
                     ..Default::default()

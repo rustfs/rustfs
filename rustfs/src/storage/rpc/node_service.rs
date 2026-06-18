@@ -16,7 +16,7 @@ use crate::admin::service::{
     config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
     site_replication::reload_site_replication_runtime_state,
 };
-use crate::storage::storage_compat::ecstore::{
+use crate::storage::storage_compat::{
     admin_server_info::get_local_server_property,
     bucket::{metadata::load_bucket_metadata, metadata_sys},
     disk::{
@@ -132,9 +132,7 @@ fn unimplemented_rpc(method: &str) -> Status {
     Status::unimplemented(format!("{method} is not implemented"))
 }
 
-fn background_rebalance_start_error_message(
-    result: crate::storage::storage_compat::ecstore::error::Result<()>,
-) -> Option<String> {
+fn background_rebalance_start_error_message(result: crate::storage::storage_compat::error::Result<()>) -> Option<String> {
     result.err().map(|err| format!("start_rebalance failed: {err}"))
 }
 
@@ -2378,9 +2376,8 @@ mod tests {
 
     #[test]
     fn test_background_rebalance_start_error_message_formats_error() {
-        let message =
-            background_rebalance_start_error_message(Err(crate::storage::storage_compat::ecstore::error::Error::other("boom")))
-                .expect("background rebalance start failure should be formatted");
+        let message = background_rebalance_start_error_message(Err(crate::storage::storage_compat::error::Error::other("boom")))
+            .expect("background rebalance start failure should be formatted");
 
         assert!(message.contains("start_rebalance failed"));
         assert!(message.contains("boom"));
@@ -2710,7 +2707,7 @@ mod tests {
         vars.insert(PEER_RESTSIGNAL.to_string(), SERVICE_SIGNAL_RELOAD_DYNAMIC.to_string());
         vars.insert(
             PEER_RESTSUB_SYS.to_string(),
-            crate::storage::storage_compat::ecstore::config::com::STORAGE_CLASS_SUB_SYS.to_string(),
+            crate::storage::storage_compat::config::com::STORAGE_CLASS_SUB_SYS.to_string(),
         );
 
         let request = Request::new(SignalServiceRequest {

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::storage_compat::ecstore::{
+use crate::app::storage_compat::{
     bucket::metadata_sys,
     disk::endpoint::Endpoint,
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
@@ -82,7 +82,7 @@ async fn setup_capacity_dirty_scope_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     };
 
     let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
-    crate::app::storage_compat::ecstore::store::init_local_disks(endpoint_pools.clone())
+    crate::app::storage_compat::store::init_local_disks(endpoint_pools.clone())
         .await
         .unwrap();
 
