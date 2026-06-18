@@ -13,8 +13,7 @@
 // limitations under the License.
 
 use crate::startup_fs_guard::enforce_unsupported_fs_policy;
-use rustfs_common::{GlobalReadiness, SystemStage};
-use rustfs_ecstore::{
+use crate::storage_compat::ecstore::{
     bucket::replication::init_background_replication,
     config as ecconfig,
     endpoints::EndpointServerPools,
@@ -22,6 +21,7 @@ use rustfs_ecstore::{
     store::{ECStore, init_local_disks, init_lock_clients, prewarm_local_disk_id_map},
     update_erasure_type,
 };
+use rustfs_common::{GlobalReadiness, SystemStage};
 use std::{
     io::{Error, Result},
     net::SocketAddr,

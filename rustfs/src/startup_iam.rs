@@ -14,8 +14,8 @@
 
 use crate::app::context::{AppContext, get_global_app_context, init_global_app_context};
 use crate::server::{ServiceStateManager, publish_ready_when_runtime_ready};
+use crate::storage_compat::ecstore::store::ECStore;
 use rustfs_common::{GlobalReadiness, SystemStage};
-use rustfs_ecstore::store::ECStore;
 use rustfs_iam::init_iam_sys;
 use rustfs_kms::KmsServiceManager;
 use std::future::Future;

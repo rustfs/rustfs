@@ -26,16 +26,16 @@ use crate::metrics::collectors::{
     DriveDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmStats, MemoryStats, NetworkStats, ProcessStats,
     ProcessStatusType, ReplicationStats, ResourceStats, ScannerStats,
 };
+use crate::storage_compat::ecstore::bucket::lifecycle::bucket_lifecycle_ops::{GLOBAL_ExpiryState, GLOBAL_TransitionState};
+use crate::storage_compat::ecstore::bucket::metadata_sys::get_quota_config;
+use crate::storage_compat::ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
+use crate::storage_compat::ecstore::data_usage::load_data_usage_from_backend;
+use crate::storage_compat::ecstore::global::get_global_bucket_monitor;
+use crate::storage_compat::ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
+use crate::storage_compat::ecstore::resolve_object_store_handle;
 use chrono::Utc;
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::global_metrics;
-use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::{GLOBAL_ExpiryState, GLOBAL_TransitionState};
-use rustfs_ecstore::bucket::metadata_sys::get_quota_config;
-use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
-use rustfs_ecstore::data_usage::load_data_usage_from_backend;
-use rustfs_ecstore::global::get_global_bucket_monitor;
-use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
-use rustfs_ecstore::resolve_object_store_handle;
 use rustfs_iam::{get_global_iam_sys, oidc::oidc_plugin_authn_metrics_snapshot};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_io_metrics::{ProcessStatusSnapshot, snapshot_process_resource_and_system};
