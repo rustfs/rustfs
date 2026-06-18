@@ -19,6 +19,7 @@ use crate::bucket::{
 };
 use crate::global::get_global_bucket_monitor;
 use crate::set_disk::get_lock_acquire_timeout;
+use rustfs_storage_api::NamespaceLocking as _;
 
 fn should_override_created_from_metadata(created: OffsetDateTime) -> bool {
     created != OffsetDateTime::UNIX_EPOCH

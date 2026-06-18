@@ -52,8 +52,8 @@ use crate::{
     event_notification::{EventArgs, send_event},
     global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id, is_dist_erasure},
     store_api::{
-        DeletedObject, GetObjectReader, HealOperations, ListObjectsV2Info, MultipartOperations, NamespaceLocking, ObjectIO,
-        ObjectInfo, ObjectOperations, PutObjReader,
+        DeletedObject, GetObjectReader, ListObjectsV2Info, MultipartOperations, ObjectIO, ObjectInfo, ObjectOperations,
+        PutObjReader,
     },
     store_init::load_format_erasure,
 };
@@ -90,6 +90,7 @@ use rustfs_storage_api::{
     BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, ListMultipartsInfo, ListPartsInfo,
     MakeBucketOptions, MultipartInfo, MultipartUploadResult, PartInfo,
 };
+use rustfs_storage_api::{MultipartOperations as _, NamespaceLocking as _, ObjectIO as _, ObjectOperations as _};
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::{
@@ -828,7 +829,15 @@ fn classify_small_write_path(is_inline_buffer: bool, object_size: i64, block_siz
 }
 
 #[async_trait::async_trait]
-impl ObjectIO for SetDisks {
+impl rustfs_storage_api::ObjectIO for SetDisks {
+    type Error = Error;
+    type RangeSpec = HTTPRangeSpec;
+    type HeaderMap = HeaderMap;
+    type ObjectOptions = ObjectOptions;
+    type ObjectInfo = ObjectInfo;
+    type GetObjectReader = GetObjectReader;
+    type PutObjectReader = PutObjReader;
+
     #[tracing::instrument(level = "debug", skip(self))]
     async fn get_object_reader(
         &self,
@@ -1720,7 +1729,10 @@ impl SetDisks {
 }
 
 #[async_trait::async_trait]
-impl NamespaceLocking for SetDisks {
+impl rustfs_storage_api::NamespaceLocking for SetDisks {
+    type Error = Error;
+    type NamespaceLock = NamespaceLockWrapper;
+
     #[tracing::instrument(skip(self))]
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         let set_lock = if is_dist_erasure().await {
@@ -1791,7 +1803,14 @@ fn check_object_lock_retention_update(bucket: &str, object: &str, obj_info: &Obj
 }
 
 #[async_trait::async_trait]
-impl ObjectOperations for SetDisks {
+impl rustfs_storage_api::ObjectOperations for SetDisks {
+    type Error = Error;
+    type ObjectInfo = ObjectInfo;
+    type ObjectOptions = ObjectOptions;
+    type FileInfo = FileInfo;
+    type ObjectToDelete = ObjectToDelete;
+    type DeletedObject = DeletedObject;
+
     #[tracing::instrument(skip(self))]
     async fn copy_object(
         &self,
@@ -2866,7 +2885,8 @@ impl ObjectOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        let get_object_reader = <Self as ObjectIO>::get_object_reader(self, bucket, object, None, HeaderMap::new(), opts).await?;
+        let get_object_reader =
+            <Self as rustfs_storage_api::ObjectIO>::get_object_reader(self, bucket, object, None, HeaderMap::new(), opts).await?;
         // Stream to sink to avoid loading entire object into memory during verification
         let mut reader = get_object_reader.stream;
         tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
@@ -3035,7 +3055,18 @@ impl rustfs_storage_api::ListOperations for SetDisks {
 }
 
 #[async_trait::async_trait]
-impl MultipartOperations for SetDisks {
+impl rustfs_storage_api::MultipartOperations for SetDisks {
+    type Error = Error;
+    type ObjectInfo = ObjectInfo;
+    type ObjectOptions = ObjectOptions;
+    type PutObjectReader = PutObjReader;
+    type CompletePart = CompletePart;
+    type ListMultipartsInfo = ListMultipartsInfo;
+    type MultipartUploadResult = MultipartUploadResult;
+    type PartInfo = PartInfo;
+    type MultipartInfo = MultipartInfo;
+    type ListPartsInfo = ListPartsInfo;
+
     #[tracing::instrument(skip(self))]
     async fn copy_object_part(
         &self,
@@ -4116,7 +4147,11 @@ impl MultipartOperations for SetDisks {
 }
 
 #[async_trait::async_trait]
-impl HealOperations for SetDisks {
+impl rustfs_storage_api::HealOperations for SetDisks {
+    type Error = Error;
+    type HealResultItem = HealResultItem;
+    type HealOptions = HealOpts;
+
     #[tracing::instrument(skip(self))]
     async fn heal_format(&self, _dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
         unimplemented!()
@@ -4991,7 +5026,7 @@ mod tests {
     use rustfs_filemeta::ReplicationState;
     use rustfs_lock::client::local::LocalClient;
     use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
-    use rustfs_storage_api::CompletePart;
+    use rustfs_storage_api::{CompletePart, NamespaceLocking as _, ObjectOperations as _};
     use serial_test::serial;
     use std::collections::HashMap;
     use tempfile::TempDir;

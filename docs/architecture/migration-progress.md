@@ -5,18 +5,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-list-operations-contracts`
-- Baseline: `main` at `36f7ad6936d03b9593880b5c4958f47b2a039fc9`
-  after the walk options contract merge.
-- PR type for this branch: `api-extraction`
+- Branch: `overtrue/arch-storage-shared-operation-bounds`
+- Baseline: `main` at `46e200c290e3fc0887f4c19172bcc146e019d737`
+  after the heal/namespace-lock operation contract merge.
+- PR type for this branch: `consumer-migration`
 - Runtime behavior changes: no external behavior change expected.
-- Rust code changes: move `ListOperations` into `rustfs-storage-api` as a
-  generic operation contract with associated ECStore-bound types, then keep
-  ECStore's existing public name as a fixed associated-type compatibility
-  subtrait.
-- CI/script changes: extend migration guards for the `ListOperations` public
-  re-export and ECStore local-definition regressions.
-- Docs changes: record the list operations contract extraction slice.
+- Rust code changes: migrate RustFS bucket response builders and IAM walk
+  channel typing away from ECStore list response aliases to the generic
+  `rustfs-storage-api` list contracts while keeping ECStore-owned
+  `ObjectInfo`, `ObjectOptions`, readers, delete DTOs, and implementation
+  behavior in ECStore.
+- CI/script changes: extend migration guards so outer RustFS/IAM list response
+  consumers do not drift back to ECStore alias imports.
+- Docs changes: record the shared list operation consumer cleanup slice.
 
 ## Phase 0 Tasks
 
@@ -684,6 +685,74 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
     full pre-commit, and required three-expert review passed.
 
+- [x] `API-022` Move object and multipart operation contracts.
+  - Completed slice: move `ObjectIO`, `ObjectOperations`, and
+    `MultipartOperations` from ECStore `store_api/traits.rs` into
+    `rustfs-storage-api` as generic public operation contracts over ECStore
+    reader, option, metadata, multipart DTO, file-info, delete, header, range,
+    and error associated types; keep ECStore's old public trait names as fixed
+    associated-type compatibility subtraits.
+  - Acceptance: `rustfs-storage-api` exports the object and multipart
+    operation contracts, ECStore no longer defines local object/multipart method
+    signatures, existing ECStore generic bounds keep the old import path, and
+    migration guards reject dropping the public storage-api re-export or
+    reintroducing local ECStore object/multipart method definitions.
+  - Must preserve: object reader/writer behavior, object metadata/tag/delete
+    behavior, multipart create/copy/part/list/complete/abort behavior, ECStore
+    public compatibility bounds, and all ECStore object/multipart runtime
+    behavior.
+  - Risk defense: only the trait contracts cross into `rustfs-storage-api`;
+    ECStore keeps the concrete associated type bindings, readers,
+    `ObjectInfo`, `ObjectOptions`, `PutObjReader`, filemeta adaptation, storage
+    errors, lifecycle/replication/rio/compression/encryption coupling, and
+    implementation bodies.
+  - Verification: focused storage-api tests, ECStore/RustFS/downstream compile
+    checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    full pre-commit, and required three-expert review passed.
+- [x] `API-023` Move heal and namespace-lock operation contracts.
+  - Completed slice: move `HealOperations` and `NamespaceLocking` from ECStore
+    `store_api/traits.rs` into `rustfs-storage-api` as generic public
+    operation contracts over ECStore heal result/options, namespace-lock
+    wrapper, and error associated types; keep ECStore's old public trait names
+    as fixed associated-type compatibility subtraits.
+  - Acceptance: `rustfs-storage-api` exports the heal and namespace-lock
+    operation contracts, ECStore no longer defines local heal/namespace-lock
+    method signatures, focused consumers use the shared trait for method
+    resolution, and migration guards reject dropping the public storage-api
+    re-export or reintroducing local ECStore method definitions.
+  - Must preserve: heal format/bucket/object behavior, abandoned-part checks,
+    pool/set lookup behavior, namespace-lock acquisition behavior, ECStore
+    public compatibility bounds, and all runtime lock/heal implementation
+    bodies.
+  - Risk defense: only the trait contracts cross into `rustfs-storage-api`;
+    ECStore keeps concrete associated type bindings, `HealOpts`,
+    `HealResultItem`, `NamespaceLockWrapper`, lock implementation, peer heal
+    behavior, set/pool dispatch, and storage error mapping.
+  - Verification: focused storage-api/ECStore/RustFS/heal/scanner compile
+    checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    full pre-commit, and required three-expert review passed.
+
+- [x] `API-024` Clean shared list operation consumer bounds.
+  - Completed slice: migrate RustFS S3/bucket usecase list response builders from
+    ECStore `ListObjectVersionsInfo`/`ListObjectsV2Info` aliases to
+    `rustfs-storage-api` generic list response contracts bound to ECStore
+    `ObjectInfo`; migrate IAM walk channel typing from ECStore
+    `ObjectInfoOrErr` alias to the shared generic item contract.
+  - Acceptance: outer RustFS/IAM consumers use storage-api list response
+    contracts directly, ECStore keeps concrete aliases for internal
+    implementation and compatibility, and migration guards reject restoring the
+    old outer-consumer imports.
+  - Must preserve: S3 list v2/version output mapping, IAM config walk channel
+    item/error handling, ECStore concrete object metadata shape, walk options
+    inference, and storage error conversion behavior.
+  - Risk defense: this slice moves only low-coupling generic response/channel
+    typing; ECStore still owns `ObjectInfo`, `ObjectOptions`, readers,
+    filemeta-bound walk filter type, delete DTOs, and list/walk implementation
+    bodies.
+  - Verification: focused RustFS/IAM compile and tests, migration/layer guards,
+    formatting, diff hygiene, Rust risk scan, full pre-commit, and required
+    three-expert review passed.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -960,16 +1029,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Generic `ListOperations` now lives in `rustfs-storage-api`; ECStore still owns the concrete associated type bindings and implementation behavior. |
-| Migration preservation | passed | List v2, list-object-versions, walk channel/cancellation shape, and existing ECStore generic bound import path are preserved through a compatibility subtrait. |
-| Testing/verification | passed | Focused storage-api tests, downstream compile checks, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Outer RustFS/IAM list response consumers now use the generic storage-api contracts; ECStore keeps concrete aliases only for implementation and compatibility. |
+| Migration preservation | passed | S3 list response mapping and IAM walk item/error handling keep the same ECStore `ObjectInfo`, error conversion, and walk option inference behavior. |
+| Testing/verification | passed | Focused RustFS/IAM compile/tests, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
 Passed before push:
 
-- `cargo test -p rustfs-storage-api`: passed.
-- `cargo check --tests -p rustfs-storage-api -p rustfs-ecstore -p rustfs -p rustfs-iam -p rustfs-scanner -p rustfs-protocols`: passed.
+- `cargo check --tests -p rustfs -p rustfs-iam`: passed.
+- `cargo test -p rustfs --lib storage::s3_api::bucket`: passed; 22 passed.
+- `cargo test -p rustfs-iam`: passed; 150 passed.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
 - `cargo fmt --all --check`: passed.
@@ -977,27 +1047,25 @@ Passed before push:
 - Rust risk scan: no new `unwrap`/`expect`, panic/todo markers, `unsafe`,
   process-spawning calls, lossy casts, println/eprintln, or relaxed ordering in
   added Rust lines.
-- `make pre-commit`: passed; nextest reported 6204 tests passed and 111
+- `make pre-commit`: passed; nextest reported 6207 tests passed and 111
   skipped, and doctests passed.
 
 Notes:
 
-- This slice follows the walk options contract branch and keeps the old
-  aggregate facade, bucket DTO, multipart DTO, bucket operation contract, object
-  helper, range helper, list helper, object precondition, list response, and
-  walk options contract guards active.
-- The shared list operations contract is now owned by `rustfs-storage-api`;
-  ECStore keeps the concrete associated type bindings, response aliases,
-  `WalkOptions` alias, `ObjectInfo`, storage `Error`, `ObjectOptions`, object
-  metadata adaptation, storage error mapping, readers, lifecycle/replication,
-  rio, filemeta, and implementation behavior.
-- The slice does not alter object, list, walk, multipart, bucket, delete,
-  namespace-lock, or reader runtime behavior.
+- This slice follows the heal and namespace-lock operation contract branch and
+  keeps the old aggregate facade, DTO/helper, response, and operation contract
+  guards active.
+- Outer RustFS/IAM consumers now bind low-coupling list response/channel
+  containers through `rustfs-storage-api`; ECStore keeps the concrete aliases,
+  object metadata, filemeta-bound walk filter, readers, delete DTOs, and list
+  implementation behavior.
+- The slice does not alter list, walk, bucket, object, delete, reader,
+  tag/metadata, heal, namespace-lock, multipart, or storage error runtime
+  behavior.
 
 ## Handoff Notes
 
-- List operations contract cleanup is stacked on the walk options contract
-  branch.
-- After this lands, remaining storage work can continue by extracting larger
-  low-coupling DTO/consumer slices or by narrowing remaining operation-group
-  consumers.
+- Shared list operation consumer cleanup is rebased onto `main` after
+  `rustfs/rustfs#3560` merged.
+- After this lands, continue with larger consumer-migration batches instead of
+  single-alias slices.

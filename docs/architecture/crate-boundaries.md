@@ -95,13 +95,19 @@ Required `rustfs-storage-api` public re-exports:
 - `pub use error::{StorageErrorCode, StorageResult};`
 - `pub use multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};`
 - `pub use object::{HTTPPreconditions, HTTPRangeError, HTTPRangeSpec, ObjectLockRetentionOptions};`
+- `pub use object::{HealOperations, MultipartOperations, NamespaceLocking, ObjectIO, ObjectOperations};`
 - `pub use object::{ListObjectVersionsInfo, ListObjectsInfo, ListObjectsV2Info, ListOperations, ObjectInfoOrErr};`
 - `pub use object::{ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState};`
 - `pub use object::{VersionMarker, WalkOptions, WalkVersionsSortOrder};`
 
-ECStore must keep compile-time coverage for both `StorageAdminApi` and the
-separate `NamespaceLocking` operation group.
+ECStore must keep compile-time coverage for `StorageAdminApi`, `HealOperations`,
+and the separate `NamespaceLocking` operation group.
 
 The old `StorageAPI` aggregate facade must not reappear in production
 `crates/ecstore/src` or `rustfs/src` code after the storage operation groups
 have been made explicit.
+
+Outer RustFS/IAM consumers must use `rustfs-storage-api` generic list response
+contracts directly for `ListObjectsV2Info`, `ListObjectVersionsInfo`, and
+`ObjectInfoOrErr`; ECStore keeps the concrete aliases only for internal
+implementation and compatibility.
