@@ -15,13 +15,11 @@
 //! Admin application use-case contracts.
 
 use crate::app::context::{AppContext, get_global_app_context, resolve_object_store_handle_for_context};
-use crate::app::storage_compat::admin_server_info::get_server_info;
-use crate::app::storage_compat::data_usage::{apply_bucket_usage_memory_overlay, load_data_usage_from_backend};
-use crate::app::storage_compat::endpoints::EndpointServerPools;
-use crate::app::storage_compat::pools::{
-    PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free,
-};
-use crate::app::storage_compat::store::ECStore;
+use crate::app::storage_compat::ECStore;
+use crate::app::storage_compat::EndpointServerPools;
+use crate::app::storage_compat::get_server_info;
+use crate::app::storage_compat::{PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free};
+use crate::app::storage_compat::{apply_bucket_usage_memory_overlay, load_data_usage_from_backend};
 use crate::capacity::resolve_admin_used_capacity;
 use crate::error::ApiError;
 use crate::server::{DependencyReadiness, collect_dependency_readiness as collect_runtime_dependency_readiness};
@@ -318,7 +316,7 @@ impl DefaultAdminUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::storage_compat::pools::{PoolDecommissionInfo, PoolStatus};
+    use crate::app::storage_compat::{PoolDecommissionInfo, PoolStatus};
     use time::OffsetDateTime;
 
     #[tokio::test]

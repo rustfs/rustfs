@@ -17,21 +17,12 @@ use crate::admin::service::{
     site_replication::reload_site_replication_runtime_state,
 };
 use crate::storage::storage_compat::{
-    admin_server_info::get_local_server_property,
+    CollectMetricsOpts, DeleteOptions, DiskAPI, DiskError, DiskInfoOptions, DiskStore, FileInfoVersions, GLOBAL_TierConfigMgr,
+    LocalPeerS3Client, MetricType, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerS3Client, ReadMultipleReq, ReadMultipleResp,
+    ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, UpdateMetadataOpts, all_local_disk_path,
     bucket::{metadata::load_bucket_metadata, metadata_sys},
-    disk::{
-        DeleteOptions, DiskAPI, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-        UpdateMetadataOpts, error::DiskError,
-    },
-    get_global_lock_client,
-    global::GLOBAL_TierConfigMgr,
-    metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics},
+    collect_local_metrics, find_local_disk_by_ref, get_global_lock_client, get_local_server_property,
     resolve_object_store_handle,
-    rpc::{
-        LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG,
-        SERVICE_SIGNAL_RELOAD_DYNAMIC,
-    },
-    store::{all_local_disk_path, find_local_disk_by_ref},
 };
 use bytes::Bytes;
 use futures::Stream;
@@ -132,7 +123,7 @@ fn unimplemented_rpc(method: &str) -> Status {
     Status::unimplemented(format!("{method} is not implemented"))
 }
 
-fn background_rebalance_start_error_message(result: crate::storage::storage_compat::error::Result<()>) -> Option<String> {
+fn background_rebalance_start_error_message(result: crate::storage::storage_compat::Result<()>) -> Option<String> {
     result.err().map(|err| format!("start_rebalance failed: {err}"))
 }
 
@@ -2376,7 +2367,7 @@ mod tests {
 
     #[test]
     fn test_background_rebalance_start_error_message_formats_error() {
-        let message = background_rebalance_start_error_message(Err(crate::storage::storage_compat::error::Error::other("boom")))
+        let message = background_rebalance_start_error_message(Err(crate::storage::storage_compat::Error::other("boom")))
             .expect("background rebalance start failure should be formatted");
 
         assert!(message.contains("start_rebalance failed"));

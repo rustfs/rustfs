@@ -157,7 +157,7 @@ fn arn_to_target_id(arn_str: &str) -> Result<rustfs_targets::arn::TargetID, Targ
 /// * `buckets` - A vector of bucket names to process
 #[instrument(skip_all)]
 pub async fn add_bucket_notification_configuration(buckets: Vec<String>) {
-    let global_region = crate::storage_compat::global::get_global_region();
+    let global_region = crate::storage_compat::get_global_region();
     let region = global_region
         .as_ref()
         .filter(|r| !r.as_str().is_empty())

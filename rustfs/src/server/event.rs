@@ -14,7 +14,7 @@
 
 use super::{module_switch::resolve_notify_module_state, refresh_persisted_module_switches_from_store};
 use crate::app::context::resolve_server_config;
-use crate::storage_compat::event_notification::{EventArgs as EcstoreEventArgs, register_event_dispatch_hook};
+use crate::storage_compat::{EcstoreEventArgs, register_event_dispatch_hook};
 use rustfs_notify::EventArgs as NotifyEventArgs;
 use rustfs_s3_types::EventName;
 use std::net::SocketAddr;
