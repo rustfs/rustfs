@@ -41,7 +41,6 @@ use rustfs_ecstore::error::{Error, StorageError};
 use rustfs_ecstore::global::GLOBAL_TierConfigMgr;
 use rustfs_ecstore::resolve_object_store_handle;
 use rustfs_ecstore::set_disk::SetDisks;
-use rustfs_ecstore::store_api::ObjectInfo;
 use rustfs_ecstore::{error::Result, store::ECStore};
 use rustfs_filemeta::FileMeta;
 use rustfs_storage_api::{BucketInfo, BucketOperations, BucketOptions, DiskSetSelector, StorageAdminApi};
@@ -58,6 +57,8 @@ use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
+
+use crate::ScannerObjectInfo as ObjectInfo;
 
 pub(crate) const SCANNER_SKIP_FILE_ERROR: &str = "skip file";
 const LOG_COMPONENT_SCANNER: &str = "scanner";

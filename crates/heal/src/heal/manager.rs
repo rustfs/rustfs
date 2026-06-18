@@ -2283,7 +2283,7 @@ fn can_schedule_request(request: &HealRequest, running_per_set: &HashMap<String,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::heal::storage::HealStorageAPI;
+    use crate::heal::storage::{HealObjectInfo, HealStorageAPI};
     use crate::heal::task::{HealOptions, HealPriority, HealRequest, HealTask, HealType};
     use rustfs_common::heal_channel::{HealOpts, HealRequestSource};
     use rustfs_ecstore::disk::{DiskStore, endpoint::Endpoint};
@@ -2294,7 +2294,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HealStorageAPI for MockStorage {
-        async fn get_object_meta(&self, _bucket: &str, _object: &str) -> Result<Option<rustfs_ecstore::store_api::ObjectInfo>> {
+        async fn get_object_meta(&self, _bucket: &str, _object: &str) -> Result<Option<HealObjectInfo>> {
             Ok(None)
         }
 

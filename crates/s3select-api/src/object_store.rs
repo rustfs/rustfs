@@ -29,7 +29,9 @@ use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object
 use rustfs_ecstore::resolve_object_store_handle;
 use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::{GetObjectReader, ObjectOptions};
+use rustfs_ecstore::store_api::{
+    GetObjectReader as EcstoreGetObjectReader, ObjectInfo as EcstoreObjectInfo, ObjectOptions as EcstoreObjectOptions,
+};
 use rustfs_storage_api::{HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
 use s3s::S3Result;
 use s3s::dto::SelectObjectContentInput;
@@ -65,6 +67,10 @@ use transform_stream::AsyncTryStream;
 pub const MAX_JSON_DOCUMENT_BYTES: u64 = 128 * 1024 * 1024;
 pub const INVALID_SCAN_RANGE_MESSAGE: &str =
     "The value of a parameter in ScanRange element is invalid. Check the service API documentation and try again.";
+
+type SelectGetObjectReader = EcstoreGetObjectReader;
+type SelectObjectInfo = EcstoreObjectInfo;
+type SelectObjectOptions = EcstoreObjectOptions;
 
 #[derive(Debug)]
 pub struct EcObjectStore {
@@ -155,8 +161,8 @@ impl EcObjectStore {
         })
     }
 
-    fn object_options(&self, options: &GetOptions) -> ObjectOptions {
-        ObjectOptions {
+    fn object_options(&self, options: &GetOptions) -> SelectObjectOptions {
+        SelectObjectOptions {
             version_id: options.version.clone(),
             ..Default::default()
         }
@@ -194,14 +200,14 @@ impl EcObjectStore {
             .is_some_and(|info| matches!(info.as_str(), "USE" | "IGNORE"))
     }
 
-    async fn object_info(&self, opts: &ObjectOptions) -> Result<rustfs_ecstore::store_api::ObjectInfo> {
+    async fn object_info(&self, opts: &SelectObjectOptions) -> Result<SelectObjectInfo> {
         self.store
             .get_object_info(&self.input.bucket, &self.input.key, opts)
             .await
             .map_err(|err| map_storage_error(&self.input.bucket, &self.input.key, err))
     }
 
-    async fn object_reader(&self, range: Option<HTTPRangeSpec>, opts: &ObjectOptions) -> Result<GetObjectReader> {
+    async fn object_reader(&self, range: Option<HTTPRangeSpec>, opts: &SelectObjectOptions) -> Result<SelectGetObjectReader> {
         let h = self.read_headers();
         self.store
             .get_object_reader(&self.input.bucket, &self.input.key, range, h, opts)
@@ -209,7 +215,7 @@ impl EcObjectStore {
             .map_err(|err| map_storage_error(&self.input.bucket, &self.input.key, err))
     }
 
-    async fn read_raw_range_with_opts(&self, range: Range<u64>, opts: &ObjectOptions) -> Result<Bytes> {
+    async fn read_raw_range_with_opts(&self, range: Range<u64>, opts: &SelectObjectOptions) -> Result<Bytes> {
         if range.is_empty() {
             return Ok(Bytes::new());
         }
@@ -228,7 +234,7 @@ impl EcObjectStore {
             .await
     }
 
-    async fn read_header_record(&self, object_size: u64, delimiter: &[u8], opts: &ObjectOptions) -> Result<Bytes> {
+    async fn read_header_record(&self, object_size: u64, delimiter: &[u8], opts: &SelectObjectOptions) -> Result<Bytes> {
         if object_size == 0 {
             return Ok(Bytes::new());
         }

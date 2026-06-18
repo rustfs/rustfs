@@ -2050,11 +2050,10 @@ impl std::fmt::Debug for HealTask {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::heal::storage::DiskStatus;
+    use crate::heal::storage::{DiskStatus, HealObjectInfo};
     use rustfs_ecstore::{
         data_usage::DATA_USAGE_CACHE_NAME,
         disk::{BUCKET_META_PREFIX, DiskStore, RUSTFS_META_BUCKET, endpoint::Endpoint},
-        store_api::ObjectInfo,
     };
     use rustfs_madmin::heal_commands::HealResultItem;
     use rustfs_storage_api::BucketInfo;
@@ -2070,7 +2069,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HealStorageAPI for MockStorage {
-        async fn get_object_meta(&self, _bucket: &str, _object: &str) -> Result<Option<ObjectInfo>> {
+        async fn get_object_meta(&self, _bucket: &str, _object: &str) -> Result<Option<HealObjectInfo>> {
             Ok(None)
         }
 

@@ -19,7 +19,7 @@ use rustfs_ecstore::{
     disk::{DiskStore, endpoint::Endpoint},
     error::StorageError,
     store::ECStore,
-    store_api::ObjectOptions,
+    store_api::{ObjectInfo as EcstoreObjectInfo, ObjectOptions as EcstoreObjectOptions, PutObjReader as EcstorePutObjReader},
 };
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_storage_api::{
@@ -36,6 +36,10 @@ const EVENT_HEAL_STORAGE_OBJECT_READ_LIMIT: &str = "heal_storage_object_read_lim
 const EVENT_HEAL_STORAGE_OBJECT_VERIFY: &str = "heal_storage_object_verify";
 const EVENT_HEAL_STORAGE_ADMIN_OP: &str = "heal_storage_admin_op";
 const EVENT_HEAL_STORAGE_REPAIR_OP: &str = "heal_storage_repair_op";
+
+pub type HealObjectInfo = EcstoreObjectInfo;
+pub type HealObjectOptions = EcstoreObjectOptions;
+pub type HealPutObjReader = EcstorePutObjReader;
 
 /// Disk status for heal operations
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +68,7 @@ pub enum DiskStatus {
 #[async_trait]
 pub trait HealStorageAPI: Send + Sync {
     /// Get object meta
-    async fn get_object_meta(&self, bucket: &str, object: &str) -> Result<Option<rustfs_ecstore::store_api::ObjectInfo>>;
+    async fn get_object_meta(&self, bucket: &str, object: &str) -> Result<Option<HealObjectInfo>>;
 
     /// Get object data
     async fn get_object_data(&self, bucket: &str, object: &str) -> Result<Option<Vec<u8>>>;
@@ -183,7 +187,7 @@ fn is_transient_object_exists_error(err: &StorageError) -> bool {
 
 #[async_trait]
 impl HealStorageAPI for ECStoreHealStorage {
-    async fn get_object_meta(&self, bucket: &str, object: &str) -> Result<Option<rustfs_ecstore::store_api::ObjectInfo>> {
+    async fn get_object_meta(&self, bucket: &str, object: &str) -> Result<Option<HealObjectInfo>> {
         debug!(
             target: "rustfs::heal::storage",
             event = EVENT_HEAL_STORAGE_OBJECT_IO,
@@ -330,7 +334,7 @@ impl HealStorageAPI for ECStoreHealStorage {
             "Heal storage request started"
         );
 
-        let mut reader = rustfs_ecstore::store_api::PutObjReader::from_vec(data.to_vec());
+        let mut reader = HealPutObjReader::from_vec(data.to_vec());
         match (*self.ecstore)
             .put_object(bucket, object, &mut reader, &Default::default())
             .await
@@ -801,7 +805,7 @@ impl HealStorageAPI for ECStoreHealStorage {
 
         // Existence checks are best-effort for background heal scheduling, so avoid
         // acquiring an extra namespace read lock here.
-        let opts = ObjectOptions {
+        let opts = HealObjectOptions {
             no_lock: true,
             ..Default::default()
         };
