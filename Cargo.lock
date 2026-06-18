@@ -9702,6 +9702,7 @@ dependencies = [
  "rustfs-ecstore",
  "rustfs-s3-ops",
  "rustfs-s3-types",
+ "rustfs-storage-api",
  "rustfs-targets",
  "rustfs-utils",
  "serde",

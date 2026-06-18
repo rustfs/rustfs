@@ -95,6 +95,7 @@ Required `rustfs-storage-api` public re-exports:
 - `pub use error::{StorageErrorCode, StorageResult};`
 - `pub use multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};`
 - `pub use object::{HTTPPreconditions, HTTPRangeError, HTTPRangeSpec, ObjectLockRetentionOptions};`
+- `pub use object::{ExpirationOptions, TransitionedObject};`
 - `pub use object::{HealOperations, MultipartOperations, NamespaceLocking, ObjectIO, ObjectOperations};`
 - `pub use object::{ListObjectVersionsInfo, ListObjectsInfo, ListObjectsV2Info, ListOperations, ObjectInfoOrErr};`
 - `pub use object::{ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState};`
@@ -117,3 +118,7 @@ directly for `ObjectIO`, `ObjectOperations`, `ListOperations`,
 `MultipartOperations`, `HealOperations`, and `NamespaceLocking`; ECStore keeps
 the concrete compatibility traits only for internal implementation and
 downstream compatibility.
+
+ECStore internal consumers must use `rustfs-storage-api` lifecycle helper DTOs
+directly for `ExpirationOptions` and `TransitionedObject`; ECStore keeps the
+old lifecycle paths only as downstream compatibility re-exports.

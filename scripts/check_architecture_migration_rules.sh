@@ -59,6 +59,8 @@ STORE_API_LIST_HELPER_REEXPORTS_FILE="${TMP_DIR}/store_api_list_helper_reexports
 STORE_API_LIST_RESPONSE_REEXPORTS_FILE="${TMP_DIR}/store_api_list_response_reexports.txt"
 STORE_API_DELETE_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_delete_dto_reexports.txt"
 STORE_API_DELETE_DTO_INTERNAL_HITS_FILE="${TMP_DIR}/store_api_delete_dto_internal_hits.txt"
+STORE_API_LIFECYCLE_HELPER_DEFINITION_HITS_FILE="${TMP_DIR}/store_api_lifecycle_helper_definition_hits.txt"
+STORE_API_LIFECYCLE_HELPER_OLD_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_lifecycle_helper_old_consumer_hits.txt"
 STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_list_consumer_hits.txt"
 STORE_API_EXTERNAL_OPERATION_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_operation_consumer_hits.txt"
 STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE="${TMP_DIR}/store_api_object_operation_local_method_hits.txt"
@@ -216,6 +218,10 @@ require_source_line \
   "storage-api public delete object contract re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
+  "pub use object::{ExpirationOptions, TransitionedObject};" \
+  "storage-api public lifecycle helper contract re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
   "pub use object::{ListObjectVersionsInfo, ListObjectsInfo, ListObjectsV2Info, ListOperations, ObjectInfoOrErr};" \
   "storage-api public list response contract re-export"
 require_source_line \
@@ -332,6 +338,36 @@ fi
 
 if [[ -s "$STORE_API_DELETE_DTO_INTERNAL_HITS_FILE" ]]; then
   report_failure "ecstore internal delete DTO old store_api path reintroduced: $(paste -sd '; ' "$STORE_API_DELETE_DTO_INTERNAL_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub struct (?:ExpirationOptions|TransitionedObject)\b' \
+    crates/ecstore/src/bucket/lifecycle/core.rs \
+    crates/ecstore/src/bucket/lifecycle/bucket_lifecycle_ops.rs || true
+) >"$STORE_API_LIFECYCLE_HELPER_DEFINITION_HITS_FILE"
+
+if [[ -s "$STORE_API_LIFECYCLE_HELPER_DEFINITION_HITS_FILE" ]]; then
+  report_failure "ECStore lifecycle helper DTO definitions must stay in rustfs-storage-api: $(paste -sd '; ' "$STORE_API_LIFECYCLE_HELPER_DEFINITION_HITS_FILE")"
+fi
+
+require_source_line \
+  "crates/ecstore/src/bucket/lifecycle/core.rs" \
+  "pub use rustfs_storage_api::ExpirationOptions;" \
+  "ECStore ExpirationOptions compatibility re-export"
+require_source_line \
+  "crates/ecstore/src/bucket/lifecycle/bucket_lifecycle_ops.rs" \
+  "pub use rustfs_storage_api::TransitionedObject;" \
+  "ECStore TransitionedObject compatibility re-export"
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'crate::bucket::lifecycle::(?:bucket_lifecycle_ops::TransitionedObject|core::ExpirationOptions|lifecycle::ExpirationOptions)|use crate::bucket::lifecycle::(?:bucket_lifecycle_ops::TransitionedObject|core::ExpirationOptions|lifecycle::ExpirationOptions)|rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::TransitionedObject' \
+    crates/ecstore/src rustfs/src crates/scanner/src crates/scanner/tests crates/notify/src --glob '*.rs' || true
+) >"$STORE_API_LIFECYCLE_HELPER_OLD_CONSUMER_HITS_FILE"
+
+if [[ -s "$STORE_API_LIFECYCLE_HELPER_OLD_CONSUMER_HITS_FILE" ]]; then
+  report_failure "lifecycle helper DTO consumers must import rustfs-storage-api directly: $(paste -sd '; ' "$STORE_API_LIFECYCLE_HELPER_OLD_CONSUMER_HITS_FILE")"
 fi
 
 (
