@@ -1160,6 +1160,27 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     guards, formatting check, diff hygiene, risk scan, full pre-commit, and
     required three-expert review required before push.
 
+- [x] `API-045` Remove observability ECStore module passthroughs.
+  - Current branch: `overtrue/arch-compat-passthrough-contracts`.
+  - Current slice: replace OBS metrics passthroughs for ECStore bucket,
+    data-usage, global, pools, and object-store resolver modules with
+    crate-local storage compatibility functions and snapshots, then shrink the
+    passthrough guard snapshot.
+  - Acceptance: OBS metrics collection no longer reaches through ECStore
+    modules directly; object-store resolution, data-usage loading, capacity
+    calculation, quota reads, replication state, bucket bandwidth monitor
+    access, and ILM runtime counters remain behind the OBS compatibility
+    boundary.
+  - Must preserve: cluster/health metrics, bucket usage metrics, replication
+    and bandwidth metrics, scheduler tombstone behavior, disk/drive metrics,
+    erasure-set metrics, ILM metrics, existing warning paths, and no-data
+    fallback behavior.
+  - Risk defense: this changes compatibility ownership only; OBS still reads
+    the same ECStore runtime state through narrower local compatibility names.
+  - Verification: focused OBS/notify/S3 Select/RustFS compile, migration and
+    layer guards, formatting check, diff hygiene, risk scan, full pre-commit,
+    and required three-expert review required before push.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -1436,8 +1457,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-042/API-043/API-044 narrow notify and S3 Select compatibility contracts without moving ECStore storage metadata ownership. |
-| Migration preservation | passed | Event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, unchanged no-op handling, and remove-event behavior are preserved. |
+| Quality/architecture | passed | API-042/API-043/API-044/API-045 narrow notify, S3 Select, and OBS compatibility contracts without moving ECStore storage metadata ownership. |
+| Migration preservation | passed | Event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, OBS metrics state reads, unchanged no-op handling, and remove-event behavior are preserved. |
 | Testing/verification | passed | Focused compiles/tests, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
@@ -1473,6 +1494,19 @@ Passed before push:
 - API-044 current slice:
   - `cargo check --tests -p rustfs-s3select-api -p rustfs-notify -p
     rustfs`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: passed; no new unwrap/expect, numeric casts, string error
+    public APIs, boxed public errors, production println/eprintln, or relaxed
+    ordering introduced in changed Rust files.
+  - `make pre-commit`: passed, including 6245 nextest tests passed and 111
+    skipped.
+
+- API-045 current slice:
+  - `cargo check --tests -p rustfs-obs -p rustfs-s3select-api -p
+    rustfs-notify -p rustfs`: passed.
   - `./scripts/check_architecture_migration_rules.sh`: passed.
   - `./scripts/check_layer_dependencies.sh`: passed.
   - `cargo fmt --all --check`: passed.

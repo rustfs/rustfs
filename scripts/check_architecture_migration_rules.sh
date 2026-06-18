@@ -441,11 +441,6 @@ crates/iam/src/storage_compat.rs:error
 crates/iam/src/storage_compat.rs:global
 crates/iam/src/storage_compat.rs:notification_sys
 crates/iam/src/storage_compat.rs:store
-crates/obs/src/storage_compat.rs:bucket
-crates/obs/src/storage_compat.rs:data_usage
-crates/obs/src/storage_compat.rs:global
-crates/obs/src/storage_compat.rs:pools
-crates/obs/src/storage_compat.rs:resolve_object_store_handle
 crates/protocols/src/swift/storage_compat.rs:bucket
 crates/protocols/src/swift/storage_compat.rs:error
 crates/protocols/src/swift/storage_compat.rs:resolve_object_store_handle
