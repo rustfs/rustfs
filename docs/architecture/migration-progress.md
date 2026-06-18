@@ -5,17 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-api-lifecycle-contracts`
-- Baseline: stacked on `rustfs/rustfs#3594` head
-  (`6fc05b84e2cd22a0482adfbc042184b03f8fdfa6`).
+- Branch: `overtrue/arch-test-harness-compat-aliases`
+- Baseline: stacked on `rustfs/rustfs#3595` head
+  (`a6056baa392873d0e8c37a6d9a98bcd69bdaab32`).
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: no migration behavior change expected.
-- Rust code changes: move lifecycle helper DTO contracts for expiration and
-  transitioned object metadata into rustfs-storage-api, switch ECStore internal
-  consumers to direct storage-api imports, and keep ECStore old-path re-exports.
-- CI/script changes: add migration guards rejecting reintroduced ECStore
-  lifecycle helper DTO definitions and old internal consumer imports.
-- Docs changes: record the lifecycle helper pure-move slice.
+- Rust code changes: flatten e2e, heal, scanner, and fuzz storage compatibility
+  harnesses from nested ECStore modules into direct aliases and functions.
+- CI/script changes: add migration guards rejecting nested
+  `storage_compat::ecstore` paths in test and fuzz harnesses.
+- Docs changes: record the test harness compatibility alias cleanup slice.
 
 ## Phase 0 Tasks
 
@@ -1296,6 +1295,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration and layer guards, formatting check, diff hygiene, risk scan, full
     pre-commit, and required three-expert review passed before push.
 
+- [x] `API-051` Flatten test harness storage compatibility aliases.
+  - Current branch: `overtrue/arch-test-harness-compat-aliases`.
+  - Current slice: flatten e2e, heal, scanner, and fuzz storage compatibility
+    harnesses from nested `storage_compat::ecstore` modules into direct
+    crate-local aliases, constants, and function imports.
+  - Acceptance: no e2e, heal-test, scanner-test, or fuzz-target harness file
+    may expose or consume nested `storage_compat::ecstore` paths, and migration
+    rules reject reintroducing nested test/fuzz ECStore compatibility modules.
+  - Must preserve: e2e bucket target/RPC/disk helper imports, heal ECStore disk
+    and endpoint setup, scanner lifecycle/tier/disk/storage setup, fuzz bucket
+    validation behavior, and fuzz path-containment validation behavior.
+  - Risk defense: this is test-harness and fuzz-harness import cleanup only; no
+    production runtime behavior, ECStore ownership, storage metadata format, or
+    scanner/heal lifecycle logic is changed.
+  - Verification: focused e2e/heal/scanner test compile, harness tests,
+    migration and layer guards, formatting check, diff hygiene, risk scan, full
+    pre-commit, and required three-expert review passed before push.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -1572,9 +1589,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | S-015 removes obsolete KMS admin policy action variants after the handler fallback cleanup; API-042/API-043/API-044/API-045/API-046/API-047/API-048/API-049/API-050 narrow notify, S3 Select, OBS, IAM, Swift, heal, scanner, RustFS runtime, test, fuzz, and lifecycle helper compatibility contracts without moving ECStore storage metadata ownership. |
-| Migration preservation | passed | KMS endpoint URLs, query aliases, request bodies, response contracts, and dedicated `kms:*` authorization behavior are preserved; event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, OBS metrics state reads, IAM config/notification/error semantics, Swift bucket metadata access, heal disk/resume/task behavior, scanner lifecycle/replication/data-usage behavior, RustFS startup/admin/app/storage runtime access, e2e/test/fuzz import behavior, lifecycle expiration/transition helper DTO field contracts, unchanged no-op handling, and remove-event behavior are preserved. |
-| Testing/verification | passed | Focused compiles/tests, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed for the current slice. |
+| Quality/architecture | passed | S-015 removes obsolete KMS admin policy action variants after the handler fallback cleanup; API-042/API-043/API-044/API-045/API-046/API-047/API-048/API-049/API-050/API-051 narrow notify, S3 Select, OBS, IAM, Swift, heal, scanner, RustFS runtime, test, fuzz, lifecycle helper, and harness compatibility contracts without moving ECStore storage metadata ownership. |
+| Migration preservation | passed | KMS endpoint URLs, query aliases, request bodies, response contracts, and dedicated `kms:*` authorization behavior are preserved; event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, OBS metrics state reads, IAM config/notification/error semantics, Swift bucket metadata access, heal disk/resume/task behavior, scanner lifecycle/replication/data-usage behavior, RustFS startup/admin/app/storage runtime access, e2e/test/fuzz import behavior, lifecycle expiration/transition helper DTO field contracts, flattened harness alias behavior, unchanged no-op handling, and remove-event behavior are preserved. |
+| Testing/verification | passed | Focused compiles/tests, fuzz target compile, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed for the current slice. |
 
 ## Verification Notes
 
@@ -1596,6 +1613,24 @@ Passed before push:
   - Rust risk scan: passed; no new unwrap/expect, panic/todo/unsafe, risky
     casts, ad-hoc error construction, or sensitive-token handling in added
     lines.
+  - `make pre-commit`: passed.
+
+- API-051 current slice:
+  - `cargo check --tests -p e2e_test -p rustfs-heal -p rustfs-scanner`:
+    passed.
+  - `cargo check --manifest-path fuzz/Cargo.toml --all-targets`: passed.
+  - `cargo test -p rustfs-heal --test endpoint_index_test test_endpoint_index_settings --no-fail-fast`:
+    passed.
+  - `cargo test -p rustfs-scanner --test lifecycle_integration_test --no-run`:
+    passed.
+  - `cargo test -p e2e_test --no-run`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: passed; only existing test `unwrap` calls were touched by
+    import path rewrites, with no new unwrap/expect, panic/todo/unsafe, risky
+    casts, ad-hoc error construction, or sensitive-token handling semantics.
   - `make pre-commit`: passed.
 
 - S-015 current slice:
