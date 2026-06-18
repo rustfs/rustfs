@@ -365,6 +365,16 @@ fn build_rebalance_stop_propagation_status(meta: &RebalanceMeta) -> RebalanceSto
     }
 }
 
+fn build_rebalance_admin_status(now: OffsetDateTime, disk_stats: &[DiskStat], meta: &RebalanceMeta) -> RebalanceAdminStatus {
+    let stop_time = meta.stopped_at;
+    RebalanceAdminStatus {
+        id: meta.id.clone(),
+        stopped_at: meta.stopped_at,
+        pools: build_rebalance_pool_statuses(now, stop_time, meta.percent_free_goal, &meta.pool_stats, disk_stats),
+        stop_propagation: build_rebalance_stop_propagation_status(meta),
+    }
+}
+
 pub struct RebalanceStart {}
 
 #[async_trait::async_trait]
@@ -627,14 +637,8 @@ impl Operation for RebalanceStatus {
             disk_stats[disk.pool_index as usize].total_space += disk.total_space;
         }
 
-        let stop_time = meta.stopped_at;
         let now = OffsetDateTime::now_utc();
-        let admin_status = RebalanceAdminStatus {
-            id: meta.id.clone(),
-            stopped_at: meta.stopped_at,
-            pools: build_rebalance_pool_statuses(now, stop_time, meta.percent_free_goal, &meta.pool_stats, &disk_stats),
-            stop_propagation: build_rebalance_stop_propagation_status(&meta),
-        };
+        let admin_status = build_rebalance_admin_status(now, &disk_stats, &meta);
 
         let data = serde_json::to_string(&admin_status)
             .map_err(|e| s3_error!(InternalError, "failed to serialize rebalance status response: {}", e))?;
@@ -869,9 +873,9 @@ mod rebalance_handler_tests {
     use super::calculate_rebalance_progress;
     use super::{
         RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, RebalanceStopPropagationStatus,
-        build_rebalance_pool_statuses, build_rebalance_stop_propagation_status, rebalance_pool_used, rebalance_query_present,
-        rebalance_remaining_buckets, rebalance_rollback_stop_failure_message, rebalance_start_rollback_error, rebalance_used_pct,
-        rollback_result_label,
+        build_rebalance_admin_status, build_rebalance_pool_statuses, build_rebalance_stop_propagation_status,
+        rebalance_pool_used, rebalance_query_present, rebalance_remaining_buckets, rebalance_rollback_stop_failure_message,
+        rebalance_start_rollback_error, rebalance_used_pct, rollback_result_label,
     };
     use rustfs_ecstore::rebalance::{
         DiskStat, RebalStatus, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta, RebalanceStats,
@@ -1316,6 +1320,93 @@ mod rebalance_handler_tests {
         assert!(json.contains("\"stoppedAt\":null"));
         assert!(json.contains("\"stopPropagation\""));
         assert!(json.contains("\"pendingTerminalReload\":false"));
+    }
+
+    #[test]
+    fn test_build_rebalance_admin_status_is_stable_for_same_persisted_meta() {
+        let started = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+        let disk_stats = vec![
+            DiskStat {
+                total_space: 2_000,
+                available_space: 1_000,
+            },
+            DiskStat {
+                total_space: 2_000,
+                available_space: 1_500,
+            },
+        ];
+        let meta = RebalanceMeta {
+            id: "rebalance-id".to_string(),
+            percent_free_goal: 0.6,
+            pool_stats: vec![
+                RebalanceStats {
+                    participating: true,
+                    init_capacity: 2_000,
+                    init_free_space: 500,
+                    buckets: vec!["bucket-a".to_string(), "bucket-b".to_string()],
+                    rebalanced_buckets: vec!["bucket-a".to_string()],
+                    bucket: "bucket-b".to_string(),
+                    object: "object.txt".to_string(),
+                    num_objects: 10,
+                    num_versions: 12,
+                    bytes: 300,
+                    info: RebalanceInfo {
+                        status: RebalStatus::Started,
+                        start_time: Some(started),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                RebalanceStats {
+                    participating: false,
+                    info: RebalanceInfo {
+                        status: RebalStatus::Completed,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let first = build_rebalance_admin_status(OffsetDateTime::from_unix_timestamp(1_030).unwrap(), &disk_stats, &meta);
+        let second = build_rebalance_admin_status(OffsetDateTime::from_unix_timestamp(1_060).unwrap(), &disk_stats, &meta);
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.stopped_at, second.stopped_at);
+        assert_eq!(first.stop_propagation.failed_peers, second.stop_propagation.failed_peers);
+        assert_eq!(first.pools.len(), second.pools.len());
+        for (left, right) in first.pools.iter().zip(second.pools.iter()) {
+            assert_eq!(left.id, right.id);
+            assert_eq!(left.status, right.status);
+            assert_eq!(left.stopping, right.stopping);
+            assert_eq!(left.used, right.used);
+            assert_eq!(left.last_error, right.last_error);
+            assert_eq!(left.cleanup_warnings.count, right.cleanup_warnings.count);
+            assert_eq!(
+                left.progress.as_ref().map(|progress| (
+                    progress.num_objects,
+                    progress.num_versions,
+                    progress.bytes,
+                    progress.remaining_buckets,
+                    progress.bucket.as_str(),
+                    progress.object.as_str()
+                )),
+                right.progress.as_ref().map(|progress| (
+                    progress.num_objects,
+                    progress.num_versions,
+                    progress.bytes,
+                    progress.remaining_buckets,
+                    progress.bucket.as_str(),
+                    progress.object.as_str()
+                ))
+            );
+        }
+
+        assert_ne!(
+            first.pools[0].progress.as_ref().map(|progress| progress.elapsed),
+            second.pools[0].progress.as_ref().map(|progress| progress.elapsed)
+        );
     }
 
     #[test]
