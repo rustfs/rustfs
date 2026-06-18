@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::store_api::{
+pub(crate) use rustfs_ecstore as ecstore;
+
+use ecstore::store_api::{
     GetObjectReader as EcstoreGetObjectReader, ObjectInfo as EcstoreObjectInfo, ObjectOptions as EcstoreObjectOptions,
 };
 

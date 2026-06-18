@@ -27,6 +27,16 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 
+use crate::storage_compat::ecstore::bucket::{
+    metadata::{
+        BUCKET_TABLE_CATALOG_META_PREFIX, BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG,
+        BUCKET_TABLE_RESERVED_PREFIX, table_catalog_path_hash,
+    },
+    metadata_sys,
+};
+use crate::storage_compat::ecstore::disk::RUSTFS_META_BUCKET;
+use crate::storage_compat::ecstore::error::{Error as EcstoreError, StorageError};
+use crate::storage_compat::ecstore::set_disk::get_lock_acquire_timeout;
 use bytes::Bytes;
 use datafusion::{
     arrow::datatypes::SchemaRef,
@@ -34,16 +44,6 @@ use datafusion::{
 };
 use http::HeaderMap;
 use metrics::{counter, histogram};
-use rustfs_ecstore::bucket::{
-    metadata::{
-        BUCKET_TABLE_CATALOG_META_PREFIX, BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG,
-        BUCKET_TABLE_RESERVED_PREFIX, table_catalog_path_hash,
-    },
-    metadata_sys,
-};
-use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
-use rustfs_ecstore::error::{Error as EcstoreError, StorageError};
-use rustfs_ecstore::set_disk::get_lock_acquire_timeout;
 use rustfs_filemeta::FileInfo;
 use rustfs_storage_api::{
     HTTPPreconditions, HTTPRangeSpec, ListObjectVersionsInfo as StorageListObjectVersionsInfo,
@@ -7541,7 +7541,7 @@ mod tests {
             .map(|(bucket, _)| bucket.as_str())
             .collect::<BTreeSet<_>>();
 
-        assert_eq!(object_buckets, BTreeSet::from([rustfs_ecstore::disk::RUSTFS_META_BUCKET]));
+        assert_eq!(object_buckets, BTreeSet::from([crate::storage_compat::ecstore::disk::RUSTFS_META_BUCKET]));
     }
 
     #[tokio::test]
@@ -10409,7 +10409,7 @@ mod tests {
             .unwrap();
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
         backend
-            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &idempotency_path, 1)
+            .fail_put_attempt(crate::storage_compat::ecstore::disk::RUSTFS_META_BUCKET, &idempotency_path, 1)
             .await;
 
         let err = store
@@ -10459,7 +10459,7 @@ mod tests {
             .unwrap();
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
         backend
-            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &commit_path, 2)
+            .fail_put_attempt(crate::storage_compat::ecstore::disk::RUSTFS_META_BUCKET, &commit_path, 2)
             .await;
 
         let request = TableCommitRequest {
@@ -10514,7 +10514,7 @@ mod tests {
             .unwrap();
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
         backend
-            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &commit_path, 2)
+            .fail_put_attempt(crate::storage_compat::ecstore::disk::RUSTFS_META_BUCKET, &commit_path, 2)
             .await;
 
         let result = store
@@ -10568,7 +10568,7 @@ mod tests {
             .unwrap();
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
         backend
-            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &commit_path, 2)
+            .fail_put_attempt(crate::storage_compat::ecstore::disk::RUSTFS_META_BUCKET, &commit_path, 2)
             .await;
 
         store
@@ -10622,7 +10622,7 @@ mod tests {
             .unwrap();
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
         backend
-            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &commit_path, 2)
+            .fail_put_attempt(crate::storage_compat::ecstore::disk::RUSTFS_META_BUCKET, &commit_path, 2)
             .await;
 
         store
@@ -10673,7 +10673,7 @@ mod tests {
         backend.seed_object(bucket, &current_metadata, b"{}".to_vec()).await;
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
         backend
-            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &table_path, 2)
+            .fail_put_attempt(crate::storage_compat::ecstore::disk::RUSTFS_META_BUCKET, &table_path, 2)
             .await;
 
         let err = store
@@ -10730,7 +10730,7 @@ mod tests {
             .unwrap();
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
         backend
-            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &idempotency_path, 2)
+            .fail_put_attempt(crate::storage_compat::ecstore::disk::RUSTFS_META_BUCKET, &idempotency_path, 2)
             .await;
 
         let result = store

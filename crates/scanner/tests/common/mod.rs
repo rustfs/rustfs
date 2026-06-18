@@ -12,6 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use rustfs_ecstore as ecstore;
-
-pub type NotifyObjectInfo = ecstore::store_api::ObjectInfo;
+pub(crate) mod storage_compat;

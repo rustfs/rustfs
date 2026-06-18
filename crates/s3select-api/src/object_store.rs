@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::storage_compat::ecstore::error::{
+    StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
+};
+use crate::storage_compat::ecstore::resolve_object_store_handle;
+use crate::storage_compat::ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
+use crate::storage_compat::ecstore::store::ECStore;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
@@ -25,10 +31,6 @@ use object_store::{
 };
 use pin_project_lite::pin_project;
 use rustfs_common::DEFAULT_DELIMITER;
-use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
-use rustfs_ecstore::resolve_object_store_handle;
-use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
-use rustfs_ecstore::store::ECStore;
 use rustfs_storage_api::{HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
 use s3s::S3Result;
 use s3s::dto::SelectObjectContentInput;

@@ -13,5 +13,3 @@
 // limitations under the License.
 
 pub(crate) use rustfs_ecstore as ecstore;
-
-pub type NotifyObjectInfo = ecstore::store_api::ObjectInfo;

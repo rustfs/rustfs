@@ -81,8 +81,8 @@ use crate::metrics::stats_collector::{
     collect_ilm_metric_stats, collect_internode_network_stats, collect_process_metric_bundle, collect_replication_stats,
     collect_scanner_metric_stats, collect_system_cpu_and_memory_stats_with,
 };
+use crate::storage_compat::ecstore::global::get_global_bucket_monitor;
 use rustfs_audit::audit_target_metrics;
-use rustfs_ecstore::global::get_global_bucket_monitor;
 use rustfs_notify::{notification_metrics_snapshot, notification_target_metrics};
 use rustfs_utils::get_env_opt_u64;
 use serde::Serialize;

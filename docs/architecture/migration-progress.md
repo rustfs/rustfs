@@ -5,20 +5,21 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-app-storage-admin-runtime-boundaries`
-- Baseline: rebased onto `origin/main` at
-  `bdb2461b5594f736cbbcd3788f12d39966c2ec78` after
-  `rustfs/rustfs#3571` merged.
+- Branch: `overtrue/arch-test-harness-fuzz-storage-boundaries`
+- Baseline: `origin/main` after `rustfs/rustfs#3572` merged as
+  `8313767f75f694cb8cf1fb47e5c0f44dfc5bf2b8`.
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: no migration behavior change expected; CI follow-up
   preserves empty-object erasure recovery by avoiding zero-byte SIMD decode.
-- Rust code changes: add app-, storage-, and admin-local ECStore compatibility
-  boundaries and route existing direct runtime imports through those deliberate
-  boundary modules. ECStore-owned definitions and runtime behavior stay in
-  ECStore.
+- Rust code changes: add RustFS root, observability, IAM, test harness, and
+  fuzz ECStore compatibility boundaries; extend notify and S3 Select
+  boundaries; route runtime, server, startup, capacity, table catalog, obs,
+  notify, S3 Select, IAM, scanner/heal integration tests, e2e helpers, and
+  fuzz direct ECStore imports through local boundaries. ECStore-owned
+  definitions and runtime behavior stay in ECStore.
 - CI/script changes: none.
-- Docs changes: record the larger DTO consumer-boundary cleanup slice and the
-  empty-object erasure recovery CI follow-up.
+- Docs changes: record the larger runtime/observability/select/IAM plus test
+  harness/fuzz boundary cleanup slice.
 
 ## Phase 0 Tasks
 
@@ -882,6 +883,47 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
     full pre-commit, and required three-expert review passed.
 
+- [x] `API-031` Clean runtime, observability, S3 Select, notify, and IAM
+  ECStore runtime boundaries.
+  - Current branch: `overtrue/arch-runtime-observability-select-boundaries`.
+  - Completed slice: add RustFS root, obs, and IAM compatibility boundary
+    modules; extend notify and S3 Select compatibility modules; migrate direct
+    `rustfs_ecstore` imports in RustFS startup/server/runtime/table-catalog
+    code plus obs, notify, S3 Select, and IAM through those local boundaries.
+  - Acceptance: direct `rustfs_ecstore` references in those source areas are
+    limited to local compatibility boundary modules; runtime and crate business
+    modules consume local compatibility names.
+  - Must preserve: startup ordering, readiness/RPC behavior, capacity metrics,
+    table catalog object I/O behavior, notification config persistence, S3
+    Select object-store reads, IAM storage/error mapping, and observability
+    metrics collection behavior.
+  - Risk defense: this slice changes import ownership only; it does not move
+    ECStore definitions, alter runtime control flow, adjust readiness checks,
+    mutate table catalog metadata, change IAM policy behavior, or alter notify,
+    S3 Select, or obs runtime semantics.
+  - Verification: focused compile, direct import scan, migration/layer guards,
+    formatting, diff hygiene, Rust risk scan, full pre-commit, and required
+    three-expert review passed.
+
+- [x] `API-032` Clean test harness and fuzz ECStore compatibility boundaries.
+  - Current branch: `overtrue/arch-test-harness-fuzz-storage-boundaries`.
+  - Completed slice: add scanner/heal integration test, e2e test, and fuzz
+    target compatibility boundary modules; migrate direct `rustfs_ecstore`
+    imports in those test/fuzz harnesses through local boundaries.
+  - Acceptance: direct `rustfs_ecstore` references in scanner/heal integration
+    tests, e2e test helpers, and fuzz targets are limited to local
+    compatibility boundary modules; test and fuzz modules consume local
+    compatibility names.
+  - Must preserve: scanner lifecycle integration behavior, heal integration and
+    bug-fix test behavior, e2e node/grpc/replication helpers, fuzz target input
+    shape, and existing ECStore-owned concrete type ownership.
+  - Risk defense: this slice changes import ownership only; it does not move
+    ECStore definitions, alter test setup semantics, change fuzz inputs, adjust
+    runtime control flow, or mutate metadata formats.
+  - Verification: focused scanner/heal/e2e compile, fuzz target compile,
+    migration/layer guards, formatting check, diff hygiene, direct import scan,
+    risk scan, full pre-commit, and required three-expert review passed.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -1152,44 +1194,52 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 1. `pure-move`/`consumer-migration`: continue larger cleanup slices with the
    loss-prevention guards active for remaining ECStore compatibility contracts
-   outside the app/storage/admin scanner/heal/Swift boundaries already cleaned.
+   outside the app/storage/admin scanner/heal/Swift/runtime/obs/notify/S3
+   Select/IAM boundaries already cleaned.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | App, storage, and admin source modules now use local compatibility boundaries for ECStore runtime imports. |
-| Migration preservation | passed | ECStore remains the owner of backing types and behavior; app usecases, storage ECFS/SSE/RPC, and admin handlers/services keep existing semantics. |
-| Testing/verification | passed | Direct app/storage/admin import scan, RustFS test compile check, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Runtime, server, startup, table catalog, obs, notify, S3 Select, IAM, scanner/heal integration tests, e2e helpers, and fuzz targets now use local compatibility boundaries for ECStore runtime imports. |
+| Migration preservation | passed | ECStore remains the owner of backing types and behavior; startup/readiness, table catalog, notify, S3 Select, IAM, obs, test harness, and fuzz semantics are unchanged. |
+| Testing/verification | passed | Focused scanner/heal/e2e and fuzz compile checks, guards, formatting check, diff hygiene, risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
 Passed before push:
 
-- `cargo check --tests -p rustfs`: passed.
-- `rg -n 'rustfs_ecstore' rustfs/src/app rustfs/src/storage rustfs/src/admin --glob '*.rs'`:
-  remaining matches are deliberate app/storage/admin compatibility boundary
-  definitions.
+- `cargo check --tests -p rustfs -p rustfs-obs -p rustfs-notify -p rustfs-s3select-api -p rustfs-iam`:
+  passed.
+- `cargo check --tests -p rustfs-scanner -p rustfs-heal -p e2e_test`:
+  passed.
+- `cargo check --manifest-path fuzz/Cargo.toml --bins`: passed.
+- `rg -n 'rustfs_ecstore' rustfs/src crates/obs/src crates/notify/src crates/s3select-api/src crates/iam/src --glob '*.rs'`:
+  remaining matches are deliberate compatibility boundary definitions.
+- Direct import scan for target scanner/heal/e2e/fuzz paths: passed; remaining
+  matches are deliberate compatibility boundary definitions.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
 - `cargo fmt --all --check`: passed.
 - `git diff --check`: passed.
-- Rust risk scan: reviewed mechanical path-only hits on existing
-  `unwrap`/`expect` and numeric-cast lines; no new risky logic was introduced.
+- Rust risk scan: reviewed added `.unwrap()` matches as preserved test setup
+  unwraps caused by path rewrite formatting; no new risky behavior added.
 - `make pre-commit`: passed.
 
 Notes:
 
-- This slice was prepared on the API-029 boundary and rebased onto main after
-  `rustfs/rustfs#3571` merged.
-- Direct app/storage/admin ECStore imports now remain only in their
-  compatibility boundary modules.
-- The slice does not alter app usecase behavior, storage behavior, admin
-  behavior, object I/O behavior, metadata serialization, or ECStore definitions.
+- This larger slice is based on `origin/main` after `rustfs/rustfs#3572`
+  merged.
+- Direct ECStore imports in the target runtime/obs/notify/S3 Select/IAM and
+  scanner/heal/e2e/fuzz areas now remain only in local compatibility boundary
+  modules.
+- The slice does not alter startup behavior, readiness behavior, table catalog
+  object I/O, notification persistence, S3 Select reads, IAM error mapping,
+  observability metrics, test/fuzz semantics, or ECStore definitions.
 
 ## Handoff Notes
 
 - Continue with larger consumer-migration batches outside the cleaned
-  app/storage/admin/scanner/heal/Swift runtime boundaries; keep ECStore-owned
-  behavior in ECStore until concrete behavior is isolated enough for a
-  pure-move slice.
+  app/storage/admin/scanner/heal/Swift/runtime/obs/notify/S3 Select/IAM/test
+  and fuzz boundaries; keep ECStore-owned behavior in ECStore until concrete
+  behavior is isolated enough for a pure-move slice.
