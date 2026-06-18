@@ -16,10 +16,10 @@ use super::interfaces::{
     BucketMetadataInterface, BufferConfigInterface, EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface,
     NotifyInterface, RegionInterface, ServerConfigInterface, TierConfigInterface,
 };
+use crate::app::storage_compat::EndpointServerPools;
 use crate::app::storage_compat::bucket::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
-use crate::app::storage_compat::endpoints::EndpointServerPools;
-use crate::app::storage_compat::global::{get_global_endpoints_opt, get_global_region, get_global_tier_config_mgr};
 use crate::app::storage_compat::tier::tier::TierConfigMgr;
+use crate::app::storage_compat::{get_global_endpoints_opt, get_global_region, get_global_tier_config_mgr};
 use crate::config::{RustFSBufferConfig, get_global_buffer_config};
 use async_trait::async_trait;
 use rustfs_config::server_config::Config;

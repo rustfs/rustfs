@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::admin::storage_compat::{
+    ECStore,
     bucket::{metadata::table_catalog_path_hash, metadata_sys},
-    store::ECStore,
 };
 use crate::admin::{
     auth::{AdminResourceScope, validate_admin_request, validate_admin_request_with_bucket_object},

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_compat::endpoints::EndpointServerPools;
+use crate::storage_compat::EndpointServerPools;
 use rustfs_config::{
     DEFAULT_RUSTFS_UNSUPPORTED_FS_POLICY, ENV_RUSTFS_UNSUPPORTED_FS_POLICY, RUSTFS_UNSUPPORTED_FS_POLICY_FAIL,
     RUSTFS_UNSUPPORTED_FS_POLICY_WARN,

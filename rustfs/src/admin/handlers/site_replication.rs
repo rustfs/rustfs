@@ -18,6 +18,7 @@ use crate::admin::site_replication_identity::{
     canonical_endpoint, deployment_id_for_endpoint, normalize_peer_map_by_identity_with, same_identity_endpoint,
     site_identity_key,
 };
+use crate::admin::storage_compat::Error as StorageError;
 use crate::admin::storage_compat::bucket::bucket_target_sys::BucketTargetSys;
 use crate::admin::storage_compat::bucket::metadata::{
     BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE, BUCKET_REPLICATION_CONFIG,
@@ -30,10 +31,7 @@ use crate::admin::storage_compat::bucket::target::{ARN, BucketTarget, BucketTarg
 use crate::admin::storage_compat::bucket::utils::{deserialize, serialize};
 use crate::admin::storage_compat::bucket::versioning::VersioningApi;
 use crate::admin::storage_compat::config::com::{delete_config, read_config, save_config};
-use crate::admin::storage_compat::error::Error as StorageError;
-use crate::admin::storage_compat::global::{
-    get_global_deployment_id, get_global_endpoints_opt, get_global_region, global_rustfs_port,
-};
+use crate::admin::storage_compat::{get_global_deployment_id, get_global_endpoints_opt, get_global_region, global_rustfs_port};
 use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
 use crate::app::context::resolve_object_store_handle;
 use crate::auth::{check_key_valid, get_session_token};
@@ -654,7 +652,7 @@ async fn site_replication_peer_client() -> S3Result<reqwest::Client> {
     built
 }
 
-fn runtime_tls_enabled_with(endpoints: Option<&crate::admin::storage_compat::endpoints::EndpointServerPools>) -> bool {
+fn runtime_tls_enabled_with(endpoints: Option<&crate::admin::storage_compat::EndpointServerPools>) -> bool {
     if !rustfs_utils::get_env_str(ENV_RUSTFS_TLS_PATH, DEFAULT_RUSTFS_TLS_PATH).is_empty() {
         return true;
     }
@@ -4576,8 +4574,8 @@ impl Operation for SRRotateServiceAccountHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::storage_compat::disk::endpoint::Endpoint;
-    use crate::admin::storage_compat::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+    use crate::admin::storage_compat::Endpoint;
+    use crate::admin::storage_compat::{EndpointServerPools, Endpoints, PoolEndpoints};
     use http::{HeaderMap, HeaderValue, Uri};
     use rustfs_common::{get_global_outbound_tls_generation, set_global_outbound_tls_generation};
     use rustfs_policy::policy::action::S3Action;

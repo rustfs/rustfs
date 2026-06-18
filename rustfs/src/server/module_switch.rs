@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::storage_compat::{
+    EcstoreError as StorageError,
     config::com::{read_config, save_config},
-    error::Error as StorageError,
     resolve_object_store_handle,
 };
 use serde::{Deserialize, Serialize};

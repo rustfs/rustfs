@@ -14,6 +14,7 @@
 
 use crate::admin::storage_compat::bucket::utils::{deserialize, serialize};
 use crate::admin::storage_compat::{
+    StorageError,
     bucket::{
         metadata::{
             BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE,
@@ -24,7 +25,6 @@ use crate::admin::storage_compat::{
         quota::BucketQuota,
         target::BucketTargets,
     },
-    error::StorageError,
 };
 use crate::{
     admin::{

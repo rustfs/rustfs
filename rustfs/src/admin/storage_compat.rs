@@ -27,57 +27,28 @@ pub(crate) mod config {
     pub(crate) use rustfs_ecstore::config::{com, init, set_global_storage_class, storageclass};
 }
 
-pub(crate) mod data_usage {
-    pub(crate) use rustfs_ecstore::data_usage::load_data_usage_from_backend;
-}
-
-pub(crate) mod disk {
-    pub(crate) use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
-    #[cfg(test)]
-    pub(crate) use rustfs_ecstore::disk::endpoint;
-}
-
-pub(crate) mod endpoints {
-    pub(crate) use rustfs_ecstore::endpoints::EndpointServerPools;
-    #[cfg(test)]
-    pub(crate) use rustfs_ecstore::endpoints::{Endpoints, PoolEndpoints};
-}
-
-pub(crate) mod error {
-    pub(crate) use rustfs_ecstore::error::{Error, StorageError};
-}
-
-pub(crate) mod global {
-    pub(crate) use rustfs_ecstore::global::{
-        GLOBAL_BOOT_TIME, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt, get_global_region,
-        global_rustfs_port,
-    };
-}
-
-pub(crate) mod metrics_realtime {
-    pub(crate) use rustfs_ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
-}
-
-pub(crate) mod notification_sys {
-    pub(crate) use rustfs_ecstore::notification_sys::get_global_notification_sys;
-}
+pub(crate) use rustfs_ecstore::data_usage::load_data_usage_from_backend;
+pub(crate) use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::disk::endpoint::Endpoint;
+pub(crate) use rustfs_ecstore::endpoints::EndpointServerPools;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::endpoints::{Endpoints, PoolEndpoints};
+pub(crate) use rustfs_ecstore::error::{Error, StorageError};
+pub(crate) use rustfs_ecstore::global::{
+    GLOBAL_BOOT_TIME, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt, get_global_region,
+    global_rustfs_port,
+};
+pub(crate) use rustfs_ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
+pub(crate) use rustfs_ecstore::notification_sys::get_global_notification_sys;
+pub(crate) use rustfs_ecstore::rpc::PeerRestClient;
+pub(crate) use rustfs_ecstore::store::ECStore;
+pub(crate) use rustfs_ecstore::store_utils::is_reserved_or_invalid_bucket;
 
 pub(crate) mod rebalance {
     pub(crate) use rustfs_ecstore::rebalance::{DiskStat, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStats};
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::rebalance::{RebalStatus, RebalanceInfo};
-}
-
-pub(crate) mod rpc {
-    pub(crate) use rustfs_ecstore::rpc::PeerRestClient;
-}
-
-pub(crate) mod store {
-    pub(crate) use rustfs_ecstore::store::ECStore;
-}
-
-pub(crate) mod store_utils {
-    pub(crate) use rustfs_ecstore::store_utils::is_reserved_or_invalid_bucket;
 }
 
 pub(crate) mod tier {

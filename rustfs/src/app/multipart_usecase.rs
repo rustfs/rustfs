@@ -16,6 +16,7 @@
 
 use crate::app::context::{AppContext, get_global_app_context, resolve_object_store_handle_for_context};
 use crate::app::object_usecase::{build_put_like_object_lock_metadata, validate_existing_object_lock_for_write};
+use crate::app::storage_compat::ECStore;
 use crate::app::storage_compat::bucket::quota::checker::QuotaChecker;
 use crate::app::storage_compat::bucket::{
     lifecycle::{bucket_lifecycle_audit::LcEventSrc, bucket_lifecycle_ops::enqueue_transition_immediate},
@@ -26,12 +27,11 @@ use crate::app::storage_compat::bucket::{
 };
 use crate::app::storage_compat::client::object_api_utils::to_s3s_etag;
 use crate::app::storage_compat::compress::is_disk_compressible;
-use crate::app::storage_compat::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
+use crate::app::storage_compat::is_valid_storage_class;
 #[cfg(test)]
 use crate::app::storage_compat::rio::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
 use crate::app::storage_compat::rio::{HashReader, WritePlan};
-use crate::app::storage_compat::set_disk::is_valid_storage_class;
-use crate::app::storage_compat::store::ECStore;
+use crate::app::storage_compat::{StorageError, is_err_object_not_found, is_err_version_not_found};
 use crate::capacity::record_capacity_write;
 use crate::error::ApiError;
 use crate::storage::access::has_bypass_governance_header;
@@ -479,7 +479,7 @@ impl DefaultMultipartUsecase {
                         ));
                     }
                     // Update quota tracking after successful multipart upload
-                    crate::app::storage_compat::data_usage::record_bucket_object_write_memory(
+                    crate::app::storage_compat::record_bucket_object_write_memory(
                         &bucket,
                         previous_current_size,
                         obj_info.size.max(0) as u64,

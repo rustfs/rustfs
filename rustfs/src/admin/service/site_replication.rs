@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::admin::site_replication_identity::{deployment_id_for_endpoint, normalize_peer_map_by_identity_with};
+use crate::admin::storage_compat::Error as StorageError;
 use crate::admin::storage_compat::config::com::{read_config, save_config};
-use crate::admin::storage_compat::error::Error as StorageError;
 use crate::app::context::resolve_object_store_handle;
 use rustfs_madmin::PeerInfo;
 use s3s::{S3Error, S3ErrorCode, S3Result};

@@ -15,14 +15,11 @@
 use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};
 use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::app::storage_compat::{
+    ECStore, Endpoint, EndpointServerPools, Endpoints, GLOBAL_TierConfigMgr, PoolEndpoints,
     bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, OBJECT_LOCK_CONFIG},
     bucket::metadata_sys,
     client::object_api_utils::to_s3s_etag,
     client::transition_api::{ReadCloser, ReaderImpl},
-    disk::endpoint::Endpoint,
-    endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
-    global::GLOBAL_TierConfigMgr,
-    store::ECStore,
     tier::{
         tier_config::{TierConfig, TierType},
         warm_backend::{WarmBackend, WarmBackendGetOpts},
@@ -113,7 +110,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
 
     let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
 
-    crate::app::storage_compat::store::init_local_disks(endpoint_pools.clone())
+    crate::app::storage_compat::init_local_disks(endpoint_pools.clone())
         .await
         .unwrap();
 

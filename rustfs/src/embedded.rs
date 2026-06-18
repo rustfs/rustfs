@@ -51,20 +51,15 @@ use crate::init::{add_bucket_notification_configuration, init_buffer_profile_sys
 use crate::server::{ShutdownHandle, shutdown_event_notifier, start_http_server, stop_audit_system};
 use crate::startup_fs_guard::enforce_unsupported_fs_policy;
 use crate::startup_iam::{bootstrap_or_defer_iam_init, publish_ready_for_iam_bootstrap};
-use crate::storage_compat::store::init_lock_clients;
+use crate::storage_compat::init_lock_clients;
 use crate::storage_compat::{
+    ECStore, EndpointServerPools,
     bucket::replication::init_background_replication,
     bucket::{
         metadata_sys::init_bucket_metadata_sys,
         migration::{try_migrate_bucket_metadata, try_migrate_iam_config},
     },
-    config as ecconfig,
-    endpoints::EndpointServerPools,
-    global::set_global_rustfs_port,
-    set_global_endpoints,
-    store::ECStore,
-    store::init_local_disks,
-    update_erasure_type,
+    config as ecconfig, init_local_disks, set_global_endpoints, set_global_rustfs_port, update_erasure_type,
 };
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
@@ -333,7 +328,7 @@ impl RustFSServerBuilder {
             let region = region_str
                 .parse()
                 .map_err(|e| ServerError::Init(format!("invalid region '{region_str}': {e}")))?;
-            crate::storage_compat::global::set_global_region(region);
+            crate::storage_compat::set_global_region(region);
         }
 
         let server_port = server_addr.port();

@@ -13,15 +13,13 @@
 // limitations under the License.
 
 use crate::storage_compat::{
+    ECStore, EndpointServerPools,
     bucket::{
         metadata_sys::init_bucket_metadata_sys,
         migration::{try_migrate_bucket_metadata, try_migrate_iam_config},
         replication::get_global_replication_pool,
     },
-    endpoints::EndpointServerPools,
-    global::shutdown_background_services,
-    notification_sys::new_global_notification_sys,
-    store::ECStore,
+    new_global_notification_sys, shutdown_background_services,
 };
 use crate::{
     config::Config,
@@ -597,14 +595,14 @@ where
     start_audit().await
 }
 
-pub async fn init_notification_system(endpoint_pools: EndpointServerPools) -> crate::storage_compat::error::Result<()> {
+pub async fn init_notification_system(endpoint_pools: EndpointServerPools) -> crate::storage_compat::EcstoreResult<()> {
     init_notification_system_with(|| new_global_notification_sys(endpoint_pools)).await
 }
 
-async fn init_notification_system_with<InitFn, InitFuture>(init_notification: InitFn) -> crate::storage_compat::error::Result<()>
+async fn init_notification_system_with<InitFn, InitFuture>(init_notification: InitFn) -> crate::storage_compat::EcstoreResult<()>
 where
     InitFn: FnOnce() -> InitFuture,
-    InitFuture: Future<Output = crate::storage_compat::error::Result<()>>,
+    InitFuture: Future<Output = crate::storage_compat::EcstoreResult<()>>,
 {
     init_notification().await
 }
@@ -662,7 +660,7 @@ mod tests {
 
     #[tokio::test]
     async fn notification_system_returns_source_error() {
-        let result = init_notification_system_with(|| async { Err(crate::storage_compat::error::Error::FaultyDisk) }).await;
+        let result = init_notification_system_with(|| async { Err(crate::storage_compat::EcstoreError::FaultyDisk) }).await;
 
         assert!(result.is_err());
     }
