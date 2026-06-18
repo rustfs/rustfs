@@ -152,4 +152,7 @@ mod namespace_lock_quorum_test;
 #[cfg(test)]
 mod admin_timeout_regression_test;
 
+#[cfg(test)]
+mod overwrite_cleanup_regression_test;
+
 pub mod tls_gen;
