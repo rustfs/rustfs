@@ -10481,9 +10481,7 @@ mod tests {
             .await
             .unwrap();
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
-        backend
-            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &commit_path, 2)
-            .await;
+        backend.fail_put_attempt(RUSTFS_META_BUCKET, &commit_path, 2).await;
 
         store
             .commit_table(TableCommitRequest {
