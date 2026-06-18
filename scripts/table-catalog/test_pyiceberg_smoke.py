@@ -753,11 +753,25 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             self.assertIn("status", entry)
             self.assertIn("roadmap_area", entry)
 
+    def test_production_readiness_inventory_tracks_catalog_backing(self) -> None:
+        inventory = pyiceberg_smoke.production_readiness_inventory()
+        capabilities = {entry["capability"] for entry in inventory}
+
+        self.assertIn("strong-catalog-backing", capabilities)
+        self.assertIn("single-active-writer-ha", capabilities)
+        self.assertIn("scale-validation-matrix", capabilities)
+        strong_backing = next(entry for entry in inventory if entry["capability"] == "strong-catalog-backing")
+        self.assertEqual(strong_backing["status"], "migration-contract-supported")
+        for entry in inventory:
+            self.assertIn("status", entry)
+            self.assertIn("validation", entry)
+
     def test_published_table_catalog_docs_do_not_use_internal_roadmap_labels(self) -> None:
         readme = (SCRIPT_DIR / "README.md").read_text(encoding="utf-8")
 
         self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(readme))
         self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(str(pyiceberg_smoke.unsupported_inventory())))
+        self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(str(pyiceberg_smoke.production_readiness_inventory())))
 
 
 if __name__ == "__main__":

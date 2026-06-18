@@ -5193,9 +5193,17 @@ impl Operation for SyncExternalCatalogBridgeHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableMetadataLocationAction).await?;
-        let request = read_json_body::<ExternalCatalogBridgeSyncRequest>(req.input).await?;
         let metadata_backend = table_catalog_backend()?;
         let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        if store
+            .load_table(&warehouse, &namespace.public_name(), &table)
+            .await
+            .map_err(catalog_store_error)?
+            .is_none()
+        {
+            authorize_table_catalog_resource_request(&req, &resource, AdminAction::RegisterTableAction).await?;
+        }
+        let request = read_json_body::<ExternalCatalogBridgeSyncRequest>(req.input).await?;
         let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
         let response = sync_external_catalog_bridge_response(
             &store,
@@ -5473,6 +5481,16 @@ mod tests {
                 "{handler} should not bypass catalog resource auth"
             );
         }
+
+        let sync_bridge_block = operation_block(src, "SyncExternalCatalogBridgeHandler");
+        assert!(
+            sync_bridge_block.contains("AdminAction::RegisterTableAction"),
+            "external catalog sync should require register authorization before creating a missing table"
+        );
+        assert!(
+            sync_bridge_block.contains(".load_table(&warehouse, &namespace.public_name(), &table)"),
+            "external catalog sync should branch authorization on current table existence"
+        );
 
         for (handler, action) in [
             ("RestLoadTableHandler", "AdminAction::GetTableMetadataAction"),

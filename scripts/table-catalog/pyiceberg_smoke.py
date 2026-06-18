@@ -178,6 +178,24 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
     },
 ]
 
+PRODUCTION_READINESS_INVENTORY: list[dict[str, str]] = [
+    {
+        "capability": "strong-catalog-backing",
+        "status": "migration-contract-supported",
+        "validation": "catalog export and diagnostics expose an object-backed manifest, recoverable commit-log WAL state, strong-kv-wal migration target, required migration steps, and recovery blockers before cutover",
+    },
+    {
+        "capability": "single-active-writer-ha",
+        "status": "policy-published",
+        "validation": "diagnostics publish single-active-writer-region semantics, linearizable leader-read requirements for commits, read-only replica limits, and explicit no active-active support",
+    },
+    {
+        "capability": "scale-validation-matrix",
+        "status": "matrix-published",
+        "validation": "required validation scenarios are machine-readable: concurrent commit CAS, commit-log recovery replay, migration snapshot replay, stale replica read guards, and long-running client conformance",
+    },
+]
+
 
 @dataclass(frozen=True)
 class RuntimeDeps:
@@ -223,6 +241,10 @@ def client_matrix() -> list[dict[str, str]]:
 
 def unsupported_inventory() -> list[dict[str, str]]:
     return [entry.copy() for entry in UNSUPPORTED_INVENTORY]
+
+
+def production_readiness_inventory() -> list[dict[str, str]]:
+    return [entry.copy() for entry in PRODUCTION_READINESS_INVENTORY]
 
 
 def normalized_rest_path(rest_path: str) -> str:
@@ -278,6 +300,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--print-client-matrix", action="store_true", help="Print the current client conformance matrix as JSON and exit.")
     parser.add_argument("--print-vendor-profiles", action="store_true", help="Print vendor connection profile references as JSON and exit.")
     parser.add_argument("--print-unsupported-inventory", action="store_true", help="Print unsupported capability inventory as JSON and exit.")
+    parser.add_argument(
+        "--print-production-readiness",
+        action="store_true",
+        help="Print catalog backing, HA, and scale-readiness inventory as JSON and exit.",
+    )
     return apply_profile_defaults(parser.parse_args())
 
 
@@ -699,6 +726,9 @@ def printed_metadata(args: argparse.Namespace) -> bool:
         printed = True
     if args.print_unsupported_inventory:
         print_json_document({"unsupported_inventory": unsupported_inventory()})
+        printed = True
+    if args.print_production_readiness:
+        print_json_document({"production_readiness": production_readiness_inventory()})
         printed = True
     return printed
 
