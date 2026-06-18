@@ -3936,17 +3936,22 @@ mod rebalance_unit_tests {
     use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
     use crate::disk::RUSTFS_META_BUCKET;
+    use crate::disk::endpoint::Endpoint;
+    use crate::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::error::{Error, Result};
     use crate::pools::{PoolDecommissionInfo, PoolMeta, PoolStatus};
+    use crate::store::ECStore;
     use rustfs_filemeta::FileInfo;
     use rustfs_filemeta::TRANSITION_COMPLETE;
     use rustfs_rio::Index;
     use s3s::dto::ReplicationConfiguration;
     use serde::Serialize;
+    use std::fs;
     use std::io::Cursor;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tempfile::TempDir;
     use time::OffsetDateTime;
     use tokio::sync::mpsc;
     use tokio::time::Duration;
@@ -4002,6 +4007,74 @@ mod rebalance_unit_tests {
         percent_free_goal: f64,
         #[serde(rename = "rss")]
         pool_stats: Vec<LegacyRebalanceStats>,
+    }
+
+    async fn new_rebalance_test_store(pool_count: usize, drives_per_pool: usize) -> (TempDir, Arc<ECStore>) {
+        let temp_dir = TempDir::new().expect("create temp dir for rebalance store test");
+        let mut pools = Vec::with_capacity(pool_count);
+
+        for pool_idx in 0..pool_count {
+            let mut endpoints = Vec::with_capacity(drives_per_pool);
+            for disk_idx in 0..drives_per_pool {
+                let disk_path = temp_dir.path().join(format!("pool-{pool_idx}/disk-{disk_idx}"));
+                fs::create_dir_all(&disk_path).expect("create temp disk directory for rebalance store test");
+                let mut endpoint = Endpoint::try_from(disk_path.to_str().expect("temp disk path should be valid utf8"))
+                    .expect("temp disk endpoint should parse");
+                endpoint.set_pool_index(pool_idx);
+                endpoint.set_set_index(0);
+                endpoint.set_disk_index(disk_idx);
+                endpoints.push(endpoint);
+            }
+
+            pools.push(PoolEndpoints {
+                legacy: false,
+                set_count: 1,
+                drives_per_set: drives_per_pool,
+                endpoints: Endpoints::from(endpoints),
+                cmd_line: format!("rebalance-test-pool-{pool_idx}"),
+                platform: "test".to_string(),
+            });
+        }
+
+        let endpoint_pools = EndpointServerPools::from(pools);
+        crate::store::init_local_disks(endpoint_pools.clone())
+            .await
+            .expect("initialize local disks for rebalance store test");
+        let store = ECStore::new(
+            "127.0.0.1:0".parse().expect("test address should parse"),
+            endpoint_pools,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("create rebalance test store");
+
+        (temp_dir, store)
+    }
+
+    fn started_rebalance_meta(id: &str, pool_count: usize) -> RebalanceMeta {
+        let mut pool_stats = Vec::with_capacity(pool_count);
+        for pool_idx in 0..pool_count {
+            pool_stats.push(RebalanceStats {
+                participating: pool_idx == 0,
+                info: if pool_idx == 0 {
+                    RebalanceInfo {
+                        start_time: Some(OffsetDateTime::UNIX_EPOCH),
+                        status: RebalStatus::Started,
+                        ..Default::default()
+                    }
+                } else {
+                    RebalanceInfo::default()
+                },
+                ..Default::default()
+            });
+        }
+
+        RebalanceMeta {
+            id: id.to_string(),
+            percent_free_goal: 0.5,
+            pool_stats,
+            ..Default::default()
+        }
     }
 
     struct MigrationBackendSpy {
@@ -5113,6 +5186,37 @@ mod rebalance_unit_tests {
         let err = resolve_rebalance_meta_save_result(Err(Error::DecommissionAlreadyRunning), "init_rebalance_meta")
             .expect_err("decommission conflict should be preserved");
         assert!(matches!(err, Error::DecommissionAlreadyRunning));
+    }
+
+    #[tokio::test]
+    async fn test_save_new_rebalance_meta_rejects_persisted_active_operation() {
+        let (_temp_dir, store) = new_rebalance_test_store(2, 4).await;
+        let pool = store
+            .pools
+            .first()
+            .cloned()
+            .expect("rebalance test store should have a first pool");
+
+        let first = started_rebalance_meta("rebalance-a", store.pools.len());
+        store
+            .save_new_rebalance_meta(pool.clone(), &first, "first rebalance start")
+            .await
+            .expect("first rebalance metadata save should succeed");
+
+        let second = started_rebalance_meta("rebalance-b", store.pools.len());
+        let err = store
+            .save_new_rebalance_meta(pool.clone(), &second, "second rebalance start")
+            .await
+            .expect_err("second coordinator must observe persisted active rebalance");
+
+        assert!(matches!(err, Error::RebalanceAlreadyRunning));
+
+        let mut persisted = RebalanceMeta::new();
+        persisted
+            .load(pool)
+            .await
+            .expect("persisted rebalance metadata should remain readable");
+        assert_eq!(persisted.id, "rebalance-a");
     }
 
     #[test]
