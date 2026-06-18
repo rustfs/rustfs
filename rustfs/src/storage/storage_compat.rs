@@ -13,10 +13,11 @@
 // limitations under the License.
 
 pub(crate) mod ecstore {
-    #![allow(unused_imports)]
-
     pub(crate) use rustfs_ecstore::{
-        admin_server_info, bucket, client, config, disk, error, get_global_lock_client, global, metrics_realtime,
+        admin_server_info, bucket, client, disk, error, get_global_lock_client, global, metrics_realtime,
         resolve_object_store_handle, rio, rpc, set_disk, store, store_api,
     };
+
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::config;
 }

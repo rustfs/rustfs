@@ -13,8 +13,6 @@
 // limitations under the License.
 
 mod ecstore {
-    #![allow(unused_imports)]
-
     pub(super) use rustfs_ecstore::{bucket, error, resolve_object_store_handle, store, store_api};
 }
 use self::ecstore::{

@@ -5,18 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-remaining-storage-compat-exports`
-- Baseline: `rustfs/rustfs#3576` head
-  `8255bd68539dc3c8cfc07a0ceb783ead67a02453`.
+- Branch: `overtrue/arch-compat-reexport-prune`
+- Baseline: `origin/main` after `rustfs/rustfs#3578`
+  (`f3fcdd4ba26181e3fe5d3afb6d6f5510bb9ad186`).
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: no migration behavior change expected.
-- Rust code changes: narrow remaining scanner, heal, Swift, and IAM store
-  ECStore compatibility boundary modules from direct ECStore imports to explicit
-  local `ecstore` re-export surfaces. ECStore-owned definitions and runtime
-  behavior stay in ECStore.
-- CI/script changes: none.
-- Docs changes: record the remaining compatibility export surface cleanup
-  slice.
+- Rust code changes: prune unused ECStore compatibility re-export allowances
+  from production and fuzz compatibility boundaries, keep target-specific test
+  harness exceptions explicit, and gate test-only RustFS storage compatibility
+  re-exports with `cfg(test)`.
+- CI/script changes: add a migration guard rejecting production
+  `storage_compat.rs` unused-import allows.
+- Docs changes: record the compatibility re-export pruning slice.
 
 ## Phase 0 Tasks
 
@@ -40,7 +40,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     public storage-api re-export coverage, ECStore compatibility-test coverage,
     and a production-source guard against reintroducing the removed
     `StorageAPI` aggregate facade identifier; add a source guard that rejects
-    direct `rustfs_ecstore` imports outside compatibility boundary modules.
+    direct `rustfs_ecstore` imports outside compatibility boundary modules; add
+    a guard that rejects production compatibility boundaries hiding unused
+    ECStore re-exports.
   - Acceptance: architecture migration rules fail if the public storage-api
     contract re-export surface drifts or if ECStore compile-time compatibility
     tests for the remaining storage-admin and namespace-lock contracts are
@@ -963,6 +965,28 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration/layer guards, formatting check, diff hygiene, direct import scan,
     risk scan, full pre-commit, and required three-expert review passed.
 
+- [x] `API-035` Prune compatibility re-export allowances.
+  - Current branch: `overtrue/arch-compat-reexport-prune`.
+  - Current slice: remove unused-import allowances from production and fuzz
+    ECStore compatibility boundary modules, keep target-specific test harness
+    exceptions explicit, gate test-only RustFS storage compatibility re-exports
+    with `cfg(test)`, and add a migration rule preventing production
+    compatibility boundaries from hiding unused ECStore re-exports.
+  - Acceptance: production and fuzz `storage_compat.rs` modules compile without
+    unused-import allows, test-only compatibility exceptions remain scoped to
+    harnesses with target-specific compile needs, and migration rules reject
+    reintroducing broad unused-import allowances in production compatibility
+    boundaries.
+  - Must preserve: all ECStore-owned concrete types and runtime behavior,
+    startup/storage/admin/app/Swift/scanner/heal/IAM/notify/obs/S3 Select
+    import paths, test harness behavior, and fuzz target behavior.
+  - Risk defense: this slice changes only compatibility boundary re-export
+    hygiene and migration guard coverage; it does not move definitions, alter
+    runtime control flow, mutate metadata formats, or change storage behavior.
+  - Verification: focused compile checks, fuzz manifest compile, migration and
+    layer guards, formatting check, diff hygiene, risk scan, full pre-commit,
+    and required three-expert review passed.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -1239,9 +1263,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Scanner, heal, Swift, and IAM store now keep direct ECStore references inside local compatibility boundary modules with existing local semantic aliases preserved; guard coverage rejects new bypasses. |
-| Migration preservation | passed | ECStore remains the owner of backing types and behavior; scanner, heal, Swift, and IAM runtime semantics are unchanged. |
-| Testing/verification | passed | Focused scanner/heal/IAM compile, Swift feature compile, guards, formatting check, diff hygiene, risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Production compatibility boundaries no longer hide unused ECStore re-exports behind broad unused-import allows; target-specific test exceptions remain scoped. |
+| Migration preservation | passed | ECStore remains the owner of backing types and behavior; this slice only changes compatibility-boundary hygiene and guard coverage. |
+| Testing/verification | passed | Focused compile checks, fuzz manifest compile, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
@@ -1250,6 +1274,9 @@ Passed before push:
 - `cargo check --tests -p rustfs-scanner -p rustfs-heal -p rustfs-iam`:
   passed.
 - `cargo check --tests -p rustfs-protocols --features swift`: passed.
+- `cargo check --tests -p rustfs -p rustfs-scanner -p rustfs-heal -p rustfs-iam -p rustfs-notify -p rustfs-obs -p rustfs-s3select-api -p e2e_test`:
+  passed.
+- `cargo check --manifest-path fuzz/Cargo.toml --bins`: passed.
 - `rg -n 'rustfs_ecstore' crates/scanner/src crates/heal/src crates/protocols/src/swift crates/iam/src/store --glob '*.rs'`:
   remaining matches are deliberate compatibility boundary definitions.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
