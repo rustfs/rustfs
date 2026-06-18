@@ -14,12 +14,10 @@
 
 use crate::error::{Error, Result, is_err_data_movement_overwrite, is_err_object_not_found, is_err_version_not_found};
 use crate::store::ECStore;
-use crate::store_api::{
-    GetObjectReader, MultipartOperations, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, PutObjReader,
-};
+use crate::store_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use bytes::Bytes;
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex};
-use rustfs_storage_api::CompletePart;
+use rustfs_storage_api::{CompletePart, MultipartOperations as _, ObjectIO as _, ObjectOperations as _};
 use rustfs_utils::path::encode_dir_object;
 use std::io::Cursor;
 use std::pin::Pin;

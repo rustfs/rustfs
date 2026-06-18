@@ -40,11 +40,11 @@ use rustfs_ecstore::{
         versioning_sys::BucketVersioningSys,
     },
     error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
-    store_api::{ObjectOperations, ObjectOptions},
+    store_api::ObjectOptions,
 };
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
-use rustfs_storage_api::{BucketOperations, BucketOptions, ObjectLockRetentionOptions};
+use rustfs_storage_api::{BucketOperations, BucketOptions, ObjectLockRetentionOptions, ObjectOperations as _};
 use rustfs_targets::EventName;
 use rustfs_utils::http::headers::{
     AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,

@@ -57,6 +57,7 @@ STORE_API_OBJECT_HELPER_REEXPORTS_FILE="${TMP_DIR}/store_api_object_helper_reexp
 STORE_API_RANGE_HELPER_REEXPORTS_FILE="${TMP_DIR}/store_api_range_helper_reexports.txt"
 STORE_API_LIST_HELPER_REEXPORTS_FILE="${TMP_DIR}/store_api_list_helper_reexports.txt"
 STORE_API_LIST_RESPONSE_REEXPORTS_FILE="${TMP_DIR}/store_api_list_response_reexports.txt"
+STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE="${TMP_DIR}/store_api_object_operation_local_method_hits.txt"
 
 awk '
   /^## PR Types$/ {
@@ -203,6 +204,10 @@ require_source_line \
   "storage-api public list response contract re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
+  "pub use object::{MultipartOperations, ObjectIO, ObjectOperations};" \
+  "storage-api public object operation contract re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
   "pub use object::{ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState};" \
   "storage-api public object precondition contract re-export"
 require_source_line \
@@ -293,6 +298,28 @@ if [[ -s "$STORE_API_LIST_RESPONSE_REEXPORTS_FILE" ]]; then
   report_failure "old ecstore store_api list response path reintroduced: $(paste -sd '; ' "$STORE_API_LIST_RESPONSE_REEXPORTS_FILE")"
 fi
 
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'async fn (get_object_reader|put_object|get_object_info|verify_object_integrity|copy_object|delete_object_version|delete_object|delete_objects|put_object_metadata|get_object_tags|put_object_tags|delete_object_tags|add_partial|transition_object|restore_transitioned_object|list_multipart_uploads|new_multipart_upload|copy_object_part|put_object_part|get_multipart_info|list_object_parts|abort_multipart_upload|complete_multipart_upload)\b' \
+    crates/ecstore/src/store_api/traits.rs || true
+) >"$STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE"
+
+if [[ -s "$STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE" ]]; then
+  report_failure "old ecstore object/multipart operation method signatures reintroduced: $(paste -sd '; ' "$STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE")"
+fi
+
+require_source_contains \
+  "crates/ecstore/src/store_api/traits.rs" \
+  "rustfs_storage_api::ObjectIO<" \
+  "ECStore ObjectIO compatibility binding"
+require_source_contains \
+  "crates/ecstore/src/store_api/traits.rs" \
+  "rustfs_storage_api::ObjectOperations<" \
+  "ECStore ObjectOperations compatibility binding"
+require_source_contains \
+  "crates/ecstore/src/store_api/traits.rs" \
+  "rustfs_storage_api::MultipartOperations<" \
+  "ECStore MultipartOperations compatibility binding"
 require_source_contains \
   "crates/ecstore/src/store_api/traits.rs" \
   "pub trait NamespaceLocking: Send + Sync + Debug + 'static" \
