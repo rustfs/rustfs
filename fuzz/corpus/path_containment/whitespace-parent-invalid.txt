@@ -1,0 +1,4 @@
+valid-bucket
+safe/path
+escape
+leading_ws,parent_segment,trailing_ws
