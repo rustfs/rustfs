@@ -67,6 +67,9 @@ PRODUCTION_UNUSED_COMPAT_ALLOW_HITS_FILE="${TMP_DIR}/production_unused_compat_al
 BROAD_STORE_API_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/broad_store_api_compat_reexport_hits.txt"
 NESTED_STORE_API_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/nested_store_api_compat_module_hits.txt"
 UNAPPROVED_STORE_API_COMPAT_ALIAS_HITS_FILE="${TMP_DIR}/unapproved_store_api_compat_alias_hits.txt"
+ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE="${TMP_DIR}/ecstore_compat_passthrough_expected.txt"
+ECSTORE_COMPAT_PASSTHROUGH_ACTUAL_FILE="${TMP_DIR}/ecstore_compat_passthrough_actual.txt"
+ECSTORE_COMPAT_PASSTHROUGH_DIFF_FILE="${TMP_DIR}/ecstore_compat_passthrough_diff.txt"
 
 awk '
   /^## PR Types$/ {
@@ -418,6 +421,148 @@ fi
 
 if [[ -s "$UNAPPROVED_STORE_API_COMPAT_ALIAS_HITS_FILE" ]]; then
   report_failure "storage compatibility boundaries may only keep explicit ECStore-owned store_api type aliases: $(paste -sd '; ' "$UNAPPROVED_STORE_API_COMPAT_ALIAS_HITS_FILE")"
+fi
+
+cat >"$ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE" <<'EOF'
+crates/e2e_test/src/storage_compat.rs:bucket
+crates/e2e_test/src/storage_compat.rs:disk
+crates/e2e_test/src/storage_compat.rs:rpc
+crates/heal/src/heal/storage_compat.rs:data_usage
+crates/heal/src/heal/storage_compat.rs:disk
+crates/heal/src/heal/storage_compat.rs:error
+crates/heal/src/heal/storage_compat.rs:global
+crates/heal/src/heal/storage_compat.rs:store
+crates/heal/tests/common/storage_compat.rs:bucket
+crates/heal/tests/common/storage_compat.rs:disk
+crates/heal/tests/common/storage_compat.rs:endpoints
+crates/heal/tests/common/storage_compat.rs:store
+crates/iam/src/storage_compat.rs:config
+crates/iam/src/storage_compat.rs:error
+crates/iam/src/storage_compat.rs:global
+crates/iam/src/storage_compat.rs:notification_sys
+crates/iam/src/storage_compat.rs:store
+crates/notify/src/storage_compat.rs:config
+crates/notify/src/storage_compat.rs:global
+crates/obs/src/storage_compat.rs:bucket
+crates/obs/src/storage_compat.rs:data_usage
+crates/obs/src/storage_compat.rs:global
+crates/obs/src/storage_compat.rs:pools
+crates/obs/src/storage_compat.rs:resolve_object_store_handle
+crates/protocols/src/swift/storage_compat.rs:bucket
+crates/protocols/src/swift/storage_compat.rs:error
+crates/protocols/src/swift/storage_compat.rs:resolve_object_store_handle
+crates/protocols/src/swift/storage_compat.rs:store
+crates/s3select-api/src/storage_compat.rs:error
+crates/s3select-api/src/storage_compat.rs:resolve_object_store_handle
+crates/s3select-api/src/storage_compat.rs:set_disk
+crates/s3select-api/src/storage_compat.rs:store
+crates/scanner/src/storage_compat.rs:bucket
+crates/scanner/src/storage_compat.rs:cache_value
+crates/scanner/src/storage_compat.rs:config
+crates/scanner/src/storage_compat.rs:data_usage
+crates/scanner/src/storage_compat.rs:disk
+crates/scanner/src/storage_compat.rs:error
+crates/scanner/src/storage_compat.rs:global
+crates/scanner/src/storage_compat.rs:pools
+crates/scanner/src/storage_compat.rs:resolve_object_store_handle
+crates/scanner/src/storage_compat.rs:set_disk
+crates/scanner/src/storage_compat.rs:store
+crates/scanner/src/storage_compat.rs:store_utils
+crates/scanner/tests/common/storage_compat.rs:bucket
+crates/scanner/tests/common/storage_compat.rs:client
+crates/scanner/tests/common/storage_compat.rs:disk
+crates/scanner/tests/common/storage_compat.rs:endpoints
+crates/scanner/tests/common/storage_compat.rs:global
+crates/scanner/tests/common/storage_compat.rs:pools
+crates/scanner/tests/common/storage_compat.rs:store
+crates/scanner/tests/common/storage_compat.rs:tier
+fuzz/fuzz_targets/storage_compat.rs:bucket
+rustfs/src/admin/storage_compat.rs:bucket
+rustfs/src/admin/storage_compat.rs:client
+rustfs/src/admin/storage_compat.rs:config
+rustfs/src/admin/storage_compat.rs:data_usage
+rustfs/src/admin/storage_compat.rs:disk
+rustfs/src/admin/storage_compat.rs:endpoints
+rustfs/src/admin/storage_compat.rs:error
+rustfs/src/admin/storage_compat.rs:global
+rustfs/src/admin/storage_compat.rs:metrics_realtime
+rustfs/src/admin/storage_compat.rs:notification_sys
+rustfs/src/admin/storage_compat.rs:rebalance
+rustfs/src/admin/storage_compat.rs:rpc
+rustfs/src/admin/storage_compat.rs:store
+rustfs/src/admin/storage_compat.rs:store_utils
+rustfs/src/admin/storage_compat.rs:tier
+rustfs/src/app/storage_compat.rs:admin_server_info
+rustfs/src/app/storage_compat.rs:bucket
+rustfs/src/app/storage_compat.rs:client
+rustfs/src/app/storage_compat.rs:compress
+rustfs/src/app/storage_compat.rs:config
+rustfs/src/app/storage_compat.rs:data_usage
+rustfs/src/app/storage_compat.rs:disk
+rustfs/src/app/storage_compat.rs:endpoints
+rustfs/src/app/storage_compat.rs:error
+rustfs/src/app/storage_compat.rs:global
+rustfs/src/app/storage_compat.rs:new_object_layer_fn
+rustfs/src/app/storage_compat.rs:notification_sys
+rustfs/src/app/storage_compat.rs:pools
+rustfs/src/app/storage_compat.rs:rio
+rustfs/src/app/storage_compat.rs:set_disk
+rustfs/src/app/storage_compat.rs:set_object_store_resolver
+rustfs/src/app/storage_compat.rs:store
+rustfs/src/app/storage_compat.rs:tier
+rustfs/src/storage/storage_compat.rs:admin_server_info
+rustfs/src/storage/storage_compat.rs:bucket
+rustfs/src/storage/storage_compat.rs:client
+rustfs/src/storage/storage_compat.rs:config
+rustfs/src/storage/storage_compat.rs:disk
+rustfs/src/storage/storage_compat.rs:error
+rustfs/src/storage/storage_compat.rs:get_global_lock_client
+rustfs/src/storage/storage_compat.rs:global
+rustfs/src/storage/storage_compat.rs:metrics_realtime
+rustfs/src/storage/storage_compat.rs:resolve_object_store_handle
+rustfs/src/storage/storage_compat.rs:rio
+rustfs/src/storage/storage_compat.rs:rpc
+rustfs/src/storage/storage_compat.rs:set_disk
+rustfs/src/storage/storage_compat.rs:store
+rustfs/src/storage_compat.rs:bucket
+rustfs/src/storage_compat.rs:config
+rustfs/src/storage_compat.rs:disk
+rustfs/src/storage_compat.rs:disks_layout
+rustfs/src/storage_compat.rs:endpoints
+rustfs/src/storage_compat.rs:error
+rustfs/src/storage_compat.rs:event_notification
+rustfs/src/storage_compat.rs:global
+rustfs/src/storage_compat.rs:notification_sys
+rustfs/src/storage_compat.rs:resolve_object_store_handle
+rustfs/src/storage_compat.rs:rpc
+rustfs/src/storage_compat.rs:set_disk
+rustfs/src/storage_compat.rs:set_global_endpoints
+rustfs/src/storage_compat.rs:store
+rustfs/src/storage_compat.rs:update_erasure_type
+EOF
+sort -o "$ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE" "$ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE"
+
+(
+  cd "$ROOT_DIR"
+  find rustfs/src crates fuzz/fuzz_targets -type f -name 'storage_compat.rs' -print0 |
+    xargs -0 perl -0ne '
+      my $file = $ARGV;
+      while (/pub(?:\([^)]*\))?\s+use\s+rustfs_ecstore::\{([^}]*)\}\s*;/sg) {
+        my $items = $1;
+        for my $item (split /,/, $items) {
+          $item =~ s/^\s+|\s+$//g;
+          next if $item eq "";
+          print "$file:$item\n";
+        }
+      }
+      while (/pub(?:\([^)]*\))?\s+use\s+rustfs_ecstore::([A-Za-z_][A-Za-z0-9_]*)\s*;/g) {
+        print "$file:$1\n";
+      }
+    ' | sort
+) >"$ECSTORE_COMPAT_PASSTHROUGH_ACTUAL_FILE"
+
+if ! diff -u "$ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE" "$ECSTORE_COMPAT_PASSTHROUGH_ACTUAL_FILE" >"$ECSTORE_COMPAT_PASSTHROUGH_DIFF_FILE"; then
+  report_failure "ECStore compatibility passthrough allowlist drifted: $(tr '\n' '; ' <"$ECSTORE_COMPAT_PASSTHROUGH_DIFF_FILE")"
 fi
 
 (

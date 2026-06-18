@@ -1086,6 +1086,25 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: migration and layer guards, formatting check, diff hygiene,
     risk scan, full pre-commit, and required three-expert review passed.
 
+- [x] `API-041` Lock ECStore compatibility passthrough allowlists.
+  - Current branch: `overtrue/arch-compat-passthrough-guards`.
+  - Current slice: add a migration rule that snapshots every
+    `rustfs_ecstore` module/function passthrough exposed from local
+    `storage_compat.rs` boundaries across RustFS, scanner, heal, Swift,
+    S3 Select, IAM, notify, observability, e2e, and fuzz harnesses.
+  - Acceptance: compatibility boundaries cannot silently add or remove ECStore
+    passthrough items; future cleanup PRs must update the explicit allowlist
+    when they intentionally shrink or reshape a boundary.
+  - Must preserve: all existing local compatibility paths, ECStore concrete
+    type ownership, storage behavior, startup behavior, scanner/heal behavior,
+    Swift/S3 Select/IAM/notify behavior, observability reads, and test/fuzz
+    harness behavior.
+  - Risk defense: this is a loss-prevention guard only; it does not change
+    runtime code, storage APIs, object metadata shape, reader behavior, or
+    worker lifecycle.
+  - Verification: migration guard, formatting check, diff hygiene, risk scan,
+    focused script check, and full pre-commit required before push.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -1362,13 +1381,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Delete-object DTO ownership lives in storage-api; ECStore internal consumers use storage-api directly while public aliases remain, and store_api compatibility boundaries now expose only direct explicit contract aliases guarded by a whitelist. |
-| Migration preservation | passed | Field shape, helper semantics, delete behavior, replication scheduling, MRF delete replay, object info/options aliases, reader aliases, and old ECStore concrete type compatibility are preserved. |
-| Testing/verification | passed | Multi-crate compile, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | passed | API-041 is guard-only and snapshots local ECStore compatibility passthroughs without changing runtime boundaries. |
+| Migration preservation | passed | Existing local `storage_compat.rs` paths and ECStore concrete ownership remain unchanged; the guard only reports passthrough drift. |
+| Testing/verification | passed | Script syntax, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- API-041 current slice:
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: passed; no Rust code changed.
+  - `make pre-commit`: passed.
 
 - API-040 current slice:
   - `./scripts/check_architecture_migration_rules.sh`: passed.
