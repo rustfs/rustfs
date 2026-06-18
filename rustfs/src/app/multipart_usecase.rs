@@ -1340,6 +1340,7 @@ mod tests {
         AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
     };
     use std::{collections::HashMap, io::Cursor};
+    use temp_env::async_with_vars;
     use tokio::io::AsyncReadExt;
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
@@ -1455,172 +1456,182 @@ mod tests {
 
     #[tokio::test]
     async fn managed_multipart_roundtrip_preserves_session_nonce_between_parts() {
-        let prepare_request = PrepareEncryptionRequest {
-            bucket: "bucket",
-            key: "object",
-            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
-            ssekms_key_id: None,
-            ssekms_context: None,
-            sse_customer_algorithm: None,
-            sse_customer_key: None,
-            sse_customer_key_md5: None,
-        };
-        let session_material = sse_prepare_encryption(prepare_request)
-            .await
-            .expect("prepare multipart encryption")
-            .expect("managed multipart session material");
-        let mut session_metadata = encryption_material_to_metadata(&session_material);
-        mark_encrypted_multipart_metadata(&mut session_metadata);
+        let local_sse_master_key = base64_simd::STANDARD.encode_to_string([0x24u8; 32]);
+        async_with_vars(
+            [
+                ("__RUSTFS_SSE_SIMPLE_CMK", None::<String>),
+                ("RUSTFS_SSE_S3_MASTER_KEY", Some(local_sse_master_key)),
+            ],
+            async {
+                let prepare_request = PrepareEncryptionRequest {
+                    bucket: "bucket",
+                    key: "object",
+                    server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+                    ssekms_key_id: None,
+                    ssekms_context: None,
+                    sse_customer_algorithm: None,
+                    sse_customer_key: None,
+                    sse_customer_key_md5: None,
+                };
+                let session_material = sse_prepare_encryption(prepare_request)
+                    .await
+                    .expect("prepare multipart encryption")
+                    .expect("managed multipart session material");
+                let mut session_metadata = encryption_material_to_metadata(&session_material);
+                mark_encrypted_multipart_metadata(&mut session_metadata);
 
-        let part_one_plaintext = vec![0x31; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE + 23];
-        let part_two_plaintext = vec![0x32; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE * 2 + 7];
+                let part_one_plaintext = vec![0x31; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE + 23];
+                let part_two_plaintext = vec![0x32; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE * 2 + 7];
 
-        let part_one_material = sse_decryption(DecryptionRequest {
-            bucket: "bucket",
-            key: "object",
-            metadata: &session_metadata,
-            sse_customer_key: None,
-            sse_customer_key_md5: None,
-        })
-        .await
-        .expect("decrypt session one")
-        .expect("part one material");
-        let mut encrypted_one = Vec::new();
-        #[cfg(feature = "rio-v2")]
-        let mut part_one_reader = match part_one_material.key_kind {
-            crate::storage::sse::EncryptionKeyKind::Object => EncryptReader::new_multipart_with_object_key(
-                Cursor::new(part_one_plaintext.clone()),
-                part_one_material.key_bytes,
-                1,
-            ),
-            crate::storage::sse::EncryptionKeyKind::Direct => EncryptReader::new_multipart(
-                Cursor::new(part_one_plaintext.clone()),
-                part_one_material.key_bytes,
-                part_one_material.base_nonce,
-                1,
-            ),
-        };
-        #[cfg(not(feature = "rio-v2"))]
-        let mut part_one_reader = EncryptReader::new_multipart(
-            Cursor::new(part_one_plaintext.clone()),
-            part_one_material.key_bytes,
-            part_one_material.base_nonce,
-            1,
-        );
-        part_one_reader
-            .read_to_end(&mut encrypted_one)
-            .await
-            .expect("read encrypted part one");
+                let part_one_material = sse_decryption(DecryptionRequest {
+                    bucket: "bucket",
+                    key: "object",
+                    metadata: &session_metadata,
+                    sse_customer_key: None,
+                    sse_customer_key_md5: None,
+                })
+                .await
+                .expect("decrypt session one")
+                .expect("part one material");
+                let mut encrypted_one = Vec::new();
+                #[cfg(feature = "rio-v2")]
+                let mut part_one_reader = match part_one_material.key_kind {
+                    crate::storage::sse::EncryptionKeyKind::Object => EncryptReader::new_multipart_with_object_key(
+                        Cursor::new(part_one_plaintext.clone()),
+                        part_one_material.key_bytes,
+                        1,
+                    ),
+                    crate::storage::sse::EncryptionKeyKind::Direct => EncryptReader::new_multipart(
+                        Cursor::new(part_one_plaintext.clone()),
+                        part_one_material.key_bytes,
+                        part_one_material.base_nonce,
+                        1,
+                    ),
+                };
+                #[cfg(not(feature = "rio-v2"))]
+                let mut part_one_reader = EncryptReader::new_multipart(
+                    Cursor::new(part_one_plaintext.clone()),
+                    part_one_material.key_bytes,
+                    part_one_material.base_nonce,
+                    1,
+                );
+                part_one_reader
+                    .read_to_end(&mut encrypted_one)
+                    .await
+                    .expect("read encrypted part one");
 
-        let part_two_material = sse_decryption(DecryptionRequest {
-            bucket: "bucket",
-            key: "object",
-            metadata: &session_metadata,
-            sse_customer_key: None,
-            sse_customer_key_md5: None,
-        })
-        .await
-        .expect("decrypt session two")
-        .expect("part two material");
-        let mut encrypted_two = Vec::new();
-        #[cfg(feature = "rio-v2")]
-        let mut part_two_reader = match part_two_material.key_kind {
-            crate::storage::sse::EncryptionKeyKind::Object => EncryptReader::new_multipart_with_object_key(
-                Cursor::new(part_two_plaintext.clone()),
-                part_two_material.key_bytes,
-                2,
-            ),
-            crate::storage::sse::EncryptionKeyKind::Direct => EncryptReader::new_multipart(
-                Cursor::new(part_two_plaintext.clone()),
-                part_two_material.key_bytes,
-                part_two_material.base_nonce,
-                2,
-            ),
-        };
-        #[cfg(not(feature = "rio-v2"))]
-        let mut part_two_reader = EncryptReader::new_multipart(
-            Cursor::new(part_two_plaintext.clone()),
-            part_two_material.key_bytes,
-            part_two_material.base_nonce,
-            2,
-        );
-        part_two_reader
-            .read_to_end(&mut encrypted_two)
-            .await
-            .expect("read encrypted part two");
+                let part_two_material = sse_decryption(DecryptionRequest {
+                    bucket: "bucket",
+                    key: "object",
+                    metadata: &session_metadata,
+                    sse_customer_key: None,
+                    sse_customer_key_md5: None,
+                })
+                .await
+                .expect("decrypt session two")
+                .expect("part two material");
+                let mut encrypted_two = Vec::new();
+                #[cfg(feature = "rio-v2")]
+                let mut part_two_reader = match part_two_material.key_kind {
+                    crate::storage::sse::EncryptionKeyKind::Object => EncryptReader::new_multipart_with_object_key(
+                        Cursor::new(part_two_plaintext.clone()),
+                        part_two_material.key_bytes,
+                        2,
+                    ),
+                    crate::storage::sse::EncryptionKeyKind::Direct => EncryptReader::new_multipart(
+                        Cursor::new(part_two_plaintext.clone()),
+                        part_two_material.key_bytes,
+                        part_two_material.base_nonce,
+                        2,
+                    ),
+                };
+                #[cfg(not(feature = "rio-v2"))]
+                let mut part_two_reader = EncryptReader::new_multipart(
+                    Cursor::new(part_two_plaintext.clone()),
+                    part_two_material.key_bytes,
+                    part_two_material.base_nonce,
+                    2,
+                );
+                part_two_reader
+                    .read_to_end(&mut encrypted_two)
+                    .await
+                    .expect("read encrypted part two");
 
-        if session_material.key_kind == crate::storage::sse::EncryptionKeyKind::Object {
-            assert!(session_metadata.contains_key("X-Minio-Internal-Encrypted-Multipart"));
-            assert!(session_metadata.contains_key("X-Minio-Internal-Server-Side-Encryption-S3-Sealed-Key"));
-        } else {
-            assert!(session_metadata.contains_key("x-rustfs-encryption-iv"));
-        }
+                if session_material.key_kind == crate::storage::sse::EncryptionKeyKind::Object {
+                    assert!(session_metadata.contains_key("X-Minio-Internal-Encrypted-Multipart"));
+                    assert!(session_metadata.contains_key("X-Minio-Internal-Server-Side-Encryption-S3-Sealed-Key"));
+                } else {
+                    assert!(session_metadata.contains_key("x-rustfs-encryption-iv"));
+                }
 
-        let parts = vec![
-            ObjectPartInfo {
-                number: 1,
-                size: encrypted_one.len(),
-                actual_size: part_one_plaintext.len() as i64,
-                ..Default::default()
+                let parts = vec![
+                    ObjectPartInfo {
+                        number: 1,
+                        size: encrypted_one.len(),
+                        actual_size: part_one_plaintext.len() as i64,
+                        ..Default::default()
+                    },
+                    ObjectPartInfo {
+                        number: 2,
+                        size: encrypted_two.len(),
+                        actual_size: part_two_plaintext.len() as i64,
+                        ..Default::default()
+                    },
+                ];
+
+                let mut encrypted_stream = Vec::with_capacity(encrypted_one.len() + encrypted_two.len());
+                encrypted_stream.extend_from_slice(&encrypted_one);
+                encrypted_stream.extend_from_slice(&encrypted_two);
+
+                let decryption_material = sse_decryption(DecryptionRequest {
+                    bucket: "bucket",
+                    key: "object",
+                    metadata: &session_metadata,
+                    sse_customer_key: None,
+                    sse_customer_key_md5: None,
+                })
+                .await
+                .expect("decrypt multipart")
+                .expect("managed decryption material");
+
+                let plaintext_size = multipart_plaintext_size(&parts, -1);
+                #[cfg(feature = "rio-v2")]
+                let decrypted_stream = match decryption_material.key_kind {
+                    crate::storage::sse::EncryptionKeyKind::Object => boxed_reader(DecryptReader::new_multipart_with_object_key(
+                        wrap_reader(Cursor::new(encrypted_stream)),
+                        decryption_material.key_bytes,
+                        multipart_part_numbers(&parts),
+                    )),
+                    crate::storage::sse::EncryptionKeyKind::Direct => boxed_reader(DecryptReader::new_multipart(
+                        wrap_reader(Cursor::new(encrypted_stream)),
+                        decryption_material.key_bytes,
+                        decryption_material.base_nonce,
+                        multipart_part_numbers(&parts),
+                    )),
+                };
+                #[cfg(not(feature = "rio-v2"))]
+                let decrypted_stream = boxed_reader(DecryptReader::new_multipart(
+                    wrap_reader(Cursor::new(encrypted_stream)),
+                    decryption_material.key_bytes,
+                    decryption_material.base_nonce,
+                    multipart_part_numbers(&parts),
+                ));
+                let mut decrypted_reader = HardLimitReader::new(decrypted_stream, plaintext_size);
+
+                let mut decrypted = Vec::new();
+                decrypted_reader
+                    .read_to_end(&mut decrypted)
+                    .await
+                    .expect("read decrypted multipart data");
+
+                let mut expected = part_one_plaintext;
+                expected.extend_from_slice(&part_two_plaintext);
+
+                assert_eq!(plaintext_size, expected.len() as i64);
+                assert_eq!(decrypted, expected);
             },
-            ObjectPartInfo {
-                number: 2,
-                size: encrypted_two.len(),
-                actual_size: part_two_plaintext.len() as i64,
-                ..Default::default()
-            },
-        ];
-
-        let mut encrypted_stream = Vec::with_capacity(encrypted_one.len() + encrypted_two.len());
-        encrypted_stream.extend_from_slice(&encrypted_one);
-        encrypted_stream.extend_from_slice(&encrypted_two);
-
-        let decryption_material = sse_decryption(DecryptionRequest {
-            bucket: "bucket",
-            key: "object",
-            metadata: &session_metadata,
-            sse_customer_key: None,
-            sse_customer_key_md5: None,
-        })
-        .await
-        .expect("decrypt multipart")
-        .expect("managed decryption material");
-
-        let plaintext_size = multipart_plaintext_size(&parts, -1);
-        #[cfg(feature = "rio-v2")]
-        let decrypted_stream = match decryption_material.key_kind {
-            crate::storage::sse::EncryptionKeyKind::Object => boxed_reader(DecryptReader::new_multipart_with_object_key(
-                wrap_reader(Cursor::new(encrypted_stream)),
-                decryption_material.key_bytes,
-                multipart_part_numbers(&parts),
-            )),
-            crate::storage::sse::EncryptionKeyKind::Direct => boxed_reader(DecryptReader::new_multipart(
-                wrap_reader(Cursor::new(encrypted_stream)),
-                decryption_material.key_bytes,
-                decryption_material.base_nonce,
-                multipart_part_numbers(&parts),
-            )),
-        };
-        #[cfg(not(feature = "rio-v2"))]
-        let decrypted_stream = boxed_reader(DecryptReader::new_multipart(
-            wrap_reader(Cursor::new(encrypted_stream)),
-            decryption_material.key_bytes,
-            decryption_material.base_nonce,
-            multipart_part_numbers(&parts),
-        ));
-        let mut decrypted_reader = HardLimitReader::new(decrypted_stream, plaintext_size);
-
-        let mut decrypted = Vec::new();
-        decrypted_reader
-            .read_to_end(&mut decrypted)
-            .await
-            .expect("read decrypted multipart data");
-
-        let mut expected = part_one_plaintext;
-        expected.extend_from_slice(&part_two_plaintext);
-
-        assert_eq!(plaintext_size, expected.len() as i64);
-        assert_eq!(decrypted, expected);
+        )
+        .await;
     }
 
     #[tokio::test]
