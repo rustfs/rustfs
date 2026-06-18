@@ -1655,10 +1655,22 @@ async fn apply_managed_decryption_material(
 
     // Use factory pattern to get provider (test or production mode)
     let provider = get_sse_dek_provider().await?;
+    #[cfg(feature = "rio-v2")]
+    let decrypted_data_key = if is_legacy_rustfs_managed_metadata(&normalized_metadata) {
+        provider
+            .decrypt_legacy_sse_dek(&encrypted_data_key, &kms_key_id, &object_context)
+            .await
+    } else {
+        provider
+            .decrypt_sse_dek(&encrypted_data_key, &kms_key_id, &object_context)
+            .await
+    };
+    #[cfg(not(feature = "rio-v2"))]
     let decrypted_data_key = provider
         .decrypt_sse_dek(&encrypted_data_key, &kms_key_id, &object_context)
-        .await
-        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt data key: {e}"))))?;
+        .await;
+    let decrypted_data_key =
+        decrypted_data_key.map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt data key: {e}"))))?;
     #[cfg(feature = "rio-v2")]
     let (key_bytes, base_nonce, key_kind) = if let Some(sealed_key) = minio_sealed_key {
         (
@@ -1736,6 +1748,16 @@ pub trait SseDekProvider: Send + Sync {
         kms_key_id: &str,
         context: &ObjectEncryptionContext,
     ) -> Result<[u8; 32], ApiError>;
+
+    /// Decrypt a DEK from positively identified legacy managed metadata.
+    async fn decrypt_legacy_sse_dek(
+        &self,
+        encrypted_dek: &[u8],
+        kms_key_id: &str,
+        context: &ObjectEncryptionContext,
+    ) -> Result<[u8; 32], ApiError> {
+        self.decrypt_sse_dek(encrypted_dek, kms_key_id, context).await
+    }
 }
 
 // ============================================================================
@@ -1792,6 +1814,23 @@ impl SseDekProvider for KmsSseDekProvider {
             .decrypt_data_key(encrypted_dek, context)
             .await
             .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt data key: {}", e))))?;
+
+        Ok(data_key.plaintext_key)
+    }
+
+    async fn decrypt_legacy_sse_dek(
+        &self,
+        encrypted_dek: &[u8],
+        _kms_key_id: &str,
+        _context: &ObjectEncryptionContext,
+    ) -> Result<[u8; 32], ApiError> {
+        let service = Self::current_service()
+            .await
+            .ok_or_else(|| ApiError::from(StorageError::other("KMS encryption service is not initialized")))?;
+        let data_key = service
+            .decrypt_legacy_data_key(encrypted_dek)
+            .await
+            .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt legacy data key: {e}"))))?;
 
         Ok(data_key.plaintext_key)
     }
@@ -2113,6 +2152,14 @@ fn contains_managed_encryption_metadata(metadata: &HashMap<String, String>) -> b
         || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER)
         || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER)
         || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER)
+}
+
+#[cfg(feature = "rio-v2")]
+fn is_legacy_rustfs_managed_metadata(metadata: &HashMap<String, String>) -> bool {
+    metadata.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER)
+        && metadata.contains_key(INTERNAL_ENCRYPTION_IV_HEADER)
+        && !metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER)
+        && !metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER)
 }
 
 #[cfg(feature = "rio-v2")]
@@ -2997,6 +3044,23 @@ mod tests {
         assert!(!metadata.contains_key("x-rustfs-encryption-key"));
         assert!(!metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER));
         assert!(metadata.contains_key("content-type"));
+    }
+
+    #[cfg(feature = "rio-v2")]
+    #[test]
+    fn test_legacy_managed_metadata_excludes_sealed_keys() {
+        let legacy_metadata = HashMap::from([
+            (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), "encrypted-dek".to_string()),
+            (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), "nonce".to_string()),
+        ]);
+        assert!(is_legacy_rustfs_managed_metadata(&legacy_metadata));
+
+        let sealed_metadata = HashMap::from([
+            (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), "encrypted-dek".to_string()),
+            (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), "nonce".to_string()),
+            (MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER.to_string(), "sealed-key".to_string()),
+        ]);
+        assert!(!is_legacy_rustfs_managed_metadata(&sealed_metadata));
     }
 
     #[cfg(feature = "rio-v2")]

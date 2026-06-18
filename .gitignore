@@ -51,6 +51,8 @@ docs/*
 !docs/architecture/**
 docs/heal-scanner-logging-governance.md
 .codegraph/*
+.docker/compat/data/*
+.docker/compat/kms/*
 
 # nix stuff
 result*
