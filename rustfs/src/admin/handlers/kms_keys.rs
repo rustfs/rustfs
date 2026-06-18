@@ -24,7 +24,7 @@ use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_kms::{KmsError, init_global_kms_service_manager, types::*};
-use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
+use rustfs_policy::policy::action::{Action, KmsAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
@@ -126,27 +126,15 @@ async fn kms_encryption_service_from_context() -> Option<std::sync::Arc<rustfs_k
 }
 
 fn kms_create_key_actions() -> Vec<Action> {
-    // RUSTFS_COMPAT_TODO(S-012): keep legacy KMS create-key grants during KMS policy migration. Remove after KMS admin clients and built-in policies use kms:Configure.
-    vec![
-        Action::KmsAction(KmsAction::ConfigureAction),
-        Action::AdminAction(AdminAction::KMSCreateKeyAdminAction),
-    ]
+    vec![Action::KmsAction(KmsAction::ConfigureAction)]
 }
 
 fn kms_describe_key_actions() -> Vec<Action> {
-    // RUSTFS_COMPAT_TODO(S-012): keep legacy KMS key-status grants during KMS policy migration. Remove after KMS admin clients and built-in policies use kms:DescribeKey.
-    vec![
-        Action::KmsAction(KmsAction::DescribeKeyAction),
-        Action::AdminAction(AdminAction::KMSKeyStatusAdminAction),
-    ]
+    vec![Action::KmsAction(KmsAction::DescribeKeyAction)]
 }
 
 fn kms_list_keys_actions() -> Vec<Action> {
-    // RUSTFS_COMPAT_TODO(S-012): keep legacy KMS key-status grants during KMS policy migration. Remove after KMS admin clients and built-in policies use kms:ListKeys.
-    vec![
-        Action::KmsAction(KmsAction::ListKeysAction),
-        Action::AdminAction(AdminAction::KMSKeyStatusAdminAction),
-    ]
+    vec![Action::KmsAction(KmsAction::ListKeysAction)]
 }
 
 fn kms_generate_data_key_actions() -> Vec<Action> {
@@ -405,15 +393,15 @@ mod tests {
     fn kms_key_auth_actions_use_dedicated_kms_actions() {
         let create_actions = kms_create_key_actions();
         assert_has_action(&create_actions, Action::KmsAction(KmsAction::ConfigureAction));
-        assert_has_action(&create_actions, Action::AdminAction(AdminAction::KMSCreateKeyAdminAction));
+        assert_lacks_action(&create_actions, Action::AdminAction(AdminAction::KMSCreateKeyAdminAction));
 
         let describe_actions = kms_describe_key_actions();
         assert_has_action(&describe_actions, Action::KmsAction(KmsAction::DescribeKeyAction));
-        assert_has_action(&describe_actions, Action::AdminAction(AdminAction::KMSKeyStatusAdminAction));
+        assert_lacks_action(&describe_actions, Action::AdminAction(AdminAction::KMSKeyStatusAdminAction));
 
         let list_actions = kms_list_keys_actions();
         assert_has_action(&list_actions, Action::KmsAction(KmsAction::ListKeysAction));
-        assert_has_action(&list_actions, Action::AdminAction(AdminAction::KMSKeyStatusAdminAction));
+        assert_lacks_action(&list_actions, Action::AdminAction(AdminAction::KMSKeyStatusAdminAction));
     }
 
     #[test]
