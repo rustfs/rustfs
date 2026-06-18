@@ -1220,6 +1220,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     formatting check, diff hygiene, risk scan, full pre-commit, and required
     three-expert review required before push.
 
+- [x] `API-048` Remove RustFS runtime ECStore module passthroughs.
+  - Current branch: `overtrue/arch-rustfs-runtime-compat-boundaries`.
+  - Current slice: replace the RustFS app, admin, storage, and root runtime
+    compatibility passthrough modules with explicit local aliases and nested
+    compatibility exports, while preserving existing consumer paths.
+  - Acceptance: RustFS runtime compatibility files no longer expose broad
+    ECStore top-level module passthroughs for app/admin/storage/root runtime
+    consumers, and the passthrough guard snapshot keeps only test/fuzz
+    harness allowances.
+  - Must preserve: startup config/bootstrap behavior, server readiness checks,
+    admin replication/rebalance/tier/config handlers, app object/bucket/
+    multipart usecases, storage RPC/SSE/access paths, table catalog storage
+    access, and existing test-only harness imports.
+  - Risk defense: this is an import ownership and compatibility-boundary
+    cleanup only; ECStore remains the owner of concrete storage/runtime state
+    while RustFS runtime modules retain stable local compatibility paths.
+  - Verification: focused RustFS test compile, migration and layer guards,
+    formatting check, diff hygiene, risk scan, full pre-commit, and required
+    three-expert review passed before push.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -1496,13 +1516,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-042/API-043/API-044/API-045/API-046/API-047 narrow notify, S3 Select, OBS, IAM, Swift, heal, and scanner compatibility contracts without moving ECStore storage metadata ownership. |
-| Migration preservation | passed | Event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, OBS metrics state reads, IAM config/notification/error semantics, Swift bucket metadata access, heal disk/resume/task behavior, scanner lifecycle/replication/data-usage behavior, unchanged no-op handling, and remove-event behavior are preserved. |
+| Quality/architecture | passed | API-042/API-043/API-044/API-045/API-046/API-047/API-048 narrow notify, S3 Select, OBS, IAM, Swift, heal, scanner, and RustFS runtime compatibility contracts without moving ECStore storage metadata ownership. |
+| Migration preservation | passed | Event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, OBS metrics state reads, IAM config/notification/error semantics, Swift bucket metadata access, heal disk/resume/task behavior, scanner lifecycle/replication/data-usage behavior, RustFS startup/admin/app/storage runtime access, unchanged no-op handling, and remove-event behavior are preserved. |
 | Testing/verification | passed | Focused compiles/tests, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed for the current slice. |
 
 ## Verification Notes
 
 Passed before push:
+
+- API-048 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Rust risk scan: passed; no new unwrap/expect, panic/todo/unsafe, risky
+    casts, ad-hoc error construction, or sensitive-token handling in added
+    lines.
+  - `make pre-commit`: passed.
 
 - API-047 current slice:
   - `cargo check --tests -p rustfs-heal -p rustfs-scanner`: passed.
