@@ -14,10 +14,6 @@
 
 pub(crate) mod ecstore {
     pub(crate) use rustfs_ecstore::{config, global};
-
-    pub(crate) mod store_api {
-        pub(crate) use rustfs_ecstore::store_api::ObjectInfo;
-    }
 }
 
-pub type NotifyObjectInfo = ecstore::store_api::ObjectInfo;
+pub type NotifyObjectInfo = rustfs_ecstore::store_api::ObjectInfo;
