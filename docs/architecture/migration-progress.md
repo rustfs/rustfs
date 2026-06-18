@@ -1201,6 +1201,25 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     layer guards, formatting check, diff hygiene, risk scan, full pre-commit,
     and required three-expert review required before push.
 
+- [x] `API-047` Remove heal and scanner production ECStore module passthroughs.
+  - Current branch: `overtrue/arch-heal-scanner-compat-boundaries`.
+  - Current slice: replace heal and scanner production compatibility
+    passthrough modules with explicit local aliases and wrapper functions,
+    while leaving test-only ECStore compatibility harnesses for later cleanup.
+  - Acceptance: heal and scanner production code no longer exposes broad
+    ECStore module passthroughs for bucket/config/data-usage/disk/error/global,
+    pools, set-disk, store, or store-utils through `storage_compat.rs`.
+  - Must preserve: heal disk/resume/task behavior, scanner config persistence,
+    scanner lifecycle/replication actions, bucket cache scanning, object-store
+    resolution, erasure-mode checks, storage-class accounting, and data-usage
+    memory updates.
+  - Risk defense: this narrows import ownership only; ECStore remains the owner
+    of concrete storage/runtime state and scanner/heal keep the same local
+    compatibility names for existing call sites.
+  - Verification: focused heal/scanner compile, migration and layer guards,
+    formatting check, diff hygiene, risk scan, full pre-commit, and required
+    three-expert review required before push.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -1477,13 +1496,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-042/API-043/API-044/API-045/API-046 narrow notify, S3 Select, OBS, IAM, and Swift compatibility contracts without moving ECStore storage metadata ownership. |
-| Migration preservation | passed | Event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, OBS metrics state reads, IAM config/notification/error semantics, Swift bucket metadata access, unchanged no-op handling, and remove-event behavior are preserved. |
-| Testing/verification | passed | Focused compiles/tests, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | passed | API-042/API-043/API-044/API-045/API-046/API-047 narrow notify, S3 Select, OBS, IAM, Swift, heal, and scanner compatibility contracts without moving ECStore storage metadata ownership. |
+| Migration preservation | passed | Event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, OBS metrics state reads, IAM config/notification/error semantics, Swift bucket metadata access, heal disk/resume/task behavior, scanner lifecycle/replication/data-usage behavior, unchanged no-op handling, and remove-event behavior are preserved. |
+| Testing/verification | passed | Focused compiles/tests, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed for the current slice. |
 
 ## Verification Notes
 
 Passed before push:
+
+- API-047 current slice:
+  - `cargo check --tests -p rustfs-heal -p rustfs-scanner`: passed.
+  - `cargo test -p rustfs-heal -p rustfs-scanner`: passed, 290 tests passed
+    and 14 ignored.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: passed; the only match was a test-only scanner config init
+    re-export.
 
 - API-046 current slice:
   - `cargo check --tests -p rustfs-iam -p rustfs-protos`: passed.
