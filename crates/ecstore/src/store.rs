@@ -62,10 +62,7 @@ use crate::{
     endpoints::EndpointServerPools,
     rpc::S3PeerSys,
     sets::Sets,
-    store_api::{
-        DeletedObject, GetObjectReader, HealOperations, ListObjectsV2Info, NamespaceLocking, ObjectInfo, ObjectOptions,
-        ObjectToDelete, PutObjReader,
-    },
+    store_api::{DeletedObject, GetObjectReader, ListObjectsV2Info, ObjectInfo, ObjectOptions, ObjectToDelete, PutObjReader},
     store_init,
 };
 use futures::future::join_all;
@@ -708,7 +705,11 @@ impl rustfs_storage_api::MultipartOperations for ECStore {
 }
 
 #[async_trait::async_trait]
-impl HealOperations for ECStore {
+impl rustfs_storage_api::HealOperations for ECStore {
+    type Error = Error;
+    type HealResultItem = HealResultItem;
+    type HealOptions = HealOpts;
+
     #[instrument(skip(self))]
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
         self.handle_heal_format(dry_run).await
@@ -741,7 +742,10 @@ impl HealOperations for ECStore {
 }
 
 #[async_trait::async_trait]
-impl NamespaceLocking for ECStore {
+impl rustfs_storage_api::NamespaceLocking for ECStore {
+    type Error = Error;
+    type NamespaceLock = NamespaceLockWrapper;
+
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         self.handle_new_ns_lock(bucket, object).await
     }
