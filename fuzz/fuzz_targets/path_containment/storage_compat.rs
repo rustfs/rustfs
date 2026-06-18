@@ -12,12 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod ecstore {
-    pub(crate) mod bucket {
-        pub(crate) mod utils {
-            pub(crate) use rustfs_ecstore::bucket::utils::{
-                check_object_name_for_length_and_slash, has_bad_path_component, is_valid_object_prefix,
-            };
-        }
-    }
-}
+pub(crate) use rustfs_ecstore::bucket::utils::{
+    check_object_name_for_length_and_slash, has_bad_path_component, is_valid_object_prefix,
+};
