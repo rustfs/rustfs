@@ -1,0 +1,56 @@
+[package]
+name = "rustfs-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+arbitrary = "1"
+libfuzzer-sys = "0.4"
+rustfs = { path = "../rustfs", default-features = false }
+rustfs-ecstore = { path = "../crates/ecstore" }
+rustfs-filemeta = { path = "../crates/filemeta" }
+rustfs-policy = { path = "../crates/policy" }
+rustfs-security-governance = { path = "../crates/security-governance" }
+rustfs-utils = { path = "../crates/utils", features = ["compress", "path"] }
+serde_json = "1"
+
+[[bin]]
+name = "bucket_validation"
+path = "fuzz_targets/bucket_validation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive_extract"
+path = "fuzz_targets/archive_extract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "local_metadata"
+path = "fuzz_targets/local_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy_ingress"
+path = "fuzz_targets/policy_ingress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "path_containment"
+path = "fuzz_targets/path_containment.rs"
+test = false
+doc = false
+bench = false

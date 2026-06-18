@@ -553,6 +553,7 @@ pub fn trim_etag(etag: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn test_trim_etag() {
@@ -891,5 +892,30 @@ mod tests {
 
         assert_eq!(bucket, "s3-test-bucket");
         assert_eq!(object, "中文/日本語/한글-9cd5599a-f8eb-4e24-9df7-32ecd8d8ad1f");
+    }
+
+    proptest! {
+        #[test]
+        fn clean_is_idempotent(input in any::<String>()) {
+            let once = clean(&input);
+            let twice = clean(&once);
+            prop_assert_eq!(twice, once);
+        }
+
+        #[test]
+        fn clean_output_has_no_redundant_current_dir_or_empty_segments(input in any::<String>()) {
+            let cleaned = clean(&input);
+
+            prop_assert!(!cleaned.contains("//"), "clean output should not contain doubled separators");
+            prop_assert!(!cleaned.contains("/./"), "clean output should not contain embedded current-dir segments");
+            prop_assert!(!cleaned.ends_with("/."), "clean output should not end with a current-dir segment");
+
+            if cleaned != "/" {
+                prop_assert!(
+                    !cleaned.ends_with('/') || cleaned.is_empty(),
+                    "clean output should not preserve a trailing slash"
+                );
+            }
+        }
     }
 }

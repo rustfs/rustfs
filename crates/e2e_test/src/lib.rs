@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod reliant;
+mod storage_compat;
 
 // Common utilities for all E2E tests
 #[cfg(test)]
@@ -151,5 +152,8 @@ mod namespace_lock_quorum_test;
 
 #[cfg(test)]
 mod admin_timeout_regression_test;
+
+#[cfg(test)]
+mod overwrite_cleanup_regression_test;
 
 pub mod tls_gen;

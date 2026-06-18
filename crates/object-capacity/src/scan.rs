@@ -556,6 +556,7 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
                         subsystem = LOG_SUBSYSTEM_SCAN,
                         result = "partial",
                         root_path = ?path,
+                        file_count,
                         error = %err,
                         "capacity scan traversal failed"
                     );
@@ -590,6 +591,7 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
                         subsystem = LOG_SUBSYSTEM_SCAN,
                         result = "partial",
                         entry_path = ?entry.path(),
+                        file_count,
                         error = %err,
                         "capacity scan metadata failed"
                     );

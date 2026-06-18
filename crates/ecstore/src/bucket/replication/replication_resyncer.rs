@@ -33,10 +33,7 @@ use crate::global::GLOBAL_LocalNodeName;
 use crate::global::get_global_bucket_monitor;
 use crate::resolve_object_store_handle;
 use crate::set_disk::get_lock_acquire_timeout;
-use crate::store_api::{
-    DeletedObject, HTTPRangeSpec, ListOperations, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions,
-    ObjectToDelete, WalkOptions,
-};
+use crate::store_api::{ListOperations, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, WalkOptions};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
 use aws_sdk_s3::primitives::ByteStream;
@@ -61,6 +58,7 @@ use rustfs_filemeta::{
     get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
 use rustfs_s3_types::EventName;
+use rustfs_storage_api::{DeletedObject, HTTPRangeSpec, ObjectToDelete};
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, AMZ_TAGGING_DIRECTIVE, CONTENT_ENCODING, HeaderExt as _,
     SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,

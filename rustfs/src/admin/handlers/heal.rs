@@ -14,6 +14,8 @@
 
 use crate::admin::auth::{authenticate_request, validate_admin_request};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::storage_compat::ecstore::bucket::utils::is_valid_object_prefix;
+use crate::admin::storage_compat::ecstore::store_utils::is_reserved_or_invalid_bucket;
 use crate::app::context::resolve_object_store_handle;
 use crate::server::ADMIN_PREFIX;
 use crate::server::RemoteAddr;
@@ -24,11 +26,9 @@ use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_common::heal_channel::{HealChannelPriority, HealChannelRequest, HealOpts, HealRequestSource};
 use rustfs_config::MAX_HEAL_REQUEST_SIZE;
-use rustfs_ecstore::bucket::utils::is_valid_object_prefix;
-use rustfs_ecstore::store_api::HealOperations;
-use rustfs_ecstore::store_utils::is_reserved_or_invalid_bucket;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_scanner::scanner::{BackgroundHealInfo, read_background_heal_info};
+use rustfs_storage_api::HealOperations as _;
 use rustfs_utils::path::path_join;
 use s3s::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
@@ -247,6 +247,11 @@ fn encode_heal_task_status(
 }
 
 fn build_heal_channel_request(hip: &HealInitParams) -> HealChannelRequest {
+    let recursive = if !hip.bucket.is_empty() && hip.obj_prefix.is_empty() {
+        true
+    } else {
+        hip.hs.recursive
+    };
     let mut heal_request = rustfs_common::heal_channel::create_heal_request(
         hip.bucket.clone(),
         if hip.obj_prefix.is_empty() {
@@ -264,7 +269,7 @@ fn build_heal_channel_request(hip: &HealInitParams) -> HealChannelRequest {
     heal_request.remove_corrupted = Some(hip.hs.remove);
     heal_request.recreate_missing = Some(hip.hs.recreate);
     heal_request.update_parity = Some(hip.hs.update_parity);
-    heal_request.recursive = Some(hip.hs.recursive);
+    heal_request.recursive = Some(recursive);
     heal_request.dry_run = Some(hip.hs.dry_run);
     heal_request.source = HealRequestSource::Admin;
     heal_request
@@ -340,10 +345,10 @@ fn should_handle_root_heal_directly(hip: &HealInitParams) -> bool {
     hip.bucket.is_empty() && hip.obj_prefix.is_empty() && hip.client_token.is_empty() && !hip.force_stop
 }
 
-fn map_root_heal_status(heal_err: Option<rustfs_ecstore::error::Error>) -> S3Result<()> {
+fn map_root_heal_status(heal_err: Option<crate::admin::storage_compat::ecstore::error::Error>) -> S3Result<()> {
     match heal_err {
         None => Ok(()),
-        Some(rustfs_ecstore::error::StorageError::NoHealRequired) => {
+        Some(crate::admin::storage_compat::ecstore::error::StorageError::NoHealRequired) => {
             info!(
                 event = EVENT_ADMIN_RESPONSE_EMITTED,
                 component = LOG_COMPONENT_ADMIN_API,
@@ -698,12 +703,12 @@ mod tests {
         encode_heal_task_status, heal_channel_response_items, heal_channel_response_summary, json_response, map_heal_response,
         map_root_heal_status, should_handle_root_heal_directly, validate_heal_request_mode, validate_heal_target,
     };
+    use crate::admin::storage_compat::ecstore::error::StorageError;
     use bytes::Bytes;
     use http::StatusCode;
     use http::Uri;
     use matchit::Router;
     use rustfs_common::heal_channel::{HealChannelPriority, HealOpts, HealRequestSource, HealScanMode};
-    use rustfs_ecstore::error::StorageError;
     use rustfs_scanner::scanner::BackgroundHealInfo;
     use s3s::{
         S3ErrorCode,
@@ -829,6 +834,27 @@ mod tests {
         assert_eq!(request.update_parity, Some(true));
         assert_eq!(request.pool_index, Some(1));
         assert_eq!(request.set_index, Some(2));
+    }
+
+    #[test]
+    fn test_bucket_heal_channel_request_defaults_to_recursive() {
+        let hip = HealInitParams {
+            bucket: "bucket".to_string(),
+            obj_prefix: String::new(),
+            hs: HealOpts {
+                recursive: false,
+                scan_mode: HealScanMode::Deep,
+                recreate: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let request = build_heal_channel_request(&hip);
+
+        assert_eq!(request.bucket, "bucket");
+        assert_eq!(request.object_prefix, None);
+        assert_eq!(request.recursive, Some(true));
     }
 
     #[test]

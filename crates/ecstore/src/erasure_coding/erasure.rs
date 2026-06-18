@@ -107,6 +107,10 @@ impl LegacyReedSolomonEncoder {
     }
 
     fn reconstruct_data(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+        if recover_empty_payload_data_shards(shards, self.data_shards, self.parity_shards)? {
+            return Ok(());
+        }
+
         let shard_len = shards
             .iter()
             .find_map(|s| s.as_ref().map(|v| v.len()))
@@ -235,6 +239,10 @@ impl ReedSolomonEncoder {
 
     /// Reconstruct missing data shards.
     pub fn reconstruct_data(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+        if recover_empty_payload_data_shards(shards, self.data_shards, self.parity_shards)? {
+            return Ok(());
+        }
+
         if let Some(ref rs) = self.encoder {
             rs.reconstruct_data(shards)
                 .map_err(|e| io::Error::other(format!("Reed-Solomon reconstruct failed: {e:?}")))
@@ -278,6 +286,22 @@ where
         }
     }
 
+    if shard_len == 0 {
+        for (index, shard) in shards.iter().enumerate() {
+            let shard = shard
+                .as_ref()
+                .ok_or_else(|| io::Error::other(format!("missing shard {index} after data reconstruction")))?;
+            if !shard.is_empty() {
+                return Err(io::Error::other(format!(
+                    "inconsistent shard length at index {index}: got {}, expected {}",
+                    shard.len(),
+                    shard_len
+                )));
+            }
+        }
+        return Ok(());
+    }
+
     let mut shard_refs: SmallVec<[&mut [u8]; 16]> = SmallVec::new();
     for (index, shard) in shards.iter_mut().enumerate() {
         let shard = shard
@@ -294,6 +318,39 @@ where
     }
 
     encode(shard_refs)
+}
+
+fn recover_empty_payload_data_shards(
+    shards: &mut [Option<Vec<u8>>],
+    data_shards: usize,
+    parity_shards: usize,
+) -> io::Result<bool> {
+    let expected_shards = data_shards + parity_shards;
+    if shards.len() != expected_shards {
+        return Err(io::Error::other(format!(
+            "invalid shard count: got {}, expected {}",
+            shards.len(),
+            expected_shards
+        )));
+    }
+
+    let mut has_present_shard = false;
+    for shard in shards.iter().filter_map(|shard| shard.as_ref()) {
+        has_present_shard = true;
+        if !shard.is_empty() {
+            return Ok(false);
+        }
+    }
+    if !has_present_shard {
+        return Ok(false);
+    }
+
+    for shard in shards.iter_mut().take(data_shards) {
+        if shard.is_none() {
+            *shard = Some(Vec::new());
+        }
+    }
+    Ok(true)
 }
 
 /// Erasure coding utility for data reliability using Reed-Solomon codes.
@@ -394,7 +451,7 @@ impl Erasure {
             encoder,
             legacy_encoder,
             uses_legacy,
-            _id: Uuid::new_v4(),
+            _id: Uuid::nil(), // Unused in hot paths; avoid CSPRNG syscall
         }
     }
 
@@ -631,15 +688,11 @@ impl Erasure {
     ) -> Result<usize, E>
     where
         R: AsyncRead + Send + Sync + Unpin,
-        F: FnMut(std::io::Result<Vec<Bytes>>) -> Fut + Send,
-        Fut: std::future::Future<Output = Result<(), E>> + Send,
+        F: FnMut(io::Result<Vec<Bytes>>) -> Fut + Send,
+        Fut: Future<Output = Result<(), E>> + Send,
     {
         if self.block_size == 0 {
-            on_block(Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "erasure block_size must be non-zero",
-            )))
-            .await?;
+            on_block(Err(io::Error::new(io::ErrorKind::InvalidInput, "erasure block_size must be non-zero"))).await?;
             return Ok(0);
         }
 
@@ -662,7 +715,7 @@ impl Erasure {
                     {
                         Ok(result) => result,
                         Err(err) => {
-                            on_block(Err(std::io::Error::other(format!("EC encode task failed: {err}")))).await?;
+                            on_block(Err(io::Error::other(format!("EC encode task failed: {err}")))).await?;
                             break;
                         }
                     };
@@ -673,7 +726,7 @@ impl Erasure {
                     warn!("encode_stream_callback_async read unexpected ok");
                     break;
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                     warn!("encode_stream_callback_async read unexpected eof");
                     break;
                 }
@@ -690,11 +743,42 @@ impl Erasure {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
+    use proptest::collection::{btree_set, vec};
+    use proptest::prelude::*;
 
     fn optional_shards(shards: &[Bytes]) -> Vec<Option<Vec<u8>>> {
         shards.iter().map(|shard| Some(shard.to_vec())).collect()
+    }
+
+    fn recover_data(shards: &[Option<Vec<u8>>], data_shards: usize, original_len: usize) -> Vec<u8> {
+        let mut recovered = Vec::new();
+        for shard in shards.iter().take(data_shards) {
+            recovered.extend_from_slice(
+                shard
+                    .as_ref()
+                    .expect("reconstructed data shard should be present after decode_data_and_parity"),
+            );
+        }
+        recovered.truncate(original_len);
+        recovered
+    }
+
+    fn erasure_recoverability_case_strategy()
+    -> impl Strategy<Value = (usize, usize, usize, bool, Vec<u8>, std::collections::BTreeSet<usize>)> {
+        (2usize..=8, 1usize..=4, prop::sample::select(vec![64usize, 256, 1024]), any::<bool>()).prop_flat_map(
+            |(data_shards, parity_shards, block_size, uses_legacy)| {
+                let total_shards = data_shards + parity_shards;
+                (
+                    Just(data_shards),
+                    Just(parity_shards),
+                    Just(block_size),
+                    Just(uses_legacy),
+                    vec(any::<u8>(), 0..=4096),
+                    btree_set(0usize..total_shards, 0..=parity_shards),
+                )
+            },
+        )
     }
 
     fn assert_owned_encode_matches_borrowed(erasure: &Erasure, data: Vec<u8>) {
@@ -837,9 +921,62 @@ mod tests {
     }
 
     #[test]
+    fn legacy_decode_data_and_parity_reconstructs_empty_object_shards() {
+        let erasure = Erasure::new_with_options(3, 3, 64, true);
+        let encoded = erasure.encode_data(&[]).expect("empty encode should succeed");
+        let mut shards = optional_shards(&encoded);
+        shards[1] = None;
+        shards[4] = None;
+
+        erasure
+            .decode_data_and_parity(&mut shards)
+            .expect("empty decode should rebuild missing shards without SIMD");
+
+        for (index, shard) in shards.iter().enumerate() {
+            assert_eq!(
+                shard.as_deref(),
+                Some(encoded[index].as_ref()),
+                "empty shard {index} should match encoded source"
+            );
+        }
+    }
+
+    #[test]
     fn test_shard_file_size_cases2() {
         let erasure = Erasure::new(12, 4, 1024 * 1024);
         assert_eq!(erasure.shard_file_size(1572864), 131073);
+    }
+
+    proptest! {
+        #[test]
+        fn decode_data_and_parity_round_trips_bounded_recoverability(
+            (data_shards, parity_shards, block_size, uses_legacy, data, missing_indices) in
+                erasure_recoverability_case_strategy(),
+        ) {
+            let erasure = Erasure::new_with_options(data_shards, parity_shards, block_size, uses_legacy);
+            let encoded = erasure.encode_data(&data)
+                .expect("encode_data should succeed for bounded recoverability property cases");
+            let mut shards = optional_shards(&encoded);
+
+            for index in &missing_indices {
+                shards[*index] = None;
+            }
+
+            erasure.decode_data_and_parity(&mut shards)
+                .expect("decode_data_and_parity should recover when missing shard count does not exceed parity");
+
+            let recovered = recover_data(&shards, data_shards, data.len());
+            prop_assert_eq!(recovered, data);
+
+            for (index, shard) in shards.iter().enumerate() {
+                prop_assert_eq!(
+                    shard.as_deref(),
+                    Some(encoded[index].as_ref()),
+                    "reconstructed shard {} should match the original encoded shard",
+                    index
+                );
+            }
+        }
     }
 
     #[test]
@@ -1140,7 +1277,7 @@ mod tests {
         assert_eq!(total, 0);
         let observed = observed.lock().unwrap();
         let (kind, message) = observed.as_ref().expect("callback should be invoked once");
-        assert_eq!(*kind, std::io::ErrorKind::InvalidInput);
+        assert_eq!(*kind, io::ErrorKind::InvalidInput);
         assert!(message.contains("block_size"));
     }
 

@@ -37,10 +37,7 @@ use crate::global::GLOBAL_LocalNodeName;
 use crate::global::{GLOBAL_LifecycleSys, GLOBAL_TierConfigMgr, get_global_deployment_id};
 use crate::set_disk::{MAX_PARTS_COUNT, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, SetDisks};
 use crate::store::ECStore;
-use crate::store_api::{
-    GetObjectReader, HTTPRangeSpec, ListOperations, MultipartOperations, ObjectInfo, ObjectOperations, ObjectOptions,
-    ObjectToDelete,
-};
+use crate::store_api::{GetObjectReader, ObjectInfo, ObjectOptions};
 use crate::tier::warm_backend::WarmBackendGetOpts;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use futures::Future;
@@ -61,6 +58,9 @@ use rustfs_filemeta::{
     VersionPurgeStatusType, get_file_info, is_restored_object_on_disk,
 };
 use rustfs_s3_types::EventName;
+use rustfs_storage_api::{
+    DeletedObject, HTTPRangeSpec, ListOperations as _, MultipartOperations as _, ObjectOperations as _, ObjectToDelete,
+};
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
 use s3s::dto::{
     BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, ReplicationConfiguration, RestoreRequest,
@@ -1416,6 +1416,10 @@ fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>) {
                     );
                 }
                 Err(err) => {
+                    rustfs_io_metrics::record_stage_duration(
+                        "lifecycle_free_version_recovery_failed",
+                        started_at.elapsed().as_secs_f64() * 1000.0,
+                    );
                     warn!(
                         event = EVENT_LIFECYCLE_WORKER_STATE,
                         component = LOG_COMPONENT_ECSTORE,
@@ -2690,9 +2694,9 @@ pub async fn apply_expiry_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &
     expiry_state.enqueue_by_days(oi, event, src).await
 }
 
-fn lifecycle_deleted_object(oi: &ObjectInfo, dobj: &ObjectInfo) -> crate::store_api::DeletedObject {
+fn lifecycle_deleted_object(oi: &ObjectInfo, dobj: &ObjectInfo) -> DeletedObject {
     if dobj.delete_marker {
-        return crate::store_api::DeletedObject {
+        return DeletedObject {
             object_name: oi.name.clone(),
             delete_marker: true,
             delete_marker_version_id: dobj.version_id,
@@ -2702,7 +2706,7 @@ fn lifecycle_deleted_object(oi: &ObjectInfo, dobj: &ObjectInfo) -> crate::store_
     }
 
     if oi.delete_marker && oi.version_id.is_some() {
-        return crate::store_api::DeletedObject {
+        return DeletedObject {
             object_name: oi.name.clone(),
             delete_marker: false,
             delete_marker_version_id: oi.version_id,
@@ -2711,7 +2715,7 @@ fn lifecycle_deleted_object(oi: &ObjectInfo, dobj: &ObjectInfo) -> crate::store_
         };
     }
 
-    crate::store_api::DeletedObject {
+    DeletedObject {
         object_name: oi.name.clone(),
         delete_marker: false,
         version_id: oi.version_id,
@@ -2868,12 +2872,12 @@ mod tests {
     use crate::error::is_err_invalid_upload_id;
     use crate::set_disk::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
     use crate::store::ECStore;
-    use crate::store_api::{MultipartOperations, ObjectInfo, ObjectOptions, PutObjReader};
+    use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader};
     use futures::FutureExt;
     use rustfs_common::metrics::{IlmAction, global_metrics};
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
     use rustfs_filemeta::{ReplicateDecision, VersionPurgeStatusType};
-    use rustfs_storage_api::{BucketOperations, BucketOptions, MakeBucketOptions};
+    use rustfs_storage_api::{BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations as _};
     use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, Timestamp};
     use serial_test::serial;
     use sha2::{Digest, Sha256};
@@ -4141,7 +4145,7 @@ mod tests {
                 &bucket,
                 object,
                 &upload.upload_id,
-                vec![crate::store_api::CompletePart {
+                vec![rustfs_storage_api::CompletePart {
                     part_num: 1,
                     etag: second_part.etag.clone(),
                     checksum_crc32: None,

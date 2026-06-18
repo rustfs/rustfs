@@ -196,6 +196,7 @@ S3TESTS_CONF="${S3TESTS_CONF:-s3tests.conf}"
 DEPLOY_MODE="${DEPLOY_MODE:-build}"
 RUSTFS_BINARY="${RUSTFS_BINARY:-}"
 NO_CACHE="${NO_CACHE:-false}"
+S3TESTS_LOCAL_SSE_MASTER_KEY_DEFAULT="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 
 # Additional directories (SCRIPT_DIR and PROJECT_ROOT defined earlier)
 ARTIFACTS_DIR="${PROJECT_ROOT}/artifacts/s3tests-${TEST_MODE}"
@@ -209,6 +210,11 @@ else
 fi
 DATA_DIR="${DATA_BASE}/test-data/${CONTAINER_NAME}"
 RUSTFS_PID=""
+
+if [ "${DEPLOY_MODE}" != "existing" ] && [ -z "${RUSTFS_SSE_S3_MASTER_KEY:-}" ]; then
+    export RUSTFS_SSE_S3_MASTER_KEY="${S3TESTS_LOCAL_SSE_MASTER_KEY_DEFAULT}"
+    log_info "Using deterministic local SSE-S3 master key for the s3-tests harness"
+fi
 
 show_usage() {
     cat << EOF
@@ -233,6 +239,7 @@ Environment Variables:
   S3_SECRET_KEY          - Main user secret key (default: rustfsadmin)
   S3_ALT_ACCESS_KEY      - Alt user access key (default: rustfsalt)
   S3_ALT_SECRET_KEY      - Alt user secret key (default: rustfsalt)
+  RUSTFS_SSE_S3_MASTER_KEY - Optional base64 32-byte key for local managed SSE fallback
   MAXFAIL                - Stop after N failures (default: 1)
   XDIST                  - Enable parallel execution with N workers (default: 0)
   MARKEXPR               - pytest marker expression (default: no marker filtering)
@@ -449,6 +456,7 @@ elif [ "${DEPLOY_MODE}" = "docker" ]; then
         -e RUSTFS_ADDRESS=0.0.0.0:9000 \
         -e RUSTFS_ACCESS_KEY="${S3_ACCESS_KEY}" \
         -e RUSTFS_SECRET_KEY="${S3_SECRET_KEY}" \
+        -e RUSTFS_SSE_S3_MASTER_KEY="${RUSTFS_SSE_S3_MASTER_KEY}" \
         -e RUSTFS_VOLUMES="/data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3" \
         -v "/tmp/${CONTAINER_NAME}:/data" \
         rustfs-ci || {

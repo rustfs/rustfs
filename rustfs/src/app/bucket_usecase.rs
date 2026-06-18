@@ -20,22 +20,7 @@ use crate::admin::handlers::site_replication::{
 use crate::app::context::{
     AppContext, default_notify_interface, get_global_app_context, resolve_object_store_handle_for_context,
 };
-use crate::auth::get_condition_values_with_client_info;
-use crate::error::ApiError;
-use crate::server::RemoteAddr;
-use crate::storage::access::{ReqInfo, authorize_request, req_info_ref};
-use crate::storage::helper::{OperationHelper, spawn_background_with_context};
-use crate::storage::s3_api::bucket::{
-    ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
-    build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
-};
-use crate::storage::s3_api::common::rustfs_owner;
-use crate::storage::*;
-use futures::StreamExt;
-use http::StatusCode;
-use metrics::counter;
-use rustfs_config::RUSTFS_REGION;
-use rustfs_ecstore::bucket::{
+use crate::app::storage_compat::ecstore::bucket::{
     bucket_target_sys::BucketTargetSys,
     lifecycle::bucket_lifecycle_ops::{
         enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects, validate_transition_tier,
@@ -53,18 +38,36 @@ use rustfs_ecstore::bucket::{
     versioning::VersioningApi,
     versioning_sys::BucketVersioningSys,
 };
-use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
-use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::notification_sys::get_global_notification_sys;
-use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::{ListObjectVersionsInfo, ListObjectsV2Info, ListOperations, ObjectInfo};
+use crate::app::storage_compat::ecstore::client::object_api_utils::to_s3s_etag;
+use crate::app::storage_compat::ecstore::error::StorageError;
+use crate::app::storage_compat::ecstore::notification_sys::get_global_notification_sys;
+use crate::app::storage_compat::ecstore::store::ECStore;
+use crate::auth::get_condition_values_with_client_info;
+use crate::error::ApiError;
+use crate::server::RemoteAddr;
+use crate::storage::StorageObjectInfo as ObjectInfo;
+use crate::storage::access::{ReqInfo, authorize_request, req_info_ref};
+use crate::storage::helper::{OperationHelper, spawn_background_with_context};
+use crate::storage::s3_api::bucket::{
+    ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
+    build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
+};
+use crate::storage::s3_api::common::rustfs_owner;
+use crate::storage::*;
+use futures::StreamExt;
+use http::StatusCode;
+use metrics::counter;
+use rustfs_config::RUSTFS_REGION;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::{
     action::{Action, S3Action},
     {BucketPolicy, BucketPolicyArgs, Effect, Validator},
 };
 use rustfs_s3_ops::S3Operation;
-use rustfs_storage_api::{BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
+use rustfs_storage_api::{
+    BucketOperations, BucketOptions, DeleteBucketOptions, ListObjectVersionsInfo as StorageListObjectVersionsInfo,
+    ListObjectsV2Info as StorageListObjectsV2Info, ListOperations as _, MakeBucketOptions,
+};
 use rustfs_targets::{
     EventName,
     arn::{ARN, TargetIDError},
@@ -87,6 +90,9 @@ use tracing::{debug, error, info, instrument, warn};
 const LOG_COMPONENT_APP: &str = "app";
 const LOG_SUBSYSTEM_BUCKET: &str = "bucket";
 use urlencoding::encode;
+
+type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
+type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
 
 fn serialize_config<T: xml::Serialize>(value: &T) -> S3Result<Vec<u8>> {
     serialize(value).map_err(to_internal_error)
@@ -799,6 +805,7 @@ impl DefaultBucketUsecase {
         counter!("rustfs_create_bucket_total").increment(1);
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         result
     }
 
@@ -831,6 +838,7 @@ impl DefaultBucketUsecase {
             )
             .await
             .map_err(ApiError::from)?;
+        rustfs_scanner::clear_dirty_usage_bucket(&input.bucket);
 
         if let Err(err) = site_replication_delete_bucket_hook(&input.bucket, force).await {
             warn!(bucket = %input.bucket, error = ?err, "site replication delete bucket hook failed");
@@ -1620,7 +1628,9 @@ impl DefaultBucketUsecase {
             }
         };
 
-        if let Err(err) = rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle::validate(&input_cfg, &rcfg).await {
+        if let Err(err) =
+            crate::app::storage_compat::ecstore::bucket::lifecycle::lifecycle::Lifecycle::validate(&input_cfg, &rcfg).await
+        {
             return Err(s3_error!(InvalidArgument, "{err}"));
         }
 
@@ -2270,7 +2280,7 @@ mod tests {
         BucketTargets {
             targets: arns
                 .iter()
-                .map(|arn| rustfs_ecstore::bucket::target::BucketTarget {
+                .map(|arn| crate::app::storage_compat::ecstore::bucket::target::BucketTarget {
                     arn: (*arn).to_string(),
                     target_type: BucketTargetType::ReplicationService,
                     ..Default::default()

@@ -55,6 +55,7 @@ tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, 
 full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp"]
 manual-test-runners = []
 rio-v2 = ["rustfs-ecstore/rio-v2"]
+pyroscope = ["rustfs-obs/pyroscope"]
 
 [lints]
 workspace = true
@@ -79,7 +80,7 @@ rustfs-obs = { workspace = true }
 rustfs-policy = { workspace = true }
 rustfs-protocols = { workspace = true }
 rustfs-protos = { workspace = true }
-rustfs-rio.workspace = true
+rustfs-rio = { workspace = true }
 rustfs-s3-types = { workspace = true }
 rustfs-s3-ops = { workspace = true }
 rustfs-security-governance = { workspace = true }
@@ -202,6 +203,7 @@ serial_test = { workspace = true }
 tempfile = { workspace = true }
 aws-config = { workspace = true }
 anyhow = { workspace = true }
+proptest = "1"
 tokio = { workspace = true, features = ["test-util"] }
 temp-env = { workspace = true, features = ["async_closure"] }
 tracing-subscriber = { workspace = true }

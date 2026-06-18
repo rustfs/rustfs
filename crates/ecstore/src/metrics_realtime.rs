@@ -26,7 +26,7 @@ use rustfs_madmin::metrics::{
     ScannerPacingPressureSnapshot as MadminScannerPacingPressureSnapshot,
     ScannerReplicationRepairSnapshot as MadminScannerReplicationRepairSnapshot,
     ScannerSourceCycleSnapshot as MadminScannerSourceCycleSnapshot, ScannerSourceWorkSnapshot as MadminScannerSourceWorkSnapshot,
-    TimedAction as MadminTimedAction,
+    ScannerUsageFreshnessSnapshot as MadminScannerUsageFreshnessSnapshot, TimedAction as MadminTimedAction,
 };
 use rustfs_storage_api::StorageAdminApi;
 use rustfs_utils::os::get_drive_stats;
@@ -190,6 +190,16 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
             queue_missed: metrics.lifecycle_expiry.queue_missed,
             scanner_queued: metrics.lifecycle_expiry.scanner_queued,
             scanner_missed: metrics.lifecycle_expiry.scanner_missed,
+        },
+        usage_freshness: MadminScannerUsageFreshnessSnapshot {
+            dirty_pending_buckets: metrics.usage_freshness.dirty_pending_buckets,
+            last_dirty_mark_unix_secs: metrics.usage_freshness.last_dirty_mark_unix_secs,
+            last_dirty_clear_unix_secs: metrics.usage_freshness.last_dirty_clear_unix_secs,
+            last_cycle_dirty_buckets: metrics.usage_freshness.last_cycle_dirty_buckets,
+            last_cycle_cleared_dirty_buckets: metrics.usage_freshness.last_cycle_cleared_dirty_buckets,
+            last_usage_save_unix_secs: metrics.usage_freshness.last_usage_save_unix_secs,
+            last_usage_save_result: metrics.usage_freshness.last_usage_save_result,
+            last_usage_save_result_code: metrics.usage_freshness.last_usage_save_result_code,
         },
         maintenance_control: MadminScannerMaintenanceControlSnapshot {
             primary_control: metrics.maintenance_control.primary_control,
@@ -708,6 +718,32 @@ mod test {
         assert_eq!(lifecycle.current_missed, 3);
         assert_eq!(lifecycle.lifetime_missed, 8);
         assert_eq!(lifecycle.partial_cycles, 5);
+    }
+
+    #[test]
+    fn scanner_metrics_mapping_preserves_usage_freshness_status() {
+        let scanner = to_madmin_scanner_metrics(rustfs_common::metrics::ScannerMetricsReport {
+            usage_freshness: rustfs_common::metrics::ScannerUsageFreshnessSnapshot {
+                dirty_pending_buckets: 3,
+                last_dirty_mark_unix_secs: 10,
+                last_dirty_clear_unix_secs: 11,
+                last_cycle_dirty_buckets: 2,
+                last_cycle_cleared_dirty_buckets: 1,
+                last_usage_save_unix_secs: 12,
+                last_usage_save_result: "success".to_string(),
+                last_usage_save_result_code: 1,
+            },
+            ..Default::default()
+        });
+
+        assert_eq!(scanner.usage_freshness.dirty_pending_buckets, 3);
+        assert_eq!(scanner.usage_freshness.last_dirty_mark_unix_secs, 10);
+        assert_eq!(scanner.usage_freshness.last_dirty_clear_unix_secs, 11);
+        assert_eq!(scanner.usage_freshness.last_cycle_dirty_buckets, 2);
+        assert_eq!(scanner.usage_freshness.last_cycle_cleared_dirty_buckets, 1);
+        assert_eq!(scanner.usage_freshness.last_usage_save_unix_secs, 12);
+        assert_eq!(scanner.usage_freshness.last_usage_save_result, "success");
+        assert_eq!(scanner.usage_freshness.last_usage_save_result_code, 1);
     }
 
     #[test]

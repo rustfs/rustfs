@@ -13,10 +13,11 @@
 // limitations under the License.
 
 use crate::storage::s3_api::common::rustfs_owner;
+use crate::storage::storage_compat::ecstore::client::object_api_utils::to_s3s_etag;
 use percent_encoding::percent_decode_str;
-use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
-use rustfs_ecstore::store_api::{ListObjectVersionsInfo, ListObjectsV2Info};
-use rustfs_storage_api::BucketInfo;
+use rustfs_storage_api::{
+    BucketInfo, ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
+};
 use s3s::dto::{
     Bucket, CommonPrefix, DeleteMarkerEntry, EncodingType, ListBucketsOutput, ListObjectVersionsOutput, ListObjectsOutput,
     ListObjectsV2Output, Object, ObjectStorageClass, ObjectVersion, ObjectVersionStorageClass, Timestamp,
@@ -25,7 +26,12 @@ use s3s::{S3Error, S3ErrorCode};
 use tracing::debug;
 use urlencoding::encode;
 
+use crate::storage::StorageObjectInfo as ObjectInfo;
+
 const S3_MAX_KEYS: i32 = 1000;
+
+type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
+type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
 
 fn normalize_max_keys(max_keys: i32) -> i32 {
     max_keys.min(S3_MAX_KEYS)
@@ -384,11 +390,12 @@ fn calculate_next_marker(v2: &ListObjectsV2Output) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ListObjectVersionsParams, build_list_buckets_output, build_list_object_versions_output, build_list_objects_output,
-        build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
+        ListObjectVersionsInfo, ListObjectVersionsParams, ListObjectsV2Info, build_list_buckets_output,
+        build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output,
+        parse_list_object_versions_params, parse_list_objects_v2_params,
     };
+    use crate::storage::StorageObjectInfo as ObjectInfo;
     use crate::storage::s3_api::common::rustfs_owner;
-    use rustfs_ecstore::store_api::{ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo};
     use rustfs_storage_api::BucketInfo;
     use s3s::S3ErrorCode;
     use s3s::dto::{CommonPrefix, EncodingType, ListObjectsV2Output, Object};

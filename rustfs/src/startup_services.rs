@@ -12,6 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::storage_compat::ecstore::{
+    bucket::{
+        metadata_sys::init_bucket_metadata_sys,
+        migration::{try_migrate_bucket_metadata, try_migrate_iam_config},
+        replication::get_global_replication_pool,
+    },
+    endpoints::EndpointServerPools,
+    global::shutdown_background_services,
+    notification_sys::new_global_notification_sys,
+    store::ECStore,
+};
 use crate::{
     config::Config,
     init::{
@@ -28,17 +39,6 @@ use crate::{
 use futures_util::future::join_all;
 use rustfs_audit::AuditResult;
 use rustfs_common::GlobalReadiness;
-use rustfs_ecstore::{
-    bucket::{
-        metadata_sys::init_bucket_metadata_sys,
-        migration::{try_migrate_bucket_metadata, try_migrate_iam_config},
-        replication::get_global_replication_pool,
-    },
-    endpoints::EndpointServerPools,
-    global::shutdown_background_services,
-    notification_sys::new_global_notification_sys,
-    store::ECStore,
-};
 use rustfs_heal::{
     create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
 };
@@ -355,6 +355,7 @@ async fn init_observability_runtime(ctx: CancellationToken) {
     crate::allocator_reclaim::init_allocator_reclaim(ctx.clone());
 
     if rustfs_obs::observability_metric_enabled() {
+        rustfs_io_metrics::set_put_stage_metrics_enabled(true);
         init_metrics_runtime(ctx.clone());
         crate::memory_observability::init_memory_observability(ctx.clone());
         init_auto_tuner(ctx).await;
@@ -596,14 +597,16 @@ where
     start_audit().await
 }
 
-pub async fn init_notification_system(endpoint_pools: EndpointServerPools) -> rustfs_ecstore::error::Result<()> {
+pub async fn init_notification_system(endpoint_pools: EndpointServerPools) -> crate::storage_compat::ecstore::error::Result<()> {
     init_notification_system_with(|| new_global_notification_sys(endpoint_pools)).await
 }
 
-async fn init_notification_system_with<InitFn, InitFuture>(init_notification: InitFn) -> rustfs_ecstore::error::Result<()>
+async fn init_notification_system_with<InitFn, InitFuture>(
+    init_notification: InitFn,
+) -> crate::storage_compat::ecstore::error::Result<()>
 where
     InitFn: FnOnce() -> InitFuture,
-    InitFuture: Future<Output = rustfs_ecstore::error::Result<()>>,
+    InitFuture: Future<Output = crate::storage_compat::ecstore::error::Result<()>>,
 {
     init_notification().await
 }
@@ -661,7 +664,8 @@ mod tests {
 
     #[tokio::test]
     async fn notification_system_returns_source_error() {
-        let result = init_notification_system_with(|| async { Err(rustfs_ecstore::error::Error::FaultyDisk) }).await;
+        let result =
+            init_notification_system_with(|| async { Err(crate::storage_compat::ecstore::error::Error::FaultyDisk) }).await;
 
         assert!(result.is_err());
     }

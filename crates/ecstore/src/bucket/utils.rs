@@ -137,25 +137,9 @@ pub fn has_bad_path_component(path: &str) -> bool {
             i += 1;
         }
 
-        // Trim whitespace of segment
-        let mut segment_start = start;
-        let mut segment_end = i;
-
-        while segment_start < segment_end && bytes[segment_start].is_ascii_whitespace() {
-            segment_start += 1;
-        }
-        while segment_end > segment_start && bytes[segment_end - 1].is_ascii_whitespace() {
-            segment_end -= 1;
-        }
-
-        // Check for ".." or "."
-        match segment_end - segment_start {
-            2 if segment_start + 1 < n && bytes[segment_start] == b'.' && bytes[segment_start + 1] == b'.' => {
-                return true;
-            }
-            1 if bytes[segment_start] == b'.' => {
-                return true;
-            }
+        // Trim whitespace of segment and check for ".." or "."
+        match path[start..i].trim() {
+            "." | ".." => return true,
             _ => {}
         }
 
@@ -353,6 +337,7 @@ pub fn check_put_object_args(bucket: &str, object: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     // Test validation functions
     #[test]
@@ -435,6 +420,9 @@ mod tests {
         assert!(!is_valid_object_prefix("prefix/./other"));
         assert!(!is_valid_object_prefix("a/../b/../c"));
         assert!(!is_valid_object_prefix("a/./b/./c"));
+        assert!(!is_valid_object_prefix("\x0b./object"));
+        assert!(!is_valid_object_prefix("prefix/\x0b../object"));
+        assert!(!is_valid_object_prefix("\x0b.\\\\object"));
 
         // Invalid cases - double slashes
         assert!(!is_valid_object_prefix("prefix//with//double//slashes"));
@@ -525,5 +513,29 @@ mod tests {
         assert!(check_put_object_args("test-bucket", "test-object").is_ok());
         assert!(check_put_object_args("", "test-object").is_err());
         assert!(check_put_object_args("test-bucket", "").is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn valid_object_prefixes_preserve_prefix_invariants(input in any::<String>()) {
+            if is_valid_object_prefix(&input) {
+                prop_assert!(!has_bad_path_component(&input));
+                prop_assert!(!input.contains("//"));
+                prop_assert!(!input.contains('\0'));
+            }
+        }
+
+        #[test]
+        fn valid_object_names_preserve_name_invariants(input in any::<String>()) {
+            if is_valid_object_name(&input) {
+                prop_assert!(!input.is_empty());
+                prop_assert!(is_valid_object_prefix(&input));
+            }
+        }
+
+        #[test]
+        fn object_name_validity_matches_prefix_validity_plus_non_empty(input in any::<String>()) {
+            prop_assert_eq!(is_valid_object_name(&input), !input.is_empty() && is_valid_object_prefix(&input));
+        }
     }
 }

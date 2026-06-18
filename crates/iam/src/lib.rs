@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::error::{Error, Result};
+use crate::storage_compat::ecstore::store::ECStore;
 use manager::IamCache;
 use oidc::OidcSys;
-use rustfs_ecstore::store::ECStore;
 use std::sync::{Arc, OnceLock};
 use store::object::ObjectStore;
 use sys::IamSys;
@@ -33,6 +33,7 @@ pub mod keyring;
 pub mod manager;
 pub mod oidc;
 pub mod oidc_state;
+mod storage_compat;
 pub mod store;
 pub mod sys;
 pub mod utils;

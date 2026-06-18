@@ -51,6 +51,7 @@ pub mod ratelimit;
 pub mod router;
 pub mod slo;
 pub mod staticweb;
+pub mod storage_compat;
 pub mod symlink;
 pub mod sync;
 pub mod tempurl;

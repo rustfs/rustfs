@@ -33,6 +33,7 @@ use crate::server::{
 use crate::storage;
 use crate::storage::rpc::InternodeRpcService;
 use crate::storage::tonic_service::make_server;
+use crate::storage_compat::ecstore::rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request as HttpRequest, Response};
 use hyper_util::{
@@ -45,7 +46,6 @@ use metrics::{counter, gauge, histogram};
 use opentelemetry::global;
 use opentelemetry::trace::TraceContextExt;
 use rustfs_common::GlobalReadiness;
-use rustfs_ecstore::rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
 use rustfs_keystone::KeystoneAuthLayer;
 #[cfg(feature = "swift")]
 use rustfs_protocols::SwiftService;
@@ -275,13 +275,31 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
 
         // Helper to configure socket with optimized parameters
         let configure_socket = |socket: &socket2::Socket| -> Result<()> {
-            socket.set_reuse_address(true)?;
+            if let Err(e) = socket.set_reuse_address(true) {
+                debug!(
+                    event = "socket_option_unavailable",
+                    component = LOG_COMPONENT_SERVER,
+                    subsystem = LOG_SUBSYSTEM_STARTUP,
+                    option = "SO_REUSEADDR",
+                    error = %e,
+                    "Socket option is unavailable"
+                );
+            }
 
             // Set the socket to non-blocking before passing it to Tokio.
             socket.set_nonblocking(true)?;
 
             // 1. Disable Nagle algorithm: Critical for 4KB Payload, achieving ultra-low latency
-            socket.set_tcp_nodelay(true)?;
+            if let Err(e) = socket.set_tcp_nodelay(true) {
+                debug!(
+                    event = "socket_option_unavailable",
+                    component = LOG_COMPONENT_SERVER,
+                    subsystem = LOG_SUBSYSTEM_STARTUP,
+                    option = "TCP_NODELAY",
+                    error = %e,
+                    "Socket option is unavailable"
+                );
+            }
 
             // 2. Enable SO_REUSEPORT for better multi-core scalability on supported platforms
             #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
@@ -297,11 +315,40 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
             }
 
             // 3. Set system-level TCP KeepAlive to protect long connections
-            socket.set_tcp_keepalive(&keepalive)?;
+            if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
+                debug!(
+                    event = "socket_option_unavailable",
+                    component = LOG_COMPONENT_SERVER,
+                    subsystem = LOG_SUBSYSTEM_STARTUP,
+                    option = "TCP_KEEPALIVE",
+                    error = %e,
+                    "Socket option is unavailable"
+                );
+            }
 
-            // 4. Increase receive/send buffer to support BDP at GB-level throughput
-            socket.set_recv_buffer_size(4 * rustfs_config::MI_B)?;
-            socket.set_send_buffer_size(4 * rustfs_config::MI_B)?;
+            // 4. Increase receive/send buffer to support BDP at GB-level throughput.
+            // Some constrained local environments reject these socket options with
+            // EPERM/ENOPROTOOPT-style failures; log and continue in that case.
+            if let Err(e) = socket.set_recv_buffer_size(4 * rustfs_config::MI_B) {
+                debug!(
+                    event = "socket_option_unavailable",
+                    component = LOG_COMPONENT_SERVER,
+                    subsystem = LOG_SUBSYSTEM_STARTUP,
+                    option = "SO_RCVBUF",
+                    error = %e,
+                    "Socket option is unavailable"
+                );
+            }
+            if let Err(e) = socket.set_send_buffer_size(4 * rustfs_config::MI_B) {
+                debug!(
+                    event = "socket_option_unavailable",
+                    component = LOG_COMPONENT_SERVER,
+                    subsystem = LOG_SUBSYSTEM_STARTUP,
+                    option = "SO_SNDBUF",
+                    error = %e,
+                    "Socket option is unavailable"
+                );
+            }
 
             Ok(())
         };

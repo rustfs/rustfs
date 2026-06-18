@@ -21,6 +21,7 @@ use rustfs_config::{
     NATS_TLS_CLIENT_CERT, NATS_TLS_CLIENT_KEY, NATS_TOKEN, NATS_USERNAME, PULSAR_AUTH_TOKEN, PULSAR_PASSWORD, PULSAR_QUEUE_DIR,
     PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA, PULSAR_TLS_HOSTNAME_VERIFICATION, PULSAR_TOPIC, PULSAR_USERNAME,
 };
+use rustfs_utils::egress::validate_outbound_url;
 use std::collections::HashSet;
 use std::path::Path;
 use std::str::FromStr;
@@ -179,6 +180,10 @@ pub(super) fn validate_pulsar_broker_config(broker: &str, config: &KVS, default_
 
 pub(super) fn parse_url(value: &str, field_label: &str) -> Result<Url, TargetError> {
     Url::parse(value).map_err(|e| TargetError::Configuration(format!("Invalid {field_label}: {e} (value: '{value}')")))
+}
+
+pub(super) fn validate_outbound_http_url(value: &Url, field_label: &str) -> Result<(), TargetError> {
+    validate_outbound_url(value).map_err(|e| TargetError::Configuration(format!("{field_label} is not allowed: {e}")))
 }
 
 #[cfg(test)]

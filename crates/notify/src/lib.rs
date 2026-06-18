@@ -36,6 +36,7 @@ mod runtime_facade;
 mod runtime_view;
 mod services;
 mod status_view;
+mod storage_compat;
 
 pub use bucket_config_manager::NotifyBucketConfigManager;
 pub use config_manager::{NotifyConfigManager, runtime_target_id_for_subsystem};
@@ -54,3 +55,4 @@ pub use runtime_facade::NotifyRuntimeFacade;
 pub use runtime_view::NotifyRuntimeView;
 pub use services::NotifyServices;
 pub use status_view::NotifyStatusView;
+pub use storage_compat::NotifyObjectInfo;

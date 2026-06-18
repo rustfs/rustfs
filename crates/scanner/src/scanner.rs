@@ -14,7 +14,9 @@
 
 use std::sync::Arc;
 
-use crate::data_usage_define::{BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH};
+use crate::data_usage_define::{
+    BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH, ScannerObjectIO,
+};
 use crate::runtime_config::{
     current_scanner_runtime_config, lookup_scanner_runtime_config, refresh_scanner_runtime_config_from_global,
     scanner_bitrot_cycle, scanner_cycle_interval, scanner_start_delay, set_scanner_default_cycle_secs,
@@ -27,7 +29,7 @@ use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError};
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{
-    CurrentCycle, Metric, Metrics, ScanCyclePartialReason, ScannerWorkSource, emit_scan_cycle_complete,
+    CurrentCycle, Metric, Metrics, ScanCyclePartialReason, ScannerUsageSaveResult, ScannerWorkSource, emit_scan_cycle_complete,
     emit_scan_cycle_partial_with_source, global_metrics,
 };
 use rustfs_config::ScannerSpeed;
@@ -37,23 +39,18 @@ use rustfs_config::{
     ENV_SCANNER_CYCLE_MAX_OBJECTS,
 };
 use rustfs_config::{ENV_SCANNER_CYCLE, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS};
-use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle as _;
-use rustfs_ecstore::bucket::metadata_sys::{get_lifecycle_config, get_replication_config};
-use rustfs_ecstore::bucket::replication::ReplicationConfigurationExt as _;
-use rustfs_ecstore::config::com::{read_config, save_config};
-use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
-use rustfs_ecstore::error::Error as EcstoreError;
-use rustfs_ecstore::global::is_erasure_sd;
-use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::{NamespaceLocking as _, ObjectIO};
-use rustfs_storage_api::{BucketOperations, BucketOptions};
+use rustfs_storage_api::{BucketOperations, BucketOptions, NamespaceLocking as _};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-const SINGLE_DISK_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
+use crate::storage_compat::{
+    ECStore, EcstoreError, Lifecycle as _, RUSTFS_META_BUCKET, ReplicationConfigurationExt as _, get_lifecycle_config,
+    get_replication_config, is_erasure_sd, read_config, replace_bucket_usage_memory_from_info, save_config,
+};
+
 const LOG_COMPONENT_SCANNER: &str = "scanner";
 const LOG_SUBSYSTEM_RUNTIME: &str = "runtime";
 const LOG_SUBSYSTEM_BACKGROUND_HEAL: &str = "background_heal";
@@ -147,12 +144,12 @@ fn initial_scanner_delay_for_startup(
     has_active_replication: bool,
 ) -> Duration {
     // Skip the startup delay when the cache is cold (first ever scan) OR when active replication
-    // rules exist. In single-disk/Slowest mode the normal inter-cycle delay is 27-33 minutes; if
-    // the node was SIGKILL'd with FAILED-status objects queued, waiting that long leaves them
-    // permanently unhealed until the next full cycle. Replication config is live-read at startup
-    // by configure_scanner_defaults, so this signal is always current regardless of when the
-    // persisted DataUsageInfo was last written.
-    if (usage_cache_is_cold || has_active_replication) && has_buckets {
+    // rules exist. A cold usage cache also covers startup-before-bucket-creation: running the
+    // first cycle promptly keeps later bucket metrics bounded by the normal scanner cycle instead
+    // of an extra startup delay. Replication config is live-read at startup by
+    // configure_scanner_defaults, so this signal is always current regardless of when the persisted
+    // DataUsageInfo was last written.
+    if usage_cache_is_cold || (has_active_replication && has_buckets) {
         Duration::ZERO
     } else {
         initial_scanner_delay_for(start_delay_secs)
@@ -239,11 +236,7 @@ async fn initial_scanner_startup_usage_state(storeapi: &Arc<ECStore>) -> (bool, 
         }
     };
 
-    if !has_buckets {
-        return (false, false);
-    }
-
-    (persisted_usage_cache_is_cold_for_startup(storeapi).await, true)
+    (persisted_usage_cache_is_cold_for_startup(storeapi).await, has_buckets)
 }
 
 pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
@@ -331,12 +324,12 @@ impl ScannerMaintenanceFeatures {
     }
 }
 
-fn single_disk_default_cycle_secs(features: ScannerMaintenanceFeatures) -> Option<u64> {
-    if features.needs_regular_cycle() {
-        None
-    } else {
-        Some(SINGLE_DISK_SCANNER_CYCLE_SECS)
-    }
+fn single_disk_default_cycle_secs(_features: ScannerMaintenanceFeatures) -> Option<u64> {
+    None
+}
+
+fn single_disk_default_speed() -> ScannerSpeed {
+    ScannerSpeed::Default
 }
 
 async fn detect_scanner_maintenance_features(storeapi: &Arc<ECStore>) -> ScannerMaintenanceFeatures {
@@ -421,7 +414,7 @@ async fn configure_scanner_defaults(storeapi: &Arc<ECStore>) -> ScannerMaintenan
     if is_erasure_sd().await {
         let features = detect_scanner_maintenance_features(storeapi).await;
         let default_cycle_secs = single_disk_default_cycle_secs(features);
-        set_scanner_default_speed(ScannerSpeed::Slowest);
+        set_scanner_default_speed(single_disk_default_speed());
         set_scanner_default_cycle_secs(default_cycle_secs);
         info!(
             target: "rustfs::scanner",
@@ -981,7 +974,7 @@ impl Drop for ScannerScanModeGuard {
 #[instrument(skip(ctx, storeapi))]
 pub async fn store_data_usage_in_backend(
     ctx: CancellationToken,
-    storeapi: Arc<impl ObjectIO>,
+    storeapi: Arc<impl ScannerObjectIO>,
     mut receiver: mpsc::Receiver<DataUsageInfo>,
 ) {
     let mut attempts = 1u32;
@@ -1008,6 +1001,7 @@ pub async fn store_data_usage_in_backend(
                 state = "skip_stale_update",
                 "Scanner stale data usage update skipped"
             );
+            global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::SkippedStale);
             continue;
         }
 
@@ -1025,6 +1019,7 @@ pub async fn store_data_usage_in_backend(
                     error = %e,
                     "Scanner data usage encode failed"
                 );
+                global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::EncodeFailed);
                 continue;
             }
         };
@@ -1062,8 +1057,10 @@ pub async fn store_data_usage_in_backend(
                 error = %e,
                 "Scanner data usage save failed"
             );
+            global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Failed);
         } else {
-            rustfs_ecstore::data_usage::replace_bucket_usage_memory_from_info(&data_usage_info).await;
+            replace_bucket_usage_memory_from_info(&data_usage_info).await;
+            global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
         }
         done_save();
 
@@ -1074,13 +1071,19 @@ pub async fn store_data_usage_in_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_ecstore::store_api::{GetObjectReader, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader};
+    use crate::storage_compat::EcstoreResult;
+    use crate::{
+        ScannerGetObjectReader as GetObjectReader, ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions,
+        ScannerPutObjReader as PutObjReader,
+    };
     use serial_test::serial;
     use std::collections::HashMap;
     use std::io::Cursor;
     use temp_env::{with_var, with_var_unset};
     use tokio::io::AsyncReadExt;
     use tokio::sync::Mutex;
+
+    const TEST_DEFAULT_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
 
     struct ScannerDefaultSpeedGuard;
 
@@ -1122,20 +1125,28 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ObjectIO for MemoryConfigStore {
+    impl rustfs_storage_api::ObjectIO for MemoryConfigStore {
+        type Error = EcstoreError;
+        type RangeSpec = rustfs_storage_api::HTTPRangeSpec;
+        type HeaderMap = http::HeaderMap;
+        type ObjectOptions = ObjectOptions;
+        type ObjectInfo = ObjectInfo;
+        type GetObjectReader = GetObjectReader;
+        type PutObjectReader = PutObjReader;
+
         async fn get_object_reader(
             &self,
             bucket: &str,
             object: &str,
-            _range: Option<rustfs_ecstore::store_api::HTTPRangeSpec>,
+            _range: Option<rustfs_storage_api::HTTPRangeSpec>,
             _h: http::HeaderMap,
             _opts: &ObjectOptions,
-        ) -> rustfs_ecstore::error::Result<GetObjectReader> {
+        ) -> EcstoreResult<GetObjectReader> {
             let objects = self.objects.lock().await;
             let data = objects
                 .get(&memory_config_key(bucket, object))
                 .cloned()
-                .ok_or(rustfs_ecstore::error::Error::FileNotFound)?;
+                .ok_or(EcstoreError::FileNotFound)?;
 
             Ok(GetObjectReader {
                 stream: Box::new(Cursor::new(data)),
@@ -1149,7 +1160,7 @@ mod tests {
             object: &str,
             data: &mut PutObjReader,
             _opts: &ObjectOptions,
-        ) -> rustfs_ecstore::error::Result<ObjectInfo> {
+        ) -> EcstoreResult<ObjectInfo> {
             let mut buf = Vec::new();
             data.stream.read_to_end(&mut buf).await?;
             self.objects.lock().await.insert(memory_config_key(bucket, object), buf);
@@ -1219,10 +1230,9 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_initial_scanner_delay_keeps_configured_delay_without_buckets() {
+    fn test_initial_scanner_delay_skips_for_cold_usage_cache_without_buckets() {
         let delay = initial_scanner_delay_for_startup(Some(120), true, false, false);
-        assert!(delay >= Duration::from_secs(108));
-        assert!(delay <= Duration::from_secs(132));
+        assert_eq!(delay, Duration::ZERO);
     }
 
     #[test]
@@ -1425,7 +1435,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_cycle_interval_prefers_explicit_cycle_over_default_cycle() {
-        let _guard = ScannerDefaultCycleGuard::set(SINGLE_DISK_SCANNER_CYCLE_SECS);
+        let _guard = ScannerDefaultCycleGuard::set(TEST_DEFAULT_SCANNER_CYCLE_SECS);
 
         with_var(ENV_SCANNER_CYCLE, Some("42"), || {
             assert_eq!(cycle_interval(), Duration::from_secs(42));
@@ -1463,19 +1473,21 @@ mod tests {
     #[test]
     #[serial]
     fn test_cycle_interval_uses_default_cycle_override_when_unconfigured() {
-        let _guard = ScannerDefaultCycleGuard::set(SINGLE_DISK_SCANNER_CYCLE_SECS);
+        let _guard = ScannerDefaultCycleGuard::set(TEST_DEFAULT_SCANNER_CYCLE_SECS);
 
         with_unset_scanner_timing_env(|| {
-            assert_eq!(cycle_interval(), Duration::from_secs(SINGLE_DISK_SCANNER_CYCLE_SECS));
+            assert_eq!(cycle_interval(), Duration::from_secs(TEST_DEFAULT_SCANNER_CYCLE_SECS));
         });
     }
 
     #[test]
-    fn test_single_disk_default_cycle_uses_long_interval_without_maintenance_features() {
-        assert_eq!(
-            single_disk_default_cycle_secs(ScannerMaintenanceFeatures::default()),
-            Some(SINGLE_DISK_SCANNER_CYCLE_SECS)
-        );
+    fn test_single_disk_default_cycle_uses_speed_based_interval_without_maintenance_features() {
+        assert_eq!(single_disk_default_cycle_secs(ScannerMaintenanceFeatures::default()), None);
+    }
+
+    #[test]
+    fn test_single_disk_default_speed_uses_regular_scanner_default() {
+        assert_eq!(single_disk_default_speed(), ScannerSpeed::Default);
     }
 
     #[test]
@@ -1513,15 +1525,15 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_cycle_interval_keeps_single_disk_cycle_with_explicit_speed() {
-        let _guard = ScannerDefaultCycleGuard::set(SINGLE_DISK_SCANNER_CYCLE_SECS);
+    fn test_cycle_interval_keeps_default_cycle_with_explicit_speed() {
+        let _guard = ScannerDefaultCycleGuard::set(TEST_DEFAULT_SCANNER_CYCLE_SECS);
 
         with_var_unset(ENV_SCANNER_CYCLE, || {
             with_var_unset("MINIO_SCANNER_CYCLE", || {
                 with_var_unset(ENV_SCANNER_START_DELAY_SECS, || {
                     with_var_unset(ENV_SCANNER_START_DELAY_SECS_DEPRECATED, || {
                         with_var(ENV_SCANNER_SPEED, Some("slowest"), || {
-                            assert_eq!(cycle_interval(), Duration::from_secs(SINGLE_DISK_SCANNER_CYCLE_SECS));
+                            assert_eq!(cycle_interval(), Duration::from_secs(TEST_DEFAULT_SCANNER_CYCLE_SECS));
                         });
                     });
                 });
@@ -1532,7 +1544,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_cycle_interval_prefers_explicit_start_delay_over_default_cycle() {
-        let _guard = ScannerDefaultCycleGuard::set(SINGLE_DISK_SCANNER_CYCLE_SECS);
+        let _guard = ScannerDefaultCycleGuard::set(TEST_DEFAULT_SCANNER_CYCLE_SECS);
 
         with_var_unset(ENV_SCANNER_CYCLE, || {
             with_var_unset("MINIO_SCANNER_CYCLE", || {
