@@ -19,9 +19,9 @@ use super::handles::{
 };
 use crate::app::storage_compat::ECStore;
 use crate::app::storage_compat::EndpointServerPools;
-use crate::app::storage_compat::bucket::metadata_sys::BucketMetadataSys;
+use crate::app::storage_compat::TierConfigMgr;
+use crate::app::storage_compat::metadata_sys::BucketMetadataSys;
 use crate::app::storage_compat::new_object_layer_fn;
-use crate::app::storage_compat::tier::tier::TierConfigMgr;
 #[cfg(test)]
 use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;

@@ -14,7 +14,7 @@
 
 use crate::storage_compat::{
     EcstoreError as StorageError,
-    config::com::{read_config, save_config},
+    com::{read_config, save_config},
     resolve_object_store_handle,
 };
 use serde::{Deserialize, Serialize};

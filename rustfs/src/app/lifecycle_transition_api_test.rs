@@ -15,15 +15,12 @@
 use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};
 use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::app::storage_compat::{
-    ECStore, Endpoint, EndpointServerPools, Endpoints, GLOBAL_TierConfigMgr, PoolEndpoints,
-    bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, OBJECT_LOCK_CONFIG},
-    bucket::metadata_sys,
-    client::object_api_utils::to_s3s_etag,
-    client::transition_api::{ReadCloser, ReaderImpl},
-    tier::{
-        tier_config::{TierConfig, TierType},
-        warm_backend::{WarmBackend, WarmBackendGetOpts},
-    },
+    ECStore, Endpoint, EndpointServerPools, Endpoints, GLOBAL_TierConfigMgr, PoolEndpoints, TierConfig, TierType, WarmBackend,
+    WarmBackendGetOpts,
+    metadata::{BUCKET_LIFECYCLE_CONFIG, OBJECT_LOCK_CONFIG},
+    metadata_sys,
+    object_api_utils::to_s3s_etag,
+    transition_api::{ReadCloser, ReaderImpl},
 };
 use crate::storage::ecfs::FS;
 use crate::storage::{
@@ -129,7 +126,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     let buckets = buckets_list.into_iter().map(|v| v.name).collect();
     metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
 
-    crate::app::storage_compat::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+    crate::app::storage_compat::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
 
     let _ = GLOBAL_ENV.set((disk_paths.clone(), ecstore.clone()));
 
@@ -929,7 +926,7 @@ async fn delete_transitioned_object_removes_remote_tier_copy_via_usecase() {
         .expect("Failed to set lifecycle configuration");
     let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
 
-    crate::app::storage_compat::bucket::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(
+    crate::app::storage_compat::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(
         ecstore.clone(),
         bucket.as_str(),
     )
@@ -989,7 +986,7 @@ async fn lifecycle_transition_marks_dirty_disks_for_capacity_manager() {
         .expect("Failed to set lifecycle configuration");
     let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
 
-    crate::app::storage_compat::bucket::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(
+    crate::app::storage_compat::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(
         ecstore.clone(),
         bucket.as_str(),
     )

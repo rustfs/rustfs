@@ -14,8 +14,8 @@
 
 use crate::admin::auth::{authenticate_request, validate_admin_request};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::storage_compat::bucket::utils::is_valid_object_prefix;
 use crate::admin::storage_compat::is_reserved_or_invalid_bucket;
+use crate::admin::storage_compat::utils::is_valid_object_prefix;
 use crate::app::context::resolve_object_store_handle;
 use crate::server::ADMIN_PREFIX;
 use crate::server::RemoteAddr;

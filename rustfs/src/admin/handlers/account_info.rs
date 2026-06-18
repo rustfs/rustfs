@@ -14,7 +14,7 @@
 
 use crate::admin::auth::authenticate_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::storage_compat::bucket::versioning_sys::BucketVersioningSys;
+use crate::admin::storage_compat::versioning_sys::BucketVersioningSys;
 use crate::app::context::resolve_object_store_handle;
 use crate::auth::get_condition_values;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};

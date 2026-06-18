@@ -14,7 +14,7 @@
 
 use crate::server::ShutdownHandle;
 use crate::storage::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
-use crate::storage_compat::bucket::metadata_sys;
+use crate::storage_compat::metadata_sys;
 use crate::{admin, config, version};
 use rustfs_config::{
     DEFAULT_BUFFER_MAX_SIZE, DEFAULT_BUFFER_MIN_SIZE, DEFAULT_BUFFER_PROFILE, DEFAULT_BUFFER_UNKNOWN_SIZE, DEFAULT_UPDATE_CHECK,
