@@ -15,10 +15,10 @@
 mod common;
 
 use crate::common::storage_compat::ecstore::{
-    bucket::lifecycle::lifecycle::TransitionOptions,
     bucket::metadata::BUCKET_LIFECYCLE_CONFIG,
     bucket::{
-        lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects, metadata_sys,
+        lifecycle::{TransitionOptions, bucket_lifecycle_ops::enqueue_transition_for_existing_objects},
+        metadata_sys,
         versioning_sys::BucketVersioningSys,
     },
     client::transition_api::{ReadCloser, ReaderImpl},

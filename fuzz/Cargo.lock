@@ -8758,6 +8758,7 @@ name = "rustfs-storage-api"
 version = "1.0.0-beta.8"
 dependencies = [
  "async-trait",
+ "rustfs-filemeta",
  "serde",
  "time",
  "uuid",
