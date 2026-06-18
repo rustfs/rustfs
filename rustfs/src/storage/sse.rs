@@ -69,12 +69,16 @@
 //! }
 //! ```
 
+#[cfg(feature = "rio-v2")]
+use aes_gcm::aead::Payload;
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit},
 };
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+#[cfg(feature = "rio-v2")]
+use chacha20poly1305::ChaCha20Poly1305;
 #[cfg(feature = "rio-v2")]
 use hmac::{Hmac, Mac};
 use http::{HeaderMap, HeaderValue};
@@ -116,6 +120,8 @@ const MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM: &str = "DAREv2-HMAC-SHA256";
 const DARE_VERSION_20: u8 = 0x20;
 #[cfg(feature = "rio-v2")]
 const DARE_CIPHER_AES_256_GCM: u8 = 0x00;
+#[cfg(feature = "rio-v2")]
+const DARE_CIPHER_CHACHA20_POLY1305: u8 = 0x01;
 #[cfg(feature = "rio-v2")]
 const DARE_HEADER_SIZE: usize = 16;
 #[cfg(feature = "rio-v2")]
@@ -820,6 +826,36 @@ fn decode_minio_kms_context(metadata: &HashMap<String, String>) -> Result<Option
 }
 
 #[cfg(feature = "rio-v2")]
+fn is_supported_sealed_object_key_cipher(cipher: u8) -> bool {
+    matches!(cipher, DARE_CIPHER_AES_256_GCM | DARE_CIPHER_CHACHA20_POLY1305)
+}
+
+#[cfg(feature = "rio-v2")]
+fn decrypt_sealed_object_key_payload(sealing_key: [u8; 32], header: &[u8], sealed_key: &[u8]) -> Result<Vec<u8>, ApiError> {
+    let nonce = &header[4..16];
+    let ciphertext = &sealed_key[DARE_HEADER_SIZE..];
+    let aad = &header[..4];
+    match header[1] {
+        DARE_CIPHER_AES_256_GCM => {
+            let cipher = Aes256Gcm::new_from_slice(&sealing_key)
+                .map_err(|err| ApiError::from(StorageError::other(format!("Invalid AES-GCM sealing key: {err}"))))?;
+            let nonce = Nonce::try_from(nonce)
+                .map_err(|_| ApiError::from(StorageError::other("Invalid sealed object-key package nonce")))?;
+            cipher.decrypt(&nonce, Payload { msg: ciphertext, aad })
+        }
+        DARE_CIPHER_CHACHA20_POLY1305 => {
+            let cipher = ChaCha20Poly1305::new_from_slice(&sealing_key)
+                .map_err(|err| ApiError::from(StorageError::other(format!("Invalid ChaCha20-Poly1305 sealing key: {err}"))))?;
+            let nonce = chacha20poly1305::Nonce::try_from(nonce)
+                .map_err(|_| ApiError::from(StorageError::other("Invalid sealed object-key package nonce")))?;
+            cipher.decrypt(&nonce, Payload { msg: ciphertext, aad })
+        }
+        _ => return Err(ApiError::from(StorageError::other("Unsupported sealed object-key DARE header"))),
+    }
+    .map_err(|err| ApiError::from(StorageError::other(format!("Failed to unseal object key: {err}"))))
+}
+
+#[cfg(feature = "rio-v2")]
 fn canonical_sse_path(bucket: &str, object: &str) -> String {
     let bucket = bucket.trim_matches('/');
     let object = object.trim_matches('/');
@@ -916,7 +952,7 @@ fn unseal_object_key(
     object: &str,
 ) -> Result<[u8; 32], ApiError> {
     let header = &sealed.sealed_key[..DARE_HEADER_SIZE];
-    if header[0] != DARE_VERSION_20 || header[1] != DARE_CIPHER_AES_256_GCM {
+    if header[0] != DARE_VERSION_20 || !is_supported_sealed_object_key_cipher(header[1]) {
         return Err(ApiError::from(StorageError::other("Unsupported sealed object-key DARE header")));
     }
     if u16::from_le_bytes([header[2], header[3]]) != 31 || header[4] & 0x80 == 0 {
@@ -924,19 +960,7 @@ fn unseal_object_key(
     }
 
     let sealing_key = derive_sealing_key(external_key, sealed.iv, managed_sse_domain(sse_type), bucket, object);
-    let cipher = Aes256Gcm::new_from_slice(&sealing_key)
-        .map_err(|err| ApiError::from(StorageError::other(format!("Invalid sealing key: {err}"))))?;
-    let nonce = Nonce::try_from(&header[4..16])
-        .map_err(|_| ApiError::from(StorageError::other("Invalid sealed object-key package nonce")))?;
-    let plaintext = cipher
-        .decrypt(
-            &nonce,
-            aes_gcm::aead::Payload {
-                msg: &sealed.sealed_key[DARE_HEADER_SIZE..],
-                aad: &header[..4],
-            },
-        )
-        .map_err(|err| ApiError::from(StorageError::other(format!("Failed to unseal object key: {err}"))))?;
+    let plaintext = decrypt_sealed_object_key_payload(sealing_key, header, &sealed.sealed_key)?;
 
     let object_key: [u8; 32] = plaintext
         .as_slice()
@@ -3082,6 +3106,14 @@ mod tests {
 
         assert_eq!(decrypted.key_kind, EncryptionKeyKind::Object);
         assert_eq!(decrypted.key_bytes, material.key_bytes);
+    }
+
+    #[cfg(feature = "rio-v2")]
+    #[test]
+    fn test_supported_sealed_object_key_cipher_accepts_current_minio_fixture_value() {
+        assert!(is_supported_sealed_object_key_cipher(DARE_CIPHER_AES_256_GCM));
+        assert!(is_supported_sealed_object_key_cipher(DARE_CIPHER_CHACHA20_POLY1305));
+        assert!(!is_supported_sealed_object_key_cipher(0x02));
     }
 
     #[cfg(feature = "rio-v2")]

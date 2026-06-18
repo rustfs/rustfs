@@ -9018,6 +9018,7 @@ dependencies = [
  "base64 0.22.1",
  "base64-simd",
  "bytes",
+ "chacha20poly1305",
  "clap",
  "const-str",
  "datafusion",
@@ -9261,6 +9262,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "bytesize",
+ "chacha20poly1305",
  "chrono",
  "criterion",
  "enumset",
@@ -9874,6 +9876,7 @@ version = "1.0.0-beta.8"
 dependencies = [
  "aes-gcm",
  "bytes",
+ "chacha20poly1305",
  "hex",
  "hmac 0.13.0",
  "minlz",
