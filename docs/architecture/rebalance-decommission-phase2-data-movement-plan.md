@@ -361,4 +361,3 @@ F06 and F07 may combine only if checksum preservation requires the new streaming
 1. Which metadata fields are considered mandatory for equivalence in Phase 2: strict internal fields or externally observable fields only?
 2. Should F08 fully match MinIO cleanup behavior, or should RustFS keep expired source entries but expose them as residual state?
 3. Should F10 apply to both rebalance and decommission in the same PR, or should rebalance land first as the higher-risk cleanup path?
-

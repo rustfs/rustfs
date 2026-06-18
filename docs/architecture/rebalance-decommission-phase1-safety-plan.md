@@ -374,4 +374,3 @@ F01 is highest risk, but it may need the most design review. F02 and F04 are goo
 1. For F01 remote tiered versions, should Phase 1 match MinIO and skip them during rebalance, or should RustFS implement cross-pool remote metadata movement now?
 2. For F03 reload failure, should the implementation attempt to rollback persisted pool meta, or fail closed and expose degraded metadata state?
 3. For F05 start propagation, is a backward-compatible degraded error response acceptable, or must the API stay strictly compatible with current success/error shapes?
-

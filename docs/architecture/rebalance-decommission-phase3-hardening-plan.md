@@ -318,4 +318,3 @@ F11 may depend on Phase 2 cleanup semantics if F10 changes retry behavior. F12 c
 2. Which actor identity is safe and useful to log for admin requests?
 3. Should metadata unknown fields fail startup, warn and continue, or quarantine only the affected operation?
 4. Should RustFS match MinIO's rebalance completion tolerance by default?
-

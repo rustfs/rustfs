@@ -36,8 +36,8 @@ This file is not a code patch. Each block below should be expanded into a focuse
 
 ### F01: Fix rebalance delete marker and remote tiered version migration
 
-**Source:** P1.1  
-**Decision:** Confirmed fix required.  
+**Source:** P1.1
+**Decision:** Confirmed fix required.
 **Target priority:** Critical.
 
 **Problem:** `rebalance_entry` marks delete markers and remote tiered versions as moved, but those branches operate through the source `SetDisks` path rather than a confirmed cross-pool target write. Source cleanup can then remove the only metadata that preserves tombstone or tiered-object semantics.
@@ -71,8 +71,8 @@ This file is not a code patch. Each block below should be expanded into a focuse
 
 ### F02: Stop treating `DataMovementOverwriteErr` as cleanup-safe in decommission
 
-**Source:** P1.5  
-**Decision:** Confirmed fix required.  
+**Source:** P1.5
+**Decision:** Confirmed fix required.
 **Target priority:** High.
 
 **Problem:** Decommission treats `DataMovementOverwriteErr` like object-not-found/version-not-found and sets `cleanup_ignored = true`. That error only means source and destination pool are the same; it does not prove an equivalent target version exists.
@@ -103,8 +103,8 @@ This file is not a code patch. Each block below should be expanded into a focuse
 
 ### F03: Make decommission `pool_meta` reload a cluster-wide start barrier
 
-**Source:** P1.4  
-**Decision:** Confirmed fix required.  
+**Source:** P1.4
+**Decision:** Confirmed fix required.
 **Target priority:** High.
 
 **Problem:** `start_decommission` saves pool meta and then calls peer reload. Reload failure is logged but the operation still returns success, leaving stale peers able to write into the retiring pool.
@@ -137,8 +137,8 @@ This file is not a code patch. Each block below should be expanded into a focuse
 
 ### F04: Reorder store init recovery to restore pool meta before rebalance
 
-**Source:** P1.2  
-**Decision:** Confirmed fix required.  
+**Source:** P1.2
+**Decision:** Confirmed fix required.
 **Target priority:** High.
 
 **Problem:** Store init loads and starts rebalance before loading persisted pool meta. If unfinished decommission exists on disk, `start_rebalance` can miss it and both processes may resume.
@@ -171,8 +171,8 @@ This file is not a code patch. Each block below should be expanded into a focuse
 
 ### F05: Make rebalance start/stop distributed semantics explicit and fail-safe
 
-**Source:** P1.3, A4  
-**Decision:** Confirmed fix required.  
+**Source:** P1.3, A4
+**Decision:** Confirmed fix required.
 **Target priority:** High.
 
 **Problem:** Rebalance start can return success even when peer propagation fails or peer background start later fails. Stop can return success while peer stop failed or local stop errors were ignored. Stop is also asynchronous, but admin semantics do not clearly expose `stopping` versus `stopped`.
@@ -213,8 +213,8 @@ This file is not a code patch. Each block below should be expanded into a focuse
 
 ### F06: Stream multipart data movement instead of buffering whole parts
 
-**Source:** P2.1  
-**Decision:** Confirmed fix required.  
+**Source:** P2.1
+**Decision:** Confirmed fix required.
 **Target priority:** High.
 
 **Problem:** Multipart migration allocates `Vec<u8>` for each part and reads the whole part into memory. Large parts plus concurrent workers can OOM the process.
@@ -245,8 +245,8 @@ This file is not a code patch. Each block below should be expanded into a focuse
 
 ### F07: Preserve and verify full data movement metadata
 
-**Source:** P2.2, A3  
-**Decision:** Confirmed fix required for checksum; additional metadata requires verification and likely fixes.  
+**Source:** P2.2, A3
+**Decision:** Confirmed fix required for checksum; additional metadata requires verification and likely fixes.
 **Target priority:** Medium.
 
 **Problem:** Data movement preserves basic metadata but does not fully prove checksum, multipart checksum, replication state, version purge status, or object-lock metadata equivalence after migration.
@@ -286,8 +286,8 @@ This file is not a code patch. Each block below should be expanded into a focuse
 
 ### F08: Align decommission lifecycle-expired version cleanup semantics
 
-**Source:** P2.4  
-**Decision:** Confirmed fix required or explicit design decision required.  
+**Source:** P2.4
+**Decision:** Confirmed fix required or explicit design decision required.
 **Target priority:** Medium.
 
 **Problem:** Decommission skips lifecycle-expired versions but does not clean the source entry if any expired version exists. MinIO counts expired versions as completed and can clean the source entry.
@@ -317,8 +317,8 @@ This file is not a code patch. Each block below should be expanded into a focuse
 
 ### F09: Handle rebalance overwrite races using explicit equivalence checks
 
-**Source:** P2.3  
-**Decision:** Fix likely required; first confirm exact race cases with tests.  
+**Source:** P2.3
+**Decision:** Fix likely required; first confirm exact race cases with tests.
 **Target priority:** Medium.
 
 **Problem:** RustFS treats `DataMovementOverwriteErr` as non-transient during rebalance, while MinIO ignores acceptable overwrite races. A strict failure can prevent rebalance convergence when the target already has an equivalent version.
@@ -350,8 +350,8 @@ This file is not a code patch. Each block below should be expanded into a focuse
 
 ### F10: Add source cleanup preflight verification before deleting migrated entries
 
-**Source:** A2  
-**Decision:** Fix recommended as defense-in-depth.  
+**Source:** A2
+**Decision:** Fix recommended as defense-in-depth.
 **Target priority:** Medium.
 
 **Problem:** After versions are migrated, source cleanup deletes the source prefix based on the version list read before migration. A final verification would protect against state propagation failures, recovery races, or repair processes changing metadata before cleanup.
@@ -384,8 +384,8 @@ This file is not a code patch. Each block below should be expanded into a focuse
 
 ### F11: Improve rebalance cleanup failure handling and reporting
 
-**Source:** A1  
-**Decision:** Fix recommended.  
+**Source:** A1
+**Decision:** Fix recommended.
 **Target priority:** Medium.
 
 **Problem:** Rebalance source cleanup failure is converted to a warning and the task can still complete. Only a count and last warning are preserved.
@@ -418,8 +418,8 @@ This file is not a code patch. Each block below should be expanded into a focuse
 
 ### F12: Add structured audit fields for rebalance and decommission operations
 
-**Source:** P3.2  
-**Decision:** Fix recommended.  
+**Source:** P3.2
+**Decision:** Fix recommended.
 **Target priority:** Low.
 
 **Problem:** Critical admin operations do not consistently log actor, remote address, request ID, pool indices, peer host, result, and partial failure state.
@@ -451,8 +451,8 @@ This file is not a code patch. Each block below should be expanded into a focuse
 
 ### F13: Harden persisted rebalance and pool metadata decoding
 
-**Source:** P3.3  
-**Decision:** Fix recommended after compatibility review.  
+**Source:** P3.3
+**Decision:** Fix recommended after compatibility review.
 **Target priority:** Low.
 
 **Problem:** Persisted rebalance and pool metadata can accept unknown fields silently. This may be acceptable for compatibility, but it weakens corruption and typo detection.
@@ -484,8 +484,8 @@ This file is not a code patch. Each block below should be expanded into a focuse
 
 ### F14: Decide and document rebalance completion threshold behavior
 
-**Source:** P3.4  
-**Decision:** Design decision required.  
+**Source:** P3.4
+**Decision:** Design decision required.
 **Target priority:** Low.
 
 **Problem:** RustFS uses a stricter rebalance completion goal than MinIO's tolerance-based behavior. This may increase movement work and operational time.
@@ -544,4 +544,3 @@ Each fix should be developed in a separate PR unless two adjacent fixes share th
 - F01 and F09 should not be merged together unless the equivalence helper is clearly isolated.
 - F06 and F07 may be combined only if streaming part migration and checksum preservation share the same reader changes.
 - F03 and F05 may share peer failure aggregation utilities, but their admin behavior should be tested separately.
-
