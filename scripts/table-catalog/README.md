@@ -123,6 +123,7 @@ PyIceberg, PyArrow, or boto3:
 
 ```bash
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-client-matrix
+python3 scripts/table-catalog/pyiceberg_smoke.py --print-engine-compatibility
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-vendor-profiles
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-unsupported-inventory
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-production-readiness
@@ -130,8 +131,17 @@ python3 scripts/table-catalog/pyiceberg_smoke.py --print-production-readiness
 
 Use these outputs when updating release notes, PR descriptions, or follow-up
 work items. They are intentionally conservative: only PyIceberg is automated by
-this script today; other engines are documented until a repeatable harness is
-added.
+this script today. Spark now has generated configuration and SQL smoke input;
+other engines are documented until a repeatable harness is added.
+
+The standalone engine helper prints the same compatibility matrix and can also
+generate Spark REST catalog input without importing PyIceberg:
+
+```bash
+python3 scripts/table-catalog/engine_compatibility.py --print-engine-matrix
+python3 scripts/table-catalog/engine_compatibility.py --print-spark-config
+python3 scripts/table-catalog/engine_compatibility.py --print-spark-sql --cleanup
+```
 
 The smoke test also probes catalog-backed advanced Iceberg surfaces:
 
@@ -153,9 +163,10 @@ The smoke test also probes catalog-backed advanced Iceberg surfaces:
 | Client | Current status | Claim |
 |---|---|---|
 | PyIceberg | Automated smoke target | create namespace, create table, append, reload, scan, metadata-location, refs, views, maintenance, diagnostics, optional catalog-vended table credentials with exact-prefix data-plane scope probe |
-| Spark Iceberg REST catalog | Manual-ready | create/load/append/reload should be verified against a running RustFS endpoint |
+| Spark Iceberg REST catalog | Generated smoke harness | configuration and SQL can be generated for create namespace, create table, append, reload, count, and cleanup against a running RustFS endpoint |
 | Trino Iceberg REST catalog | Documented, not automated | no write compatibility claim yet |
 | DuckDB Iceberg | Documented, not automated | read-path reference only |
+| StarRocks Iceberg REST catalog | Documented, not automated | external catalog read-path reference only |
 | Databend | Documented, not automated | S3 data-plane reference only; Iceberg REST catalog integration is not claimed |
 | Snowflake/Open Catalog integrations | Documented, not automated | reference only |
 
@@ -221,10 +232,21 @@ The TTL is clamped to the supported short-lived range by the server.
 ## Spark Manual Baseline
 
 Spark validation should use the same RustFS endpoint and warehouse bucket as the
-PyIceberg smoke test. The exact package version should be recorded in the client
-matrix after each run.
+PyIceberg smoke test. The exact Spark and Iceberg package versions should be
+recorded in the client matrix after each run.
 
-Minimum configuration shape:
+Generate the configuration properties:
+
+```bash
+python3 scripts/table-catalog/engine_compatibility.py \
+  --endpoint http://127.0.0.1:9000 \
+  --warehouse rustfs-s3table-smoke \
+  --access-key rustfsadmin \
+  --secret-key rustfsadmin \
+  --print-spark-config
+```
+
+The generated configuration shape is:
 
 ```properties
 spark.sql.catalog.rustfs=org.apache.iceberg.spark.SparkCatalog
@@ -237,7 +259,22 @@ spark.sql.catalog.rustfs.s3.path-style-access=true
 spark.sql.catalog.rustfs.rest.sigv4-enabled=true
 spark.sql.catalog.rustfs.rest.signing-name=s3
 spark.sql.catalog.rustfs.rest.signing-region=us-east-1
+spark.sql.catalog.rustfs.s3.access-key-id=rustfsadmin
+spark.sql.catalog.rustfs.s3.secret-access-key=rustfsadmin
 ```
 
-Until Spark is automated, do not claim Spark support beyond a manually verified
-run with the exact Spark and Iceberg versions recorded.
+Generate the SQL smoke input:
+
+```bash
+python3 scripts/table-catalog/engine_compatibility.py \
+  --catalog-name rustfs \
+  --namespace smoke \
+  --table events \
+  --print-spark-sql \
+  --cleanup
+```
+
+The generated SQL covers namespace creation, table creation, append, refresh,
+count, and optional cleanup. Until Spark execution is automated in CI, do not
+claim Spark support beyond a manually verified run with the exact Spark and
+Iceberg versions recorded.

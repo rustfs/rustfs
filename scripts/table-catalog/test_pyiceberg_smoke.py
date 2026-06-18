@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -765,6 +766,19 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         for entry in inventory:
             self.assertIn("status", entry)
             self.assertIn("validation", entry)
+
+    def test_print_engine_compatibility_outputs_machine_readable_matrix(self) -> None:
+        args = self.parse_with_args(["--print-engine-compatibility"])
+
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            self.assertTrue(pyiceberg_smoke.printed_metadata(args))
+
+        document = json.loads(stdout.getvalue())
+        self.assertIn("engine_compatibility", document)
+        clients = {entry["client"] for entry in document["engine_compatibility"]}
+        self.assertIn("PyIceberg", clients)
+        self.assertIn("Spark Iceberg REST catalog", clients)
 
     def test_published_table_catalog_docs_do_not_use_internal_roadmap_labels(self) -> None:
         readme = (SCRIPT_DIR / "README.md").read_text(encoding="utf-8")

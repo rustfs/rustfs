@@ -16,6 +16,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+import engine_compatibility
+
 DEFAULT_PROFILE = "rustfs"
 CATALOG_VENDED_PROFILE = "rustfs-vended-credentials"
 VENDED_CREDENTIAL_PROFILES = {CATALOG_VENDED_PROFILE}
@@ -298,6 +300,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--insecure", action="store_true", help="Disable TLS verification for HTTPS endpoints.")
     parser.add_argument("--print-client-matrix", action="store_true", help="Print the current client conformance matrix as JSON and exit.")
+    parser.add_argument("--print-engine-compatibility", action="store_true", help="Print the current Iceberg engine compatibility matrix as JSON and exit.")
     parser.add_argument("--print-vendor-profiles", action="store_true", help="Print vendor connection profile references as JSON and exit.")
     parser.add_argument("--print-unsupported-inventory", action="store_true", help="Print unsupported capability inventory as JSON and exit.")
     parser.add_argument(
@@ -720,6 +723,9 @@ def printed_metadata(args: argparse.Namespace) -> bool:
     printed = False
     if args.print_client_matrix:
         print_json_document({"client_matrix": client_matrix()})
+        printed = True
+    if args.print_engine_compatibility:
+        print_json_document({"engine_compatibility": engine_compatibility.engine_compatibility_matrix()})
         printed = True
     if args.print_vendor_profiles:
         print_json_document({"vendor_profiles": vendor_profiles()})
