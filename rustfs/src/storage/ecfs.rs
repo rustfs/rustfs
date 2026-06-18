@@ -21,11 +21,7 @@ use crate::storage::access::has_bypass_governance_header;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::get_opts;
 use crate::storage::s3_api::acl;
-use crate::storage::{parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled};
-use crate::table_catalog;
-use http::StatusCode;
-use metrics::{counter, histogram};
-use rustfs_ecstore::{
+use crate::storage::storage_compat::ecstore::{
     bucket::{
         metadata::{
             BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_VERSIONING_CONFIG,
@@ -40,8 +36,11 @@ use rustfs_ecstore::{
         versioning_sys::BucketVersioningSys,
     },
     error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
-    store_api::ObjectOptions,
 };
+use crate::storage::{parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled};
+use crate::table_catalog;
+use http::StatusCode;
+use metrics::{counter, histogram};
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use rustfs_storage_api::{BucketOperations, BucketOptions, ObjectLockRetentionOptions, ObjectOperations as _};
@@ -59,6 +58,8 @@ const LOG_COMPONENT_STORAGE: &str = "storage";
 const LOG_SUBSYSTEM_OBJECT: &str = "object";
 const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
 const LOG_SUBSYSTEM_TAGGING: &str = "tagging";
+
+use crate::storage::StorageObjectOptions as ObjectOptions;
 
 #[derive(Debug, Clone)]
 pub struct FS {

@@ -28,6 +28,7 @@ pub mod scanner_budget;
 pub mod scanner_folder;
 pub mod scanner_io;
 pub mod sleeper;
+mod storage_compat;
 
 pub use data_usage_define::*;
 pub use error::ScannerError;

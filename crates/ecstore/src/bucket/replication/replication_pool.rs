@@ -42,6 +42,7 @@ use rustfs_filemeta::VersionPurgeStatusType;
 use rustfs_filemeta::replication_statuses_map;
 use rustfs_filemeta::version_purge_statuses_map;
 use rustfs_filemeta::{REPLICATE_EXISTING, REPLICATE_HEAL, REPLICATE_HEAL_DELETE};
+use rustfs_storage_api::DeletedObject;
 use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
 use std::any::Any;
 use std::sync::Arc;
@@ -838,7 +839,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         // get_object_info here because the delete-marker or version may
                         // already be absent from the local store — that is expected.
                         let dv = DeletedObjectReplicationInfo {
-                            delete_object: crate::store_api::DeletedObject {
+                            delete_object: DeletedObject {
                                 object_name: entry.object.clone(),
                                 version_id: entry.version_id,
                                 delete_marker_version_id: entry.delete_marker_version_id,
@@ -1577,7 +1578,7 @@ pub async fn queue_replication_heal_internal(
         };
 
         let dv = DeletedObjectReplicationInfo {
-            delete_object: crate::store_api::DeletedObject {
+            delete_object: DeletedObject {
                 object_name: roi.name.clone(),
                 delete_marker_version_id: dm_version_id,
                 version_id,

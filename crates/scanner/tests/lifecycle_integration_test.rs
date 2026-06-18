@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use futures::FutureExt;
-use rustfs_config::ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT;
-use rustfs_ecstore::{
+mod common;
+
+use crate::common::storage_compat::ecstore::{
     bucket::lifecycle::lifecycle::TransitionOptions,
     bucket::metadata::BUCKET_LIFECYCLE_CONFIG,
     bucket::{
@@ -28,16 +28,20 @@ use rustfs_ecstore::{
     global::GLOBAL_TierConfigMgr,
     pools::path2_bucket_object_with_base_path,
     store::ECStore,
-    store_api::{ObjectOptions, PutObjReader},
     tier::{
         tier_config::{TierConfig, TierMinIO, TierType},
         warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
     },
 };
+use futures::FutureExt;
+use rustfs_config::ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT;
 use rustfs_filemeta::FileMeta;
-use rustfs_scanner::scanner::init_data_scanner;
 use rustfs_scanner::scanner_folder::ScannerItem;
 use rustfs_scanner::scanner_io::ScannerIODisk;
+use rustfs_scanner::{
+    ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions, ScannerPutObjReader as PutObjReader,
+    scanner::init_data_scanner,
+};
 use rustfs_storage_api::{
     BucketOperations, ListOperations as _, MakeBucketOptions, MultipartOperations as _, ObjectIO as _, ObjectOperations as _,
 };
@@ -121,7 +125,9 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
 
     // format disks (only first time)
-    rustfs_ecstore::store::init_local_disks(endpoint_pools.clone()).await.unwrap();
+    crate::common::storage_compat::ecstore::store::init_local_disks(endpoint_pools.clone())
+        .await
+        .unwrap();
 
     // create ECStore with dynamic port 0 (let OS assign) or fixed 9002 if free
     let port = 9002; // for simplicity
@@ -139,10 +145,11 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
         .await
         .unwrap();
     let buckets = buckets_list.into_iter().map(|v| v.name).collect();
-    rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
+    crate::common::storage_compat::ecstore::bucket::metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
 
     // Initialize background expiry workers
-    rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+    crate::common::storage_compat::ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone())
+        .await;
 
     // Store in global once lock
     let _ = GLOBAL_ENV.set((disk_paths.clone(), ecstore.clone()));
@@ -190,7 +197,9 @@ async fn setup_isolated_test_env(init_expiry: bool) -> (Vec<PathBuf>, Arc<ECStor
     };
 
     let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
-    rustfs_ecstore::store::init_local_disks(endpoint_pools.clone()).await.unwrap();
+    crate::common::storage_compat::ecstore::store::init_local_disks(endpoint_pools.clone())
+        .await
+        .unwrap();
 
     let server_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
@@ -205,10 +214,11 @@ async fn setup_isolated_test_env(init_expiry: bool) -> (Vec<PathBuf>, Arc<ECStor
         .await
         .unwrap();
     let buckets = buckets_list.into_iter().map(|v| v.name).collect();
-    rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
+    crate::common::storage_compat::ecstore::bucket::metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
 
     if init_expiry {
-        rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+        crate::common::storage_compat::ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone())
+            .await;
     }
 
     (disk_paths, ecstore)
@@ -784,12 +794,7 @@ async fn register_mock_tier(tier_name: &str) -> MockWarmBackend {
     backend
 }
 
-async fn wait_for_transition(
-    ecstore: &Arc<ECStore>,
-    bucket: &str,
-    object: &str,
-    timeout: Duration,
-) -> Option<rustfs_ecstore::store_api::ObjectInfo> {
+async fn wait_for_transition(ecstore: &Arc<ECStore>, bucket: &str, object: &str, timeout: Duration) -> Option<ObjectInfo> {
     let deadline = tokio::time::Instant::now() + timeout;
 
     loop {
@@ -873,7 +878,7 @@ mod serial_tests {
         println!("✅ Lifecycle configuration set for bucket: {bucket_name}");
 
         // Verify lifecycle configuration was set
-        match rustfs_ecstore::bucket::metadata_sys::get(bucket_name.as_str()).await {
+        match crate::common::storage_compat::ecstore::bucket::metadata_sys::get(bucket_name.as_str()).await {
             Ok(bucket_meta) => {
                 assert!(bucket_meta.lifecycle_config.is_some());
                 println!("✅ Bucket metadata retrieved successfully");
@@ -900,7 +905,7 @@ mod serial_tests {
             println!("✅ Object was transitioned by lifecycle processing");
             // Let's try to get object info to see its details
             match ecstore
-                .get_object_info(bucket_name.as_str(), object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
+                .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
                 .await
             {
                 Ok(obj_info) => {
@@ -1279,7 +1284,8 @@ mod serial_tests {
             "stale transitioned remote object should still exist before scanner fallback runs"
         );
 
-        rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+        crate::common::storage_compat::ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone())
+            .await;
         scan_object_metadata(&disk_paths[0], bucket_name.as_str(), object_name).await;
 
         assert!(
@@ -1340,7 +1346,8 @@ mod serial_tests {
             "stale transitioned remote object should still exist before scanner cleanup runs"
         );
 
-        rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+        crate::common::storage_compat::ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone())
+            .await;
         scan_object_metadata(&disk_paths[0], bucket_name.as_str(), object_name).await;
 
         assert!(
@@ -1707,7 +1714,8 @@ mod serial_tests {
 
         assert!(object_exists(&ecstore, bucket_name.as_str(), object_name).await);
 
-        rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+        crate::common::storage_compat::ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone())
+            .await;
         scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
 
         assert!(
@@ -1811,7 +1819,8 @@ mod serial_tests {
             .await
             .expect("Failed to set noncurrent lifecycle configuration");
 
-        rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+        crate::common::storage_compat::ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone())
+            .await;
 
         scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
 

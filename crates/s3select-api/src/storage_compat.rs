@@ -1,0 +1,41 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+pub(crate) type SelectGetObjectReader = rustfs_ecstore::store_api::GetObjectReader;
+pub(crate) type SelectObjectInfo = rustfs_ecstore::store_api::ObjectInfo;
+pub(crate) type SelectObjectOptions = rustfs_ecstore::store_api::ObjectOptions;
+pub(crate) type SelectStorageError = rustfs_ecstore::error::StorageError;
+pub(crate) type SelectStore = rustfs_ecstore::store::ECStore;
+
+pub(crate) const SELECT_DEFAULT_READ_BUFFER_SIZE: usize = rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
+
+pub(crate) fn select_default_read_buffer_size_u64() -> u64 {
+    u64::try_from(SELECT_DEFAULT_READ_BUFFER_SIZE).unwrap_or(u64::MAX)
+}
+
+pub(crate) fn resolve_select_object_store_handle() -> Option<std::sync::Arc<SelectStore>> {
+    rustfs_ecstore::resolve_object_store_handle()
+}
+
+pub(crate) fn select_is_err_bucket_not_found(err: &SelectStorageError) -> bool {
+    rustfs_ecstore::error::is_err_bucket_not_found(err)
+}
+
+pub(crate) fn select_is_err_object_not_found(err: &SelectStorageError) -> bool {
+    rustfs_ecstore::error::is_err_object_not_found(err)
+}
+
+pub(crate) fn select_is_err_version_not_found(err: &SelectStorageError) -> bool {
+    rustfs_ecstore::error::is_err_version_not_found(err)
+}

@@ -2322,11 +2322,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_object_reader_uses_local_managed_fallback_without_env() {
+    async fn test_get_object_reader_uses_local_managed_fallback_with_explicit_sse_s3_key() {
         async_with_vars(
             [
                 ("__RUSTFS_SSE_SIMPLE_CMK", None::<String>),
-                ("RUSTFS_SSE_S3_MASTER_KEY", None::<String>),
+                ("RUSTFS_SSE_S3_MASTER_KEY", Some(BASE64_STANDARD.encode([0u8; 32]))),
             ],
             async {
                 let plaintext = b"managed-local-fallback".to_vec();
@@ -2390,7 +2390,7 @@ mod tests {
                     &HeaderMap::new(),
                 )
                 .await
-                .expect("managed encrypted reads should fall back to the local SSE-S3 key");
+                .expect("managed encrypted reads should use the configured local SSE-S3 key");
 
                 let mut actual = Vec::new();
                 reader.read_to_end(&mut actual).await.expect("read managed plaintext");

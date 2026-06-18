@@ -137,25 +137,9 @@ pub fn has_bad_path_component(path: &str) -> bool {
             i += 1;
         }
 
-        // Trim whitespace of segment
-        let mut segment_start = start;
-        let mut segment_end = i;
-
-        while segment_start < segment_end && bytes[segment_start].is_ascii_whitespace() {
-            segment_start += 1;
-        }
-        while segment_end > segment_start && bytes[segment_end - 1].is_ascii_whitespace() {
-            segment_end -= 1;
-        }
-
-        // Check for ".." or "."
-        match segment_end - segment_start {
-            2 if segment_start + 1 < n && bytes[segment_start] == b'.' && bytes[segment_start + 1] == b'.' => {
-                return true;
-            }
-            1 if bytes[segment_start] == b'.' => {
-                return true;
-            }
+        // Trim whitespace of segment and check for ".." or "."
+        match path[start..i].trim() {
+            "." | ".." => return true,
             _ => {}
         }
 
@@ -436,6 +420,9 @@ mod tests {
         assert!(!is_valid_object_prefix("prefix/./other"));
         assert!(!is_valid_object_prefix("a/../b/../c"));
         assert!(!is_valid_object_prefix("a/./b/./c"));
+        assert!(!is_valid_object_prefix("\x0b./object"));
+        assert!(!is_valid_object_prefix("prefix/\x0b../object"));
+        assert!(!is_valid_object_prefix("\x0b.\\\\object"));
 
         // Invalid cases - double slashes
         assert!(!is_valid_object_prefix("prefix//with//double//slashes"));

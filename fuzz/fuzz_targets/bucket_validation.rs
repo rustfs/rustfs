@@ -1,7 +1,9 @@
 #![no_main]
 
+mod storage_compat;
+
 use libfuzzer_sys::fuzz_target;
-use rustfs_ecstore::bucket::utils::{check_bucket_and_object_names, check_list_objs_args, check_valid_bucket_name_strict};
+use crate::storage_compat::ecstore::bucket::utils::{check_bucket_and_object_names, check_list_objs_args, check_valid_bucket_name_strict};
 
 fn parse_case(data: &[u8]) -> (String, String) {
     let text = String::from_utf8_lossy(data);

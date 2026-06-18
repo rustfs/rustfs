@@ -488,7 +488,8 @@ impl HealChannelProcessor {
 mod tests {
     use super::*;
     use crate::heal::manager::HealConfig;
-    use crate::heal::storage::HealStorageAPI;
+    use crate::heal::storage::{HealObjectInfo, HealStorageAPI};
+    use crate::heal::storage_compat::{DiskStore, Endpoint};
     use rustfs_common::heal_channel::{
         HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealRequestSource, HealScanMode,
     };
@@ -498,11 +499,7 @@ mod tests {
     struct MockStorage;
     #[async_trait::async_trait]
     impl HealStorageAPI for MockStorage {
-        async fn get_object_meta(
-            &self,
-            _bucket: &str,
-            _object: &str,
-        ) -> crate::Result<Option<rustfs_ecstore::store_api::ObjectInfo>> {
+        async fn get_object_meta(&self, _bucket: &str, _object: &str) -> crate::Result<Option<HealObjectInfo>> {
             Ok(None)
         }
         async fn get_object_data(&self, _bucket: &str, _object: &str) -> crate::Result<Option<Vec<u8>>> {
@@ -520,13 +517,10 @@ mod tests {
         async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> crate::Result<Vec<u8>> {
             Ok(vec![])
         }
-        async fn get_disk_status(
-            &self,
-            _endpoint: &rustfs_ecstore::disk::endpoint::Endpoint,
-        ) -> crate::Result<crate::heal::storage::DiskStatus> {
+        async fn get_disk_status(&self, _endpoint: &Endpoint) -> crate::Result<crate::heal::storage::DiskStatus> {
             Ok(crate::heal::storage::DiskStatus::Ok)
         }
-        async fn format_disk(&self, _endpoint: &rustfs_ecstore::disk::endpoint::Endpoint) -> crate::Result<()> {
+        async fn format_disk(&self, _endpoint: &Endpoint) -> crate::Result<()> {
             Ok(())
         }
         async fn get_bucket_info(&self, _bucket: &str) -> crate::Result<Option<rustfs_storage_api::BucketInfo>> {
@@ -580,7 +574,7 @@ mod tests {
         ) -> crate::Result<(Vec<String>, Option<String>, bool)> {
             Ok((vec![], None, false))
         }
-        async fn get_disk_for_resume(&self, _set_disk_id: &str) -> crate::Result<rustfs_ecstore::disk::DiskStore> {
+        async fn get_disk_for_resume(&self, _set_disk_id: &str) -> crate::Result<DiskStore> {
             Err(crate::Error::other("Not implemented in mock"))
         }
     }

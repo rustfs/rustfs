@@ -14,9 +14,10 @@
 
 use crate::heal::{HealOptions, HealPriority, HealRequest, HealType};
 use crate::{Error, Result};
-use rustfs_ecstore::disk::endpoint::Endpoint;
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
+
+use super::storage_compat::Endpoint;
 
 /// Corruption type
 #[derive(Debug, Clone, Serialize, Deserialize)]

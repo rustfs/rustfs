@@ -16,14 +16,14 @@ use super::interfaces::{
     BucketMetadataInterface, BufferConfigInterface, EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface,
     NotifyInterface, RegionInterface, ServerConfigInterface, TierConfigInterface,
 };
+use crate::app::storage_compat::ecstore::bucket::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
+use crate::app::storage_compat::ecstore::endpoints::EndpointServerPools;
+use crate::app::storage_compat::ecstore::global::{get_global_endpoints_opt, get_global_region, get_global_tier_config_mgr};
+use crate::app::storage_compat::ecstore::tier::tier::TierConfigMgr;
 use crate::config::{RustFSBufferConfig, get_global_buffer_config};
 use async_trait::async_trait;
 use rustfs_config::server_config::Config;
 use rustfs_config::server_config::get_global_server_config;
-use rustfs_ecstore::bucket::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
-use rustfs_ecstore::endpoints::EndpointServerPools;
-use rustfs_ecstore::global::{get_global_endpoints_opt, get_global_region, get_global_tier_config_mgr};
-use rustfs_ecstore::tier::tier::TierConfigMgr;
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::{KmsServiceManager, get_global_kms_service_manager};
 use rustfs_notify::{EventArgs, NotificationError, notifier_global};

@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::storage::storage_compat::ecstore::bucket::versioning_sys::BucketVersioningSys;
+use crate::storage::storage_compat::ecstore::error::Result;
+use crate::storage::storage_compat::ecstore::error::StorageError;
 use http::header::{IF_MATCH, IF_NONE_MATCH};
 use http::{HeaderMap, HeaderValue};
-use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::error::Result;
-use rustfs_ecstore::error::StorageError;
 use rustfs_utils::http::{
     AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
     AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
@@ -31,7 +31,6 @@ use s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE;
 
 use crate::auth::UNSIGNED_PAYLOAD;
 use crate::auth::UNSIGNED_PAYLOAD_TRAILER;
-use rustfs_ecstore::store_api::ObjectOptions;
 use rustfs_policy::service_type::ServiceType;
 use rustfs_storage_api::{HTTPPreconditions, HTTPRangeSpec};
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
@@ -47,6 +46,7 @@ use crate::auth::AuthType;
 use crate::auth::get_query_param;
 use crate::auth::get_request_auth_type_with_query;
 use crate::auth::is_request_presigned_signature_v4_with_query;
+use crate::storage::StorageObjectOptions as ObjectOptions;
 
 #[cfg(test)]
 use rustfs_utils::http::insert_header;

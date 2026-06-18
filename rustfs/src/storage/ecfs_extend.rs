@@ -16,16 +16,15 @@ use crate::config::{RustFSBufferConfig, WorkloadProfile, get_global_buffer_confi
 use crate::error::ApiError;
 use crate::server::cors;
 use crate::storage::ecfs::ListObjectUnorderedQuery;
+use crate::storage::storage_compat::ecstore::bucket::metadata_sys;
+use crate::storage::storage_compat::ecstore::bucket::metadata_sys::get_replication_config;
+use crate::storage::storage_compat::ecstore::bucket::object_lock::objectlock_sys;
+use crate::storage::storage_compat::ecstore::bucket::replication::ReplicationConfigurationExt;
+use crate::storage::storage_compat::ecstore::error::StorageError;
+use crate::storage::storage_compat::ecstore::resolve_object_store_handle;
 use http::header::{IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::counter;
-use rustfs_ecstore::bucket::metadata_sys;
-use rustfs_ecstore::bucket::metadata_sys::get_replication_config;
-use rustfs_ecstore::bucket::object_lock::objectlock_sys;
-use rustfs_ecstore::bucket::replication::ReplicationConfigurationExt;
-use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::resolve_object_store_handle;
-use rustfs_ecstore::store_api::{ObjectInfo, ObjectToDelete};
 use rustfs_storage_api::{BucketOperations, BucketOptions};
 use rustfs_targets::EventName;
 use rustfs_targets::arn::{TargetID, TargetIDError};
@@ -47,6 +46,8 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use time::{format_description::FormatItem, macros::format_description};
 use tracing::{debug, warn};
+
+use crate::storage::{StorageObjectInfo as ObjectInfo, StorageObjectToDelete as ObjectToDelete};
 
 const LOG_COMPONENT_STORAGE: &str = "storage";
 const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
@@ -738,7 +739,7 @@ pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelet
 }
 
 /// Helper function to get store and validate bucket exists
-pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<rustfs_ecstore::store::ECStore>> {
+pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<crate::storage::storage_compat::ecstore::store::ECStore>> {
     let Some(store) = resolve_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };

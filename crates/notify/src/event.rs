@@ -64,6 +64,22 @@ pub struct Object {
     pub sequencer: String,
 }
 
+/// Object metadata required by notification event serialization.
+#[derive(Debug, Clone, Default)]
+pub struct NotifyObjectInfo {
+    pub bucket: String,
+    pub name: String,
+    pub size: i64,
+    pub etag: Option<String>,
+    pub content_type: Option<String>,
+    pub user_defined: HashMap<String, String>,
+    pub version_id: Option<String>,
+    pub mod_time: Option<DateTime<Utc>>,
+    pub restore_expires: Option<DateTime<Utc>>,
+    pub storage_class: Option<String>,
+    pub transitioned_tier: Option<String>,
+}
+
 /// Metadata about the event
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -204,7 +220,7 @@ impl Event {
     pub fn new(args: EventArgs) -> Self {
         let event_time = Utc::now().naive_local();
         let sequencer = match args.object.mod_time {
-            Some(t) => format!("{:X}", t.unix_timestamp_nanos()),
+            Some(t) => format!("{:X}", t.timestamp_nanos_opt().unwrap_or(0)),
             None => format!("{:X}", event_time.and_utc().timestamp_nanos_opt().unwrap_or(0)),
         };
 
@@ -215,10 +231,7 @@ impl Event {
         let key_name = form_urlencoded::byte_serialize(args.object.name.as_bytes()).collect::<String>();
         let principal_id = args.req_params.get("principalId").unwrap_or(&String::new()).to_string();
 
-        let version_id = match args.object.version_id {
-            Some(id) => Some(id.to_string()),
-            None => Some(args.version_id.clone()),
-        };
+        let version_id = args.object.version_id.clone().or_else(|| Some(args.version_id.clone()));
 
         let mut s3_metadata = Metadata {
             schema_version: "1.0".to_string(),
@@ -255,11 +268,12 @@ impl Event {
         }
 
         let glacier_event_data = if args.event_name == EventName::ObjectRestoreCompleted {
-            args.object.restore_expires.and_then(|expiry| {
-                let expiry_time = DateTime::<Utc>::from_timestamp(expiry.unix_timestamp(), expiry.nanosecond())?;
-                let storage_class = args.object.storage_class.clone().or_else(|| {
-                    (!args.object.transitioned_object.tier.is_empty()).then_some(args.object.transitioned_object.tier.clone())
-                })?;
+            args.object.restore_expires.and_then(|expiry_time| {
+                let storage_class = args
+                    .object
+                    .storage_class
+                    .clone()
+                    .or_else(|| args.object.transitioned_tier.clone())?;
                 Some(GlacierEventData {
                     restore_event_data: RestoreEventData {
                         lifecycle_restoration_expiry_time: expiry_time.to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -305,7 +319,7 @@ fn initialize_response_elements(elements: &mut HashMap<String, String>, keys: &[
 pub struct EventArgs {
     pub event_name: EventName,
     pub bucket_name: String,
-    pub object: rustfs_ecstore::store_api::ObjectInfo,
+    pub object: NotifyObjectInfo,
     pub req_params: HashMap<String, String>,
     pub resp_elements: HashMap<String, String>,
     pub version_id: String,
@@ -354,7 +368,7 @@ impl EventArgs {
 pub struct EventArgsBuilder {
     event_name: EventName,
     bucket_name: String,
-    object: rustfs_ecstore::store_api::ObjectInfo,
+    object: NotifyObjectInfo,
     req_params: HashMap<String, String>,
     resp_elements: HashMap<String, String>,
     version_id: String,
@@ -365,11 +379,11 @@ pub struct EventArgsBuilder {
 
 impl EventArgsBuilder {
     /// Creates a new builder with the required fields.
-    pub fn new(event_name: EventName, bucket_name: impl Into<String>, object: rustfs_ecstore::store_api::ObjectInfo) -> Self {
+    pub fn new(event_name: EventName, bucket_name: impl Into<String>, object: impl Into<NotifyObjectInfo>) -> Self {
         Self {
             event_name,
             bucket_name: bucket_name.into(),
-            object,
+            object: object.into(),
             ..Default::default()
         }
     }
@@ -387,8 +401,8 @@ impl EventArgsBuilder {
     }
 
     /// Sets the object information.
-    pub fn object(mut self, object: rustfs_ecstore::store_api::ObjectInfo) -> Self {
-        self.object = object;
+    pub fn object(mut self, object: impl Into<NotifyObjectInfo>) -> Self {
+        self.object = object.into();
         self
     }
 
@@ -482,7 +496,7 @@ mod tests {
         let args = EventArgsBuilder::new(
             EventName::LifecycleTransition,
             "bucket",
-            rustfs_ecstore::store_api::ObjectInfo {
+            NotifyObjectInfo {
                 bucket: "bucket".to_string(),
                 name: "key".to_string(),
                 ..Default::default()
@@ -498,10 +512,10 @@ mod tests {
         let args = EventArgsBuilder::new(
             EventName::ObjectRestoreCompleted,
             "bucket",
-            rustfs_ecstore::store_api::ObjectInfo {
+            NotifyObjectInfo {
                 bucket: "bucket".to_string(),
                 name: "key".to_string(),
-                restore_expires: Some(time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()),
+                restore_expires: DateTime::<Utc>::from_timestamp(1_700_000_000, 0),
                 storage_class: Some("GLACIER".to_string()),
                 ..Default::default()
             },
@@ -518,9 +532,8 @@ mod tests {
 
 #[cfg(test)]
 mod event_args_tests {
-    use super::EventArgs;
+    use super::{EventArgs, NotifyObjectInfo as ObjectInfo};
     use hashbrown::HashMap;
-    use rustfs_ecstore::store_api::ObjectInfo;
     use rustfs_s3_types::EventName;
 
     fn args_with_headers(pairs: &[(&str, &str)]) -> EventArgs {

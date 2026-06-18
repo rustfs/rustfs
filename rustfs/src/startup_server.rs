@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::storage_compat::ecstore::global::set_global_rustfs_port;
 use crate::{
     capacity::capacity_integration::init_capacity_management,
     config::Config,
@@ -19,7 +20,6 @@ use crate::{
 };
 use rustfs_common::{GlobalReadiness, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
-use rustfs_ecstore::global::set_global_rustfs_port;
 use rustfs_utils::net::parse_and_resolve_address;
 use std::{
     io::{Error, Result},
@@ -57,7 +57,7 @@ pub async fn init_startup_listen_context(config: &Config) -> Result<StartupListe
     if let Some(region_str) = &config.region {
         region_str
             .parse::<s3s::region::Region>()
-            .map(rustfs_ecstore::global::set_global_region)
+            .map(crate::storage_compat::ecstore::global::set_global_region)
             .map_err(|err| Error::other(format!("invalid region '{}': {}", region_str, err)))?;
     }
 

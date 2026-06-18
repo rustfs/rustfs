@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::admin::router::{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH, AdminOperation, Operation, S3Router};
+use crate::admin::storage_compat::ecstore::global::get_global_region;
 use crate::app::context::resolve_object_store_handle;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
@@ -31,7 +32,6 @@ use matchit::Params;
 use rand::RngExt;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::get_global_action_cred;
-use rustfs_ecstore::{global::get_global_region, store_api::ObjectOptions};
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_storage_api::{BucketOperations, ListOperations as _, ObjectIO as _, ObjectOperations as _, bucket::BucketOptions};
 use rustfs_trusted_proxies::{ClientInfo, ValidationMode};
@@ -48,6 +48,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use url::form_urlencoded;
 use uuid::Uuid;
+
+use crate::storage::StorageObjectOptions as ObjectOptions;
 
 const OBJECT_ZIP_DOWNLOAD_TOKEN_TTL: Duration = Duration::minutes(5);
 const ZIP_STREAM_BUFFER_SIZE: usize = 1024 * 1024;
@@ -647,7 +649,7 @@ async fn preflight_zip_items(request: &CreateObjectZipDownloadRequest, items: &[
     Ok(())
 }
 
-fn storage_error_to_s3(err: rustfs_ecstore::error::Error) -> s3s::S3Error {
+fn storage_error_to_s3(err: crate::admin::storage_compat::ecstore::error::Error) -> s3s::S3Error {
     ApiError::from(err).into()
 }
 

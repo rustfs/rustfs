@@ -13,7 +13,11 @@
 // limitations under the License.
 
 use crate::{
-    Event, NotificationError, registry::TargetRegistry, rule_engine::NotifyRuleEngine, runtime_facade::NotifyRuntimeFacade,
+    Event, NotificationError,
+    registry::TargetRegistry,
+    rule_engine::NotifyRuleEngine,
+    runtime_facade::NotifyRuntimeFacade,
+    storage_compat::{self, NotifyConfigStoreError},
 };
 use rustfs_config::notify::{
     NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_SUB_SYS, NOTIFY_NATS_SUB_SYS,
@@ -316,17 +320,16 @@ impl NotifyConfigManager {
     where
         F: FnMut(&mut Config) -> bool,
     {
-        let Some(store) = rustfs_ecstore::global::resolve_object_store_handle() else {
-            return Err(NotificationError::StorageNotAvailable(
-                "Failed to save target configuration: server storage not initialized".to_string(),
-            ));
-        };
-
-        let mut new_config = rustfs_ecstore::config::com::read_config_without_migrate(store.clone())
+        let Some(new_config) = storage_compat::update_server_config(&mut modifier)
             .await
-            .map_err(|e| NotificationError::ReadConfig(e.to_string()))?;
-
-        if !modifier(&mut new_config) {
+            .map_err(|err| match err {
+                NotifyConfigStoreError::StorageNotAvailable => NotificationError::StorageNotAvailable(
+                    "Failed to save target configuration: server storage not initialized".to_string(),
+                ),
+                NotifyConfigStoreError::Read(err) => NotificationError::ReadConfig(err),
+                NotifyConfigStoreError::Save(err) => NotificationError::SaveConfig(err),
+            })?
+        else {
             debug!(
                 event = EVENT_NOTIFY_CONFIG_UPDATE,
                 component = LOG_COMPONENT_NOTIFY,
@@ -336,11 +339,7 @@ impl NotifyConfigManager {
                 "notify config update"
             );
             return Ok(());
-        }
-
-        rustfs_ecstore::config::com::save_server_config(store, &new_config)
-            .await
-            .map_err(|e| NotificationError::SaveConfig(e.to_string()))?;
+        };
 
         info!(
             event = EVENT_NOTIFY_CONFIG_UPDATE,
