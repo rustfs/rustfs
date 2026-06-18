@@ -70,8 +70,23 @@ fn materialize_object(base: String, extra: &str, flags: &[String]) -> String {
 
 fn has_dot_segments(path: &str) -> bool {
     path.split(['/', '\\']).any(|segment| {
-        let trimmed = segment.trim();
-        trimmed == "." || trimmed == ".."
+        let mut bytes = segment.as_bytes();
+
+        // Match ecstore's path-component check. `str::trim()` also trims
+        // Unicode whitespace such as vertical tab, which would reject object
+        // keys that the production validator accepts as ordinary path bytes.
+        while let Some((first, rest)) = bytes.split_first()
+            && first.is_ascii_whitespace()
+        {
+            bytes = rest;
+        }
+        while let Some((last, rest)) = bytes.split_last()
+            && last.is_ascii_whitespace()
+        {
+            bytes = rest;
+        }
+
+        bytes == b"." || bytes == b".."
     })
 }
 

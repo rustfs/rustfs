@@ -1995,6 +1995,8 @@ impl Metrics {
     pub fn record_scanner_dirty_usage_cycle_snapshot(&self, dirty_buckets: u64) {
         self.scanner_dirty_usage_last_cycle_dirty_buckets
             .store(dirty_buckets, Ordering::Relaxed);
+        self.scanner_dirty_usage_last_cycle_cleared_buckets
+            .store(0, Ordering::Relaxed);
     }
 
     pub fn record_scanner_dirty_usage_cycle_clear(&self, cleared_buckets: u64, pending_buckets: u64) {
@@ -3672,6 +3674,19 @@ mod tests {
         assert!(report.usage_freshness.last_usage_save_unix_secs > 0);
         assert_eq!(report.usage_freshness.last_usage_save_result, "success");
         assert_eq!(report.usage_freshness.last_usage_save_result_code, 1);
+    }
+
+    #[tokio::test]
+    async fn dirty_usage_cycle_snapshot_resets_stale_cleared_count() {
+        let metrics = Metrics::new();
+        metrics.record_scanner_dirty_usage_cycle_snapshot(2);
+        metrics.record_scanner_dirty_usage_cycle_clear(2, 0);
+        metrics.record_scanner_dirty_usage_cycle_snapshot(1);
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.usage_freshness.last_cycle_dirty_buckets, 1);
+        assert_eq!(report.usage_freshness.last_cycle_cleared_dirty_buckets, 0);
     }
 
     #[tokio::test]
