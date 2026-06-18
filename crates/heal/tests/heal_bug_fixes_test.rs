@@ -162,7 +162,7 @@ fn test_path_to_str_helper() {
 
 #[test]
 fn test_heal_task_status_atomic_update() {
-    use rustfs_heal::heal::storage::HealStorageAPI;
+    use rustfs_heal::heal::storage::{HealObjectInfo, HealStorageAPI};
     use rustfs_heal::heal::task::{HealOptions, HealRequest, HealTask, HealTaskStatus};
     use std::sync::Arc;
 
@@ -170,11 +170,7 @@ fn test_heal_task_status_atomic_update() {
     struct MockStorage;
     #[async_trait::async_trait]
     impl HealStorageAPI for MockStorage {
-        async fn get_object_meta(
-            &self,
-            _bucket: &str,
-            _object: &str,
-        ) -> rustfs_heal::Result<Option<rustfs_ecstore::store_api::ObjectInfo>> {
+        async fn get_object_meta(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<HealObjectInfo>> {
             Ok(None)
         }
         async fn get_object_data(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<Vec<u8>>> {
@@ -284,7 +280,7 @@ fn test_heal_task_status_atomic_update() {
 
 #[tokio::test]
 async fn test_heal_task_transient_object_exists_skip_avoids_recreate() {
-    use rustfs_heal::heal::storage::{DiskStatus, HealStorageAPI};
+    use rustfs_heal::heal::storage::{DiskStatus, HealObjectInfo, HealStorageAPI};
     use rustfs_heal::heal::task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType};
     use std::sync::{
         Arc,
@@ -298,11 +294,7 @@ async fn test_heal_task_transient_object_exists_skip_avoids_recreate() {
 
     #[async_trait::async_trait]
     impl HealStorageAPI for MockStorage {
-        async fn get_object_meta(
-            &self,
-            _bucket: &str,
-            _object: &str,
-        ) -> rustfs_heal::Result<Option<rustfs_ecstore::store_api::ObjectInfo>> {
+        async fn get_object_meta(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<HealObjectInfo>> {
             Ok(None)
         }
 

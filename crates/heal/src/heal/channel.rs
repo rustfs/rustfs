@@ -488,7 +488,7 @@ impl HealChannelProcessor {
 mod tests {
     use super::*;
     use crate::heal::manager::HealConfig;
-    use crate::heal::storage::HealStorageAPI;
+    use crate::heal::storage::{HealObjectInfo, HealStorageAPI};
     use rustfs_common::heal_channel::{
         HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealRequestSource, HealScanMode,
     };
@@ -498,11 +498,7 @@ mod tests {
     struct MockStorage;
     #[async_trait::async_trait]
     impl HealStorageAPI for MockStorage {
-        async fn get_object_meta(
-            &self,
-            _bucket: &str,
-            _object: &str,
-        ) -> crate::Result<Option<rustfs_ecstore::store_api::ObjectInfo>> {
+        async fn get_object_meta(&self, _bucket: &str, _object: &str) -> crate::Result<Option<HealObjectInfo>> {
             Ok(None)
         }
         async fn get_object_data(&self, _bucket: &str, _object: &str) -> crate::Result<Option<Vec<u8>>> {

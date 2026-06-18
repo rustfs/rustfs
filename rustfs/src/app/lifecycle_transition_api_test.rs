@@ -15,6 +15,9 @@
 use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};
 use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::storage::ecfs::FS;
+use crate::storage::{
+    StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
+};
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::stream;
@@ -29,7 +32,6 @@ use rustfs_ecstore::{
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     global::GLOBAL_TierConfigMgr,
     store::ECStore,
-    store_api::{ObjectOptions, PutObjReader},
     tier::{
         tier_config::{TierConfig, TierType},
         warm_backend::{WarmBackend, WarmBackendGetOpts},
@@ -148,12 +150,7 @@ async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
         .expect("Failed to create test bucket");
 }
 
-async fn upload_test_object(
-    ecstore: &Arc<ECStore>,
-    bucket: &str,
-    object: &str,
-    data: &[u8],
-) -> rustfs_ecstore::store_api::ObjectInfo {
+async fn upload_test_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str, data: &[u8]) -> ObjectInfo {
     let mut reader = PutObjReader::from_vec(data.to_vec());
     (**ecstore)
         .put_object(bucket, object, &mut reader, &ObjectOptions::default())
@@ -362,12 +359,7 @@ async fn register_mock_tier(tier_name: &str) -> MockWarmBackend {
     backend
 }
 
-async fn wait_for_transition(
-    ecstore: &Arc<ECStore>,
-    bucket: &str,
-    object: &str,
-    timeout: Duration,
-) -> Option<rustfs_ecstore::store_api::ObjectInfo> {
+async fn wait_for_transition(ecstore: &Arc<ECStore>, bucket: &str, object: &str, timeout: Duration) -> Option<ObjectInfo> {
     let deadline = tokio::time::Instant::now() + timeout;
 
     loop {

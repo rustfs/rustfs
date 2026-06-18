@@ -5,20 +5,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-operation-bounds-cleanup`
-- Baseline: `main` at `a30cafa73fde3e7e88c160e70c290e74a0c2235f`
-  after `rustfs/rustfs#3563` merged.
+- Branch: `overtrue/arch-storage-dto-consumer-boundaries`
+- Baseline: local API-025 commit
+  `daa9d19724e370906630bb848aa1f36868475c6f`, based on `main` at
+  `a30cafa73fde3e7e88c160e70c290e74a0c2235f`, while
+  `rustfs/rustfs#3565` is pending.
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: no external behavior change expected.
-- Rust code changes: migrate scanner cache persistence, RustFS object
-  namespace-lock helper, and table catalog storage bounds away from ECStore
-  compatibility operation traits to `rustfs-storage-api` operation traits with
-  ECStore concrete associated-type bindings. ECStore-owned `ObjectInfo`,
-  `ObjectOptions`, readers, delete DTOs, walk filters, lock wrappers, and
-  implementation behavior stay in ECStore.
-- CI/script changes: extend migration guards so outer consumers do not drift
-  back to ECStore operation trait imports.
-- Docs changes: record the larger operation consumer-bound cleanup slice.
+- Rust code changes: add crate-local semantic aliases for ECStore-owned object
+  metadata, options, readers, and delete DTOs in scanner, heal, notify, Swift,
+  S3 Select, and RustFS storage/app consumers so external call sites stop
+  importing raw `rustfs_ecstore::store_api` DTOs outside deliberate boundary
+  files. ECStore-owned DTO definitions and runtime behavior stay in ECStore.
+- CI/script changes: none.
+- Docs changes: record the larger DTO consumer-boundary cleanup slice.
 
 ## Phase 0 Tasks
 
@@ -775,6 +775,29 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     guards, formatting, diff hygiene, Rust risk scan, full pre-commit, and
     required three-expert review passed.
 
+- [x] `API-026` Clean external DTO consumer boundaries.
+  - Current branch: `overtrue/arch-storage-dto-consumer-boundaries`.
+  - Completed slice: introduce crate-local semantic aliases for ECStore-owned
+    object metadata/options/readers/delete DTOs in scanner, heal, notify, Swift,
+    S3 Select, and RustFS storage/app consumers; update production and affected
+    test call sites to use those local aliases instead of raw
+    `rustfs_ecstore::store_api` DTO imports.
+  - Acceptance: non-ECStore direct `rustfs_ecstore::store_api` references are
+    limited to boundary alias definitions, ECStore remains the owner of
+    `ObjectInfo`, `ObjectOptions`, object readers, delete DTOs, walk filters,
+    lock wrappers, and implementation behavior, and external consumers express
+    their local semantic dependency through crate-owned names.
+  - Must preserve: object metadata shape, object option defaults, reader/writer
+    behavior, delete replication DTO handling, scanner cache semantics, heal
+    storage metadata semantics, Swift and S3 Select object reads, notification
+    event payloads, S3 response DTO mapping, and storage/app test behavior.
+  - Risk defense: this slice uses type aliases and import-boundary cleanup only;
+    it does not move DTO definitions, alter serialization, change object-store
+    implementations, or adjust runtime control flow.
+  - Verification: focused compile/tests, migration/layer guards, formatting,
+    diff hygiene, direct import scan, Rust risk scan, full pre-commit, and
+    required three-expert review passed.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -1051,20 +1074,30 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Outer scanner/RustFS operation consumers now use storage-api operation traits with explicit ECStore concrete associated-type bindings; ECStore keeps compatibility traits only for implementation and downstream compatibility. |
-| Migration preservation | passed | Scanner cache persistence, object self-copy namespace locking, and table catalog object storage keep the same ECStore DTOs, readers, lock wrappers, walk filter shape, and storage error conversion behavior. |
-| Testing/verification | passed | Focused RustFS/scanner compile/tests, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Scanner, heal, notify, Swift, S3 Select, and RustFS storage/app consumers now use crate-local DTO aliases; direct ECStore `store_api` references are limited to deliberate boundary alias definitions outside ECStore. |
+| Migration preservation | passed | ECStore remains the owner of object metadata, options, readers, delete DTOs, walk filters, lock wrappers, and implementation behavior; aliases preserve the existing concrete types without runtime or serialization changes. |
+| Testing/verification | passed | Focused compile/tests, migration/layer guards, direct import scan, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
 Passed before push:
 
-- `cargo check --tests -p rustfs -p rustfs-scanner`: passed.
-- `cargo test -p rustfs-scanner`: passed; 151 unit tests passed, lifecycle
-  focused test passed, 14 lifecycle integration tests ignored by default.
-- `cargo test -p rustfs --lib table_catalog`: passed; 168 passed.
-- `cargo test -p rustfs --lib app::object_usecase`: passed; 86 passed, 2
-  ignored.
+- `cargo check --tests -p rustfs -p rustfs-scanner -p rustfs-heal -p
+  rustfs-protocols -p rustfs-notify -p rustfs-s3select-api`: passed.
+- `cargo test -p rustfs-scanner -p rustfs-heal -p rustfs-notify -p
+  rustfs-protocols -p rustfs-s3select-api`: passed.
+- `cargo test -p rustfs --lib app::object_usecase::tests`: passed; 85 passed,
+  2 ignored.
+- `cargo test -p rustfs --lib app::bucket_usecase::tests`: passed; 64 passed.
+- `cargo test -p rustfs --lib app::multipart_usecase::tests`: passed; 24
+  passed, 4 ignored.
+- `cargo test -p rustfs --lib storage::s3_api::bucket::tests`: passed; 22
+  passed.
+- `cargo test -p rustfs --lib storage::ecfs_test::tests`: passed; 59 passed,
+  14 ignored.
+- `rg -n 'rustfs_ecstore::store_api' rustfs/src crates --glob
+  '!crates/ecstore/**' --glob '*.rs'`: remaining matches are deliberate
+  boundary alias definitions.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
 - `cargo fmt --all --check`: passed.
@@ -1072,25 +1105,26 @@ Passed before push:
 - Rust risk scan: no new `unwrap`/`expect`, panic/todo markers, `unsafe`,
   process-spawning calls, lossy casts, println/eprintln, or relaxed ordering in
   added Rust lines.
-- `make pre-commit`: passed; nextest reported 6207 tests passed and 111
+- `make pre-commit`: passed; nextest reported 6214 tests passed and 111
   skipped, and doctests passed.
 
 Notes:
 
-- This slice follows the shared list operation consumer cleanup and keeps the
-  old aggregate facade, DTO/helper, response, and operation contract guards
-  active.
-- Outer scanner/RustFS operation consumers now bind operation traits through
-  `rustfs-storage-api`; ECStore keeps concrete object metadata, options,
-  readers, delete DTOs, lock wrappers, filemeta-bound walk filters, and
-  implementation behavior.
-- The slice does not alter scanner cache load/save behavior, object self-copy
-  lock behavior, table catalog object operations, list/walk implementation,
-  object reader/writer behavior, or storage error runtime behavior.
+- This slice follows the external operation consumer cleanup and keeps the old
+  aggregate facade, DTO/helper, response, and operation contract guards active.
+- External DTO consumers now name ECStore-owned object DTOs through local
+  semantic aliases in their owning crates or RustFS storage boundary module.
+- The slice does not alter object metadata shape, options defaults,
+  reader/writer behavior, delete replication DTO handling, scanner cache
+  semantics, heal storage metadata semantics, Swift/S3 Select object reads,
+  notification event payloads, S3 response DTO mapping, or runtime storage
+  behavior.
 
 ## Handoff Notes
 
-- External operation consumer cleanup is based on `main` after
-  `rustfs/rustfs#3563` merged.
-- Continue with larger consumer-migration batches; avoid moving ECStore-owned
-  DTOs/readers/walk filters until their concrete behavior is isolated.
+- External DTO consumer cleanup is stacked on local API-025 commit
+  `daa9d19724e370906630bb848aa1f36868475c6f` while `rustfs/rustfs#3565` is
+  pending; rebase onto `main` after that PR lands before opening this PR.
+- Continue with larger consumer-migration batches; keep ECStore-owned
+  DTOs/readers/walk filters in ECStore until their concrete behavior is isolated
+  enough for a pure-move slice.

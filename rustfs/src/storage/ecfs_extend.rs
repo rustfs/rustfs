@@ -25,7 +25,6 @@ use rustfs_ecstore::bucket::object_lock::objectlock_sys;
 use rustfs_ecstore::bucket::replication::ReplicationConfigurationExt;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::resolve_object_store_handle;
-use rustfs_ecstore::store_api::{ObjectInfo, ObjectToDelete};
 use rustfs_storage_api::{BucketOperations, BucketOptions};
 use rustfs_targets::EventName;
 use rustfs_targets::arn::{TargetID, TargetIDError};
@@ -47,6 +46,8 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use time::{format_description::FormatItem, macros::format_description};
 use tracing::{debug, warn};
+
+use crate::storage::{StorageObjectInfo as ObjectInfo, StorageObjectToDelete as ObjectToDelete};
 
 const LOG_COMPONENT_STORAGE: &str = "storage";
 const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
