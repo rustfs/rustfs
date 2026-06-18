@@ -29,7 +29,7 @@ use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError};
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{
-    CurrentCycle, Metric, Metrics, ScanCyclePartialReason, ScannerWorkSource, emit_scan_cycle_complete,
+    CurrentCycle, Metric, Metrics, ScanCyclePartialReason, ScannerUsageSaveResult, ScannerWorkSource, emit_scan_cycle_complete,
     emit_scan_cycle_partial_with_source, global_metrics,
 };
 use rustfs_config::ScannerSpeed;
@@ -1001,6 +1001,7 @@ pub async fn store_data_usage_in_backend(
                 state = "skip_stale_update",
                 "Scanner stale data usage update skipped"
             );
+            global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::SkippedStale);
             continue;
         }
 
@@ -1018,6 +1019,7 @@ pub async fn store_data_usage_in_backend(
                     error = %e,
                     "Scanner data usage encode failed"
                 );
+                global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::EncodeFailed);
                 continue;
             }
         };
@@ -1055,8 +1057,10 @@ pub async fn store_data_usage_in_backend(
                 error = %e,
                 "Scanner data usage save failed"
             );
+            global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Failed);
         } else {
             replace_bucket_usage_memory_from_info(&data_usage_info).await;
+            global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
         }
         done_save();
 

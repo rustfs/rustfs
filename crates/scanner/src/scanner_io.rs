@@ -91,13 +91,22 @@ fn dirty_usage_buckets() -> MutexGuard<'static, DirtyUsageBuckets> {
     DIRTY_USAGE_BUCKETS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn usize_to_u64_saturated(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 pub fn record_dirty_usage_bucket(bucket: &str) {
     if bucket.is_empty() {
         return;
     }
 
     let generation = DIRTY_USAGE_BUCKET_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
-    dirty_usage_buckets().insert(bucket.to_string(), generation);
+    let pending_buckets = {
+        let mut dirty_buckets = dirty_usage_buckets();
+        dirty_buckets.insert(bucket.to_string(), generation);
+        dirty_buckets.len()
+    };
+    global_metrics().record_scanner_dirty_usage_pending(usize_to_u64_saturated(pending_buckets));
 }
 
 pub fn clear_dirty_usage_bucket(bucket: &str) {
@@ -105,32 +114,44 @@ pub fn clear_dirty_usage_bucket(bucket: &str) {
         return;
     }
 
-    dirty_usage_buckets().remove(bucket);
+    let pending_buckets = {
+        let mut dirty_buckets = dirty_usage_buckets();
+        dirty_buckets.remove(bucket);
+        dirty_buckets.len()
+    };
+    global_metrics().record_scanner_dirty_usage_clear(usize_to_u64_saturated(pending_buckets));
 }
 
 fn snapshot_dirty_usage_buckets(buckets: &[BucketInfo]) -> DirtyUsageBuckets {
-    let dirty_buckets = dirty_usage_buckets();
-    buckets
-        .iter()
-        .filter_map(|bucket| {
-            dirty_buckets
-                .get(&bucket.name)
-                .map(|generation| (bucket.name.clone(), *generation))
-        })
-        .collect()
+    let snapshot = {
+        let dirty_buckets = dirty_usage_buckets();
+        buckets
+            .iter()
+            .filter_map(|bucket| {
+                dirty_buckets
+                    .get(&bucket.name)
+                    .map(|generation| (bucket.name.clone(), *generation))
+            })
+            .collect::<DirtyUsageBuckets>()
+    };
+    global_metrics().record_scanner_dirty_usage_cycle_snapshot(usize_to_u64_saturated(snapshot.len()));
+    snapshot
 }
 
 fn clear_dirty_usage_buckets(snapshot: &DirtyUsageBuckets) {
-    if snapshot.is_empty() {
-        return;
-    }
-
-    let mut dirty_buckets = dirty_usage_buckets();
-    for (bucket, generation) in snapshot {
-        if dirty_buckets.get(bucket).is_some_and(|current| current == generation) {
-            dirty_buckets.remove(bucket);
+    let (cleared_buckets, pending_buckets) = {
+        let mut dirty_buckets = dirty_usage_buckets();
+        let mut cleared_buckets = 0usize;
+        for (bucket, generation) in snapshot {
+            if dirty_buckets.get(bucket).is_some_and(|current| current == generation) {
+                dirty_buckets.remove(bucket);
+                cleared_buckets += 1;
+            }
         }
-    }
+        (cleared_buckets, dirty_buckets.len())
+    };
+    global_metrics()
+        .record_scanner_dirty_usage_cycle_clear(usize_to_u64_saturated(cleared_buckets), usize_to_u64_saturated(pending_buckets));
 }
 
 #[cfg(test)]

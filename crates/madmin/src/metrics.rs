@@ -280,6 +280,43 @@ impl ScannerMaintenanceControlSnapshot {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerUsageFreshnessSnapshot {
+    #[serde(rename = "dirty_pending_buckets", default)]
+    pub dirty_pending_buckets: u64,
+    #[serde(rename = "last_dirty_mark_unix_secs", default)]
+    pub last_dirty_mark_unix_secs: u64,
+    #[serde(rename = "last_dirty_clear_unix_secs", default)]
+    pub last_dirty_clear_unix_secs: u64,
+    #[serde(rename = "last_cycle_dirty_buckets", default)]
+    pub last_cycle_dirty_buckets: u64,
+    #[serde(rename = "last_cycle_cleared_dirty_buckets", default)]
+    pub last_cycle_cleared_dirty_buckets: u64,
+    #[serde(rename = "last_usage_save_unix_secs", default)]
+    pub last_usage_save_unix_secs: u64,
+    #[serde(rename = "last_usage_save_result", default)]
+    pub last_usage_save_result: String,
+    #[serde(rename = "last_usage_save_result_code", default)]
+    pub last_usage_save_result_code: u64,
+}
+
+impl ScannerUsageFreshnessSnapshot {
+    fn merge(&mut self, other: &Self) {
+        self.dirty_pending_buckets = self.dirty_pending_buckets.saturating_add(other.dirty_pending_buckets);
+        self.last_dirty_mark_unix_secs = self.last_dirty_mark_unix_secs.max(other.last_dirty_mark_unix_secs);
+        self.last_dirty_clear_unix_secs = self.last_dirty_clear_unix_secs.max(other.last_dirty_clear_unix_secs);
+        self.last_cycle_dirty_buckets = self.last_cycle_dirty_buckets.saturating_add(other.last_cycle_dirty_buckets);
+        self.last_cycle_cleared_dirty_buckets = self
+            .last_cycle_cleared_dirty_buckets
+            .saturating_add(other.last_cycle_cleared_dirty_buckets);
+        if other.last_usage_save_unix_secs > self.last_usage_save_unix_secs {
+            self.last_usage_save_unix_secs = other.last_usage_save_unix_secs;
+            self.last_usage_save_result = other.last_usage_save_result.clone();
+            self.last_usage_save_result_code = other.last_usage_save_result_code;
+        }
+    }
+}
+
 impl ScannerSourceWorkSnapshot {
     fn merge(&mut self, other: &Self) {
         self.checked = self.checked.saturating_add(other.checked);
@@ -609,6 +646,8 @@ pub struct ScannerMetrics {
     pub lifecycle_expiry: ScannerLifecycleExpirySnapshot,
     #[serde(rename = "lifecycle_transition", default)]
     pub lifecycle_transition: ScannerLifecycleTransitionSnapshot,
+    #[serde(rename = "usage_freshness", default)]
+    pub usage_freshness: ScannerUsageFreshnessSnapshot,
     #[serde(rename = "maintenance_control", default)]
     pub maintenance_control: ScannerMaintenanceControlSnapshot,
     #[serde(rename = "throttle_idle_mode_enabled", default)]
@@ -690,6 +729,7 @@ impl ScannerMetrics {
         self.pacing_pressure.merge(&other.pacing_pressure);
         self.lifecycle_expiry.merge(&other.lifecycle_expiry);
         self.lifecycle_transition.merge(&other.lifecycle_transition);
+        self.usage_freshness.merge(&other.usage_freshness);
         self.maintenance_control.merge(&other.maintenance_control);
         self.current_set_scan_concurrency_limit = self
             .current_set_scan_concurrency_limit
