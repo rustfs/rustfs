@@ -15,6 +15,7 @@
 use super::sts::create_oidc_sts_credentials;
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::storage_compat::ecstore::config::com::{read_config_without_migrate, save_server_config};
 use crate::app::context::resolve_object_store_handle;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, MINIO_ADMIN_PREFIX, RemoteAddr};
@@ -30,7 +31,6 @@ use rustfs_config::oidc::{
 use rustfs_config::server_config::Config as ServerConfig;
 use rustfs_config::server_config::get_global_server_config;
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
-use rustfs_ecstore::config::com::{read_config_without_migrate, save_server_config};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_utils::egress::validate_outbound_url;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};

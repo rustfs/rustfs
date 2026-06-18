@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use crate::admin::router::Operation;
+use crate::admin::storage_compat::ecstore::rpc::PeerRestClient;
 use crate::app::context::resolve_endpoints_handle;
 use http::StatusCode;
 use hyper::Uri;
 use matchit::Params;
-use rustfs_ecstore::rpc::PeerRestClient;
 use rustfs_madmin::service_commands::ServiceTraceOpts;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 

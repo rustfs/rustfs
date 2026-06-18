@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::storage_compat::ecstore::{
+    bucket::{metadata::table_catalog_path_hash, metadata_sys},
+    store::ECStore,
+};
 use crate::admin::{
     auth::{AdminResourceScope, validate_admin_request, validate_admin_request_with_bucket_object},
     router::{AdminOperation, Operation, S3Router},
@@ -25,10 +29,6 @@ use hyper::Method;
 use matchit::Params;
 use metrics::{counter, histogram};
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_ecstore::{
-    bucket::{metadata::table_catalog_path_hash, metadata_sys},
-    store::ECStore,
-};
 use rustfs_iam::{manager::get_token_signing_key, sys::SESSION_POLICY_NAME};
 use rustfs_policy::{
     auth::get_new_credentials_with_metadata,

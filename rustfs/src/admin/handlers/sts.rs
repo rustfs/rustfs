@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::is_admin::IsAdminHandler;
+use crate::admin::storage_compat::ecstore::bucket::utils::serialize;
 use crate::{
     admin::{
         handlers::site_replication::site_replication_iam_change_hook,
@@ -28,7 +29,6 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::get_global_action_cred;
-use rustfs_ecstore::bucket::utils::serialize;
 use rustfs_iam::{manager::get_token_signing_key, oidc::OidcClaims, sys::SESSION_POLICY_NAME};
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRIAMItem, SRSTSCredential};
 use rustfs_policy::{

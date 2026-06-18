@@ -5,19 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-dto-consumer-boundaries`
-- Baseline: `main` at `99941f7e7c5e0c88532a93cc175a3ea4111d7098`
-  after `rustfs/rustfs#3565` merged.
+- Branch: `overtrue/arch-app-storage-admin-runtime-boundaries`
+- Baseline: rebased onto `origin/main` at
+  `bdb2461b5594f736cbbcd3788f12d39966c2ec78` after
+  `rustfs/rustfs#3571` merged.
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: no migration behavior change expected; CI follow-up
   preserves empty-object erasure recovery by avoiding zero-byte SIMD decode.
-- Rust code changes: add crate-local semantic aliases for ECStore-owned object
-  metadata, options, readers, and delete DTOs in scanner, heal, notify, Swift,
-  S3 Select, and RustFS storage/app consumers so external call sites stop
-  importing raw `rustfs_ecstore::store_api` DTOs outside deliberate boundary
-  files. ECStore-owned DTO definitions and runtime behavior stay in ECStore.
-  CI follow-up handles zero-length shards in erasure reconstruction without
-  changing non-empty shard behavior.
+- Rust code changes: add app-, storage-, and admin-local ECStore compatibility
+  boundaries and route existing direct runtime imports through those deliberate
+  boundary modules. ECStore-owned definitions and runtime behavior stay in
+  ECStore.
 - CI/script changes: none.
 - Docs changes: record the larger DTO consumer-boundary cleanup slice and the
   empty-object erasure recovery CI follow-up.
@@ -864,6 +862,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration/layer guards, formatting, diff hygiene, Rust risk scan, full
     pre-commit, and required three-expert review passed.
 
+- [x] `API-030` Clean app, storage, and admin ECStore runtime boundaries.
+  - Current branch: `overtrue/arch-app-storage-admin-runtime-boundaries`.
+  - Completed slice: add crate-local app, storage, and admin compatibility
+    boundary modules for ECStore-owned runtime contracts, then migrate direct
+    `rustfs_ecstore` imports in `rustfs/src/app`, `rustfs/src/storage`, and
+    `rustfs/src/admin` through those boundary modules.
+  - Acceptance: direct `rustfs_ecstore` references in app/storage/admin source
+    are limited to the local compatibility boundary modules; app, storage, and
+    admin business/test modules consume local compatibility names.
+  - Must preserve: app object/bucket/multipart/admin usecase behavior, storage
+    ECFS/access/SSE/RPC behavior, admin route/handler/service behavior,
+    metadata serialization, encryption handling, authorization, and existing
+    ECStore-owned concrete type ownership.
+  - Risk defense: this slice changes import ownership only; it does not move
+    ECStore definitions, alter runtime control flow, adjust route registration,
+    change storage I/O, mutate metadata formats, or alter admin authorization.
+  - Verification: direct app/storage/admin import scan, RustFS test compile
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    full pre-commit, and required three-expert review passed.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -1133,47 +1151,45 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Next PRs
 
 1. `pure-move`/`consumer-migration`: continue larger cleanup slices with the
-   loss-prevention guards active for remaining storage compatibility contracts
-   around app/storage/admin runtime boundaries.
+   loss-prevention guards active for remaining ECStore compatibility contracts
+   outside the app/storage/admin scanner/heal/Swift boundaries already cleaned.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Scanner and heal source modules now use crate-local compatibility boundaries for ECStore runtime, disk, metadata, lifecycle, replication, config, and error imports. |
-| Migration preservation | passed | ECStore remains the owner of scanner/heal backing types and behavior; scanner cache/lifecycle/replication scans and heal object/bucket/format/resume semantics are preserved. |
-| Testing/verification | passed | Focused scanner/heal compile/tests, direct source import scans, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | passed | App, storage, and admin source modules now use local compatibility boundaries for ECStore runtime imports. |
+| Migration preservation | passed | ECStore remains the owner of backing types and behavior; app usecases, storage ECFS/SSE/RPC, and admin handlers/services keep existing semantics. |
+| Testing/verification | passed | Direct app/storage/admin import scan, RustFS test compile check, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
 Passed before push:
 
-- `cargo check --tests -p rustfs-scanner -p rustfs-heal`: passed.
-- `cargo test -p rustfs-scanner -p rustfs-heal`: passed.
-- `rg -n 'rustfs_ecstore' crates/scanner/src --glob '*.rs'`: remaining matches
-  are deliberate scanner compatibility boundary definitions.
-- `rg -n 'rustfs_ecstore' crates/heal/src --glob '*.rs'`: remaining matches are
-  deliberate heal compatibility boundary definitions.
+- `cargo check --tests -p rustfs`: passed.
+- `rg -n 'rustfs_ecstore' rustfs/src/app rustfs/src/storage rustfs/src/admin --glob '*.rs'`:
+  remaining matches are deliberate app/storage/admin compatibility boundary
+  definitions.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
 - `cargo fmt --all --check`: passed.
 - `git diff --check`: passed.
-- Rust risk scan: no new `unwrap`/`expect`, panic/todo markers, `unsafe`,
-  process-spawning calls, println/eprintln, relaxed ordering, or numeric casts
-  in added Rust lines.
+- Rust risk scan: reviewed mechanical path-only hits on existing
+  `unwrap`/`expect` and numeric-cast lines; no new risky logic was introduced.
 - `make pre-commit`: passed.
 
 Notes:
 
-- This slice builds on the merged API-028 compatibility cleanup.
-- Direct scanner/heal ECStore imports now remain only in their compatibility
-  boundary modules.
-- The slice does not alter scanner runtime behavior, heal runtime behavior,
-  object I/O behavior, disk operations, metadata serialization, or ECStore
-  definitions.
+- This slice was prepared on the API-029 boundary and rebased onto main after
+  `rustfs/rustfs#3571` merged.
+- Direct app/storage/admin ECStore imports now remain only in their
+  compatibility boundary modules.
+- The slice does not alter app usecase behavior, storage behavior, admin
+  behavior, object I/O behavior, metadata serialization, or ECStore definitions.
 
 ## Handoff Notes
 
-- Continue with larger consumer-migration batches around app/storage/admin
-  runtime boundaries; keep ECStore-owned behavior in ECStore until concrete
-  behavior is isolated enough for a pure-move slice.
+- Continue with larger consumer-migration batches outside the cleaned
+  app/storage/admin/scanner/heal/Swift runtime boundaries; keep ECStore-owned
+  behavior in ECStore until concrete behavior is isolated enough for a
+  pure-move slice.

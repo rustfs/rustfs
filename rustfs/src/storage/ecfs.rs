@@ -21,11 +21,7 @@ use crate::storage::access::has_bypass_governance_header;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::get_opts;
 use crate::storage::s3_api::acl;
-use crate::storage::{parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled};
-use crate::table_catalog;
-use http::StatusCode;
-use metrics::{counter, histogram};
-use rustfs_ecstore::{
+use crate::storage::storage_compat::ecstore::{
     bucket::{
         metadata::{
             BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_VERSIONING_CONFIG,
@@ -41,6 +37,10 @@ use rustfs_ecstore::{
     },
     error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
 };
+use crate::storage::{parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled};
+use crate::table_catalog;
+use http::StatusCode;
+use metrics::{counter, histogram};
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use rustfs_storage_api::{BucketOperations, BucketOptions, ObjectLockRetentionOptions, ObjectOperations as _};

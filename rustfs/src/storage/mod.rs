@@ -24,15 +24,16 @@ pub mod request_context;
 pub mod rpc;
 pub(crate) mod s3_api;
 pub(crate) mod sse;
+pub(crate) mod storage_compat;
 pub mod timeout_wrapper;
 pub mod tonic_service;
 
-pub(crate) type StorageDeletedObject = rustfs_ecstore::store_api::DeletedObject;
-pub(crate) type StorageGetObjectReader = rustfs_ecstore::store_api::GetObjectReader;
-pub(crate) type StorageObjectInfo = rustfs_ecstore::store_api::ObjectInfo;
-pub(crate) type StorageObjectOptions = rustfs_ecstore::store_api::ObjectOptions;
-pub(crate) type StorageObjectToDelete = rustfs_ecstore::store_api::ObjectToDelete;
-pub(crate) type StoragePutObjReader = rustfs_ecstore::store_api::PutObjReader;
+pub(crate) type StorageDeletedObject = crate::storage::storage_compat::ecstore::store_api::DeletedObject;
+pub(crate) type StorageGetObjectReader = crate::storage::storage_compat::ecstore::store_api::GetObjectReader;
+pub(crate) type StorageObjectInfo = crate::storage::storage_compat::ecstore::store_api::ObjectInfo;
+pub(crate) type StorageObjectOptions = crate::storage::storage_compat::ecstore::store_api::ObjectOptions;
+pub(crate) type StorageObjectToDelete = crate::storage::storage_compat::ecstore::store_api::ObjectToDelete;
+pub(crate) type StoragePutObjReader = crate::storage::storage_compat::ecstore::store_api::PutObjReader;
 
 #[cfg(test)]
 mod concurrent_fix_test;
