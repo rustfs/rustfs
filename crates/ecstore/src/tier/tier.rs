@@ -53,6 +53,7 @@ use crate::{
     store_api::{ObjectIO, ObjectOperations, ObjectOptions, PutObjReader},
 };
 use rustfs_rio::HashReader;
+use rustfs_storage_api::{ObjectIO as _, ObjectOperations as _};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join};
 use s3s::S3ErrorCode;
 

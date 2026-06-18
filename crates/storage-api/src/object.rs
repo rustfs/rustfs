@@ -181,6 +181,106 @@ impl<Filter> Default for WalkOptions<Filter> {
 }
 
 #[async_trait::async_trait]
+pub trait ObjectIO: Send + Sync + fmt::Debug + 'static {
+    type Error: std::error::Error + Send + Sync + 'static;
+    type RangeSpec: Send + 'static;
+    type HeaderMap: Send + 'static;
+    type ObjectOptions: Send + Sync + 'static;
+    type ObjectInfo: Send + 'static;
+    type GetObjectReader: Send + 'static;
+    type PutObjectReader: Send + 'static;
+
+    async fn get_object_reader(
+        &self,
+        bucket: &str,
+        object: &str,
+        range: Option<Self::RangeSpec>,
+        h: Self::HeaderMap,
+        opts: &Self::ObjectOptions,
+    ) -> Result<Self::GetObjectReader, Self::Error>;
+
+    async fn put_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut Self::PutObjectReader,
+        opts: &Self::ObjectOptions,
+    ) -> Result<Self::ObjectInfo, Self::Error>;
+}
+
+#[async_trait::async_trait]
+#[allow(clippy::too_many_arguments)]
+pub trait ObjectOperations: Send + Sync + fmt::Debug {
+    type Error: std::error::Error + Send + Sync + 'static;
+    type ObjectInfo: Send + 'static;
+    type ObjectOptions: Send + Sync + 'static;
+    type FileInfo: Send + Sync + 'static;
+    type ObjectToDelete: Send + 'static;
+    type DeletedObject: Send + 'static;
+
+    async fn get_object_info(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &Self::ObjectOptions,
+    ) -> Result<Self::ObjectInfo, Self::Error>;
+    async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &Self::ObjectOptions) -> Result<(), Self::Error>;
+    async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_object: &str,
+        dst_bucket: &str,
+        dst_object: &str,
+        src_info: &mut Self::ObjectInfo,
+        src_opts: &Self::ObjectOptions,
+        dst_opts: &Self::ObjectOptions,
+    ) -> Result<Self::ObjectInfo, Self::Error>;
+    async fn delete_object_version(
+        &self,
+        bucket: &str,
+        object: &str,
+        fi: &Self::FileInfo,
+        force_del_marker: bool,
+    ) -> Result<(), Self::Error>;
+    async fn delete_object(&self, bucket: &str, object: &str, opts: Self::ObjectOptions)
+    -> Result<Self::ObjectInfo, Self::Error>;
+    async fn delete_objects(
+        &self,
+        bucket: &str,
+        objects: Vec<Self::ObjectToDelete>,
+        opts: Self::ObjectOptions,
+    ) -> (Vec<Self::DeletedObject>, Vec<Option<Self::Error>>);
+    async fn put_object_metadata(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &Self::ObjectOptions,
+    ) -> Result<Self::ObjectInfo, Self::Error>;
+    async fn get_object_tags(&self, bucket: &str, object: &str, opts: &Self::ObjectOptions) -> Result<String, Self::Error>;
+    async fn put_object_tags(
+        &self,
+        bucket: &str,
+        object: &str,
+        tags: &str,
+        opts: &Self::ObjectOptions,
+    ) -> Result<Self::ObjectInfo, Self::Error>;
+    async fn delete_object_tags(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &Self::ObjectOptions,
+    ) -> Result<Self::ObjectInfo, Self::Error>;
+    async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<(), Self::Error>;
+    async fn transition_object(&self, bucket: &str, object: &str, opts: &Self::ObjectOptions) -> Result<(), Self::Error>;
+    async fn restore_transitioned_object(
+        self: Arc<Self>,
+        bucket: &str,
+        object: &str,
+        opts: &Self::ObjectOptions,
+    ) -> Result<(), Self::Error>;
+}
+
+#[async_trait::async_trait]
 #[allow(clippy::too_many_arguments)]
 pub trait ListOperations: Send + Sync + fmt::Debug {
     type Error: std::error::Error + Send + Sync + 'static;
@@ -221,6 +321,91 @@ pub trait ListOperations: Send + Sync + fmt::Debug {
         result: Self::WalkResultSender,
         opts: Self::WalkOptions,
     ) -> Result<(), Self::Error>;
+}
+
+#[async_trait::async_trait]
+#[allow(clippy::too_many_arguments)]
+pub trait MultipartOperations: Send + Sync + fmt::Debug {
+    type Error: std::error::Error + Send + Sync + 'static;
+    type ObjectInfo: Send + 'static;
+    type ObjectOptions: Send + Sync + 'static;
+    type PutObjectReader: Send + 'static;
+    type CompletePart: Send + 'static;
+    type ListMultipartsInfo: Send + 'static;
+    type MultipartUploadResult: Send + 'static;
+    type PartInfo: Send + 'static;
+    type MultipartInfo: Send + 'static;
+    type ListPartsInfo: Send + 'static;
+
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        key_marker: Option<String>,
+        upload_id_marker: Option<String>,
+        delimiter: Option<String>,
+        max_uploads: usize,
+    ) -> Result<Self::ListMultipartsInfo, Self::Error>;
+    async fn new_multipart_upload(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &Self::ObjectOptions,
+    ) -> Result<Self::MultipartUploadResult, Self::Error>;
+    async fn copy_object_part(
+        &self,
+        src_bucket: &str,
+        src_object: &str,
+        dst_bucket: &str,
+        dst_object: &str,
+        upload_id: &str,
+        part_id: usize,
+        start_offset: i64,
+        length: i64,
+        src_info: &Self::ObjectInfo,
+        src_opts: &Self::ObjectOptions,
+        dst_opts: &Self::ObjectOptions,
+    ) -> Result<(), Self::Error>;
+    async fn put_object_part(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_id: usize,
+        data: &mut Self::PutObjectReader,
+        opts: &Self::ObjectOptions,
+    ) -> Result<Self::PartInfo, Self::Error>;
+    async fn get_multipart_info(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        opts: &Self::ObjectOptions,
+    ) -> Result<Self::MultipartInfo, Self::Error>;
+    async fn list_object_parts(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_number_marker: Option<usize>,
+        max_parts: usize,
+        opts: &Self::ObjectOptions,
+    ) -> Result<Self::ListPartsInfo, Self::Error>;
+    async fn abort_multipart_upload(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        opts: &Self::ObjectOptions,
+    ) -> Result<(), Self::Error>;
+    async fn complete_multipart_upload(
+        self: Arc<Self>,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        uploaded_parts: Vec<Self::CompletePart>,
+        opts: &Self::ObjectOptions,
+    ) -> Result<Self::ObjectInfo, Self::Error>;
 }
 
 #[derive(Debug, Default)]

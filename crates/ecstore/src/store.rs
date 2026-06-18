@@ -53,7 +53,7 @@ use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
 use crate::rebalance::RebalanceMeta;
 use crate::rpc::RemoteClient;
-use crate::store_api::{ListObjectVersionsInfo, ObjectIO, ObjectInfoOrErr, WalkOptions};
+use crate::store_api::{ListObjectVersionsInfo, ObjectInfoOrErr, WalkOptions};
 use crate::store_init::{check_disk_fatal_errs, ec_drives_no_config};
 use crate::tier::tier::TierConfigMgr;
 use crate::{
@@ -63,8 +63,8 @@ use crate::{
     rpc::S3PeerSys,
     sets::Sets,
     store_api::{
-        DeletedObject, GetObjectReader, HealOperations, ListObjectsV2Info, MultipartOperations, NamespaceLocking, ObjectInfo,
-        ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader,
+        DeletedObject, GetObjectReader, HealOperations, ListObjectsV2Info, NamespaceLocking, ObjectInfo, ObjectOptions,
+        ObjectToDelete, PutObjReader,
     },
     store_init,
 };
@@ -367,7 +367,15 @@ impl Clone for PoolObjInfo {
 // }
 
 #[async_trait::async_trait]
-impl ObjectIO for ECStore {
+impl rustfs_storage_api::ObjectIO for ECStore {
+    type Error = Error;
+    type RangeSpec = HTTPRangeSpec;
+    type HeaderMap = HeaderMap;
+    type ObjectOptions = ObjectOptions;
+    type ObjectInfo = ObjectInfo;
+    type GetObjectReader = GetObjectReader;
+    type PutObjectReader = PutObjReader;
+
     #[instrument(level = "debug", skip(self))]
     async fn get_object_reader(
         &self,
@@ -420,7 +428,14 @@ impl BucketOperations for ECStore {
 }
 
 #[async_trait::async_trait]
-impl ObjectOperations for ECStore {
+impl rustfs_storage_api::ObjectOperations for ECStore {
+    type Error = Error;
+    type ObjectInfo = ObjectInfo;
+    type ObjectOptions = ObjectOptions;
+    type FileInfo = FileInfo;
+    type ObjectToDelete = ObjectToDelete;
+    type DeletedObject = DeletedObject;
+
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.handle_get_object_info(bucket, object, opts).await
     }
@@ -569,7 +584,18 @@ impl rustfs_storage_api::ListOperations for ECStore {
 }
 
 #[async_trait::async_trait]
-impl MultipartOperations for ECStore {
+impl rustfs_storage_api::MultipartOperations for ECStore {
+    type Error = Error;
+    type ObjectInfo = ObjectInfo;
+    type ObjectOptions = ObjectOptions;
+    type PutObjectReader = PutObjReader;
+    type CompletePart = CompletePart;
+    type ListMultipartsInfo = ListMultipartsInfo;
+    type MultipartUploadResult = MultipartUploadResult;
+    type PartInfo = PartInfo;
+    type MultipartInfo = MultipartInfo;
+    type ListPartsInfo = ListPartsInfo;
+
     #[instrument(skip(self))]
     async fn list_multipart_uploads(
         &self,
