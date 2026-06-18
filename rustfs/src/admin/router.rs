@@ -69,6 +69,7 @@ use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_types::EventName;
 use rustfs_signer::pre_sign_v4;
 use rustfs_storage_api::{BucketOperations, BucketOptions};
+use rustfs_utils::egress::validate_outbound_url;
 use rustfs_utils::http::{
     SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_REQUEST,
     SUFFIX_SOURCE_VERSION_ID, get_source_scheme, insert_header,
@@ -613,8 +614,13 @@ fn resolve_object_lambda_webhook_config_from_server_config(
         None => None,
     };
 
+    let parsed_endpoint =
+        Url::parse(&endpoint).map_err(|_| s3_error!(InvalidRequest, "object lambda target endpoint is invalid"))?;
+    validate_outbound_url(&parsed_endpoint)
+        .map_err(|err| s3_error!(InvalidRequest, "object lambda target endpoint is not allowed: {}", err))?;
+
     Ok(ObjectLambdaWebhookConfig {
-        endpoint: Url::parse(&endpoint).map_err(|_| s3_error!(InvalidRequest, "object lambda target endpoint is invalid"))?,
+        endpoint: parsed_endpoint,
         auth_token: kvs.lookup(WEBHOOK_AUTH_TOKEN).unwrap_or_default(),
         client_cert: kvs.lookup(WEBHOOK_CLIENT_CERT).unwrap_or_default(),
         client_key: kvs.lookup(WEBHOOK_CLIENT_KEY).unwrap_or_default(),
@@ -656,6 +662,8 @@ async fn resolve_object_lambda_webhook_config(uri: &Uri) -> S3Result<ObjectLambd
 }
 
 fn build_object_lambda_http_client(config: &ObjectLambdaWebhookConfig) -> S3Result<reqwest::Client> {
+    validate_outbound_url(&config.endpoint)
+        .map_err(|err| s3_error!(InvalidRequest, "object lambda target endpoint is not allowed: {}", err))?;
     let mut builder = reqwest::Client::builder().user_agent(rustfs_targets::get_user_agent(rustfs_targets::ServiceType::Basis));
 
     if let Some(timeout) = config.response_header_timeout {
@@ -3551,6 +3559,36 @@ mod tests {
         let disabled_err = resolve_object_lambda_webhook_config_from_server_config(&disabled_config, &webhook)
             .expect_err("disabled target should fail");
         assert_eq!(disabled_err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn resolve_object_lambda_webhook_config_from_server_config_rejects_loopback_endpoint() {
+        let arn = "arn:acme:s3-object-lambda::transformer:webhook"
+            .parse::<rustfs_targets::arn::ARN>()
+            .expect("arn should parse");
+        let config = rustfs_config::server_config::Config(std::collections::HashMap::from([(
+            LAMBDA_WEBHOOK_SUB_SYS.to_string(),
+            std::collections::HashMap::from([(
+                "transformer".to_string(),
+                rustfs_config::server_config::KVS(vec![
+                    rustfs_config::server_config::KV {
+                        key: ENABLE_KEY.to_string(),
+                        value: "on".to_string(),
+                        hidden_if_empty: false,
+                    },
+                    rustfs_config::server_config::KV {
+                        key: WEBHOOK_ENDPOINT.to_string(),
+                        value: "https://127.0.0.1/transform".to_string(),
+                        hidden_if_empty: false,
+                    },
+                ]),
+            )]),
+        )]));
+
+        let err = resolve_object_lambda_webhook_config_from_server_config(&config, &arn)
+            .expect_err("loopback endpoint should be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert!(err.message().unwrap_or_default().contains("not allowed"));
     }
 
     #[test]
