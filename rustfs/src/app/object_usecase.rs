@@ -78,9 +78,7 @@ use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object
 use rustfs_ecstore::rio::{DynReader, HashReader, WritePlan, wrap_reader};
 use rustfs_ecstore::set_disk::{get_lock_acquire_timeout, is_valid_storage_class};
 use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::{
-    NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader,
-};
+use rustfs_ecstore::store_api::{NamespaceLocking, ObjectInfo, ObjectOptions, ObjectToDelete, PutObjReader};
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateTargetDecision, ReplicationState, ReplicationStatusType,
     ReplicationType, RestoreStatusOps, VersionPurgeStatusType, parse_restore_obj_status, replication_statuses_map,
@@ -95,7 +93,7 @@ use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_fo
 use rustfs_s3select_api::object_store::bytes_stream;
 #[cfg(test)]
 use rustfs_storage_api::HTTPPreconditions;
-use rustfs_storage_api::HTTPRangeSpec;
+use rustfs_storage_api::{HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
 use rustfs_targets::{
     EventName, extract_params_header, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
 };

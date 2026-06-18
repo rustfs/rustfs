@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use rustfs_storage_api::MultipartOperations as _;
 
 impl ECStore {
     #[instrument(skip(self))]
