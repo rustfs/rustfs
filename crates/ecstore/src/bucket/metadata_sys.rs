@@ -21,11 +21,11 @@ use crate::bucket::utils::{deserialize, is_meta_bucketname};
 use crate::error::{Error, Result, is_err_bucket_not_found};
 use crate::global::{GLOBAL_Endpoints, is_dist_erasure, is_erasure, resolve_object_store_handle};
 use crate::store::ECStore;
-use crate::store_api::HealOperations as _;
 use futures::future::join_all;
 use lazy_static::lazy_static;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_policy::policy::BucketPolicy;
+use rustfs_storage_api::HealOperations as _;
 use s3s::dto::ReplicationConfiguration;
 use s3s::dto::{
     AccelerateConfiguration, BucketLifecycleConfiguration, BucketLoggingStatus, CORSConfiguration, NotificationConfiguration,
