@@ -2399,6 +2399,7 @@ impl DefaultObjectUsecase {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
 
         // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
         let manager = get_capacity_manager();
@@ -3329,6 +3330,7 @@ impl DefaultObjectUsecase {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         result
     }
 
@@ -3644,6 +3646,8 @@ impl DefaultObjectUsecase {
             .map(|context| context.notify())
             .unwrap_or_else(default_notify_interface);
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
+        let deleted_any = delete_results.iter().any(|result| result.delete_object.is_some());
+        let notify_bucket = bucket.clone();
         spawn_background_with_context(request_context, async move {
             let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Notify);
             for res in delete_results {
@@ -3651,10 +3655,10 @@ impl DefaultObjectUsecase {
                     let event_name = delete_event_name_for_marker(dobj.delete_marker);
                     let event_args = EventArgsBuilder::new(
                         event_name,
-                        bucket.clone(),
+                        notify_bucket.clone(),
                         ObjectInfo {
                             name: dobj.object_name.clone(),
-                            bucket: bucket.clone(),
+                            bucket: notify_bucket.clone(),
                             ..Default::default()
                         },
                     )
@@ -3672,6 +3676,9 @@ impl DefaultObjectUsecase {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        if deleted_any {
+            rustfs_scanner::record_dirty_usage_bucket(&bucket);
+        }
         // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
         let manager = get_capacity_manager();
         manager.record_write_operation().await;
@@ -3840,6 +3847,7 @@ impl DefaultObjectUsecase {
             let manager = get_capacity_manager();
             manager.record_write_operation().await;
             let _ = helper.complete(&result);
+            rustfs_scanner::record_dirty_usage_bucket(&bucket);
             return result;
         }
 
@@ -3908,6 +3916,7 @@ impl DefaultObjectUsecase {
         let manager = get_capacity_manager();
         manager.record_write_operation().await;
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         result
     }
 
@@ -4623,6 +4632,7 @@ impl DefaultObjectUsecase {
         let host = get_request_host(&req.headers);
         let port = get_request_port(&req.headers);
         let user_agent = get_request_user_agent(&req.headers);
+        let mut wrote_any_entry = false;
 
         while let Some(entry) = entries.next().await {
             let mut f = match entry {
@@ -4789,6 +4799,10 @@ impl DefaultObjectUsecase {
                     return Err(ApiError::from(e).into());
                 }
             };
+            if !wrote_any_entry {
+                rustfs_scanner::record_dirty_usage_bucket(&bucket);
+                wrote_any_entry = true;
+            }
 
             let _manager = get_concurrency_manager();
             let _fpath_clone = fpath.clone();
