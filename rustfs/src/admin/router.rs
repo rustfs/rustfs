@@ -16,21 +16,21 @@ use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
 use crate::admin::storage_compat::GLOBAL_BOOT_TIME;
 use crate::admin::storage_compat::PeerRestClient;
-use crate::admin::storage_compat::bucket::bandwidth::monitor::BandwidthDetails;
-use crate::admin::storage_compat::bucket::bucket_target_sys::{
+use crate::admin::storage_compat::bandwidth::monitor::BandwidthDetails;
+use crate::admin::storage_compat::bucket_target_sys::{
     BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, TargetClient,
 };
-use crate::admin::storage_compat::bucket::metadata::BUCKET_TARGETS_FILE;
-use crate::admin::storage_compat::bucket::metadata_sys;
-use crate::admin::storage_compat::bucket::replication::{
+use crate::admin::storage_compat::com::read_config_without_migrate;
+use crate::admin::storage_compat::get_global_notification_sys;
+use crate::admin::storage_compat::metadata::BUCKET_TARGETS_FILE;
+use crate::admin::storage_compat::metadata_sys;
+use crate::admin::storage_compat::replication::{
     BucketReplicationResyncStatus, BucketStats, GLOBAL_REPLICATION_STATS, ObjectOpts, ReplicationConfigurationExt, ResyncOpts,
     get_global_replication_pool,
 };
-use crate::admin::storage_compat::bucket::target::{BucketTarget, BucketTargetType, BucketTargets};
-use crate::admin::storage_compat::bucket::versioning::VersioningApi;
-use crate::admin::storage_compat::bucket::versioning_sys::BucketVersioningSys;
-use crate::admin::storage_compat::config::com::read_config_without_migrate;
-use crate::admin::storage_compat::get_global_notification_sys;
+use crate::admin::storage_compat::target::{BucketTarget, BucketTargetType, BucketTargets};
+use crate::admin::storage_compat::versioning::VersioningApi;
+use crate::admin::storage_compat::versioning_sys::BucketVersioningSys;
 use crate::admin::storage_compat::{get_global_bucket_monitor, get_global_deployment_id, get_global_region};
 use crate::app::context::resolve_object_store_handle;
 use crate::app::object_usecase::DefaultObjectUsecase;
@@ -1945,7 +1945,7 @@ async fn resolve_replication_target_client(bucket: &str, target: &BucketTarget) 
 
 fn build_replication_probe_put_options(now: OffsetDateTime) -> PutObjectOptions {
     PutObjectOptions {
-        internal: crate::admin::storage_compat::bucket::bucket_target_sys::AdvancedPutOptions {
+        internal: crate::admin::storage_compat::bucket_target_sys::AdvancedPutOptions {
             source_version_id: Uuid::new_v4().to_string(),
             replication_status: ReplicationStatusType::Replica,
             source_mtime: now,
@@ -2774,7 +2774,7 @@ mod tests {
     #[test]
     fn apply_replication_reset_to_targets_updates_matching_target() {
         let mut targets = BucketTargets {
-            targets: vec![crate::admin::storage_compat::bucket::target::BucketTarget {
+            targets: vec![crate::admin::storage_compat::target::BucketTarget {
                 arn: "arn:target".to_string(),
                 ..Default::default()
             }],
@@ -2796,10 +2796,10 @@ mod tests {
         let mut status = BucketReplicationResyncStatus::new();
         status.targets_map.insert(
             "arn:z".to_string(),
-            crate::admin::storage_compat::bucket::replication::TargetReplicationResyncStatus {
+            crate::admin::storage_compat::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-z".to_string(),
                 last_update: Some(datetime!(2025-01-03 00:00 UTC)),
-                resync_status: crate::admin::storage_compat::bucket::replication::ResyncStatusType::ResyncFailed,
+                resync_status: crate::admin::storage_compat::replication::ResyncStatusType::ResyncFailed,
                 failed_count: 2,
                 failed_size: 4,
                 bucket: "bucket-z".to_string(),
@@ -2809,10 +2809,10 @@ mod tests {
         );
         status.targets_map.insert(
             "arn:a".to_string(),
-            crate::admin::storage_compat::bucket::replication::TargetReplicationResyncStatus {
+            crate::admin::storage_compat::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-a".to_string(),
                 last_update: Some(datetime!(2025-01-02 00:00 UTC)),
-                resync_status: crate::admin::storage_compat::bucket::replication::ResyncStatusType::ResyncCompleted,
+                resync_status: crate::admin::storage_compat::replication::ResyncStatusType::ResyncCompleted,
                 replicated_count: 3,
                 replicated_size: 9,
                 bucket: "bucket-a".to_string(),
@@ -2842,10 +2842,10 @@ mod tests {
         let mut status = BucketReplicationResyncStatus::new();
         status.targets_map.insert(
             "arn:z".to_string(),
-            crate::admin::storage_compat::bucket::replication::TargetReplicationResyncStatus {
+            crate::admin::storage_compat::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-z".to_string(),
                 last_update: Some(datetime!(2025-02-03 00:00 UTC)),
-                resync_status: crate::admin::storage_compat::bucket::replication::ResyncStatusType::ResyncFailed,
+                resync_status: crate::admin::storage_compat::replication::ResyncStatusType::ResyncFailed,
                 failed_count: 2,
                 failed_size: 4,
                 bucket: "bucket-z".to_string(),
@@ -2855,10 +2855,10 @@ mod tests {
         );
         status.targets_map.insert(
             "arn:a".to_string(),
-            crate::admin::storage_compat::bucket::replication::TargetReplicationResyncStatus {
+            crate::admin::storage_compat::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-a".to_string(),
                 last_update: Some(datetime!(2025-02-02 00:00 UTC)),
-                resync_status: crate::admin::storage_compat::bucket::replication::ResyncStatusType::ResyncCompleted,
+                resync_status: crate::admin::storage_compat::replication::ResyncStatusType::ResyncCompleted,
                 replicated_count: 3,
                 replicated_size: 9,
                 bucket: "bucket-a".to_string(),

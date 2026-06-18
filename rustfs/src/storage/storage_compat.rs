@@ -13,6 +13,12 @@
 // limitations under the License.
 
 pub(crate) use rustfs_ecstore::admin_server_info::get_local_server_property;
+pub(crate) use rustfs_ecstore::bucket::{
+    metadata, metadata_sys, object_lock, policy_sys, replication, tagging, utils, versioning, versioning_sys,
+};
+pub(crate) use rustfs_ecstore::client::object_api_utils;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::config::com;
 pub(crate) use rustfs_ecstore::disk::error::DiskError;
 pub(crate) use rustfs_ecstore::disk::{
     DeleteOptions, DiskAPI, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadMultipleResp, ReadOptions,
@@ -33,22 +39,7 @@ pub(crate) use rustfs_ecstore::rpc::{
 pub(crate) use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 pub(crate) use rustfs_ecstore::store::{ECStore, all_local_disk_path, find_local_disk_by_ref};
 
-pub(crate) mod bucket {
-    pub(crate) use rustfs_ecstore::bucket::{
-        metadata, metadata_sys, object_lock, policy_sys, replication, tagging, utils, versioning, versioning_sys,
-    };
-}
-
-pub(crate) mod client {
-    pub(crate) use rustfs_ecstore::client::object_api_utils;
-}
-
 pub(crate) type GetObjectReader = rustfs_ecstore::store_api::GetObjectReader;
 pub(crate) type ObjectInfo = rustfs_ecstore::store_api::ObjectInfo;
 pub(crate) type ObjectOptions = rustfs_ecstore::store_api::ObjectOptions;
 pub(crate) type PutObjReader = rustfs_ecstore::store_api::PutObjReader;
-
-#[cfg(test)]
-pub(crate) mod config {
-    pub(crate) use rustfs_ecstore::config::com;
-}

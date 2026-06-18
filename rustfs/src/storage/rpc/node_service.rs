@@ -20,9 +20,8 @@ use crate::storage::storage_compat::{
     CollectMetricsOpts, DeleteOptions, DiskAPI, DiskError, DiskInfoOptions, DiskStore, FileInfoVersions, GLOBAL_TierConfigMgr,
     LocalPeerS3Client, MetricType, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerS3Client, ReadMultipleReq, ReadMultipleResp,
     ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, UpdateMetadataOpts, all_local_disk_path,
-    bucket::{metadata::load_bucket_metadata, metadata_sys},
     collect_local_metrics, find_local_disk_by_ref, get_global_lock_client, get_local_server_property,
-    resolve_object_store_handle,
+    metadata::load_bucket_metadata, metadata_sys, resolve_object_store_handle,
 };
 use bytes::Bytes;
 use futures::Stream;
@@ -2698,7 +2697,7 @@ mod tests {
         vars.insert(PEER_RESTSIGNAL.to_string(), SERVICE_SIGNAL_RELOAD_DYNAMIC.to_string());
         vars.insert(
             PEER_RESTSUB_SYS.to_string(),
-            crate::storage::storage_compat::config::com::STORAGE_CLASS_SUB_SYS.to_string(),
+            crate::storage::storage_compat::com::STORAGE_CLASS_SUB_SYS.to_string(),
         );
 
         let request = Request::new(SignalServiceRequest {

@@ -53,13 +53,9 @@ use crate::startup_fs_guard::enforce_unsupported_fs_policy;
 use crate::startup_iam::{bootstrap_or_defer_iam_init, publish_ready_for_iam_bootstrap};
 use crate::storage_compat::init_lock_clients;
 use crate::storage_compat::{
-    ECStore, EndpointServerPools,
-    bucket::replication::init_background_replication,
-    bucket::{
-        metadata_sys::init_bucket_metadata_sys,
-        migration::{try_migrate_bucket_metadata, try_migrate_iam_config},
-    },
-    config as ecconfig, init_local_disks, set_global_endpoints, set_global_rustfs_port, update_erasure_type,
+    ECStore, EndpointServerPools, init as init_ecstore_config, init_background_replication, init_bucket_metadata_sys,
+    init_global_config_sys, init_local_disks, set_global_endpoints, set_global_rustfs_port, try_migrate_bucket_metadata,
+    try_migrate_iam_config, try_migrate_server_config, update_erasure_type,
 };
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
@@ -384,12 +380,12 @@ impl RustFSServerBuilder {
             }
         };
 
-        ecconfig::init();
-        ecconfig::try_migrate_server_config(store.clone()).await;
+        init_ecstore_config();
+        try_migrate_server_config(store.clone()).await;
 
         // Global config system (with retry).
         let mut retry = 0;
-        while let Err(e) = ecconfig::init_global_config_sys(store.clone()).await {
+        while let Err(e) = init_global_config_sys(store.clone()).await {
             retry += 1;
             if retry > 15 {
                 shutdown_embedded_server();
