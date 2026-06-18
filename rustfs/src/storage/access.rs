@@ -18,12 +18,12 @@ use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::RemoteAddr;
 use crate::storage::request_context::RequestContext;
+use crate::storage::storage_compat::ecstore::bucket::metadata_sys;
+use crate::storage::storage_compat::ecstore::bucket::policy_sys::PolicySys;
+use crate::storage::storage_compat::ecstore::error::{StorageError, is_err_bucket_not_found};
+use crate::storage::storage_compat::ecstore::resolve_object_store_handle;
+use crate::storage::storage_compat::ecstore::store::ECStore;
 use metrics::counter;
-use rustfs_ecstore::bucket::metadata_sys;
-use rustfs_ecstore::bucket::policy_sys::PolicySys;
-use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found};
-use rustfs_ecstore::resolve_object_store_handle;
-use rustfs_ecstore::store::ECStore;
 use rustfs_iam::error::Error as IamError;
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
 use rustfs_policy::policy::{
@@ -930,7 +930,7 @@ impl S3Access for FS {
         let req_info = ReqInfo {
             cred,
             is_owner,
-            region: rustfs_ecstore::global::get_global_region(),
+            region: crate::storage::storage_compat::ecstore::global::get_global_region(),
             request_context,
             ..Default::default()
         };

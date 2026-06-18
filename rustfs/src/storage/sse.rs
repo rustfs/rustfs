@@ -69,6 +69,7 @@
 //! }
 //! ```
 
+use crate::storage::storage_compat::ecstore::error::StorageError;
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit},
@@ -81,7 +82,6 @@ use http::{HeaderMap, HeaderValue};
 use rand::Rng;
 #[cfg(feature = "rio-v2")]
 use rand::RngExt;
-use rustfs_ecstore::error::StorageError;
 use rustfs_kms::{DataKey, service_manager::get_global_encryption_service, types::ObjectEncryptionContext};
 use rustfs_utils::get_env_opt_str;
 use s3s::S3ErrorCode;
@@ -128,8 +128,8 @@ const SEALED_KEY_SIZE: usize = DARE_HEADER_SIZE + 32 + DARE_TAG_SIZE;
 const OBJECT_KEY_DERIVATION_CONTEXT: &[u8] = b"object-encryption-key generation";
 
 use crate::error::ApiError;
-use rustfs_ecstore::bucket::metadata_sys;
-use rustfs_ecstore::error::Error;
+use crate::storage::storage_compat::ecstore::bucket::metadata_sys;
+use crate::storage::storage_compat::ecstore::error::Error;
 use rustfs_utils::http::headers::{
     AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
     AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5, AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT,
@@ -745,17 +745,29 @@ pub struct ManagedSealedKey {
 }
 
 impl EncryptionMaterial {
-    pub fn write_encryption(&self, multipart_part_number: Option<usize>) -> rustfs_ecstore::rio::WriteEncryption {
+    pub fn write_encryption(
+        &self,
+        multipart_part_number: Option<usize>,
+    ) -> crate::storage::storage_compat::ecstore::rio::WriteEncryption {
         match (self.key_kind, multipart_part_number) {
             (EncryptionKeyKind::Object, Some(part_number)) => {
-                rustfs_ecstore::rio::WriteEncryption::multipart_object_key(self.key_bytes, part_number as u32)
+                crate::storage::storage_compat::ecstore::rio::WriteEncryption::multipart_object_key(
+                    self.key_bytes,
+                    part_number as u32,
+                )
             }
-            (EncryptionKeyKind::Object, None) => rustfs_ecstore::rio::WriteEncryption::singlepart_object_key(self.key_bytes),
+            (EncryptionKeyKind::Object, None) => {
+                crate::storage::storage_compat::ecstore::rio::WriteEncryption::singlepart_object_key(self.key_bytes)
+            }
             (EncryptionKeyKind::Direct, Some(part_number)) => {
-                rustfs_ecstore::rio::WriteEncryption::multipart(self.key_bytes, self.base_nonce, part_number)
+                crate::storage::storage_compat::ecstore::rio::WriteEncryption::multipart(
+                    self.key_bytes,
+                    self.base_nonce,
+                    part_number,
+                )
             }
             (EncryptionKeyKind::Direct, None) => {
-                rustfs_ecstore::rio::WriteEncryption::singlepart(self.key_bytes, self.base_nonce)
+                crate::storage::storage_compat::ecstore::rio::WriteEncryption::singlepart(self.key_bytes, self.base_nonce)
             }
         }
     }

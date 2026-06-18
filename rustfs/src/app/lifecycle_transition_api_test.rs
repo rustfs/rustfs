@@ -14,16 +14,7 @@
 
 use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};
 use crate::app::bucket_usecase::DefaultBucketUsecase;
-use crate::storage::ecfs::FS;
-use crate::storage::{
-    StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
-};
-use bytes::Bytes;
-use futures::FutureExt;
-use futures::stream;
-use http::{Extensions, HeaderMap, HeaderValue, Method, Uri, header::IF_NONE_MATCH};
-use rustfs_config::{ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT};
-use rustfs_ecstore::{
+use crate::app::storage_compat::ecstore::{
     bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, OBJECT_LOCK_CONFIG},
     bucket::metadata_sys,
     client::object_api_utils::to_s3s_etag,
@@ -37,6 +28,15 @@ use rustfs_ecstore::{
         warm_backend::{WarmBackend, WarmBackendGetOpts},
     },
 };
+use crate::storage::ecfs::FS;
+use crate::storage::{
+    StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
+};
+use bytes::Bytes;
+use futures::FutureExt;
+use futures::stream;
+use http::{Extensions, HeaderMap, HeaderValue, Method, Uri, header::IF_NONE_MATCH};
+use rustfs_config::{ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT};
 use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
 use rustfs_storage_api::{
     BucketOperations, BucketOptions, ListOperations as _, MakeBucketOptions, MultipartOperations as _, ObjectIO as _,
@@ -113,7 +113,9 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
 
     let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
 
-    rustfs_ecstore::store::init_local_disks(endpoint_pools.clone()).await.unwrap();
+    crate::app::storage_compat::ecstore::store::init_local_disks(endpoint_pools.clone())
+        .await
+        .unwrap();
 
     let server_addr: std::net::SocketAddr = "127.0.0.1:9003".parse().unwrap();
     let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
@@ -130,7 +132,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     let buckets = buckets_list.into_iter().map(|v| v.name).collect();
     metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
 
-    rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+    crate::app::storage_compat::ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
 
     let _ = GLOBAL_ENV.set((disk_paths.clone(), ecstore.clone()));
 
@@ -930,7 +932,7 @@ async fn delete_transitioned_object_removes_remote_tier_copy_via_usecase() {
         .expect("Failed to set lifecycle configuration");
     let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
 
-    rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(
+    crate::app::storage_compat::ecstore::bucket::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(
         ecstore.clone(),
         bucket.as_str(),
     )
@@ -990,7 +992,7 @@ async fn lifecycle_transition_marks_dirty_disks_for_capacity_manager() {
         .expect("Failed to set lifecycle configuration");
     let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
 
-    rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(
+    crate::app::storage_compat::ecstore::bucket::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(
         ecstore.clone(),
         bucket.as_str(),
     )
