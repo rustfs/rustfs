@@ -1028,6 +1028,27 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     layer guards, formatting check, diff hygiene, risk scan, full pre-commit,
     and required three-expert review passed.
 
+- [x] `API-038` Narrow remaining `store_api` compatibility re-export surfaces.
+  - Current branch: `overtrue/arch-delete-object-contracts`.
+  - Current slice: replace whole-module `rustfs_ecstore::store_api`
+    compatibility re-exports in RustFS storage, scanner, heal, Swift,
+    S3 Select, IAM, and notify boundaries with explicit contract type
+    re-exports, and add a migration rule rejecting broad `store_api`
+    compatibility re-exports.
+  - Acceptance: storage compatibility boundaries expose only the concrete
+    `store_api` contracts their consumers use; downstream local aliases keep
+    the same names; migration rules reject reintroducing broad `store_api`
+    passthroughs in production compatibility boundaries.
+  - Must preserve: object info/options reader aliases, storage/list/multipart
+    operation trait bindings, scanner/heal/Swift/S3 Select/IAM/notify behavior,
+    and all ECStore-owned concrete type ownership.
+  - Risk defense: this is compatibility import surface cleanup only; it does
+    not move definitions, alter storage/runtime control flow, change object
+    metadata conversion, or mutate reader behavior.
+  - Verification: focused multi-crate compile, migration guard, formatting
+    check, diff hygiene, risk scan, full pre-commit, and required three-expert
+    review passed.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -1304,13 +1325,25 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Delete-object DTO ownership lives in storage-api; ECStore internal consumers use storage-api directly while public aliases remain for compatibility. |
-| Migration preservation | passed | Field shape, helper semantics, delete behavior, replication scheduling, MRF delete replay, and old ECStore public import compatibility are preserved. |
-| Testing/verification | passed | ECStore/RustFS/scanner compile, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Delete-object DTO ownership lives in storage-api; ECStore internal consumers use storage-api directly while public aliases remain, and store_api compatibility boundaries now expose explicit contract types only. |
+| Migration preservation | passed | Field shape, helper semantics, delete behavior, replication scheduling, MRF delete replay, object info/options aliases, reader aliases, and old ECStore public import compatibility are preserved. |
+| Testing/verification | passed | Multi-crate compile, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- API-038 current slice:
+  - `cargo check --tests -p rustfs -p rustfs-scanner -p rustfs-heal -p rustfs-protocols -p rustfs-s3select-api -p rustfs-iam -p rustfs-notify`:
+    passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: passed; no new unwrap/expect, numeric casts, string error
+    public APIs, boxed public errors, production println/eprintln, or relaxed
+    ordering introduced in changed Rust files.
+  - `make pre-commit`: passed.
 
 - API-037 current slice:
   - `cargo check --tests -p rustfs-ecstore -p rustfs -p rustfs-scanner`:

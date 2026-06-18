@@ -13,7 +13,11 @@
 // limitations under the License.
 
 pub(crate) mod ecstore {
-    pub(crate) use rustfs_ecstore::{error, resolve_object_store_handle, set_disk, store, store_api};
+    pub(crate) use rustfs_ecstore::{error, resolve_object_store_handle, set_disk, store};
+
+    pub(crate) mod store_api {
+        pub(crate) use rustfs_ecstore::store_api::{GetObjectReader, ObjectInfo, ObjectOptions};
+    }
 }
 
 use ecstore::store_api::{

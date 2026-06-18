@@ -15,8 +15,12 @@
 pub(crate) mod ecstore {
     pub(crate) use rustfs_ecstore::{
         admin_server_info, bucket, client, disk, error, get_global_lock_client, global, metrics_realtime,
-        resolve_object_store_handle, rio, rpc, set_disk, store, store_api,
+        resolve_object_store_handle, rio, rpc, set_disk, store,
     };
+
+    pub(crate) mod store_api {
+        pub(crate) use rustfs_ecstore::store_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
+    }
 
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::config;

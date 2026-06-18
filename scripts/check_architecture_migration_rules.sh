@@ -64,6 +64,7 @@ STORE_API_EXTERNAL_OPERATION_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_o
 STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE="${TMP_DIR}/store_api_object_operation_local_method_hits.txt"
 DIRECT_ECSTORE_IMPORT_HITS_FILE="${TMP_DIR}/direct_ecstore_import_hits.txt"
 PRODUCTION_UNUSED_COMPAT_ALLOW_HITS_FILE="${TMP_DIR}/production_unused_compat_allow_hits.txt"
+BROAD_STORE_API_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/broad_store_api_compat_reexport_hits.txt"
 
 awk '
   /^## PR Types$/ {
@@ -372,6 +373,19 @@ fi
 
 if [[ -s "$PRODUCTION_UNUSED_COMPAT_ALLOW_HITS_FILE" ]]; then
   report_failure "production storage compatibility boundaries must not hide unused ECStore re-exports: $(paste -sd '; ' "$PRODUCTION_UNUSED_COMPAT_ALLOW_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading '(?:use|pub(?:\([^)]*\))? use) rustfs_ecstore::\{[^}]*\bstore_api\b[^}]*\}|(?:use|pub(?:\([^)]*\))? use) rustfs_ecstore::store_api\s*(?:;|as\b)' \
+    rustfs/src crates/*/src fuzz/fuzz_targets \
+    --glob '*storage_compat.rs' \
+    --glob '!crates/ecstore/**' \
+    --glob '!crates/e2e_test/**' || true
+) >"$BROAD_STORE_API_COMPAT_REEXPORT_HITS_FILE"
+
+if [[ -s "$BROAD_STORE_API_COMPAT_REEXPORT_HITS_FILE" ]]; then
+  report_failure "storage compatibility boundaries must expose explicit store_api contracts only: $(paste -sd '; ' "$BROAD_STORE_API_COMPAT_REEXPORT_HITS_FILE")"
 fi
 
 (

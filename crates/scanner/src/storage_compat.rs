@@ -16,8 +16,12 @@ use http::HeaderMap;
 pub(crate) mod ecstore {
     pub(crate) use rustfs_ecstore::{
         bucket, cache_value, config, data_usage, disk, error, global, pools, resolve_object_store_handle, set_disk, store,
-        store_api, store_utils,
+        store_utils,
     };
+
+    pub(crate) mod store_api {
+        pub(crate) use rustfs_ecstore::store_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
+    }
 }
 pub(crate) use self::ecstore::{
     bucket::{
