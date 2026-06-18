@@ -12,9 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::store_api::{
-    ObjectInfo as EcstoreObjectInfo, ObjectOptions as EcstoreObjectOptions, PutObjReader as EcstorePutObjReader,
+pub(crate) use rustfs_ecstore::{
+    data_usage::DATA_USAGE_CACHE_NAME,
+    disk::{BUCKET_META_PREFIX, DiskAPI, DiskStore, RUSTFS_META_BUCKET, endpoint::Endpoint, error::DiskError},
+    error::{Error as EcstoreError, StorageError},
+    global::GLOBAL_LOCAL_DISK_MAP,
+    store::ECStore,
+    store_api::{ObjectInfo as EcstoreObjectInfo, ObjectOptions as EcstoreObjectOptions, PutObjReader as EcstorePutObjReader},
 };
+
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::disk::{DiskOption, new_disk};
 
 pub type HealObjectInfo = EcstoreObjectInfo;
 pub type HealObjectOptions = EcstoreObjectOptions;

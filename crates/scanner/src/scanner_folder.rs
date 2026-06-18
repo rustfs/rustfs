@@ -39,25 +39,6 @@ use rustfs_common::metrics::{
     IlmAction, Metric, Metrics, ScannerReplicationRepairKind, ScannerSourceWorkUpdate, ScannerWorkSource, UpdateCurrentPathFn,
     current_path_updater, global_metrics,
 };
-use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
-use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::{GLOBAL_ExpiryState, apply_expiry_rule};
-use rustfs_ecstore::bucket::lifecycle::evaluator::Evaluator;
-use rustfs_ecstore::bucket::lifecycle::{
-    bucket_lifecycle_ops::apply_transition_rule,
-    lifecycle::{Event, Lifecycle, ObjectOpts},
-};
-use rustfs_ecstore::bucket::replication::{
-    ReplicationConfig, ReplicationConfigurationExt as _, ReplicationQueueAdmission, queue_replication_heal_internal,
-};
-use rustfs_ecstore::bucket::versioning::VersioningApi;
-use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
-use rustfs_ecstore::disk::error::DiskError;
-use rustfs_ecstore::disk::{Disk, DiskAPI as _, DiskInfoOptions};
-use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::global::is_erasure;
-use rustfs_ecstore::pools::{path2_bucket_object, path2_bucket_object_with_base_path};
-use rustfs_ecstore::store_utils::is_reserved_or_invalid_bucket;
 use rustfs_filemeta::{
     MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ReplicateObjectInfo, ReplicationStatusType, ReplicationType,
 };
@@ -69,6 +50,12 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
+use crate::storage_compat::{
+    BucketVersioningSys, Disk, DiskAPI as _, DiskError, DiskInfoOptions, Evaluator, Event, GLOBAL_ExpiryState, LcEventSrc,
+    Lifecycle, ListPathRawOptions, ObjectOpts, ReplicationConfig, ReplicationConfigurationExt as _, ReplicationQueueAdmission,
+    StorageError, VersioningApi, apply_expiry_rule, apply_transition_rule, is_erasure, is_reserved_or_invalid_bucket,
+    list_path_raw, path2_bucket_object, path2_bucket_object_with_base_path, queue_replication_heal_internal,
+};
 use crate::{ScannerObjectInfo as ObjectInfo, ScannerObjectToDelete as ObjectToDelete};
 
 const LOG_COMPONENT_SCANNER: &str = "scanner";
@@ -2436,7 +2423,7 @@ mod tests {
     use crate::SCANNER_SLEEPER;
 
     use super::*;
-    use rustfs_ecstore::disk::{DiskOption, endpoint::Endpoint, new_disk};
+    use crate::storage_compat::{DiskOption, Endpoint, new_disk};
     use rustfs_filemeta::{ReplicateObjectInfo, ReplicationType, ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType};
     use serial_test::serial;
     #[cfg(unix)]
