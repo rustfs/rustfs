@@ -1070,7 +1070,10 @@ pub async fn store_data_usage_in_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_ecstore::store_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
+    use crate::{
+        ScannerGetObjectReader as GetObjectReader, ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions,
+        ScannerPutObjReader as PutObjReader,
+    };
     use serial_test::serial;
     use std::collections::HashMap;
     use std::io::Cursor;

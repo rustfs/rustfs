@@ -15,7 +15,6 @@
 use crate::storage::s3_api::common::rustfs_owner;
 use percent_encoding::percent_decode_str;
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
-use rustfs_ecstore::store_api::ObjectInfo;
 use rustfs_storage_api::{
     BucketInfo, ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
 };
@@ -26,6 +25,8 @@ use s3s::dto::{
 use s3s::{S3Error, S3ErrorCode};
 use tracing::debug;
 use urlencoding::encode;
+
+use crate::storage::StorageObjectInfo as ObjectInfo;
 
 const S3_MAX_KEYS: i32 = 1000;
 
@@ -393,8 +394,8 @@ mod tests {
         build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output,
         parse_list_object_versions_params, parse_list_objects_v2_params,
     };
+    use crate::storage::StorageObjectInfo as ObjectInfo;
     use crate::storage::s3_api::common::rustfs_owner;
-    use rustfs_ecstore::store_api::ObjectInfo;
     use rustfs_storage_api::BucketInfo;
     use s3s::S3ErrorCode;
     use s3s::dto::{CommonPrefix, EncodingType, ListObjectsV2Output, Object};

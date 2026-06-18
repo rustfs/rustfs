@@ -19,17 +19,16 @@ mod tests {
     use crate::storage::ecfs::{FS, validate_object_lock_configuration_input};
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
     use crate::storage::{
-        apply_cors_headers, apply_default_lock_retention_metadata, check_preconditions, get_adaptive_buffer_size_with_profile,
-        get_buffer_size_opt_in, is_etag_equal, matches_origin_pattern, parse_etag, parse_object_lock_legal_hold,
-        parse_object_lock_retention, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
-        remove_object_lock_metadata_for_copy, remove_object_lock_retention_metadata, validate_bucket_object_lock_enabled,
-        validate_list_object_unordered_with_delimiter,
+        StorageObjectInfo as ObjectInfo, apply_cors_headers, apply_default_lock_retention_metadata, check_preconditions,
+        get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, is_etag_equal, matches_origin_pattern, parse_etag,
+        parse_object_lock_legal_hold, parse_object_lock_retention, process_lambda_configurations, process_queue_configurations,
+        process_topic_configurations, remove_object_lock_metadata_for_copy, remove_object_lock_retention_metadata,
+        validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter,
     };
     use http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, Uri};
     use rustfs_config::MI_B;
     use rustfs_ecstore::bucket::{metadata::BucketMetadata, metadata_sys};
     use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
-    use rustfs_ecstore::store_api::ObjectInfo;
     use rustfs_utils::http::{
         AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
         SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, contains_key_str, get_str, insert_str,

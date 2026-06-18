@@ -33,6 +33,7 @@ use crate::storage::sse::{
     extract_ssekms_context_from_headers, map_get_object_reader_error, mark_encrypted_multipart_metadata,
 };
 use crate::storage::*;
+use crate::storage::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
 use crate::table_catalog;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -53,7 +54,6 @@ use rustfs_ecstore::rio::{DecryptReader, EncryptReader, HardLimitReader, boxed_r
 use rustfs_ecstore::rio::{HashReader, WritePlan};
 use rustfs_ecstore::set_disk::is_valid_storage_class;
 use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::{ObjectOptions, PutObjReader};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_s3_ops::S3Operation;
 #[cfg(test)]

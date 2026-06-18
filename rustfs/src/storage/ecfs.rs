@@ -40,7 +40,6 @@ use rustfs_ecstore::{
         versioning_sys::BucketVersioningSys,
     },
     error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
-    store_api::ObjectOptions,
 };
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
@@ -59,6 +58,8 @@ const LOG_COMPONENT_STORAGE: &str = "storage";
 const LOG_SUBSYSTEM_OBJECT: &str = "object";
 const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
 const LOG_SUBSYSTEM_TAGGING: &str = "tagging";
+
+use crate::storage::StorageObjectOptions as ObjectOptions;
 
 #[derive(Debug, Clone)]
 pub struct FS {
