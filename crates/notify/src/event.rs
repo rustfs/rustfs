@@ -19,7 +19,7 @@ use rustfs_s3_types::{EventName, event_schema_version};
 use serde::{Deserialize, Serialize};
 use url::form_urlencoded;
 
-pub type NotifyObjectInfo = rustfs_ecstore::store_api::ObjectInfo;
+use crate::storage_compat::NotifyObjectInfo;
 
 /// Represents the identity of the user who triggered the event
 #[derive(Debug, Clone, Serialize, Deserialize)]
