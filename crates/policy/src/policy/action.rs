@@ -412,10 +412,6 @@ pub enum AdminAction {
     TraceAdminAction,
     #[strum(serialize = "admin:ConsoleLog")]
     ConsoleLogAdminAction,
-    #[strum(serialize = "admin:KMSCreateKey")]
-    KMSCreateKeyAdminAction,
-    #[strum(serialize = "admin:KMSKeyStatus")]
-    KMSKeyStatusAdminAction,
     #[strum(serialize = "admin:ServerInfo")]
     ServerInfoAdminAction,
     #[strum(serialize = "admin:OBDInfo")]
@@ -614,8 +610,6 @@ impl AdminAction {
                 | AdminAction::ProfilingAdminAction
                 | AdminAction::TraceAdminAction
                 | AdminAction::ConsoleLogAdminAction
-                | AdminAction::KMSCreateKeyAdminAction
-                | AdminAction::KMSKeyStatusAdminAction
                 | AdminAction::ServerInfoAdminAction
                 | AdminAction::HealthInfoAdminAction
                 | AdminAction::LicenseInfoAdminAction
@@ -765,6 +759,13 @@ mod tests {
             let action = Action::try_from(raw).expect("Should parse KMS action");
             assert_eq!(action, Action::KmsAction(expected));
             assert_eq!(<&str>::from(&action), raw);
+        }
+    }
+
+    #[test]
+    fn test_legacy_kms_admin_actions_are_rejected() {
+        for raw in ["admin:KMSCreateKey", "admin:KMSKeyStatus"] {
+            assert!(Action::try_from(raw).is_err(), "{raw} should not parse as a policy action");
         }
     }
 

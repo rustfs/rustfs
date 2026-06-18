@@ -312,6 +312,14 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: focused KMS auth and route-policy tests, migration guards,
     formatting, diff hygiene, risk scan, full pre-commit, and required
     three-expert review passed before push.
+- [x] `S-015` Remove legacy KMS admin policy action taxonomy.
+  - Acceptance: `admin:KMSCreateKey` and `admin:KMSKeyStatus` no longer parse as
+    valid policy actions; KMS key handlers keep using dedicated `kms:*` actions.
+  - Must preserve: legacy KMS endpoint URLs, query aliases, request bodies, and
+    response contracts remain unchanged.
+  - Verification: focused policy and KMS auth tests, route-policy tests,
+    migration guards, formatting, diff hygiene, risk scan, full pre-commit, and
+    required three-expert review passed before push.
 - [x] `KMSD-001` Inventory KMS development defaults.
   - Acceptance:
     [`kms-development-defaults-inventory.md`](kms-development-defaults-inventory.md)
@@ -1544,15 +1552,31 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | S-014 removes the registered KMS legacy admin action fallback; API-042/API-043/API-044/API-045/API-046/API-047/API-048/API-049 narrow notify, S3 Select, OBS, IAM, Swift, heal, scanner, RustFS runtime, test, and fuzz compatibility contracts without moving ECStore storage metadata ownership. |
-| Migration preservation | passed | KMS endpoint URLs, query aliases, request bodies, and response contracts are preserved; event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, OBS metrics state reads, IAM config/notification/error semantics, Swift bucket metadata access, heal disk/resume/task behavior, scanner lifecycle/replication/data-usage behavior, RustFS startup/admin/app/storage runtime access, e2e/test/fuzz import behavior, unchanged no-op handling, and remove-event behavior are preserved. |
+| Quality/architecture | passed | S-015 removes obsolete KMS admin policy action variants after the handler fallback cleanup; API-042/API-043/API-044/API-045/API-046/API-047/API-048/API-049 narrow notify, S3 Select, OBS, IAM, Swift, heal, scanner, RustFS runtime, test, and fuzz compatibility contracts without moving ECStore storage metadata ownership. |
+| Migration preservation | passed | KMS endpoint URLs, query aliases, request bodies, response contracts, and dedicated `kms:*` authorization behavior are preserved; event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, OBS metrics state reads, IAM config/notification/error semantics, Swift bucket metadata access, heal disk/resume/task behavior, scanner lifecycle/replication/data-usage behavior, RustFS startup/admin/app/storage runtime access, e2e/test/fuzz import behavior, unchanged no-op handling, and remove-event behavior are preserved. |
 | Testing/verification | passed | Focused compiles/tests, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed for the current slice. |
 
 ## Verification Notes
 
 Passed before push:
 
-- S-014 current slice:
+- S-015 current slice:
+  - `cargo test -p rustfs-policy test_legacy_kms_admin_actions_are_rejected --no-fail-fast`:
+    passed.
+  - `cargo test -p rustfs kms_key_auth_actions_use_dedicated_kms_actions --no-fail-fast`:
+    passed.
+  - `cargo test -p rustfs route_policy_records_dedicated_kms_actions --no-fail-fast`:
+    passed.
+  - `cargo test -p rustfs route_policy_rejects_server_info_for_sensitive_kms_actions --no-fail-fast`:
+    passed.
+  - `cargo check --tests -p rustfs-policy -p rustfs`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `make pre-commit`: passed.
+
+- S-014 previous slice:
   - `cargo test -p rustfs kms_key_auth_actions_use_dedicated_kms_actions --no-fail-fast`:
     passed.
   - `cargo test -p rustfs route_policy_records_dedicated_kms_actions --no-fail-fast`:

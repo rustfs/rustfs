@@ -391,17 +391,9 @@ mod tests {
 
     #[test]
     fn kms_key_auth_actions_use_dedicated_kms_actions() {
-        let create_actions = kms_create_key_actions();
-        assert_has_action(&create_actions, Action::KmsAction(KmsAction::ConfigureAction));
-        assert_lacks_action(&create_actions, Action::AdminAction(AdminAction::KMSCreateKeyAdminAction));
-
-        let describe_actions = kms_describe_key_actions();
-        assert_has_action(&describe_actions, Action::KmsAction(KmsAction::DescribeKeyAction));
-        assert_lacks_action(&describe_actions, Action::AdminAction(AdminAction::KMSKeyStatusAdminAction));
-
-        let list_actions = kms_list_keys_actions();
-        assert_has_action(&list_actions, Action::KmsAction(KmsAction::ListKeysAction));
-        assert_lacks_action(&list_actions, Action::AdminAction(AdminAction::KMSKeyStatusAdminAction));
+        assert_eq!(kms_create_key_actions(), vec![Action::KmsAction(KmsAction::ConfigureAction)]);
+        assert_eq!(kms_describe_key_actions(), vec![Action::KmsAction(KmsAction::DescribeKeyAction)]);
+        assert_eq!(kms_list_keys_actions(), vec![Action::KmsAction(KmsAction::ListKeysAction)]);
     }
 
     #[test]
