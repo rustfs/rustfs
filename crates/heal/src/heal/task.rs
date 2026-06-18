@@ -148,6 +148,8 @@ pub enum HealTaskStatus {
     Pending,
     /// Running
     Running,
+    /// Retrying after a recoverable failure
+    Retrying { error: String, retry_attempt: u32 },
     /// Completed
     Completed,
     /// Failed
@@ -173,6 +175,8 @@ pub struct HealRequest {
     pub source: HealRequestSource,
     /// Whether this request should bypass queue admission dedup/full policies.
     pub force_start: bool,
+    /// Number of recoverable retry attempts already scheduled for this request.
+    pub retry_attempts: u32,
     /// Created time
     pub created_at: SystemTime,
     /// Queue admission time used for scheduler delay metrics
@@ -189,6 +193,7 @@ impl HealRequest {
             priority,
             source: HealRequestSource::Internal,
             force_start: false,
+            retry_attempts: 0,
             created_at: now,
             enqueued_at: now,
         }
@@ -239,6 +244,8 @@ pub struct HealTask {
     pub priority: HealPriority,
     /// Origin inherited from the request
     pub source: HealRequestSource,
+    /// Number of recoverable retry attempts already scheduled for this task.
+    pub retry_attempts: u32,
     /// Task status
     pub status: Arc<RwLock<HealTaskStatus>>,
     /// Progress tracking
@@ -269,6 +276,7 @@ impl HealTask {
             options: request.options,
             priority: request.priority,
             source: request.source,
+            retry_attempts: request.retry_attempts,
             status: Arc::new(RwLock::new(HealTaskStatus::Pending)),
             progress: Arc::new(RwLock::new(HealProgress::new())),
             result_items: Arc::new(RwLock::new(Vec::new())),
@@ -279,6 +287,20 @@ impl HealTask {
             task_start_instant: Arc::new(RwLock::new(None)),
             cancel_token: tokio_util::sync::CancellationToken::new(),
             storage,
+        }
+    }
+
+    pub fn retry_request(&self) -> HealRequest {
+        HealRequest {
+            id: self.id.clone(),
+            heal_type: self.heal_type.clone(),
+            options: self.options.clone(),
+            priority: self.priority,
+            source: self.source,
+            force_start: false,
+            retry_attempts: self.retry_attempts.saturating_add(1),
+            created_at: self.created_at,
+            enqueued_at: SystemTime::now(),
         }
     }
 

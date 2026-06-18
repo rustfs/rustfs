@@ -20,7 +20,6 @@ use crate::{
     disk::DiskAPI,
     error::{Error, classify_system_path_failure_reason},
     store::ECStore,
-    store_api::ListOperations,
 };
 pub use local_snapshot::{
     DATA_USAGE_DIR, DATA_USAGE_STATE_DIR, LOCAL_USAGE_SNAPSHOT_VERSION, LocalUsageSnapshot, LocalUsageSnapshotMeta,
@@ -31,6 +30,7 @@ use rustfs_data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus, SizeSummary,
 };
 use rustfs_io_metrics::record_system_path_failure;
+use rustfs_storage_api::{ListOperations as _, ObjectIO as _};
 use rustfs_utils::path::SLASH_SEPARATOR;
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
@@ -654,7 +654,7 @@ pub fn create_cache_entry_from_summary(summary: &SizeSummary) -> DataUsageEntry 
 }
 
 /// Convert data usage cache to DataUsageInfo
-pub fn cache_to_data_usage_info(cache: &DataUsageCache, path: &str, buckets: &[crate::store_api::BucketInfo]) -> DataUsageInfo {
+pub fn cache_to_data_usage_info(cache: &DataUsageCache, path: &str, buckets: &[rustfs_storage_api::BucketInfo]) -> DataUsageInfo {
     let e = match cache.find(path) {
         Some(e) => e,
         None => return DataUsageInfo::default(),
@@ -715,7 +715,7 @@ pub fn cache_to_data_usage_info(cache: &DataUsageCache, path: &str, buckets: &[c
 // Helper functions for DataUsageCache operations
 pub async fn load_data_usage_cache(store: &crate::set_disk::SetDisks, name: &str) -> crate::error::Result<DataUsageCache> {
     use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
-    use crate::store_api::{ObjectIO, ObjectOptions};
+    use crate::store_api::ObjectOptions;
     use http::HeaderMap;
     use rand::RngExt;
     use std::path::Path;

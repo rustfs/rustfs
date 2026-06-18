@@ -420,7 +420,7 @@ async fn create_slo_stream(
 
                 // Fetch segment with range
                 let range_spec = if byte_start > 0 || byte_end < segment.size_bytes - 1 {
-                    Some(rustfs_ecstore::store_api::HTTPRangeSpec {
+                    Some(rustfs_storage_api::HTTPRangeSpec {
                         is_suffix_length: false,
                         start: byte_start as i64,
                         end: byte_end as i64,

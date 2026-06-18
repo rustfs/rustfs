@@ -53,10 +53,14 @@ use rustfs_ecstore::rio::{DecryptReader, EncryptReader, HardLimitReader, boxed_r
 use rustfs_ecstore::rio::{HashReader, WritePlan};
 use rustfs_ecstore::set_disk::is_valid_storage_class;
 use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::{CompletePart, HTTPRangeSpec, MultipartUploadResult, ObjectIO, ObjectOptions, PutObjReader};
-use rustfs_ecstore::store_api::{MultipartOperations, ObjectOperations};
+use rustfs_ecstore::store_api::{ObjectOptions, PutObjReader};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_s3_ops::S3Operation;
+#[cfg(test)]
+use rustfs_storage_api::HTTPPreconditions;
+use rustfs_storage_api::{
+    CompletePart, HTTPRangeSpec, MultipartOperations as _, MultipartUploadResult, ObjectIO as _, ObjectOperations as _,
+};
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
@@ -145,6 +149,21 @@ fn normalize_complete_multipart_parts(parts: Vec<CompletePart>) -> S3Result<Vec<
     Ok(deduped_reversed)
 }
 
+fn complete_part_from_s3(value: CompletedPart) -> CompletePart {
+    CompletePart {
+        part_num: value
+            .part_number
+            .and_then(|part_num| usize::try_from(part_num).ok())
+            .unwrap_or_default(),
+        etag: value.e_tag.map(|v| v.value().to_owned()),
+        checksum_crc32: value.checksum_crc32,
+        checksum_crc32c: value.checksum_crc32c,
+        checksum_sha1: value.checksum_sha1,
+        checksum_sha256: value.checksum_sha256,
+        checksum_crc64nvme: value.checksum_crc64nvme,
+    }
+}
+
 async fn validate_table_catalog_object_mutation(bucket: &str, key: &str) -> S3Result<()> {
     table_catalog::validate_bucket_object_mutation(bucket, key)
         .await
@@ -193,6 +212,44 @@ fn extract_request_host(headers: &HeaderMap, uri: &Uri) -> Option<String> {
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .or_else(|| uri.authority().map(|authority| authority.as_str().to_string()))
+}
+
+fn decoded_content_length_from_headers(headers: &HeaderMap) -> S3Result<Option<i64>> {
+    let Some(val) = headers.get(AMZ_DECODED_CONTENT_LENGTH) else {
+        return Ok(None);
+    };
+
+    match atoi::atoi::<i64>(val.as_bytes()) {
+        Some(x) => Ok(Some(x)),
+        None => Err(s3_error!(UnexpectedContent)),
+    }
+}
+
+fn request_uses_aws_chunked(headers: &HeaderMap) -> bool {
+    let has_aws_chunked = |header_name: &str| {
+        headers
+            .get(header_name)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.split(',').any(|part| part.trim().eq_ignore_ascii_case("aws-chunked")))
+    };
+
+    has_aws_chunked("content-encoding") || has_aws_chunked("transfer-encoding")
+}
+
+fn resolve_upload_part_size(headers: &HeaderMap, content_length: Option<i64>) -> S3Result<Option<i64>> {
+    let decoded_content_length = decoded_content_length_from_headers(headers)?;
+    let size = match (request_uses_aws_chunked(headers), decoded_content_length, content_length) {
+        (true, Some(decoded), _) => Some(decoded),
+        (_, _, Some(length)) => Some(length),
+        (_, Some(decoded), None) => Some(decoded),
+        _ => None,
+    };
+
+    if size == Some(-1) {
+        return Err(s3_error!(UnexpectedContent));
+    }
+
+    Ok(size)
 }
 
 fn build_complete_multipart_location(headers: &HeaderMap, uri: &Uri, bucket: &str, key: &str) -> String {
@@ -341,7 +398,7 @@ impl DefaultMultipartUsecase {
             .parts
             .unwrap_or_default()
             .into_iter()
-            .map(CompletePart::from)
+            .map(complete_part_from_s3)
             .collect::<Vec<_>>();
 
         let uploaded_parts = normalize_complete_multipart_parts(uploaded_parts_vec)?;
@@ -507,6 +564,7 @@ impl DefaultMultipartUsecase {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         result
     }
 
@@ -704,34 +762,26 @@ impl DefaultMultipartUsecase {
 
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
-        let mut size = content_length;
+        let mut size = resolve_upload_part_size(&req.headers, content_length)?;
         let mut body_stream = body.ok_or_else(|| s3_error!(IncompleteBody))?;
 
         if size.is_none() {
-            if let Some(val) = req.headers.get(AMZ_DECODED_CONTENT_LENGTH)
-                && let Some(x) = atoi::atoi::<i64>(val.as_bytes())
-            {
-                size = Some(x);
+            let mut total = 0i64;
+            let mut buffer = bytes::BytesMut::new();
+            while let Some(chunk) = body_stream.next().await {
+                let chunk = chunk.map_err(|e| ApiError::from(StorageError::other(e.to_string())))?;
+                total += chunk.len() as i64;
+                buffer.extend_from_slice(&chunk);
             }
 
-            if size.is_none() {
-                let mut total = 0i64;
-                let mut buffer = bytes::BytesMut::new();
-                while let Some(chunk) = body_stream.next().await {
-                    let chunk = chunk.map_err(|e| ApiError::from(StorageError::other(e.to_string())))?;
-                    total += chunk.len() as i64;
-                    buffer.extend_from_slice(&chunk);
-                }
-
-                if total <= 0 {
-                    return Err(s3_error!(UnexpectedContent));
-                }
-
-                size = Some(total);
-                let combined = buffer.freeze();
-                let stream = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(combined) });
-                body_stream = StreamingBlob::wrap(stream);
+            if total <= 0 {
+                return Err(s3_error!(UnexpectedContent));
             }
+
+            size = Some(total);
+            let combined = buffer.freeze();
+            let stream = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(combined) });
+            body_stream = StreamingBlob::wrap(stream);
         }
 
         // Get multipart info early to check if managed encryption will be applied
@@ -739,7 +789,7 @@ impl DefaultMultipartUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let opts = ObjectOptions::default();
+        let mut opts = ObjectOptions::default();
         let fi = store
             .get_multipart_info(&bucket, &key, &upload_id, &opts)
             .await
@@ -791,6 +841,7 @@ impl DefaultMultipartUsecase {
         if let Err(err) = reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), size < 0) {
             return Err(ApiError::from(err).into());
         }
+        opts.want_checksum = reader.checksum();
 
         let has_ssec = sse_customer_algorithm.is_some();
         // When SSE-C headers are present, skip managed-encryption metadata to avoid
@@ -1347,11 +1398,31 @@ mod tests {
     }
 
     #[test]
+    fn resolve_upload_part_size_uses_decoded_length_for_aws_chunked() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", HeaderValue::from_static("aws-chunked"));
+        headers.insert(AMZ_DECODED_CONTENT_LENGTH, HeaderValue::from_static("5242880"));
+
+        let size = resolve_upload_part_size(&headers, Some(5242962)).expect("decoded size should parse");
+
+        assert_eq!(size, Some(5242880));
+    }
+
+    #[test]
+    fn resolve_upload_part_size_preserves_regular_content_length() {
+        let headers = HeaderMap::new();
+
+        let size = resolve_upload_part_size(&headers, Some(5242880)).expect("regular size should parse");
+
+        assert_eq!(size, Some(5242880));
+    }
+
+    #[test]
     fn internal_object_info_lookup_opts_drops_http_preconditions() {
         let opts = ObjectOptions {
             version_id: Some(Uuid::new_v4().to_string()),
             no_lock: true,
-            http_preconditions: Some(rustfs_ecstore::store_api::HTTPPreconditions {
+            http_preconditions: Some(HTTPPreconditions {
                 if_none_match: Some("*".to_string()),
                 if_match: Some("\"etag\"".to_string()),
                 ..Default::default()

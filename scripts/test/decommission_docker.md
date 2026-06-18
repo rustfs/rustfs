@@ -5,10 +5,12 @@ This setup simulates a two-pool RustFS cluster locally with Docker so decommissi
 ## Topology
 
 - One RustFS container
+- One disposable MinIO container for tier/lifecycle validation
 - Two pools
 - Four disks per pool
 - S3 API on `http://127.0.0.1:9100`
 - Console on `http://127.0.0.1:9101`
+- Tier backend S3 API on `http://127.0.0.1:9200`
 
 Pool cmdlines used by admin decommission:
 

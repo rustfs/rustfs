@@ -46,6 +46,7 @@ arc-swap.workspace = true
 [dev-dependencies]
 criterion = { workspace = true }
 tempfile = { workspace = true }
+proptest = "1"
 
 [[bench]]
 name = "xl_meta_bench"

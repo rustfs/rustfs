@@ -34,6 +34,7 @@ use rustfs_filemeta::{
 use rustfs_lock::NamespaceLockWrapper;
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_rio::Checksum;
+use rustfs_storage_api::HTTPRangeSpec;
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, AMZ_RESTORE, AMZ_STORAGE_CLASS};
@@ -56,8 +57,6 @@ pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
 mod readers;
 mod traits;
 mod types;
-
-pub(crate) use rustfs_storage_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
 
 pub use readers::*;
 pub use traits::*;

@@ -1,0 +1,2 @@
+INVALID-BUCKET
+safe-object

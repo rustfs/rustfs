@@ -78,20 +78,22 @@ use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object
 use rustfs_ecstore::rio::{DynReader, HashReader, WritePlan, wrap_reader};
 use rustfs_ecstore::set_disk::{get_lock_acquire_timeout, is_valid_storage_class};
 use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::{
-    HTTPRangeSpec, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader,
-};
+use rustfs_ecstore::store_api::{NamespaceLocking, ObjectInfo, ObjectOptions, ObjectToDelete, PutObjReader};
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateTargetDecision, ReplicationState, ReplicationStatusType,
     ReplicationType, RestoreStatusOps, VersionPurgeStatusType, parse_restore_obj_status, replication_statuses_map,
     version_purge_statuses_map,
 };
+use rustfs_io_core::{BytesPool, PooledBuffer};
 use rustfs_io_metrics;
 use rustfs_lock::NamespaceLockGuard;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_for_post_object};
 use rustfs_s3select_api::object_store::bytes_stream;
+#[cfg(test)]
+use rustfs_storage_api::HTTPPreconditions;
+use rustfs_storage_api::{HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
 use rustfs_targets::{
     EventName, extract_params_header, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
 };
@@ -118,6 +120,8 @@ use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
 use std::ops::Add;
 use std::path::{Component, Path};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -133,6 +137,11 @@ use uuid::Uuid;
 
 const ACCEPT_RANGES_BYTES: &str = "bytes";
 const MAX_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
+const LOG_COMPONENT_APP: &str = "app";
+const LOG_SUBSYSTEM_OBJECT: &str = "object";
+const EVENT_PUT_OBJECT_STORE_INFLIGHT_SLOW: &str = "put_object_store_inflight_slow";
+const EVENT_PUT_OBJECT_STORE_RETURNED: &str = "put_object_store_returned";
+const PUT_OBJECT_STORE_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 static GET_OBJECT_BUFFER_THRESHOLD_WARNED: AtomicBool = AtomicBool::new(false);
 
 fn decoded_content_length_from_headers(headers: &HeaderMap) -> S3Result<Option<i64>> {
@@ -248,9 +257,15 @@ enum GetObjectTimeoutStage {
     BeforeRead,
 }
 
-async fn enqueue_transitioned_delete_cleanup(bucket: &str, object: &str, opts: &ObjectOptions, existing: Option<&ObjectInfo>) {
+async fn enqueue_transitioned_delete_cleanup(
+    store: Arc<ECStore>,
+    bucket: &str,
+    object: &str,
+    opts: &ObjectOptions,
+    existing: Option<&ObjectInfo>,
+) -> std::io::Result<()> {
     let Some(existing) = existing else {
-        return;
+        return Ok(());
     };
     let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Cleanup);
 
@@ -266,8 +281,10 @@ async fn enqueue_transitioned_delete_cleanup(bucket: &str, object: &str, opts: &
         )
     };
     let Some(je) = je else {
-        return;
+        return Ok(());
     };
+
+    rustfs_ecstore::bucket::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry(store, &je).await?;
 
     let mut expiry_state = rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState
         .write()
@@ -280,9 +297,10 @@ async fn enqueue_transitioned_delete_cleanup(bucket: &str, object: &str, opts: &
             remote_version_id = %existing.transitioned_object.version_id,
             tier = %existing.transitioned_object.tier,
             error = ?err,
-            "failed to enqueue transitioned object cleanup"
+            "transitioned object cleanup journal persisted but was not queued"
         );
     }
+    Ok(())
 }
 
 pin_project! {
@@ -365,6 +383,33 @@ impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
     }
 }
 
+struct PooledBufferReader {
+    buffer: PooledBuffer,
+    len: usize,
+    pos: usize,
+}
+
+impl PooledBufferReader {
+    fn new(buffer: PooledBuffer, len: usize) -> Self {
+        Self { buffer, len, pos: 0 }
+    }
+}
+
+impl AsyncRead for PooledBufferReader {
+    fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        if self.pos >= self.len {
+            return Poll::Ready(Ok(()));
+        }
+
+        let remaining = self.len - self.pos;
+        let to_read = remaining.min(buf.remaining());
+        buf.put_slice(&self.buffer[self.pos..self.pos + to_read]);
+        self.pos += to_read;
+
+        Poll::Ready(Ok(()))
+    }
+}
+
 /// Determine if zero-copy write should be used for this PutObject operation.
 ///
 /// Zero-copy is beneficial for large objects without encryption or compression.
@@ -418,6 +463,105 @@ fn should_use_zero_copy(size: i64, headers: &HeaderMap) -> bool {
     }
 
     true
+}
+
+fn has_put_sse_request_headers(headers: &HeaderMap) -> bool {
+    headers.get(AMZ_SERVER_SIDE_ENCRYPTION).is_some()
+        || headers.get(AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM).is_some()
+        || headers.get(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID).is_some()
+}
+
+fn should_use_small_eager_put_path(
+    size: i64,
+    headers: &HeaderMap,
+    server_side_encryption_requested: bool,
+    should_compress: bool,
+    is_extract: bool,
+) -> bool {
+    const SMALL_EAGER_PUT_MAX_SIZE: i64 = 1024 * 1024;
+
+    if is_extract || should_compress || server_side_encryption_requested {
+        return false;
+    }
+
+    if size <= 0 || size > SMALL_EAGER_PUT_MAX_SIZE {
+        return false;
+    }
+
+    if has_put_sse_request_headers(headers) {
+        return false;
+    }
+
+    if request_uses_aws_chunked(headers) && decoded_content_length_from_headers(headers).ok().flatten().is_none() {
+        return false;
+    }
+
+    true
+}
+
+/// Objects at or below this size bypass BytesPool and use direct allocation.
+/// This avoids Small-tier Mutex contention under high concurrency for tiny objects
+/// where the allocation cost is negligible (≤4KiB memcpy).
+const POOL_BYPASS_MAX_SIZE: usize = 4 * 1024;
+
+async fn read_small_put_body_exact_pooled<R>(mut body: R, size: usize, pool: &BytesPool) -> S3Result<PooledBuffer>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = pool.acquire_buffer(size).await;
+    buf.resize(size, 0);
+    let mut filled = 0;
+
+    while filled < size {
+        let read = tokio::io::AsyncReadExt::read(&mut body, &mut buf[filled..size])
+            .await
+            .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
+        if read == 0 {
+            return Err(s3_error!(IncompleteBody));
+        }
+        filled += read;
+    }
+
+    let mut extra = [0u8; 1];
+    let extra_read = tokio::io::AsyncReadExt::read(&mut body, &mut extra)
+        .await
+        .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
+    if extra_read != 0 {
+        return Err(s3_error!(UnexpectedContent));
+    }
+
+    Ok(buf)
+}
+
+/// Read small PUT body into a directly-allocated buffer, bypassing BytesPool.
+/// Used for objects ≤4KiB where pool contention under high concurrency
+/// outweighs the allocation cost.
+async fn read_small_put_body_exact_direct<R>(mut body: R, size: usize) -> S3Result<std::io::Cursor<Vec<u8>>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = vec![0u8; size];
+    let mut filled = 0;
+
+    while filled < size {
+        let read = tokio::io::AsyncReadExt::read(&mut body, &mut buf[filled..size])
+            .await
+            .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
+        if read == 0 {
+            return Err(s3_error!(IncompleteBody));
+        }
+        filled += read;
+    }
+
+    let mut extra = [0u8; 1];
+    let extra_read = tokio::io::AsyncReadExt::read(&mut body, &mut extra)
+        .await
+        .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
+    if extra_read != 0 {
+        return Err(s3_error!(UnexpectedContent));
+    }
+
+    Ok(std::io::Cursor::new(buf))
 }
 
 fn object_seek_support_threshold() -> usize {
@@ -844,7 +988,7 @@ fn contains_parent_dir_component(path: &str) -> bool {
     path.split(['/', '\\']).any(|component| component == "..")
 }
 
-fn validate_extract_relative_path(path: &str) -> S3Result<()> {
+pub fn validate_extract_relative_path(path: &str) -> S3Result<()> {
     let path = Path::new(path);
     if path
         .components()
@@ -868,7 +1012,7 @@ fn normalize_snowball_prefix(prefix: &str) -> S3Result<Option<String>> {
     Ok(Some(normalized.to_string()))
 }
 
-fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: bool) -> S3Result<String> {
+pub fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: bool) -> S3Result<String> {
     validate_extract_relative_path(path)?;
     let path = path.trim_matches('/');
     let mut key = match prefix {
@@ -1440,7 +1584,17 @@ impl DefaultObjectUsecase {
         if let Some(part_number) = part_number
             && rs.is_none()
         {
-            rs = HTTPRangeSpec::from_object_info(&info, part_number);
+            rs = HTTPRangeSpec::from_part_sizes(
+                info.size,
+                part_number,
+                info.parts.iter().map(|part| {
+                    if part.actual_size > 0 {
+                        part.actual_size
+                    } else {
+                        i64::try_from(part.size).unwrap_or(i64::MAX)
+                    }
+                }),
+            );
         }
 
         validate_sse_headers_for_read(&info.user_defined, &req.headers)?;
@@ -1805,10 +1959,21 @@ impl DefaultObjectUsecase {
             return Err(s3_error!(UnexpectedContent));
         }
 
+        let ingress_stage_start = std::time::Instant::now();
+        let should_compress = is_disk_compressible(&req.headers, &key) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64;
+        let server_side_encryption_requested =
+            server_side_encryption.is_some() || sse_customer_algorithm.is_some() || ssekms_key_id.is_some();
+
         // Apply adaptive buffer sizing based on file size for optimal streaming performance.
         // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
         // Buffer sizes range from 32KB to 4MB depending on file size and configured workload profile.
-        let buffer_size = get_buffer_size_opt_in(size);
+        // Concurrency-aware adjustment reduces buffer size under high concurrency to lower memory pressure.
+        // TODO: get_concurrency_aware_buffer_size reads ACTIVE_GET_REQUESTS (GET concurrency tracker),
+        // not PUT concurrency. Under pure PUT load the counter stays zero so buffers never shrink;
+        // unrelated GET load can shrink PUT buffers instead. Fix by adding ACTIVE_PUT_REQUESTS +
+        // PutObjectGuard and using PUT concurrency here. See PR #3514 review comment.
+        let base_buffer_size = get_buffer_size_opt_in(size);
+        let buffer_size = get_concurrency_aware_buffer_size(size, base_buffer_size);
 
         // Detect zero-copy opportunity before encryption/compression decisions
         // Zero-copy is beneficial for large unencrypted, uncompressed objects
@@ -1821,10 +1986,15 @@ impl DefaultObjectUsecase {
             debug!("Zero-copy write enabled for {} byte object (bucket={}, key={})", size, bucket, key);
         }
 
-        let body = tokio::io::BufReader::with_capacity(
-            buffer_size,
-            StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
-        );
+        let use_small_eager_put_path =
+            should_use_small_eager_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
+        let put_path = if should_compress {
+            "stream_compressed"
+        } else if use_small_eager_put_path {
+            "small_eager"
+        } else {
+            "streaming"
+        };
 
         let store = get_validated_store(&bucket).await?;
 
@@ -1946,9 +2116,12 @@ impl DefaultObjectUsecase {
 
         let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
 
-        let should_compress = is_disk_compressible(&req.headers, &key) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64;
         let mut write_plan = WritePlan::new();
         let mut reader = if should_compress {
+            let body = tokio::io::BufReader::with_capacity(
+                buffer_size,
+                StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+            );
             let algorithm = CompressionAlgorithm::default();
             insert_str(
                 &mut metadata,
@@ -1976,7 +2149,35 @@ impl DefaultObjectUsecase {
             write_plan = write_plan.with_compression(algorithm);
             hrd
         } else {
-            HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
+            if use_small_eager_put_path {
+                if (actual_size as usize) <= POOL_BYPASS_MAX_SIZE {
+                    // Bypass BytesPool for very small objects to avoid Small-tier
+                    // Mutex contention under high concurrency. Direct allocation
+                    // for ≤4KiB is negligible cost.
+                    let eager_body = read_small_put_body_exact_direct(
+                        StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+                        actual_size as usize,
+                    )
+                    .await?;
+                    HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
+                } else {
+                    let pool = get_concurrency_manager().bytes_pool();
+                    let eager_body = read_small_put_body_exact_pooled(
+                        StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+                        actual_size as usize,
+                        pool.as_ref(),
+                    )
+                    .await?;
+                    let eager_reader = PooledBufferReader::new(eager_body, actual_size as usize);
+                    HashReader::from_stream(eager_reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
+                }
+            } else {
+                let body = tokio::io::BufReader::with_capacity(
+                    buffer_size,
+                    StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+                );
+                HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
+            }
         };
 
         if size >= 0 {
@@ -1986,6 +2187,11 @@ impl DefaultObjectUsecase {
 
             opts.want_checksum = reader.checksum();
         }
+        rustfs_io_metrics::record_put_object_path(put_path);
+        rustfs_io_metrics::record_put_object_stage_duration(
+            "ingress_prepare",
+            ingress_stage_start.elapsed().as_secs_f64() * 1000.0,
+        );
 
         let mut helper = OperationHelper::new(&req, event_name, S3Operation::PutObject);
         let ssekms_context = extract_ssekms_context_from_headers(&req.headers)?;
@@ -2029,6 +2235,11 @@ impl DefaultObjectUsecase {
 
         let mt2 = metadata.clone();
         opts.user_defined.extend(metadata);
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
+        let request_id = request_context
+            .as_ref()
+            .map(|ctx| ctx.request_id.clone())
+            .unwrap_or_else(|| request_context::RequestContext::fallback().request_id);
 
         let repoptions =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
@@ -2043,13 +2254,76 @@ impl DefaultObjectUsecase {
             );
         }
 
+        let store_put_watchdog = tokio_util::sync::CancellationToken::new();
+        spawn_traced({
+            let store_put_watchdog = store_put_watchdog.clone();
+            let request_id = request_id.clone();
+            let bucket = bucket.clone();
+            let key = key.clone();
+            let put_path = put_path.to_string();
+            async move {
+                tokio::select! {
+                    _ = store_put_watchdog.cancelled() => {}
+                    _ = tokio::time::sleep(PUT_OBJECT_STORE_WARN_THRESHOLD) => {
+                        warn!(
+                            target: "rustfs::app::object_usecase",
+                            event = EVENT_PUT_OBJECT_STORE_INFLIGHT_SLOW,
+                            component = LOG_COMPONENT_APP,
+                            subsystem = LOG_SUBSYSTEM_OBJECT,
+                            request_id = %request_id,
+                            bucket = %bucket,
+                            key = %key,
+                            put_path = %put_path,
+                            object_size = actual_size,
+                            threshold_ms = PUT_OBJECT_STORE_WARN_THRESHOLD.as_millis() as u64,
+                            state = "store_put_pending",
+                            "PutObject store write remains in flight"
+                        );
+                    }
+                }
+            }
+        });
+
         let obj_info = match store
             .put_object(&bucket, &key, &mut reader, &opts)
             .await
             .map_err(ApiError::from)
         {
-            Ok(obj_info) => obj_info,
+            Ok(obj_info) => {
+                store_put_watchdog.cancel();
+                debug!(
+                    target: "rustfs::app::object_usecase",
+                    event = EVENT_PUT_OBJECT_STORE_RETURNED,
+                    component = LOG_COMPONENT_APP,
+                    subsystem = LOG_SUBSYSTEM_OBJECT,
+                    request_id = %request_id,
+                    bucket = %bucket,
+                    key = %key,
+                    put_path = put_path,
+                    object_size = actual_size,
+                    duration_ms = start_time.elapsed().as_millis() as u64,
+                    result = "success",
+                    "PutObject store write returned"
+                );
+                obj_info
+            }
             Err(err) => {
+                store_put_watchdog.cancel();
+                warn!(
+                    target: "rustfs::app::object_usecase",
+                    event = EVENT_PUT_OBJECT_STORE_RETURNED,
+                    component = LOG_COMPONENT_APP,
+                    subsystem = LOG_SUBSYSTEM_OBJECT,
+                    request_id = %request_id,
+                    bucket = %bucket,
+                    key = %key,
+                    put_path = put_path,
+                    object_size = actual_size,
+                    duration_ms = start_time.elapsed().as_millis() as u64,
+                    result = "error",
+                    error = %err,
+                    "PutObject store write returned"
+                );
                 let result: S3Result<S3Response<PutObjectOutput>> = Err(err.into());
                 let _ = helper.complete(&result);
                 return result;
@@ -2125,6 +2399,7 @@ impl DefaultObjectUsecase {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
 
         // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
         let manager = get_capacity_manager();
@@ -2317,6 +2592,7 @@ impl DefaultObjectUsecase {
         // x-amz-expiration: predict from lifecycle configuration
         let expiration = resolve_put_object_expiration(bucket, &info).await;
         let storage_class = response_storage_class(&info, &info.user_defined);
+        let content_disposition = info.user_defined.get("content-disposition").cloned();
 
         let output = GetObjectOutput {
             body,
@@ -2324,6 +2600,7 @@ impl DefaultObjectUsecase {
             last_modified,
             content_type,
             content_encoding: info.content_encoding.clone(),
+            content_disposition,
             accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
             content_range,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
@@ -3053,6 +3330,7 @@ impl DefaultObjectUsecase {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         result
     }
 
@@ -3274,7 +3552,8 @@ impl DefaultObjectUsecase {
                     dobjs[i].replication_state = Some(object_to_delete[i].replication_state());
                 }
                 delete_results[didx].delete_object = Some(dobjs[i].clone());
-                enqueue_transitioned_delete_cleanup(
+                if let Err(err) = enqueue_transitioned_delete_cleanup(
+                    store.clone(),
                     &bucket,
                     &object_to_delete[i].object_name,
                     &ObjectOptions {
@@ -3285,7 +3564,15 @@ impl DefaultObjectUsecase {
                     },
                     existing_object_infos[i].as_ref(),
                 )
-                .await;
+                .await
+                {
+                    warn!(
+                        bucket = %bucket,
+                        object = %object_to_delete[i].object_name,
+                        error = ?err,
+                        "failed to persist transitioned object cleanup journal"
+                    );
+                }
                 let size = object_sizes[i].max(0) as u64;
                 rustfs_ecstore::data_usage::record_bucket_object_delete_memory(
                     &bucket,
@@ -3359,6 +3646,8 @@ impl DefaultObjectUsecase {
             .map(|context| context.notify())
             .unwrap_or_else(default_notify_interface);
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
+        let deleted_any = delete_results.iter().any(|result| result.delete_object.is_some());
+        let notify_bucket = bucket.clone();
         spawn_background_with_context(request_context, async move {
             let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Notify);
             for res in delete_results {
@@ -3366,10 +3655,10 @@ impl DefaultObjectUsecase {
                     let event_name = delete_event_name_for_marker(dobj.delete_marker);
                     let event_args = EventArgsBuilder::new(
                         event_name,
-                        bucket.clone(),
+                        notify_bucket.clone(),
                         ObjectInfo {
                             name: dobj.object_name.clone(),
-                            bucket: bucket.clone(),
+                            bucket: notify_bucket.clone(),
                             ..Default::default()
                         },
                     )
@@ -3387,6 +3676,9 @@ impl DefaultObjectUsecase {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        if deleted_any {
+            rustfs_scanner::record_dirty_usage_bucket(&bucket);
+        }
         // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
         let manager = get_capacity_manager();
         manager.record_write_operation().await;
@@ -3508,7 +3800,16 @@ impl DefaultObjectUsecase {
             }
         };
 
-        enqueue_transitioned_delete_cleanup(&bucket, &key, &opts, existing_object_info.as_ref()).await;
+        if let Err(err) =
+            enqueue_transitioned_delete_cleanup(store.clone(), &bucket, &key, &opts, existing_object_info.as_ref()).await
+        {
+            warn!(
+                bucket = %bucket,
+                object = %key,
+                error = ?err,
+                "failed to persist transitioned object cleanup journal"
+            );
+        }
 
         // Fast in-memory update for immediate quota and admin usage consistency
         rustfs_ecstore::data_usage::record_bucket_object_delete_memory(
@@ -3546,6 +3847,7 @@ impl DefaultObjectUsecase {
             let manager = get_capacity_manager();
             manager.record_write_operation().await;
             let _ = helper.complete(&result);
+            rustfs_scanner::record_dirty_usage_bucket(&bucket);
             return result;
         }
 
@@ -3614,6 +3916,7 @@ impl DefaultObjectUsecase {
         let manager = get_capacity_manager();
         manager.record_write_operation().await;
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         result
     }
 
@@ -4329,6 +4632,7 @@ impl DefaultObjectUsecase {
         let host = get_request_host(&req.headers);
         let port = get_request_port(&req.headers);
         let user_agent = get_request_user_agent(&req.headers);
+        let mut wrote_any_entry = false;
 
         while let Some(entry) = entries.next().await {
             let mut f = match entry {
@@ -4495,6 +4799,10 @@ impl DefaultObjectUsecase {
                     return Err(ApiError::from(e).into());
                 }
             };
+            if !wrote_any_entry {
+                rustfs_scanner::record_dirty_usage_bucket(&bucket);
+                wrote_any_entry = true;
+            }
 
             let _manager = get_concurrency_manager();
             let _fpath_clone = fpath.clone();
@@ -4614,7 +4922,7 @@ mod tests {
         let opts = ObjectOptions {
             version_id: Some(version_id.clone()),
             no_lock: true,
-            http_preconditions: Some(rustfs_ecstore::store_api::HTTPPreconditions {
+            http_preconditions: Some(HTTPPreconditions {
                 if_none_match: Some("\"etag\"".to_string()),
                 if_match: Some("\"other\"".to_string()),
                 ..Default::default()
@@ -5028,6 +5336,86 @@ mod tests {
     }
 
     #[test]
+    fn should_use_small_eager_put_path_allows_up_to_1mb() {
+        let headers = HeaderMap::new();
+
+        assert!(should_use_small_eager_put_path(1024, &headers, false, false, false));
+        assert!(should_use_small_eager_put_path(1024 * 1024, &headers, false, false, false));
+        assert!(!should_use_small_eager_put_path(1024 * 1024 + 1, &headers, false, false, false));
+    }
+
+    #[test]
+    fn should_use_small_eager_put_path_rejects_sse_requests() {
+        let headers = HeaderMap::new();
+
+        assert!(!should_use_small_eager_put_path(1024, &headers, true, false, false));
+    }
+
+    #[test]
+    fn should_use_small_eager_put_path_rejects_compressible_objects() {
+        let headers = HeaderMap::new();
+
+        assert!(!should_use_small_eager_put_path(1024, &headers, false, true, false));
+    }
+
+    #[test]
+    fn should_use_small_eager_put_path_rejects_extract_requests() {
+        let headers = HeaderMap::new();
+
+        assert!(!should_use_small_eager_put_path(1024, &headers, false, false, true));
+    }
+
+    #[test]
+    fn should_use_small_eager_put_path_rejects_large_or_empty_objects() {
+        let headers = HeaderMap::new();
+
+        assert!(!should_use_small_eager_put_path(0, &headers, false, false, false));
+        assert!(!should_use_small_eager_put_path(1024 * 1024 + 1, &headers, false, false, false));
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_pooled_reads_exact_bytes() {
+        let pool = get_concurrency_manager().bytes_pool();
+        let body = std::io::Cursor::new(b"hello".to_vec());
+
+        let buffer = read_small_put_body_exact_pooled(body, 5, pool.as_ref())
+            .await
+            .expect("pooled exact read should succeed");
+
+        assert_eq!(&buffer[..5], b"hello");
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_pooled_rejects_short_body() {
+        let pool = get_concurrency_manager().bytes_pool();
+        let body = std::io::Cursor::new(b"hell".to_vec());
+
+        let err = match read_small_put_body_exact_pooled(body, 5, pool.as_ref()).await {
+            Ok(_) => panic!("short pooled body should fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code(), &S3ErrorCode::IncompleteBody);
+    }
+
+    #[tokio::test]
+    async fn pooled_buffer_reader_keeps_buffer_alive_until_consumed() {
+        use tokio::io::AsyncReadExt;
+
+        let pool = get_concurrency_manager().bytes_pool();
+        let body = std::io::Cursor::new(b"hello".to_vec());
+        let buffer = read_small_put_body_exact_pooled(body, 5, pool.as_ref())
+            .await
+            .expect("pooled exact read should succeed");
+        let mut reader = PooledBufferReader::new(buffer, 5);
+        let mut out = Vec::new();
+
+        reader.read_to_end(&mut out).await.expect("pooled reader should be readable");
+
+        assert_eq!(out, b"hello");
+    }
+
+    #[test]
     fn should_use_zero_copy_allows_large_unencrypted_binary_objects() {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
@@ -5266,6 +5654,66 @@ mod tests {
                 .as_ref()
                 .map(StorageClass::as_str),
             Some(storageclass::STANDARD_IA)
+        );
+    }
+
+    #[tokio::test]
+    async fn build_get_object_output_context_returns_content_disposition() {
+        let mut metadata = HashMap::new();
+        metadata.insert("content-disposition".to_string(), "attachment; filename=\"demo.png\"".to_string());
+
+        let info = ObjectInfo {
+            bucket: "test-bucket".to_string(),
+            name: "path/raw".to_string(),
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+
+        let input = GetObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("path/raw".to_string())
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultObjectUsecase::without_context();
+        let queue_status = concurrency::IoQueueStatus::default();
+
+        let context = usecase
+            .build_get_object_output_context(
+                &req,
+                get_concurrency_manager(),
+                "test-bucket",
+                "path/raw",
+                info.clone(),
+                info,
+                wrap_reader(tokio::io::empty()),
+                None,
+                None,
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                Duration::ZERO,
+                0.0,
+                &queue_status,
+                1,
+                None,
+                false,
+            )
+            .await
+            .expect("get object output context");
+
+        assert_eq!(context.output.content_disposition.as_deref(), Some("attachment; filename=\"demo.png\""));
+        assert!(
+            !context
+                .output
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.contains_key("content-disposition"))
         );
     }
 

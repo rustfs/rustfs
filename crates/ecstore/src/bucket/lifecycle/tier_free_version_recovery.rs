@@ -20,7 +20,8 @@ use tokio_util::sync::CancellationToken;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::Result;
 use crate::store::ECStore;
-use crate::store_api::{BucketOperations, BucketOptions, ListOperations, ObjectInfo, ObjectInfoOrErr, WalkOptions};
+use crate::store_api::{ObjectInfo, ObjectInfoOrErr, WalkOptions};
+use rustfs_storage_api::{BucketOperations, BucketOptions, ListOperations as _};
 
 pub const DEFAULT_FREE_VERSION_RECOVERY_LIMIT: usize = 1_000;
 const DEFAULT_FREE_VERSION_RECOVERY_SCAN_LIMIT: usize = 10_000;

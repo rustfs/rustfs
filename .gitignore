@@ -4,6 +4,8 @@
 .vscode
 .cursor
 .direnv/
+.claude/
+.tmp/
 /test
 /logs
 /data
@@ -21,6 +23,8 @@ deploy/data/*
 .env
 .rustfs.sys
 .cargo/
+!fuzz/.cargo/
+!fuzz/.cargo/config.toml
 !.cargo/config.toml
 profile.json
 .docker/openobserve-otel/data
@@ -60,3 +64,4 @@ rustfs-webdav.code-workspace
 benchmarks.logs
 tmp/
 crates/*/docs
+fuzz/target
