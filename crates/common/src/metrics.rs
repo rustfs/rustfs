@@ -753,6 +753,13 @@ pub struct Metrics {
     scanner_checkpoint_cleared: AtomicU64,
     scanner_checkpoint_ignored: AtomicU64,
     scanner_checkpoint_stale: AtomicU64,
+    scanner_dirty_usage_pending_buckets: AtomicU64,
+    scanner_dirty_usage_last_mark_unix_secs: AtomicU64,
+    scanner_dirty_usage_last_clear_unix_secs: AtomicU64,
+    scanner_dirty_usage_last_cycle_dirty_buckets: AtomicU64,
+    scanner_dirty_usage_last_cycle_cleared_buckets: AtomicU64,
+    scanner_usage_last_save_unix_secs: AtomicU64,
+    scanner_usage_last_save_result: AtomicU8,
     scanner_source_work: Vec<ScannerSourceWorkCounters>,
     current_scan_cycle_source_work_start: Vec<ScannerSourceWorkCounters>,
     last_scan_cycle_source_work: Vec<ScannerSourceWorkCounters>,
@@ -795,6 +802,38 @@ impl ScanCyclePartialReason {
             1 => Self::Runtime,
             2 => Self::Objects,
             3 => Self::Directories,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScannerUsageSaveResult {
+    #[default]
+    Unknown = 0,
+    Success = 1,
+    Failed = 2,
+    SkippedStale = 3,
+    EncodeFailed = 4,
+}
+
+impl ScannerUsageSaveResult {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => SCAN_CYCLE_RESULT_UNKNOWN_LABEL,
+            Self::Success => SCAN_CYCLE_RESULT_SUCCESS_LABEL,
+            Self::Failed => "failed",
+            Self::SkippedStale => "skipped_stale",
+            Self::EncodeFailed => "encode_failed",
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::Success,
+            2 => Self::Failed,
+            3 => Self::SkippedStale,
+            4 => Self::EncodeFailed,
             _ => Self::Unknown,
         }
     }
@@ -977,6 +1016,18 @@ pub struct ScannerLifecycleTransitionSnapshot {
     pub failed: u64,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerUsageFreshnessSnapshot {
+    pub dirty_pending_buckets: u64,
+    pub last_dirty_mark_unix_secs: u64,
+    pub last_dirty_clear_unix_secs: u64,
+    pub last_cycle_dirty_buckets: u64,
+    pub last_cycle_cleared_dirty_buckets: u64,
+    pub last_usage_save_unix_secs: u64,
+    pub last_usage_save_result: String,
+    pub last_usage_save_result_code: u64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScannerLastMinute {
     pub actions: HashMap<String, ScannerTimedAction>,
@@ -1096,6 +1147,8 @@ pub struct ScannerMetricsReport {
     #[serde(default)]
     pub lifecycle_transition: ScannerLifecycleTransitionSnapshot,
     #[serde(default)]
+    pub usage_freshness: ScannerUsageFreshnessSnapshot,
+    #[serde(default)]
     pub maintenance_control: ScannerMaintenanceControlSnapshot,
     #[serde(default)]
     pub throttle_idle_mode_enabled: bool,
@@ -1190,6 +1243,13 @@ fn scanner_ratio(numerator: f64, denominator: f64) -> f64 {
     } else {
         (numerator / denominator).clamp(0.0, 1.0)
     }
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn scanner_last_cycle_budget_limited(result_code: u64, partial_reason: &str) -> bool {
@@ -1628,6 +1688,13 @@ impl Metrics {
             scanner_checkpoint_cleared: AtomicU64::new(0),
             scanner_checkpoint_ignored: AtomicU64::new(0),
             scanner_checkpoint_stale: AtomicU64::new(0),
+            scanner_dirty_usage_pending_buckets: AtomicU64::new(0),
+            scanner_dirty_usage_last_mark_unix_secs: AtomicU64::new(0),
+            scanner_dirty_usage_last_clear_unix_secs: AtomicU64::new(0),
+            scanner_dirty_usage_last_cycle_dirty_buckets: AtomicU64::new(0),
+            scanner_dirty_usage_last_cycle_cleared_buckets: AtomicU64::new(0),
+            scanner_usage_last_save_unix_secs: AtomicU64::new(0),
+            scanner_usage_last_save_result: AtomicU8::new(ScannerUsageSaveResult::Unknown as u8),
             scanner_source_work: ScannerWorkSource::all()
                 .iter()
                 .map(|_| ScannerSourceWorkCounters::default())
@@ -1907,6 +1974,44 @@ impl Metrics {
     pub fn record_scanner_checkpoint_stale(&self) {
         self.scanner_checkpoint_stale.fetch_add(1, Ordering::Relaxed);
         self.update_scanner_checkpoint_event(SCANNER_CHECKPOINT_EVENT_STALE);
+    }
+
+    pub fn record_scanner_dirty_usage_pending(&self, pending_buckets: u64) {
+        self.scanner_dirty_usage_pending_buckets
+            .store(pending_buckets, Ordering::Relaxed);
+        if pending_buckets > 0 {
+            self.scanner_dirty_usage_last_mark_unix_secs
+                .store(unix_now_secs(), Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_scanner_dirty_usage_clear(&self, pending_buckets: u64) {
+        self.scanner_dirty_usage_pending_buckets
+            .store(pending_buckets, Ordering::Relaxed);
+        self.scanner_dirty_usage_last_clear_unix_secs
+            .store(unix_now_secs(), Ordering::Relaxed);
+    }
+
+    pub fn record_scanner_dirty_usage_cycle_snapshot(&self, dirty_buckets: u64) {
+        self.scanner_dirty_usage_last_cycle_dirty_buckets
+            .store(dirty_buckets, Ordering::Relaxed);
+    }
+
+    pub fn record_scanner_dirty_usage_cycle_clear(&self, cleared_buckets: u64, pending_buckets: u64) {
+        self.scanner_dirty_usage_last_cycle_cleared_buckets
+            .store(cleared_buckets, Ordering::Relaxed);
+        self.scanner_dirty_usage_pending_buckets
+            .store(pending_buckets, Ordering::Relaxed);
+        if cleared_buckets > 0 {
+            self.scanner_dirty_usage_last_clear_unix_secs
+                .store(unix_now_secs(), Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_scanner_usage_save_result(&self, result: ScannerUsageSaveResult) {
+        self.scanner_usage_last_save_result.store(result as u8, Ordering::Relaxed);
+        self.scanner_usage_last_save_unix_secs
+            .store(unix_now_secs(), Ordering::Relaxed);
     }
 
     pub fn record_scanner_source_work(&self, source: ScannerWorkSource, work: ScannerSourceWorkUpdate) {
@@ -2606,6 +2711,17 @@ impl Metrics {
             scanner_missed: self.scanner_transition_missed_total.load(Ordering::Relaxed),
             completed: self.scanner_transition_completed.load(Ordering::Relaxed),
             failed: self.scanner_transition_failed.load(Ordering::Relaxed),
+        };
+        let usage_save_result = ScannerUsageSaveResult::from_code(self.scanner_usage_last_save_result.load(Ordering::Relaxed));
+        m.usage_freshness = ScannerUsageFreshnessSnapshot {
+            dirty_pending_buckets: self.scanner_dirty_usage_pending_buckets.load(Ordering::Relaxed),
+            last_dirty_mark_unix_secs: self.scanner_dirty_usage_last_mark_unix_secs.load(Ordering::Relaxed),
+            last_dirty_clear_unix_secs: self.scanner_dirty_usage_last_clear_unix_secs.load(Ordering::Relaxed),
+            last_cycle_dirty_buckets: self.scanner_dirty_usage_last_cycle_dirty_buckets.load(Ordering::Relaxed),
+            last_cycle_cleared_dirty_buckets: self.scanner_dirty_usage_last_cycle_cleared_buckets.load(Ordering::Relaxed),
+            last_usage_save_unix_secs: self.scanner_usage_last_save_unix_secs.load(Ordering::Relaxed),
+            last_usage_save_result: usage_save_result.as_str().to_string(),
+            last_usage_save_result_code: usage_save_result as u8 as u64,
         };
         m.throttle_idle_mode_enabled = self.scanner_throttle_idle_mode_enabled.load(Ordering::Relaxed);
         m.throttle_sleep_factor = self.scanner_throttle_sleep_factor_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
@@ -3536,6 +3652,26 @@ mod tests {
 
         assert_eq!(report.life_time_ops.get("scan_bucket_drive_start"), Some(&1));
         assert_eq!(report.life_time_ops.get("scan_bucket_drive_failure"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn report_includes_usage_freshness_status() {
+        let metrics = Metrics::new();
+        metrics.record_scanner_dirty_usage_pending(2);
+        metrics.record_scanner_dirty_usage_cycle_snapshot(1);
+        metrics.record_scanner_dirty_usage_cycle_clear(1, 1);
+        metrics.record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.usage_freshness.dirty_pending_buckets, 1);
+        assert!(report.usage_freshness.last_dirty_mark_unix_secs > 0);
+        assert!(report.usage_freshness.last_dirty_clear_unix_secs > 0);
+        assert_eq!(report.usage_freshness.last_cycle_dirty_buckets, 1);
+        assert_eq!(report.usage_freshness.last_cycle_cleared_dirty_buckets, 1);
+        assert!(report.usage_freshness.last_usage_save_unix_secs > 0);
+        assert_eq!(report.usage_freshness.last_usage_save_result, "success");
+        assert_eq!(report.usage_freshness.last_usage_save_result_code, 1);
     }
 
     #[tokio::test]
