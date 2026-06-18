@@ -439,6 +439,16 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             "/analytics/namespaces/sales/tables/orders/catalog/external",
         ),
         table_route_sample(
+            Method::PUT,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
+            "/analytics/namespaces/sales/tables/orders/catalog/external",
+        ),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external/sync",
+            "/analytics/namespaces/sales/tables/orders/catalog/external/sync",
+        ),
+        table_route_sample(
             Method::GET,
             "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/diagnostics",
             "/analytics/namespaces/sales/tables/orders/catalog/diagnostics",
@@ -600,6 +610,16 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             Method::GET,
             "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
             "/analytics/namespaces/sales/tables/orders/catalog/external",
+        ),
+        compat_table_route_sample(
+            Method::PUT,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
+            "/analytics/namespaces/sales/tables/orders/catalog/external",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external/sync",
+            "/analytics/namespaces/sales/tables/orders/catalog/external/sync",
         ),
         compat_table_route_sample(
             Method::GET,
@@ -837,6 +857,16 @@ fn test_register_routes_cover_representative_admin_paths() {
     );
     assert_route(
         &router,
+        Method::PUT,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/external"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/external/sync"),
+    );
+    assert_route(
+        &router,
         Method::GET,
         &table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/diagnostics"),
     );
@@ -971,6 +1001,16 @@ fn test_register_routes_cover_representative_admin_paths() {
         &router,
         Method::GET,
         &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/external"),
+    );
+    assert_route(
+        &router,
+        Method::PUT,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/external"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/external/sync"),
     );
     assert_route(
         &router,

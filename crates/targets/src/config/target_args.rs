@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::common::{parse_target_bool, parse_url, validate_nats_server_config, validate_pulsar_broker_config};
+use super::common::{
+    parse_target_bool, parse_url, validate_nats_server_config, validate_outbound_http_url, validate_pulsar_broker_config,
+};
 use crate::error::TargetError;
 use crate::target::{
     TargetType,
@@ -137,6 +139,7 @@ pub fn build_webhook_args(config: &KVS, default_queue_dir: &str, target_type: Ta
         .ok_or_else(|| TargetError::Configuration("Missing webhook endpoint".to_string()))?;
     let parsed_endpoint = endpoint.trim();
     let endpoint_url = parse_url(parsed_endpoint, "endpoint URL")?;
+    validate_outbound_http_url(&endpoint_url, "endpoint URL")?;
 
     Ok(WebhookArgs {
         enable: true,
@@ -165,7 +168,8 @@ pub fn validate_webhook_config(config: &KVS, default_queue_dir: &str) -> Result<
         .lookup(WEBHOOK_ENDPOINT)
         .ok_or_else(|| TargetError::Configuration("Missing webhook endpoint".to_string()))?;
     let parsed_endpoint = endpoint.trim();
-    let _ = parse_url(parsed_endpoint, "endpoint URL")?;
+    let endpoint_url = parse_url(parsed_endpoint, "endpoint URL")?;
+    validate_outbound_http_url(&endpoint_url, "endpoint URL")?;
 
     let client_cert = config.lookup(WEBHOOK_CLIENT_CERT).unwrap_or_default();
     let client_key = config.lookup(WEBHOOK_CLIENT_KEY).unwrap_or_default();
@@ -594,8 +598,9 @@ pub fn validate_mysql_config(config: &KVS, default_queue_dir: &str) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::{
-        build_amqp_args, build_kafka_args, build_mysql_args, build_postgres_args, build_redis_args, validate_amqp_config,
-        validate_kafka_config, validate_mysql_config, validate_postgres_config, validate_redis_config,
+        build_amqp_args, build_kafka_args, build_mysql_args, build_postgres_args, build_redis_args, build_webhook_args,
+        validate_amqp_config, validate_kafka_config, validate_mysql_config, validate_postgres_config, validate_redis_config,
+        validate_webhook_config,
     };
     use crate::target::{
         TargetType,
@@ -610,7 +615,7 @@ mod tests {
         MYSQL_QUEUE_DIR, MYSQL_TABLE, MYSQL_TLS_CA, MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY, POSTGRES_DSN_STRING,
         POSTGRES_FORMAT, POSTGRES_QUEUE_DIR, POSTGRES_TABLE, POSTGRES_TLS_CA, POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY,
         REDIS_CHANNEL, REDIS_CONNECTION_TIMEOUT, REDIS_MAX_RETRY_DELAY, REDIS_MIN_RETRY_DELAY, REDIS_PIPELINE_BUFFER_SIZE,
-        REDIS_RECONNECT_RETRY_ATTEMPTS, REDIS_RESPONSE_TIMEOUT, REDIS_TLS_ALLOW_INSECURE, REDIS_URL,
+        REDIS_RECONNECT_RETRY_ATTEMPTS, REDIS_RESPONSE_TIMEOUT, REDIS_TLS_ALLOW_INSECURE, REDIS_URL, WEBHOOK_ENDPOINT,
     };
 
     fn absolute_test_path(path: &str) -> String {
@@ -622,6 +627,12 @@ mod tests {
         config.insert(AMQP_URL.to_string(), "amqp://127.0.0.1:5672/%2f".to_string());
         config.insert(AMQP_EXCHANGE.to_string(), "rustfs.events".to_string());
         config.insert(AMQP_ROUTING_KEY.to_string(), "objects".to_string());
+        config
+    }
+
+    fn webhook_base_config() -> KVS {
+        let mut config = KVS::new();
+        config.insert(WEBHOOK_ENDPOINT.to_string(), "https://example.com/hook".to_string());
         config
     }
 
@@ -757,6 +768,25 @@ mod tests {
         let err = validate_amqp_config(&config, "").expect_err("ambiguous credentials should fail");
 
         assert!(err.to_string().contains("either in url or username/password"));
+    }
+
+    #[test]
+    fn build_webhook_args_rejects_loopback_endpoint() {
+        let mut config = webhook_base_config();
+        config.insert(WEBHOOK_ENDPOINT.to_string(), "https://127.0.0.1/hook".to_string());
+
+        let err = build_webhook_args(&config, "/tmp/webhook-queue", TargetType::NotifyEvent)
+            .expect_err("loopback endpoint should be rejected");
+        assert!(err.to_string().contains("not allowed"));
+    }
+
+    #[test]
+    fn validate_webhook_config_rejects_loopback_endpoint() {
+        let mut config = webhook_base_config();
+        config.insert(WEBHOOK_ENDPOINT.to_string(), "https://127.0.0.1/hook".to_string());
+
+        let err = validate_webhook_config(&config, "/tmp/webhook-queue").expect_err("loopback endpoint should be rejected");
+        assert!(err.to_string().contains("not allowed"));
     }
 
     #[test]

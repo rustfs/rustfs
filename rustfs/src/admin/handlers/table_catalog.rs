@@ -74,6 +74,21 @@ const TABLE_CATALOG_TABLE_RESOURCE_ROOT: &str = "tables";
 const TABLE_CATALOG_VIEW_RESOURCE_ROOT: &str = "views";
 const TABLE_CATALOG_ADMIN_OPERATION_SLOW_LOG_THRESHOLD: StdDuration = StdDuration::from_secs(2);
 const DEFAULT_TABLE_MAINTENANCE_WORKER_ID: &str = "rustfs-maintenance-worker";
+const EXTERNAL_CATALOG_BRIDGE_STATUS_UNCONFIGURED: &str = "bridge-unconfigured";
+const EXTERNAL_CATALOG_BRIDGE_STATUS_CONFIGURED: &str = "bridge-configured";
+const EXTERNAL_CATALOG_BRIDGE_SYNC_STATUS: &str = "synced";
+const EXTERNAL_CATALOG_BRIDGE_SUPPORTED_STATUS: &str = "operator-sync-supported";
+const EXTERNAL_CATALOG_BRIDGE_SUPPORTED_REASON: &str =
+    "operator-supplied metadata pointer sync is supported; online vendor SDK synchronization is not claimed";
+const EXTERNAL_CATALOG_POLICY_MODE_RUSTFS: &str = "rustfs-authoritative";
+const EXTERNAL_CATALOG_CREDENTIAL_MODE_RUSTFS: &str = "rustfs-table-credentials";
+const EXTERNAL_CATALOG_SYNC_MODE_MANUAL: &str = "manual";
+const EXTERNAL_CATALOG_ROLLBACK_RETAIN_CURRENT: &str = "retain-current-pointer";
+const EXTERNAL_CATALOG_SYNC_OPERATION: &str = "external-catalog-sync";
+const EXTERNAL_CATALOG_SYNC_WRITER: &str = "rustfs-external-catalog-bridge";
+const EXTERNAL_CATALOG_ACTION_REGISTERED: &str = "registered";
+const EXTERNAL_CATALOG_ACTION_COMMITTED: &str = "committed";
+const EXTERNAL_CATALOG_BRIDGE_CAPABILITIES: &[&str] = &["polaris", "glue", "dlf", "hive-metastore"];
 const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /v1/{prefix}/namespaces",
     "POST /v1/{prefix}/namespaces",
@@ -123,6 +138,8 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
+    "PUT /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
+    "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external/sync",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/diagnostics",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
@@ -164,6 +181,8 @@ static HEARTBEAT_TABLE_MAINTENANCE_JOB_HANDLER: HeartbeatTableMaintenanceJobHand
 static EXPORT_TABLE_CATALOG_HANDLER: ExportTableCatalogHandler = ExportTableCatalogHandler {};
 static IMPORT_TABLE_CATALOG_HANDLER: ImportTableCatalogHandler = ImportTableCatalogHandler {};
 static EXTERNAL_CATALOG_BRIDGE_HANDLER: ExternalCatalogBridgeHandler = ExternalCatalogBridgeHandler {};
+static PUT_EXTERNAL_CATALOG_BRIDGE_HANDLER: PutExternalCatalogBridgeHandler = PutExternalCatalogBridgeHandler {};
+static SYNC_EXTERNAL_CATALOG_BRIDGE_HANDLER: SyncExternalCatalogBridgeHandler = SyncExternalCatalogBridgeHandler {};
 static GET_TABLE_CATALOG_DIAGNOSTICS_HANDLER: GetTableCatalogDiagnosticsHandler = GetTableCatalogDiagnosticsHandler {};
 static RECOVER_TABLE_CATALOG_HANDLER: RecoverTableCatalogHandler = RecoverTableCatalogHandler {};
 static ROLLBACK_TABLE_CATALOG_HANDLER: RollbackTableCatalogHandler = RollbackTableCatalogHandler {};
@@ -366,6 +385,66 @@ struct CatalogImportRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ExternalCatalogBridgeRequest {
+    catalog: String,
+    #[serde(default, rename = "external-catalog-id", alias = "externalCatalogId")]
+    external_catalog_id: Option<String>,
+    #[serde(rename = "external-namespace", alias = "externalNamespace")]
+    external_namespace: String,
+    #[serde(rename = "external-table", alias = "externalTable")]
+    external_table: String,
+    #[serde(default, rename = "external-table-uuid", alias = "externalTableUuid")]
+    external_table_uuid: Option<String>,
+    #[serde(default, rename = "metadata-location", alias = "metadataLocation")]
+    metadata_location: Option<String>,
+    #[serde(default, rename = "external-version-token", alias = "externalVersionToken")]
+    external_version_token: Option<String>,
+    #[serde(default, rename = "policy-mode", alias = "policyMode")]
+    policy_mode: Option<String>,
+    #[serde(default, rename = "credential-mode", alias = "credentialMode")]
+    credential_mode: Option<String>,
+    #[serde(default, rename = "sync-mode", alias = "syncMode")]
+    sync_mode: Option<String>,
+    #[serde(default)]
+    properties: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalCatalogBridgeSyncRequest {
+    catalog: String,
+    #[serde(default, rename = "external-catalog-id", alias = "externalCatalogId")]
+    external_catalog_id: Option<String>,
+    #[serde(rename = "external-namespace", alias = "externalNamespace")]
+    external_namespace: String,
+    #[serde(rename = "external-table", alias = "externalTable")]
+    external_table: String,
+    #[serde(default, rename = "external-table-uuid", alias = "externalTableUuid")]
+    external_table_uuid: Option<String>,
+    #[serde(rename = "metadata-location", alias = "metadataLocation")]
+    metadata_location: String,
+    #[serde(default, rename = "external-version-token", alias = "externalVersionToken")]
+    external_version_token: Option<String>,
+    #[serde(default, rename = "expected-version-token", alias = "expectedVersionToken")]
+    expected_version_token: Option<String>,
+    #[serde(default, rename = "expected-metadata-location", alias = "expectedMetadataLocation")]
+    expected_metadata_location: Option<String>,
+    #[serde(default, rename = "commit-id", alias = "commitId")]
+    commit_id: Option<String>,
+    #[serde(default, rename = "idempotency-key", alias = "idempotencyKey")]
+    idempotency_key: Option<String>,
+    #[serde(default, rename = "policy-mode", alias = "policyMode")]
+    policy_mode: Option<String>,
+    #[serde(default, rename = "credential-mode", alias = "credentialMode")]
+    credential_mode: Option<String>,
+    #[serde(default, rename = "rollback-strategy", alias = "rollbackStrategy")]
+    rollback_strategy: Option<String>,
+    #[serde(default)]
+    properties: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RollbackTableRequest {
     #[serde(rename = "metadata-location", alias = "metadataLocation")]
     metadata_location: String,
@@ -396,17 +475,49 @@ struct ExternalCatalogBridgeResponse {
     table_bucket: String,
     namespace: String,
     table: String,
-    status: &'static str,
-    supported_import: &'static str,
+    status: String,
+    supported_import: String,
+    #[serde(default)]
+    capabilities: Vec<ExternalCatalogBridgeCapability>,
+    #[serde(default)]
     unsupported_bridges: Vec<ExternalCatalogBridgeCapability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bridge: Option<ExternalCatalogBridgeStateResponse>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 struct ExternalCatalogBridgeCapability {
-    catalog: &'static str,
-    status: &'static str,
-    reason: &'static str,
+    catalog: String,
+    status: String,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct ExternalCatalogBridgeStateResponse {
+    catalog: String,
+    external_catalog_id: Option<String>,
+    external_namespace: String,
+    external_table: String,
+    external_table_uuid: Option<String>,
+    metadata_location: Option<String>,
+    external_version_token: Option<String>,
+    policy_mode: String,
+    credential_mode: String,
+    sync_mode: String,
+    rollback_strategy: String,
+    last_sync_status: Option<String>,
+    last_synced_metadata_location: Option<String>,
+    properties: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct ExternalCatalogBridgeSyncResponse {
+    action: String,
+    table: RestLoadTableResponse,
+    bridge: ExternalCatalogBridgeResponse,
 }
 
 #[derive(Debug, Serialize)]
@@ -834,6 +945,16 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         Method::GET,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/catalog/external").as_str(),
         AdminOperation(&EXTERNAL_CATALOG_BRIDGE_HANDLER),
+    )?;
+    r.insert(
+        Method::PUT,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/catalog/external").as_str(),
+        AdminOperation(&PUT_EXTERNAL_CATALOG_BRIDGE_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/catalog/external/sync").as_str(),
+        AdminOperation(&SYNC_EXTERNAL_CATALOG_BRIDGE_HANDLER),
     )?;
     r.insert(
         Method::GET,
@@ -3978,40 +4099,342 @@ fn snapshot_ref_has_explicit_retention(reference: &serde_json::Value) -> bool {
         || reference.get("max-ref-age-ms").is_some()
 }
 
-fn external_catalog_bridge_response(
+async fn external_catalog_bridge_response<B>(
+    store: &crate::table_catalog::ObjectTableCatalogStore<B>,
     bucket: &str,
     namespace: &crate::table_catalog::Namespace,
     table: &str,
+) -> S3Result<ExternalCatalogBridgeResponse>
+where
+    B: crate::table_catalog::TableCatalogObjectBackend,
+{
+    let bridge = store
+        .get_external_catalog_bridge(bucket, &namespace.public_name(), table)
+        .await
+        .map_err(catalog_store_error)?;
+    Ok(external_catalog_bridge_response_from_entry(bucket, namespace, table, bridge))
+}
+
+fn external_catalog_bridge_response_from_entry(
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+    bridge: Option<crate::table_catalog::ExternalCatalogBridgeEntry>,
 ) -> ExternalCatalogBridgeResponse {
+    let status = if bridge.is_some() {
+        EXTERNAL_CATALOG_BRIDGE_STATUS_CONFIGURED
+    } else {
+        EXTERNAL_CATALOG_BRIDGE_STATUS_UNCONFIGURED
+    };
     ExternalCatalogBridgeResponse {
         table_bucket: bucket.to_string(),
         namespace: namespace.public_name(),
         table: table.to_string(),
-        status: "metadata-import-supported",
-        supported_import: "register/import an existing Iceberg metadata location into the RustFS catalog; online external catalog synchronization is not implemented",
-        unsupported_bridges: vec![
-            ExternalCatalogBridgeCapability {
-                catalog: "polaris",
-                status: "unsupported",
-                reason: "online REST catalog bridge and policy synchronization are not implemented",
-            },
-            ExternalCatalogBridgeCapability {
-                catalog: "glue",
-                status: "unsupported",
-                reason: "Glue catalog synchronization is not implemented",
-            },
-            ExternalCatalogBridgeCapability {
-                catalog: "dlf",
-                status: "unsupported",
-                reason: "DLF catalog synchronization is not implemented",
-            },
-            ExternalCatalogBridgeCapability {
-                catalog: "hive-metastore",
-                status: "unsupported",
-                reason: "Hive Metastore synchronization is not implemented",
-            },
-        ],
+        status: status.to_string(),
+        supported_import:
+            "register/import an existing Iceberg metadata location into the RustFS catalog; operator-supplied external metadata sync is supported"
+                .to_string(),
+        capabilities: external_catalog_bridge_capabilities(),
+        unsupported_bridges: Vec::new(),
+        bridge: bridge.map(external_catalog_bridge_state_response),
     }
+}
+
+fn external_catalog_bridge_capabilities() -> Vec<ExternalCatalogBridgeCapability> {
+    EXTERNAL_CATALOG_BRIDGE_CAPABILITIES
+        .iter()
+        .map(|catalog| ExternalCatalogBridgeCapability {
+            catalog: (*catalog).to_string(),
+            status: EXTERNAL_CATALOG_BRIDGE_SUPPORTED_STATUS.to_string(),
+            reason: EXTERNAL_CATALOG_BRIDGE_SUPPORTED_REASON.to_string(),
+        })
+        .collect()
+}
+
+fn external_catalog_bridge_state_response(
+    entry: crate::table_catalog::ExternalCatalogBridgeEntry,
+) -> ExternalCatalogBridgeStateResponse {
+    ExternalCatalogBridgeStateResponse {
+        catalog: entry.catalog,
+        external_catalog_id: entry.external_catalog_id,
+        external_namespace: entry.external_namespace,
+        external_table: entry.external_table,
+        external_table_uuid: entry.external_table_uuid,
+        metadata_location: entry.metadata_location,
+        external_version_token: entry.external_version_token,
+        policy_mode: entry.policy_mode,
+        credential_mode: entry.credential_mode,
+        sync_mode: entry.sync_mode,
+        rollback_strategy: entry.rollback_strategy,
+        last_sync_status: entry.last_sync_status,
+        last_synced_metadata_location: entry.last_synced_metadata_location,
+        properties: entry.properties,
+    }
+}
+
+fn validate_external_catalog_name(catalog: String) -> S3Result<String> {
+    let catalog = catalog.trim().to_ascii_lowercase();
+    if EXTERNAL_CATALOG_BRIDGE_CAPABILITIES.contains(&catalog.as_str()) {
+        return Ok(catalog);
+    }
+    Err(s3_error!(InvalidRequest, "unsupported external catalog bridge: {catalog}"))
+}
+
+fn validate_external_catalog_field(field_name: &str, value: String) -> S3Result<String> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(s3_error!(InvalidRequest, "{} must not be empty", field_name));
+    }
+    if value.len() > 512 || value.chars().any(|ch| ch.is_control() || ch == '/' || ch == '\\') {
+        return Err(s3_error!(InvalidRequest, "{} contains unsupported characters", field_name));
+    }
+    Ok(value)
+}
+
+fn validate_external_catalog_optional_field(field_name: &str, value: Option<String>) -> S3Result<Option<String>> {
+    value
+        .map(|value| validate_external_catalog_field(field_name, value))
+        .transpose()
+}
+
+fn validate_external_catalog_mode(field_name: &str, value: Option<String>, default_value: &str) -> S3Result<String> {
+    match value {
+        Some(value) if value == default_value => Ok(value),
+        Some(_) => Err(s3_error!(
+            InvalidRequest,
+            "{} must be {} until additional external catalog modes are implemented",
+            field_name,
+            default_value
+        )),
+        None => Ok(default_value.to_string()),
+    }
+}
+
+fn validate_external_catalog_metadata_location(
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+    metadata_location: &str,
+) -> S3Result<()> {
+    let table = crate::table_catalog::IdentifierSegment::parse(table.to_string())
+        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
+    if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table, metadata_location) {
+        return Err(s3_error!(InvalidRequest, "metadata location must be inside the table metadata directory"));
+    }
+    Ok(())
+}
+
+fn validate_external_catalog_metadata_uuid(
+    request_table_uuid: Option<&str>,
+    metadata: &serde_json::Value,
+) -> S3Result<Option<String>> {
+    let metadata_table_uuid = metadata_table_uuid(metadata)?;
+    if let Some(request_table_uuid) = request_table_uuid
+        && request_table_uuid != metadata_table_uuid
+    {
+        return Err(s3_error!(InvalidRequest, "external table uuid does not match table metadata table-uuid"));
+    }
+    Ok(Some(metadata_table_uuid.to_string()))
+}
+
+fn external_catalog_bridge_entry_from_request(
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+    request: ExternalCatalogBridgeRequest,
+) -> S3Result<crate::table_catalog::ExternalCatalogBridgeEntry> {
+    let catalog = validate_external_catalog_name(request.catalog)?;
+    let external_catalog_id = validate_external_catalog_optional_field("external catalog id", request.external_catalog_id)?;
+    let external_namespace = validate_external_catalog_field("external namespace", request.external_namespace)?;
+    let external_table = validate_external_catalog_field("external table", request.external_table)?;
+    let external_table_uuid = validate_external_catalog_optional_field("external table uuid", request.external_table_uuid)?;
+    if let Some(metadata_location) = request.metadata_location.as_deref() {
+        validate_external_catalog_metadata_location(namespace, table, metadata_location)?;
+    }
+    Ok(crate::table_catalog::ExternalCatalogBridgeEntry {
+        version: crate::table_catalog::TABLE_EXTERNAL_CATALOG_BRIDGE_VERSION,
+        table_bucket: bucket.to_string(),
+        namespace: namespace.public_name(),
+        table: table.to_string(),
+        catalog,
+        external_catalog_id,
+        external_namespace,
+        external_table,
+        external_table_uuid,
+        metadata_location: request.metadata_location,
+        external_version_token: validate_external_catalog_optional_field(
+            "external version token",
+            request.external_version_token,
+        )?,
+        policy_mode: validate_external_catalog_mode("policy mode", request.policy_mode, EXTERNAL_CATALOG_POLICY_MODE_RUSTFS)?,
+        credential_mode: validate_external_catalog_mode(
+            "credential mode",
+            request.credential_mode,
+            EXTERNAL_CATALOG_CREDENTIAL_MODE_RUSTFS,
+        )?,
+        sync_mode: validate_external_catalog_mode("sync mode", request.sync_mode, EXTERNAL_CATALOG_SYNC_MODE_MANUAL)?,
+        rollback_strategy: EXTERNAL_CATALOG_ROLLBACK_RETAIN_CURRENT.to_string(),
+        last_sync_status: None,
+        last_synced_metadata_location: None,
+        properties: request.properties,
+        created_at: None,
+        updated_at: None,
+    })
+}
+
+fn external_catalog_bridge_entry_from_sync_request(
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+    request: &ExternalCatalogBridgeSyncRequest,
+    external_table_uuid: Option<String>,
+) -> S3Result<crate::table_catalog::ExternalCatalogBridgeEntry> {
+    let catalog = validate_external_catalog_name(request.catalog.clone())?;
+    let external_catalog_id =
+        validate_external_catalog_optional_field("external catalog id", request.external_catalog_id.clone())?;
+    let external_namespace = validate_external_catalog_field("external namespace", request.external_namespace.clone())?;
+    let external_table = validate_external_catalog_field("external table", request.external_table.clone())?;
+    let external_version_token =
+        validate_external_catalog_optional_field("external version token", request.external_version_token.clone())?;
+    let rollback_strategy = validate_external_catalog_mode(
+        "rollback strategy",
+        request.rollback_strategy.clone(),
+        EXTERNAL_CATALOG_ROLLBACK_RETAIN_CURRENT,
+    )?;
+    Ok(crate::table_catalog::ExternalCatalogBridgeEntry {
+        version: crate::table_catalog::TABLE_EXTERNAL_CATALOG_BRIDGE_VERSION,
+        table_bucket: bucket.to_string(),
+        namespace: namespace.public_name(),
+        table: table.to_string(),
+        catalog,
+        external_catalog_id,
+        external_namespace,
+        external_table,
+        external_table_uuid,
+        metadata_location: Some(request.metadata_location.clone()),
+        external_version_token,
+        policy_mode: validate_external_catalog_mode(
+            "policy mode",
+            request.policy_mode.clone(),
+            EXTERNAL_CATALOG_POLICY_MODE_RUSTFS,
+        )?,
+        credential_mode: validate_external_catalog_mode(
+            "credential mode",
+            request.credential_mode.clone(),
+            EXTERNAL_CATALOG_CREDENTIAL_MODE_RUSTFS,
+        )?,
+        sync_mode: EXTERNAL_CATALOG_SYNC_MODE_MANUAL.to_string(),
+        rollback_strategy,
+        last_sync_status: Some(EXTERNAL_CATALOG_BRIDGE_SYNC_STATUS.to_string()),
+        last_synced_metadata_location: Some(request.metadata_location.clone()),
+        properties: request.properties.clone(),
+        created_at: None,
+        updated_at: None,
+    })
+}
+
+async fn put_external_catalog_bridge_response<B>(
+    store: &crate::table_catalog::ObjectTableCatalogStore<B>,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+    request: ExternalCatalogBridgeRequest,
+) -> S3Result<ExternalCatalogBridgeResponse>
+where
+    B: crate::table_catalog::TableCatalogObjectBackend,
+{
+    let entry = external_catalog_bridge_entry_from_request(bucket, namespace, table, request)?;
+    let entry = store.put_external_catalog_bridge(entry).await.map_err(catalog_store_error)?;
+    Ok(external_catalog_bridge_response_from_entry(bucket, namespace, table, Some(entry)))
+}
+
+async fn sync_external_catalog_bridge_response<B>(
+    store: &crate::table_catalog::ObjectTableCatalogStore<B>,
+    metadata_backend: &B,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+    request: ExternalCatalogBridgeSyncRequest,
+    table_bucket_enabled: bool,
+) -> S3Result<ExternalCatalogBridgeSyncResponse>
+where
+    B: crate::table_catalog::TableCatalogObjectBackend,
+{
+    ensure_table_bucket_entry(store, bucket, table_bucket_enabled).await?;
+    validate_external_catalog_metadata_location(namespace, table, &request.metadata_location)?;
+    let target_metadata = read_table_metadata_json(metadata_backend, bucket, &request.metadata_location).await?;
+    validate_metadata_table_location_in_bucket(bucket, &target_metadata)?;
+    let external_table_uuid = validate_external_catalog_metadata_uuid(request.external_table_uuid.as_deref(), &target_metadata)?;
+
+    let (action, table_response) = if let Some(current) = store
+        .load_table(bucket, &namespace.public_name(), table)
+        .await
+        .map_err(catalog_store_error)?
+    {
+        let expected_version_token = request
+            .expected_version_token
+            .clone()
+            .ok_or_else(|| s3_error!(InvalidRequest, "external catalog sync requires expected-version-token"))?;
+        let expected_metadata_location = request
+            .expected_metadata_location
+            .clone()
+            .ok_or_else(|| s3_error!(InvalidRequest, "external catalog sync requires expected-metadata-location"))?;
+        let current_metadata = read_table_metadata_json(metadata_backend, bucket, &current.metadata_location).await?;
+        validate_metadata_table_location_in_bucket(bucket, &current_metadata)?;
+        validate_metadata_matches_current_metadata(&current_metadata, &target_metadata)?;
+        let result = store
+            .commit_table(crate::table_catalog::TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.to_string(),
+                commit_id: request.commit_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string()),
+                idempotency_key: request.idempotency_key.clone(),
+                operation: EXTERNAL_CATALOG_SYNC_OPERATION.to_string(),
+                expected_version_token,
+                expected_metadata_location,
+                new_metadata_location: request.metadata_location.clone(),
+                requirements: Vec::new(),
+                writer: Some(EXTERNAL_CATALOG_SYNC_WRITER.to_string()),
+            })
+            .await
+            .map_err(catalog_store_error)?;
+        (
+            EXTERNAL_CATALOG_ACTION_COMMITTED.to_string(),
+            load_table_response_from_entry(result.table, target_metadata),
+        )
+    } else {
+        if request.expected_version_token.is_some() || request.expected_metadata_location.is_some() {
+            return Err(s3_error!(
+                InvalidRequest,
+                "external catalog sync cannot use expected table state when registering a missing table"
+            ));
+        }
+        let mut entry = table_entry_from_import_request(
+            bucket,
+            namespace,
+            table,
+            CatalogImportRequest {
+                metadata_location: request.metadata_location.clone(),
+                properties: request.properties.clone(),
+            },
+        )?;
+        adopt_registered_metadata_identity(&mut entry, &target_metadata)?;
+        store.register_table(entry.clone()).await.map_err(catalog_store_error)?;
+        (
+            EXTERNAL_CATALOG_ACTION_REGISTERED.to_string(),
+            load_table_response_from_entry(entry, target_metadata),
+        )
+    };
+
+    let bridge_entry = external_catalog_bridge_entry_from_sync_request(bucket, namespace, table, &request, external_table_uuid)?;
+    let bridge_entry = store
+        .put_external_catalog_bridge(bridge_entry)
+        .await
+        .map_err(catalog_store_error)?;
+    Ok(ExternalCatalogBridgeSyncResponse {
+        action,
+        table: table_response,
+        bridge: external_catalog_bridge_response_from_entry(bucket, namespace, table, Some(bridge_entry)),
+    })
 }
 
 async fn catalog_import_response<B>(
@@ -4737,7 +5160,54 @@ impl Operation for ExternalCatalogBridgeHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
-        build_json_response(StatusCode::OK, &external_catalog_bridge_response(&warehouse, &namespace, &table))
+        let store = table_catalog_store()?;
+        let response = external_catalog_bridge_response(&store, &warehouse, &namespace, &table).await?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct PutExternalCatalogBridgeHandler {}
+
+#[async_trait::async_trait]
+impl Operation for PutExternalCatalogBridgeHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::RegisterTableAction).await?;
+        let request = read_json_body::<ExternalCatalogBridgeRequest>(req.input).await?;
+        let store = table_catalog_store()?;
+        let response = put_external_catalog_bridge_response(&store, &warehouse, &namespace, &table, request).await?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct SyncExternalCatalogBridgeHandler {}
+
+#[async_trait::async_trait]
+impl Operation for SyncExternalCatalogBridgeHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableMetadataLocationAction).await?;
+        let request = read_json_body::<ExternalCatalogBridgeSyncRequest>(req.input).await?;
+        let metadata_backend = table_catalog_backend()?;
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
+        let response = sync_external_catalog_bridge_response(
+            &store,
+            &metadata_backend,
+            &warehouse,
+            &namespace,
+            &table,
+            request,
+            table_bucket_enabled,
+        )
+        .await?;
+        build_json_response(StatusCode::OK, &response)
     }
 }
 
@@ -4916,6 +5386,16 @@ mod tests {
         assert!(
             response
                 .endpoints
+                .contains(&"PUT /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external")
+        );
+        assert!(
+            response
+                .endpoints
+                .contains(&"POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external/sync")
+        );
+        assert!(
+            response
+                .endpoints
                 .contains(&"POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery")
         );
     }
@@ -4973,6 +5453,8 @@ mod tests {
             ("ExportTableCatalogHandler", "AdminAction::GetTableMetadataAction"),
             ("ImportTableCatalogHandler", "AdminAction::RegisterTableAction"),
             ("ExternalCatalogBridgeHandler", "AdminAction::GetTableMetadataAction"),
+            ("PutExternalCatalogBridgeHandler", "AdminAction::RegisterTableAction"),
+            ("SyncExternalCatalogBridgeHandler", "AdminAction::SetTableMetadataLocationAction"),
             ("GetTableCatalogDiagnosticsHandler", "AdminAction::GetTableMetadataAction"),
             ("RecoverTableCatalogHandler", "AdminAction::CommitTableAction"),
             ("RollbackTableCatalogHandler", "AdminAction::CommitTableAction"),
@@ -5008,6 +5490,8 @@ mod tests {
             ("ExportTableCatalogHandler", "AdminAction::GetTableMetadataAction"),
             ("ImportTableCatalogHandler", "AdminAction::RegisterTableAction"),
             ("ExternalCatalogBridgeHandler", "AdminAction::GetTableMetadataAction"),
+            ("PutExternalCatalogBridgeHandler", "AdminAction::RegisterTableAction"),
+            ("SyncExternalCatalogBridgeHandler", "AdminAction::SetTableMetadataLocationAction"),
             ("GetTableCatalogDiagnosticsHandler", "AdminAction::GetTableMetadataAction"),
             ("RecoverTableCatalogHandler", "AdminAction::CommitTableAction"),
             ("RollbackTableCatalogHandler", "AdminAction::CommitTableAction"),
@@ -5088,6 +5572,8 @@ mod tests {
         let _: &ExportTableCatalogHandler = &EXPORT_TABLE_CATALOG_HANDLER;
         let _: &ImportTableCatalogHandler = &IMPORT_TABLE_CATALOG_HANDLER;
         let _: &ExternalCatalogBridgeHandler = &EXTERNAL_CATALOG_BRIDGE_HANDLER;
+        let _: &PutExternalCatalogBridgeHandler = &PUT_EXTERNAL_CATALOG_BRIDGE_HANDLER;
+        let _: &SyncExternalCatalogBridgeHandler = &SYNC_EXTERNAL_CATALOG_BRIDGE_HANDLER;
         let _: &GetTableCatalogDiagnosticsHandler = &GET_TABLE_CATALOG_DIAGNOSTICS_HANDLER;
         let _: &RecoverTableCatalogHandler = &RECOVER_TABLE_CATALOG_HANDLER;
         let _: &RollbackTableCatalogHandler = &ROLLBACK_TABLE_CATALOG_HANDLER;
@@ -5124,6 +5610,8 @@ mod tests {
         assert_operation::<ExportTableCatalogHandler>();
         assert_operation::<ImportTableCatalogHandler>();
         assert_operation::<ExternalCatalogBridgeHandler>();
+        assert_operation::<PutExternalCatalogBridgeHandler>();
+        assert_operation::<SyncExternalCatalogBridgeHandler>();
         assert_operation::<GetTableCatalogDiagnosticsHandler>();
         assert_operation::<RecoverTableCatalogHandler>();
         assert_operation::<RollbackTableCatalogHandler>();
@@ -5290,6 +5778,25 @@ mod tests {
         assert_rejects_unknown_field::<CatalogImportRequest>(
             "CatalogImportRequest",
             serde_json::json!({
+                "metadata-location": ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json",
+                "unexpected": true
+            }),
+        );
+        assert_rejects_unknown_field::<ExternalCatalogBridgeRequest>(
+            "ExternalCatalogBridgeRequest",
+            serde_json::json!({
+                "catalog": "polaris",
+                "external-namespace": "analytics",
+                "external-table": "events",
+                "unexpected": true
+            }),
+        );
+        assert_rejects_unknown_field::<ExternalCatalogBridgeSyncRequest>(
+            "ExternalCatalogBridgeSyncRequest",
+            serde_json::json!({
+                "catalog": "glue",
+                "external-namespace": "analytics",
+                "external-table": "events",
                 "metadata-location": ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json",
                 "unexpected": true
             }),
@@ -6590,19 +7097,327 @@ mod tests {
         assert!(response.refs.contains_key("audit"));
     }
 
-    #[test]
-    fn external_catalog_bridge_response_lists_unsupported_bridges() {
+    #[tokio::test]
+    async fn external_catalog_bridge_response_lists_supported_operator_bridges() {
+        let backend = TestTableCatalogObjectBackend::default();
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(backend);
+        let bucket = "warehouse";
         let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
-        let response = external_catalog_bridge_response("warehouse", &namespace, "events");
+        ensure_table_bucket_entry(&store, bucket, true)
+            .await
+            .expect("table bucket entry should be seeded");
+        create_namespace_response(
+            &store,
+            bucket,
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+        let response = external_catalog_bridge_response(&store, bucket, &namespace, "events")
+            .await
+            .expect("bridge response should load");
 
-        assert_eq!(response.status, "metadata-import-supported");
-        assert_eq!(response.unsupported_bridges.len(), 4);
+        assert_eq!(response.status, "bridge-unconfigured");
+        assert!(response.unsupported_bridges.is_empty());
+        assert_eq!(response.capabilities.len(), 4);
         assert!(
             response
-                .unsupported_bridges
+                .capabilities
                 .iter()
-                .any(|bridge| bridge.catalog == "polaris" && bridge.status == "unsupported")
+                .any(|bridge| bridge.catalog == "polaris" && bridge.status == "operator-sync-supported")
         );
+    }
+
+    #[tokio::test]
+    async fn external_catalog_bridge_persists_identity_and_boundary() {
+        let backend = TestTableCatalogObjectBackend::default();
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(backend);
+        let bucket = "warehouse";
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        ensure_table_bucket_entry(&store, bucket, true)
+            .await
+            .expect("table bucket entry should be seeded");
+        create_namespace_response(
+            &store,
+            bucket,
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+
+        let configured = put_external_catalog_bridge_response(
+            &store,
+            bucket,
+            &namespace,
+            "events",
+            ExternalCatalogBridgeRequest {
+                catalog: "polaris".to_string(),
+                external_catalog_id: Some("prod-catalog".to_string()),
+                external_namespace: "sales.analytics".to_string(),
+                external_table: "orders".to_string(),
+                external_table_uuid: Some("table-uuid".to_string()),
+                metadata_location: None,
+                external_version_token: Some("polaris-v7".to_string()),
+                policy_mode: Some("rustfs-authoritative".to_string()),
+                credential_mode: Some("rustfs-table-credentials".to_string()),
+                sync_mode: Some("manual".to_string()),
+                properties: BTreeMap::from([("owner".to_string(), "lakehouse".to_string())]),
+            },
+        )
+        .await
+        .expect("bridge should configure");
+
+        assert_eq!(configured.status, "bridge-configured");
+        let bridge = configured.bridge.as_ref().expect("bridge state should be returned");
+        assert_eq!(bridge.catalog, "polaris");
+        assert_eq!(bridge.external_catalog_id.as_deref(), Some("prod-catalog"));
+        assert_eq!(bridge.external_namespace, "sales.analytics");
+        assert_eq!(bridge.external_table, "orders");
+        assert_eq!(bridge.external_version_token.as_deref(), Some("polaris-v7"));
+        assert_eq!(bridge.policy_mode, "rustfs-authoritative");
+        assert_eq!(bridge.credential_mode, "rustfs-table-credentials");
+        assert_eq!(bridge.sync_mode, "manual");
+
+        let loaded = external_catalog_bridge_response(&store, bucket, &namespace, "events")
+            .await
+            .expect("bridge response should load");
+        assert_eq!(loaded.status, "bridge-configured");
+        assert!(
+            loaded
+                .capabilities
+                .iter()
+                .any(|capability| capability.catalog == "polaris" && capability.status == "operator-sync-supported")
+        );
+    }
+
+    #[tokio::test]
+    async fn external_catalog_bridge_sync_registers_missing_table_from_snapshot() {
+        let backend = TestTableCatalogObjectBackend::default();
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "warehouse";
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
+        ensure_table_bucket_entry(&store, bucket, true)
+            .await
+            .expect("table bucket entry should be seeded");
+        create_namespace_response(
+            &store,
+            bucket,
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+        let metadata_location = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        backend
+            .put_json(
+                bucket,
+                &metadata_location,
+                serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://warehouse/tables/table-id"
+                }),
+            )
+            .await;
+
+        let synced = sync_external_catalog_bridge_response(
+            &store,
+            &backend,
+            bucket,
+            &namespace,
+            "events",
+            ExternalCatalogBridgeSyncRequest {
+                catalog: "glue".to_string(),
+                external_catalog_id: Some("aws-glue-prod".to_string()),
+                external_namespace: "sales".to_string(),
+                external_table: "orders".to_string(),
+                external_table_uuid: Some("table-uuid".to_string()),
+                metadata_location: metadata_location.clone(),
+                external_version_token: Some("glue-version-1".to_string()),
+                expected_version_token: None,
+                expected_metadata_location: None,
+                commit_id: Some("external-sync-1".to_string()),
+                idempotency_key: Some("external-sync-idempotency-1".to_string()),
+                policy_mode: Some("rustfs-authoritative".to_string()),
+                credential_mode: Some("rustfs-table-credentials".to_string()),
+                rollback_strategy: Some("retain-current-pointer".to_string()),
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("external sync should register missing table");
+
+        assert_eq!(synced.action, "registered");
+        assert_eq!(synced.table.metadata_location, metadata_location);
+        let bridge = synced.bridge.bridge.as_ref().expect("bridge state should be returned");
+        assert_eq!(bridge.catalog, "glue");
+        assert_eq!(bridge.last_sync_status.as_deref(), Some("synced"));
+        assert_eq!(bridge.last_synced_metadata_location.as_deref(), Some(metadata_location.as_str()));
+        assert_eq!(bridge.rollback_strategy, "retain-current-pointer");
+        let current = store
+            .load_table(bucket, "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should be registered");
+        assert_eq!(current.metadata_location, metadata_location);
+        assert_eq!(current.table_uuid, "table-uuid");
+    }
+
+    #[tokio::test]
+    async fn external_catalog_bridge_sync_commits_existing_table_pointer() {
+        let backend = TestTableCatalogObjectBackend::default();
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "warehouse";
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
+        let current_location = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let next_location = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        seed_object_table_for_metadata_maintenance(&store, &backend, bucket, &namespace, &table, current_location.clone()).await;
+        backend
+            .put_json(
+                bucket,
+                &current_location,
+                serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://warehouse/tables/table-id",
+                    "last-sequence-number": 1
+                }),
+            )
+            .await;
+        backend
+            .put_json(
+                bucket,
+                &next_location,
+                serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://warehouse/tables/table-id",
+                    "last-sequence-number": 2
+                }),
+            )
+            .await;
+
+        let synced = sync_external_catalog_bridge_response(
+            &store,
+            &backend,
+            bucket,
+            &namespace,
+            "events",
+            ExternalCatalogBridgeSyncRequest {
+                catalog: "hive-metastore".to_string(),
+                external_catalog_id: Some("hms-prod".to_string()),
+                external_namespace: "sales".to_string(),
+                external_table: "orders".to_string(),
+                external_table_uuid: Some("table-uuid".to_string()),
+                metadata_location: next_location.clone(),
+                external_version_token: Some("hms-version-2".to_string()),
+                expected_version_token: Some("token-v1".to_string()),
+                expected_metadata_location: Some(current_location.clone()),
+                commit_id: Some("external-sync-2".to_string()),
+                idempotency_key: Some("external-sync-idempotency-2".to_string()),
+                policy_mode: Some("rustfs-authoritative".to_string()),
+                credential_mode: Some("rustfs-table-credentials".to_string()),
+                rollback_strategy: Some("retain-current-pointer".to_string()),
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("external sync should commit existing table");
+
+        assert_eq!(synced.action, "committed");
+        assert_eq!(synced.table.metadata_location, next_location);
+        let current = store
+            .load_table(bucket, "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+        assert_eq!(current.metadata_location, next_location);
+        assert_eq!(current.generation, 2);
+    }
+
+    #[tokio::test]
+    async fn external_catalog_bridge_sync_conflicts_leave_pointer_unchanged() {
+        let backend = TestTableCatalogObjectBackend::default();
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "warehouse";
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
+        let current_location = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let next_location = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        seed_object_table_for_metadata_maintenance(&store, &backend, bucket, &namespace, &table, current_location.clone()).await;
+        backend
+            .put_json(
+                bucket,
+                &current_location,
+                serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://warehouse/tables/table-id"
+                }),
+            )
+            .await;
+        backend
+            .put_json(
+                bucket,
+                &next_location,
+                serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "different-table-uuid",
+                    "location": "s3://warehouse/tables/table-id"
+                }),
+            )
+            .await;
+
+        let result = sync_external_catalog_bridge_response(
+            &store,
+            &backend,
+            bucket,
+            &namespace,
+            "events",
+            ExternalCatalogBridgeSyncRequest {
+                catalog: "dlf".to_string(),
+                external_catalog_id: Some("dlf-prod".to_string()),
+                external_namespace: "sales".to_string(),
+                external_table: "orders".to_string(),
+                external_table_uuid: Some("different-table-uuid".to_string()),
+                metadata_location: next_location.clone(),
+                external_version_token: Some("dlf-version-2".to_string()),
+                expected_version_token: Some("token-v1".to_string()),
+                expected_metadata_location: Some(current_location.clone()),
+                commit_id: Some("external-sync-3".to_string()),
+                idempotency_key: Some("external-sync-idempotency-3".to_string()),
+                policy_mode: Some("rustfs-authoritative".to_string()),
+                credential_mode: Some("rustfs-table-credentials".to_string()),
+                rollback_strategy: Some("retain-current-pointer".to_string()),
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let current = store
+            .load_table(bucket, "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+        assert_eq!(current.metadata_location, current_location);
+        assert_eq!(current.version_token, "token-v1");
     }
 
     #[test]

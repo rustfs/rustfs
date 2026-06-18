@@ -824,6 +824,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::Sensitive,
     ),
     admin(
+        HttpMethod::Put,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
+        REGISTER_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external/sync",
+        SET_TABLE_METADATA_LOCATION,
+        RouteRiskLevel::High,
+    ),
+    admin(
         HttpMethod::Get,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/diagnostics",
         GET_TABLE_METADATA,
@@ -1053,6 +1065,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::Sensitive,
     ),
     admin(
+        HttpMethod::Put,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
+        REGISTER_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external/sync",
+        SET_TABLE_METADATA_LOCATION,
+        RouteRiskLevel::High,
+    ),
+    admin(
         HttpMethod::Get,
         "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/diagnostics",
         GET_TABLE_METADATA,
@@ -1252,7 +1276,7 @@ mod tests {
         let table_specs = ADMIN_ROUTE_POLICY_SPECS
             .iter()
             .filter(|spec| spec.path().starts_with("/iceberg/v1") || spec.path().starts_with("/_iceberg/v1"));
-        assert_eq!(table_specs.count(), 78);
+        assert_eq!(table_specs.count(), 82);
         assert_action(HttpMethod::Put, "/iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET);
         assert_action(HttpMethod::Get, "/_iceberg/v1/buckets/{warehouse}", GET_TABLE_BUCKET);
         assert_action(HttpMethod::Get, "/iceberg/v1/{warehouse}/namespaces", GET_TABLE_NAMESPACE);
@@ -1396,6 +1420,16 @@ mod tests {
             HttpMethod::Get,
             "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
             GET_TABLE_METADATA,
+        );
+        assert_action(
+            HttpMethod::Put,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
+            REGISTER_TABLE,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external/sync",
+            SET_TABLE_METADATA_LOCATION,
         );
         assert_action(
             HttpMethod::Post,
