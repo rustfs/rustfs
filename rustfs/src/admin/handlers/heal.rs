@@ -14,6 +14,8 @@
 
 use crate::admin::auth::{authenticate_request, validate_admin_request};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::storage_compat::ecstore::bucket::utils::is_valid_object_prefix;
+use crate::admin::storage_compat::ecstore::store_utils::is_reserved_or_invalid_bucket;
 use crate::app::context::resolve_object_store_handle;
 use crate::server::ADMIN_PREFIX;
 use crate::server::RemoteAddr;
@@ -24,8 +26,6 @@ use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_common::heal_channel::{HealChannelPriority, HealChannelRequest, HealOpts, HealRequestSource};
 use rustfs_config::MAX_HEAL_REQUEST_SIZE;
-use rustfs_ecstore::bucket::utils::is_valid_object_prefix;
-use rustfs_ecstore::store_utils::is_reserved_or_invalid_bucket;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_scanner::scanner::{BackgroundHealInfo, read_background_heal_info};
 use rustfs_storage_api::HealOperations as _;
@@ -345,10 +345,10 @@ fn should_handle_root_heal_directly(hip: &HealInitParams) -> bool {
     hip.bucket.is_empty() && hip.obj_prefix.is_empty() && hip.client_token.is_empty() && !hip.force_stop
 }
 
-fn map_root_heal_status(heal_err: Option<rustfs_ecstore::error::Error>) -> S3Result<()> {
+fn map_root_heal_status(heal_err: Option<crate::admin::storage_compat::ecstore::error::Error>) -> S3Result<()> {
     match heal_err {
         None => Ok(()),
-        Some(rustfs_ecstore::error::StorageError::NoHealRequired) => {
+        Some(crate::admin::storage_compat::ecstore::error::StorageError::NoHealRequired) => {
             info!(
                 event = EVENT_ADMIN_RESPONSE_EMITTED,
                 component = LOG_COMPONENT_ADMIN_API,
@@ -703,12 +703,12 @@ mod tests {
         encode_heal_task_status, heal_channel_response_items, heal_channel_response_summary, json_response, map_heal_response,
         map_root_heal_status, should_handle_root_heal_directly, validate_heal_request_mode, validate_heal_target,
     };
+    use crate::admin::storage_compat::ecstore::error::StorageError;
     use bytes::Bytes;
     use http::StatusCode;
     use http::Uri;
     use matchit::Router;
     use rustfs_common::heal_channel::{HealChannelPriority, HealOpts, HealRequestSource, HealScanMode};
-    use rustfs_ecstore::error::StorageError;
     use rustfs_scanner::scanner::BackgroundHealInfo;
     use s3s::{
         S3ErrorCode,

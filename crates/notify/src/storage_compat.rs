@@ -12,4 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub(crate) mod ecstore {
+    pub(crate) use rustfs_ecstore::{config, global};
+}
+
 pub type NotifyObjectInfo = rustfs_ecstore::store_api::ObjectInfo;

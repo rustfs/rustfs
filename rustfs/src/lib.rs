@@ -77,6 +77,7 @@ pub mod startup_server;
 pub mod startup_services;
 pub mod startup_storage;
 pub mod storage;
+pub(crate) mod storage_compat;
 pub(crate) mod table_catalog;
 pub mod tls;
 pub mod update;

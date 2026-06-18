@@ -27,10 +27,7 @@ use crate::{
     error::StorageError,
     global::{GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_lock_clients, is_dist_erasure},
     set_disk::SetDisks,
-    store_api::{
-        DeletedObject, GetObjectReader, ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo, ObjectOptions, ObjectToDelete,
-        PutObjReader,
-    },
+    store_api::{GetObjectReader, ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo, ObjectOptions, PutObjReader},
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
 };
 use futures::{
@@ -50,8 +47,8 @@ use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_storage_api::CompletePart;
 use rustfs_storage_api::HTTPRangeSpec;
 use rustfs_storage_api::{
-    BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, ListMultipartsInfo, ListPartsInfo, MakeBucketOptions,
-    MultipartInfo, MultipartUploadResult, PartInfo,
+    BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, DeletedObject, ListMultipartsInfo, ListPartsInfo,
+    MakeBucketOptions, MultipartInfo, MultipartUploadResult, ObjectToDelete, PartInfo,
 };
 use rustfs_storage_api::{ObjectIO as _, ObjectOperations as _};
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};

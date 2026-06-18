@@ -14,6 +14,8 @@
 
 use thiserror::Error;
 
+use crate::heal::storage_compat::{DiskError, EcstoreError};
+
 /// Custom error type for heal operations
 /// This enum defines various error variants that can occur during
 /// the execution of heal-related tasks, such as I/O errors, storage errors,
@@ -24,10 +26,10 @@ pub enum Error {
     Io(#[from] std::io::Error),
 
     #[error("Storage error: {0}")]
-    Storage(#[from] rustfs_ecstore::error::Error),
+    Storage(#[from] EcstoreError),
 
     #[error("Disk error: {0}")]
-    Disk(#[from] rustfs_ecstore::disk::error::DiskError),
+    Disk(#[from] DiskError),
 
     #[error("Configuration error: {0}")]
     Config(String),

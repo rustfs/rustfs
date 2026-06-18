@@ -62,7 +62,7 @@ use crate::{
     endpoints::EndpointServerPools,
     rpc::S3PeerSys,
     sets::Sets,
-    store_api::{DeletedObject, GetObjectReader, ListObjectsV2Info, ObjectInfo, ObjectOptions, ObjectToDelete, PutObjReader},
+    store_api::{GetObjectReader, ListObjectsV2Info, ObjectInfo, ObjectOptions, PutObjReader},
     store_init,
 };
 use futures::future::join_all;
@@ -77,8 +77,8 @@ use rustfs_lock::{LocalClient, LockClient, NamespaceLockWrapper};
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_storage_api::HTTPRangeSpec;
 use rustfs_storage_api::{
-    BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, ListMultipartsInfo, ListPartsInfo,
-    MakeBucketOptions, MultipartInfo, MultipartUploadResult, PartInfo,
+    BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, ListMultipartsInfo,
+    ListPartsInfo, MakeBucketOptions, MultipartInfo, MultipartUploadResult, ObjectToDelete, PartInfo,
 };
 use rustfs_utils::path::{decode_dir_object, encode_dir_object, path_join_buf};
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};

@@ -125,6 +125,7 @@ PyIceberg, PyArrow, or boto3:
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-client-matrix
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-vendor-profiles
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-unsupported-inventory
+python3 scripts/table-catalog/pyiceberg_smoke.py --print-production-readiness
 ```
 
 Use these outputs when updating release notes, PR descriptions, or follow-up
@@ -143,6 +144,9 @@ The smoke test also probes catalog-backed advanced Iceberg surfaces:
   execution checks
 - catalog diagnostics exposes the table recovery and consistency state used by
   operators
+- catalog export and diagnostics expose the current catalog backing manifest,
+  recoverable commit-log WAL state, strong backing migration target, single
+  active writer HA policy, and scale validation matrix
 
 ## Client Matrix
 
@@ -179,7 +183,7 @@ current unsupported inventory is:
 - automatic maintenance scheduling: external scheduler hook supported through the worker run endpoint; built-in periodic scheduling is not claimed
 - compaction rewrite: controlled run-once support for unpartitioned Parquet binpack through metadata maintenance; built-in periodic scheduling, sort compaction, delete-file rewrite, and row-level compaction are not claimed
 - row-level delete/update/merge commits: standard catalog commit validates append, overwrite, delete, and replace snapshot manifests for table-warehouse scope, referenced object existence, current-live-file deletes, and stale add/delete conflicts; end-to-end SQL DML client coverage remains a compatibility validation item
-- external catalog bridges: metadata import/register is supported, but Polaris/Glue/DLF/Hive synchronization is unsupported
+- external catalog bridges: metadata import/register and operator-supplied metadata pointer sync are supported for Polaris/Glue/DLF/Hive identity boundaries; online vendor SDK polling and policy mirroring are not claimed
 - multi-table transactions: not a short-term production claim
 
 ## Credential Boundary

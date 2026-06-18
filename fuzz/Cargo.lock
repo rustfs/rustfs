@@ -8760,6 +8760,7 @@ dependencies = [
  "async-trait",
  "serde",
  "time",
+ "uuid",
 ]
 
 [[package]]
@@ -8789,6 +8790,7 @@ dependencies = [
  "rustfs-kafka-async",
  "rustfs-s3-types",
  "rustfs-tls-runtime",
+ "rustfs-utils",
  "rustls",
  "rustls-native-certs",
  "s3s",

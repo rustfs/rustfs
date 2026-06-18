@@ -316,13 +316,13 @@ impl NotifyConfigManager {
     where
         F: FnMut(&mut Config) -> bool,
     {
-        let Some(store) = rustfs_ecstore::global::resolve_object_store_handle() else {
+        let Some(store) = crate::storage_compat::ecstore::global::resolve_object_store_handle() else {
             return Err(NotificationError::StorageNotAvailable(
                 "Failed to save target configuration: server storage not initialized".to_string(),
             ));
         };
 
-        let mut new_config = rustfs_ecstore::config::com::read_config_without_migrate(store.clone())
+        let mut new_config = crate::storage_compat::ecstore::config::com::read_config_without_migrate(store.clone())
             .await
             .map_err(|e| NotificationError::ReadConfig(e.to_string()))?;
 
@@ -338,7 +338,7 @@ impl NotifyConfigManager {
             return Ok(());
         }
 
-        rustfs_ecstore::config::com::save_server_config(store, &new_config)
+        crate::storage_compat::ecstore::config::com::save_server_config(store, &new_config)
             .await
             .map_err(|e| NotificationError::SaveConfig(e.to_string()))?;
 

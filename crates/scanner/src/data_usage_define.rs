@@ -28,20 +28,18 @@ use rustfs_config::ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS;
 pub use rustfs_data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, hash_path,
 };
-use rustfs_ecstore::{
-    bucket::{lifecycle::lifecycle::TRANSITION_COMPLETE, replication::ReplicationConfig},
-    config::{com::save_config, storageclass},
-    disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
-    error::{Error, Result as StorageResult, StorageError},
-};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use tokio::time::{Duration, Instant, sleep, timeout};
 use tracing::warn;
 
+use crate::storage_compat::{
+    BUCKET_META_PREFIX, EcstoreError as Error, EcstoreResult as StorageResult, RUSTFS_META_BUCKET, ReplicationConfig,
+    ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions, StorageError, TRANSITION_COMPLETE, save_config,
+    storageclass,
+};
 pub use crate::storage_compat::{
     ScannerGetObjectReader, ScannerObjectIO, ScannerObjectInfo, ScannerObjectOptions, ScannerObjectToDelete, ScannerPutObjReader,
 };
-use crate::storage_compat::{ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions};
 
 // Data usage constants
 pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;

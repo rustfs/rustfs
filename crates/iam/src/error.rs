@@ -179,20 +179,20 @@ impl Error {
     }
 }
 
-impl From<rustfs_ecstore::error::StorageError> for Error {
-    fn from(e: rustfs_ecstore::error::StorageError) -> Self {
+impl From<crate::storage_compat::ecstore::error::StorageError> for Error {
+    fn from(e: crate::storage_compat::ecstore::error::StorageError) -> Self {
         match e {
-            rustfs_ecstore::error::StorageError::ConfigNotFound => Error::ConfigNotFound,
+            crate::storage_compat::ecstore::error::StorageError::ConfigNotFound => Error::ConfigNotFound,
             _ => Error::other(e),
         }
     }
 }
 
-impl From<Error> for rustfs_ecstore::error::StorageError {
+impl From<Error> for crate::storage_compat::ecstore::error::StorageError {
     fn from(e: Error) -> Self {
         match e {
-            Error::ConfigNotFound => rustfs_ecstore::error::StorageError::ConfigNotFound,
-            _ => rustfs_ecstore::error::StorageError::other(e),
+            Error::ConfigNotFound => crate::storage_compat::ecstore::error::StorageError::ConfigNotFound,
+            _ => crate::storage_compat::ecstore::error::StorageError::other(e),
         }
     }
 }
@@ -330,13 +330,13 @@ mod tests {
     #[test]
     fn test_iam_error_from_storage_error() {
         // Test conversion from StorageError
-        let storage_error = rustfs_ecstore::error::StorageError::ConfigNotFound;
+        let storage_error = crate::storage_compat::ecstore::error::StorageError::ConfigNotFound;
         let iam_error: Error = storage_error.into();
         assert_eq!(iam_error, Error::ConfigNotFound);
 
         // Test reverse conversion
-        let back_to_storage: rustfs_ecstore::error::StorageError = iam_error.into();
-        assert_eq!(back_to_storage, rustfs_ecstore::error::StorageError::ConfigNotFound);
+        let back_to_storage: crate::storage_compat::ecstore::error::StorageError = iam_error.into();
+        assert_eq!(back_to_storage, crate::storage_compat::ecstore::error::StorageError::ConfigNotFound);
     }
 
     #[test]
