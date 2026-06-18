@@ -5,21 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-test-harness-fuzz-storage-boundaries`
-- Baseline: `origin/main` after `rustfs/rustfs#3572` merged as
-  `8313767f75f694cb8cf1fb47e5c0f44dfc5bf2b8`.
+- Branch: `overtrue/arch-narrow-storage-compat-exports`
+- Baseline: `origin/main` after `rustfs/rustfs#3573` merged as
+  `c098184c67a80ed9c8e31ac7fd2587fddfa1799e`.
 - PR type for this branch: `consumer-migration`
-- Runtime behavior changes: no migration behavior change expected; CI follow-up
-  preserves empty-object erasure recovery by avoiding zero-byte SIMD decode.
-- Rust code changes: add RustFS root, observability, IAM, test harness, and
-  fuzz ECStore compatibility boundaries; extend notify and S3 Select
-  boundaries; route runtime, server, startup, capacity, table catalog, obs,
-  notify, S3 Select, IAM, scanner/heal integration tests, e2e helpers, and
-  fuzz direct ECStore imports through local boundaries. ECStore-owned
-  definitions and runtime behavior stay in ECStore.
+- Runtime behavior changes: no migration behavior change expected.
+- Rust code changes: narrow RustFS, obs, notify, S3 Select, IAM, scanner/heal
+  test, e2e, and fuzz ECStore compatibility boundary modules from whole-crate
+  aliases to explicit re-export surfaces. ECStore-owned definitions and runtime
+  behavior stay in ECStore.
 - CI/script changes: none.
-- Docs changes: record the larger runtime/observability/select/IAM plus test
-  harness/fuzz boundary cleanup slice.
+- Docs changes: record the compatibility export surface cleanup slice.
 
 ## Phase 0 Tasks
 
@@ -923,6 +919,25 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: focused scanner/heal/e2e compile, fuzz target compile,
     migration/layer guards, formatting check, diff hygiene, direct import scan,
     risk scan, full pre-commit, and required three-expert review passed.
+
+- [x] `API-033` Narrow ECStore compatibility export surfaces.
+  - Current branch: `overtrue/arch-narrow-storage-compat-exports`.
+  - Completed slice: replace local whole-crate ECStore compatibility aliases
+    with explicit re-export modules for RustFS runtime/app/admin/storage, obs,
+    notify, S3 Select, IAM, scanner/heal integration tests, e2e helpers, and
+    fuzz targets.
+  - Acceptance: local ECStore compatibility boundaries expose only the ECStore
+    modules/functions required by their consumers; direct `rustfs_ecstore`
+    references remain limited to compatibility boundary modules.
+  - Must preserve: all runtime, admin, storage, observability, notification, S3
+    Select, IAM, scanner/heal test, e2e helper, and fuzz behavior from
+    API-031/API-032.
+  - Risk defense: this slice changes compatibility re-export ownership only; it
+    does not move ECStore definitions, alter runtime control flow, mutate
+    metadata formats, change test setup semantics, or adjust fuzz inputs.
+  - Verification: focused compile, fuzz target compile, migration/layer guards,
+    formatting check, diff hygiene, direct import scan, risk scan, full
+    pre-commit, and required three-expert review passed.
 
 ## Phase 8 Background Controller Tasks
 
