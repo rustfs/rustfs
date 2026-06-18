@@ -15,7 +15,7 @@
 use crate::common::{
     RustFSTestEnvironment, awscurl_available, awscurl_post_sts_form_urlencoded, init_logging, local_http_client,
 };
-use crate::storage_compat::ecstore::bucket::bucket_target_sys::BucketTargetSys;
+use crate::storage_compat::BucketTargetSys;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};

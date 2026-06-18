@@ -14,8 +14,8 @@
 // limitations under the License.
 
 use crate::common::workspace_root;
-use crate::storage_compat::ecstore::disk::{VolumeInfo, WalkDirOptions};
-use crate::storage_compat::ecstore::rpc::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
+use crate::storage_compat::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
+use crate::storage_compat::{VolumeInfo, WalkDirOptions};
 use futures::future::join_all;
 use rmp_serde::{Deserializer, Serializer};
 use rustfs_filemeta::{MetaCacheEntry, MetacacheReader, MetacacheWriter};

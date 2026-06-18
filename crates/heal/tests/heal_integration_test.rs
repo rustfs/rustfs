@@ -14,10 +14,8 @@
 
 mod common;
 
-use crate::common::storage_compat::ecstore::{
-    disk::endpoint::Endpoint,
-    endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
-    store::ECStore,
+use crate::common::storage_compat::{
+    ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, init_bucket_metadata_sys, init_local_disks,
 };
 use http::HeaderMap;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
@@ -124,9 +122,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage
     let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
 
     // format disks (only first time)
-    crate::common::storage_compat::ecstore::store::init_local_disks(endpoint_pools.clone())
-        .await
-        .unwrap();
+    init_local_disks(endpoint_pools.clone()).await.unwrap();
 
     // create ECStore with dynamic port 0 (let OS assign) or fixed 9001 if free
     let port = 9001; // for simplicity
@@ -144,7 +140,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage
         .await
         .unwrap();
     let buckets = buckets_list.into_iter().map(|v| v.name).collect();
-    crate::common::storage_compat::ecstore::bucket::metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
+    init_bucket_metadata_sys(ecstore.clone(), buckets).await;
 
     // Create heal storage layer
     let heal_storage = Arc::new(ECStoreHealStorage::new(ecstore.clone()));
