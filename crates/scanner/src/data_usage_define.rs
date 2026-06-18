@@ -33,12 +33,15 @@ use rustfs_ecstore::{
     config::{com::save_config, storageclass},
     disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
     error::{Error, Result as StorageResult, StorageError},
-    store_api::{GetObjectReader, ObjectInfo, ObjectOptions, ObjectToDelete, PutObjReader},
 };
-use rustfs_storage_api::{HTTPRangeSpec, ObjectIO};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use tokio::time::{Duration, Instant, sleep, timeout};
 use tracing::warn;
+
+pub use crate::storage_compat::{
+    ScannerGetObjectReader, ScannerObjectIO, ScannerObjectInfo, ScannerObjectOptions, ScannerObjectToDelete, ScannerPutObjReader,
+};
+use crate::storage_compat::{ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions};
 
 // Data usage constants
 pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
@@ -60,38 +63,6 @@ const LOG_SUBSYSTEM_CACHE: &str = "cache";
 const EVENT_SCANNER_CACHE_LOAD_STATE: &str = "scanner_cache_load_state";
 const EVENT_SCANNER_CACHE_SAVE_STATE: &str = "scanner_cache_save_state";
 static CACHE_SAVE_METRICS_ONCE: Once = Once::new();
-
-pub type ScannerGetObjectReader = GetObjectReader;
-pub type ScannerObjectInfo = ObjectInfo;
-pub type ScannerObjectOptions = ObjectOptions;
-pub type ScannerObjectToDelete = ObjectToDelete;
-pub type ScannerPutObjReader = PutObjReader;
-
-pub trait ScannerObjectIO:
-    ObjectIO<
-        Error = Error,
-        RangeSpec = HTTPRangeSpec,
-        HeaderMap = HeaderMap,
-        ObjectOptions = ObjectOptions,
-        ObjectInfo = ObjectInfo,
-        GetObjectReader = GetObjectReader,
-        PutObjectReader = PutObjReader,
-    >
-{
-}
-
-impl<T> ScannerObjectIO for T where
-    T: ObjectIO<
-            Error = Error,
-            RangeSpec = HTTPRangeSpec,
-            HeaderMap = HeaderMap,
-            ObjectOptions = ObjectOptions,
-            ObjectInfo = ObjectInfo,
-            GetObjectReader = GetObjectReader,
-            PutObjectReader = PutObjReader,
-        >
-{
-}
 
 pub const DATA_USAGE_SCAN_CHECKPOINT_VERSION: u16 = 1;
 
