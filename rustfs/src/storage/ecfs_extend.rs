@@ -16,12 +16,12 @@ use crate::config::{RustFSBufferConfig, WorkloadProfile, get_global_buffer_confi
 use crate::error::ApiError;
 use crate::server::cors;
 use crate::storage::ecfs::ListObjectUnorderedQuery;
-use crate::storage::storage_compat::ecstore::bucket::metadata_sys;
-use crate::storage::storage_compat::ecstore::bucket::metadata_sys::get_replication_config;
-use crate::storage::storage_compat::ecstore::bucket::object_lock::objectlock_sys;
-use crate::storage::storage_compat::ecstore::bucket::replication::ReplicationConfigurationExt;
-use crate::storage::storage_compat::ecstore::error::StorageError;
-use crate::storage::storage_compat::ecstore::resolve_object_store_handle;
+use crate::storage::storage_compat::bucket::metadata_sys;
+use crate::storage::storage_compat::bucket::metadata_sys::get_replication_config;
+use crate::storage::storage_compat::bucket::object_lock::objectlock_sys;
+use crate::storage::storage_compat::bucket::replication::ReplicationConfigurationExt;
+use crate::storage::storage_compat::error::StorageError;
+use crate::storage::storage_compat::resolve_object_store_handle;
 use http::header::{IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::counter;
@@ -739,7 +739,7 @@ pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelet
 }
 
 /// Helper function to get store and validate bucket exists
-pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<crate::storage::storage_compat::ecstore::store::ECStore>> {
+pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<crate::storage::storage_compat::store::ECStore>> {
     let Some(store) = resolve_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };

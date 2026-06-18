@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::storage_compat::ecstore::{
+use crate::admin::storage_compat::{
     error::StorageError,
     notification_sys::get_global_notification_sys,
     rebalance::{DiskStat, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta},
@@ -150,7 +150,7 @@ fn build_rebalance_pool_progress(
     now: OffsetDateTime,
     stop_time: Option<OffsetDateTime>,
     percent_free_goal: f64,
-    ps: &crate::admin::storage_compat::ecstore::rebalance::RebalanceStats,
+    ps: &crate::admin::storage_compat::rebalance::RebalanceStats,
 ) -> Option<RebalPoolProgress> {
     let total_bytes_to_rebal = ps.init_capacity as f64 * percent_free_goal - ps.init_free_space as f64;
     let terminal_time = ps.info.end_time.or(stop_time);
@@ -193,7 +193,7 @@ fn build_rebalance_pool_statuses(
     now: OffsetDateTime,
     stop_time: Option<OffsetDateTime>,
     percent_free_goal: f64,
-    pool_stats: &[crate::admin::storage_compat::ecstore::rebalance::RebalanceStats],
+    pool_stats: &[crate::admin::storage_compat::rebalance::RebalanceStats],
     disk_stats: &[DiskStat],
 ) -> Vec<RebalancePoolStatus> {
     pool_stats
@@ -563,7 +563,7 @@ mod rebalance_handler_tests {
         RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, build_rebalance_pool_statuses, rebalance_pool_used,
         rebalance_remaining_buckets, rebalance_used_pct,
     };
-    use crate::admin::storage_compat::ecstore::rebalance::{
+    use crate::admin::storage_compat::rebalance::{
         DiskStat, RebalStatus, RebalanceCleanupWarnings, RebalanceInfo, RebalanceStats,
     };
     use time::OffsetDateTime;

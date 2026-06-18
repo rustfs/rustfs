@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::startup_fs_guard::enforce_unsupported_fs_policy;
-use crate::storage_compat::ecstore::{
+use crate::storage_compat::{
     bucket::replication::init_background_replication,
     config as ecconfig,
     endpoints::EndpointServerPools,

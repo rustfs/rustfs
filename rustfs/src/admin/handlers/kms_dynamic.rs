@@ -16,7 +16,7 @@
 
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::storage_compat::ecstore::config::com::{read_config, save_config};
+use crate::admin::storage_compat::config::com::{read_config, save_config};
 use crate::app::context::{resolve_kms_runtime_service_manager, resolve_object_store_handle};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
