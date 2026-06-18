@@ -4829,7 +4829,7 @@ impl DefaultObjectUsecase {
             let event_args = rustfs_notify::EventArgs {
                 event_name: put_event_name_for_post_object(false),
                 bucket_name: bucket.clone(),
-                object: obj_info.clone(),
+                object: obj_info.clone().into(),
                 req_params: req_params.clone(),
                 resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
                 version_id: version_id.clone(),
