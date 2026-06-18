@@ -207,7 +207,7 @@ require_source_line \
   "storage-api public object precondition contract re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
-  "pub use object::{VersionMarker, WalkVersionsSortOrder};" \
+  "pub use object::{VersionMarker, WalkOptions, WalkVersionsSortOrder};" \
   "storage-api public list helper contract re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
@@ -275,7 +275,7 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:VersionMarker|WalkVersionsSortOrder)\b|::(?:VersionMarker|WalkVersionsSortOrder)\b)|pub enum (?:VersionMarker|WalkVersionsSortOrder)\b' \
+  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:VersionMarker|WalkOptions|WalkVersionsSortOrder)\b|::(?:VersionMarker|WalkOptions|WalkVersionsSortOrder)\b)|pub (?:enum (?:VersionMarker|WalkVersionsSortOrder)|struct WalkOptions)\b' \
     crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
 ) >"$STORE_API_LIST_HELPER_REEXPORTS_FILE"
 

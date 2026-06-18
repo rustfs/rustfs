@@ -5,18 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-list-response-contracts`
-- Baseline: `main` at `80ed63484bf62b916ceda17fd76b1092261fda77`
-  after the object precondition contract merge.
+- Branch: `overtrue/arch-walk-options-contracts`
+- Baseline: `main` at `604379d62fab481b73d1848bfbd045a684031441`
+  after the table catalog row-level conflict hardening merge.
 - PR type for this branch: `api-extraction`
 - Runtime behavior changes: no external behavior change expected.
-- Rust code changes: move object list response DTO contracts into
-  `rustfs-storage-api` as generic `ListObjectsInfo`,
-  `ListObjectsV2Info`, `ListObjectVersionsInfo`, and `ObjectInfoOrErr`,
-  then keep ECStore's existing public names as `ObjectInfo`/`Error` aliases.
-- CI/script changes: extend migration guards for list response contract public
-  re-exports and ECStore local-definition regressions.
-- Docs changes: record the object list response contract extraction slice.
+- Rust code changes: move `WalkOptions` into `rustfs-storage-api` as a generic
+  filter-container contract, then keep ECStore's existing public name as a
+  `FileInfo` filter alias.
+- CI/script changes: extend migration guards for the `WalkOptions` public
+  re-export and ECStore local-definition regressions.
+- Docs changes: record the walk options contract extraction slice.
 
 ## Phase 0 Tasks
 
@@ -642,6 +641,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
     full pre-commit, and required three-expert review passed.
 
+- [x] `API-020` Move walk options contract.
+  - Completed slice: move `WalkOptions` from ECStore `store_api/types.rs` into
+    `rustfs-storage-api` as a generic public contract over the filter type,
+    then keep ECStore's old public `WalkOptions` name as a type alias bound to
+    the existing `fn(&FileInfo) -> bool` filter shape.
+  - Acceptance: `rustfs-storage-api` exports `WalkOptions`, ECStore no longer
+    defines a local `WalkOptions` struct, existing ECStore consumers keep their
+    old import path, and migration guards reject dropping the public
+    storage-api re-export or reintroducing a local ECStore definition.
+  - Must preserve: walk filter optionality, marker, latest-only flag, ask-disks
+    string, version sort default, limit semantics, include-free-versions flag,
+    and ECStore list/walk runtime behavior.
+  - Risk defense: only the generic options container crosses into
+    `rustfs-storage-api`; ECStore keeps the concrete `FileInfo` filter binding,
+    list/walk implementations, metadata conversion, readers, storage errors,
+    lifecycle/replication coupling, and operation traits.
+  - Verification: focused storage-api tests, ECStore/RustFS/downstream compile
+    checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    full pre-commit, and required three-expert review passed.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -918,8 +937,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Generic list response containers now live in `rustfs-storage-api`; ECStore still owns `ObjectInfo`, `Error`, walk options, and list implementation behavior. |
-| Migration preservation | passed | List v1/v2 fields, version-list fields, walk item/error channel shape, and existing ECStore public import paths are preserved through aliases. |
+| Quality/architecture | passed | Generic `WalkOptions` now lives in `rustfs-storage-api`; ECStore still owns the concrete `FileInfo` filter binding and list/walk implementation behavior. |
+| Migration preservation | passed | Filter optionality, marker/default fields, version sort default, include-free-versions flag, and existing ECStore public import path are preserved through an alias. |
 | Testing/verification | passed | Focused storage-api tests, downstream compile checks, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
@@ -927,7 +946,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 Passed before push:
 
 - `cargo test -p rustfs-storage-api`: passed.
-- `cargo check --tests -p rustfs-storage-api -p rustfs-ecstore -p rustfs -p rustfs-iam -p rustfs-scanner`: passed.
+- `cargo check --tests -p rustfs-storage-api -p rustfs-ecstore -p rustfs -p rustfs-iam -p rustfs-scanner -p rustfs-protocols`: passed.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
 - `cargo fmt --all --check`: passed.
@@ -935,26 +954,26 @@ Passed before push:
 - Rust risk scan: no new `unwrap`/`expect`, panic/todo markers, `unsafe`,
   process-spawning calls, lossy casts, println/eprintln, or relaxed ordering in
   added Rust lines.
-- `make pre-commit`: passed; nextest reported 6191 tests passed and 111
+- `make pre-commit`: passed; nextest reported 6203 tests passed and 111
   skipped, and doctests passed.
 
 Notes:
 
-- This slice follows the object precondition contract branch and keeps the old
+- This slice follows the object list response contract branch and keeps the old
   aggregate facade, bucket DTO, multipart DTO, bucket operation contract, object
-  helper, range helper, list helper, object precondition, and list response
-  contract guards active.
-- The shared list response containers are now owned by `rustfs-storage-api`;
-  ECStore keeps `ObjectInfo`, storage `Error`, `ObjectOptions`, `WalkOptions`,
-  object metadata adaptation, storage error mapping, readers,
-  lifecycle/replication, rio, filemeta, and implementation behavior.
+  helper, range helper, list helper, object precondition, list response, and
+  walk options contract guards active.
+- The shared walk options container is now owned by `rustfs-storage-api`;
+  ECStore keeps the concrete `FileInfo` filter alias, `ObjectInfo`, storage
+  `Error`, `ObjectOptions`, object metadata adaptation, storage error mapping,
+  readers, lifecycle/replication, rio, filemeta, and implementation behavior.
 - The slice does not alter object, list, walk, multipart, bucket, delete, or
   reader runtime behavior.
 
 ## Handoff Notes
 
-- Object list response contract cleanup is stacked on the object precondition
-  contract branch.
+- Walk options contract cleanup is stacked on the object list response contract
+  branch.
 - After this lands, remaining storage work can continue by extracting larger
   low-coupling DTO/consumer slices or by narrowing remaining operation-group
   consumers.

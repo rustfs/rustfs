@@ -27,4 +27,4 @@ pub use multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartIn
 pub use object::{HTTPPreconditions, HTTPRangeError, HTTPRangeSpec, ObjectLockRetentionOptions};
 pub use object::{ListObjectVersionsInfo, ListObjectsInfo, ListObjectsV2Info, ObjectInfoOrErr};
 pub use object::{ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState};
-pub use object::{VersionMarker, WalkVersionsSortOrder};
+pub use object::{VersionMarker, WalkOptions, WalkVersionsSortOrder};
