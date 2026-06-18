@@ -20,6 +20,7 @@
 
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::Operation;
+use crate::admin::storage_compat::ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::RemoteAddr;
 use crate::storage::request_context::spawn_traced;
@@ -28,7 +29,6 @@ use futures::{Stream, StreamExt};
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::StatusCode;
 use matchit::Params;
-use rustfs_ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
 use rustfs_madmin::metrics::RealtimeMetrics;
 use rustfs_madmin::utils::parse_duration;
 use rustfs_policy::policy::action::{Action, AdminAction};

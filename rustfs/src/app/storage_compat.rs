@@ -12,18 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Application layer module entry.
-//! Concrete use-case modules will be introduced incrementally in Phase 3.
-
-pub mod admin_usecase;
-pub mod bucket_usecase;
-pub mod context;
-pub mod multipart_usecase;
-pub mod object_usecase;
-mod select_object;
-pub(crate) mod storage_compat;
-
-#[cfg(test)]
-mod capacity_dirty_scope_test;
-#[cfg(test)]
-mod lifecycle_transition_api_test;
+pub(crate) use rustfs_ecstore as ecstore;
