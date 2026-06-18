@@ -13,7 +13,15 @@
 // limitations under the License.
 
 use http::HeaderMap;
-pub(crate) use rustfs_ecstore::{
+pub(crate) mod ecstore {
+    #![allow(unused_imports)]
+
+    pub(crate) use rustfs_ecstore::{
+        bucket, cache_value, config, data_usage, disk, error, global, pools, resolve_object_store_handle, set_disk, store,
+        store_api, store_utils,
+    };
+}
+pub(crate) use self::ecstore::{
     bucket::{
         bucket_target_sys::BucketTargetSys,
         lifecycle::{
@@ -51,7 +59,7 @@ use rustfs_storage_api::{HTTPRangeSpec, ObjectIO};
 use std::sync::Arc;
 
 #[cfg(test)]
-pub(crate) use rustfs_ecstore::{
+pub(crate) use self::ecstore::{
     config::init as init_ecstore_config_for_scanner_tests,
     disk::{DiskOption, endpoint::Endpoint, new_disk},
 };
@@ -63,7 +71,7 @@ pub type ScannerObjectToDelete = EcstoreObjectToDelete;
 pub type ScannerPutObjReader = EcstorePutObjReader;
 
 pub(crate) fn resolve_scanner_object_store_handle() -> Option<Arc<ECStore>> {
-    rustfs_ecstore::resolve_object_store_handle()
+    ecstore::resolve_object_store_handle()
 }
 
 pub trait ScannerObjectIO:

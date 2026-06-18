@@ -12,7 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::{
+mod ecstore {
+    #![allow(unused_imports)]
+
+    pub(super) use rustfs_ecstore::{bucket, error, resolve_object_store_handle, store, store_api};
+}
+use self::ecstore::{
     bucket::{metadata::BucketMetadata, metadata_sys},
     error::Result as EcstoreResult,
     store::ECStore,
@@ -29,7 +34,7 @@ pub type SwiftObjectOptions = EcstoreObjectOptions;
 pub type SwiftPutObjReader = EcstorePutObjReader;
 
 pub fn resolve_swift_object_store_handle() -> Option<Arc<ECStore>> {
-    rustfs_ecstore::resolve_object_store_handle()
+    ecstore::resolve_object_store_handle()
 }
 
 pub async fn get_swift_bucket_metadata(bucket: &str) -> EcstoreResult<Arc<BucketMetadata>> {

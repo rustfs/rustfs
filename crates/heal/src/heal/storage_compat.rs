@@ -12,7 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use rustfs_ecstore::{
+pub(crate) mod ecstore {
+    #![allow(unused_imports)]
+
+    pub(crate) use rustfs_ecstore::{data_usage, disk, error, global, store, store_api};
+}
+pub(crate) use self::ecstore::{
     data_usage::DATA_USAGE_CACHE_NAME,
     disk::{BUCKET_META_PREFIX, DiskAPI, DiskStore, RUSTFS_META_BUCKET, endpoint::Endpoint, error::DiskError},
     error::{Error as EcstoreError, StorageError},
@@ -22,7 +27,7 @@ pub(crate) use rustfs_ecstore::{
 };
 
 #[cfg(test)]
-pub(crate) use rustfs_ecstore::disk::{DiskOption, new_disk};
+pub(crate) use self::ecstore::disk::{DiskOption, new_disk};
 
 pub type HealObjectInfo = EcstoreObjectInfo;
 pub type HealObjectOptions = EcstoreObjectOptions;

@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::store_api::{ObjectInfo as EcstoreObjectInfo, ObjectOptions as EcstoreObjectOptions};
+mod ecstore {
+    pub(super) use rustfs_ecstore::store_api;
+}
 
-pub(super) type IamObjectInfo = EcstoreObjectInfo;
-pub(super) type IamObjectOptions = EcstoreObjectOptions;
+pub(super) type IamObjectInfo = ecstore::store_api::ObjectInfo;
+pub(super) type IamObjectOptions = ecstore::store_api::ObjectOptions;
