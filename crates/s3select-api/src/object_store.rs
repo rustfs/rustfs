@@ -29,9 +29,6 @@ use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object
 use rustfs_ecstore::resolve_object_store_handle;
 use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::{
-    GetObjectReader as EcstoreGetObjectReader, ObjectInfo as EcstoreObjectInfo, ObjectOptions as EcstoreObjectOptions,
-};
 use rustfs_storage_api::{HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
 use s3s::S3Result;
 use s3s::dto::SelectObjectContentInput;
@@ -51,6 +48,8 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::ReaderStream;
 use transform_stream::AsyncTryStream;
 
+use crate::storage_compat::{SelectGetObjectReader, SelectObjectInfo, SelectObjectOptions};
+
 /// Maximum allowed object size for JSON DOCUMENT mode.
 ///
 /// JSON DOCUMENT format requires loading the entire file into memory for DOM
@@ -67,10 +66,6 @@ use transform_stream::AsyncTryStream;
 pub const MAX_JSON_DOCUMENT_BYTES: u64 = 128 * 1024 * 1024;
 pub const INVALID_SCAN_RANGE_MESSAGE: &str =
     "The value of a parameter in ScanRange element is invalid. Check the service API documentation and try again.";
-
-type SelectGetObjectReader = EcstoreGetObjectReader;
-type SelectObjectInfo = EcstoreObjectInfo;
-type SelectObjectOptions = EcstoreObjectOptions;
 
 #[derive(Debug)]
 pub struct EcObjectStore {

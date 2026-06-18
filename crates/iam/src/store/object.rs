@@ -29,7 +29,6 @@ use rustfs_ecstore::{
         com::{delete_config, read_config_no_lock, read_config_with_metadata, save_config, save_config_with_opts},
     },
     store::ECStore,
-    store_api::{ObjectInfo, ObjectOptions},
 };
 use rustfs_io_metrics::record_system_path_failure;
 use rustfs_policy::{auth::UserIdentity, policy::PolicyDoc};
@@ -42,6 +41,8 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::{self, Sender};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
+
+use super::storage_compat::{IamObjectInfo, IamObjectOptions};
 
 pub static IAM_CONFIG_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam"));
 pub static IAM_CONFIG_USERS_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam/users/"));
@@ -60,7 +61,7 @@ pub static IAM_CONFIG_POLICY_DB_SERVICE_ACCOUNTS_PREFIX: LazyLock<String> =
 pub static IAM_CONFIG_POLICY_DB_GROUPS_PREFIX: LazyLock<String> =
     LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam/policydb/groups/"));
 
-type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, EcstoreError>;
+type ObjectInfoOrErr = StorageObjectInfoOrErr<IamObjectInfo, EcstoreError>;
 
 const IAM_IDENTITY_FILE: &str = "identity.json";
 const IAM_POLICY_FILE: &str = "policy.json";
@@ -282,7 +283,7 @@ impl ObjectStore {
         entry.cooldown_until = Some(Instant::now() + IAM_LAZY_REWRITE_COOLDOWN);
     }
 
-    fn maybe_schedule_lazy_rewrite(&self, path: &str, outcome: &DecryptOutcome, object_info: &ObjectInfo) {
+    fn maybe_schedule_lazy_rewrite(&self, path: &str, outcome: &DecryptOutcome, object_info: &IamObjectInfo) {
         if !Self::should_lazy_rewrite(outcome.source) {
             return;
         }
@@ -322,7 +323,7 @@ impl ObjectStore {
     async fn lazy_rewrite_iam_config(&self, path: &str, plain: &[u8], etag: &str) -> std::result::Result<(), StorageError> {
         let encrypted = Self::encrypt_data_with_master_key(plain).map_err(StorageError::other)?;
 
-        let mut opts = ObjectOptions {
+        let mut opts = IamObjectOptions {
             max_parity: true,
             ..Default::default()
         };
@@ -343,9 +344,9 @@ impl ObjectStore {
         Self::prepare_data_for_storage(data)
     }
 
-    async fn load_iamconfig_bytes_with_metadata(&self, path: impl AsRef<str> + Send) -> Result<(Vec<u8>, ObjectInfo)> {
+    async fn load_iamconfig_bytes_with_metadata(&self, path: impl AsRef<str> + Send) -> Result<(Vec<u8>, IamObjectInfo)> {
         let path_ref = path.as_ref();
-        let (data, obj) = read_config_with_metadata(self.object_api.clone(), path_ref, &ObjectOptions::default()).await?;
+        let (data, obj) = read_config_with_metadata(self.object_api.clone(), path_ref, &IamObjectOptions::default()).await?;
         let outcome = Self::decrypt_data_with_source(&data)?;
         self.maybe_schedule_lazy_rewrite(path_ref, &outcome, &obj);
 
@@ -640,7 +641,7 @@ impl Store for ObjectStore {
     }
     async fn load_iam_config<Item: DeserializeOwned>(&self, path: impl AsRef<str> + Send) -> Result<Item> {
         let path_ref = path.as_ref();
-        let (data, obj) = read_config_with_metadata(self.object_api.clone(), path_ref, &ObjectOptions::default()).await?;
+        let (data, obj) = read_config_with_metadata(self.object_api.clone(), path_ref, &IamObjectOptions::default()).await?;
 
         let outcome = match Self::decrypt_data_with_source(&data) {
             Ok(v) => v,

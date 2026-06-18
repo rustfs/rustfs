@@ -55,24 +55,17 @@ use super::{SwiftError, SwiftResult};
 use axum::http::HeaderMap;
 use rustfs_credentials::Credentials;
 use rustfs_ecstore::resolve_object_store_handle;
-use rustfs_ecstore::store_api::{
-    GetObjectReader as EcstoreGetObjectReader, ObjectInfo as EcstoreObjectInfo, ObjectOptions as EcstoreObjectOptions,
-    PutObjReader as EcstorePutObjReader,
-};
 use rustfs_rio::HashReader;
 use rustfs_storage_api::{BucketOperations, BucketOptions, ObjectIO as _, ObjectOperations as _};
 use std::collections::HashMap;
 use tracing::debug;
 use tracing::error;
 
+pub use super::storage_compat::{SwiftGetObjectReader, SwiftObjectInfo, SwiftObjectOptions, SwiftPutObjReader};
+
 const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
 const LOG_SUBSYSTEM_SWIFT_OBJECT: &str = "swift_object";
 const EVENT_SWIFT_OBJECT_STORAGE_STATE: &str = "swift_object_storage_state";
-
-pub type SwiftGetObjectReader = EcstoreGetObjectReader;
-pub type SwiftObjectInfo = EcstoreObjectInfo;
-pub type SwiftObjectOptions = EcstoreObjectOptions;
-pub type SwiftPutObjReader = EcstorePutObjReader;
 
 /// Maximum number of metadata headers allowed per object (Swift standard)
 const MAX_METADATA_COUNT: usize = 90;

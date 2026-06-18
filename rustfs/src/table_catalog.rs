@@ -43,10 +43,7 @@ use rustfs_ecstore::bucket::{
 };
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 use rustfs_ecstore::error::{Error as EcstoreError, StorageError};
-use rustfs_ecstore::{
-    set_disk::get_lock_acquire_timeout,
-    store_api::{DeletedObject, GetObjectReader, ObjectInfo, ObjectOptions, ObjectToDelete, PutObjReader},
-};
+use rustfs_ecstore::set_disk::get_lock_acquire_timeout;
 use rustfs_filemeta::FileInfo;
 use rustfs_storage_api::{
     HTTPPreconditions, HTTPRangeSpec, ListObjectVersionsInfo as StorageListObjectVersionsInfo,
@@ -58,6 +55,11 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use time::{Duration, OffsetDateTime};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
+
+use crate::storage::{
+    StorageDeletedObject as DeletedObject, StorageGetObjectReader as GetObjectReader, StorageObjectInfo as ObjectInfo,
+    StorageObjectOptions as ObjectOptions, StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
+};
 
 pub(crate) const TABLE_BUCKET_MARKER_CONFIG: &str = BUCKET_TABLE_CONFIG;
 pub(crate) const RESERVED_CATALOG_OBJECT_MESSAGE: &str = "Object key is reserved for the table catalog";
