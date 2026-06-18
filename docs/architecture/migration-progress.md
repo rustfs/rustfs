@@ -5,18 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-runtime-compat-surface-prune`
-- Baseline: stacked on `rustfs/rustfs#3597` head
-  (`33920e8fff1c62666435be1bc04a4e0dc97b5165`).
-- PR type for this branch: `pure-move`
-- Runtime behavior changes: no migration behavior change expected.
-- Rust code changes: flatten RustFS root, app, admin, and storage runtime
-  scalar compatibility facades from secondary modules into direct aliases and
-  functions.
-- CI/script changes: add migration guards rejecting restored scalar
-  `storage_compat::*::*` paths in RustFS runtime source.
-- Docs changes: record the RustFS runtime scalar compatibility surface cleanup
-  slice.
+- Branch: `overtrue/arch-scheduler-profiling-baselines`
+- Baseline: stacked on `rustfs/rustfs#3599` head
+  (`91767c9b36c19d7bb6c8c5f85ab3b3570242cadb`).
+- PR type for this branch: `docs-only`
+- Runtime behavior changes: none.
+- Rust code changes: none.
+- CI/script changes: none.
+- Docs changes: add scheduler, placement/repair, and profiling/NUMA baseline
+  inventories for `G-011`, `G-012`, and `G-013`.
 
 ## Phase 0 Tasks
 
@@ -64,6 +61,28 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     [`ecstore-config-consumer-inventory.md`](ecstore-config-consumer-inventory.md)
     records the current model definitions, global accessors, persistence helpers,
     consumer groups, migration risks, and do-not-change contract.
+- [x] `G-011` Inventory scheduler baseline.
+  - Acceptance:
+    [`scheduler-baseline.md`](scheduler-baseline.md) records current owners for
+    request admission, reusable scheduler/backpressure facades, workers, scanner
+    budget, heal admission, and the Tokio runtime builder.
+  - Must preserve: no Rust source changes, no scheduler/controller contract
+    changes, and no runtime behavior changes.
+- [x] `G-012` Inventory placement and repair invariants.
+  - Acceptance:
+    [`placement-repair-invariants.md`](placement-repair-invariants.md) records
+    object-to-set hashing, pool/set/disk assignment boundaries, set-aware
+    readiness and lock quorum, scanner budget, and heal admission preservation
+    gates.
+  - Must preserve: no placement, repair, scanner, heal, readiness, lock, or
+    storage metadata behavior changes.
+- [x] `G-013` Inventory profiling and NUMA capabilities.
+  - Acceptance:
+    [`profiling-numa-capability-inventory.md`](profiling-numa-capability-inventory.md)
+    records current CPU/memory profiling, cgroup memory sampling, allocator
+    backend, eBPF, and NUMA capability support plus no-op fallback invariants.
+  - Must preserve: no startup, profiling, allocator, runtime, or platform-gate
+    behavior changes.
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.
   - Acceptance: `./scripts/check_architecture_migration_rules.sh` parses the
     allowed PR types from [`crate-boundaries.md`](crate-boundaries.md) and fails
@@ -1646,7 +1665,10 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `pure-move`/`consumer-migration`: continue larger cleanup slices with the
+1. `docs-only`/`contract`: use the scheduler, placement/repair, and
+   profiling/NUMA baseline inventories to size the next larger capability or
+   startup-runtime slice.
+2. `pure-move`/`consumer-migration`: continue larger cleanup slices with the
    loss-prevention guards active for remaining ECStore compatibility contracts
    now that broad compatibility passthroughs are fully closed.
 
@@ -1654,13 +1676,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | S-015 removes obsolete KMS admin policy action variants after the handler fallback cleanup; API-042/API-043/API-044/API-045/API-046/API-047/API-048/API-049/API-050/API-051/API-052/API-053/API-054 narrow notify, S3 Select, OBS, IAM, Swift, heal, scanner, RustFS runtime, test, fuzz, lifecycle helper, harness, and RustFS runtime compatibility contracts without moving ECStore storage metadata ownership. |
-| Migration preservation | passed | KMS endpoint URLs, query aliases, request bodies, response contracts, and dedicated `kms:*` authorization behavior are preserved; event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, OBS metrics state reads, IAM config/notification/error semantics, Swift bucket metadata access, heal disk/resume/task behavior, scanner lifecycle/replication/data-usage behavior, RustFS startup/admin/app/storage runtime access, e2e/test/fuzz import behavior, lifecycle expiration/transition helper DTO field contracts, flattened harness and RustFS runtime scalar/secondary alias behavior, unchanged no-op handling, and remove-event behavior are preserved. |
-| Testing/verification | passed | Focused compiles/tests, fuzz target compile, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed for the current slice. |
+| Quality/architecture | passed | S-015 removes obsolete KMS admin policy action variants after the handler fallback cleanup; API-042/API-043/API-044/API-045/API-046/API-047/API-048/API-049/API-050/API-051/API-052/API-053/API-054 narrow notify, S3 Select, OBS, IAM, Swift, heal, scanner, RustFS runtime, test, fuzz, lifecycle helper, harness, and RustFS runtime compatibility contracts without moving ECStore storage metadata ownership; G-011/G-012/G-013 add docs-only baselines for scheduler, placement/repair, and profiling/NUMA work. |
+| Migration preservation | passed | KMS endpoint URLs, query aliases, request bodies, response contracts, and dedicated `kms:*` authorization behavior are preserved; event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, OBS metrics state reads, IAM config/notification/error semantics, Swift bucket metadata access, heal disk/resume/task behavior, scanner lifecycle/replication/data-usage behavior, RustFS startup/admin/app/storage runtime access, e2e/test/fuzz import behavior, lifecycle expiration/transition helper DTO field contracts, flattened harness and RustFS runtime scalar/secondary alias behavior, unchanged no-op handling, remove-event behavior, scheduler/readiness/placement/profiling runtime behavior, and platform gates are preserved. |
+| Testing/verification | passed | Focused compiles/tests, fuzz target compile, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed for prior code slices; docs-only G-011/G-012/G-013 uses architecture guard and diff hygiene verification. |
 
 ## Verification Notes
 
 Passed before push:
+
+- G-011/G-012/G-013 current slice:
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `git diff --check`: passed.
+  - Three-expert review: passed.
+  - Full `make pre-commit`: not run because this slice is documentation-only.
 
 - API-054 current slice:
   - `cargo check -p rustfs --lib`: passed.
