@@ -13,13 +13,8 @@
 // limitations under the License.
 
 use crate::storage_compat::{
-    ECStore, EndpointServerPools,
-    bucket::{
-        metadata_sys::init_bucket_metadata_sys,
-        migration::{try_migrate_bucket_metadata, try_migrate_iam_config},
-        replication::get_global_replication_pool,
-    },
-    new_global_notification_sys, shutdown_background_services,
+    ECStore, EndpointServerPools, get_global_replication_pool, init_bucket_metadata_sys, new_global_notification_sys,
+    shutdown_background_services, try_migrate_bucket_metadata, try_migrate_iam_config,
 };
 use crate::{
     config::Config,

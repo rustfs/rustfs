@@ -129,7 +129,7 @@ const OBJECT_KEY_DERIVATION_CONTEXT: &[u8] = b"object-encryption-key generation"
 
 use crate::error::ApiError;
 use crate::storage::storage_compat::Error;
-use crate::storage::storage_compat::bucket::metadata_sys;
+use crate::storage::storage_compat::metadata_sys;
 use rustfs_utils::http::headers::{
     AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
     AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5, AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT,

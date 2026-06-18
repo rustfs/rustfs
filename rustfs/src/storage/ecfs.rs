@@ -22,21 +22,18 @@ use crate::storage::helper::OperationHelper;
 use crate::storage::options::get_opts;
 use crate::storage::s3_api::acl;
 use crate::storage::storage_compat::{
-    StorageError,
-    bucket::{
-        metadata::{
-            BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_VERSIONING_CONFIG,
-            BUCKET_WEBSITE_CONFIG, OBJECT_LOCK_CONFIG,
-        },
-        metadata_sys,
-        object_lock::objectlock_sys::check_retention_for_modification,
-        replication::{GLOBAL_REPLICATION_STATS, ReplicationConfigurationExt},
-        tagging::{decode_tags, decode_tags_to_map, encode_tags},
-        utils::serialize,
-        versioning::VersioningApi,
-        versioning_sys::BucketVersioningSys,
+    StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
+    metadata::{
+        BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_VERSIONING_CONFIG,
+        BUCKET_WEBSITE_CONFIG, OBJECT_LOCK_CONFIG,
     },
-    is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
+    metadata_sys,
+    object_lock::objectlock_sys::check_retention_for_modification,
+    replication::{GLOBAL_REPLICATION_STATS, ReplicationConfigurationExt},
+    tagging::{decode_tags, decode_tags_to_map, encode_tags},
+    utils::serialize,
+    versioning::VersioningApi,
+    versioning_sys::BucketVersioningSys,
 };
 use crate::storage::{parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled};
 use crate::table_catalog;

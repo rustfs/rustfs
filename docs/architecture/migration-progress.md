@@ -1355,6 +1355,29 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     formatting check, diff hygiene, risk scan, full pre-commit, and required
     three-expert review passed before push.
 
+- [x] `API-054` Flatten RustFS runtime secondary storage compatibility aliases.
+  - Current branch: `overtrue/arch-runtime-secondary-compat-flatten`.
+  - Current slice: flatten RustFS root, app, admin, and storage runtime
+    secondary compatibility modules such as bucket, config, rio, client, tier,
+    compress, disk, and rebalance into direct crate-local aliases, modules, and
+    functions.
+  - Acceptance: RustFS runtime source no longer consumes those compatibility
+    surfaces through broad secondary modules, the runtime compatibility files no
+    longer define those wrapper modules, and migration rules reject restoring
+    the flattened secondary paths.
+  - Must preserve: startup config/bootstrap behavior, server module-switch
+    config reads, embedded startup storage initialization, admin bucket/meta/
+    tier/rebalance/config handlers, app object/bucket/multipart usecases,
+    storage RPC/SSE/access paths, table catalog storage access, and ECStore
+    concrete type ownership.
+  - Risk defense: this is import ownership and facade-shape cleanup only; no
+    production runtime behavior, ECStore ownership, storage metadata format,
+    object I/O, admin authorization, tier behavior, or readiness semantics are
+    changed.
+  - Verification: focused RustFS compile, migration and layer guards,
+    formatting check, diff hygiene, risk scan, and required three-expert review
+    passed before push.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -1631,13 +1654,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | S-015 removes obsolete KMS admin policy action variants after the handler fallback cleanup; API-042/API-043/API-044/API-045/API-046/API-047/API-048/API-049/API-050/API-051/API-052/API-053 narrow notify, S3 Select, OBS, IAM, Swift, heal, scanner, RustFS runtime, test, fuzz, lifecycle helper, harness, and RustFS runtime compatibility contracts without moving ECStore storage metadata ownership. |
-| Migration preservation | passed | KMS endpoint URLs, query aliases, request bodies, response contracts, and dedicated `kms:*` authorization behavior are preserved; event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, OBS metrics state reads, IAM config/notification/error semantics, Swift bucket metadata access, heal disk/resume/task behavior, scanner lifecycle/replication/data-usage behavior, RustFS startup/admin/app/storage runtime access, e2e/test/fuzz import behavior, lifecycle expiration/transition helper DTO field contracts, flattened harness and RustFS runtime scalar alias behavior, unchanged no-op handling, and remove-event behavior are preserved. |
+| Quality/architecture | passed | S-015 removes obsolete KMS admin policy action variants after the handler fallback cleanup; API-042/API-043/API-044/API-045/API-046/API-047/API-048/API-049/API-050/API-051/API-052/API-053/API-054 narrow notify, S3 Select, OBS, IAM, Swift, heal, scanner, RustFS runtime, test, fuzz, lifecycle helper, harness, and RustFS runtime compatibility contracts without moving ECStore storage metadata ownership. |
+| Migration preservation | passed | KMS endpoint URLs, query aliases, request bodies, response contracts, and dedicated `kms:*` authorization behavior are preserved; event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, OBS metrics state reads, IAM config/notification/error semantics, Swift bucket metadata access, heal disk/resume/task behavior, scanner lifecycle/replication/data-usage behavior, RustFS startup/admin/app/storage runtime access, e2e/test/fuzz import behavior, lifecycle expiration/transition helper DTO field contracts, flattened harness and RustFS runtime scalar/secondary alias behavior, unchanged no-op handling, and remove-event behavior are preserved. |
 | Testing/verification | passed | Focused compiles/tests, fuzz target compile, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed for the current slice. |
 
 ## Verification Notes
 
 Passed before push:
+
+- API-054 current slice:
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo check --tests -p rustfs`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: passed; only existing import and path rewrites were
+    reviewed, with no new unwrap/expect, panic/todo/unsafe, risky casts,
+    ad-hoc error construction, or sensitive-token handling semantics.
 
 - API-053 current slice:
   - `cargo check -p rustfs --lib`: passed.

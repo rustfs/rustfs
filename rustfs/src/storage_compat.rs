@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub(crate) use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
+pub(crate) use rustfs_ecstore::bucket::migration::{try_migrate_bucket_metadata, try_migrate_iam_config};
+pub(crate) use rustfs_ecstore::bucket::replication::{get_global_replication_pool, init_background_replication};
+pub(crate) use rustfs_ecstore::bucket::{metadata, metadata_sys, quota};
+pub(crate) use rustfs_ecstore::config::{com, init, init_global_config_sys, try_migrate_server_config};
 pub(crate) use rustfs_ecstore::disk::{DiskAPI, RUSTFS_META_BUCKET, endpoint::Endpoint};
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::disks_layout::DisksLayout;
@@ -28,11 +33,3 @@ pub(crate) use rustfs_ecstore::notification_sys::new_global_notification_sys;
 pub(crate) use rustfs_ecstore::rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
 pub(crate) use rustfs_ecstore::set_disk::get_lock_acquire_timeout;
 pub(crate) use rustfs_ecstore::store::{ECStore, all_local_disk, init_local_disks, init_lock_clients, prewarm_local_disk_id_map};
-
-pub(crate) mod bucket {
-    pub(crate) use rustfs_ecstore::bucket::{metadata, metadata_sys, migration, quota, replication};
-}
-
-pub(crate) mod config {
-    pub(crate) use rustfs_ecstore::config::{com, init, init_global_config_sys, try_migrate_server_config};
-}

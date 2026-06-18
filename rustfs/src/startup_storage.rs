@@ -14,8 +14,9 @@
 
 use crate::startup_fs_guard::enforce_unsupported_fs_policy;
 use crate::storage_compat::{
-    ECStore, EndpointServerPools, bucket::replication::init_background_replication, config as ecconfig, init_local_disks,
-    init_lock_clients, prewarm_local_disk_id_map, set_global_endpoints, update_erasure_type,
+    ECStore, EndpointServerPools, init as init_ecstore_config, init_background_replication, init_global_config_sys,
+    init_local_disks, init_lock_clients, prewarm_local_disk_id_map, set_global_endpoints, try_migrate_server_config,
+    update_erasure_type,
 };
 use rustfs_common::{GlobalReadiness, SystemStage};
 use std::{
@@ -143,11 +144,11 @@ pub async fn init_startup_storage_runtime(
 }
 
 async fn init_startup_storage_global_config(store: Arc<ECStore>) -> Result<()> {
-    ecconfig::init();
-    ecconfig::try_migrate_server_config(store.clone()).await;
+    init_ecstore_config();
+    try_migrate_server_config(store.clone()).await;
 
     let mut retry_count = 0;
-    while let Err(e) = ecconfig::init_global_config_sys(store.clone()).await {
+    while let Err(e) = init_global_config_sys(store.clone()).await {
         let next_retry_count = retry_count + 1;
         error!(
             target: "rustfs::main::run",

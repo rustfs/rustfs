@@ -19,18 +19,18 @@ use crate::admin::site_replication_identity::{
     site_identity_key,
 };
 use crate::admin::storage_compat::Error as StorageError;
-use crate::admin::storage_compat::bucket::bucket_target_sys::BucketTargetSys;
-use crate::admin::storage_compat::bucket::metadata::{
+use crate::admin::storage_compat::bucket_target_sys::BucketTargetSys;
+use crate::admin::storage_compat::com::{delete_config, read_config, save_config};
+use crate::admin::storage_compat::metadata::{
     BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE, BUCKET_REPLICATION_CONFIG,
     BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG,
 };
-use crate::admin::storage_compat::bucket::metadata_sys;
-use crate::admin::storage_compat::bucket::replication::GLOBAL_REPLICATION_STATS;
-use crate::admin::storage_compat::bucket::replication::{ReplicationConfigurationExt, ResyncOpts, get_global_replication_pool};
-use crate::admin::storage_compat::bucket::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
-use crate::admin::storage_compat::bucket::utils::{deserialize, serialize};
-use crate::admin::storage_compat::bucket::versioning::VersioningApi;
-use crate::admin::storage_compat::config::com::{delete_config, read_config, save_config};
+use crate::admin::storage_compat::metadata_sys;
+use crate::admin::storage_compat::replication::GLOBAL_REPLICATION_STATS;
+use crate::admin::storage_compat::replication::{ReplicationConfigurationExt, ResyncOpts, get_global_replication_pool};
+use crate::admin::storage_compat::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
+use crate::admin::storage_compat::utils::{deserialize, serialize};
+use crate::admin::storage_compat::versioning::VersioningApi;
 use crate::admin::storage_compat::{get_global_deployment_id, get_global_endpoints_opt, get_global_region, global_rustfs_port};
 use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
 use crate::app::context::resolve_object_store_handle;
@@ -3353,7 +3353,7 @@ fn is_stale_update(local_updated_at: OffsetDateTime, incoming_updated_at: Option
 }
 
 fn bucket_meta_local_updated_at(
-    bucket_meta: &crate::admin::storage_compat::bucket::metadata::BucketMetadata,
+    bucket_meta: &crate::admin::storage_compat::metadata::BucketMetadata,
     config_file: &str,
 ) -> OffsetDateTime {
     match config_file {

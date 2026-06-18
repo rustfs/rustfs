@@ -24,7 +24,7 @@ pub(crate) async fn load_server_config_from_store() -> S3Result<Config> {
         return Ok(Config::new());
     };
 
-    crate::admin::storage_compat::config::com::read_config_without_migrate(store)
+    crate::admin::storage_compat::com::read_config_without_migrate(store)
         .await
         .map_err(|e| s3_error!(InternalError, "failed to read server config: {}", e))
 }
@@ -82,7 +82,7 @@ where
         return Err(s3_error!(InternalError, "server storage not initialized"));
     };
 
-    let mut config = crate::admin::storage_compat::config::com::read_config_without_migrate(store.clone())
+    let mut config = crate::admin::storage_compat::com::read_config_without_migrate(store.clone())
         .await
         .map_err(|e| s3_error!(InternalError, "failed to read server config: {}", e))?;
 
@@ -90,7 +90,7 @@ where
         return Ok(());
     }
 
-    crate::admin::storage_compat::config::com::save_server_config(store, &config)
+    crate::admin::storage_compat::com::save_server_config(store, &config)
         .await
         .map_err(|e| s3_error!(InternalError, "failed to save audit config: {}", e))?;
 

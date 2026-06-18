@@ -14,7 +14,7 @@
 
 use crate::storage::storage_compat::Result;
 use crate::storage::storage_compat::StorageError;
-use crate::storage::storage_compat::bucket::versioning_sys::BucketVersioningSys;
+use crate::storage::storage_compat::versioning_sys::BucketVersioningSys;
 use http::header::{IF_MATCH, IF_NONE_MATCH};
 use http::{HeaderMap, HeaderValue};
 use rustfs_utils::http::{

@@ -28,15 +28,15 @@ use std::{
 };
 
 use crate::storage_compat::RUSTFS_META_BUCKET;
-use crate::storage_compat::bucket::{
+use crate::storage_compat::get_lock_acquire_timeout;
+use crate::storage_compat::{EcstoreError, StorageError};
+use crate::storage_compat::{
     metadata::{
         BUCKET_TABLE_CATALOG_META_PREFIX, BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG,
         BUCKET_TABLE_RESERVED_PREFIX, table_catalog_path_hash,
     },
     metadata_sys,
 };
-use crate::storage_compat::get_lock_acquire_timeout;
-use crate::storage_compat::{EcstoreError, StorageError};
 use bytes::Bytes;
 use datafusion::{
     arrow::datatypes::SchemaRef,
