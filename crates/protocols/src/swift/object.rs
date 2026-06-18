@@ -55,12 +55,13 @@ use super::{SwiftError, SwiftResult};
 use axum::http::HeaderMap;
 use rustfs_credentials::Credentials;
 use rustfs_ecstore::resolve_object_store_handle;
-use rustfs_ecstore::store_api::{ObjectOptions, PutObjReader};
 use rustfs_rio::HashReader;
 use rustfs_storage_api::{BucketOperations, BucketOptions, ObjectIO as _, ObjectOperations as _};
 use std::collections::HashMap;
 use tracing::debug;
 use tracing::error;
+
+pub use super::storage_compat::{SwiftGetObjectReader, SwiftObjectInfo, SwiftObjectOptions, SwiftPutObjReader};
 
 const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
 const LOG_SUBSYSTEM_SWIFT_OBJECT: &str = "swift_object";
@@ -397,7 +398,7 @@ where
     })?;
 
     // 12. Prepare object options with metadata
-    let opts = ObjectOptions {
+    let opts = SwiftObjectOptions {
         user_defined: user_metadata,
         ..Default::default()
     };
@@ -410,7 +411,7 @@ where
         .map_err(|e| sanitize_storage_error("Hash reader creation", e))?;
 
     // 15. Wrap in PutObjReader as expected by storage layer
-    let mut put_reader = PutObjReader::new(hash_reader);
+    let mut put_reader = SwiftPutObjReader::new(hash_reader);
 
     // 16. Upload object to storage
     let obj_info = store
@@ -477,7 +478,7 @@ where
     })?;
 
     // Prepare object options with metadata
-    let opts = ObjectOptions {
+    let opts = SwiftObjectOptions {
         user_defined: metadata.clone(),
         ..Default::default()
     };
@@ -493,7 +494,7 @@ where
         .map_err(|e| sanitize_storage_error("Hash reader creation", e))?;
 
     // Wrap in PutObjReader
-    let mut put_reader = PutObjReader::new(hash_reader);
+    let mut put_reader = SwiftPutObjReader::new(hash_reader);
 
     // Upload object to storage
     let obj_info = store
@@ -534,9 +535,7 @@ pub async fn get_object(
     object: &str,
     credentials: &Credentials,
     range: Option<rustfs_storage_api::HTTPRangeSpec>,
-) -> SwiftResult<rustfs_ecstore::store_api::GetObjectReader> {
-    use rustfs_ecstore::store_api::GetObjectReader;
-
+) -> SwiftResult<SwiftGetObjectReader> {
     // 1. Validate account access and get project_id
     let project_id = validate_account_access(account, credentials)?;
 
@@ -556,10 +555,10 @@ pub async fn get_object(
     };
 
     // 6. Prepare object options
-    let opts = ObjectOptions::default();
+    let opts = SwiftObjectOptions::default();
 
     // 7. Get object reader from storage with range support
-    let reader: GetObjectReader = store
+    let reader: SwiftGetObjectReader = store
         .get_object_reader(&bucket, &s3_key, range, HeaderMap::new(), &opts)
         .await
         .map_err(|e| {
@@ -594,9 +593,7 @@ pub async fn head_object(
     container: &str,
     object: &str,
     credentials: &Credentials,
-) -> SwiftResult<rustfs_ecstore::store_api::ObjectInfo> {
-    use rustfs_ecstore::store_api::ObjectInfo;
-
+) -> SwiftResult<SwiftObjectInfo> {
     // 1. Validate account access and get project_id
     let project_id = validate_account_access(account, credentials)?;
 
@@ -616,10 +613,10 @@ pub async fn head_object(
     };
 
     // 6. Prepare object options
-    let opts = ObjectOptions::default();
+    let opts = SwiftObjectOptions::default();
 
     // 7. Get object info (metadata only) from storage
-    let info: ObjectInfo = store.get_object_info(&bucket, &s3_key, &opts).await.map_err(|e| {
+    let info: SwiftObjectInfo = store.get_object_info(&bucket, &s3_key, &opts).await.map_err(|e| {
         let err_str = e.to_string();
         if err_str.contains("does not exist") || err_str.contains("not found") {
             SwiftError::NotFound(format!("Object '{}' not found in container '{}'", object, container))
@@ -674,7 +671,7 @@ pub async fn delete_object(account: &str, container: &str, object: &str, credent
     };
 
     // 6. Prepare object options for deletion
-    let opts = ObjectOptions::default();
+    let opts = SwiftObjectOptions::default();
 
     // 7. Delete object from storage
     // Swift DELETE is idempotent - returns success even if object doesn't exist
@@ -737,7 +734,7 @@ pub async fn update_object_metadata(
     };
 
     // 6. First, get the existing object info to verify it exists
-    let opts = ObjectOptions::default();
+    let opts = SwiftObjectOptions::default();
     let existing_info = store.get_object_info(&bucket, &s3_key, &opts).await.map_err(|e| {
         let err_str = e.to_string();
         if err_str.contains("does not exist") || err_str.contains("not found") {
@@ -778,7 +775,7 @@ pub async fn update_object_metadata(
 
     // 11. Prepare options for metadata update
     // Swift POST replaces all custom metadata, not merges
-    let update_opts = ObjectOptions {
+    let update_opts = SwiftObjectOptions {
         user_defined: new_metadata,
         mod_time: existing_info.mod_time,
         version_id: existing_info.version_id.map(|v| v.to_string()),
@@ -861,7 +858,7 @@ pub async fn copy_object(
     };
 
     // 7. First, verify source object exists and get its info
-    let src_opts = ObjectOptions::default();
+    let src_opts = SwiftObjectOptions::default();
     let mut src_info = store
         .get_object_info(&src_bucket, &src_s3_key, &src_opts)
         .await
@@ -928,7 +925,7 @@ pub async fn copy_object(
     validate_metadata(&new_metadata)?;
 
     // 14. Prepare destination options
-    let dst_opts = ObjectOptions {
+    let dst_opts = SwiftObjectOptions {
         user_defined: new_metadata,
         ..Default::default()
     };

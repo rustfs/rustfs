@@ -42,16 +42,24 @@ use rustfs_ecstore::bucket::{
     metadata_sys,
 };
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
-use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::{
-    set_disk::get_lock_acquire_timeout,
-    store_api::{ListOperations, NamespaceLocking, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader},
+use rustfs_ecstore::error::{Error as EcstoreError, StorageError};
+use rustfs_ecstore::set_disk::get_lock_acquire_timeout;
+use rustfs_filemeta::FileInfo;
+use rustfs_storage_api::{
+    HTTPPreconditions, HTTPRangeSpec, ListObjectVersionsInfo as StorageListObjectVersionsInfo,
+    ListObjectsV2Info as StorageListObjectsV2Info, ListOperations as StorageListOperations,
+    NamespaceLocking as StorageNamespaceLocking, ObjectIO as StorageObjectIO, ObjectInfoOrErr as StorageObjectInfoOrErr,
+    ObjectOperations as StorageObjectOperations, WalkOptions as StorageWalkOptions,
 };
-use rustfs_storage_api::HTTPPreconditions;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use time::{Duration, OffsetDateTime};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
+
+use crate::storage::{
+    StorageDeletedObject as DeletedObject, StorageGetObjectReader as GetObjectReader, StorageObjectInfo as ObjectInfo,
+    StorageObjectOptions as ObjectOptions, StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
+};
 
 pub(crate) const TABLE_BUCKET_MARKER_CONFIG: &str = BUCKET_TABLE_CONFIG;
 pub(crate) const RESERVED_CATALOG_OBJECT_MESSAGE: &str = "Object key is reserved for the table catalog";
@@ -104,6 +112,67 @@ const ICEBERG_MAX_REF_AGE_MS_PROPERTY: &str = "history.expire.max-ref-age-ms";
 const ICEBERG_REF_MIN_SNAPSHOTS_TO_KEEP_FIELD: &str = "min-snapshots-to-keep";
 const ICEBERG_REF_MAX_SNAPSHOT_AGE_MS_FIELD: &str = "max-snapshot-age-ms";
 const ICEBERG_REF_MAX_REF_AGE_MS_FIELD: &str = "max-ref-age-ms";
+
+type CatalogListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
+type CatalogListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
+type CatalogObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, EcstoreError>;
+type CatalogWalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
+
+pub(crate) trait TableCatalogStorage:
+    StorageObjectIO<
+        Error = EcstoreError,
+        RangeSpec = HTTPRangeSpec,
+        HeaderMap = HeaderMap,
+        ObjectOptions = ObjectOptions,
+        ObjectInfo = ObjectInfo,
+        GetObjectReader = GetObjectReader,
+        PutObjectReader = PutObjReader,
+    > + StorageObjectOperations<
+        Error = EcstoreError,
+        ObjectInfo = ObjectInfo,
+        ObjectOptions = ObjectOptions,
+        FileInfo = FileInfo,
+        ObjectToDelete = ObjectToDelete,
+        DeletedObject = DeletedObject,
+    > + StorageListOperations<
+        Error = EcstoreError,
+        ListObjectsV2Info = CatalogListObjectsV2Info,
+        ListObjectVersionsInfo = CatalogListObjectVersionsInfo,
+        ObjectInfoOrErr = CatalogObjectInfoOrErr,
+        WalkOptions = CatalogWalkOptions,
+        WalkCancellation = tokio_util::sync::CancellationToken,
+        WalkResultSender = tokio::sync::mpsc::Sender<CatalogObjectInfoOrErr>,
+    > + StorageNamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
+{
+}
+
+impl<T> TableCatalogStorage for T where
+    T: StorageObjectIO<
+            Error = EcstoreError,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        > + StorageObjectOperations<
+            Error = EcstoreError,
+            ObjectInfo = ObjectInfo,
+            ObjectOptions = ObjectOptions,
+            FileInfo = FileInfo,
+            ObjectToDelete = ObjectToDelete,
+            DeletedObject = DeletedObject,
+        > + StorageListOperations<
+            Error = EcstoreError,
+            ListObjectsV2Info = CatalogListObjectsV2Info,
+            ListObjectVersionsInfo = CatalogListObjectVersionsInfo,
+            ObjectInfoOrErr = CatalogObjectInfoOrErr,
+            WalkOptions = CatalogWalkOptions,
+            WalkCancellation = tokio_util::sync::CancellationToken,
+            WalkResultSender = tokio::sync::mpsc::Sender<CatalogObjectInfoOrErr>,
+        > + StorageNamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
+{
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogIdentifierError {
@@ -3487,7 +3556,7 @@ impl<S> Clone for EcStoreTableCatalogObjectBackend<S> {
 
 impl<S> EcStoreTableCatalogObjectBackend<S>
 where
-    S: ObjectIO + ObjectOperations + ListOperations + NamespaceLocking,
+    S: TableCatalogStorage,
 {
     pub fn new(store: Arc<S>) -> Self {
         Self { store }
@@ -3499,7 +3568,7 @@ pub(crate) type EcStoreTableCatalogStore<S> = ObjectTableCatalogStore<EcStoreTab
 #[async_trait::async_trait]
 impl<S> TableCatalogObjectBackend for EcStoreTableCatalogObjectBackend<S>
 where
-    S: ObjectIO + ObjectOperations + ListOperations + NamespaceLocking,
+    S: TableCatalogStorage,
 {
     async fn read_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
         self.read_object_with_options(bucket, object, ObjectOptions::default()).await
@@ -3598,7 +3667,7 @@ where
 
 impl<S> EcStoreTableCatalogObjectBackend<S>
 where
-    S: ObjectIO + ObjectOperations + ListOperations + NamespaceLocking,
+    S: TableCatalogStorage,
 {
     async fn read_object_with_options(
         &self,

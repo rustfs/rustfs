@@ -107,6 +107,10 @@ impl LegacyReedSolomonEncoder {
     }
 
     fn reconstruct_data(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+        if recover_empty_payload_data_shards(shards, self.data_shards, self.parity_shards)? {
+            return Ok(());
+        }
+
         let shard_len = shards
             .iter()
             .find_map(|s| s.as_ref().map(|v| v.len()))
@@ -235,6 +239,10 @@ impl ReedSolomonEncoder {
 
     /// Reconstruct missing data shards.
     pub fn reconstruct_data(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+        if recover_empty_payload_data_shards(shards, self.data_shards, self.parity_shards)? {
+            return Ok(());
+        }
+
         if let Some(ref rs) = self.encoder {
             rs.reconstruct_data(shards)
                 .map_err(|e| io::Error::other(format!("Reed-Solomon reconstruct failed: {e:?}")))
@@ -278,6 +286,22 @@ where
         }
     }
 
+    if shard_len == 0 {
+        for (index, shard) in shards.iter().enumerate() {
+            let shard = shard
+                .as_ref()
+                .ok_or_else(|| io::Error::other(format!("missing shard {index} after data reconstruction")))?;
+            if !shard.is_empty() {
+                return Err(io::Error::other(format!(
+                    "inconsistent shard length at index {index}: got {}, expected {}",
+                    shard.len(),
+                    shard_len
+                )));
+            }
+        }
+        return Ok(());
+    }
+
     let mut shard_refs: SmallVec<[&mut [u8]; 16]> = SmallVec::new();
     for (index, shard) in shards.iter_mut().enumerate() {
         let shard = shard
@@ -294,6 +318,39 @@ where
     }
 
     encode(shard_refs)
+}
+
+fn recover_empty_payload_data_shards(
+    shards: &mut [Option<Vec<u8>>],
+    data_shards: usize,
+    parity_shards: usize,
+) -> io::Result<bool> {
+    let expected_shards = data_shards + parity_shards;
+    if shards.len() != expected_shards {
+        return Err(io::Error::other(format!(
+            "invalid shard count: got {}, expected {}",
+            shards.len(),
+            expected_shards
+        )));
+    }
+
+    let mut has_present_shard = false;
+    for shard in shards.iter().filter_map(|shard| shard.as_ref()) {
+        has_present_shard = true;
+        if !shard.is_empty() {
+            return Ok(false);
+        }
+    }
+    if !has_present_shard {
+        return Ok(false);
+    }
+
+    for shard in shards.iter_mut().take(data_shards) {
+        if shard.is_none() {
+            *shard = Some(Vec::new());
+        }
+    }
+    Ok(true)
 }
 
 /// Erasure coding utility for data reliability using Reed-Solomon codes.
@@ -859,6 +916,27 @@ mod tests {
                 shard.as_deref(),
                 Some(encoded[index].as_ref()),
                 "shard {index} should match encoded source"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_decode_data_and_parity_reconstructs_empty_object_shards() {
+        let erasure = Erasure::new_with_options(3, 3, 64, true);
+        let encoded = erasure.encode_data(&[]).expect("empty encode should succeed");
+        let mut shards = optional_shards(&encoded);
+        shards[1] = None;
+        shards[4] = None;
+
+        erasure
+            .decode_data_and_parity(&mut shards)
+            .expect("empty decode should rebuild missing shards without SIMD");
+
+        for (index, shard) in shards.iter().enumerate() {
+            assert_eq!(
+                shard.as_deref(),
+                Some(encoded[index].as_ref()),
+                "empty shard {index} should match encoded source"
             );
         }
     }

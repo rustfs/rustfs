@@ -14,7 +14,9 @@
 
 use std::sync::Arc;
 
-use crate::data_usage_define::{BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH};
+use crate::data_usage_define::{
+    BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH, ScannerObjectIO,
+};
 use crate::runtime_config::{
     current_scanner_runtime_config, lookup_scanner_runtime_config, refresh_scanner_runtime_config_from_global,
     scanner_bitrot_cycle, scanner_cycle_interval, scanner_start_delay, set_scanner_default_cycle_secs,
@@ -45,7 +47,6 @@ use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 use rustfs_ecstore::error::Error as EcstoreError;
 use rustfs_ecstore::global::is_erasure_sd;
 use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::ObjectIO;
 use rustfs_storage_api::{BucketOperations, BucketOptions, NamespaceLocking as _};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -976,7 +977,7 @@ impl Drop for ScannerScanModeGuard {
 #[instrument(skip(ctx, storeapi))]
 pub async fn store_data_usage_in_backend(
     ctx: CancellationToken,
-    storeapi: Arc<impl ObjectIO>,
+    storeapi: Arc<impl ScannerObjectIO>,
     mut receiver: mpsc::Receiver<DataUsageInfo>,
 ) {
     let mut attempts = 1u32;
@@ -1069,7 +1070,10 @@ pub async fn store_data_usage_in_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_ecstore::store_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
+    use crate::{
+        ScannerGetObjectReader as GetObjectReader, ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions,
+        ScannerPutObjReader as PutObjReader,
+    };
     use serial_test::serial;
     use std::collections::HashMap;
     use std::io::Cursor;

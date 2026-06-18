@@ -53,11 +53,10 @@
 
 use super::account::validate_account_access;
 use super::container::ContainerMapper;
-use super::object::{ObjectKeyMapper, head_object};
+use super::object::{ObjectKeyMapper, SwiftObjectOptions as ObjectOptions, head_object};
 use super::{SwiftError, SwiftResult};
 use rustfs_credentials::Credentials;
 use rustfs_ecstore::resolve_object_store_handle;
-use rustfs_ecstore::store_api::ObjectOptions;
 use rustfs_storage_api::{ListOperations as _, ObjectOperations as _};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error};

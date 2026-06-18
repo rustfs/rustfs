@@ -33,11 +33,15 @@ use rustfs_ecstore::{
     config::{com::save_config, storageclass},
     disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
     error::{Error, Result as StorageResult, StorageError},
-    store_api::{ObjectIO, ObjectInfo, ObjectOptions},
 };
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use tokio::time::{Duration, Instant, sleep, timeout};
 use tracing::warn;
+
+pub use crate::storage_compat::{
+    ScannerGetObjectReader, ScannerObjectIO, ScannerObjectInfo, ScannerObjectOptions, ScannerObjectToDelete, ScannerPutObjReader,
+};
+use crate::storage_compat::{ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions};
 
 // Data usage constants
 pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
@@ -616,7 +620,7 @@ impl DataUsageCache {
     /// Only backend errors are returned as errors.
     /// The loader is optimistic and has no locking, but tries 5 times before giving up.
     /// If the object is not found, a nil error with empty data usage cache is returned.
-    pub async fn load<S: ObjectIO>(&mut self, store: Arc<S>, name: &str) -> StorageResult<()> {
+    pub async fn load<S: ScannerObjectIO>(&mut self, store: Arc<S>, name: &str) -> StorageResult<()> {
         // By default, empty data usage cache
         *self = DataUsageCache::default();
 
@@ -671,7 +675,7 @@ impl DataUsageCache {
     }
     // Inner load function that attempts to load from a specific path
     // Returns (should_retry, cache_option, error_option)
-    async fn try_load_inner<S: ObjectIO>(
+    async fn try_load_inner<S: ScannerObjectIO>(
         store: Arc<S>,
         load_name: &str,
         timeout_duration: Duration,
@@ -866,7 +870,7 @@ impl DataUsageCache {
         Err(last_err.unwrap_or_else(|| StorageError::other("Failed to save data usage cache".to_string())))
     }
 
-    async fn save_path_with_retry<S: ObjectIO>(
+    async fn save_path_with_retry<S: ScannerObjectIO>(
         store: Arc<S>,
         path: &str,
         buf: &[u8],
@@ -889,7 +893,7 @@ impl DataUsageCache {
         .await
     }
 
-    pub async fn save<S: ObjectIO>(&self, store: Arc<S>, name: &str) -> StorageResult<()> {
+    pub async fn save<S: ScannerObjectIO>(&self, store: Arc<S>, name: &str) -> StorageResult<()> {
         let mut buf = Vec::new();
         self.serialize(&mut rmp_serde::Serializer::new(&mut buf))?;
         let timeout_duration = Self::cache_save_timeout();

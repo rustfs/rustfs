@@ -23,6 +23,7 @@ use crate::app::context::{
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
+use crate::storage::StorageObjectInfo as ObjectInfo;
 use crate::storage::access::{ReqInfo, authorize_request, req_info_ref};
 use crate::storage::helper::{OperationHelper, spawn_background_with_context};
 use crate::storage::s3_api::bucket::{
@@ -57,15 +58,16 @@ use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::notification_sys::get_global_notification_sys;
 use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::{ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo};
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::{
     action::{Action, S3Action},
     {BucketPolicy, BucketPolicyArgs, Effect, Validator},
 };
 use rustfs_s3_ops::S3Operation;
-use rustfs_storage_api::ListOperations as _;
-use rustfs_storage_api::{BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
+use rustfs_storage_api::{
+    BucketOperations, BucketOptions, DeleteBucketOptions, ListObjectVersionsInfo as StorageListObjectVersionsInfo,
+    ListObjectsV2Info as StorageListObjectsV2Info, ListOperations as _, MakeBucketOptions,
+};
 use rustfs_targets::{
     EventName,
     arn::{ARN, TargetIDError},
@@ -88,6 +90,9 @@ use tracing::{debug, error, info, instrument, warn};
 const LOG_COMPONENT_APP: &str = "app";
 const LOG_SUBSYSTEM_BUCKET: &str = "bucket";
 use urlencoding::encode;
+
+type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
+type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
 
 fn serialize_config<T: xml::Serialize>(value: &T) -> S3Result<Vec<u8>> {
     serialize(value).map_err(to_internal_error)

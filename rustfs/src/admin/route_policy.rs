@@ -36,6 +36,7 @@ const EXPORT_BUCKET_METADATA: AdminActionRef = AdminActionRef::new("ExportBucket
 const EXPORT_IAM: AdminActionRef = AdminActionRef::new("ExportIAMAction");
 const GET_BUCKET_TARGET: AdminActionRef = AdminActionRef::new("GetBucketTargetAction");
 const GET_GROUP: AdminActionRef = AdminActionRef::new("GetGroupAdminAction");
+const GET_METRICS: AdminActionRef = AdminActionRef::new("GetMetricsAction");
 const GET_POLICY: AdminActionRef = AdminActionRef::new("GetPolicyAdminAction");
 const GET_REPLICATION_METRICS: AdminActionRef = AdminActionRef::new("GetReplicationMetricsAction");
 const GET_TABLE: AdminActionRef = AdminActionRef::new("GetTableAction");
@@ -227,6 +228,7 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(HttpMethod::Get, "/rustfs/admin/v3/info", SERVER_INFO, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Get, "/rustfs/admin/v3/storageinfo", STORAGE_INFO, RouteRiskLevel::Sensitive),
+    admin(HttpMethod::Get, "/rustfs/admin/v3/metrics", GET_METRICS, RouteRiskLevel::Sensitive),
     admin(
         HttpMethod::Post,
         "/rustfs/admin/v3/pools/decommission",
@@ -1148,7 +1150,6 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
         "/rustfs/admin/v3/object-zip-downloads/{id}.zip",
         DeferredRoutePolicyReason::CredentialOnly,
     ),
-    deferred(HttpMethod::Get, "/rustfs/admin/v3/metrics", DeferredRoutePolicyReason::CredentialOnly),
     deferred(HttpMethod::Get, "/rustfs/admin/v3/pools/list", DeferredRoutePolicyReason::MultipleActions),
     deferred(
         HttpMethod::Get,
@@ -1463,6 +1464,11 @@ mod tests {
             "/rustfs/admin/v3/object-zip-downloads/{id}.zip",
             DeferredRoutePolicyReason::CredentialOnly,
         );
+    }
+
+    #[test]
+    fn route_policy_maps_metrics_to_explicit_admin_action() {
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/metrics", GET_METRICS);
     }
 
     fn route_policy_inventory_keys() -> BTreeSet<String> {

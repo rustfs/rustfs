@@ -57,7 +57,6 @@ use rustfs_ecstore::disk::{Disk, DiskAPI as _, DiskInfoOptions};
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::global::is_erasure;
 use rustfs_ecstore::pools::{path2_bucket_object, path2_bucket_object_with_base_path};
-use rustfs_ecstore::store_api::{ObjectInfo, ObjectToDelete};
 use rustfs_ecstore::store_utils::is_reserved_or_invalid_bucket;
 use rustfs_filemeta::{
     MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ReplicateObjectInfo, ReplicationStatusType, ReplicationType,
@@ -69,6 +68,8 @@ use tokio::select;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
+
+use crate::{ScannerObjectInfo as ObjectInfo, ScannerObjectToDelete as ObjectToDelete};
 
 const LOG_COMPONENT_SCANNER: &str = "scanner";
 const LOG_SUBSYSTEM_FOLDER: &str = "folder";

@@ -27,6 +27,13 @@ pub(crate) mod sse;
 pub mod timeout_wrapper;
 pub mod tonic_service;
 
+pub(crate) type StorageDeletedObject = rustfs_ecstore::store_api::DeletedObject;
+pub(crate) type StorageGetObjectReader = rustfs_ecstore::store_api::GetObjectReader;
+pub(crate) type StorageObjectInfo = rustfs_ecstore::store_api::ObjectInfo;
+pub(crate) type StorageObjectOptions = rustfs_ecstore::store_api::ObjectOptions;
+pub(crate) type StorageObjectToDelete = rustfs_ecstore::store_api::ObjectToDelete;
+pub(crate) type StoragePutObjReader = rustfs_ecstore::store_api::PutObjReader;
+
 #[cfg(test)]
 mod concurrent_fix_test;
 #[cfg(test)]

@@ -74,11 +74,12 @@ use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::compress::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
 use rustfs_ecstore::config::storageclass;
 use rustfs_ecstore::disk::{error::DiskError, error_reduce::is_all_buckets_not_found};
-use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
+use rustfs_ecstore::error::{
+    Error as EcstoreError, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
+};
 use rustfs_ecstore::rio::{DynReader, HashReader, WritePlan, wrap_reader};
 use rustfs_ecstore::set_disk::{get_lock_acquire_timeout, is_valid_storage_class};
 use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::{NamespaceLocking, ObjectInfo, ObjectOptions, ObjectToDelete, PutObjReader};
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateTargetDecision, ReplicationState, ReplicationStatusType,
     ReplicationType, RestoreStatusOps, VersionPurgeStatusType, parse_restore_obj_status, replication_statuses_map,
@@ -93,7 +94,7 @@ use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_fo
 use rustfs_s3select_api::object_store::bytes_stream;
 #[cfg(test)]
 use rustfs_storage_api::HTTPPreconditions;
-use rustfs_storage_api::{HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
+use rustfs_storage_api::{HTTPRangeSpec, NamespaceLocking, ObjectIO as _, ObjectOperations as _};
 use rustfs_targets::{
     EventName, extract_params_header, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
 };
@@ -134,6 +135,11 @@ use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
+
+use crate::storage::{
+    StorageDeletedObject, StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions,
+    StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
+};
 
 const ACCEPT_RANGES_BYTES: &str = "bytes";
 const MAX_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
@@ -776,7 +782,7 @@ fn delete_replication_state_from_config(
 
 async fn enrich_delete_replication_state_if_needed(
     bucket: &str,
-    delete_object: &mut rustfs_ecstore::store_api::DeletedObject,
+    delete_object: &mut StorageDeletedObject,
     obj_info: &ObjectInfo,
 ) {
     let Some(replication_state) = delete_object.replication_state.as_ref() else {
@@ -876,11 +882,10 @@ fn copy_namespace_lock_error(bucket: &str, object: &str, mode: &'static str, err
     }
 }
 
-async fn acquire_self_copy_namespace_lock<S: NamespaceLocking + ?Sized>(
-    store: &S,
-    bucket: &str,
-    object: &str,
-) -> S3Result<NamespaceLockGuard> {
+async fn acquire_self_copy_namespace_lock<S>(store: &S, bucket: &str, object: &str) -> S3Result<NamespaceLockGuard>
+where
+    S: NamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper> + ?Sized,
+{
     let object = encode_dir_object(object);
     let lock = store.new_ns_lock(bucket, &object).await.map_err(ApiError::from)?;
     lock.get_write_lock(get_lock_acquire_timeout())
@@ -3379,7 +3384,7 @@ impl DefaultObjectUsecase {
 
         #[derive(Default, Clone)]
         struct DeleteResult {
-            delete_object: Option<rustfs_ecstore::store_api::DeletedObject>,
+            delete_object: Option<StorageDeletedObject>,
             error: Option<Error>,
         }
 
@@ -3822,7 +3827,7 @@ impl DefaultObjectUsecase {
         if obj_info.name.is_empty() {
             if replicate_force_delete {
                 schedule_replication_delete(DeletedObjectReplicationInfo {
-                    delete_object: rustfs_ecstore::store_api::DeletedObject {
+                    delete_object: StorageDeletedObject {
                         object_name: key.clone(),
                         force_delete: true,
                         ..Default::default()
@@ -3870,7 +3875,7 @@ impl DefaultObjectUsecase {
         if schedule_delete_replication {
             let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Replication);
             let mut deleted_object = DeletedObjectReplicationInfo {
-                delete_object: rustfs_ecstore::store_api::DeletedObject {
+                delete_object: StorageDeletedObject {
                     delete_marker: deleted_object_source.delete_marker && !deleted_delete_marker_version,
                     delete_marker_version_id: if deleted_object_source.delete_marker {
                         deleted_object_source.version_id
@@ -6308,7 +6313,7 @@ mod tests {
 
     #[test]
     fn replica_delete_enrichment_must_not_reuse_upstream_targets() {
-        let delete_object = rustfs_ecstore::store_api::DeletedObject {
+        let delete_object = StorageDeletedObject {
             replication_state: Some(ReplicationState {
                 replicate_decision_str: "arn:aws:s3:::upstream=true;false;arn:aws:s3:::upstream;".to_string(),
                 replication_status_internal: Some("arn:aws:s3:::upstream=COMPLETED;".to_string()),
