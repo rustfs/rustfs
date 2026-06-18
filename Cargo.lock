@@ -9624,6 +9624,7 @@ version = "1.0.0-beta.8"
 dependencies = [
  "aes-gcm",
  "arc-swap",
+ "argon2",
  "async-trait",
  "base64 0.22.1",
  "chacha20poly1305",
