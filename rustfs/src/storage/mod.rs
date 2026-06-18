@@ -28,11 +28,11 @@ pub(crate) mod storage_compat;
 pub mod timeout_wrapper;
 pub mod tonic_service;
 
-pub(crate) type StorageDeletedObject = crate::storage::storage_compat::ecstore::store_api::DeletedObject;
+pub(crate) type StorageDeletedObject = rustfs_storage_api::DeletedObject;
 pub(crate) type StorageGetObjectReader = crate::storage::storage_compat::ecstore::store_api::GetObjectReader;
 pub(crate) type StorageObjectInfo = crate::storage::storage_compat::ecstore::store_api::ObjectInfo;
 pub(crate) type StorageObjectOptions = crate::storage::storage_compat::ecstore::store_api::ObjectOptions;
-pub(crate) type StorageObjectToDelete = crate::storage::storage_compat::ecstore::store_api::ObjectToDelete;
+pub(crate) type StorageObjectToDelete = rustfs_storage_api::ObjectToDelete;
 pub(crate) type StoragePutObjReader = crate::storage::storage_compat::ecstore::store_api::PutObjReader;
 
 #[cfg(test)]

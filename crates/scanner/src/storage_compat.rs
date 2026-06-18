@@ -16,8 +16,12 @@ use http::HeaderMap;
 pub(crate) mod ecstore {
     pub(crate) use rustfs_ecstore::{
         bucket, cache_value, config, data_usage, disk, error, global, pools, resolve_object_store_handle, set_disk, store,
-        store_api, store_utils,
+        store_utils,
     };
+
+    pub(crate) mod store_api {
+        pub(crate) use rustfs_ecstore::store_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
+    }
 }
 pub(crate) use self::ecstore::{
     bucket::{
@@ -49,11 +53,11 @@ pub(crate) use self::ecstore::{
     store::ECStore,
     store_api::{
         GetObjectReader as EcstoreGetObjectReader, ObjectInfo as EcstoreObjectInfo, ObjectOptions as EcstoreObjectOptions,
-        ObjectToDelete as EcstoreObjectToDelete, PutObjReader as EcstorePutObjReader,
+        PutObjReader as EcstorePutObjReader,
     },
     store_utils::is_reserved_or_invalid_bucket,
 };
-use rustfs_storage_api::{HTTPRangeSpec, ObjectIO};
+use rustfs_storage_api::{HTTPRangeSpec, ObjectIO, ObjectToDelete};
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -65,7 +69,7 @@ pub(crate) use self::ecstore::{
 pub type ScannerGetObjectReader = EcstoreGetObjectReader;
 pub type ScannerObjectInfo = EcstoreObjectInfo;
 pub type ScannerObjectOptions = EcstoreObjectOptions;
-pub type ScannerObjectToDelete = EcstoreObjectToDelete;
+pub type ScannerObjectToDelete = ObjectToDelete;
 pub type ScannerPutObjReader = EcstorePutObjReader;
 
 pub(crate) fn resolve_scanner_object_store_handle() -> Option<Arc<ECStore>> {

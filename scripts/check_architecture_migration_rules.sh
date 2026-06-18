@@ -57,11 +57,14 @@ STORE_API_OBJECT_HELPER_REEXPORTS_FILE="${TMP_DIR}/store_api_object_helper_reexp
 STORE_API_RANGE_HELPER_REEXPORTS_FILE="${TMP_DIR}/store_api_range_helper_reexports.txt"
 STORE_API_LIST_HELPER_REEXPORTS_FILE="${TMP_DIR}/store_api_list_helper_reexports.txt"
 STORE_API_LIST_RESPONSE_REEXPORTS_FILE="${TMP_DIR}/store_api_list_response_reexports.txt"
+STORE_API_DELETE_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_delete_dto_reexports.txt"
+STORE_API_DELETE_DTO_INTERNAL_HITS_FILE="${TMP_DIR}/store_api_delete_dto_internal_hits.txt"
 STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_list_consumer_hits.txt"
 STORE_API_EXTERNAL_OPERATION_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_operation_consumer_hits.txt"
 STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE="${TMP_DIR}/store_api_object_operation_local_method_hits.txt"
 DIRECT_ECSTORE_IMPORT_HITS_FILE="${TMP_DIR}/direct_ecstore_import_hits.txt"
 PRODUCTION_UNUSED_COMPAT_ALLOW_HITS_FILE="${TMP_DIR}/production_unused_compat_allow_hits.txt"
+BROAD_STORE_API_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/broad_store_api_compat_reexport_hits.txt"
 
 awk '
   /^## PR Types$/ {
@@ -204,6 +207,10 @@ require_source_line \
   "storage-api public object helper contract re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
+  "pub use object::{DeletedObject, ObjectToDelete};" \
+  "storage-api public delete object contract re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
   "pub use object::{ListObjectVersionsInfo, ListObjectsInfo, ListObjectsV2Info, ListOperations, ObjectInfoOrErr};" \
   "storage-api public list response contract re-export"
 require_source_line \
@@ -304,6 +311,26 @@ fi
 
 (
   cd "$ROOT_DIR"
+  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:DeletedObject|ObjectToDelete)\b|::(?:DeletedObject|ObjectToDelete)\b)|pub struct (?:DeletedObject|ObjectToDelete)\b' \
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
+) >"$STORE_API_DELETE_DTO_REEXPORTS_FILE"
+
+if [[ -s "$STORE_API_DELETE_DTO_REEXPORTS_FILE" ]]; then
+  report_failure "old ecstore store_api delete DTO path reintroduced: $(paste -sd '; ' "$STORE_API_DELETE_DTO_REEXPORTS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'crate::store_api::(?:DeletedObject|ObjectToDelete)|store_api::\{[^}]*\b(?:DeletedObject|ObjectToDelete)\b' \
+    crates/ecstore/src --glob '*.rs' --glob '!store_api/types.rs' || true
+) >"$STORE_API_DELETE_DTO_INTERNAL_HITS_FILE"
+
+if [[ -s "$STORE_API_DELETE_DTO_INTERNAL_HITS_FILE" ]]; then
+  report_failure "ecstore internal delete DTO old store_api path reintroduced: $(paste -sd '; ' "$STORE_API_DELETE_DTO_INTERNAL_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
   rg -n --no-heading 'rustfs_ecstore::store_api(?:::\{[^}]*\b(?:ListObjectVersionsInfo|ListObjectsV2Info|ObjectInfoOrErr)\b|::(?:ListObjectVersionsInfo|ListObjectsV2Info|ObjectInfoOrErr)\b)' \
     rustfs/src crates/iam/src || true
 ) >"$STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE"
@@ -346,6 +373,19 @@ fi
 
 if [[ -s "$PRODUCTION_UNUSED_COMPAT_ALLOW_HITS_FILE" ]]; then
   report_failure "production storage compatibility boundaries must not hide unused ECStore re-exports: $(paste -sd '; ' "$PRODUCTION_UNUSED_COMPAT_ALLOW_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading '(?:use|pub(?:\([^)]*\))? use) rustfs_ecstore::\{[^}]*\bstore_api\b[^}]*\}|(?:use|pub(?:\([^)]*\))? use) rustfs_ecstore::store_api\s*(?:;|as\b)' \
+    rustfs/src crates/*/src fuzz/fuzz_targets \
+    --glob '*storage_compat.rs' \
+    --glob '!crates/ecstore/**' \
+    --glob '!crates/e2e_test/**' || true
+) >"$BROAD_STORE_API_COMPAT_REEXPORT_HITS_FILE"
+
+if [[ -s "$BROAD_STORE_API_COMPAT_REEXPORT_HITS_FILE" ]]; then
+  report_failure "storage compatibility boundaries must expose explicit store_api contracts only: $(paste -sd '; ' "$BROAD_STORE_API_COMPAT_REEXPORT_HITS_FILE")"
 fi
 
 (

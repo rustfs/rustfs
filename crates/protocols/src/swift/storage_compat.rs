@@ -13,7 +13,11 @@
 // limitations under the License.
 
 mod ecstore {
-    pub(super) use rustfs_ecstore::{bucket, error, resolve_object_store_handle, store, store_api};
+    pub(super) use rustfs_ecstore::{bucket, error, resolve_object_store_handle, store};
+
+    pub(super) mod store_api {
+        pub(crate) use rustfs_ecstore::store_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
+    }
 }
 use self::ecstore::{
     bucket::{metadata::BucketMetadata, metadata_sys},

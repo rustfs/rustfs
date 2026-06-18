@@ -13,7 +13,11 @@
 // limitations under the License.
 
 pub(crate) mod ecstore {
-    pub(crate) use rustfs_ecstore::{data_usage, disk, error, global, store, store_api};
+    pub(crate) use rustfs_ecstore::{data_usage, disk, error, global, store};
+
+    pub(crate) mod store_api {
+        pub(crate) use rustfs_ecstore::store_api::{ObjectInfo, ObjectOptions, PutObjReader};
+    }
 }
 pub(crate) use self::ecstore::{
     data_usage::DATA_USAGE_CACHE_NAME,
