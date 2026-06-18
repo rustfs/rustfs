@@ -59,7 +59,7 @@ fn convert_ecstore_event_args(args: EcstoreEventArgs) -> Option<NotifyEventArgs>
     Some(NotifyEventArgs {
         event_name,
         bucket_name: args.bucket_name,
-        object: args.object,
+        object: args.object.into(),
         req_params,
         resp_elements,
         version_id,

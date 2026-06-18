@@ -19,8 +19,6 @@ use rustfs_s3_types::{EventName, event_schema_version};
 use serde::{Deserialize, Serialize};
 use url::form_urlencoded;
 
-use crate::storage_compat::NotifyObjectInfo;
-
 /// Represents the identity of the user who triggered the event
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,6 +62,22 @@ pub struct Object {
     pub version_id: Option<String>,
     /// A unique identifier for the event
     pub sequencer: String,
+}
+
+/// Object metadata required by notification event serialization.
+#[derive(Debug, Clone, Default)]
+pub struct NotifyObjectInfo {
+    pub bucket: String,
+    pub name: String,
+    pub size: i64,
+    pub etag: Option<String>,
+    pub content_type: Option<String>,
+    pub user_defined: HashMap<String, String>,
+    pub version_id: Option<String>,
+    pub mod_time: Option<DateTime<Utc>>,
+    pub restore_expires: Option<DateTime<Utc>>,
+    pub storage_class: Option<String>,
+    pub transitioned_tier: Option<String>,
 }
 
 /// Metadata about the event
@@ -206,7 +220,7 @@ impl Event {
     pub fn new(args: EventArgs) -> Self {
         let event_time = Utc::now().naive_local();
         let sequencer = match args.object.mod_time {
-            Some(t) => format!("{:X}", t.unix_timestamp_nanos()),
+            Some(t) => format!("{:X}", t.timestamp_nanos_opt().unwrap_or(0)),
             None => format!("{:X}", event_time.and_utc().timestamp_nanos_opt().unwrap_or(0)),
         };
 
@@ -217,10 +231,7 @@ impl Event {
         let key_name = form_urlencoded::byte_serialize(args.object.name.as_bytes()).collect::<String>();
         let principal_id = args.req_params.get("principalId").unwrap_or(&String::new()).to_string();
 
-        let version_id = match args.object.version_id {
-            Some(id) => Some(id.to_string()),
-            None => Some(args.version_id.clone()),
-        };
+        let version_id = args.object.version_id.clone().or_else(|| Some(args.version_id.clone()));
 
         let mut s3_metadata = Metadata {
             schema_version: "1.0".to_string(),
@@ -257,11 +268,12 @@ impl Event {
         }
 
         let glacier_event_data = if args.event_name == EventName::ObjectRestoreCompleted {
-            args.object.restore_expires.and_then(|expiry| {
-                let expiry_time = DateTime::<Utc>::from_timestamp(expiry.unix_timestamp(), expiry.nanosecond())?;
-                let storage_class = args.object.storage_class.clone().or_else(|| {
-                    (!args.object.transitioned_object.tier.is_empty()).then_some(args.object.transitioned_object.tier.clone())
-                })?;
+            args.object.restore_expires.and_then(|expiry_time| {
+                let storage_class = args
+                    .object
+                    .storage_class
+                    .clone()
+                    .or_else(|| args.object.transitioned_tier.clone())?;
                 Some(GlacierEventData {
                     restore_event_data: RestoreEventData {
                         lifecycle_restoration_expiry_time: expiry_time.to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -367,11 +379,11 @@ pub struct EventArgsBuilder {
 
 impl EventArgsBuilder {
     /// Creates a new builder with the required fields.
-    pub fn new(event_name: EventName, bucket_name: impl Into<String>, object: NotifyObjectInfo) -> Self {
+    pub fn new(event_name: EventName, bucket_name: impl Into<String>, object: impl Into<NotifyObjectInfo>) -> Self {
         Self {
             event_name,
             bucket_name: bucket_name.into(),
-            object,
+            object: object.into(),
             ..Default::default()
         }
     }
@@ -389,8 +401,8 @@ impl EventArgsBuilder {
     }
 
     /// Sets the object information.
-    pub fn object(mut self, object: NotifyObjectInfo) -> Self {
-        self.object = object;
+    pub fn object(mut self, object: impl Into<NotifyObjectInfo>) -> Self {
+        self.object = object.into();
         self
     }
 
@@ -503,7 +515,7 @@ mod tests {
             NotifyObjectInfo {
                 bucket: "bucket".to_string(),
                 name: "key".to_string(),
-                restore_expires: Some(time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()),
+                restore_expires: DateTime::<Utc>::from_timestamp(1_700_000_000, 0),
                 storage_class: Some("GLACIER".to_string()),
                 ..Default::default()
             },
