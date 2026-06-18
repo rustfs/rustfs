@@ -797,8 +797,12 @@ async fn wait_decommission_worker_drain(workers: &Semaphore, limit: usize) -> Re
     Ok(())
 }
 
-fn is_decommission_cancel_terminal(complete: bool, failed: bool, canceled: bool) -> bool {
-    complete || failed || canceled
+fn should_reject_decommission_cancel_as_terminal(complete: bool, failed: bool) -> bool {
+    complete || failed
+}
+
+fn should_retry_decommission_cancel_reload(changed: bool, already_canceled: bool) -> bool {
+    changed || already_canceled
 }
 
 fn ensure_decommission_cancel_allowed(pool_present: bool, decommission_present: bool, terminal: bool) -> Result<()> {
@@ -1940,11 +1944,13 @@ impl ECStore {
     pub async fn decommission_cancel(&self, idx: usize) -> Result<()> {
         ensure_decommission_terminal_operation_supported(self.single_pool(), "cancel decommission")?;
 
-        let should_reload_pool_meta = {
+        let (should_save_pool_meta, should_reload_pool_meta, already_canceled) = {
             let mut lock = self.pool_meta.write().await;
+            let mut already_canceled = false;
             let (pool_present, decommission_present, terminal) = if let Some(pool) = lock.pools.get(idx) {
                 if let Some(info) = pool.decommission.as_ref() {
-                    (true, true, is_decommission_cancel_terminal(info.complete, info.failed, info.canceled))
+                    already_canceled = info.canceled;
+                    (true, true, should_reject_decommission_cancel_as_terminal(info.complete, info.failed))
                 } else {
                     (true, false, false)
                 }
@@ -1953,14 +1959,19 @@ impl ECStore {
             };
 
             ensure_decommission_cancel_allowed(pool_present, decommission_present, terminal)?;
-            lock.decommission_cancel(idx)
+            let changed = lock.decommission_cancel(idx);
+            (
+                changed,
+                should_retry_decommission_cancel_reload(changed, already_canceled),
+                already_canceled,
+            )
         };
 
         let canceled_worker = {
             let mut cancelers = self.decommission_cancelers.write().await;
             take_and_cancel_decommission_canceler(cancelers.as_mut_slice(), idx)
         };
-        if !canceled_worker {
+        if !canceled_worker && !already_canceled {
             warn!(
                 event = EVENT_DECOMMISSION_STATE,
                 component = LOG_COMPONENT_ECSTORE,
@@ -1972,7 +1983,7 @@ impl ECStore {
             );
         }
 
-        if should_reload_pool_meta {
+        if should_save_pool_meta {
             self.save_current_pool_meta().await?;
         }
 
@@ -4309,21 +4320,22 @@ mod pools_tests {
         ensure_decommission_start_rebalance_meta_allowed, ensure_decommission_terminal_operation_supported,
         ensure_local_decommission_pool_leaders, ensure_valid_decommission_pool_index, first_resumable_decommission_queue_indices,
         get_by_index, has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_requested,
-        is_decommission_cancel_terminal, load_decommission_entry_versions, local_decommission_queue_prefix,
-        mark_decommission_bucket_done, missing_decommission_worker_prefix, observe_decommission_terminal_reload_result,
-        pool_meta_has_active_decommission, require_decommission_store, resolve_decommission_bucket_done_save_result,
-        resolve_decommission_bucket_state, resolve_decommission_check_after_list_result,
-        resolve_decommission_entry_cleanup_delete_result, resolve_decommission_entry_reload_result,
-        resolve_decommission_listing_worker_result, resolve_decommission_optional_bucket_config_result,
-        resolve_decommission_pool_meta_reload_result, resolve_decommission_preflight_heal_result,
-        resolve_decommission_progress_save_result, resolve_decommission_spawn_failure_result,
-        resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
-        resolve_decommission_update_after_result, resolve_start_decommission_pool_meta_reload_result,
-        rollback_start_decommission_pool_meta, run_decommission_buckets_bounded, should_cleanup_decommission_source_entry,
-        should_continue_decommission_queue, should_count_decommission_version_complete,
-        should_preserve_decommission_canceled_state, should_skip_canceled_decommission_routine, split_decommission_buckets,
-        take_and_cancel_decommission_canceler, take_decommission_canceler, track_decommission_current_object,
-        validate_start_decommission_request, wait_decommission_worker_drain, with_decommission_entry_context,
+        load_decommission_entry_versions, local_decommission_queue_prefix, mark_decommission_bucket_done,
+        missing_decommission_worker_prefix, observe_decommission_terminal_reload_result, pool_meta_has_active_decommission,
+        require_decommission_store, resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
+        resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
+        resolve_decommission_entry_reload_result, resolve_decommission_listing_worker_result,
+        resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,
+        resolve_decommission_preflight_heal_result, resolve_decommission_progress_save_result,
+        resolve_decommission_spawn_failure_result, resolve_decommission_terminal_mark_after_error_result,
+        resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result,
+        resolve_start_decommission_pool_meta_reload_result, rollback_start_decommission_pool_meta,
+        run_decommission_buckets_bounded, should_cleanup_decommission_source_entry, should_continue_decommission_queue,
+        should_count_decommission_version_complete, should_preserve_decommission_canceled_state,
+        should_reject_decommission_cancel_as_terminal, should_retry_decommission_cancel_reload,
+        should_skip_canceled_decommission_routine, split_decommission_buckets, take_and_cancel_decommission_canceler,
+        take_decommission_canceler, track_decommission_current_object, validate_start_decommission_request,
+        wait_decommission_worker_drain, with_decommission_entry_context,
     };
     use crate::data_movement;
     use crate::disk::endpoint::Endpoint;
@@ -5773,23 +5785,25 @@ mod pools_tests {
     }
 
     #[test]
-    fn test_is_decommission_cancel_terminal_true_when_completed() {
-        assert!(is_decommission_cancel_terminal(true, false, false));
+    fn test_should_reject_decommission_cancel_as_terminal_true_when_completed() {
+        assert!(should_reject_decommission_cancel_as_terminal(true, false));
     }
 
     #[test]
-    fn test_is_decommission_cancel_terminal_true_when_failed() {
-        assert!(is_decommission_cancel_terminal(false, true, false));
+    fn test_should_reject_decommission_cancel_as_terminal_true_when_failed() {
+        assert!(should_reject_decommission_cancel_as_terminal(false, true));
     }
 
     #[test]
-    fn test_is_decommission_cancel_terminal_true_when_canceled() {
-        assert!(is_decommission_cancel_terminal(false, false, true));
+    fn test_should_reject_decommission_cancel_as_terminal_false_when_active_or_canceled() {
+        assert!(!should_reject_decommission_cancel_as_terminal(false, false));
     }
 
     #[test]
-    fn test_is_decommission_cancel_terminal_false_when_active() {
-        assert!(!is_decommission_cancel_terminal(false, false, false));
+    fn test_should_retry_decommission_cancel_reload_when_changed_or_already_canceled() {
+        assert!(should_retry_decommission_cancel_reload(true, false));
+        assert!(should_retry_decommission_cancel_reload(false, true));
+        assert!(!should_retry_decommission_cancel_reload(false, false));
     }
 
     #[test]
