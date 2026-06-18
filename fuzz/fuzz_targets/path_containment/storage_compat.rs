@@ -13,21 +13,11 @@
 // limitations under the License.
 
 pub(crate) mod ecstore {
-    #![allow(unused_imports)]
-
     pub(crate) mod bucket {
-        pub(crate) mod bucket_target_sys {
-            pub(crate) use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
+        pub(crate) mod utils {
+            pub(crate) use rustfs_ecstore::bucket::utils::{
+                check_object_name_for_length_and_slash, has_bad_path_component, is_valid_object_prefix,
+            };
         }
-    }
-
-    pub(crate) mod disk {
-        pub(crate) use rustfs_ecstore::disk::{VolumeInfo, WalkDirOptions};
-    }
-
-    pub(crate) mod rpc {
-        pub(crate) use rustfs_ecstore::rpc::{
-            TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client, node_service_time_out_client_no_auth,
-        };
     }
 }

@@ -13,5 +13,11 @@
 // limitations under the License.
 
 pub(crate) mod ecstore {
-    pub(crate) use rustfs_ecstore::bucket;
+    pub(crate) mod bucket {
+        pub(crate) mod utils {
+            pub(crate) use rustfs_ecstore::bucket::utils::{
+                check_bucket_and_object_names, check_list_objs_args, check_valid_bucket_name_strict,
+            };
+        }
+    }
 }

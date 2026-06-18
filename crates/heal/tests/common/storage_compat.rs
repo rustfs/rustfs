@@ -15,5 +15,25 @@
 pub(crate) mod ecstore {
     #![allow(unused_imports)]
 
-    pub(crate) use rustfs_ecstore::{bucket, disk, endpoints, store};
+    pub(crate) mod bucket {
+        pub(crate) mod metadata_sys {
+            pub(crate) use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
+        }
+    }
+
+    pub(crate) mod disk {
+        pub(crate) use rustfs_ecstore::disk::DiskStore;
+
+        pub(crate) mod endpoint {
+            pub(crate) use rustfs_ecstore::disk::endpoint::Endpoint;
+        }
+    }
+
+    pub(crate) mod endpoints {
+        pub(crate) use rustfs_ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+    }
+
+    pub(crate) mod store {
+        pub(crate) use rustfs_ecstore::store::{ECStore, init_local_disks};
+    }
 }
