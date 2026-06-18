@@ -18,10 +18,6 @@ pub(crate) mod ecstore {
         bucket, cache_value, config, data_usage, disk, error, global, pools, resolve_object_store_handle, set_disk, store,
         store_utils,
     };
-
-    pub(crate) mod store_api {
-        pub(crate) use rustfs_ecstore::store_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
-    }
 }
 pub(crate) use self::ecstore::{
     bucket::{
@@ -51,10 +47,6 @@ pub(crate) use self::ecstore::{
     pools::{path2_bucket_object, path2_bucket_object_with_base_path},
     set_disk::SetDisks,
     store::ECStore,
-    store_api::{
-        GetObjectReader as EcstoreGetObjectReader, ObjectInfo as EcstoreObjectInfo, ObjectOptions as EcstoreObjectOptions,
-        PutObjReader as EcstorePutObjReader,
-    },
     store_utils::is_reserved_or_invalid_bucket,
 };
 use rustfs_storage_api::{HTTPRangeSpec, ObjectIO, ObjectToDelete};
@@ -66,11 +58,11 @@ pub(crate) use self::ecstore::{
     disk::{DiskOption, endpoint::Endpoint, new_disk},
 };
 
-pub type ScannerGetObjectReader = EcstoreGetObjectReader;
-pub type ScannerObjectInfo = EcstoreObjectInfo;
-pub type ScannerObjectOptions = EcstoreObjectOptions;
+pub type ScannerGetObjectReader = rustfs_ecstore::store_api::GetObjectReader;
+pub type ScannerObjectInfo = rustfs_ecstore::store_api::ObjectInfo;
+pub type ScannerObjectOptions = rustfs_ecstore::store_api::ObjectOptions;
 pub type ScannerObjectToDelete = ObjectToDelete;
-pub type ScannerPutObjReader = EcstorePutObjReader;
+pub type ScannerPutObjReader = rustfs_ecstore::store_api::PutObjReader;
 
 pub(crate) fn resolve_scanner_object_store_handle() -> Option<Arc<ECStore>> {
     ecstore::resolve_object_store_handle()

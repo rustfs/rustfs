@@ -18,9 +18,10 @@ pub(crate) mod ecstore {
         resolve_object_store_handle, rio, rpc, set_disk, store,
     };
 
-    pub(crate) mod store_api {
-        pub(crate) use rustfs_ecstore::store_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
-    }
+    pub(crate) type GetObjectReader = rustfs_ecstore::store_api::GetObjectReader;
+    pub(crate) type ObjectInfo = rustfs_ecstore::store_api::ObjectInfo;
+    pub(crate) type ObjectOptions = rustfs_ecstore::store_api::ObjectOptions;
+    pub(crate) type PutObjReader = rustfs_ecstore::store_api::PutObjReader;
 
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::config;

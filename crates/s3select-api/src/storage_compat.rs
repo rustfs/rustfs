@@ -14,16 +14,8 @@
 
 pub(crate) mod ecstore {
     pub(crate) use rustfs_ecstore::{error, resolve_object_store_handle, set_disk, store};
-
-    pub(crate) mod store_api {
-        pub(crate) use rustfs_ecstore::store_api::{GetObjectReader, ObjectInfo, ObjectOptions};
-    }
 }
 
-use ecstore::store_api::{
-    GetObjectReader as EcstoreGetObjectReader, ObjectInfo as EcstoreObjectInfo, ObjectOptions as EcstoreObjectOptions,
-};
-
-pub(crate) type SelectGetObjectReader = EcstoreGetObjectReader;
-pub(crate) type SelectObjectInfo = EcstoreObjectInfo;
-pub(crate) type SelectObjectOptions = EcstoreObjectOptions;
+pub(crate) type SelectGetObjectReader = rustfs_ecstore::store_api::GetObjectReader;
+pub(crate) type SelectObjectInfo = rustfs_ecstore::store_api::ObjectInfo;
+pub(crate) type SelectObjectOptions = rustfs_ecstore::store_api::ObjectOptions;

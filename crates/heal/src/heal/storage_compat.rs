@@ -14,10 +14,6 @@
 
 pub(crate) mod ecstore {
     pub(crate) use rustfs_ecstore::{data_usage, disk, error, global, store};
-
-    pub(crate) mod store_api {
-        pub(crate) use rustfs_ecstore::store_api::{ObjectInfo, ObjectOptions, PutObjReader};
-    }
 }
 pub(crate) use self::ecstore::{
     data_usage::DATA_USAGE_CACHE_NAME,
@@ -25,12 +21,11 @@ pub(crate) use self::ecstore::{
     error::{Error as EcstoreError, StorageError},
     global::GLOBAL_LOCAL_DISK_MAP,
     store::ECStore,
-    store_api::{ObjectInfo as EcstoreObjectInfo, ObjectOptions as EcstoreObjectOptions, PutObjReader as EcstorePutObjReader},
 };
 
 #[cfg(test)]
 pub(crate) use self::ecstore::disk::{DiskOption, new_disk};
 
-pub type HealObjectInfo = EcstoreObjectInfo;
-pub type HealObjectOptions = EcstoreObjectOptions;
-pub type HealPutObjReader = EcstorePutObjReader;
+pub type HealObjectInfo = rustfs_ecstore::store_api::ObjectInfo;
+pub type HealObjectOptions = rustfs_ecstore::store_api::ObjectOptions;
+pub type HealPutObjReader = rustfs_ecstore::store_api::PutObjReader;
