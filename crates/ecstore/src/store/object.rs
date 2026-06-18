@@ -253,6 +253,12 @@ fn is_equivalent_data_movement_delete_marker(source: &ObjectInfo, target: &Objec
         && is_data_movement_delete_marker(target)
         && source.version_id == target.version_id
         && source.mod_time == target.mod_time
+        && source.user_defined == target.user_defined
+        && source.user_tags == target.user_tags
+        && source.replication_status_internal == target.replication_status_internal
+        && source.replication_status == target.replication_status
+        && source.version_purge_status_internal == target.version_purge_status_internal
+        && source.version_purge_status == target.version_purge_status
 }
 
 fn is_data_movement_delete_marker(info: &ObjectInfo) -> bool {
@@ -1331,6 +1337,33 @@ mod tests {
             ..target
         };
         assert!(!is_equivalent_data_movement_delete_marker(&source, &mismatched));
+    }
+
+    #[test]
+    fn equivalent_data_movement_delete_marker_rejects_metadata_and_replication_mismatch() {
+        let version_id = Uuid::nil();
+        let mod_time = OffsetDateTime::UNIX_EPOCH;
+        let source = ObjectInfo {
+            version_id: Some(version_id),
+            delete_marker: true,
+            mod_time: Some(mod_time),
+            user_defined: Arc::new(HashMap::from([("x-amz-meta-source".to_string(), "true".to_string())])),
+            replication_status_internal: Some("arn:minio:replication:target=COMPLETED;".to_string()),
+            version_purge_status_internal: Some("arn:minio:replication:target=PENDING;".to_string()),
+            ..Default::default()
+        };
+
+        let mut target = source.clone();
+        target.user_defined = Arc::new(HashMap::from([("x-amz-meta-source".to_string(), "false".to_string())]));
+        assert!(!is_equivalent_data_movement_delete_marker(&source, &target));
+
+        let mut target = source.clone();
+        target.replication_status_internal = Some("arn:minio:replication:target=FAILED;".to_string());
+        assert!(!is_equivalent_data_movement_delete_marker(&source, &target));
+
+        let mut target = source.clone();
+        target.version_purge_status_internal = Some("arn:minio:replication:target=COMPLETE;".to_string());
+        assert!(!is_equivalent_data_movement_delete_marker(&source, &target));
     }
 
     #[test]

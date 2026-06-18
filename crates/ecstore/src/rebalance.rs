@@ -184,6 +184,20 @@ fn rebalance_object_migration_read_opts(version_id: Option<String>) -> ObjectOpt
     }
 }
 
+fn rebalance_remote_tiered_opts(version: &FileInfo, version_id: Option<String>, src_pool_idx: usize) -> ObjectOptions {
+    ObjectOptions {
+        versioned: version_id.is_some(),
+        version_id,
+        mod_time: version.mod_time,
+        user_defined: version.metadata.clone(),
+        src_pool_idx,
+        data_movement: true,
+        skip_decommissioned: true,
+        skip_rebalancing: true,
+        ..Default::default()
+    }
+}
+
 fn rebalance_source_cleanup_opts(src_pool_idx: usize) -> ObjectOptions {
     ObjectOptions {
         delete_prefix: true,
@@ -387,12 +401,38 @@ where
     }
 
     if version.is_remote() {
+        let opts = rebalance_remote_tiered_opts(version, version_id, pool_index);
+        if let Err(err) = set
+            .move_remote_version_for_migration(&bucket, &version.name, version, &opts)
+            .await
+        {
+            if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                return MigrationVersionResult {
+                    moved: false,
+                    ignored: true,
+                    cleanup_ignored: true,
+                    failed: false,
+                    stage: Some("remote_tiered"),
+                    error: None,
+                };
+            }
+
+            return MigrationVersionResult {
+                moved: false,
+                ignored: false,
+                cleanup_ignored: false,
+                failed: true,
+                stage: Some("remote_tiered"),
+                error: Some(err),
+            };
+        }
+
         return MigrationVersionResult {
-            moved: false,
-            ignored: true,
+            moved: true,
+            ignored: false,
             cleanup_ignored: false,
             failed: false,
-            stage: Some("remote_tiered"),
+            stage: None,
             error: None,
         };
     }
@@ -1378,7 +1418,7 @@ impl ECStore {
         let meta_to_save = {
             let mut rebalance_meta = self.rebalance_meta.write().await;
             stop_rebalance_meta_snapshot_for_id(rebalance_meta.as_mut(), OffsetDateTime::now_utc(), expected_id)
-        };
+        }?;
 
         if let Some(meta_to_save) = meta_to_save {
             let pool = clone_first_arc(self.pools.as_slice(), "stop_rebalance: no pools available")?;
@@ -3063,18 +3103,24 @@ fn stop_rebalance_meta_snapshot_for_id(
     meta: Option<&mut RebalanceMeta>,
     now: OffsetDateTime,
     expected_id: Option<&str>,
-) -> Option<RebalanceMeta> {
-    meta.and_then(|meta| {
-        if let Some(expected_id) = expected_id
-            && !expected_id.is_empty()
-            && meta.id != expected_id
-        {
-            return None;
-        }
-        stop_rebalance_state(meta, now);
-        meta.last_refreshed_at = Some(now);
-        Some(meta.clone())
-    })
+) -> Result<Option<RebalanceMeta>> {
+    let Some(meta) = meta else {
+        return Ok(None);
+    };
+
+    if let Some(expected_id) = expected_id
+        && !expected_id.is_empty()
+        && meta.id != expected_id
+    {
+        return Err(Error::other(format!(
+            "rebalance stop id mismatch: expected {expected_id}, found {}",
+            meta.id
+        )));
+    }
+
+    stop_rebalance_state(meta, now);
+    meta.last_refreshed_at = Some(now);
+    Ok(Some(meta.clone()))
 }
 
 fn rollback_rebalance_start_meta_snapshot_for_id(
@@ -3107,7 +3153,12 @@ fn rollback_rebalance_start_meta_snapshot_for_id(
 }
 
 fn stop_rebalance_meta_snapshot(meta: Option<&mut RebalanceMeta>, now: OffsetDateTime) -> Option<RebalanceMeta> {
-    stop_rebalance_meta_snapshot_for_id(meta, now, None)
+    let Some(meta) = meta else {
+        return None;
+    };
+    stop_rebalance_state(meta, now);
+    meta.last_refreshed_at = Some(now);
+    Some(meta.clone())
 }
 
 fn heal_rebalance_stopping_without_worker(meta: &mut RebalanceMeta, has_live_worker: bool, now: OffsetDateTime) -> bool {
@@ -3918,9 +3969,10 @@ mod rebalance_unit_tests {
         migrate_entry_version_with_retry_wait, next_rebal_bucket_from_stat, parse_rebalance_max_attempts,
         rebalance_delete_marker_opts, rebalance_listing_retry_delay, rebalance_meta_load_no_data_error,
         rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error, rebalance_migration_retry_delay,
-        rebalance_object_migration_read_opts, rebalance_source_cleanup_opts, record_rebalance_cleanup_warning_in_meta,
-        refresh_missing_rebalance_pool_stats, resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket,
-        resolve_rebalance_bucket_error, resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
+        rebalance_object_migration_read_opts, rebalance_remote_tiered_opts, rebalance_source_cleanup_opts,
+        record_rebalance_cleanup_warning_in_meta, refresh_missing_rebalance_pool_stats,
+        resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket, resolve_rebalance_bucket_error,
+        resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
         resolve_rebalance_file_info_versions_result, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
         resolve_rebalance_migrate_result_error, resolve_rebalance_optional_bucket_config_result, resolve_rebalance_participants,
         resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error,
@@ -3947,6 +3999,7 @@ mod rebalance_unit_tests {
     use rustfs_storage_api::HTTPRangeSpec;
     use s3s::dto::ReplicationConfiguration;
     use serde::Serialize;
+    use std::collections::HashMap;
     use std::fs;
     use std::io::Cursor;
     use std::sync::Arc;
@@ -4230,6 +4283,27 @@ mod rebalance_unit_tests {
     }
 
     #[test]
+    fn test_rebalance_remote_tiered_opts_preserves_migration_context() {
+        let mod_time = OffsetDateTime::now_utc();
+        let version = FileInfo {
+            mod_time: Some(mod_time),
+            metadata: HashMap::from([("x-amz-meta-key".to_string(), "value".to_string())]),
+            ..version_remote()
+        };
+
+        let opts = rebalance_remote_tiered_opts(&version, Some("version-id".to_string()), 4);
+
+        assert!(opts.versioned);
+        assert_eq!(opts.version_id.as_deref(), Some("version-id"));
+        assert_eq!(opts.mod_time, Some(mod_time));
+        assert_eq!(opts.user_defined.get("x-amz-meta-key").map(String::as_str), Some("value"));
+        assert_eq!(opts.src_pool_idx, 4);
+        assert!(opts.data_movement);
+        assert!(opts.skip_rebalancing);
+        assert!(opts.skip_decommissioned);
+    }
+
+    #[test]
     fn test_rebalance_source_cleanup_opts_are_data_movement_skip_opts() {
         let opts = rebalance_source_cleanup_opts(3);
 
@@ -4242,7 +4316,7 @@ mod rebalance_unit_tests {
     }
 
     #[tokio::test]
-    async fn test_migrate_entry_version_remote_tiered_is_skipped_without_cleanup() {
+    async fn test_migrate_entry_version_remote_tiered_moves_metadata_without_transfer() {
         let backend = MigrationBackendSpy::new(None, Some(Ok(ObjectInfo::default())), Some(Ok(())));
         let version = version_remote();
         let transfer_count = Arc::new(AtomicUsize::new(0));
@@ -4269,20 +4343,20 @@ mod rebalance_unit_tests {
         )
         .await;
 
-        assert!(result.ignored);
+        assert!(!result.ignored);
         assert!(!result.cleanup_ignored);
-        assert!(!result.moved);
+        assert!(result.moved);
         assert!(!result.failed);
-        assert_eq!(result.stage, Some("remote_tiered"));
+        assert_eq!(result.stage, None);
         assert!(result.error.is_none());
         assert_eq!(transfer_count.load(Ordering::SeqCst), 0);
-        assert_eq!(backend.move_remote_calls(), 0);
+        assert_eq!(backend.move_remote_calls(), 1);
         assert_eq!(backend.get_calls(), 0);
         assert_eq!(backend.delete_calls(), 0);
     }
 
     #[tokio::test]
-    async fn test_migrate_entry_version_remote_tiered_does_not_call_backend_move() {
+    async fn test_migrate_entry_version_remote_tiered_failure_is_reported() {
         let backend = MigrationBackendSpy::new(None, Some(Ok(ObjectInfo::default())), Some(Err(Error::SlowDown)));
         let version = version_remote();
         let transfer_count = Arc::new(AtomicUsize::new(0));
@@ -4309,14 +4383,14 @@ mod rebalance_unit_tests {
         )
         .await;
 
-        assert!(result.ignored);
+        assert!(!result.ignored);
         assert!(!result.cleanup_ignored);
         assert!(!result.moved);
-        assert!(!result.failed);
+        assert!(result.failed);
         assert_eq!(result.stage, Some("remote_tiered"));
-        assert!(result.error.is_none());
+        assert!(matches!(result.error, Some(Error::SlowDown)));
         assert_eq!(transfer_count.load(Ordering::SeqCst), 0);
-        assert_eq!(backend.move_remote_calls(), 0);
+        assert_eq!(backend.move_remote_calls(), 1);
         assert_eq!(backend.get_calls(), 0);
         assert_eq!(backend.delete_calls(), 0);
     }
@@ -7854,15 +7928,18 @@ mod rebalance_unit_tests {
     }
 
     #[test]
-    fn test_stop_rebalance_meta_snapshot_ignores_mismatched_operation_id() {
+    fn test_stop_rebalance_meta_snapshot_rejects_mismatched_operation_id() {
         let mut meta = RebalanceMeta {
             id: "id-b".to_string(),
             ..Default::default()
         };
 
-        let snapshot = stop_rebalance_meta_snapshot_for_id(Some(&mut meta), OffsetDateTime::now_utc(), Some("id-a"));
+        let err = stop_rebalance_meta_snapshot_for_id(Some(&mut meta), OffsetDateTime::now_utc(), Some("id-a"))
+            .expect_err("mismatched rebalance id should be rejected");
 
-        assert!(snapshot.is_none());
+        assert!(err.to_string().contains("rebalance stop id mismatch"));
+        assert!(err.to_string().contains("expected id-a"));
+        assert!(err.to_string().contains("found id-b"));
         assert_eq!(meta.id, "id-b");
     }
 
@@ -7881,7 +7958,8 @@ mod rebalance_unit_tests {
             ..Default::default()
         });
 
-        let snapshot = stop_rebalance_meta_snapshot_for_id(Some(&mut meta), OffsetDateTime::now_utc(), Some("id-a"));
+        let snapshot = stop_rebalance_meta_snapshot_for_id(Some(&mut meta), OffsetDateTime::now_utc(), Some("id-a"))
+            .expect("matching rebalance id should be accepted");
 
         assert!(snapshot.is_some());
     }

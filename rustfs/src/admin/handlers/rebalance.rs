@@ -107,6 +107,28 @@ fn rebalance_rollback_stop_failure_message(rebalance_id: &str, failures: &[Strin
     format!("cluster stop_rebalance rollback for {rebalance_id} partial: {}", failures.join("; "))
 }
 
+fn rebalance_rollback_terminal_reload_failure_message(rebalance_id: &str, failures: &[String]) -> String {
+    format!(
+        "cluster terminal rebalance reload rollback for {rebalance_id} partial: {}",
+        failures.join("; ")
+    )
+}
+
+fn rebalance_rollback_failure_message(
+    rebalance_id: &str,
+    stop_failures: &[String],
+    terminal_reload_failures: &[String],
+) -> String {
+    let mut failures = Vec::new();
+    if !stop_failures.is_empty() {
+        failures.push(rebalance_rollback_stop_failure_message(rebalance_id, stop_failures));
+    }
+    if !terminal_reload_failures.is_empty() {
+        failures.push(rebalance_rollback_terminal_reload_failure_message(rebalance_id, terminal_reload_failures));
+    }
+    failures.join("; ")
+}
+
 async fn rollback_cluster_rebalance_start(
     store: &Arc<ECStore>,
     notification_sys: Option<&NotificationSys>,
@@ -118,20 +140,29 @@ async fn rollback_cluster_rebalance_start(
             .stop_rebalance_failures(Some(rebalance_id))
             .await
             .map_err(|err| format!("cluster stop_rebalance rollback for {rebalance_id} failed: {err}"))?;
-        if !stop_failures.is_empty() {
+        let terminal_reload_attempt_at = OffsetDateTime::now_utc();
+        let terminal_reload_failures = match notification_sys.load_rebalance_meta_failures(false).await {
+            Ok(failures) => failures,
+            Err(err) => vec![format!("terminal rebalance reload rollback for {rebalance_id} failed: {err}")],
+        };
+        if !stop_failures.is_empty() || !terminal_reload_failures.is_empty() {
             let record = RebalanceStopPropagationRecord {
                 stop_attempt_at: Some(stop_attempt_at),
                 stop_failures: stop_failures.clone(),
-                terminal_reload_attempt_at: None,
-                terminal_reload_failures: Vec::new(),
+                terminal_reload_attempt_at: Some(terminal_reload_attempt_at),
+                terminal_reload_failures: terminal_reload_failures.clone(),
             };
             store.record_rebalance_stop_propagation(record).await.map_err(|err| {
                 format!(
-                    "cluster stop_rebalance rollback for {rebalance_id} partial; failed to persist stop propagation: {err}; stop failures: {}",
-                    stop_failures.join("; ")
+                    "cluster rebalance rollback for {rebalance_id} partial; failed to persist stop propagation: {err}; {}",
+                    rebalance_rollback_failure_message(rebalance_id, &stop_failures, &terminal_reload_failures)
                 )
             })?;
-            return Err(rebalance_rollback_stop_failure_message(rebalance_id, &stop_failures));
+            return Err(rebalance_rollback_failure_message(
+                rebalance_id,
+                &stop_failures,
+                &terminal_reload_failures,
+            ));
         }
         return Ok(());
     }
@@ -874,8 +905,8 @@ mod rebalance_handler_tests {
     use super::{
         RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, RebalanceStopPropagationStatus,
         build_rebalance_admin_status, build_rebalance_pool_statuses, build_rebalance_stop_propagation_status,
-        rebalance_pool_used, rebalance_query_present, rebalance_remaining_buckets, rebalance_rollback_stop_failure_message,
-        rebalance_start_rollback_error, rebalance_used_pct, rollback_result_label,
+        rebalance_pool_used, rebalance_query_present, rebalance_remaining_buckets, rebalance_rollback_failure_message,
+        rebalance_rollback_stop_failure_message, rebalance_start_rollback_error, rebalance_used_pct, rollback_result_label,
     };
     use rustfs_ecstore::rebalance::{
         DiskStat, RebalStatus, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta, RebalanceStats,
@@ -926,6 +957,19 @@ mod rebalance_handler_tests {
         assert!(message.contains("cluster stop_rebalance rollback for rebalance-id partial"));
         assert!(message.contains("peer a stop_rebalance failed: timeout"));
         assert!(message.contains("peer b stop_rebalance failed: unavailable"));
+    }
+
+    #[test]
+    fn test_rebalance_rollback_failure_message_lists_stop_and_terminal_reload_failures() {
+        let stop_failures = vec!["peer a stop_rebalance failed: timeout".to_string()];
+        let terminal_reload_failures = vec!["peer b load_rebalance_meta(start=false) failed: unavailable".to_string()];
+
+        let message = rebalance_rollback_failure_message("rebalance-id", &stop_failures, &terminal_reload_failures);
+
+        assert!(message.contains("cluster stop_rebalance rollback for rebalance-id partial"));
+        assert!(message.contains("peer a stop_rebalance failed: timeout"));
+        assert!(message.contains("cluster terminal rebalance reload rollback for rebalance-id partial"));
+        assert!(message.contains("peer b load_rebalance_meta(start=false) failed: unavailable"));
     }
 
     #[test]
