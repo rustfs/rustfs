@@ -106,3 +106,8 @@ and the separate `NamespaceLocking` operation group.
 The old `StorageAPI` aggregate facade must not reappear in production
 `crates/ecstore/src` or `rustfs/src` code after the storage operation groups
 have been made explicit.
+
+Outer RustFS/IAM consumers must use `rustfs-storage-api` generic list response
+contracts directly for `ListObjectsV2Info`, `ListObjectVersionsInfo`, and
+`ObjectInfoOrErr`; ECStore keeps the concrete aliases only for internal
+implementation and compatibility.

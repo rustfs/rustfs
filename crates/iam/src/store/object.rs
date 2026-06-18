@@ -22,8 +22,7 @@ use crate::{
 };
 use futures::future::join_all;
 use rustfs_credentials::get_global_action_cred;
-use rustfs_ecstore::error::{StorageError, classify_system_path_failure_reason};
-use rustfs_ecstore::store_api::{ObjectInfoOrErr, WalkOptions};
+use rustfs_ecstore::error::{Error as EcstoreError, StorageError, classify_system_path_failure_reason};
 use rustfs_ecstore::{
     config::{
         RUSTFS_CONFIG_PREFIX,
@@ -34,8 +33,7 @@ use rustfs_ecstore::{
 };
 use rustfs_io_metrics::record_system_path_failure;
 use rustfs_policy::{auth::UserIdentity, policy::PolicyDoc};
-use rustfs_storage_api::HTTPPreconditions;
-use rustfs_storage_api::ListOperations as _;
+use rustfs_storage_api::{HTTPPreconditions, ListOperations as _, ObjectInfoOrErr as StorageObjectInfoOrErr};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use serde::{Serialize, de::DeserializeOwned};
 use std::sync::{LazyLock, Mutex};
@@ -61,6 +59,8 @@ pub static IAM_CONFIG_POLICY_DB_SERVICE_ACCOUNTS_PREFIX: LazyLock<String> =
     LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam/policydb/service-accounts/"));
 pub static IAM_CONFIG_POLICY_DB_GROUPS_PREFIX: LazyLock<String> =
     LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam/policydb/groups/"));
+
+type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, EcstoreError>;
 
 const IAM_IDENTITY_FILE: &str = "identity.json";
 const IAM_POLICY_FILE: &str = "policy.json";
@@ -367,7 +367,7 @@ impl ObjectStore {
         let sender_on_error = sender.clone();
         tokio::spawn(async move {
             if let Err(err) = store
-                .walk(ctx.clone(), Self::BUCKET_NAME, &path, tx, WalkOptions::default())
+                .walk(ctx.clone(), Self::BUCKET_NAME, &path, tx, Default::default())
                 .await
             {
                 let reason = classify_system_path_failure_reason(&err);
