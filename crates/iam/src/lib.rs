@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::error::{Error, Result};
-use crate::storage_compat::ecstore::store::ECStore;
+use crate::storage_compat::IamStore;
 use manager::IamCache;
 use oidc::OidcSys;
 use std::sync::{Arc, OnceLock};
@@ -42,7 +42,7 @@ static IAM_SYS: OnceLock<Arc<IamSys<ObjectStore>>> = OnceLock::new();
 static OIDC_SYS: OnceLock<Arc<OidcSys>> = OnceLock::new();
 
 #[instrument(skip(ecstore))]
-pub async fn init_iam_sys(ecstore: Arc<ECStore>) -> Result<()> {
+pub async fn init_iam_sys(ecstore: Arc<IamStore>) -> Result<()> {
     if IAM_SYS.get().is_some() {
         info!(
             event = EVENT_IAM_STATE,

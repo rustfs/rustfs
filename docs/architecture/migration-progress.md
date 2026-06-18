@@ -1181,6 +1181,65 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     layer guards, formatting check, diff hygiene, risk scan, full pre-commit,
     and required three-expert review required before push.
 
+- [x] `API-046` Remove IAM and Swift ECStore module passthroughs.
+  - Current branch: `overtrue/arch-compat-iam-swift-boundaries`.
+  - Current slice: replace IAM's ECStore config/error/global/notification/store
+    module passthroughs and Swift's ECStore bucket/error/store resolver
+    passthroughs with local compatibility aliases and wrapper functions, then
+    shrink the passthrough guard snapshot.
+  - Acceptance: IAM store, IAM notification fanout, IAM error conversion, IAM
+    first-node checks, and Swift bucket metadata/object-store access no longer
+    reach through ECStore modules directly from consumer code.
+  - Must preserve: IAM config prefix layout, IAM config read/write/delete
+    semantics, lazy rewrite precondition behavior, config-not-found mapping,
+    peer notification fanout error logging, first-node initial load behavior,
+    Swift object-store resolution, and Swift bucket metadata get/set behavior.
+  - Risk defense: this is an import ownership and compatibility-boundary
+    cleanup only; ECStore remains the owner of concrete storage/runtime state
+    while IAM and Swift expose narrower local names to their consumers.
+  - Verification: focused IAM/Swift compile, IAM unit tests, migration and
+    layer guards, formatting check, diff hygiene, risk scan, full pre-commit,
+    and required three-expert review required before push.
+
+- [x] `API-047` Remove heal and scanner production ECStore module passthroughs.
+  - Current branch: `overtrue/arch-heal-scanner-compat-boundaries`.
+  - Current slice: replace heal and scanner production compatibility
+    passthrough modules with explicit local aliases and wrapper functions,
+    while leaving test-only ECStore compatibility harnesses for later cleanup.
+  - Acceptance: heal and scanner production code no longer exposes broad
+    ECStore module passthroughs for bucket/config/data-usage/disk/error/global,
+    pools, set-disk, store, or store-utils through `storage_compat.rs`.
+  - Must preserve: heal disk/resume/task behavior, scanner config persistence,
+    scanner lifecycle/replication actions, bucket cache scanning, object-store
+    resolution, erasure-mode checks, storage-class accounting, and data-usage
+    memory updates.
+  - Risk defense: this narrows import ownership only; ECStore remains the owner
+    of concrete storage/runtime state and scanner/heal keep the same local
+    compatibility names for existing call sites.
+  - Verification: focused heal/scanner compile, migration and layer guards,
+    formatting check, diff hygiene, risk scan, full pre-commit, and required
+    three-expert review required before push.
+
+- [x] `API-048` Remove RustFS runtime ECStore module passthroughs.
+  - Current branch: `overtrue/arch-rustfs-runtime-compat-boundaries`.
+  - Current slice: replace the RustFS app, admin, storage, and root runtime
+    compatibility passthrough modules with explicit local aliases and nested
+    compatibility exports, while preserving existing consumer paths.
+  - Acceptance: RustFS runtime compatibility files no longer expose broad
+    ECStore top-level module passthroughs for app/admin/storage/root runtime
+    consumers, and the passthrough guard snapshot keeps only test/fuzz
+    harness allowances.
+  - Must preserve: startup config/bootstrap behavior, server readiness checks,
+    admin replication/rebalance/tier/config handlers, app object/bucket/
+    multipart usecases, storage RPC/SSE/access paths, table catalog storage
+    access, and existing test-only harness imports.
+  - Risk defense: this is an import ownership and compatibility-boundary
+    cleanup only; ECStore remains the owner of concrete storage/runtime state
+    while RustFS runtime modules retain stable local compatibility paths.
+  - Verification: focused RustFS test compile, migration and layer guards,
+    formatting check, diff hygiene, risk scan, full pre-commit, and required
+    three-expert review passed before push.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -1457,13 +1516,44 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-042/API-043/API-044/API-045 narrow notify, S3 Select, and OBS compatibility contracts without moving ECStore storage metadata ownership. |
-| Migration preservation | passed | Event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, OBS metrics state reads, unchanged no-op handling, and remove-event behavior are preserved. |
-| Testing/verification | passed | Focused compiles/tests, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | passed | API-042/API-043/API-044/API-045/API-046/API-047/API-048 narrow notify, S3 Select, OBS, IAM, Swift, heal, scanner, and RustFS runtime compatibility contracts without moving ECStore storage metadata ownership. |
+| Migration preservation | passed | Event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, OBS metrics state reads, IAM config/notification/error semantics, Swift bucket metadata access, heal disk/resume/task behavior, scanner lifecycle/replication/data-usage behavior, RustFS startup/admin/app/storage runtime access, unchanged no-op handling, and remove-event behavior are preserved. |
+| Testing/verification | passed | Focused compiles/tests, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed for the current slice. |
 
 ## Verification Notes
 
 Passed before push:
+
+- API-048 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Rust risk scan: passed; no new unwrap/expect, panic/todo/unsafe, risky
+    casts, ad-hoc error construction, or sensitive-token handling in added
+    lines.
+  - `make pre-commit`: passed.
+
+- API-047 current slice:
+  - `cargo check --tests -p rustfs-heal -p rustfs-scanner`: passed.
+  - `cargo test -p rustfs-heal -p rustfs-scanner`: passed, 290 tests passed
+    and 14 ignored.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: passed; the only match was a test-only scanner config init
+    re-export.
+
+- API-046 current slice:
+  - `cargo check --tests -p rustfs-iam -p rustfs-protos`: passed.
+  - `cargo test -p rustfs-iam`: passed, 150 tests.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: reviewed added lines; only existing error-mapping behavior
+    was renamed to IAM-local compatibility aliases.
+  - `make pre-commit`: passed.
 
 - API-042 current slice:
   - `cargo check --tests -p rustfs-notify -p rustfs`: passed.

@@ -12,19 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod ecstore {
-    pub(crate) use rustfs_ecstore::{data_usage, disk, error, global, store};
-}
-pub(crate) use self::ecstore::{
-    data_usage::DATA_USAGE_CACHE_NAME,
-    disk::{BUCKET_META_PREFIX, DiskAPI, DiskStore, RUSTFS_META_BUCKET, endpoint::Endpoint, error::DiskError},
-    error::{Error as EcstoreError, StorageError},
-    global::GLOBAL_LOCAL_DISK_MAP,
-    store::ECStore,
-};
+pub(crate) const DATA_USAGE_CACHE_NAME: &str = rustfs_ecstore::data_usage::DATA_USAGE_CACHE_NAME;
+pub(crate) const BUCKET_META_PREFIX: &str = rustfs_ecstore::disk::BUCKET_META_PREFIX;
+pub(crate) const RUSTFS_META_BUCKET: &str = rustfs_ecstore::disk::RUSTFS_META_BUCKET;
+
+pub(crate) type DiskError = rustfs_ecstore::disk::error::DiskError;
+pub(crate) type DiskStore = rustfs_ecstore::disk::DiskStore;
+pub(crate) type ECStore = rustfs_ecstore::store::ECStore;
+pub(crate) type EcstoreError = rustfs_ecstore::error::Error;
+pub(crate) type Endpoint = rustfs_ecstore::disk::endpoint::Endpoint;
+pub(crate) type StorageError = rustfs_ecstore::error::StorageError;
+
+pub(crate) use rustfs_ecstore::disk::DiskAPI;
+pub(crate) use rustfs_ecstore::global::GLOBAL_LOCAL_DISK_MAP;
 
 #[cfg(test)]
-pub(crate) use self::ecstore::disk::{DiskOption, new_disk};
+pub(crate) use rustfs_ecstore::disk::{DiskOption, new_disk};
 
 pub type HealObjectInfo = rustfs_ecstore::store_api::ObjectInfo;
 pub type HealObjectOptions = rustfs_ecstore::store_api::ObjectOptions;
