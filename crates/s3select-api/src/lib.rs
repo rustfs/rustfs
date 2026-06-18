@@ -19,6 +19,7 @@ use std::fmt::Display;
 pub mod object_store;
 pub mod query;
 pub mod server;
+mod storage_compat;
 
 #[cfg(test)]
 mod test;

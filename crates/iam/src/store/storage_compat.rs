@@ -12,18 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod channel;
-pub mod erasure_healer;
-pub mod event;
-pub mod manager;
-pub mod progress;
-pub mod resume;
-pub mod storage;
-mod storage_compat;
-pub mod task;
-pub mod utils;
+use rustfs_ecstore::store_api::{ObjectInfo as EcstoreObjectInfo, ObjectOptions as EcstoreObjectOptions};
 
-pub use erasure_healer::ErasureSetHealer;
-pub use manager::{HealManager, HealOperationsSnapshot, HealPriorityCounts, HealSourceCounts};
-pub use resume::{CheckpointManager, ResumeCheckpoint, ResumeManager, ResumeState, ResumeUtils};
-pub use task::{HealOptions, HealPriority, HealRequest, HealTask, HealType};
+pub(super) type IamObjectInfo = EcstoreObjectInfo;
+pub(super) type IamObjectOptions = EcstoreObjectOptions;

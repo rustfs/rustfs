@@ -19,7 +19,6 @@ use rustfs_ecstore::{
     disk::{DiskStore, endpoint::Endpoint},
     error::StorageError,
     store::ECStore,
-    store_api::{ObjectInfo as EcstoreObjectInfo, ObjectOptions as EcstoreObjectOptions, PutObjReader as EcstorePutObjReader},
 };
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_storage_api::{
@@ -29,6 +28,8 @@ use rustfs_storage_api::{
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
+pub use super::storage_compat::{HealObjectInfo, HealObjectOptions, HealPutObjReader};
+
 const LOG_COMPONENT_HEAL: &str = "heal";
 const LOG_SUBSYSTEM_STORAGE: &str = "storage";
 const EVENT_HEAL_STORAGE_OBJECT_IO: &str = "heal_storage_object_io";
@@ -36,10 +37,6 @@ const EVENT_HEAL_STORAGE_OBJECT_READ_LIMIT: &str = "heal_storage_object_read_lim
 const EVENT_HEAL_STORAGE_OBJECT_VERIFY: &str = "heal_storage_object_verify";
 const EVENT_HEAL_STORAGE_ADMIN_OP: &str = "heal_storage_admin_op";
 const EVENT_HEAL_STORAGE_REPAIR_OP: &str = "heal_storage_repair_op";
-
-pub type HealObjectInfo = EcstoreObjectInfo;
-pub type HealObjectOptions = EcstoreObjectOptions;
-pub type HealPutObjReader = EcstorePutObjReader;
 
 /// Disk status for heal operations
 #[derive(Debug, Clone, PartialEq, Eq)]
