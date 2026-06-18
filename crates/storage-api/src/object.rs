@@ -14,6 +14,10 @@
 
 use std::fmt;
 use std::sync::Arc;
+
+use rustfs_filemeta::{
+    ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_statuses_map, version_purge_statuses_map,
+};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -153,6 +157,57 @@ pub enum WalkVersionsSortOrder {
     #[default]
     Ascending,
     Descending,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ObjectToDelete {
+    pub object_name: String,
+    pub version_id: Option<Uuid>,
+    pub delete_marker_replication_status: Option<String>,
+    pub version_purge_status: Option<VersionPurgeStatusType>,
+    pub version_purge_statuses: Option<String>,
+    pub replicate_decision_str: Option<String>,
+}
+
+impl ObjectToDelete {
+    pub fn replication_state(&self) -> ReplicationState {
+        ReplicationState {
+            replication_status_internal: self.delete_marker_replication_status.clone(),
+            version_purge_status_internal: self.version_purge_statuses.clone(),
+            replicate_decision_str: self.replicate_decision_str.clone().unwrap_or_default(),
+            targets: replication_statuses_map(self.delete_marker_replication_status.as_deref().unwrap_or_default()),
+            purge_targets: version_purge_statuses_map(self.version_purge_statuses.as_deref().unwrap_or_default()),
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct DeletedObject {
+    pub delete_marker: bool,
+    pub delete_marker_version_id: Option<Uuid>,
+    pub object_name: String,
+    pub version_id: Option<Uuid>,
+    pub delete_marker_mtime: Option<OffsetDateTime>,
+    pub replication_state: Option<ReplicationState>,
+    pub found: bool,
+    pub force_delete: bool,
+}
+
+impl DeletedObject {
+    pub fn version_purge_status(&self) -> VersionPurgeStatusType {
+        self.replication_state
+            .as_ref()
+            .map(|v| v.composite_version_purge_status())
+            .unwrap_or(VersionPurgeStatusType::Empty)
+    }
+
+    pub fn delete_marker_replication_status(&self) -> ReplicationStatusType {
+        self.replication_state
+            .as_ref()
+            .map(|v| v.composite_replication_status())
+            .unwrap_or(ReplicationStatusType::Empty)
+    }
 }
 
 #[derive(Clone)]
@@ -712,6 +767,34 @@ mod tests {
         assert!(matches!(opts.versions_sort, WalkVersionsSortOrder::Ascending));
         assert_eq!(opts.limit, 0);
         assert!(!opts.include_free_versions);
+    }
+
+    #[test]
+    fn object_to_delete_builds_replication_state() {
+        let object = ObjectToDelete {
+            object_name: "photo.jpg".to_owned(),
+            delete_marker_replication_status: Some("PENDING".to_owned()),
+            version_purge_statuses: Some("arn:minio:replication:::target=PENDING".to_owned()),
+            replicate_decision_str: Some("arn:minio:replication:::target=PENDING".to_owned()),
+            ..Default::default()
+        };
+
+        let state = object.replication_state();
+
+        assert_eq!(state.replication_status_internal.as_deref(), Some("PENDING"));
+        assert_eq!(
+            state.version_purge_status_internal.as_deref(),
+            Some("arn:minio:replication:::target=PENDING")
+        );
+        assert_eq!(state.replicate_decision_str, "arn:minio:replication:::target=PENDING");
+    }
+
+    #[test]
+    fn deleted_object_status_helpers_default_to_empty() {
+        let object = DeletedObject::default();
+
+        assert_eq!(object.version_purge_status(), VersionPurgeStatusType::Empty);
+        assert_eq!(object.delete_marker_replication_status(), ReplicationStatusType::Empty);
     }
 
     #[derive(Debug)]

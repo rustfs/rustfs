@@ -1,5 +1,8 @@
 use super::*;
-use rustfs_storage_api::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};
+use rustfs_storage_api::{
+    CompletePart, DeletedObject, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, ObjectToDelete,
+    PartInfo,
+};
 
 pub trait ObjectIO:
     rustfs_storage_api::ObjectIO<
