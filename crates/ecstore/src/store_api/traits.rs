@@ -49,39 +49,34 @@ pub trait ObjectOperations: Send + Sync + Debug {
 }
 
 /// Listing and walking operations.
-#[async_trait::async_trait]
-#[allow(clippy::too_many_arguments)]
-pub trait ListOperations: Send + Sync + Debug {
-    async fn list_objects_v2(
-        self: Arc<Self>,
-        bucket: &str,
-        prefix: &str,
-        continuation_token: Option<String>,
-        delimiter: Option<String>,
-        max_keys: i32,
-        fetch_owner: bool,
-        start_after: Option<String>,
-        incl_deleted: bool,
-    ) -> Result<ListObjectsV2Info>;
+pub trait ListOperations:
+    rustfs_storage_api::ListOperations<
+        Error = Error,
+        ListObjectsV2Info = ListObjectsV2Info,
+        ListObjectVersionsInfo = ListObjectVersionsInfo,
+        ObjectInfoOrErr = ObjectInfoOrErr,
+        WalkOptions = WalkOptions,
+        WalkCancellation = CancellationToken,
+        WalkResultSender = tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+    > + Send
+    + Sync
+    + Debug
+{
+}
 
-    async fn list_object_versions(
-        self: Arc<Self>,
-        bucket: &str,
-        prefix: &str,
-        marker: Option<String>,
-        version_marker: Option<String>,
-        delimiter: Option<String>,
-        max_keys: i32,
-    ) -> Result<ListObjectVersionsInfo>;
-
-    async fn walk(
-        self: Arc<Self>,
-        rx: CancellationToken,
-        bucket: &str,
-        prefix: &str,
-        result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
-        opts: WalkOptions,
-    ) -> Result<()>;
+impl<T> ListOperations for T where
+    T: rustfs_storage_api::ListOperations<
+            Error = Error,
+            ListObjectsV2Info = ListObjectsV2Info,
+            ListObjectVersionsInfo = ListObjectVersionsInfo,
+            ObjectInfoOrErr = ObjectInfoOrErr,
+            WalkOptions = WalkOptions,
+            WalkCancellation = CancellationToken,
+            WalkResultSender = tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+        > + Send
+        + Sync
+        + Debug
+{
 }
 
 /// Multipart upload operations.

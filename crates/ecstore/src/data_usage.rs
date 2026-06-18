@@ -20,7 +20,6 @@ use crate::{
     disk::DiskAPI,
     error::{Error, classify_system_path_failure_reason},
     store::ECStore,
-    store_api::ListOperations,
 };
 pub use local_snapshot::{
     DATA_USAGE_DIR, DATA_USAGE_STATE_DIR, LOCAL_USAGE_SNAPSHOT_VERSION, LocalUsageSnapshot, LocalUsageSnapshotMeta,
@@ -31,6 +30,7 @@ use rustfs_data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus, SizeSummary,
 };
 use rustfs_io_metrics::record_system_path_failure;
+use rustfs_storage_api::ListOperations as _;
 use rustfs_utils::path::SLASH_SEPARATOR;
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},

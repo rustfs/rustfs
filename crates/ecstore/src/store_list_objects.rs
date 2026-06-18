@@ -23,8 +23,7 @@ use crate::error::{
 };
 use crate::set_disk::SetDisks;
 use crate::store_api::{
-    ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectInfoOrErr, ObjectOperations, ObjectOptions, VersionMarker,
-    WalkOptions, WalkVersionsSortOrder,
+    ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectInfoOrErr, ObjectOperations, ObjectOptions, WalkOptions,
 };
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{store::ECStore, store_api::ListObjectsV2Info};
@@ -34,6 +33,7 @@ use rustfs_filemeta::{
     MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry, MetadataResolutionParams,
     merge_file_meta_versions,
 };
+use rustfs_storage_api::{VersionMarker, WalkVersionsSortOrder};
 use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -201,11 +201,7 @@ fn list_metadata_resolution_params(bucket: String, listing_quorum: usize, versio
 }
 
 fn parse_version_marker(marker: String) -> Result<VersionMarker> {
-    if marker == "null" {
-        Ok(VersionMarker::Null)
-    } else {
-        Ok(VersionMarker::Version(Uuid::parse_str(&marker)?))
-    }
+    Ok(VersionMarker::parse(marker)?)
 }
 
 fn version_marker_for_entries(

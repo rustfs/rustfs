@@ -31,6 +31,7 @@ doctest = false
 async-trait.workspace = true
 serde.workspace = true
 time.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
