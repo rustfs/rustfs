@@ -52,8 +52,8 @@ use crate::{
     event_notification::{EventArgs, send_event},
     global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id, is_dist_erasure},
     store_api::{
-        DeletedObject, GetObjectReader, HealOperations, ListObjectsV2Info, MultipartOperations, NamespaceLocking, ObjectIO,
-        ObjectInfo, ObjectOperations, PutObjReader,
+        DeletedObject, GetObjectReader, ListObjectsV2Info, MultipartOperations, ObjectIO, ObjectInfo, ObjectOperations,
+        PutObjReader,
     },
     store_init::load_format_erasure,
 };
@@ -90,7 +90,7 @@ use rustfs_storage_api::{
     BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, ListMultipartsInfo, ListPartsInfo,
     MakeBucketOptions, MultipartInfo, MultipartUploadResult, PartInfo,
 };
-use rustfs_storage_api::{MultipartOperations as _, ObjectIO as _, ObjectOperations as _};
+use rustfs_storage_api::{MultipartOperations as _, NamespaceLocking as _, ObjectIO as _, ObjectOperations as _};
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::{
@@ -1732,7 +1732,10 @@ impl SetDisks {
 }
 
 #[async_trait::async_trait]
-impl NamespaceLocking for SetDisks {
+impl rustfs_storage_api::NamespaceLocking for SetDisks {
+    type Error = Error;
+    type NamespaceLock = NamespaceLockWrapper;
+
     #[tracing::instrument(skip(self))]
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         let set_lock = if is_dist_erasure().await {
@@ -4143,7 +4146,11 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
 }
 
 #[async_trait::async_trait]
-impl HealOperations for SetDisks {
+impl rustfs_storage_api::HealOperations for SetDisks {
+    type Error = Error;
+    type HealResultItem = HealResultItem;
+    type HealOptions = HealOpts;
+
     #[tracing::instrument(skip(self))]
     async fn heal_format(&self, _dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
         unimplemented!()
@@ -5031,7 +5038,7 @@ mod tests {
     use rustfs_filemeta::ReplicationState;
     use rustfs_lock::client::local::LocalClient;
     use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
-    use rustfs_storage_api::{CompletePart, ObjectOperations as _};
+    use rustfs_storage_api::{CompletePart, NamespaceLocking as _, ObjectOperations as _};
     use serial_test::serial;
     use std::collections::HashMap;
     use tempfile::TempDir;

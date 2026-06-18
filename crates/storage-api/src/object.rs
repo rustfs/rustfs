@@ -408,6 +408,33 @@ pub trait MultipartOperations: Send + Sync + fmt::Debug {
     ) -> Result<Self::ObjectInfo, Self::Error>;
 }
 
+#[async_trait::async_trait]
+pub trait HealOperations: Send + Sync + fmt::Debug {
+    type Error: std::error::Error + Send + Sync + 'static;
+    type HealResultItem: Send + 'static;
+    type HealOptions: Send + Sync + 'static;
+
+    async fn heal_format(&self, dry_run: bool) -> Result<(Self::HealResultItem, Option<Self::Error>), Self::Error>;
+    async fn heal_bucket(&self, bucket: &str, opts: &Self::HealOptions) -> Result<Self::HealResultItem, Self::Error>;
+    async fn heal_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &Self::HealOptions,
+    ) -> Result<(Self::HealResultItem, Option<Self::Error>), Self::Error>;
+    async fn get_pool_and_set(&self, id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>), Self::Error>;
+    async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &Self::HealOptions) -> Result<(), Self::Error>;
+}
+
+#[async_trait::async_trait]
+pub trait NamespaceLocking: Send + Sync + fmt::Debug + 'static {
+    type Error: std::error::Error + Send + Sync + 'static;
+    type NamespaceLock: Send + 'static;
+
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<Self::NamespaceLock, Self::Error>;
+}
+
 #[derive(Debug, Default)]
 pub struct ListObjectsInfo<ObjectItem> {
     pub is_truncated: bool,

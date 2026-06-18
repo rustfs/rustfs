@@ -131,24 +131,27 @@ impl<T> MultipartOperations for T where
 }
 
 /// Healing and repair operations.
-#[async_trait::async_trait]
-pub trait HealOperations: Send + Sync + Debug {
-    async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)>;
-    async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem>;
-    async fn heal_object(
-        &self,
-        bucket: &str,
-        object: &str,
-        version_id: &str,
-        opts: &HealOpts,
-    ) -> Result<(HealResultItem, Option<Error>)>;
-    async fn get_pool_and_set(&self, id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)>;
-    async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()>;
+pub trait HealOperations:
+    rustfs_storage_api::HealOperations<Error = Error, HealResultItem = HealResultItem, HealOptions = HealOpts> + Send + Sync + Debug
+{
+}
+
+impl<T> HealOperations for T where
+    T: rustfs_storage_api::HealOperations<Error = Error, HealResultItem = HealResultItem, HealOptions = HealOpts>
+        + Send
+        + Sync
+        + Debug
+{
 }
 
 /// Namespace lock operations needed by consumers that only coordinate object
 /// mutations but do not require the full storage API surface.
-#[async_trait::async_trait]
-pub trait NamespaceLocking: Send + Sync + Debug + 'static {
-    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper>;
+pub trait NamespaceLocking:
+    rustfs_storage_api::NamespaceLocking<Error = Error, NamespaceLock = NamespaceLockWrapper> + Send + Sync + Debug + 'static
+{
+}
+
+impl<T> NamespaceLocking for T where
+    T: rustfs_storage_api::NamespaceLocking<Error = Error, NamespaceLock = NamespaceLockWrapper> + Send + Sync + Debug + 'static
+{
 }
