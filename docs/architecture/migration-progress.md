@@ -1240,6 +1240,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     formatting check, diff hygiene, risk scan, full pre-commit, and required
     three-expert review passed before push.
 
+- [x] `API-049` Remove test and fuzz ECStore module passthroughs.
+  - Current branch: `overtrue/arch-test-fuzz-compat-boundaries`.
+  - Current slice: replace the remaining e2e, heal-test, scanner-test, and
+    fuzz-target ECStore module passthroughs with explicit local compatibility
+    aliases, split fuzz storage compatibility by target, and empty the
+    passthrough guard snapshot.
+  - Acceptance: no `storage_compat.rs` file may expose broad
+    `rustfs_ecstore` module passthroughs; the migration guard now rejects any
+    new passthrough unless a later slice deliberately adds a reviewed
+    allowlist entry.
+  - Must preserve: e2e bucket target and RPC helper imports, heal test disk and
+    store setup imports, scanner test lifecycle/tier/disk/storage imports,
+    fuzz bucket validation behavior, and fuzz path containment behavior.
+  - Risk defense: this is test-harness and fuzz-harness import ownership
+    cleanup only; ECStore remains the owner of the same concrete APIs and no
+    production runtime path is changed.
+  - Verification: focused test/fuzz compiles, migration and layer guards,
+    formatting check, diff hygiene, risk scan, full pre-commit, and required
+    three-expert review passed before push.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -1510,19 +1530,32 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 1. `pure-move`/`consumer-migration`: continue larger cleanup slices with the
    loss-prevention guards active for remaining ECStore compatibility contracts
-   outside the production compatibility boundaries already cleaned.
+   now that broad compatibility passthroughs are fully closed.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-042/API-043/API-044/API-045/API-046/API-047/API-048 narrow notify, S3 Select, OBS, IAM, Swift, heal, scanner, and RustFS runtime compatibility contracts without moving ECStore storage metadata ownership. |
-| Migration preservation | passed | Event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, OBS metrics state reads, IAM config/notification/error semantics, Swift bucket metadata access, heal disk/resume/task behavior, scanner lifecycle/replication/data-usage behavior, RustFS startup/admin/app/storage runtime access, unchanged no-op handling, and remove-event behavior are preserved. |
+| Quality/architecture | passed | API-042/API-043/API-044/API-045/API-046/API-047/API-048/API-049 narrow notify, S3 Select, OBS, IAM, Swift, heal, scanner, RustFS runtime, test, and fuzz compatibility contracts without moving ECStore storage metadata ownership. |
+| Migration preservation | passed | Event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, OBS metrics state reads, IAM config/notification/error semantics, Swift bucket metadata access, heal disk/resume/task behavior, scanner lifecycle/replication/data-usage behavior, RustFS startup/admin/app/storage runtime access, e2e/test/fuzz import behavior, unchanged no-op handling, and remove-event behavior are preserved. |
 | Testing/verification | passed | Focused compiles/tests, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed for the current slice. |
 
 ## Verification Notes
 
 Passed before push:
+
+- API-049 current slice:
+  - `cargo check --tests -p rustfs-heal -p rustfs-scanner -p e2e_test`:
+    passed.
+  - `cargo check --manifest-path fuzz/Cargo.toml --all-targets`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: passed; no new unwrap/expect, panic/todo/unsafe, risky
+    casts, ad-hoc error construction, or sensitive-token handling in added
+    lines.
+  - `make pre-commit`: passed.
 
 - API-048 current slice:
   - `cargo check --tests -p rustfs`: passed.

@@ -1,5 +1,6 @@
 #![no_main]
 
+#[path = "bucket_validation/storage_compat.rs"]
 mod storage_compat;
 
 use libfuzzer_sys::fuzz_target;

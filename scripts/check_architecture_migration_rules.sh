@@ -424,22 +424,6 @@ if [[ -s "$UNAPPROVED_STORE_API_COMPAT_ALIAS_HITS_FILE" ]]; then
 fi
 
 cat >"$ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE" <<'EOF'
-crates/e2e_test/src/storage_compat.rs:bucket
-crates/e2e_test/src/storage_compat.rs:disk
-crates/e2e_test/src/storage_compat.rs:rpc
-crates/heal/tests/common/storage_compat.rs:bucket
-crates/heal/tests/common/storage_compat.rs:disk
-crates/heal/tests/common/storage_compat.rs:endpoints
-crates/heal/tests/common/storage_compat.rs:store
-crates/scanner/tests/common/storage_compat.rs:bucket
-crates/scanner/tests/common/storage_compat.rs:client
-crates/scanner/tests/common/storage_compat.rs:disk
-crates/scanner/tests/common/storage_compat.rs:endpoints
-crates/scanner/tests/common/storage_compat.rs:global
-crates/scanner/tests/common/storage_compat.rs:pools
-crates/scanner/tests/common/storage_compat.rs:store
-crates/scanner/tests/common/storage_compat.rs:tier
-fuzz/fuzz_targets/storage_compat.rs:bucket
 EOF
 sort -o "$ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE" "$ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE"
 
