@@ -824,6 +824,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     diff hygiene, direct import scan, Rust risk scan, full pre-commit, and
     required three-expert review passed.
 
+- [x] `API-028` Clean Swift ECStore runtime boundary imports.
+  - Current branch: `overtrue/arch-swift-ecstore-boundaries`.
+  - Completed slice: move Swift account, container, object, and versioning
+    access to ECStore object-store resolver and bucket metadata get/set calls
+    behind the Swift-local `storage_compat` module.
+  - Acceptance: direct Swift module references to `rustfs_ecstore` for object
+    store resolution, bucket metadata reads, bucket metadata writes, and object
+    DTO aliases are limited to `swift::storage_compat`; Swift business modules
+    consume Swift-owned compatibility names.
+  - Must preserve: Swift account metadata tags, container metadata tags,
+    versioning location tags, ACL tag storage, object CRUD/copy/range behavior,
+    storage-not-initialized error mapping, and bucket metadata load/save error
+    mapping.
+  - Risk defense: this slice changes import ownership and thin wrapper
+    boundaries only; it does not move ECStore definitions, alter metadata
+    serialization, change Swift bucket naming, or adjust runtime control flow.
+  - Verification: focused Swift compile/tests, migration/layer guards,
+    formatting, diff hygiene, direct Swift import scan, Rust risk scan, full
+    pre-commit, and required three-expert review passed.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -1093,61 +1113,46 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Next PRs
 
 1. `pure-move`/`consumer-migration`: continue larger cleanup slices with the
-   loss-prevention guards active for public re-exports and remaining storage
-   compatibility contracts.
+   loss-prevention guards active for remaining storage compatibility contracts
+   such as scanner/heal runtime boundaries.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Table catalog, IAM, admin zip, capacity, heal integration, scanner, Swift, S3 Select, and notify consumers now use local DTO compatibility aliases instead of raw ECStore `store_api` imports. |
-| Migration preservation | passed | ECStore remains the owner of object DTO/readers; alias boundaries preserve concrete associated types for storage traits, IAM config reads, zip preflight reads, scanner cache I/O, Swift/S3 Select reads, notify payloads, capacity assertions, and heal integration writes. |
-| Testing/verification | passed | Focused compile/tests, migration/layer guards, direct import scan, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Swift account, container, object, and versioning modules now use Swift-local storage compatibility wrappers for ECStore resolver and bucket metadata access. |
+| Migration preservation | passed | ECStore remains the owner of object-store resolution and bucket metadata persistence; Swift metadata tags, ACL tags, versioning tags, and object read/write/copy semantics are preserved. |
+| Testing/verification | passed | Focused Swift compile/tests, migration/layer guards, direct Swift import scan, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
 Passed before push:
 
-- `cargo check --tests -p rustfs -p rustfs-iam -p rustfs-heal`: passed.
-- `cargo check --tests -p rustfs-iam -p rustfs-heal -p rustfs-scanner -p
-  rustfs-protocols -p rustfs-s3select-api -p rustfs-notify`: passed.
-- `cargo test -p rustfs --lib table_catalog_store_trait`: passed; 2 passed.
-- `cargo test -p rustfs --lib admin::handlers::object_zip_download::tests`:
-  passed; 28 passed.
-- `cargo test -p rustfs --lib app::capacity_dirty_scope_test`: passed; 2
-  passed.
-- `cargo test -p rustfs-iam store::object::tests`: passed; 8 passed.
-- `cargo test -p rustfs-heal --test heal_integration_test`: passed; 5 passed.
-- `cargo check --tests -p rustfs-scanner -p rustfs-protocols -p
-  rustfs-s3select-api -p rustfs-notify`: passed.
-- `cargo test -p rustfs-scanner -p rustfs-protocols -p rustfs-s3select-api -p
-  rustfs-notify`: passed; notify 82 passed, protocols 13 passed, S3 Select 49
-  passed, scanner 151 passed plus lifecycle integration 1 passed and 14
-  ignored.
-- `rg -n 'rustfs_ecstore::store_api|store_api::\{' rustfs/src crates --glob
-  '!crates/ecstore/**' --glob '*.rs'`: remaining matches are deliberate
-  boundary alias definitions in RustFS storage and crate-local compat modules.
+- `cargo check --tests -p rustfs-protocols`: passed.
+- `cargo test -p rustfs-protocols`: passed; 13 passed.
+- `rg -n 'rustfs_ecstore|resolve_object_store_handle|metadata_sys'
+  crates/protocols/src/swift/*.rs`: remaining matches are deliberate Swift
+  compatibility boundary definitions.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
 - `cargo fmt --all --check`: passed.
 - `git diff --check`: passed.
-- Rust risk scan: new hits are crate-local alias casts only; no new
-  `unwrap`/`expect`, panic/todo markers, `unsafe`, process-spawning calls,
-  println/eprintln, or relaxed ordering in added Rust lines.
+- Rust risk scan: no new `unwrap`/`expect`, panic/todo markers, `unsafe`,
+  process-spawning calls, println/eprintln, relaxed ordering, or numeric casts
+  in added Rust lines.
 - `make pre-commit`: passed.
 
 Notes:
 
-- This slice is stacked on API-026 while `rustfs/rustfs#3566` is pending.
-- Direct ECStore `store_api` references outside ECStore now remain only at
-  explicit alias boundary points.
-- The slice does not alter table catalog storage behavior, IAM config storage,
-  admin zip download object reads, capacity dirty-disk behavior, heal
-  integration semantics, scanner cache I/O, Swift/S3 Select object reads,
-  notification event payloads, or ECStore DTO definitions.
+- This slice builds on the merged API-027 compatibility cleanup.
+- Direct Swift ECStore resolver and bucket metadata access now remains only in
+  the Swift compatibility boundary.
+- The slice does not alter Swift account/container metadata behavior, object
+  read/write/copy behavior, versioning behavior, ACL behavior, or ECStore
+  definitions.
 
 ## Handoff Notes
 
-- Continue with larger consumer-migration batches; keep ECStore-owned
-  DTOs/readers/walk filters in ECStore until their concrete behavior is isolated
-  enough for a pure-move slice.
+- Continue with larger consumer-migration batches around scanner/heal runtime
+  boundaries; keep ECStore-owned behavior in ECStore until concrete behavior is
+  isolated enough for a pure-move slice.
