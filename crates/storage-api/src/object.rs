@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::fmt;
+use std::sync::Arc;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -177,6 +178,49 @@ impl<Filter> Default for WalkOptions<Filter> {
             include_free_versions: false,
         }
     }
+}
+
+#[async_trait::async_trait]
+#[allow(clippy::too_many_arguments)]
+pub trait ListOperations: Send + Sync + fmt::Debug {
+    type Error: std::error::Error + Send + Sync + 'static;
+    type ListObjectsV2Info: Send + 'static;
+    type ListObjectVersionsInfo: Send + 'static;
+    type ObjectInfoOrErr: Send + 'static;
+    type WalkOptions: Send + 'static;
+    type WalkCancellation: Send + 'static;
+    type WalkResultSender: Send + 'static;
+
+    async fn list_objects_v2(
+        self: Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        continuation_token: Option<String>,
+        delimiter: Option<String>,
+        max_keys: i32,
+        fetch_owner: bool,
+        start_after: Option<String>,
+        incl_deleted: bool,
+    ) -> Result<Self::ListObjectsV2Info, Self::Error>;
+
+    async fn list_object_versions(
+        self: Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        marker: Option<String>,
+        version_marker: Option<String>,
+        delimiter: Option<String>,
+        max_keys: i32,
+    ) -> Result<Self::ListObjectVersionsInfo, Self::Error>;
+
+    async fn walk(
+        self: Arc<Self>,
+        rx: Self::WalkCancellation,
+        bucket: &str,
+        prefix: &str,
+        result: Self::WalkResultSender,
+        opts: Self::WalkOptions,
+    ) -> Result<(), Self::Error>;
 }
 
 #[derive(Debug, Default)]
@@ -456,6 +500,142 @@ mod tests {
         assert!(matches!(opts.versions_sort, WalkVersionsSortOrder::Ascending));
         assert_eq!(opts.limit, 0);
         assert!(!opts.include_free_versions);
+    }
+
+    #[derive(Debug)]
+    struct TestListBackend;
+
+    #[derive(Debug)]
+    struct TestListError;
+
+    impl fmt::Display for TestListError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("test list error")
+        }
+    }
+
+    impl std::error::Error for TestListError {}
+
+    #[async_trait::async_trait]
+    impl ListOperations for TestListBackend {
+        type Error = TestListError;
+        type ListObjectsV2Info = ListObjectsV2Info<&'static str>;
+        type ListObjectVersionsInfo = ListObjectVersionsInfo<&'static str>;
+        type ObjectInfoOrErr = ObjectInfoOrErr<&'static str, TestListError>;
+        type WalkOptions = WalkOptions<fn(&str) -> bool>;
+        type WalkCancellation = ();
+        type WalkResultSender = ();
+
+        async fn list_objects_v2(
+            self: Arc<Self>,
+            bucket: &str,
+            prefix: &str,
+            continuation_token: Option<String>,
+            delimiter: Option<String>,
+            max_keys: i32,
+            fetch_owner: bool,
+            start_after: Option<String>,
+            incl_deleted: bool,
+        ) -> Result<Self::ListObjectsV2Info, Self::Error> {
+            assert_eq!(bucket, "bucket");
+            assert_eq!(prefix, "photos/");
+            assert_eq!(continuation_token.as_deref(), Some("token"));
+            assert_eq!(delimiter.as_deref(), Some("/"));
+            assert_eq!(max_keys, 10);
+            assert!(fetch_owner);
+            assert_eq!(start_after.as_deref(), Some("photos/0001.jpg"));
+            assert!(!incl_deleted);
+
+            Ok(ListObjectsV2Info {
+                is_truncated: true,
+                continuation_token,
+                next_continuation_token: Some("next".to_owned()),
+                objects: vec!["photos/0002.jpg"],
+                prefixes: vec!["photos/2024/".to_owned()],
+            })
+        }
+
+        async fn list_object_versions(
+            self: Arc<Self>,
+            bucket: &str,
+            prefix: &str,
+            marker: Option<String>,
+            version_marker: Option<String>,
+            delimiter: Option<String>,
+            max_keys: i32,
+        ) -> Result<Self::ListObjectVersionsInfo, Self::Error> {
+            assert_eq!(bucket, "bucket");
+            assert_eq!(prefix, "photos/");
+            assert_eq!(marker.as_deref(), Some("photos/0001.jpg"));
+            assert_eq!(version_marker.as_deref(), Some("version"));
+            assert_eq!(delimiter.as_deref(), Some("/"));
+            assert_eq!(max_keys, 10);
+
+            Ok(ListObjectVersionsInfo {
+                is_truncated: false,
+                next_marker: None,
+                next_version_idmarker: None,
+                objects: vec!["photos/0001.jpg"],
+                prefixes: Vec::new(),
+            })
+        }
+
+        async fn walk(
+            self: Arc<Self>,
+            _rx: Self::WalkCancellation,
+            bucket: &str,
+            prefix: &str,
+            _result: Self::WalkResultSender,
+            opts: Self::WalkOptions,
+        ) -> Result<(), Self::Error> {
+            assert_eq!(bucket, "bucket");
+            assert_eq!(prefix, "photos/");
+            assert_eq!(opts.marker.as_deref(), Some("photos/0001.jpg"));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn list_operations_trait_exposes_generic_list_contract() -> Result<(), TestListError> {
+        let backend = Arc::new(TestListBackend);
+
+        let listed = backend
+            .clone()
+            .list_objects_v2(
+                "bucket",
+                "photos/",
+                Some("token".to_owned()),
+                Some("/".to_owned()),
+                10,
+                true,
+                Some("photos/0001.jpg".to_owned()),
+                false,
+            )
+            .await?;
+        assert!(listed.is_truncated);
+        assert_eq!(listed.objects, vec!["photos/0002.jpg"]);
+        assert_eq!(listed.next_continuation_token.as_deref(), Some("next"));
+
+        let versions = backend
+            .clone()
+            .list_object_versions(
+                "bucket",
+                "photos/",
+                Some("photos/0001.jpg".to_owned()),
+                Some("version".to_owned()),
+                Some("/".to_owned()),
+                10,
+            )
+            .await?;
+        assert_eq!(versions.objects, vec!["photos/0001.jpg"]);
+
+        let opts = WalkOptions::<fn(&str) -> bool> {
+            marker: Some("photos/0001.jpg".to_owned()),
+            ..Default::default()
+        };
+        backend.walk((), "bucket", "photos/", (), opts).await?;
+
+        Ok(())
     }
 
     #[test]

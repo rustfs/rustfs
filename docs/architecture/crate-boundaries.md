@@ -95,7 +95,7 @@ Required `rustfs-storage-api` public re-exports:
 - `pub use error::{StorageErrorCode, StorageResult};`
 - `pub use multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};`
 - `pub use object::{HTTPPreconditions, HTTPRangeError, HTTPRangeSpec, ObjectLockRetentionOptions};`
-- `pub use object::{ListObjectVersionsInfo, ListObjectsInfo, ListObjectsV2Info, ObjectInfoOrErr};`
+- `pub use object::{ListObjectVersionsInfo, ListObjectsInfo, ListObjectsV2Info, ListOperations, ObjectInfoOrErr};`
 - `pub use object::{ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState};`
 - `pub use object::{VersionMarker, WalkOptions, WalkVersionsSortOrder};`
 

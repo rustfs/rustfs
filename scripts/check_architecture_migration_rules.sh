@@ -199,7 +199,7 @@ require_source_line \
   "storage-api public object helper contract re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
-  "pub use object::{ListObjectVersionsInfo, ListObjectsInfo, ListObjectsV2Info, ObjectInfoOrErr};" \
+  "pub use object::{ListObjectVersionsInfo, ListObjectsInfo, ListObjectsV2Info, ListOperations, ObjectInfoOrErr};" \
   "storage-api public list response contract re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
@@ -285,7 +285,7 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:ListObjectVersionsInfo|ListObjectsInfo|ListObjectsV2Info|ObjectInfoOrErr)\b|::(?:ListObjectVersionsInfo|ListObjectsInfo|ListObjectsV2Info|ObjectInfoOrErr)\b)|pub struct (?:ListObjectVersionsInfo|ListObjectsInfo|ListObjectsV2Info|ObjectInfoOrErr)\b' \
+  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:ListObjectVersionsInfo|ListObjectsInfo|ListObjectsV2Info|ListOperations|ObjectInfoOrErr)\b|::(?:ListObjectVersionsInfo|ListObjectsInfo|ListObjectsV2Info|ListOperations|ObjectInfoOrErr)\b)|pub struct (?:ListObjectVersionsInfo|ListObjectsInfo|ListObjectsV2Info|ObjectInfoOrErr)\b' \
     crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
 ) >"$STORE_API_LIST_RESPONSE_REEXPORTS_FILE"
 

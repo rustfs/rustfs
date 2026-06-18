@@ -63,8 +63,8 @@ use crate::{
     rpc::S3PeerSys,
     sets::Sets,
     store_api::{
-        DeletedObject, GetObjectReader, HealOperations, ListObjectsV2Info, ListOperations, MultipartOperations, NamespaceLocking,
-        ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader,
+        DeletedObject, GetObjectReader, HealOperations, ListObjectsV2Info, MultipartOperations, NamespaceLocking, ObjectInfo,
+        ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader,
     },
     store_init,
 };
@@ -504,7 +504,15 @@ impl ObjectOperations for ECStore {
 }
 
 #[async_trait::async_trait]
-impl ListOperations for ECStore {
+impl rustfs_storage_api::ListOperations for ECStore {
+    type Error = Error;
+    type ListObjectsV2Info = ListObjectsV2Info;
+    type ListObjectVersionsInfo = ListObjectVersionsInfo;
+    type ObjectInfoOrErr = ObjectInfoOrErr;
+    type WalkOptions = WalkOptions;
+    type WalkCancellation = CancellationToken;
+    type WalkResultSender = tokio::sync::mpsc::Sender<ObjectInfoOrErr>;
+
     // @continuation_token marker
     // @start_after as marker when continuation_token empty
     // @delimiter default="/", empty when recursive
