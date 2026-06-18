@@ -32,6 +32,7 @@ use rustfs_config::server_config::get_global_server_config;
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::com::{read_config_without_migrate, save_server_config};
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_utils::egress::validate_outbound_url;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -869,6 +870,8 @@ fn validate_absolute_http_url(value: &str, field_name: &str) -> S3Result<()> {
         return Err(s3_error!(InvalidRequest, "{} must be an absolute http/https URL", field_name));
     }
 
+    validate_outbound_url(&parsed).map_err(|err| s3_error!(InvalidRequest, "{} is not allowed: {}", field_name, err))?;
+
     Ok(())
 }
 
@@ -1251,6 +1254,14 @@ mod tests {
         assert!(!is_valid_scheme("ftp"));
         assert!(!is_valid_scheme("javascript"));
         assert!(!is_valid_scheme(""));
+    }
+
+    #[test]
+    fn test_validate_absolute_http_url_rejects_loopback_targets() {
+        let err = validate_absolute_http_url("https://127.0.0.1/.well-known/openid-configuration", "config_url")
+            .expect_err("loopback config URL should be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert!(err.message().unwrap_or_default().contains("not allowed"));
     }
 
     #[test]
