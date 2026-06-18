@@ -8539,20 +8539,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "reed-solomon-erasure"
-version = "6.0.0"
-dependencies = [
- "cc",
- "hashlink",
- "libc",
- "libm",
- "parking_lot",
- "rayon",
- "smallvec",
- "spin 0.12.0",
-]
-
-[[package]]
 name = "reed-solomon-simd"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9308,7 +9294,6 @@ dependencies = [
  "quick-xml 0.40.1",
  "rand 0.10.1",
  "ratelimit",
- "reed-solomon-erasure",
  "reed-solomon-simd",
  "regex",
  "reqwest",
@@ -9320,6 +9305,7 @@ dependencies = [
  "rustfs-config",
  "rustfs-credentials",
  "rustfs-data-usage",
+ "rustfs-erasure-codec",
  "rustfs-filemeta",
  "rustfs-io-metrics",
  "rustfs-kms",
@@ -9362,6 +9348,22 @@ dependencies = [
  "urlencoding",
  "uuid",
  "xxhash-rust",
+]
+
+[[package]]
+name = "rustfs-erasure-codec"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fcda6886ece4bfc6917640007a6b9693dc8424a9412d18c3dda5be2431500f31"
+dependencies = [
+ "cc",
+ "hashlink",
+ "libc",
+ "libm",
+ "parking_lot",
+ "rayon",
+ "smallvec",
+ "spin 0.12.0",
 ]
 
 [[package]]

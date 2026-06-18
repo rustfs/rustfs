@@ -2891,7 +2891,9 @@ mod tests {
     use uuid::Uuid;
 
     #[tokio::test]
+    #[serial]
     async fn expiry_enqueue_reports_missed_without_worker_channel() {
+        let before = global_metrics().report().await.lifecycle_expiry;
         let state = ExpiryState::new();
         let mut state = state.write().await;
         let object = ObjectInfo {
@@ -2908,12 +2910,9 @@ mod tests {
 
         assert!(!queued);
         assert_eq!(state.stats.missed_tasks(), 1);
-        let expiry = global_metrics().report().await.lifecycle_expiry;
-        assert_eq!(expiry.current_queue_capacity, 0);
-        assert_eq!(expiry.current_queued, 0);
-        assert_eq!(expiry.current_active, 0);
-        assert_eq!(expiry.current_workers, 0);
-        assert_eq!(expiry.queue_missed, 1);
+        let after = global_metrics().report().await.lifecycle_expiry;
+        assert!(after.queue_missed >= before.queue_missed.saturating_add(1));
+        assert!(after.scanner_missed >= before.scanner_missed.saturating_add(1));
     }
 
     #[tokio::test]

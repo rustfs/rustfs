@@ -1082,7 +1082,7 @@ mod tests {
     use crate::disk::endpoint::Endpoint;
     use crate::disk::local::LocalDisk;
     use crate::endpoints::{Endpoints, PoolEndpoints};
-    use crate::global::{GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES};
+    use crate::global::reset_local_disk_test_state;
     use crate::store::init_local_disks;
     use rustfs_filemeta::FileInfo;
     use serial_test::serial;
@@ -1108,12 +1108,6 @@ mod tests {
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
-    }
-
-    async fn reset_local_disk_globals() {
-        GLOBAL_LOCAL_DISK_MAP.write().await.clear();
-        GLOBAL_LOCAL_DISK_ID_MAP.write().await.clear();
-        GLOBAL_LOCAL_DISK_SET_DRIVES.write().await.clear();
     }
 
     #[derive(Debug)]
@@ -1292,7 +1286,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn local_get_bucket_info_survives_prior_walk_timeout() {
-        reset_local_disk_globals().await;
+        reset_local_disk_test_state().await;
 
         let temp_dir = TempDir::new().expect("create temp dir for local peer listing regression");
         let disks = init_test_local_disks(&temp_dir, 1, "local-get-bucket-info-survives-prior-walk-timeout").await;
@@ -1337,13 +1331,13 @@ mod tests {
         })
         .await;
 
-        reset_local_disk_globals().await;
+        reset_local_disk_test_state().await;
     }
 
     #[tokio::test]
     #[serial]
     async fn local_get_bucket_info_requires_local_write_quorum() {
-        reset_local_disk_globals().await;
+        reset_local_disk_test_state().await;
 
         let temp_dir = TempDir::new().expect("create temp dir for partial bucket regression");
         let disks = init_test_local_disks(&temp_dir, 2, "local-get-bucket-info-requires-local-write-quorum").await;
@@ -1360,13 +1354,13 @@ mod tests {
 
         assert_eq!(err, Error::ErasureWriteQuorum);
 
-        reset_local_disk_globals().await;
+        reset_local_disk_test_state().await;
     }
 
     #[tokio::test]
     #[serial]
     async fn local_peer_filters_disks_by_pool() {
-        reset_local_disk_globals().await;
+        reset_local_disk_test_state().await;
 
         let temp_dir = TempDir::new().expect("create temp dir for pool filtered local peer regression");
         let disks = init_test_local_disks_for_pools(&temp_dir, &[(0, 2), (1, 2)], "local-peer-filters-disks-by-pool").await;
@@ -1399,13 +1393,13 @@ mod tests {
             .expect("pool 1 local listing should succeed against its own disks");
         assert!(pool1_buckets.is_empty());
 
-        reset_local_disk_globals().await;
+        reset_local_disk_test_state().await;
     }
 
     #[tokio::test]
     #[serial]
     async fn heal_bucket_local_recreates_missing_bucket_volumes() {
-        reset_local_disk_globals().await;
+        reset_local_disk_test_state().await;
 
         let temp_dir = TempDir::new().expect("create temp dir for bucket heal regression");
         let disks = init_test_local_disks(&temp_dir, 2, "heal-bucket-local-recreates-missing-bucket-volumes").await;
@@ -1434,7 +1428,7 @@ mod tests {
             disk.stat_volume(bucket).await.expect("bucket should exist after heal");
         }
 
-        reset_local_disk_globals().await;
+        reset_local_disk_test_state().await;
     }
 
     #[test]

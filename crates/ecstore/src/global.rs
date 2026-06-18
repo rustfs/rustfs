@@ -154,6 +154,13 @@ pub fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
     GLOBAL_Endpoints.get().cloned()
 }
 
+#[cfg(test)]
+pub async fn reset_local_disk_test_state() {
+    GLOBAL_LOCAL_DISK_MAP.write().await.clear();
+    GLOBAL_LOCAL_DISK_ID_MAP.write().await.clear();
+    GLOBAL_LOCAL_DISK_SET_DRIVES.write().await.clear();
+}
+
 pub async fn is_first_cluster_node_local() -> bool {
     get_global_endpoints().first_local()
 }

@@ -137,7 +137,7 @@ futures-core = "0.3.32"
 futures-lite = "2.6.1"
 futures-util = "0.3.32"
 pollster = "0.4.0"
-pulsar = { version = "6.8.0", default-features = false, features = ["tokio-rustls-runtime","telemetry"] }
+pulsar = { version = "6.8.0", default-features = false, features = ["tokio-rustls-runtime", "telemetry"] }
 lapin = { version = "4.10.0", default-features = false, features = ["tokio", "rustls", "rustls--aws_lc_rs"] }
 hyper = { version = "1.10.1", features = ["http2", "http1", "server"] }
 hyper-rustls = { version = "0.27.9", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs", "webpki-roots"] }
@@ -263,7 +263,7 @@ pretty_assertions = "1.4.1"
 rand = { version = "0.10.1", features = ["serde"] }
 ratelimit = "0.10.1"
 rayon = "1.12.0"
-reed-solomon-erasure = { version = "6.0", features = ["simd-accel"], path = "../reed-solomon-erasure" }
+reed-solomon-erasure = { package = "rustfs-erasure-codec", version = "7.0.0", features = ["simd-accel"] }
 #reed-solomon-erasure = { version = "6.0", features = ["simd-accel"], git = "https://github.com/houseme/reed-solomon-erasure",rev = "main" }
 reed-solomon-simd = "3.1.0"
 regex = { version = "1.12.4" }
