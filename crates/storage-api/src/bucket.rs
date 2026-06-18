@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt::Debug;
+
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -54,6 +56,17 @@ pub struct BucketInfo {
     pub deleted: Option<OffsetDateTime>,
     pub versioning: bool,
     pub object_locking: bool,
+}
+
+/// Bucket-level storage operations.
+#[async_trait::async_trait]
+pub trait BucketOperations: Send + Sync + Debug {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<(), Self::Error>;
+    async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo, Self::Error>;
+    async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>, Self::Error>;
+    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<(), Self::Error>;
 }
 
 #[cfg(test)]

@@ -51,16 +51,17 @@
 
 use super::account::validate_account_access;
 use super::container::ContainerMapper;
+use super::storage_compat::resolve_swift_object_store_handle;
 use super::{SwiftError, SwiftResult};
 use axum::http::HeaderMap;
 use rustfs_credentials::Credentials;
-use rustfs_ecstore::resolve_object_store_handle;
-use rustfs_ecstore::store_api::{BucketOperations, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader};
 use rustfs_rio::HashReader;
-use rustfs_storage_api::BucketOptions;
+use rustfs_storage_api::{BucketOperations, BucketOptions, ObjectIO as _, ObjectOperations as _};
 use std::collections::HashMap;
 use tracing::debug;
 use tracing::error;
+
+pub use super::storage_compat::{SwiftGetObjectReader, SwiftObjectInfo, SwiftObjectOptions, SwiftPutObjReader};
 
 const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
 const LOG_SUBSYSTEM_SWIFT_OBJECT: &str = "swift_object";
@@ -109,6 +110,14 @@ impl ObjectKeyMapper {
 
         if object.contains('\0') {
             return Err(SwiftError::BadRequest("Object name cannot contain null bytes".to_string()));
+        }
+
+        if object.chars().any(char::is_control) {
+            return Err(SwiftError::BadRequest("Object name cannot contain control characters".to_string()));
+        }
+
+        if object.starts_with('/') {
+            return Err(SwiftError::BadRequest("Object name cannot start with '/'".to_string()));
         }
 
         // Check for directory traversal attempts
@@ -375,7 +384,7 @@ where
     }
 
     // 12. Get storage layer
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -389,7 +398,7 @@ where
     })?;
 
     // 12. Prepare object options with metadata
-    let opts = ObjectOptions {
+    let opts = SwiftObjectOptions {
         user_defined: user_metadata,
         ..Default::default()
     };
@@ -402,7 +411,7 @@ where
         .map_err(|e| sanitize_storage_error("Hash reader creation", e))?;
 
     // 15. Wrap in PutObjReader as expected by storage layer
-    let mut put_reader = PutObjReader::new(hash_reader);
+    let mut put_reader = SwiftPutObjReader::new(hash_reader);
 
     // 16. Upload object to storage
     let obj_info = store
@@ -455,7 +464,7 @@ where
     validate_metadata(metadata)?;
 
     // Get storage layer
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -469,7 +478,7 @@ where
     })?;
 
     // Prepare object options with metadata
-    let opts = ObjectOptions {
+    let opts = SwiftObjectOptions {
         user_defined: metadata.clone(),
         ..Default::default()
     };
@@ -485,7 +494,7 @@ where
         .map_err(|e| sanitize_storage_error("Hash reader creation", e))?;
 
     // Wrap in PutObjReader
-    let mut put_reader = PutObjReader::new(hash_reader);
+    let mut put_reader = SwiftPutObjReader::new(hash_reader);
 
     // Upload object to storage
     let obj_info = store
@@ -525,10 +534,8 @@ pub async fn get_object(
     container: &str,
     object: &str,
     credentials: &Credentials,
-    range: Option<rustfs_ecstore::store_api::HTTPRangeSpec>,
-) -> SwiftResult<rustfs_ecstore::store_api::GetObjectReader> {
-    use rustfs_ecstore::store_api::GetObjectReader;
-
+    range: Option<rustfs_storage_api::HTTPRangeSpec>,
+) -> SwiftResult<SwiftGetObjectReader> {
     // 1. Validate account access and get project_id
     let project_id = validate_account_access(account, credentials)?;
 
@@ -543,15 +550,15 @@ pub async fn get_object(
     let bucket = mapper.swift_to_s3_bucket(container, &project_id);
 
     // 5. Get storage layer
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // 6. Prepare object options
-    let opts = ObjectOptions::default();
+    let opts = SwiftObjectOptions::default();
 
     // 7. Get object reader from storage with range support
-    let reader: GetObjectReader = store
+    let reader: SwiftGetObjectReader = store
         .get_object_reader(&bucket, &s3_key, range, HeaderMap::new(), &opts)
         .await
         .map_err(|e| {
@@ -586,9 +593,7 @@ pub async fn head_object(
     container: &str,
     object: &str,
     credentials: &Credentials,
-) -> SwiftResult<rustfs_ecstore::store_api::ObjectInfo> {
-    use rustfs_ecstore::store_api::ObjectInfo;
-
+) -> SwiftResult<SwiftObjectInfo> {
     // 1. Validate account access and get project_id
     let project_id = validate_account_access(account, credentials)?;
 
@@ -603,15 +608,15 @@ pub async fn head_object(
     let bucket = mapper.swift_to_s3_bucket(container, &project_id);
 
     // 5. Get storage layer
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // 6. Prepare object options
-    let opts = ObjectOptions::default();
+    let opts = SwiftObjectOptions::default();
 
     // 7. Get object info (metadata only) from storage
-    let info: ObjectInfo = store.get_object_info(&bucket, &s3_key, &opts).await.map_err(|e| {
+    let info: SwiftObjectInfo = store.get_object_info(&bucket, &s3_key, &opts).await.map_err(|e| {
         let err_str = e.to_string();
         if err_str.contains("does not exist") || err_str.contains("not found") {
             SwiftError::NotFound(format!("Object '{}' not found in container '{}'", object, container))
@@ -661,12 +666,12 @@ pub async fn delete_object(account: &str, container: &str, object: &str, credent
     let bucket = mapper.swift_to_s3_bucket(container, &project_id);
 
     // 5. Get storage layer
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // 6. Prepare object options for deletion
-    let opts = ObjectOptions::default();
+    let opts = SwiftObjectOptions::default();
 
     // 7. Delete object from storage
     // Swift DELETE is idempotent - returns success even if object doesn't exist
@@ -724,12 +729,12 @@ pub async fn update_object_metadata(
     let bucket = mapper.swift_to_s3_bucket(container, &project_id);
 
     // 5. Get storage layer
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // 6. First, get the existing object info to verify it exists
-    let opts = ObjectOptions::default();
+    let opts = SwiftObjectOptions::default();
     let existing_info = store.get_object_info(&bucket, &s3_key, &opts).await.map_err(|e| {
         let err_str = e.to_string();
         if err_str.contains("does not exist") || err_str.contains("not found") {
@@ -770,7 +775,7 @@ pub async fn update_object_metadata(
 
     // 11. Prepare options for metadata update
     // Swift POST replaces all custom metadata, not merges
-    let update_opts = ObjectOptions {
+    let update_opts = SwiftObjectOptions {
         user_defined: new_metadata,
         mod_time: existing_info.mod_time,
         version_id: existing_info.version_id.map(|v| v.to_string()),
@@ -848,12 +853,12 @@ pub async fn copy_object(
     let dst_bucket = mapper.swift_to_s3_bucket(dst_container, &dst_project_id);
 
     // 6. Get storage layer
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // 7. First, verify source object exists and get its info
-    let src_opts = ObjectOptions::default();
+    let src_opts = SwiftObjectOptions::default();
     let mut src_info = store
         .get_object_info(&src_bucket, &src_s3_key, &src_opts)
         .await
@@ -920,7 +925,7 @@ pub async fn copy_object(
     validate_metadata(&new_metadata)?;
 
     // 14. Prepare destination options
-    let dst_opts = ObjectOptions {
+    let dst_opts = SwiftObjectOptions {
         user_defined: new_metadata,
         ..Default::default()
     };
@@ -1024,8 +1029,8 @@ pub fn parse_copy_from_header(copy_from: &str) -> SwiftResult<(String, String)> 
 /// assert_eq!(range.end, 1023);
 /// ```
 #[allow(dead_code)] // Handler integration: Range header
-pub fn parse_range_header(range_str: &str) -> SwiftResult<rustfs_ecstore::store_api::HTTPRangeSpec> {
-    use rustfs_ecstore::store_api::HTTPRangeSpec;
+pub fn parse_range_header(range_str: &str) -> SwiftResult<rustfs_storage_api::HTTPRangeSpec> {
+    use rustfs_storage_api::HTTPRangeSpec;
 
     if !range_str.starts_with("bytes=") {
         return Err(SwiftError::BadRequest("Range header must start with 'bytes='".to_string()));
@@ -1115,6 +1120,7 @@ pub fn format_content_range(start: i64, end: i64, total: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn test_validate_object_name_valid() {
@@ -1157,6 +1163,30 @@ mod tests {
         match result {
             Err(SwiftError::BadRequest(msg)) => {
                 assert!(msg.contains("null"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_validate_object_name_control_character() {
+        let result = ObjectKeyMapper::validate_object_name("file\nname.txt");
+        assert!(result.is_err());
+        match result {
+            Err(SwiftError::BadRequest(msg)) => {
+                assert!(msg.contains("control"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_validate_object_name_leading_slash() {
+        let result = ObjectKeyMapper::validate_object_name("/file.txt");
+        assert!(result.is_err());
+        match result {
+            Err(SwiftError::BadRequest(msg)) => {
+                assert!(msg.contains("start with '/'"));
             }
             _ => panic!("Expected BadRequest error"),
         }
@@ -1238,6 +1268,41 @@ mod tests {
 
         // Empty segments
         assert_eq!(ObjectKeyMapper::normalize_path("path///to/file.txt"), "path/to/file.txt");
+    }
+
+    proptest! {
+        #[test]
+        fn validate_object_name_ok_outputs_are_safe(input in any::<String>()) {
+            if let Ok(()) = ObjectKeyMapper::validate_object_name(&input) {
+                prop_assert!(!input.is_empty());
+                prop_assert!(input.len() <= 1024);
+                prop_assert!(!input.starts_with('/'));
+                prop_assert!(!input.chars().any(char::is_control));
+                prop_assert!(!input.split('/').any(|segment| segment == ".."));
+            }
+        }
+
+        #[test]
+        fn decode_object_from_url_round_trips_valid_input(input in any::<String>()) {
+            let encoded = ObjectKeyMapper::encode_object_for_url(&input);
+
+            match ObjectKeyMapper::decode_object_from_url(&encoded) {
+                Ok(decoded) => {
+                    prop_assert_eq!(decoded.as_str(), input.as_str());
+                    prop_assert!(ObjectKeyMapper::validate_object_name(&decoded).is_ok());
+                }
+                Err(_) => {
+                    prop_assert!(ObjectKeyMapper::validate_object_name(&input).is_err());
+                }
+            }
+        }
+
+        #[test]
+        fn normalize_path_is_idempotent(input in any::<String>()) {
+            let once = ObjectKeyMapper::normalize_path(&input);
+            let twice = ObjectKeyMapper::normalize_path(&once);
+            prop_assert_eq!(twice, once);
+        }
     }
 
     #[test]

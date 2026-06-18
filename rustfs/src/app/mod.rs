@@ -21,6 +21,7 @@ pub mod context;
 pub mod multipart_usecase;
 pub mod object_usecase;
 mod select_object;
+pub(crate) mod storage_compat;
 
 #[cfg(test)]
 mod capacity_dirty_scope_test;

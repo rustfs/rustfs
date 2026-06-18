@@ -69,3 +69,32 @@ pub struct ListPartsInfo {
     pub checksum_algorithm: String,
     pub checksum_type: String,
 }
+
+#[derive(Debug, Clone, Default)]
+pub struct CompletePart {
+    pub part_num: usize,
+    pub etag: Option<String>,
+    pub checksum_crc32: Option<String>,
+    pub checksum_crc32c: Option<String>,
+    pub checksum_sha1: Option<String>,
+    pub checksum_sha256: Option<String>,
+    pub checksum_crc64nvme: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complete_part_defaults_preserve_empty_checksums() {
+        let part = CompletePart::default();
+
+        assert_eq!(part.part_num, 0);
+        assert!(part.etag.is_none());
+        assert!(part.checksum_crc32.is_none());
+        assert!(part.checksum_crc32c.is_none());
+        assert!(part.checksum_sha1.is_none());
+        assert!(part.checksum_sha256.is_none());
+        assert!(part.checksum_crc64nvme.is_none());
+    }
+}

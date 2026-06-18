@@ -24,6 +24,8 @@ REQUIRED_STORAGE_CREDENTIAL_KEYS = (
     "s3.secret-access-key",
     "s3.session-token",
 )
+TABLE_MAINTENANCE_CONFIG_VERSION = 1
+IDENTIFIER_SEGMENT_MAX_LEN = 64
 
 PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
     "rustfs": {
@@ -88,7 +90,7 @@ CLIENT_MATRIX: list[dict[str, str]] = [
     {
         "client": "PyIceberg",
         "status": "automated",
-        "coverage": "create namespace, create table, append, reload, scan, optional catalog-vended table credentials with exact-prefix data-plane scope probe",
+        "coverage": "create namespace, create table, append, reload, scan, metadata-location, refs, views, maintenance, diagnostics, optional catalog-vended table credentials with exact-prefix data-plane scope probe",
         "entrypoint": "scripts/table-catalog/pyiceberg_smoke.py",
     },
     {
@@ -157,10 +159,16 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
         "expected_behavior": "metadata maintenance can plan binpack candidates and commit a safe unpartitioned Parquet rewrite through the catalog; built-in periodic scheduling, sort compaction, delete-file rewrite, and row-level compaction are not claimed",
     },
     {
+        "capability": "row-level-delete-update-merge",
+        "status": "catalog-conflict-validation-supported",
+        "roadmap_area": "row-level-conflict-detection",
+        "expected_behavior": "standard catalog commit validates append, overwrite, delete, and replace snapshot manifests for table-warehouse scope, referenced object existence, current-live-file deletes, and stale add/delete conflicts; end-to-end SQL DML client coverage remains a compatibility validation item",
+    },
+    {
         "capability": "external-catalog-bridge",
-        "status": "metadata-import-only",
+        "status": "operator-sync-supported",
         "roadmap_area": "external-catalog",
-        "expected_behavior": "catalog import/register supports an existing Iceberg metadata location, while Polaris, Glue, DLF, and Hive synchronization remain unsupported",
+        "expected_behavior": "catalog import/register and operator-supplied external metadata pointer sync are supported for Polaris, Glue, DLF, and Hive identity boundaries; online vendor SDK polling and policy mirroring are not claimed",
     },
     {
         "capability": "multi-table-transactions",
@@ -187,6 +195,15 @@ class RuntimeDeps:
 class StorageCredential:
     prefix: str
     config: dict[str, str]
+
+
+class RestRequestError(RuntimeError):
+    def __init__(self, method: str, path: str, status_code: int, response_body: str) -> None:
+        super().__init__(f"{method} {path} failed with HTTP {status_code}: {response_body}")
+        self.method = method
+        self.path = path
+        self.status_code = status_code
+        self.response_body = response_body
 
 
 def env_or_none(key: str) -> str | None:
@@ -252,6 +269,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=float(os.getenv("RUSTFS_TABLE_SMOKE_TIMEOUT", "20")))
     parser.add_argument("--cleanup", action="store_true", help="Drop the smoke table and namespace before exiting.")
     parser.add_argument("--replace", action="store_true", help="Drop an existing table with the same identifier first.")
+    parser.add_argument(
+        "--skip-catalog-api-probes",
+        action="store_true",
+        help="Skip direct REST probes for metadata-location, refs, views, maintenance, and diagnostics endpoints.",
+    )
     parser.add_argument("--insecure", action="store_true", help="Disable TLS verification for HTTPS endpoints.")
     parser.add_argument("--print-client-matrix", action="store_true", help="Print the current client conformance matrix as JSON and exit.")
     parser.add_argument("--print-vendor-profiles", action="store_true", help="Print vendor connection profile references as JSON and exit.")
@@ -362,7 +384,25 @@ def signed_rest_request(args: argparse.Namespace, deps: RuntimeDeps, method: str
             return json.loads(response_data.decode("utf-8"))
     except urllib.error.HTTPError as error:
         response_body = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"{method} {path} failed with HTTP {error.code}: {response_body}") from error
+        raise RestRequestError(method, path, error.code, response_body) from error
+
+
+def signed_rest_request_expect_error(
+    args: argparse.Namespace,
+    deps: RuntimeDeps,
+    method: str,
+    path: str,
+    body: dict[str, Any] | None = None,
+    expected_statuses: set[int] | None = None,
+) -> RestRequestError:
+    try:
+        signed_rest_request(args, deps, method, path, body)
+    except RestRequestError as error:
+        if expected_statuses is not None and error.status_code not in expected_statuses:
+            expected = ", ".join(str(status) for status in sorted(expected_statuses))
+            raise RuntimeError(f"{method} {path} failed with HTTP {error.status_code}, expected one of: {expected}") from error
+        return error
+    raise RuntimeError(f"{method} {path} unexpectedly succeeded")
 
 
 def ensure_bucket(args: argparse.Namespace, deps: RuntimeDeps) -> None:
@@ -404,6 +444,45 @@ def credentials_endpoint_path(args: argparse.Namespace) -> str:
     encoded_namespace = urllib.parse.quote(args.namespace, safe="")
     encoded_table = urllib.parse.quote(args.table, safe="")
     return f"{args.rest_path}/v1/{encoded_bucket}/namespaces/{encoded_namespace}/tables/{encoded_table}/credentials"
+
+
+def table_endpoint_path(args: argparse.Namespace, suffix: str = "") -> str:
+    encoded_bucket = urllib.parse.quote(args.bucket, safe="")
+    encoded_namespace = urllib.parse.quote(args.namespace, safe="")
+    encoded_table = urllib.parse.quote(args.table, safe="")
+    return f"{args.rest_path}/v1/{encoded_bucket}/namespaces/{encoded_namespace}/tables/{encoded_table}{suffix}"
+
+
+def table_ref_endpoint_path(args: argparse.Namespace, ref_name: str | None = None) -> str:
+    path = table_endpoint_path(args, "/refs")
+    if ref_name is None:
+        return path
+    return f"{path}/{urllib.parse.quote(ref_name, safe='')}"
+
+
+def view_endpoint_path(args: argparse.Namespace, view_name: str | None = None) -> str:
+    encoded_bucket = urllib.parse.quote(args.bucket, safe="")
+    encoded_namespace = urllib.parse.quote(args.namespace, safe="")
+    path = f"{args.rest_path}/v1/{encoded_bucket}/namespaces/{encoded_namespace}/views"
+    if view_name is None:
+        return path
+    return f"{path}/{urllib.parse.quote(view_name, safe='')}"
+
+
+def default_maintenance_config() -> dict[str, Any]:
+    return {
+        "version": TABLE_MAINTENANCE_CONFIG_VERSION,
+        "retain-recent-metadata-files": 2,
+        "delete-enabled": False,
+        "background-enabled": False,
+        "worker-paused": True,
+        "worker-lease-timeout-seconds": 60,
+        "max-retry-attempts": 0,
+        "retry-initial-backoff-seconds": 5,
+        "retry-max-backoff-seconds": 300,
+        "quarantine-enabled": False,
+        "quarantine-retention-seconds": 0,
+    }
 
 
 def storage_credential_from_response(response: dict[str, Any]) -> StorageCredential:
@@ -479,6 +558,18 @@ def table_warehouse_location(table: Any) -> str:
 def safe_probe_segment(namespace: str, table: str) -> str:
     source = f"{namespace}-{table}"
     return "".join(char if char.isalnum() or char in {"-", "_", "."} else "-" for char in source)
+
+
+def safe_ref_segment(namespace: str, table: str) -> str:
+    source = f"smoke-{namespace}-{table}".lower()
+    segment = "".join(
+        char if char.isascii() and (char.isalnum() or char in {"-", "_"}) else "-"
+        for char in source
+    )
+    segment = segment.strip("-_")
+    if not segment:
+        return "smoke"
+    return segment[:IDENTIFIER_SEGMENT_MAX_LEN].rstrip("-_") or "smoke"
 
 
 def scope_probe_keys(object_prefix: str, namespace: str, table: str) -> tuple[str, str]:
@@ -692,29 +783,174 @@ def cleanup_catalog(catalog: Any, identifier: tuple[str, str]) -> None:
             print(f"warning: failed to drop namespace {identifier[0]}: {error}", file=sys.stderr)
 
 
+def current_snapshot_id_from_table_response(response: dict[str, Any]) -> int:
+    metadata = response.get("metadata")
+    if not isinstance(metadata, dict):
+        raise RuntimeError("REST loadTable response did not include metadata")
+    snapshot_id = metadata.get("current-snapshot-id")
+    if not isinstance(snapshot_id, int):
+        raise RuntimeError("REST loadTable response did not include a current snapshot id")
+    return snapshot_id
+
+
+def run_metadata_location_probe(args: argparse.Namespace, deps: RuntimeDeps, table_response: dict[str, Any]) -> None:
+    metadata_location = table_response.get("metadata-location")
+    if not isinstance(metadata_location, str) or not metadata_location:
+        raise RuntimeError("REST loadTable response did not include metadata-location")
+    location_response = signed_rest_request(args, deps, "GET", table_endpoint_path(args, "/metadata-location"))
+    if location_response.get("metadata-location") != metadata_location:
+        raise RuntimeError("metadata-location endpoint does not match loadTable metadata-location")
+    if not location_response.get("version-token"):
+        raise RuntimeError("metadata-location endpoint did not include version-token")
+
+
+def run_table_ref_probe(args: argparse.Namespace, deps: RuntimeDeps, snapshot_id: int) -> None:
+    ref_name = safe_ref_segment(args.namespace, args.table)
+    ref_body = {
+        "snapshot-id": snapshot_id,
+        "type": "tag",
+        "max-ref-age-ms": 86_400_000,
+    }
+    force_deleted = False
+    signed_rest_request(args, deps, "PUT", table_ref_endpoint_path(args, ref_name), ref_body)
+    try:
+        refs = signed_rest_request(args, deps, "GET", table_ref_endpoint_path(args))
+        if refs.get("refs", {}).get(ref_name, {}).get("snapshot-id") != snapshot_id:
+            raise RuntimeError("table refs endpoint did not return the smoke tag")
+        unforced_delete = signed_rest_request_expect_error(
+            args,
+            deps,
+            "DELETE",
+            table_ref_endpoint_path(args, ref_name),
+            {},
+            expected_statuses={400},
+        )
+        if "force is required" not in unforced_delete.response_body.lower():
+            raise RuntimeError("unforced table ref delete did not report the retention force requirement")
+        signed_rest_request(args, deps, "DELETE", table_ref_endpoint_path(args, ref_name), {"force": True})
+        force_deleted = True
+        refs = signed_rest_request(args, deps, "GET", table_ref_endpoint_path(args))
+        if ref_name in refs.get("refs", {}):
+            raise RuntimeError("table refs endpoint still returned the deleted smoke tag")
+    finally:
+        if not force_deleted:
+            try:
+                signed_rest_request(args, deps, "DELETE", table_ref_endpoint_path(args, ref_name), {"force": True})
+            except RestRequestError as error:
+                if error.status_code != 404:
+                    raise
+
+
+def smoke_view_request(args: argparse.Namespace, view_name: str, version_id: int, sql: str) -> dict[str, Any]:
+    return {
+        "name": view_name,
+        "schema": {
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [
+                {"id": 1, "name": "id", "required": True, "type": "long"},
+                {"id": 2, "name": "payload", "required": False, "type": "string"},
+            ],
+        },
+        "view-version": {
+            "version-id": version_id,
+            "schema-id": 0,
+            "timestamp-ms": int(time.time() * 1000),
+            "summary": {"operation": "replace"},
+            "representations": [
+                {
+                    "type": "sql",
+                    "sql": sql,
+                    "dialect": "spark",
+                }
+            ],
+        },
+        "properties": {"rustfs.smoke": "true", "rustfs.smoke.table": args.table},
+    }
+
+
+def run_view_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
+    view_name = f"{args.table}_smoke_view"
+    create_body = smoke_view_request(args, view_name, 1, f"SELECT id, payload FROM {args.namespace}.{args.table}")
+    signed_rest_request(args, deps, "POST", view_endpoint_path(args), create_body)
+    try:
+        views = signed_rest_request(args, deps, "GET", view_endpoint_path(args))
+        identifiers = views.get("identifiers", [])
+        if not any(identifier.get("name") == view_name for identifier in identifiers if isinstance(identifier, dict)):
+            raise RuntimeError("listViews response did not include the smoke view")
+        loaded = signed_rest_request(args, deps, "GET", view_endpoint_path(args, view_name))
+        metadata_location = loaded.get("metadata-location")
+        if not isinstance(metadata_location, str) or not metadata_location:
+            raise RuntimeError("loadView response did not include metadata-location")
+    finally:
+        try:
+            signed_rest_request(args, deps, "DELETE", view_endpoint_path(args, view_name))
+        except RestRequestError as error:
+            if error.status_code != 404:
+                raise
+
+
+def run_maintenance_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
+    config_path = table_endpoint_path(args, "/maintenance/config")
+    signed_rest_request(args, deps, "PUT", config_path, default_maintenance_config())
+    config = signed_rest_request(args, deps, "GET", config_path)
+    if config.get("version") != TABLE_MAINTENANCE_CONFIG_VERSION:
+        raise RuntimeError("maintenance config endpoint did not persist the smoke config")
+
+    report = signed_rest_request(
+        args,
+        deps,
+        "POST",
+        table_endpoint_path(args, "/maintenance/metadata"),
+        {"retain-recent-metadata-files": 1, "delete": False},
+    )
+    job = report.get("job")
+    if not isinstance(job, dict) or not job.get("job-id"):
+        raise RuntimeError("maintenance metadata endpoint did not return a job id")
+    signed_rest_request(args, deps, "GET", table_endpoint_path(args, f"/maintenance/jobs/{job['job-id']}"))
+
+    worker = signed_rest_request(args, deps, "POST", table_endpoint_path(args, "/maintenance/worker/run"), {})
+    worker_job = worker.get("job")
+    expected_statuses = {"DISABLED", "PAUSED", "FAILED", "SUCCESSFUL", "RUNNING"}
+    if not isinstance(worker_job, dict) or worker_job.get("status") not in expected_statuses:
+        raise RuntimeError("maintenance worker endpoint did not return a stable job status")
+
+
+def run_catalog_api_probes(args: argparse.Namespace, deps: RuntimeDeps) -> None:
+    table_response = signed_rest_request(args, deps, "GET", table_endpoint_path(args))
+    snapshot_id = current_snapshot_id_from_table_response(table_response)
+    run_metadata_location_probe(args, deps, table_response)
+    run_table_ref_probe(args, deps, snapshot_id)
+    run_view_probe(args, deps)
+    run_maintenance_probe(args, deps)
+    diagnostics = signed_rest_request(args, deps, "GET", table_endpoint_path(args, "/catalog/diagnostics"))
+    if not isinstance(diagnostics, dict) or not diagnostics:
+        raise RuntimeError("catalog diagnostics endpoint returned an empty response")
+
+
 def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> None:
     endpoint = normalized_endpoint(args.endpoint)
     ensure_local_proxy_bypass(endpoint)
     ensure_aws_env(args.access_key, args.secret_key, args.region)
 
-    print(f"[1/9] ensuring S3 bucket {args.bucket}")
+    print(f"[1/10] ensuring S3 bucket {args.bucket}")
     ensure_bucket(args, deps)
 
-    print(f"[2/9] enabling RustFS table bucket {args.bucket} through {args.rest_path}/v1")
+    print(f"[2/10] enabling RustFS table bucket {args.bucket} through {args.rest_path}/v1")
     enable_table_bucket(args, deps)
 
-    print(f"[3/9] loading PyIceberg REST catalog at {endpoint}{args.rest_path}")
+    print(f"[3/10] loading PyIceberg REST catalog at {endpoint}{args.rest_path}")
     catalog = deps.load_catalog(args.catalog_name, **catalog_properties(args))
     install_rustfs_rest_sigv4_adapter(catalog, args, deps)
     identifier = table_identifier(args)
 
     if args.replace:
-        print(f"[4/9] replacing existing table {'.'.join(identifier)} if present")
+        print(f"[4/10] replacing existing table {'.'.join(identifier)} if present")
         drop_table_if_present(catalog, identifier)
     else:
-        print(f"[4/9] table {'.'.join(identifier)} is available")
+        print(f"[4/10] table {'.'.join(identifier)} is available")
 
-    print(f"[5/9] creating namespace and table {'.'.join(identifier)}")
+    print(f"[5/10] creating namespace and table {'.'.join(identifier)}")
     ensure_namespace(catalog, args.namespace)
     arrow_schema = deps.pyarrow.schema(
         [
@@ -726,10 +962,10 @@ def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> None:
 
     storage_credential = None
     if args.require_vended_credentials:
-        print(f"[6/9] loading table-scoped storage credentials")
+        print(f"[6/10] loading table-scoped storage credentials")
         storage_credential = load_table_storage_credential(args, deps)
         print(f"credential scope: {storage_credential.prefix or 'not reported'}")
-        print(f"[7/9] verifying table-scoped data-plane access")
+        print(f"[7/10] verifying table-scoped data-plane access")
         try:
             expected_table_location = table_warehouse_location(created_table)
         except RuntimeError:
@@ -738,10 +974,10 @@ def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> None:
         catalog = deps.load_catalog(args.catalog_name, **catalog_properties(args, storage_credential=storage_credential))
         install_rustfs_rest_sigv4_adapter(catalog, args, deps)
     else:
-        print(f"[6/9] using configured S3 credentials for data-plane operations")
-        print(f"[7/9] skipping vended credential data-plane scope probe")
+        print(f"[6/10] using configured S3 credentials for data-plane operations")
+        print(f"[7/10] skipping vended credential data-plane scope probe")
 
-    print(f"[8/9] appending rows through PyIceberg")
+    print(f"[8/10] appending rows through PyIceberg")
     table = catalog.load_table(identifier)
     rows = deps.pyarrow.Table.from_pylist(
         [
@@ -752,11 +988,17 @@ def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> None:
     )
     table.append(rows)
 
-    print(f"[9/9] reloading and scanning table")
+    print(f"[9/10] reloading and scanning table")
     loaded = catalog.load_table(identifier)
     scanned = loaded.scan().to_arrow()
     if scanned.num_rows != 2:
         raise RuntimeError(f"expected 2 rows after append, got {scanned.num_rows}")
+
+    if args.skip_catalog_api_probes:
+        print("[10/10] skipping direct REST catalog API probes")
+    else:
+        print("[10/10] probing direct REST catalog APIs")
+        run_catalog_api_probes(args, deps)
 
     if args.cleanup:
         print(f"cleanup: dropping table and namespace {'.'.join(identifier)}")

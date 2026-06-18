@@ -28,17 +28,21 @@ use rustfs_ecstore::{
     global::GLOBAL_TierConfigMgr,
     pools::path2_bucket_object_with_base_path,
     store::ECStore,
-    store_api::{BucketOperations, ListOperations, MultipartOperations, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader},
     tier::{
         tier_config::{TierConfig, TierMinIO, TierType},
         warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
     },
 };
 use rustfs_filemeta::FileMeta;
-use rustfs_scanner::scanner::init_data_scanner;
 use rustfs_scanner::scanner_folder::ScannerItem;
 use rustfs_scanner::scanner_io::ScannerIODisk;
-use rustfs_storage_api::MakeBucketOptions;
+use rustfs_scanner::{
+    ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions, ScannerPutObjReader as PutObjReader,
+    scanner::init_data_scanner,
+};
+use rustfs_storage_api::{
+    BucketOperations, ListOperations as _, MakeBucketOptions, MultipartOperations as _, ObjectIO as _, ObjectOperations as _,
+};
 use rustfs_utils::path::path_join_buf;
 use s3s::dto::RestoreRequest;
 use serial_test::serial;
@@ -782,12 +786,7 @@ async fn register_mock_tier(tier_name: &str) -> MockWarmBackend {
     backend
 }
 
-async fn wait_for_transition(
-    ecstore: &Arc<ECStore>,
-    bucket: &str,
-    object: &str,
-    timeout: Duration,
-) -> Option<rustfs_ecstore::store_api::ObjectInfo> {
+async fn wait_for_transition(ecstore: &Arc<ECStore>, bucket: &str, object: &str, timeout: Duration) -> Option<ObjectInfo> {
     let deadline = tokio::time::Instant::now() + timeout;
 
     loop {
@@ -898,7 +897,7 @@ mod serial_tests {
             println!("✅ Object was transitioned by lifecycle processing");
             // Let's try to get object info to see its details
             match ecstore
-                .get_object_info(bucket_name.as_str(), object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
+                .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
                 .await
             {
                 Ok(obj_info) => {
@@ -1020,7 +1019,7 @@ mod serial_tests {
                 multipart_bucket.as_str(),
                 multipart_object,
                 &upload.upload_id,
-                vec![rustfs_ecstore::store_api::CompletePart {
+                vec![rustfs_storage_api::CompletePart {
                     part_num: 1,
                     etag: part.etag.clone(),
                     ..Default::default()
@@ -1165,12 +1164,12 @@ mod serial_tests {
                 object_name,
                 &upload.upload_id,
                 vec![
-                    rustfs_ecstore::store_api::CompletePart {
+                    rustfs_storage_api::CompletePart {
                         part_num: 1,
                         etag: uploaded_part1.etag.clone(),
                         ..Default::default()
                     },
-                    rustfs_ecstore::store_api::CompletePart {
+                    rustfs_storage_api::CompletePart {
                         part_num: 2,
                         etag: uploaded_part2.etag.clone(),
                         ..Default::default()

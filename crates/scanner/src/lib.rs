@@ -28,12 +28,14 @@ pub mod scanner_budget;
 pub mod scanner_folder;
 pub mod scanner_io;
 pub mod sleeper;
+mod storage_compat;
 
 pub use data_usage_define::*;
 pub use error::ScannerError;
 pub use runtime_config::{apply_scanner_runtime_config, scanner_runtime_config_status, validate_scanner_runtime_config};
 pub use rustfs_common::last_minute;
 pub use scanner::init_data_scanner;
+pub use scanner_io::{clear_dirty_usage_bucket, record_dirty_usage_bucket};
 pub use sleeper::{DynamicSleeper, SCANNER_IDLE_MODE, SCANNER_SLEEPER};
 use std::sync::atomic::{AtomicU64, Ordering};
 

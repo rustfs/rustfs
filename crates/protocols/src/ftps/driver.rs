@@ -39,6 +39,22 @@ const EVENT_FTPS_DIRECTORY_STATE: &str = "ftps_directory_state";
 const EVENT_FTPS_CWD_FAILED: &str = "ftps_cwd_failed";
 const EVENT_FTPS_RENAME_STATE: &str = "ftps_rename_state";
 
+fn parse_s3_path(path_input: &str) -> std::result::Result<(String, Option<String>), String> {
+    if path_input.chars().any(char::is_control) {
+        return Err("control characters are not allowed in FTPS paths".to_string());
+    }
+
+    let cleaned_path = path::clean(path_input);
+    let (bucket, object) = path::path_to_bucket_object(&cleaned_path);
+
+    if object.contains(path::GLOBAL_DIR_SUFFIX) {
+        return Err("internal directory marker is not allowed in FTPS paths".to_string());
+    }
+
+    let key = if object.is_empty() { None } else { Some(object) };
+    Ok((bucket, key))
+}
+
 /// FTPS metadata implementation
 #[derive(Debug, Clone)]
 pub struct FtpsMetadata {
@@ -148,14 +164,6 @@ where
         }
     }
 
-    fn parse_s3_path(&self, path: &str) -> std::result::Result<(String, Option<String>), String> {
-        let cleaned_path = path::clean(path);
-        let (bucket, object) = path::path_to_bucket_object(&cleaned_path);
-        let key = if object.is_empty() { None } else { Some(object) };
-
-        Ok((bucket, key))
-    }
-
     /// Recursively delete all objects in a bucket, then delete the bucket itself.
     async fn delete_bucket_recursively(
         &self,
@@ -249,8 +257,7 @@ where
         let path_str = path.as_ref().to_string_lossy();
         let session_context = &user.session_context;
 
-        let (bucket, key) = self
-            .parse_s3_path(&path_str)
+        let (bucket, key) = parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         if let Some(key) = key {
@@ -353,8 +360,7 @@ where
             return self.list_buckets(session_context).await;
         }
 
-        let (bucket, prefix) = self
-            .parse_s3_path(&path_str)
+        let (bucket, prefix) = parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         // Authorize the operation
@@ -485,8 +491,7 @@ where
         let session_context = &user.session_context;
         let masked_username = MaskedAccessKey(&user.username);
 
-        let (bucket, key) = self
-            .parse_s3_path(&path_str)
+        let (bucket, key) = parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         let key = key.ok_or_else(|| Error::new(ErrorKind::PermanentFileNotAvailable, "Cannot get directory"))?;
@@ -566,8 +571,7 @@ where
         let session_context = &user.session_context;
         let masked_username = MaskedAccessKey(&user.username);
 
-        let (bucket, key) = self
-            .parse_s3_path(&path_str)
+        let (bucket, key) = parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         let key = key.ok_or_else(|| Error::new(ErrorKind::PermanentFileNotAvailable, "Cannot put to directory"))?;
@@ -658,8 +662,7 @@ where
             "FTPS delete requested"
         );
 
-        let (bucket, key) = self
-            .parse_s3_path(&path_str)
+        let (bucket, key) = parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         if let Some(key) = key {
@@ -726,8 +729,7 @@ where
             "ftps directory state changed"
         );
 
-        let (bucket, _key) = self
-            .parse_s3_path(&path_str)
+        let (bucket, _key) = parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         // Create bucket for directory
@@ -774,8 +776,7 @@ where
         let path_str = path.as_ref().to_string_lossy();
         let session_context = &user.session_context;
 
-        let (bucket, _key) = self
-            .parse_s3_path(&path_str)
+        let (bucket, _key) = parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         // Authorize delete bucket
@@ -831,8 +832,7 @@ where
         let path_str = path.as_ref().to_string_lossy();
         let session_context = &user.session_context;
 
-        let (bucket, _key) = self
-            .parse_s3_path(&path_str)
+        let (bucket, _key) = parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         // Authorize HeadBucket (CWD probes bucket existence)
@@ -884,5 +884,45 @@ where
             ErrorKind::CommandNotImplemented,
             "Rename operation not supported in S3 backend",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_s3_path;
+    use rustfs_utils::path;
+
+    proptest::proptest! {
+        #[test]
+        fn parse_s3_path_never_leaks_control_bytes_or_traversal_in_ok_output(
+            input in proptest::prelude::any::<String>(),
+        ) {
+            match parse_s3_path(&input) {
+                Err(_) => {}
+                Ok((bucket, key)) => {
+                    proptest::prop_assert!(!bucket.contains('/'));
+                    proptest::prop_assert!(!bucket.chars().any(char::is_control));
+
+                    if let Some(k) = key.as_deref() {
+                        proptest::prop_assert!(!k.chars().any(char::is_control));
+                        proptest::prop_assert!(!k.starts_with('/'));
+                        proptest::prop_assert!(!k.split('/').any(|segment| segment == ".."));
+                        proptest::prop_assert!(!k.contains(path::GLOBAL_DIR_SUFFIX));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parse_s3_path_rejects_control_bytes() {
+        assert!(parse_s3_path("/bucket/line\rfeed").is_err());
+        assert!(parse_s3_path("/bucket/line\nfeed").is_err());
+        assert!(parse_s3_path("/bucket/tab\tname").is_err());
+    }
+
+    #[test]
+    fn parse_s3_path_rejects_internal_directory_marker() {
+        assert!(parse_s3_path("/bucket/__XLDIR__").is_err());
     }
 }

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod object;
+mod storage_compat;
 
 use crate::cache::Cache;
 use crate::error::Result;

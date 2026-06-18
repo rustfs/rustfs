@@ -18,6 +18,24 @@ use crate::admin::site_replication_identity::{
     canonical_endpoint, deployment_id_for_endpoint, normalize_peer_map_by_identity_with, same_identity_endpoint,
     site_identity_key,
 };
+use crate::admin::storage_compat::ecstore::bucket::bucket_target_sys::BucketTargetSys;
+use crate::admin::storage_compat::ecstore::bucket::metadata::{
+    BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE, BUCKET_REPLICATION_CONFIG,
+    BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG,
+};
+use crate::admin::storage_compat::ecstore::bucket::metadata_sys;
+use crate::admin::storage_compat::ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
+use crate::admin::storage_compat::ecstore::bucket::replication::{
+    ReplicationConfigurationExt, ResyncOpts, get_global_replication_pool,
+};
+use crate::admin::storage_compat::ecstore::bucket::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
+use crate::admin::storage_compat::ecstore::bucket::utils::{deserialize, serialize};
+use crate::admin::storage_compat::ecstore::bucket::versioning::VersioningApi;
+use crate::admin::storage_compat::ecstore::config::com::{delete_config, read_config, save_config};
+use crate::admin::storage_compat::ecstore::error::Error as StorageError;
+use crate::admin::storage_compat::ecstore::global::{
+    get_global_deployment_id, get_global_endpoints_opt, get_global_region, global_rustfs_port,
+};
 use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
 use crate::app::context::resolve_object_store_handle;
 use crate::auth::{check_key_valid, get_session_token};
@@ -36,21 +54,6 @@ use rustfs_config::{
     DEFAULT_CONSOLE_ADDRESS, DEFAULT_DELIMITER, DEFAULT_RUSTFS_TLS_PATH, ENV_RUSTFS_CONSOLE_ADDRESS, ENV_RUSTFS_TLS_PATH,
     MAX_ADMIN_REQUEST_BODY_SIZE,
 };
-use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
-use rustfs_ecstore::bucket::metadata::{
-    BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE, BUCKET_REPLICATION_CONFIG,
-    BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG,
-};
-use rustfs_ecstore::bucket::metadata_sys;
-use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
-use rustfs_ecstore::bucket::replication::{ReplicationConfigurationExt, ResyncOpts, get_global_replication_pool};
-use rustfs_ecstore::bucket::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
-use rustfs_ecstore::bucket::utils::{deserialize, serialize};
-use rustfs_ecstore::bucket::versioning::VersioningApi;
-use rustfs_ecstore::config::com::{delete_config, read_config, save_config};
-use rustfs_ecstore::error::Error as StorageError;
-use rustfs_ecstore::global::{get_global_deployment_id, get_global_endpoints_opt, get_global_region, global_rustfs_port};
-use rustfs_ecstore::store_api::BucketOperations;
 use rustfs_iam::error::is_err_no_such_service_account;
 use rustfs_iam::store::{MappedPolicy, UserType};
 use rustfs_iam::sys::{
@@ -71,7 +74,7 @@ use rustfs_policy::policy::{
 };
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
-use rustfs_storage_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};
+use rustfs_storage_api::{BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};
 use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, load_global_outbound_tls_generation, load_global_outbound_tls_state};
 use rustfs_utils::http::get_source_scheme;
 use rustls_pki_types::pem::PemObject;
@@ -653,7 +656,7 @@ async fn site_replication_peer_client() -> S3Result<reqwest::Client> {
     built
 }
 
-fn runtime_tls_enabled_with(endpoints: Option<&rustfs_ecstore::endpoints::EndpointServerPools>) -> bool {
+fn runtime_tls_enabled_with(endpoints: Option<&crate::admin::storage_compat::ecstore::endpoints::EndpointServerPools>) -> bool {
     if !rustfs_utils::get_env_str(ENV_RUSTFS_TLS_PATH, DEFAULT_RUSTFS_TLS_PATH).is_empty() {
         return true;
     }
@@ -3354,7 +3357,7 @@ fn is_stale_update(local_updated_at: OffsetDateTime, incoming_updated_at: Option
 }
 
 fn bucket_meta_local_updated_at(
-    bucket_meta: &rustfs_ecstore::bucket::metadata::BucketMetadata,
+    bucket_meta: &crate::admin::storage_compat::ecstore::bucket::metadata::BucketMetadata,
     config_file: &str,
 ) -> OffsetDateTime {
     match config_file {
@@ -4575,10 +4578,10 @@ impl Operation for SRRotateServiceAccountHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::storage_compat::ecstore::disk::endpoint::Endpoint;
+    use crate::admin::storage_compat::ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use http::{HeaderMap, HeaderValue, Uri};
     use rustfs_common::{get_global_outbound_tls_generation, set_global_outbound_tls_generation};
-    use rustfs_ecstore::disk::endpoint::Endpoint;
-    use rustfs_ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use rustfs_policy::policy::action::S3Action;
     use serial_test::serial;
     use temp_env::with_var;

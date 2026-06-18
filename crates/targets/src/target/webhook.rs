@@ -31,6 +31,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use reqwest::{Client, StatusCode, Url};
 use rustfs_tls_runtime::load_cert_bundle_der_bytes;
+use rustfs_utils::egress::validate_outbound_url;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::{
@@ -102,6 +103,8 @@ impl WebhookArgs {
         if self.endpoint.as_str().is_empty() {
             return Err(TargetError::Configuration("endpoint empty".to_string()));
         }
+        validate_outbound_url(&self.endpoint)
+            .map_err(|err| TargetError::Configuration(format!("webhook endpoint is not allowed: {err}")))?;
 
         if !self.queue_dir.is_empty() {
             let path = std::path::Path::new(&self.queue_dir);
@@ -679,7 +682,6 @@ where
 mod tests {
     use super::{WebhookArgs, WebhookTarget};
     use crate::target::{REDACTED_SECRET, Target, TargetType, decode_object_name};
-    use tokio::net::TcpListener;
     use url::Url;
     use url::form_urlencoded;
 
@@ -749,6 +751,16 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_loopback_endpoint() {
+        let args = WebhookArgs {
+            endpoint: Url::parse("https://127.0.0.1/hook").expect("loopback endpoint should parse"),
+            ..base_args()
+        };
+        let err = args.validate().expect_err("loopback endpoint should be rejected");
+        assert!(err.to_string().contains("not allowed"));
+    }
+
+    #[test]
     fn test_decode_object_name_with_spaces() {
         // Test case from the issue: "greeting file (2).csv"
         let object_name = "greeting file (2).csv";
@@ -810,50 +822,16 @@ mod tests {
         assert!(!target.is_active().await.unwrap());
     }
 
-    #[tokio::test]
-    async fn test_is_active_uses_origin_reachability_for_path_endpoints() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut buf = [0u8; 1024];
-            loop {
-                let read = stream.read(&mut buf).await.unwrap();
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buf[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-
-            let request_line = request
-                .split(|byte| *byte == b'\n')
-                .next()
-                .and_then(|line| std::str::from_utf8(line).ok())
-                .unwrap_or_default()
-                .trim();
-            let path = request_line.split_whitespace().nth(1).unwrap_or_default().to_string();
-
-            if path == "/" {
-                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                let _ = stream.write_all(response).await;
-            }
-            path
-        };
-
+    #[test]
+    fn test_origin_reachability_probe_requires_non_local_endpoint() {
         let args = WebhookArgs {
-            endpoint: Url::parse(&format!("http://{address}/hook")).unwrap(),
+            endpoint: Url::parse("http://127.0.0.1/hook").unwrap(),
             ..base_args()
         };
-        let target = WebhookTarget::<serde_json::Value>::new("path-probe".to_string(), args).unwrap();
-
-        let (is_active, path) = tokio::join!(target.is_active(), server);
-        assert!(is_active.unwrap());
-        assert_eq!(path, "/");
+        let err = match WebhookTarget::<serde_json::Value>::new("path-probe".to_string(), args) {
+            Ok(_) => panic!("loopback origin probes should now be rejected at construction time"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("not allowed"));
     }
 }

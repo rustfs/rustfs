@@ -16,10 +16,6 @@ use crate::heal::{ErasureSetHealer, progress::HealProgress, storage::HealStorage
 use crate::{Error, Result};
 use metrics::{counter, histogram};
 use rustfs_common::heal_channel::{HealOpts, HealRequestSource, HealScanMode};
-use rustfs_ecstore::{
-    data_usage::DATA_USAGE_CACHE_NAME,
-    disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
-};
 use rustfs_madmin::heal_commands::HealResultItem;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -30,6 +26,8 @@ use std::{
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+use super::storage_compat::{BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME, RUSTFS_META_BUCKET};
 
 const LOG_COMPONENT_HEAL: &str = "heal";
 const LOG_SUBSYSTEM_TASK: &str = "task";
@@ -148,6 +146,8 @@ pub enum HealTaskStatus {
     Pending,
     /// Running
     Running,
+    /// Retrying after a recoverable failure
+    Retrying { error: String, retry_attempt: u32 },
     /// Completed
     Completed,
     /// Failed
@@ -173,6 +173,8 @@ pub struct HealRequest {
     pub source: HealRequestSource,
     /// Whether this request should bypass queue admission dedup/full policies.
     pub force_start: bool,
+    /// Number of recoverable retry attempts already scheduled for this request.
+    pub retry_attempts: u32,
     /// Created time
     pub created_at: SystemTime,
     /// Queue admission time used for scheduler delay metrics
@@ -189,6 +191,7 @@ impl HealRequest {
             priority,
             source: HealRequestSource::Internal,
             force_start: false,
+            retry_attempts: 0,
             created_at: now,
             enqueued_at: now,
         }
@@ -239,6 +242,8 @@ pub struct HealTask {
     pub priority: HealPriority,
     /// Origin inherited from the request
     pub source: HealRequestSource,
+    /// Number of recoverable retry attempts already scheduled for this task.
+    pub retry_attempts: u32,
     /// Task status
     pub status: Arc<RwLock<HealTaskStatus>>,
     /// Progress tracking
@@ -269,6 +274,7 @@ impl HealTask {
             options: request.options,
             priority: request.priority,
             source: request.source,
+            retry_attempts: request.retry_attempts,
             status: Arc::new(RwLock::new(HealTaskStatus::Pending)),
             progress: Arc::new(RwLock::new(HealProgress::new())),
             result_items: Arc::new(RwLock::new(Vec::new())),
@@ -279,6 +285,20 @@ impl HealTask {
             task_start_instant: Arc::new(RwLock::new(None)),
             cancel_token: tokio_util::sync::CancellationToken::new(),
             storage,
+        }
+    }
+
+    pub fn retry_request(&self) -> HealRequest {
+        HealRequest {
+            id: self.id.clone(),
+            heal_type: self.heal_type.clone(),
+            options: self.options.clone(),
+            priority: self.priority,
+            source: self.source,
+            force_start: false,
+            retry_attempts: self.retry_attempts.saturating_add(1),
+            created_at: self.created_at,
+            enqueued_at: SystemTime::now(),
         }
     }
 
@@ -2027,13 +2047,9 @@ impl std::fmt::Debug for HealTask {
 
 #[cfg(test)]
 mod tests {
+    use super::super::storage_compat::{DiskStore, Endpoint};
     use super::*;
-    use crate::heal::storage::DiskStatus;
-    use rustfs_ecstore::{
-        data_usage::DATA_USAGE_CACHE_NAME,
-        disk::{BUCKET_META_PREFIX, DiskStore, RUSTFS_META_BUCKET, endpoint::Endpoint},
-        store_api::ObjectInfo,
-    };
+    use crate::heal::storage::{DiskStatus, HealObjectInfo};
     use rustfs_madmin::heal_commands::HealResultItem;
     use rustfs_storage_api::BucketInfo;
     use std::sync::Mutex;
@@ -2048,7 +2064,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HealStorageAPI for MockStorage {
-        async fn get_object_meta(&self, _bucket: &str, _object: &str) -> Result<Option<ObjectInfo>> {
+        async fn get_object_meta(&self, _bucket: &str, _object: &str) -> Result<Option<HealObjectInfo>> {
             Ok(None)
         }
 

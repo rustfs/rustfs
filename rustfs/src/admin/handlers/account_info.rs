@@ -14,6 +14,7 @@
 
 use crate::admin::auth::authenticate_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::storage_compat::ecstore::bucket::versioning_sys::BucketVersioningSys;
 use crate::app::context::resolve_object_store_handle;
 use crate::auth::get_condition_values;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
@@ -21,12 +22,10 @@ use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_credentials::get_global_action_cred;
-use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::store_api::BucketOperations;
 use rustfs_policy::policy::BucketPolicy;
 use rustfs_policy::policy::default::DEFAULT_POLICIES;
 use rustfs_policy::policy::{Args, action::Action, action::S3Action};
-use rustfs_storage_api::{BucketOptions, StorageAdminApi};
+use rustfs_storage_api::{BucketOperations, BucketOptions, StorageAdminApi};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;

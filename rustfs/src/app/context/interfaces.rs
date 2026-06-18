@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::app::storage_compat::ecstore::bucket::metadata_sys::BucketMetadataSys;
+use crate::app::storage_compat::ecstore::endpoints::EndpointServerPools;
+use crate::app::storage_compat::ecstore::tier::tier::TierConfigMgr;
 use crate::config::RustFSBufferConfig;
 use async_trait::async_trait;
 use rustfs_config::server_config::Config;
-use rustfs_ecstore::bucket::metadata_sys::BucketMetadataSys;
-use rustfs_ecstore::endpoints::EndpointServerPools;
-use rustfs_ecstore::tier::tier::TierConfigMgr;
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
 use rustfs_notify::{EventArgs, NotificationError};

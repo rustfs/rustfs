@@ -22,10 +22,7 @@ use crate::error::{
     Error, Result, StorageError, is_all_not_found, is_all_volume_not_found, is_err_bucket_not_found, to_object_err,
 };
 use crate::set_disk::SetDisks;
-use crate::store_api::{
-    ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectInfoOrErr, ObjectOperations, ObjectOptions, VersionMarker,
-    WalkOptions, WalkVersionsSortOrder,
-};
+use crate::store_api::{ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectInfoOrErr, ObjectOptions, WalkOptions};
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{store::ECStore, store_api::ListObjectsV2Info};
 use futures::future::join_all;
@@ -34,6 +31,7 @@ use rustfs_filemeta::{
     MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry, MetadataResolutionParams,
     merge_file_meta_versions,
 };
+use rustfs_storage_api::{ObjectOperations as _, VersionMarker, WalkVersionsSortOrder};
 use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -201,11 +199,7 @@ fn list_metadata_resolution_params(bucket: String, listing_quorum: usize, versio
 }
 
 fn parse_version_marker(marker: String) -> Result<VersionMarker> {
-    if marker == "null" {
-        Ok(VersionMarker::Null)
-    } else {
-        Ok(VersionMarker::Version(Uuid::parse_str(&marker)?))
-    }
+    Ok(VersionMarker::parse(marker)?)
 }
 
 fn version_marker_for_entries(
@@ -1158,6 +1152,7 @@ impl ECStore {
 
         tokio::spawn(async move { merge_entry_channels(rx, inputs, merge_tx, 1).await }.instrument(tracing::Span::current()));
 
+        let walk_started = std::time::Instant::now();
         let walk_results = join_all(futures).await;
         let mut errs = Vec::new();
         for walk_result in walk_results {
@@ -1166,6 +1161,10 @@ impl ECStore {
                 Err(err) => errs.push(Some(err.into())),
             }
         }
+        rustfs_io_metrics::record_stage_duration(
+            "store_list_objects_walk_internal",
+            walk_started.elapsed().as_secs_f64() * 1000.0,
+        );
 
         let result = walk_result_from_set_errors(&errs);
         if let Err(err) = &result {

@@ -14,11 +14,10 @@
 
 //! Swift account operations and validation
 
+use super::storage_compat::{get_swift_bucket_metadata, resolve_swift_object_store_handle, set_swift_bucket_metadata};
 use super::{SwiftError, SwiftResult};
 use rustfs_credentials::Credentials;
-use rustfs_ecstore::resolve_object_store_handle;
-use rustfs_ecstore::store_api::BucketOperations;
-use rustfs_storage_api::MakeBucketOptions;
+use rustfs_storage_api::{BucketOperations, MakeBucketOptions};
 use s3s::dto::{Tag, Tagging};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -120,7 +119,7 @@ pub async fn get_account_metadata(account: &str, _credentials: &Option<Credentia
     let bucket_name = get_account_metadata_bucket_name(account);
 
     // Try to load bucket metadata
-    let bucket_meta = match rustfs_ecstore::bucket::metadata_sys::get(&bucket_name).await {
+    let bucket_meta = match get_swift_bucket_metadata(&bucket_name).await {
         Ok(meta) => meta,
         Err(_) => {
             // Bucket doesn't exist - return empty metadata
@@ -160,12 +159,12 @@ pub async fn update_account_metadata(
 ) -> SwiftResult<()> {
     let bucket_name = get_account_metadata_bucket_name(account);
 
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // Create bucket if it doesn't exist
-    let bucket_exists = rustfs_ecstore::bucket::metadata_sys::get(&bucket_name).await.is_ok();
+    let bucket_exists = get_swift_bucket_metadata(&bucket_name).await.is_ok();
     if !bucket_exists {
         // Create bucket for account metadata
         store
@@ -175,7 +174,7 @@ pub async fn update_account_metadata(
     }
 
     // Load current bucket metadata
-    let bucket_meta = rustfs_ecstore::bucket::metadata_sys::get(&bucket_name)
+    let bucket_meta = get_swift_bucket_metadata(&bucket_name)
         .await
         .map_err(|e| SwiftError::InternalServerError(format!("Failed to load bucket metadata: {}", e)))?;
 
@@ -222,7 +221,7 @@ pub async fn update_account_metadata(
     }
 
     // Save updated metadata
-    rustfs_ecstore::bucket::metadata_sys::set_bucket_metadata(bucket_name.clone(), bucket_meta_clone)
+    set_swift_bucket_metadata(bucket_name.clone(), bucket_meta_clone)
         .await
         .map_err(|e| SwiftError::InternalServerError(format!("Failed to save metadata: {}", e)))?;
 

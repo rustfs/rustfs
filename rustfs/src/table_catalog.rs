@@ -42,15 +42,24 @@ use rustfs_ecstore::bucket::{
     metadata_sys,
 };
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
-use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::{
-    set_disk::get_lock_acquire_timeout,
-    store_api::{HTTPPreconditions, ListOperations, NamespaceLocking, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader},
+use rustfs_ecstore::error::{Error as EcstoreError, StorageError};
+use rustfs_ecstore::set_disk::get_lock_acquire_timeout;
+use rustfs_filemeta::FileInfo;
+use rustfs_storage_api::{
+    HTTPPreconditions, HTTPRangeSpec, ListObjectVersionsInfo as StorageListObjectVersionsInfo,
+    ListObjectsV2Info as StorageListObjectsV2Info, ListOperations as StorageListOperations,
+    NamespaceLocking as StorageNamespaceLocking, ObjectIO as StorageObjectIO, ObjectInfoOrErr as StorageObjectInfoOrErr,
+    ObjectOperations as StorageObjectOperations, WalkOptions as StorageWalkOptions,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use time::{Duration, OffsetDateTime};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
+
+use crate::storage::{
+    StorageDeletedObject as DeletedObject, StorageGetObjectReader as GetObjectReader, StorageObjectInfo as ObjectInfo,
+    StorageObjectOptions as ObjectOptions, StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
+};
 
 pub(crate) const TABLE_BUCKET_MARKER_CONFIG: &str = BUCKET_TABLE_CONFIG;
 pub(crate) const RESERVED_CATALOG_OBJECT_MESSAGE: &str = "Object key is reserved for the table catalog";
@@ -62,6 +71,7 @@ pub(crate) const TABLE_RESOURCE_MARKER_VERSION: u16 = 1;
 pub(crate) const TABLE_METADATA_POINTER_VERSION: u16 = 1;
 pub(crate) const TABLE_CATALOG_ENTRY_VERSION: u16 = 1;
 pub(crate) const TABLE_MAINTENANCE_CONFIG_VERSION: u16 = 1;
+pub(crate) const TABLE_EXTERNAL_CATALOG_BRIDGE_VERSION: u16 = 1;
 pub(crate) const TABLE_METADATA_FILE_NAME_MAX_LEN: usize = 128;
 pub const TABLE_RESERVED_PREFIX: &str = BUCKET_TABLE_RESERVED_PREFIX;
 const WAREHOUSE_ROOT: &str = "warehouses";
@@ -83,6 +93,8 @@ const INTERNAL_CATALOG_ROOT: &str = BUCKET_TABLE_CATALOG_META_PREFIX;
 const TABLE_BUCKET_ROOT: &str = BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX;
 const COMMIT_LOG_ROOT: &str = "commits";
 const COMMIT_IDEMPOTENCY_ROOT: &str = "commit-idempotency";
+const EXTERNAL_CATALOG_ROOT: &str = "external-catalog";
+const EXTERNAL_CATALOG_BRIDGE_FILE: &str = "bridge.json";
 const MAINTENANCE_ROOT: &str = "maintenance";
 const MAINTENANCE_CONFIG_FILE: &str = "config.json";
 const MAINTENANCE_JOB_ROOT: &str = "jobs";
@@ -103,6 +115,67 @@ const ICEBERG_MAX_REF_AGE_MS_PROPERTY: &str = "history.expire.max-ref-age-ms";
 const ICEBERG_REF_MIN_SNAPSHOTS_TO_KEEP_FIELD: &str = "min-snapshots-to-keep";
 const ICEBERG_REF_MAX_SNAPSHOT_AGE_MS_FIELD: &str = "max-snapshot-age-ms";
 const ICEBERG_REF_MAX_REF_AGE_MS_FIELD: &str = "max-ref-age-ms";
+
+type CatalogListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
+type CatalogListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
+type CatalogObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, EcstoreError>;
+type CatalogWalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
+
+pub(crate) trait TableCatalogStorage:
+    StorageObjectIO<
+        Error = EcstoreError,
+        RangeSpec = HTTPRangeSpec,
+        HeaderMap = HeaderMap,
+        ObjectOptions = ObjectOptions,
+        ObjectInfo = ObjectInfo,
+        GetObjectReader = GetObjectReader,
+        PutObjectReader = PutObjReader,
+    > + StorageObjectOperations<
+        Error = EcstoreError,
+        ObjectInfo = ObjectInfo,
+        ObjectOptions = ObjectOptions,
+        FileInfo = FileInfo,
+        ObjectToDelete = ObjectToDelete,
+        DeletedObject = DeletedObject,
+    > + StorageListOperations<
+        Error = EcstoreError,
+        ListObjectsV2Info = CatalogListObjectsV2Info,
+        ListObjectVersionsInfo = CatalogListObjectVersionsInfo,
+        ObjectInfoOrErr = CatalogObjectInfoOrErr,
+        WalkOptions = CatalogWalkOptions,
+        WalkCancellation = tokio_util::sync::CancellationToken,
+        WalkResultSender = tokio::sync::mpsc::Sender<CatalogObjectInfoOrErr>,
+    > + StorageNamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
+{
+}
+
+impl<T> TableCatalogStorage for T where
+    T: StorageObjectIO<
+            Error = EcstoreError,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        > + StorageObjectOperations<
+            Error = EcstoreError,
+            ObjectInfo = ObjectInfo,
+            ObjectOptions = ObjectOptions,
+            FileInfo = FileInfo,
+            ObjectToDelete = ObjectToDelete,
+            DeletedObject = DeletedObject,
+        > + StorageListOperations<
+            Error = EcstoreError,
+            ListObjectsV2Info = CatalogListObjectsV2Info,
+            ListObjectVersionsInfo = CatalogListObjectVersionsInfo,
+            ObjectInfoOrErr = CatalogObjectInfoOrErr,
+            WalkOptions = CatalogWalkOptions,
+            WalkCancellation = tokio_util::sync::CancellationToken,
+            WalkResultSender = tokio::sync::mpsc::Sender<CatalogObjectInfoOrErr>,
+        > + StorageNamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
+{
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogIdentifierError {
@@ -295,6 +368,32 @@ pub(crate) struct TableCommitRequest {
 pub(crate) struct TableCommitResult {
     pub table: TableEntry,
     pub commit_log: CommitLogEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExternalCatalogBridgeEntry {
+    pub version: u16,
+    pub table_bucket: String,
+    pub namespace: String,
+    pub table: String,
+    pub catalog: String,
+    pub external_catalog_id: Option<String>,
+    pub external_namespace: String,
+    pub external_table: String,
+    pub external_table_uuid: Option<String>,
+    pub metadata_location: Option<String>,
+    pub external_version_token: Option<String>,
+    pub policy_mode: String,
+    pub credential_mode: String,
+    pub sync_mode: String,
+    pub rollback_strategy: String,
+    pub last_sync_status: Option<String>,
+    pub last_synced_metadata_location: Option<String>,
+    #[serde(default)]
+    pub properties: BTreeMap<String, String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -920,7 +1019,7 @@ fn table_warehouse_object_prefix_from_location(table_bucket: &str, warehouse_loc
     normalize_warehouse_object_prefix(object_prefix)
 }
 
-fn table_warehouse_object_prefix(entry: &TableEntry) -> TableCatalogStoreResult<String> {
+pub(crate) fn table_warehouse_object_prefix(entry: &TableEntry) -> TableCatalogStoreResult<String> {
     table_warehouse_object_prefix_from_location(&entry.table_bucket, &entry.warehouse_location)
 }
 
@@ -1152,6 +1251,14 @@ impl TableCatalogObjectPaths {
             self.table_entries_prefix(table_bucket, namespace),
             table.as_str(),
             TABLE_ENTRY_FILE
+        )
+    }
+
+    pub fn external_catalog_bridge_path(&self, table_bucket: &str, namespace: &Namespace, table: &IdentifierSegment) -> String {
+        format!(
+            "{}{}/{EXTERNAL_CATALOG_ROOT}/{EXTERNAL_CATALOG_BRIDGE_FILE}",
+            self.table_entries_prefix(table_bucket, namespace),
+            table.as_str()
         )
     }
 
@@ -1455,6 +1562,50 @@ where
         let view_path = self.paths.view_entry_path(&entry.table_bucket, &namespace, &view);
         self.write_entry(self.catalog_bucket(), &view_path, &entry, precondition)
             .await
+    }
+
+    pub(crate) async fn get_external_catalog_bridge(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<Option<ExternalCatalogBridgeEntry>> {
+        self.require_table_bucket(table_bucket).await?;
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        if self.get_namespace(table_bucket, &namespace.public_name()).await?.is_none() {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "namespace {}/{}",
+                table_bucket,
+                namespace.public_name()
+            )));
+        }
+        let bridge_path = self.paths.external_catalog_bridge_path(table_bucket, &namespace, &table);
+        self.read_entry::<ExternalCatalogBridgeEntry>(self.catalog_bucket(), &bridge_path)
+            .await
+            .map(|entry| entry.map(|(bridge, _)| bridge))
+    }
+
+    pub(crate) async fn put_external_catalog_bridge(
+        &self,
+        entry: ExternalCatalogBridgeEntry,
+    ) -> TableCatalogStoreResult<ExternalCatalogBridgeEntry> {
+        validate_catalog_entry_version("external catalog bridge", entry.version)?;
+        self.require_table_bucket(&entry.table_bucket).await?;
+        let namespace = parse_namespace_for_store(&entry.namespace)?;
+        let table = parse_table_for_store(&entry.table)?;
+        if self.get_namespace(&entry.table_bucket, &entry.namespace).await?.is_none() {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "namespace {}/{}",
+                entry.table_bucket, entry.namespace
+            )));
+        }
+        let bridge_path = self
+            .paths
+            .external_catalog_bridge_path(&entry.table_bucket, &namespace, &table);
+        self.write_entry(self.catalog_bucket(), &bridge_path, &entry, TableCatalogPutPrecondition::Any)
+            .await?;
+        Ok(entry)
     }
 
     async fn read_commit_by_path(&self, object: &str) -> TableCatalogStoreResult<Option<CommitLogEntry>> {
@@ -3486,7 +3637,7 @@ impl<S> Clone for EcStoreTableCatalogObjectBackend<S> {
 
 impl<S> EcStoreTableCatalogObjectBackend<S>
 where
-    S: ObjectIO + ObjectOperations + ListOperations + NamespaceLocking,
+    S: TableCatalogStorage,
 {
     pub fn new(store: Arc<S>) -> Self {
         Self { store }
@@ -3498,7 +3649,7 @@ pub(crate) type EcStoreTableCatalogStore<S> = ObjectTableCatalogStore<EcStoreTab
 #[async_trait::async_trait]
 impl<S> TableCatalogObjectBackend for EcStoreTableCatalogObjectBackend<S>
 where
-    S: ObjectIO + ObjectOperations + ListOperations + NamespaceLocking,
+    S: TableCatalogStorage,
 {
     async fn read_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
         self.read_object_with_options(bucket, object, ObjectOptions::default()).await
@@ -3597,7 +3748,7 @@ where
 
 impl<S> EcStoreTableCatalogObjectBackend<S>
 where
-    S: ObjectIO + ObjectOperations + ListOperations + NamespaceLocking,
+    S: TableCatalogStorage,
 {
     async fn read_object_with_options(
         &self,
@@ -4034,7 +4185,9 @@ fn manifest_paths_from_manifest_list_avro(data: &[u8]) -> TableCatalogStoreResul
         .collect())
 }
 
-fn manifest_list_references_from_manifest_list_avro(data: &[u8]) -> TableCatalogStoreResult<Vec<ManifestListReference>> {
+pub(crate) fn manifest_list_references_from_manifest_list_avro(
+    data: &[u8],
+) -> TableCatalogStoreResult<Vec<ManifestListReference>> {
     let reader = apache_avro::Reader::new(data)
         .map_err(|err| TableCatalogStoreError::Invalid(format!("failed to read manifest list Avro: {err}")))?;
     let mut manifest_paths = Vec::new();
@@ -4060,7 +4213,7 @@ fn file_references_from_manifest_avro(data: &[u8]) -> TableCatalogStoreResult<Ve
         .collect())
 }
 
-fn data_file_references_from_manifest_avro(data: &[u8]) -> TableCatalogStoreResult<Vec<ManifestDataFileReference>> {
+pub(crate) fn data_file_references_from_manifest_avro(data: &[u8]) -> TableCatalogStoreResult<Vec<ManifestDataFileReference>> {
     let reader = apache_avro::Reader::new(data)
         .map_err(|err| TableCatalogStoreError::Invalid(format!("failed to read manifest Avro: {err}")))?;
     let mut files = Vec::new();
@@ -4135,7 +4288,7 @@ fn avro_i64_value(value: &apache_avro::types::Value) -> Option<i64> {
     }
 }
 
-fn table_catalog_object_key_from_location(table_bucket: &str, location: &str) -> Option<String> {
+pub(crate) fn table_catalog_object_key_from_location(table_bucket: &str, location: &str) -> Option<String> {
     let object = if let Some(location) = location.strip_prefix("s3://") {
         let (bucket, object) = location.split_once('/')?;
         if bucket != table_bucket {
@@ -4158,7 +4311,7 @@ fn table_catalog_object_key_from_location(table_bucket: &str, location: &str) ->
     Some(object.to_string())
 }
 
-fn table_maintenance_object_kind(
+pub(crate) fn table_maintenance_object_kind(
     namespace: &Namespace,
     table: &IdentifierSegment,
     warehouse_object_prefix: Option<&str>,
@@ -4706,21 +4859,23 @@ struct CompactedDataFile {
     file_sequence_number: i64,
 }
 
-struct ManifestDataFileReference {
-    location: String,
-    object_kind: TableMetadataMaintenanceObjectKind,
-    entry_status: Option<i32>,
-    snapshot_id: Option<i64>,
-    sequence_number: Option<i64>,
-    file_sequence_number: Option<i64>,
-    record_count: Option<u64>,
-    file_size_bytes: Option<u64>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManifestDataFileReference {
+    pub location: String,
+    pub object_kind: TableMetadataMaintenanceObjectKind,
+    pub entry_status: Option<i32>,
+    pub snapshot_id: Option<i64>,
+    pub sequence_number: Option<i64>,
+    pub file_sequence_number: Option<i64>,
+    pub record_count: Option<u64>,
+    pub file_size_bytes: Option<u64>,
 }
 
-struct ManifestListReference {
-    manifest_path: String,
-    sequence_number: Option<i64>,
-    added_snapshot_id: Option<i64>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManifestListReference {
+    pub manifest_path: String,
+    pub sequence_number: Option<i64>,
+    pub added_snapshot_id: Option<i64>,
 }
 
 struct CompactionManifestListSummary<'a> {

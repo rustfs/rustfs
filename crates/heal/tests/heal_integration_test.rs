@@ -18,13 +18,13 @@ use rustfs_ecstore::{
     disk::endpoint::Endpoint,
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     store::ECStore,
-    store_api::{BucketOperations, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader},
 };
 use rustfs_heal::heal::{
     manager::{HealConfig, HealManager},
-    storage::{ECStoreHealStorage, HealStorageAPI},
+    storage::{ECStoreHealStorage, HealObjectOptions as ObjectOptions, HealPutObjReader as PutObjReader, HealStorageAPI},
     task::{HealOptions, HealPriority, HealRequest, HealTaskStatus, HealType},
 };
+use rustfs_storage_api::{BucketOperations, ObjectIO as _, ObjectOperations as _};
 use serial_test::serial;
 use std::{
     path::{Path, PathBuf},

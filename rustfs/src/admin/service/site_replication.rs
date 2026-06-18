@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::admin::site_replication_identity::{deployment_id_for_endpoint, normalize_peer_map_by_identity_with};
+use crate::admin::storage_compat::ecstore::config::com::{read_config, save_config};
+use crate::admin::storage_compat::ecstore::error::Error as StorageError;
 use crate::app::context::resolve_object_store_handle;
-use rustfs_ecstore::config::com::{read_config, save_config};
-use rustfs_ecstore::error::Error as StorageError;
 use rustfs_madmin::PeerInfo;
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use serde_json::{Map, Value};

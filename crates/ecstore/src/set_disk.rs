@@ -52,8 +52,8 @@ use crate::{
     event_notification::{EventArgs, send_event},
     global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id, is_dist_erasure},
     store_api::{
-        BucketOperations, CompletePart, DeletedObject, GetObjectReader, HTTPRangeSpec, HealOperations, ListObjectsV2Info,
-        ListOperations, MultipartOperations, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, PutObjReader,
+        DeletedObject, GetObjectReader, ListObjectsV2Info, MultipartOperations, ObjectIO, ObjectInfo, ObjectOperations,
+        PutObjReader,
     },
     store_init::load_format_erasure,
 };
@@ -85,10 +85,12 @@ use rustfs_object_capacity::capacity_scope::{
     CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope,
 };
 use rustfs_s3_types::EventName;
+use rustfs_storage_api::HTTPRangeSpec;
 use rustfs_storage_api::{
-    BucketInfo, BucketOptions, DeleteBucketOptions, ListMultipartsInfo, ListPartsInfo, MakeBucketOptions, MultipartInfo,
-    MultipartUploadResult, PartInfo,
+    BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, ListMultipartsInfo, ListPartsInfo,
+    MakeBucketOptions, MultipartInfo, MultipartUploadResult, PartInfo,
 };
+use rustfs_storage_api::{MultipartOperations as _, NamespaceLocking as _, ObjectIO as _, ObjectOperations as _};
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::{
@@ -137,6 +139,8 @@ const LOG_SUBSYSTEM_SET_DISK: &str = "set_disk";
 const EVENT_SET_DISK_MULTIPART: &str = "set_disk_multipart";
 const EVENT_SET_DISK_WRITE: &str = "set_disk_write";
 const EVENT_SET_DISK_HEAL: &str = "set_disk_heal";
+const EVENT_SET_DISK_COMMIT_TAIL_SLOW: &str = "set_disk_commit_tail_slow";
+const SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS: u128 = 5_000;
 
 use crate::rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
 
@@ -804,6 +808,16 @@ enum SmallWritePath {
     Pipeline,
 }
 
+impl SmallWritePath {
+    fn metric_label(&self) -> &'static str {
+        match self {
+            SmallWritePath::Inline => "write_inline",
+            SmallWritePath::SingleBlockNonInline => "write_single_block_non_inline",
+            SmallWritePath::Pipeline => "write_pipeline",
+        }
+    }
+}
+
 fn classify_small_write_path(is_inline_buffer: bool, object_size: i64, block_size: usize) -> SmallWritePath {
     if should_use_inline_small_fast_path(is_inline_buffer, object_size, block_size) {
         SmallWritePath::Inline
@@ -815,7 +829,15 @@ fn classify_small_write_path(is_inline_buffer: bool, object_size: i64, block_siz
 }
 
 #[async_trait::async_trait]
-impl ObjectIO for SetDisks {
+impl rustfs_storage_api::ObjectIO for SetDisks {
+    type Error = Error;
+    type RangeSpec = HTTPRangeSpec;
+    type HeaderMap = HeaderMap;
+    type ObjectOptions = ObjectOptions;
+    type ObjectInfo = ObjectInfo;
+    type GetObjectReader = GetObjectReader;
+    type PutObjectReader = PutObjReader;
+
     #[tracing::instrument(level = "debug", skip(self))]
     async fn get_object_reader(
         &self,
@@ -1061,6 +1083,7 @@ impl ObjectIO for SetDisks {
 
             let shard_file_size = erasure.shard_file_size(data.size());
             let shard_size = erasure.shard_size();
+            let writer_setup_stage_start = Instant::now();
             let writer_futs: Vec<_> = shuffle_disks
                 .iter()
                 .map(|disk_op| {
@@ -1107,6 +1130,10 @@ impl ObjectIO for SetDisks {
                 writers.push(w);
                 errors.push(e);
             }
+            rustfs_io_metrics::record_put_object_stage_duration(
+                "set_disk_writer_setup",
+                writer_setup_stage_start.elapsed().as_secs_f64() * 1000.0,
+            );
 
             let nil_count = errors.iter().filter(|&e| e.is_none()).count();
             if nil_count < write_quorum {
@@ -1135,7 +1162,9 @@ impl ObjectIO for SetDisks {
             );
 
             let write_path = classify_small_write_path(is_inline_buffer, data.size(), fi.erasure.block_size);
+            rustfs_io_metrics::record_put_object_path(write_path.metric_label());
 
+            let encode_stage_start = Instant::now();
             let (reader, w_size) = match write_path {
                 SmallWritePath::Inline => match Arc::new(erasure)
                     .encode_inline_small(stream, &mut writers, write_quorum)
@@ -1165,6 +1194,10 @@ impl ObjectIO for SetDisks {
                     }
                 },
             };
+            rustfs_io_metrics::record_put_object_stage_duration(
+                "set_disk_encode",
+                encode_stage_start.elapsed().as_secs_f64() * 1000.0,
+            );
 
             let _ = mem::replace(&mut data.stream, reader);
             // if let Err(err) = close_bitrot_writers(&mut writers).await {
@@ -1259,6 +1292,7 @@ impl ObjectIO for SetDisks {
                 object_lock_guard = Some(self.acquire_write_lock_diag("put_object_commit", bucket, object).await?);
             }
 
+            let rename_stage_start = Instant::now();
             let (online_disks, _, op_old_dir, cleanup_disks) = Self::rename_data(
                 &shuffle_disks,
                 RUSTFS_META_TMP_BUCKET,
@@ -1269,10 +1303,52 @@ impl ObjectIO for SetDisks {
                 write_quorum,
             )
             .await?;
+            rustfs_io_metrics::record_put_object_stage_duration(
+                "set_disk_rename",
+                rename_stage_start.elapsed().as_secs_f64() * 1000.0,
+            );
+            let rename_stage_ms = rename_stage_start.elapsed().as_millis();
+            if rename_stage_ms >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
+                warn!(
+                    event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    stage = "rename_data",
+                    bucket = %bucket,
+                    object = %object,
+                    tmp_dir = %tmp_dir,
+                    duration_ms = rename_stage_ms as u64,
+                    write_quorum,
+                    state = "slow",
+                    "SetDisk commit tail stage is slow"
+                );
+            }
 
             if let Some(old_dir) = op_old_dir {
+                let cleanup_stage_start = Instant::now();
                 self.commit_rename_data_dir(&cleanup_disks, bucket, object, &old_dir.to_string(), write_quorum)
                     .await?;
+                rustfs_io_metrics::record_put_object_stage_duration(
+                    "set_disk_old_data_cleanup",
+                    cleanup_stage_start.elapsed().as_secs_f64() * 1000.0,
+                );
+                let cleanup_stage_ms = cleanup_stage_start.elapsed().as_millis();
+                if cleanup_stage_ms >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
+                    warn!(
+                        event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        stage = "commit_rename_data_dir",
+                        bucket = %bucket,
+                        object = %object,
+                        tmp_dir = %tmp_dir,
+                        old_dir = %old_dir,
+                        duration_ms = cleanup_stage_ms as u64,
+                        write_quorum,
+                        state = "slow",
+                        "SetDisk commit tail stage is slow"
+                    );
+                }
             }
 
             drop(object_lock_guard); // drop object lock guard to release the lock
@@ -1304,6 +1380,23 @@ impl ObjectIO for SetDisks {
                     online_success_count,
                     op_old_dir = ?op_old_dir,
                     "issue3031_put_object_commit_succeeded"
+                );
+            }
+
+            let total_commit_tail_ms = rename_stage_start.elapsed().as_millis();
+            if total_commit_tail_ms >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
+                warn!(
+                    event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    stage = "put_object_commit_tail",
+                    bucket = %bucket,
+                    object = %object,
+                    tmp_dir = %tmp_dir,
+                    duration_ms = total_commit_tail_ms as u64,
+                    write_quorum,
+                    state = "slow",
+                    "SetDisk commit tail is slow"
                 );
             }
 
@@ -1636,7 +1729,10 @@ impl SetDisks {
 }
 
 #[async_trait::async_trait]
-impl NamespaceLocking for SetDisks {
+impl rustfs_storage_api::NamespaceLocking for SetDisks {
+    type Error = Error;
+    type NamespaceLock = NamespaceLockWrapper;
+
     #[tracing::instrument(skip(self))]
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         let set_lock = if is_dist_erasure().await {
@@ -1667,6 +1763,8 @@ impl NamespaceLocking for SetDisks {
 
 #[async_trait::async_trait]
 impl BucketOperations for SetDisks {
+    type Error = Error;
+
     #[tracing::instrument(skip(self))]
     async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
         unimplemented!()
@@ -1705,7 +1803,14 @@ fn check_object_lock_retention_update(bucket: &str, object: &str, obj_info: &Obj
 }
 
 #[async_trait::async_trait]
-impl ObjectOperations for SetDisks {
+impl rustfs_storage_api::ObjectOperations for SetDisks {
+    type Error = Error;
+    type ObjectInfo = ObjectInfo;
+    type ObjectOptions = ObjectOptions;
+    type FileInfo = FileInfo;
+    type ObjectToDelete = ObjectToDelete;
+    type DeletedObject = DeletedObject;
+
     #[tracing::instrument(skip(self))]
     async fn copy_object(
         &self,
@@ -2780,7 +2885,8 @@ impl ObjectOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        let get_object_reader = <Self as ObjectIO>::get_object_reader(self, bucket, object, None, HeaderMap::new(), opts).await?;
+        let get_object_reader =
+            <Self as rustfs_storage_api::ObjectIO>::get_object_reader(self, bucket, object, None, HeaderMap::new(), opts).await?;
         // Stream to sink to avoid loading entire object into memory during verification
         let mut reader = get_object_reader.stream;
         tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
@@ -2899,7 +3005,15 @@ impl SetDisks {
 }
 
 #[async_trait::async_trait]
-impl ListOperations for SetDisks {
+impl rustfs_storage_api::ListOperations for SetDisks {
+    type Error = Error;
+    type ListObjectsV2Info = ListObjectsV2Info;
+    type ListObjectVersionsInfo = ListObjectVersionsInfo;
+    type ObjectInfoOrErr = ObjectInfoOrErr;
+    type WalkOptions = WalkOptions;
+    type WalkCancellation = CancellationToken;
+    type WalkResultSender = Sender<ObjectInfoOrErr>;
+
     #[tracing::instrument(skip(self))]
     async fn list_objects_v2(
         self: Arc<Self>,
@@ -2941,7 +3055,18 @@ impl ListOperations for SetDisks {
 }
 
 #[async_trait::async_trait]
-impl MultipartOperations for SetDisks {
+impl rustfs_storage_api::MultipartOperations for SetDisks {
+    type Error = Error;
+    type ObjectInfo = ObjectInfo;
+    type ObjectOptions = ObjectOptions;
+    type PutObjectReader = PutObjReader;
+    type CompletePart = CompletePart;
+    type ListMultipartsInfo = ListMultipartsInfo;
+    type MultipartUploadResult = MultipartUploadResult;
+    type PartInfo = PartInfo;
+    type MultipartInfo = MultipartInfo;
+    type ListPartsInfo = ListPartsInfo;
+
     #[tracing::instrument(skip(self))]
     async fn copy_object_part(
         &self,
@@ -4022,7 +4147,11 @@ impl MultipartOperations for SetDisks {
 }
 
 #[async_trait::async_trait]
-impl HealOperations for SetDisks {
+impl rustfs_storage_api::HealOperations for SetDisks {
+    type Error = Error;
+    type HealResultItem = HealResultItem;
+    type HealOptions = HealOpts;
+
     #[tracing::instrument(skip(self))]
     async fn heal_format(&self, _dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
         unimplemented!()
@@ -4889,7 +5018,7 @@ mod tests {
     use crate::disk::health_state::RuntimeDriveHealthState;
     use crate::endpoints::SetupType;
     use crate::global::{is_dist_erasure, is_erasure, is_erasure_sd, update_erasure_type};
-    use crate::store_api::{CompletePart, ObjectInfo};
+    use crate::store_api::ObjectInfo;
     use crate::store_init::save_format_file;
     use crate::store_list_objects::ListPathOptions;
     use rustfs_filemeta::ErasureInfo;
@@ -4897,6 +5026,7 @@ mod tests {
     use rustfs_filemeta::ReplicationState;
     use rustfs_lock::client::local::LocalClient;
     use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
+    use rustfs_storage_api::{CompletePart, NamespaceLocking as _, ObjectOperations as _};
     use serial_test::serial;
     use std::collections::HashMap;
     use tempfile::TempDir;
@@ -6587,7 +6717,7 @@ mod tests {
             ..Default::default()
         };
         let opts = ObjectOptions {
-            object_lock_retention: Some(crate::store_api::ObjectLockRetentionOptions {
+            object_lock_retention: Some(rustfs_storage_api::ObjectLockRetentionOptions {
                 mode: Some(s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string()),
                 retain_until: Some(requested_until),
                 bypass_governance: true,
@@ -6622,7 +6752,7 @@ mod tests {
             ..Default::default()
         };
         let opts = ObjectOptions {
-            object_lock_retention: Some(crate::store_api::ObjectLockRetentionOptions {
+            object_lock_retention: Some(rustfs_storage_api::ObjectLockRetentionOptions {
                 mode: Some(s3s::dto::ObjectLockRetentionMode::GOVERNANCE.to_string()),
                 retain_until: Some(requested_until),
                 bypass_governance: true,

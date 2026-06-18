@@ -17,12 +17,13 @@
 //! This module implements Swift container CRUD operations and container-bucket translation.
 
 use super::account::validate_account_access;
+use super::storage_compat::{get_swift_bucket_metadata, resolve_swift_object_store_handle, set_swift_bucket_metadata};
 use super::types::Container;
 use super::{SwiftError, SwiftResult};
 use rustfs_credentials::Credentials;
-use rustfs_ecstore::resolve_object_store_handle;
-use rustfs_ecstore::store_api::{BucketOperations, ListOperations};
-use rustfs_storage_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
+use rustfs_storage_api::{
+    BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, ListOperations as _, MakeBucketOptions,
+};
 use s3s::dto::{Tag, Tagging};
 use sha2::{Digest, Sha256};
 use tracing::{debug, error};
@@ -242,7 +243,7 @@ pub async fn list_containers(account: &str, credentials: &Credentials) -> SwiftR
     let mapper = ContainerMapper::default();
 
     // Get storage layer
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -300,7 +301,7 @@ pub async fn create_container(account: &str, container: &str, credentials: &Cred
     let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
 
     // Get storage layer
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -394,7 +395,7 @@ pub async fn get_container_metadata(account: &str, container: &str, credentials:
     let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
 
     // Get storage layer
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -412,7 +413,7 @@ pub async fn get_container_metadata(account: &str, container: &str, credentials:
         })?;
 
     // Load bucket metadata to get custom metadata from tags
-    let custom_metadata = match rustfs_ecstore::bucket::metadata_sys::get(&bucket_name).await {
+    let custom_metadata = match get_swift_bucket_metadata(&bucket_name).await {
         Ok(bucket_meta) => {
             if let Some(tagging) = &bucket_meta.tagging_config {
                 s3_tags_to_swift_metadata(tagging)
@@ -471,7 +472,7 @@ pub async fn update_container_metadata(
     let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
 
     // Get storage layer
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -488,7 +489,7 @@ pub async fn update_container_metadata(
         })?;
 
     // Load current bucket metadata
-    let bucket_meta = rustfs_ecstore::bucket::metadata_sys::get(&bucket_name)
+    let bucket_meta = get_swift_bucket_metadata(&bucket_name)
         .await
         .map_err(|e| SwiftError::InternalServerError(format!("Failed to load bucket metadata: {}", e)))?;
 
@@ -535,7 +536,7 @@ pub async fn update_container_metadata(
     }
 
     // Save updated metadata
-    rustfs_ecstore::bucket::metadata_sys::set_bucket_metadata(bucket_name, bucket_meta_clone)
+    set_swift_bucket_metadata(bucket_name, bucket_meta_clone)
         .await
         .map_err(|e| SwiftError::InternalServerError(format!("Failed to save metadata: {}", e)))?;
 
@@ -570,7 +571,7 @@ pub async fn delete_container(account: &str, container: &str, credentials: &Cred
     let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
 
     // Get storage layer
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -658,7 +659,7 @@ pub async fn list_objects(
     let bucket = mapper.swift_to_s3_bucket(container, &project_id);
 
     // Get storage layer
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -768,7 +769,7 @@ pub async fn enable_versioning(
     let archive_bucket_name = mapper.swift_to_s3_bucket(archive_container, &project_id);
 
     // Get storage layer
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -801,7 +802,7 @@ pub async fn enable_versioning(
         })?;
 
     // Load current bucket metadata
-    let bucket_meta = rustfs_ecstore::bucket::metadata_sys::get(&bucket_name)
+    let bucket_meta = get_swift_bucket_metadata(&bucket_name)
         .await
         .map_err(|e| SwiftError::InternalServerError(format!("Failed to load bucket metadata: {}", e)))?;
 
@@ -835,7 +836,7 @@ pub async fn enable_versioning(
     bucket_meta_clone.tagging_config = Some(existing_tagging);
 
     // Save updated metadata
-    rustfs_ecstore::bucket::metadata_sys::set_bucket_metadata(bucket_name, bucket_meta_clone)
+    set_swift_bucket_metadata(bucket_name, bucket_meta_clone)
         .await
         .map_err(|e| SwiftError::InternalServerError(format!("Failed to save metadata: {}", e)))?;
 
@@ -864,12 +865,12 @@ pub async fn disable_versioning(account: &str, container: &str, credentials: &Cr
     let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
 
     // Verify container exists
-    let Some(_store) = resolve_object_store_handle() else {
+    let Some(_store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // Load current bucket metadata
-    let bucket_meta = rustfs_ecstore::bucket::metadata_sys::get(&bucket_name)
+    let bucket_meta = get_swift_bucket_metadata(&bucket_name)
         .await
         .map_err(|e| SwiftError::InternalServerError(format!("Failed to load bucket metadata: {}", e)))?;
 
@@ -904,7 +905,7 @@ pub async fn disable_versioning(account: &str, container: &str, credentials: &Cr
     }
 
     // Save updated metadata
-    rustfs_ecstore::bucket::metadata_sys::set_bucket_metadata(bucket_name, bucket_meta_clone)
+    set_swift_bucket_metadata(bucket_name, bucket_meta_clone)
         .await
         .map_err(|e| SwiftError::InternalServerError(format!("Failed to save metadata: {}", e)))?;
 
@@ -936,7 +937,7 @@ pub async fn get_versions_location(account: &str, container: &str, credentials: 
     let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
 
     // Load bucket metadata
-    let bucket_meta = match rustfs_ecstore::bucket::metadata_sys::get(&bucket_name).await {
+    let bucket_meta = match get_swift_bucket_metadata(&bucket_name).await {
         Ok(meta) => meta,
         Err(_) => {
             // Container doesn't exist
@@ -1015,7 +1016,7 @@ pub async fn set_container_acl(
     let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
 
     // Get storage layer
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -1032,7 +1033,7 @@ pub async fn set_container_acl(
         })?;
 
     // Load current bucket metadata
-    let bucket_meta = rustfs_ecstore::bucket::metadata_sys::get(&bucket_name)
+    let bucket_meta = get_swift_bucket_metadata(&bucket_name)
         .await
         .map_err(|e| SwiftError::InternalServerError(format!("Failed to load bucket metadata: {}", e)))?;
 
@@ -1087,7 +1088,7 @@ pub async fn set_container_acl(
     }
 
     // Save updated metadata
-    rustfs_ecstore::bucket::metadata_sys::set_bucket_metadata(bucket_name, bucket_meta_clone)
+    set_swift_bucket_metadata(bucket_name, bucket_meta_clone)
         .await
         .map_err(|e| SwiftError::InternalServerError(format!("Failed to save metadata: {}", e)))?;
 
@@ -1134,7 +1135,7 @@ pub async fn get_container_acl(
     let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
 
     // Load bucket metadata
-    let bucket_meta = rustfs_ecstore::bucket::metadata_sys::get(&bucket_name).await.map_err(|e| {
+    let bucket_meta = get_swift_bucket_metadata(&bucket_name).await.map_err(|e| {
         if e.to_string().contains("not found") {
             SwiftError::NotFound(format!("Container '{}' not found", container))
         } else {

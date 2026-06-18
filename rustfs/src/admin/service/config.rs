@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::storage_compat::ecstore::config::com::{STORAGE_CLASS_SUB_SYS, read_config_without_migrate};
+use crate::admin::storage_compat::ecstore::config::set_global_storage_class;
+use crate::admin::storage_compat::ecstore::config::storageclass;
+use crate::admin::storage_compat::ecstore::notification_sys::get_global_notification_sys;
 use crate::app::context::resolve_object_store_handle;
 use rustfs_audit::reload_audit_config;
 use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_WEBHOOK_SUB_SYS};
@@ -21,10 +25,6 @@ use rustfs_config::server_config::{Config as ServerConfig, KVS, set_global_serve
 use rustfs_config::{AUDIT_DEFAULT_DIR, EVENT_DEFAULT_DIR};
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
 use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
-use rustfs_ecstore::config::com::{STORAGE_CLASS_SUB_SYS, read_config_without_migrate};
-use rustfs_ecstore::config::set_global_storage_class;
-use rustfs_ecstore::config::storageclass;
-use rustfs_ecstore::notification_sys::get_global_notification_sys;
 use rustfs_iam::oidc::load_oidc_provider_configs_from_server_config;
 use rustfs_storage_api::StorageAdminApi;
 use rustfs_targets::config::{
@@ -371,11 +371,11 @@ pub async fn signal_config_snapshot_reload() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::storage_compat::ecstore::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG};
     use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
     use rustfs_config::oidc::{OIDC_CLIENT_ID, OIDC_CONFIG_URL, OIDC_SCOPES};
     use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
     use rustfs_config::{MQTT_BROKER, MQTT_QUEUE_DIR, MQTT_TOPIC, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR};
-    use rustfs_ecstore::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG};
 
     const LIFECYCLE_RELOAD_LABEL: &str = "lifecycle";
     const REPLICATION_RELOAD_LABEL: &str = "replication";
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn validate_notify_subsystem_config_rejects_invalid_webhook_endpoint() {
-        rustfs_ecstore::config::init();
+        crate::admin::storage_compat::ecstore::config::init();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(NOTIFY_WEBHOOK_SUB_SYS).expect("notify webhook defaults");
         let kvs = targets.get_mut(DEFAULT_DELIMITER).expect("default target");
@@ -441,7 +441,7 @@ mod tests {
 
     #[test]
     fn validate_audit_subsystem_config_rejects_relative_queue_dir() {
-        rustfs_ecstore::config::init();
+        crate::admin::storage_compat::ecstore::config::init();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(AUDIT_MQTT_SUB_SYS).expect("audit mqtt defaults");
         let kvs = targets.get_mut(DEFAULT_DELIMITER).expect("default target");
@@ -456,7 +456,7 @@ mod tests {
 
     #[test]
     fn validate_identity_openid_config_rejects_missing_openid_scope() {
-        rustfs_ecstore::config::init();
+        crate::admin::storage_compat::ecstore::config::init();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(IDENTITY_OPENID_SUB_SYS).expect("openid defaults");
         let kvs = targets.get_mut(DEFAULT_DELIMITER).expect("default target");
@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn validate_identity_openid_config_rejects_invalid_named_provider_id() {
-        rustfs_ecstore::config::init();
+        crate::admin::storage_compat::ecstore::config::init();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(IDENTITY_OPENID_SUB_SYS).expect("openid defaults");
         let default_kvs = targets.get(DEFAULT_DELIMITER).cloned().expect("default target");

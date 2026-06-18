@@ -18,6 +18,12 @@ use crate::admin::service::config::{
     apply_dynamic_config_for_subsystem, is_dynamic_config_subsystem, signal_config_snapshot_reload, signal_dynamic_config_reload,
     validate_server_config,
 };
+use crate::admin::storage_compat::ecstore::config::com::STORAGE_CLASS_SUB_SYS;
+use crate::admin::storage_compat::ecstore::config::com::{
+    delete_config, read_config, read_config_without_migrate, save_config, save_server_config,
+};
+use crate::admin::storage_compat::ecstore::config::storageclass::{INLINE_BLOCK_ENV, OPTIMIZE_ENV, RRS_ENV, STANDARD_ENV};
+use crate::admin::storage_compat::ecstore::disk::RUSTFS_META_BUCKET;
 use crate::admin::utils::{encode_compatible_admin_payload, is_compat_admin_request, read_compatible_admin_body};
 use crate::app::context::resolve_object_store_handle;
 use crate::auth::{check_key_valid, get_session_token};
@@ -69,12 +75,8 @@ use rustfs_config::{
     WEBHOOK_QUEUE_LIMIT, WEBHOOK_RETRY_INTERVAL,
 };
 use rustfs_credentials::Credentials;
-use rustfs_ecstore::config::com::STORAGE_CLASS_SUB_SYS;
-use rustfs_ecstore::config::com::{delete_config, read_config, read_config_without_migrate, save_config, save_server_config};
-use rustfs_ecstore::config::storageclass::{INLINE_BLOCK_ENV, OPTIMIZE_ENV, RRS_ENV, STANDARD_ENV};
-use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
-use rustfs_ecstore::store_api::ListOperations;
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_storage_api::ListOperations as _;
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
@@ -709,7 +711,7 @@ fn success_response(config_applied: bool) -> S3Result<S3Response<(StatusCode, Bo
     Ok(S3Response::with_headers((StatusCode::OK, Body::default()), headers))
 }
 
-fn object_store() -> S3Result<std::sync::Arc<rustfs_ecstore::store::ECStore>> {
+fn object_store() -> S3Result<std::sync::Arc<crate::admin::storage_compat::ecstore::store::ECStore>> {
     resolve_object_store_handle().ok_or_else(|| s3_error!(InternalError, "server storage not initialized"))
 }
 
@@ -754,7 +756,7 @@ fn config_update_sub_system(directives: &[ConfigDirective]) -> S3Result<Option<&
 
 fn validate_config_directives(directives: &[ConfigDirective]) -> S3Result<()> {
     if DEFAULT_KVS.get().is_none() {
-        rustfs_ecstore::config::init();
+        crate::admin::storage_compat::ecstore::config::init();
     }
     let Some(defaults) = DEFAULT_KVS.get() else {
         return Err(s3_error!(InternalError, "config defaults are not initialized"));
@@ -1408,7 +1410,7 @@ fn env_help_key(sub_system: &str, key: &str) -> String {
 
 fn default_help_postfix(sub_system: &str, key: &str) -> String {
     if DEFAULT_KVS.get().is_none() {
-        rustfs_ecstore::config::init();
+        crate::admin::storage_compat::ecstore::config::init();
     }
 
     DEFAULT_KVS
@@ -1895,7 +1897,7 @@ mod tests {
 
     #[test]
     fn full_config_export_can_be_reapplied() {
-        rustfs_ecstore::config::init();
+        crate::admin::storage_compat::ecstore::config::init();
         let mut original = ServerConfig::new();
         apply_set_directives(
             &mut original,
@@ -1942,7 +1944,7 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
 
     #[test]
     fn build_help_response_appends_default_value_postfix() {
-        rustfs_ecstore::config::init();
+        crate::admin::storage_compat::ecstore::config::init();
         let response = build_help_response(Some("identity_openid"), Some("scopes"), false).expect("help response");
 
         assert_eq!(response.keys_help.len(), 2);
@@ -2055,7 +2057,7 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
 
     #[test]
     fn render_selected_config_includes_env_override_lines() {
-        rustfs_ecstore::config::init();
+        crate::admin::storage_compat::ecstore::config::init();
         temp_env::with_vars(
             [
                 ("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY", Some("http://env.example")),
@@ -2091,7 +2093,7 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
 
     #[test]
     fn render_selected_config_lists_env_only_targets() {
-        rustfs_ecstore::config::init();
+        crate::admin::storage_compat::ecstore::config::init();
         temp_env::with_vars([("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY", Some("http://env.example"))], || {
             let config = ServerConfig::new();
             let rendered = String::from_utf8(
@@ -2114,7 +2116,7 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
 
     #[test]
     fn render_selected_config_supports_specific_env_only_target_queries() {
-        rustfs_ecstore::config::init();
+        crate::admin::storage_compat::ecstore::config::init();
         temp_env::with_vars([("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY", Some("http://env.example"))], || {
             let config = ServerConfig::new();
             let rendered = String::from_utf8(
@@ -2137,7 +2139,7 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
 
     #[test]
     fn render_selected_config_orders_default_before_named_targets() {
-        rustfs_ecstore::config::init();
+        crate::admin::storage_compat::ecstore::config::init();
         temp_env::with_vars([("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_ALPHA", Some("http://alpha.example"))], || {
             let mut config = ServerConfig::new();
             apply_set_directives(
@@ -2318,7 +2320,7 @@ identity_openid client_id="existing-client""#,
 
     #[test]
     fn storage_class_get_target_none_matches_full_export() {
-        rustfs_ecstore::config::init();
+        crate::admin::storage_compat::ecstore::config::init();
         let mut config = ServerConfig::new();
         apply_set_directives(
             &mut config,

@@ -12,6 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::storage_compat::ecstore::bucket::utils::{deserialize, serialize};
+use crate::admin::storage_compat::ecstore::{
+    bucket::{
+        metadata::{
+            BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE,
+            BUCKET_REPLICATION_CONFIG, BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG,
+            BucketMetadata, OBJECT_LOCK_CONFIG,
+        },
+        metadata_sys,
+        quota::BucketQuota,
+        target::BucketTargets,
+    },
+    error::StorageError,
+};
 use crate::{
     admin::{
         auth::validate_admin_request,
@@ -25,26 +39,11 @@ use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_BUCKET_METADATA_IMPORT_SIZE;
-use rustfs_ecstore::bucket::utils::{deserialize, serialize};
-use rustfs_ecstore::{
-    bucket::{
-        metadata::{
-            BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE,
-            BUCKET_REPLICATION_CONFIG, BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG,
-            BucketMetadata, OBJECT_LOCK_CONFIG,
-        },
-        metadata_sys,
-        quota::BucketQuota,
-        target::BucketTargets,
-    },
-    error::StorageError,
-    store_api::BucketOperations,
-};
 use rustfs_policy::policy::{
     BucketPolicy,
     action::{Action, AdminAction},
 };
-use rustfs_storage_api::{BucketOptions, MakeBucketOptions};
+use rustfs_storage_api::{BucketOperations, BucketOptions, MakeBucketOptions};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::{
     Body, S3Request, S3Response, S3Result,

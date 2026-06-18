@@ -19,6 +19,8 @@ use rustfs_s3_types::{EventName, event_schema_version};
 use serde::{Deserialize, Serialize};
 use url::form_urlencoded;
 
+use crate::storage_compat::NotifyObjectInfo;
+
 /// Represents the identity of the user who triggered the event
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -305,7 +307,7 @@ fn initialize_response_elements(elements: &mut HashMap<String, String>, keys: &[
 pub struct EventArgs {
     pub event_name: EventName,
     pub bucket_name: String,
-    pub object: rustfs_ecstore::store_api::ObjectInfo,
+    pub object: NotifyObjectInfo,
     pub req_params: HashMap<String, String>,
     pub resp_elements: HashMap<String, String>,
     pub version_id: String,
@@ -354,7 +356,7 @@ impl EventArgs {
 pub struct EventArgsBuilder {
     event_name: EventName,
     bucket_name: String,
-    object: rustfs_ecstore::store_api::ObjectInfo,
+    object: NotifyObjectInfo,
     req_params: HashMap<String, String>,
     resp_elements: HashMap<String, String>,
     version_id: String,
@@ -365,7 +367,7 @@ pub struct EventArgsBuilder {
 
 impl EventArgsBuilder {
     /// Creates a new builder with the required fields.
-    pub fn new(event_name: EventName, bucket_name: impl Into<String>, object: rustfs_ecstore::store_api::ObjectInfo) -> Self {
+    pub fn new(event_name: EventName, bucket_name: impl Into<String>, object: NotifyObjectInfo) -> Self {
         Self {
             event_name,
             bucket_name: bucket_name.into(),
@@ -387,7 +389,7 @@ impl EventArgsBuilder {
     }
 
     /// Sets the object information.
-    pub fn object(mut self, object: rustfs_ecstore::store_api::ObjectInfo) -> Self {
+    pub fn object(mut self, object: NotifyObjectInfo) -> Self {
         self.object = object;
         self
     }
@@ -482,7 +484,7 @@ mod tests {
         let args = EventArgsBuilder::new(
             EventName::LifecycleTransition,
             "bucket",
-            rustfs_ecstore::store_api::ObjectInfo {
+            NotifyObjectInfo {
                 bucket: "bucket".to_string(),
                 name: "key".to_string(),
                 ..Default::default()
@@ -498,7 +500,7 @@ mod tests {
         let args = EventArgsBuilder::new(
             EventName::ObjectRestoreCompleted,
             "bucket",
-            rustfs_ecstore::store_api::ObjectInfo {
+            NotifyObjectInfo {
                 bucket: "bucket".to_string(),
                 name: "key".to_string(),
                 restore_expires: Some(time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()),
@@ -518,9 +520,8 @@ mod tests {
 
 #[cfg(test)]
 mod event_args_tests {
-    use super::EventArgs;
+    use super::{EventArgs, NotifyObjectInfo as ObjectInfo};
     use hashbrown::HashMap;
-    use rustfs_ecstore::store_api::ObjectInfo;
     use rustfs_s3_types::EventName;
 
     fn args_with_headers(pairs: &[(&str, &str)]) -> EventArgs {
