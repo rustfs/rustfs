@@ -6,19 +6,21 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
 - Branch: `overtrue/arch-storage-dto-consumer-boundaries`
-- Baseline: local API-025 commit
-  `daa9d19724e370906630bb848aa1f36868475c6f`, based on `main` at
-  `a30cafa73fde3e7e88c160e70c290e74a0c2235f`, while
-  `rustfs/rustfs#3565` is pending.
+- Baseline: `main` at `99941f7e7c5e0c88532a93cc175a3ea4111d7098`
+  after `rustfs/rustfs#3565` merged.
 - PR type for this branch: `consumer-migration`
-- Runtime behavior changes: no external behavior change expected.
+- Runtime behavior changes: no migration behavior change expected; CI follow-up
+  preserves empty-object erasure recovery by avoiding zero-byte SIMD decode.
 - Rust code changes: add crate-local semantic aliases for ECStore-owned object
   metadata, options, readers, and delete DTOs in scanner, heal, notify, Swift,
   S3 Select, and RustFS storage/app consumers so external call sites stop
   importing raw `rustfs_ecstore::store_api` DTOs outside deliberate boundary
   files. ECStore-owned DTO definitions and runtime behavior stay in ECStore.
+  CI follow-up handles zero-length shards in erasure reconstruction without
+  changing non-empty shard behavior.
 - CI/script changes: none.
-- Docs changes: record the larger DTO consumer-boundary cleanup slice.
+- Docs changes: record the larger DTO consumer-boundary cleanup slice and the
+  empty-object erasure recovery CI follow-up.
 
 ## Phase 0 Tasks
 
@@ -1074,9 +1076,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Scanner, heal, notify, Swift, S3 Select, and RustFS storage/app consumers now use crate-local DTO aliases; direct ECStore `store_api` references are limited to deliberate boundary alias definitions outside ECStore. |
-| Migration preservation | passed | ECStore remains the owner of object metadata, options, readers, delete DTOs, walk filters, lock wrappers, and implementation behavior; aliases preserve the existing concrete types without runtime or serialization changes. |
-| Testing/verification | passed | Focused compile/tests, migration/layer guards, direct import scan, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | passed | Scanner, heal, notify, Swift, S3 Select, and RustFS storage/app consumers now use crate-local DTO aliases; the erasure CI fix is isolated to zero-length shard reconstruction. |
+| Migration preservation | passed | ECStore remains the owner of object DTOs/readers/walk filters/implementation behavior; aliases preserve concrete types and non-empty erasure encode/decode paths still use the existing encoders. |
+| Testing/verification | passed | Focused DTO/erasure compile/tests, migration/layer guards, direct import scan, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
@@ -1098,14 +1100,24 @@ Passed before push:
 - `rg -n 'rustfs_ecstore::store_api' rustfs/src crates --glob
   '!crates/ecstore/**' --glob '*.rs'`: remaining matches are deliberate
   boundary alias definitions.
+- `cargo test -p rustfs-ecstore erasure_coding::erasure::tests`: passed; 31
+  passed.
+- `PROPTEST_CASES=1024 cargo test -p rustfs-ecstore
+  erasure_coding::erasure::tests::decode_data_and_parity_round_trips_bounded_recoverability`:
+  passed.
+- `cargo test -p rustfs-ecstore
+  rpc::peer_s3_client::tests::local_get_bucket_info_survives_prior_walk_timeout`:
+  passed after a full-crate `cargo test -p rustfs-ecstore` run exposed this
+  unrelated ordinary-harness global-state interference.
 - `./scripts/check_architecture_migration_rules.sh`: passed.
 - `./scripts/check_layer_dependencies.sh`: passed.
 - `cargo fmt --all --check`: passed.
 - `git diff --check`: passed.
-- Rust risk scan: no new `unwrap`/`expect`, panic/todo markers, `unsafe`,
-  process-spawning calls, lossy casts, println/eprintln, or relaxed ordering in
+- Rust risk scan: new hits are crate-local alias casts plus the empty-erasure
+  test expectations; no new production `unwrap`/`expect`, panic/todo markers,
+  `unsafe`, process-spawning calls, println/eprintln, or relaxed ordering in
   added Rust lines.
-- `make pre-commit`: passed; nextest reported 6214 tests passed and 111
+- `make pre-commit`: passed; nextest reported 6218 tests passed and 111
   skipped, and doctests passed.
 
 Notes:
@@ -1119,12 +1131,15 @@ Notes:
   semantics, heal storage metadata semantics, Swift/S3 Select object reads,
   notification event payloads, S3 response DTO mapping, or runtime storage
   behavior.
+- The CI follow-up preserves empty-object erasure reconstruction by filling
+  missing zero-length shards before calling encoders that reject zero-byte SIMD
+  shard sizes.
 
 ## Handoff Notes
 
-- External DTO consumer cleanup is stacked on local API-025 commit
-  `daa9d19724e370906630bb848aa1f36868475c6f` while `rustfs/rustfs#3565` is
-  pending; rebase onto `main` after that PR lands before opening this PR.
+- External DTO consumer cleanup is based on `main` after
+  `rustfs/rustfs#3565` merged and carries the empty-object erasure recovery
+  CI follow-up because the merged PR did not include that post-merge fix.
 - Continue with larger consumer-migration batches; keep ECStore-owned
   DTOs/readers/walk filters in ECStore until their concrete behavior is isolated
   enough for a pure-move slice.
