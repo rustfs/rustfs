@@ -577,6 +577,12 @@ fn resolve_decommission_terminal_mark_after_error_result(result: Result<()>, idx
     })
 }
 
+fn observe_decommission_terminal_reload_result(result: Result<()>, stage: &str) -> Option<Error> {
+    result
+        .err()
+        .map(|err| Error::other(format!("decommission terminal pool meta reload failed during {stage}: {err}")))
+}
+
 fn resolve_decommission_spawn_failure_result(spawn_err: Error, rollback_err: Option<Error>) -> Error {
     if let Some(rollback_err) = rollback_err {
         Error::other(format!(
@@ -3004,22 +3010,30 @@ impl ECStore {
             take_and_cancel_decommission_canceler(cancelers.as_mut_slice(), idx);
         }
 
-        let mut reload_result = Ok(());
         if should_reload_pool_meta {
             self.save_current_pool_meta().await?;
             {
                 let mut pool_meta = self.pool_meta.write().await;
                 pool_meta.mark_decommission_progress_saved();
             }
-            reload_result = if let Some(notification_sys) = get_global_notification_sys() {
+            if let Some(notification_sys) = get_global_notification_sys() {
                 let stage = format!("decommission_failed for pool {idx}");
-                resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())
-            } else {
-                Ok(())
-            };
+                if let Some(err) = observe_decommission_terminal_reload_result(
+                    resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str()),
+                    stage.as_str(),
+                ) {
+                    warn!(
+                        event = EVENT_DECOMMISSION_STATE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_POOLS,
+                        pool_index = idx,
+                        state = "terminal_reload_failed",
+                        error = %err,
+                        "Decommission terminal state saved but pool meta reload failed"
+                    );
+                }
+            }
         }
-
-        reload_result?;
 
         Ok(())
     }
@@ -3038,22 +3052,30 @@ impl ECStore {
             take_and_cancel_decommission_canceler(cancelers.as_mut_slice(), idx);
         }
 
-        let mut reload_result = Ok(());
         if should_reload_pool_meta {
             self.save_current_pool_meta().await?;
             {
                 let mut pool_meta = self.pool_meta.write().await;
                 pool_meta.mark_decommission_progress_saved();
             }
-            reload_result = if let Some(notification_sys) = get_global_notification_sys() {
+            if let Some(notification_sys) = get_global_notification_sys() {
                 let stage = format!("complete_decommission for pool {idx}");
-                resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())
-            } else {
-                Ok(())
-            };
+                if let Some(err) = observe_decommission_terminal_reload_result(
+                    resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str()),
+                    stage.as_str(),
+                ) {
+                    warn!(
+                        event = EVENT_DECOMMISSION_STATE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_POOLS,
+                        pool_index = idx,
+                        state = "terminal_reload_failed",
+                        error = %err,
+                        "Decommission terminal state saved but pool meta reload failed"
+                    );
+                }
+            }
         }
-
-        reload_result?;
 
         Ok(())
     }
@@ -4288,20 +4310,20 @@ mod pools_tests {
         ensure_local_decommission_pool_leaders, ensure_valid_decommission_pool_index, first_resumable_decommission_queue_indices,
         get_by_index, has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_requested,
         is_decommission_cancel_terminal, load_decommission_entry_versions, local_decommission_queue_prefix,
-        mark_decommission_bucket_done, missing_decommission_worker_prefix, pool_meta_has_active_decommission,
-        require_decommission_store, resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
-        resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
-        resolve_decommission_entry_reload_result, resolve_decommission_listing_worker_result,
-        resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,
-        resolve_decommission_preflight_heal_result, resolve_decommission_progress_save_result,
-        resolve_decommission_spawn_failure_result, resolve_decommission_terminal_mark_after_error_result,
-        resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result,
-        resolve_start_decommission_pool_meta_reload_result, rollback_start_decommission_pool_meta,
-        run_decommission_buckets_bounded, should_cleanup_decommission_source_entry, should_continue_decommission_queue,
-        should_count_decommission_version_complete, should_preserve_decommission_canceled_state,
-        should_skip_canceled_decommission_routine, split_decommission_buckets, take_and_cancel_decommission_canceler,
-        take_decommission_canceler, track_decommission_current_object, validate_start_decommission_request,
-        wait_decommission_worker_drain, with_decommission_entry_context,
+        mark_decommission_bucket_done, missing_decommission_worker_prefix, observe_decommission_terminal_reload_result,
+        pool_meta_has_active_decommission, require_decommission_store, resolve_decommission_bucket_done_save_result,
+        resolve_decommission_bucket_state, resolve_decommission_check_after_list_result,
+        resolve_decommission_entry_cleanup_delete_result, resolve_decommission_entry_reload_result,
+        resolve_decommission_listing_worker_result, resolve_decommission_optional_bucket_config_result,
+        resolve_decommission_pool_meta_reload_result, resolve_decommission_preflight_heal_result,
+        resolve_decommission_progress_save_result, resolve_decommission_spawn_failure_result,
+        resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
+        resolve_decommission_update_after_result, resolve_start_decommission_pool_meta_reload_result,
+        rollback_start_decommission_pool_meta, run_decommission_buckets_bounded, should_cleanup_decommission_source_entry,
+        should_continue_decommission_queue, should_count_decommission_version_complete,
+        should_preserve_decommission_canceled_state, should_skip_canceled_decommission_routine, split_decommission_buckets,
+        take_and_cancel_decommission_canceler, take_decommission_canceler, track_decommission_current_object,
+        validate_start_decommission_request, wait_decommission_worker_drain, with_decommission_entry_context,
     };
     use crate::data_movement;
     use crate::disk::endpoint::Endpoint;
@@ -4979,6 +5001,20 @@ mod pools_tests {
         let message = err.to_string();
         assert!(message.contains("decommission terminal mark failed after background error on pool 3"));
         assert!(message.contains("mark error"));
+    }
+
+    #[test]
+    fn test_observe_decommission_terminal_reload_result_returns_none_on_success() {
+        assert!(observe_decommission_terminal_reload_result(Ok(()), "complete_decommission for pool 3").is_none());
+    }
+
+    #[test]
+    fn test_observe_decommission_terminal_reload_result_keeps_failure_for_logging() {
+        let err = observe_decommission_terminal_reload_result(Err(Error::SlowDown), "decommission_failed for pool 3")
+            .expect("reload failure should be observable");
+        let message = err.to_string();
+        assert!(message.contains("decommission terminal pool meta reload failed during decommission_failed for pool 3"));
+        assert!(message.contains(Error::SlowDown.to_string().as_str()));
     }
 
     #[test]
