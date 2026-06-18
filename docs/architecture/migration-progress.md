@@ -1181,6 +1181,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     layer guards, formatting check, diff hygiene, risk scan, full pre-commit,
     and required three-expert review required before push.
 
+- [x] `API-046` Remove IAM and Swift ECStore module passthroughs.
+  - Current branch: `overtrue/arch-compat-iam-swift-boundaries`.
+  - Current slice: replace IAM's ECStore config/error/global/notification/store
+    module passthroughs and Swift's ECStore bucket/error/store resolver
+    passthroughs with local compatibility aliases and wrapper functions, then
+    shrink the passthrough guard snapshot.
+  - Acceptance: IAM store, IAM notification fanout, IAM error conversion, IAM
+    first-node checks, and Swift bucket metadata/object-store access no longer
+    reach through ECStore modules directly from consumer code.
+  - Must preserve: IAM config prefix layout, IAM config read/write/delete
+    semantics, lazy rewrite precondition behavior, config-not-found mapping,
+    peer notification fanout error logging, first-node initial load behavior,
+    Swift object-store resolution, and Swift bucket metadata get/set behavior.
+  - Risk defense: this is an import ownership and compatibility-boundary
+    cleanup only; ECStore remains the owner of concrete storage/runtime state
+    while IAM and Swift expose narrower local names to their consumers.
+  - Verification: focused IAM/Swift compile, IAM unit tests, migration and
+    layer guards, formatting check, diff hygiene, risk scan, full pre-commit,
+    and required three-expert review required before push.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -1457,13 +1477,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-042/API-043/API-044/API-045 narrow notify, S3 Select, and OBS compatibility contracts without moving ECStore storage metadata ownership. |
-| Migration preservation | passed | Event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, OBS metrics state reads, unchanged no-op handling, and remove-event behavior are preserved. |
+| Quality/architecture | passed | API-042/API-043/API-044/API-045/API-046 narrow notify, S3 Select, OBS, IAM, and Swift compatibility contracts without moving ECStore storage metadata ownership. |
+| Migration preservation | passed | Event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, OBS metrics state reads, IAM config/notification/error semantics, Swift bucket metadata access, unchanged no-op handling, and remove-event behavior are preserved. |
 | Testing/verification | passed | Focused compiles/tests, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- API-046 current slice:
+  - `cargo check --tests -p rustfs-iam -p rustfs-protos`: passed.
+  - `cargo test -p rustfs-iam`: passed, 150 tests.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: reviewed added lines; only existing error-mapping behavior
+    was renamed to IAM-local compatibility aliases.
+  - `make pre-commit`: passed.
 
 - API-042 current slice:
   - `cargo check --tests -p rustfs-notify -p rustfs`: passed.
