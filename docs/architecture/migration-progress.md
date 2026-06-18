@@ -1069,6 +1069,23 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     formatting check, diff hygiene, risk scan, full pre-commit, and required
     three-expert review passed.
 
+- [x] `API-040` Lock remaining `store_api` compatibility aliases.
+  - Current branch: `overtrue/arch-compat-boundary-prune`.
+  - Current slice: add a migration rule that allows the remaining
+    `rustfs_ecstore::store_api::*` references in production storage
+    compatibility files only when they are explicit local type aliases to the
+    four ECStore-owned contracts still intentionally kept in ECStore.
+  - Acceptance: production compatibility boundaries can keep only explicit
+    aliases to `GetObjectReader`, `ObjectInfo`, `ObjectOptions`, and
+    `PutObjReader`; any broader import, module recreation, or new raw
+    `store_api` compatibility dependency fails the architecture guard.
+  - Must preserve: existing local alias names and concrete ECStore-owned reader,
+    object info, and object option contract ownership.
+  - Risk defense: this is a guardrail-only slice; it does not change runtime
+    code, storage behavior, object metadata shape, or reader behavior.
+  - Verification: migration and layer guards, formatting check, diff hygiene,
+    risk scan, full pre-commit, and required three-expert review passed.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -1345,13 +1362,23 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | Delete-object DTO ownership lives in storage-api; ECStore internal consumers use storage-api directly while public aliases remain, and store_api compatibility boundaries now expose direct explicit contract aliases only. |
+| Quality/architecture | passed | Delete-object DTO ownership lives in storage-api; ECStore internal consumers use storage-api directly while public aliases remain, and store_api compatibility boundaries now expose only direct explicit contract aliases guarded by a whitelist. |
 | Migration preservation | passed | Field shape, helper semantics, delete behavior, replication scheduling, MRF delete replay, object info/options aliases, reader aliases, and old ECStore concrete type compatibility are preserved. |
 | Testing/verification | passed | Multi-crate compile, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- API-040 current slice:
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: passed; no new unwrap/expect, numeric casts, string error
+    public APIs, boxed public errors, production println/eprintln, or relaxed
+    ordering introduced in changed Rust files.
+  - `make pre-commit`: passed.
 
 - API-039 current slice:
   - `cargo check --tests -p rustfs -p rustfs-scanner -p rustfs-heal -p rustfs-protocols -p rustfs-s3select-api -p rustfs-iam -p rustfs-notify`:
