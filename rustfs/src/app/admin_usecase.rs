@@ -291,8 +291,7 @@ impl DefaultAdminUsecase {
         }
 
         let has_idx = if req.by_id {
-            let idx = req.pool.parse::<usize>().unwrap_or_default();
-            if idx < endpoints.as_ref().len() { Some(idx) } else { None }
+            Self::parse_pool_idx_by_id(&req.pool, endpoints.as_ref().len())
         } else {
             endpoints.get_pool_idx(&req.pool)
         };
@@ -390,6 +389,11 @@ impl DefaultAdminUsecase {
         used_size as f64 / total_size as f64
     }
 
+    fn parse_pool_idx_by_id(pool: &str, endpoint_count: usize) -> Option<usize> {
+        let idx = pool.parse::<usize>().ok()?;
+        (idx < endpoint_count).then_some(idx)
+    }
+
     pub async fn execute_collect_dependency_readiness(&self) -> DependencyReadiness {
         collect_runtime_dependency_readiness().await
     }
@@ -424,6 +428,21 @@ mod tests {
         let readiness = usecase.execute_collect_dependency_readiness().await;
         let _ = readiness.storage_ready;
         let _ = readiness.iam_ready;
+    }
+
+    #[test]
+    fn admin_query_pool_status_by_id_rejects_non_numeric_index() {
+        assert_eq!(DefaultAdminUsecase::parse_pool_idx_by_id("pool-a", 4), None);
+    }
+
+    #[test]
+    fn admin_query_pool_status_by_id_rejects_out_of_range_index() {
+        assert_eq!(DefaultAdminUsecase::parse_pool_idx_by_id("4", 4), None);
+    }
+
+    #[test]
+    fn admin_query_pool_status_by_id_accepts_valid_index() {
+        assert_eq!(DefaultAdminUsecase::parse_pool_idx_by_id("0", 4), Some(0));
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crate::{
     auth::{check_key_valid, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},
 };
-use http::{HeaderMap, HeaderValue, StatusCode};
+use http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use hyper::Method;
 use matchit::Params;
 use rustfs_ecstore::{
@@ -79,6 +79,10 @@ fn log_rebalance_request_rejected(action: &str, reason: &str, request_id: &str, 
         remote_addr = %remote_addr,
         "admin rebalance state"
     );
+}
+
+fn rebalance_query_present(uri: &Uri) -> bool {
+    uri.query().is_some_and(|query| !query.is_empty())
 }
 
 fn rollback_result_label(result: &Result<(), String>) -> &'static str {
@@ -398,6 +402,11 @@ impl Operation for RebalanceStart {
         )
         .await?;
 
+        if rebalance_query_present(&req.uri) {
+            log_rebalance_request_rejected("start", "invalid_query_parameters", &request_id, &actor, &remote_addr);
+            return Err(s3_error!(InvalidArgument, "rebalance start does not accept query parameters"));
+        }
+
         let Some(store) = resolve_object_store_handle() else {
             return Err(s3_error!(InternalError, "object layer is not initialized"));
         };
@@ -688,6 +697,11 @@ impl Operation for RebalanceStop {
         )
         .await?;
 
+        if rebalance_query_present(&req.uri) {
+            log_rebalance_request_rejected("stop", "invalid_query_parameters", &request_id, &actor, &remote_addr);
+            return Err(s3_error!(InvalidArgument, "rebalance stop does not accept query parameters"));
+        }
+
         let Some(store) = resolve_object_store_handle() else {
             return Err(s3_error!(InternalError, "object layer is not initialized"));
         };
@@ -855,8 +869,9 @@ mod rebalance_handler_tests {
     use super::calculate_rebalance_progress;
     use super::{
         RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, RebalanceStopPropagationStatus,
-        build_rebalance_pool_statuses, build_rebalance_stop_propagation_status, rebalance_pool_used, rebalance_remaining_buckets,
-        rebalance_rollback_stop_failure_message, rebalance_start_rollback_error, rebalance_used_pct, rollback_result_label,
+        build_rebalance_pool_statuses, build_rebalance_stop_propagation_status, rebalance_pool_used, rebalance_query_present,
+        rebalance_remaining_buckets, rebalance_rollback_stop_failure_message, rebalance_start_rollback_error, rebalance_used_pct,
+        rollback_result_label,
     };
     use rustfs_ecstore::rebalance::{
         DiskStat, RebalStatus, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta, RebalanceStats,
@@ -907,6 +922,22 @@ mod rebalance_handler_tests {
         assert!(message.contains("cluster stop_rebalance rollback for rebalance-id partial"));
         assert!(message.contains("peer a stop_rebalance failed: timeout"));
         assert!(message.contains("peer b stop_rebalance failed: unavailable"));
+    }
+
+    #[test]
+    fn test_rebalance_query_present_detects_non_empty_query() {
+        let uri = "/rustfs/admin/v3/rebalance/start?pool=0".parse().unwrap();
+
+        assert!(rebalance_query_present(&uri));
+    }
+
+    #[test]
+    fn test_rebalance_query_present_allows_no_or_empty_query() {
+        let no_query = "/rustfs/admin/v3/rebalance/start".parse().unwrap();
+        let empty_query = "/rustfs/admin/v3/rebalance/start?".parse().unwrap();
+
+        assert!(!rebalance_query_present(&no_query));
+        assert!(!rebalance_query_present(&empty_query));
     }
 
     #[test]

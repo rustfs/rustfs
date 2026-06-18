@@ -316,15 +316,14 @@ fn parse_pool_idx_by_id(pool: &str, endpoint_count: usize) -> Option<usize> {
     (idx < endpoint_count).then_some(idx)
 }
 
-fn dedup_indices(indices: &[usize]) -> Vec<usize> {
+fn has_duplicate_indices(indices: &[usize]) -> bool {
     let mut seen = HashSet::with_capacity(indices.len());
-    let mut output = Vec::with_capacity(indices.len());
     for idx in indices {
-        if seen.insert(*idx) {
-            output.push(*idx);
+        if !seen.insert(*idx) {
+            return true;
         }
     }
-    output
+    false
 }
 
 pub fn register_pool_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -412,7 +411,21 @@ pub struct StatusPoolQuery {
     pub by_id: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PoolQueryMode {
+    Status,
+    Mutation,
+}
+
 fn parse_status_pool_query(uri: &Uri) -> Result<StatusPoolQuery, ()> {
+    parse_pool_query(uri, PoolQueryMode::Status)
+}
+
+fn parse_mutation_pool_query(uri: &Uri) -> Result<StatusPoolQuery, ()> {
+    parse_pool_query(uri, PoolQueryMode::Mutation)
+}
+
+fn parse_pool_query(uri: &Uri, mode: PoolQueryMode) -> Result<StatusPoolQuery, ()> {
     let mut parsed = StatusPoolQuery::default();
     let mut seen = HashSet::with_capacity(2);
     let Some(query) = uri.query() else {
@@ -436,6 +449,7 @@ fn parse_status_pool_query(uri: &Uri) -> Result<StatusPoolQuery, ()> {
                     _ => return Err(()),
                 }
             }
+            _ if mode == PoolQueryMode::Status => {}
             _ => return Err(()),
         }
     }
@@ -579,7 +593,7 @@ impl Operation for StartDecommission {
         }
         validate_start_decommission_guards(decommission_running, rebalance_running)?;
 
-        let query = parse_status_pool_query(&req.uri)
+        let query = parse_mutation_pool_query(&req.uri)
             .map_err(|_| pool_admin_query_parse_error_with_audit("start decommission", audit))?;
         let is_byid = query.by_id.as_str() == "true";
 
@@ -612,7 +626,10 @@ impl Operation for StartDecommission {
 
             parsed_indices.push(idx);
         }
-        let pools_indices = dedup_indices(&parsed_indices);
+        if has_duplicate_indices(&parsed_indices) {
+            return Err(pool_admin_query_parse_error_with_audit("start decommission", audit));
+        }
+        let pools_indices = parsed_indices;
 
         if !pools_indices.is_empty() {
             let pool_context = format!("pools {:?}", &pools_indices);
@@ -700,7 +717,7 @@ impl Operation for CancelDecommission {
             return Err(s3_error!(NotImplemented));
         }
 
-        let query = parse_status_pool_query(&req.uri)
+        let query = parse_mutation_pool_query(&req.uri)
             .map_err(|_| pool_admin_query_parse_error_with_audit("cancel decommission", audit))?;
 
         let is_byid = query.by_id.as_str() == "true";
@@ -805,7 +822,7 @@ impl Operation for ClearDecommission {
             return Err(s3_error!(NotImplemented));
         }
 
-        let query = parse_status_pool_query(&req.uri)
+        let query = parse_mutation_pool_query(&req.uri)
             .map_err(|_| pool_admin_query_parse_error_with_audit("clear decommission", audit))?;
 
         let is_byid = query.by_id.as_str() == "true";
@@ -852,11 +869,12 @@ impl Operation for ClearDecommission {
 #[cfg(test)]
 mod pools_handler_tests {
     use super::{
-        PoolAuditContext, contextualize_admin_pool_api_error, decommission_admin_not_initialized_error_with_audit, dedup_indices,
-        parse_pool_idx_by_id, parse_status_pool_query, pool_admin_missing_credentials_error,
-        pool_admin_missing_credentials_error_with_request, pool_admin_pool_index_error_with_audit,
-        pool_admin_pool_not_found_error_with_audit, pool_admin_pool_parse_error_with_audit, pool_admin_query_parse_error,
-        pool_admin_query_parse_error_with_audit, validate_start_decommission_guards,
+        PoolAuditContext, contextualize_admin_pool_api_error, decommission_admin_not_initialized_error_with_audit,
+        has_duplicate_indices, parse_mutation_pool_query, parse_pool_idx_by_id, parse_status_pool_query,
+        pool_admin_missing_credentials_error, pool_admin_missing_credentials_error_with_request,
+        pool_admin_pool_index_error_with_audit, pool_admin_pool_not_found_error_with_audit,
+        pool_admin_pool_parse_error_with_audit, pool_admin_query_parse_error, pool_admin_query_parse_error_with_audit,
+        validate_start_decommission_guards,
     };
 
     #[test]
@@ -870,11 +888,12 @@ mod pools_handler_tests {
     }
 
     #[test]
-    fn test_parse_status_pool_query_rejects_unknown_duplicate_and_invalid_bool() {
+    fn test_parse_status_pool_query_ignores_unknown_but_rejects_duplicate_and_invalid_bool() {
         let unknown = "/rustfs/admin/v3/pools/status?pool=0&force=true"
             .parse()
             .expect("uri should parse");
-        assert!(parse_status_pool_query(&unknown).is_err());
+        let query = parse_status_pool_query(&unknown).expect("status query should ignore unknown keys");
+        assert_eq!(query.pool, "0");
 
         let duplicate = "/rustfs/admin/v3/pools/status?pool=0&pool=1"
             .parse()
@@ -883,6 +902,24 @@ mod pools_handler_tests {
 
         let invalid_bool = "/rustfs/admin/v3/pools/status?by-id=yes".parse().expect("uri should parse");
         assert!(parse_status_pool_query(&invalid_bool).is_err());
+    }
+
+    #[test]
+    fn test_parse_mutation_pool_query_rejects_unknown_duplicate_and_invalid_bool() {
+        let unknown = "/rustfs/admin/v3/pools/decommission?pool=0&force=true"
+            .parse()
+            .expect("uri should parse");
+        assert!(parse_mutation_pool_query(&unknown).is_err());
+
+        let duplicate = "/rustfs/admin/v3/pools/decommission?pool=0&pool=1"
+            .parse()
+            .expect("uri should parse");
+        assert!(parse_mutation_pool_query(&duplicate).is_err());
+
+        let invalid_bool = "/rustfs/admin/v3/pools/decommission?by-id=yes"
+            .parse()
+            .expect("uri should parse");
+        assert!(parse_mutation_pool_query(&invalid_bool).is_err());
     }
 
     #[test]
@@ -1051,13 +1088,14 @@ mod pools_handler_tests {
     }
 
     #[test]
-    fn test_dedup_indices_removes_duplicates_preserving_order() {
-        assert_eq!(dedup_indices(&[0, 2, 1, 2, 3, 0]), vec![0, 2, 1, 3]);
+    fn test_has_duplicate_indices_detects_duplicate_indices() {
+        assert!(has_duplicate_indices(&[0, 2, 1, 2, 3]));
     }
 
     #[test]
-    fn test_dedup_indices_handles_empty_input() {
+    fn test_has_duplicate_indices_allows_unique_and_empty_input() {
         let empty: Vec<usize> = Vec::new();
-        assert!(dedup_indices(&empty).is_empty());
+        assert!(!has_duplicate_indices(&empty));
+        assert!(!has_duplicate_indices(&[0, 2, 1, 3]));
     }
 }
