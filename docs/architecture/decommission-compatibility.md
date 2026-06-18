@@ -53,8 +53,11 @@ Only one queued entry may own a decommission worker at a time. Startup recovery:
 
 - loads pool metadata before rebalance recovery;
 - resumes the first local non-terminal active/queued entry;
-- promotes the next queued entry only after the previous entry is durably
-  completed, failed, or canceled;
+- skips a durably completed prefix and promotes the next queued entry only after
+  successful completion;
+- treats failed or canceled terminal entries as an automatic-promotion barrier,
+  leaving later queued pools visible but stopped until an operator retries,
+  clears, or otherwise resolves the terminal entry;
 - keeps queued pools out of active worker scheduling until promotion, while still
   making their future state visible in admin status.
 
@@ -78,18 +81,23 @@ leader observes the pending cancel and applies it to the active worker.
 
 ### Status Response Shape
 
-Admin status must expose enough structure for operators and `mc admin
-decommission` compatibility:
+`GET /v3/pools/list` and `GET /v3/pools/status?pool=...` expose per-pool
+machine-readable decommission state. The `status` field can report `active`,
+`running`, `queued`, `complete`, `failed`, or `canceled`.
 
-- active entry with pool index, state, progress, last error, and propagation
-  status;
-- queued entries with stable order and submission time;
-- completed/failed/canceled history with terminal time and reason;
-- last metadata propagation attempt and peer failures for start, promotion, and
-  cancel.
+When decommission metadata is present, `decommissionInfo` includes:
 
-The status response must make it clear when no worker is currently running
-because the queue is waiting for retry, cancel propagation, or operator action.
+- queue and terminal flags: `queued`, `complete`, `failed`, `canceled`;
+- progress counters: `objectsDecommissioned`,
+  `objectsDecommissionedFailed`, `bytesDecommissioned`, and
+  `bytesDecommissionedFailed`;
+- current location: `bucket`, `prefix`, and `object`;
+- queue/history lists: `queuedBuckets` and `decommissionedBuckets`;
+- `waitingReason`, currently `queued` for queued entries and
+  `waiting_for_worker` when metadata exists but no worker has started.
+
+This makes queued pools and stalled metadata visible without requiring operators
+to inspect pool metadata files directly.
 
 ## MinIO Divergence Decisions
 
@@ -149,6 +157,9 @@ The queued multi-pool contract is guarded by:
 - `test_local_decommission_queue_prefix_stops_at_remote_leader`
 - `test_pool_meta_queued_decommission_is_not_suspended_until_promoted`
 - `test_pool_meta_promoted_queued_decommission_can_be_canceled`
-- `test_first_resumable_decommission_queue_indices_skips_terminal_states`
+- `test_first_resumable_decommission_queue_indices_stops_at_failed_or_canceled_state`
+- `test_first_resumable_decommission_queue_indices_allows_after_completed_prefix`
+- `admin_pool_list_item_exposes_queued_decommission_state`
 
-These tests live in `crates/ecstore/src/pools.rs`.
+These tests live in `crates/ecstore/src/pools.rs` and
+`rustfs/src/app/admin_usecase.rs`.

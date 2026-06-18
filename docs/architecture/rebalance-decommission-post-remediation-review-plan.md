@@ -41,7 +41,8 @@ read path avoids requiring request customer headers for data movement.
 | Decommission worker accounting | Entry permits are held through entry completion. R28 is no longer a pending worker-accounting bug. | decommission worker permit tests |
 | Rebalance rollback | Failed start rollback finalizes metadata instead of leaving `Started` plus `stopping=true` without a worker. | rollback tests |
 | Decommission progress save | Periodic progress-save errors are best-effort; terminal saves remain strict. | progress-save tests |
-| Queue semantics | Multi-pool decommission is queued, local-leader prefix scheduling is supported, completed restart is rejected, failed/canceled retry preserves bucket progress, and promoted queued pools are canceled if cancellation arrives before work starts. | queue/promotion/retry tests in `pools.rs` |
+| Queue semantics | Multi-pool decommission is queued, local-leader prefix scheduling is supported, completed restart is rejected, completed queue prefixes can advance, failed/canceled entries block automatic promotion, failed/canceled retry preserves bucket progress, and promoted queued pools are canceled if cancellation arrives before work starts. | queue/promotion/retry tests in `pools.rs` |
+| Admin status and query hardening | Pool admin status exposes queued/progress state, dangerous pool/rebalance mutation queries reject unknown or ambiguous parameters, and pool status `by-id` parsing no longer falls back to pool 0. | `admin_pool_list_item`, `pools_handler_tests`, `rebalance_handler_tests` |
 | Cancel/clear operations | Non-leader cancel intent is accepted and failed/canceled terminal decommission can be explicitly cleared. | remote cancel and clear tests |
 | Resume equivalence | Delete-marker replication state, tiered-object metadata, multipart part numbers, tags, expires, and version counts are covered more strictly. | data-movement equivalence tests |
 | Lifecycle expiry | Data movement no longer treats failed lifecycle expiry application as a successful skip. | `resolve_data_movement_lifecycle_expiry_result_rejects_apply_failure` |
@@ -92,11 +93,15 @@ Focused checks were run per task, including:
 cargo test -p rustfs-ecstore data_movement_single_part_raw_reader --lib
 cargo test -p rustfs-ecstore test_merge_rebalance_meta_preserves_stopping_stop_snapshot --lib
 cargo test -p rustfs-ecstore test_merge_rebalance_pool_stats_clears_stopping_for_terminal_status --lib
-cargo test -p rustfs-ecstore test_first_resumable_decommission_queue_indices_skips_terminal_states --lib
+cargo test -p rustfs-ecstore first_resumable_decommission_queue_indices --lib
 cargo test -p rustfs-ecstore test_return_resumable_pools_skips_failed_decommission --lib
 cargo test -p rustfs-ecstore resolve_data_movement_lifecycle_expiry_result --lib
 cargo test -p rustfs-ecstore lifecycle_action_removes_data_movement_version --lib
 cargo test -p rustfs-ecstore test_pool_meta_promoted_queued_decommission_can_be_canceled --lib
+cargo test -p rustfs admin_pool_list_item --lib
+cargo test -p rustfs pools_handler_tests --lib
+cargo test -p rustfs rebalance_handler_tests --lib
+cargo test -p rustfs admin_query_pool_status_by_id --lib
 cargo fmt --all --check
 ```
 

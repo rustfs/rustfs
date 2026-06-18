@@ -1019,13 +1019,21 @@ git commit -m "fix(versioning): persist only delete markers"
 
 ## R15: Document Single-pool Decommission Compatibility Scope
 
+> Superseded by R24. RustFS now supports queued multi-pool decommission start
+> requests on multi-pool deployments. This section is retained as historical
+> context for the earlier conservative contract.
+
 ### Original Fix
 
 Compatibility follow-up for decommission admin behavior.
 
 ### Finding
 
-`rustfs/src/admin/handlers/pools.rs` parses comma-separated pool targets, but `crates/ecstore/src/pools.rs` rejects more than one index with "decommission supports one target pool at a time". This is conservative and not directly dangerous, but MinIO supports submitting multiple pools for queued serial decommission. In this remediation plan, RustFS should document and test the stricter single-pool contract. A queued multi-pool implementation requires a separate product decision and a larger design task.
+Historical finding: `rustfs/src/admin/handlers/pools.rs` parsed
+comma-separated pool targets while `crates/ecstore/src/pools.rs` rejected more
+than one index with "decommission supports one target pool at a time". That was
+the earlier conservative contract. R24 supersedes it with persisted queued
+multi-pool decommission.
 
 ### Files
 
@@ -1044,7 +1052,7 @@ Document single-pool support for this remediation scope:
 
 ### Implementation Steps
 
-- [x] Update the relevant admin/decommission docs with the current single-pool decommission contract.
+- [x] Record the historical conservative decommission contract.
 - [x] Keep or add a test that comma-separated multiple pools return the documented error.
 - [x] Add a short note that MinIO-like queued multi-pool decommission is out of scope for R15 and requires a separate product-approved task.
 - [x] Run:
@@ -1057,9 +1065,8 @@ cargo fmt --all --check
 
 ### Acceptance Criteria
 
-- RustFS single-pool decommission behavior is explicit and tested.
-- The multi-pool rejection error is documented as intentional compatibility scope.
-- No queued multi-pool implementation is mixed into this P3 documentation task.
+- Superseded by the queued multi-pool contract in
+  `docs/architecture/decommission-compatibility.md`.
 
 ### Commit
 
@@ -1459,38 +1466,50 @@ R15 compatibility follow-up.
 
 ### Finding
 
-RustFS currently rejects multiple decommission target pools in one request. MinIO supports submitting multiple pools and processing them serially. This is a compatibility gap, but implementing it safely requires a persisted queue, restart recovery, clear active/queued status, cancellation semantics, and one-active-pool-at-a-time worker scheduling.
+RustFS previously rejected multiple decommission target pools in one request.
+MinIO supports submitting multiple pools and processing them serially. RustFS
+now implements a persisted queued multi-pool contract with restart recovery,
+active/queued status, cancellation semantics, and one-active-pool-at-a-time
+worker scheduling.
 
 ### Files
 
 - Modify: `docs/architecture/decommission-compatibility.md`
 - Modify: `docs/architecture/rebalance-decommission-followup-review-plan.md`
-- Code changes only after product approval.
+- Modify: `crates/ecstore/src/pools.rs`
+- Modify: `rustfs/src/app/admin_usecase.rs`
+- Modify if query contract changes: `rustfs/src/admin/handlers/pools.rs`
 
 ### Design
 
-Keep R24 as a design/product decision task unless the product requirement is explicitly approved:
+Current queued multi-pool contract:
 
-1. Define request semantics for comma-separated pools.
-2. Define persisted queued metadata shape and legacy decode compatibility.
-3. Define serial worker scheduling and restart recovery.
-4. Define cancel semantics for active and queued pools.
-5. Define status response shape for active/queued/completed pools.
+1. Comma-separated targets are accepted after all targets are validated.
+2. Duplicate target pools in the same request are rejected.
+3. Queue state is persisted in pool metadata with legacy decode defaults.
+4. Startup skips completed queue prefixes, but failed or canceled entries block
+   automatic promotion until the operator resolves the terminal entry.
+5. Active and queued entries are visible through pool admin status.
 
 ### Implementation Steps
 
 - [x] Write or update a compatibility design section for queued multi-pool decommission.
-- [x] Do not change store behavior until the design is approved.
+- [x] Implement queued multi-pool scheduling and recovery.
+- [x] Expose queued/progress state in admin pool status.
 - [x] Run:
 
 ```bash
+cargo test -p rustfs-ecstore first_resumable_decommission_queue_indices --lib
+cargo test -p rustfs admin_pool_list_item --lib
 cargo fmt --all --check
 ```
 
 ### Acceptance Criteria
 
-- Multi-pool decommission remains an explicit product decision.
-- Implementation is not mixed into P1 data safety work.
+- Multi-pool decommission behavior is explicit and tested.
+- Failed or canceled entries do not allow later queued pools to start
+  automatically.
+- Queued pools are visible in admin status.
 
 ### Commit
 
@@ -1602,7 +1621,7 @@ git commit -m "docs(rebalance): plan coordinator start semantics"
 
 ---
 
-## R26: Design Strict Query Parsing for Dangerous Admin APIs
+## R26: Strict Query Parsing for Dangerous Admin APIs
 
 ### Original Fix
 
@@ -1615,7 +1634,9 @@ Dangerous admin API query parameters can silently fall back when misspelled or u
 ### Files
 
 - Modify: `docs/architecture/rebalance-decommission-followup-review-plan.md`
-- Code changes only after endpoint scope is approved.
+- Modify: `rustfs/src/admin/handlers/pools.rs`
+- Modify: `rustfs/src/admin/handlers/rebalance.rs`
+- Modify: `rustfs/src/app/admin_usecase.rs`
 
 ### Design
 
@@ -1637,11 +1658,16 @@ state or start/stop background workers:
 | `/v3/rebalance/stop` | `POST` | No query parameters allowed. |
 | `/v3/pools/decommission` | `POST` | Allow only `pool` and `by-id`. |
 | `/v3/pools/cancel` | `POST` | Allow only `pool` and `by-id`. |
+| `/v3/pools/clear` | `POST` | Allow only `pool` and `by-id`. |
 
 Read-only endpoints such as `/v3/rebalance/status`, `/v3/pools/status`, and
 `/v3/pools/list` should retain the existing permissive behavior unless product
 approval explicitly includes them. This avoids breaking dashboards or scripts
 that attach harmless tracking parameters to status requests.
+
+Current implementation keeps `/v3/pools/status` compatible for unknown query
+keys, but rejects duplicate known keys and invalid `by-id` values because those
+make pool selection ambiguous.
 
 The proposed error contract for dangerous endpoints:
 
@@ -1653,11 +1679,11 @@ The proposed error contract for dangerous endpoints:
   `by-id` should return `InvalidArgument`.
 - Empty required values continue to use the existing endpoint-specific invalid
   pool or missing target errors after strict key validation passes.
-- Rejection logs must include request ID, actor, remote address, operation, and
-  the rejected query key when authentication has already succeeded.
+- Rejection logs must include request ID, actor, remote address, and operation
+  when authentication has already succeeded.
 
-Implementation should use a small shared helper rather than adding
-endpoint-specific ad hoc parsing:
+Implementation uses small local helpers rather than endpoint-specific ad hoc
+fallbacks:
 
 1. Parse the raw query into key/value pairs while preserving duplicate keys.
 2. Validate the key set against the endpoint allow-list.
@@ -1675,36 +1701,43 @@ Tests should cover:
 - read-only status endpoints keep current behavior unless included in the
   approved endpoint list.
 
-Approval questions before code changes:
+Resolved implementation decisions:
 
-- Should `by-id` accept only `true`/`false`, or keep the current
-  string-compare semantics where any non-`true` value is false?
-- Should repeated `pool` ever be accepted as an alternative to comma-separated
-  pool lists if multi-pool decommission is approved later?
-- Should unknown query rejection happen before or after authentication for these
-  admin endpoints? The safer audit path is after authentication, matching the
-  current contextual logging pattern.
+- `by-id` accepts only `true` or `false`.
+- Repeated `pool` and `by-id` are rejected; comma-separated `pool` remains the
+  list form for decommission start.
+- Unknown query rejection happens after authentication/authorization for these
+  admin endpoints, preserving contextual audit logs.
+- `GET /v3/pools/status?by-id=true&pool=abc` is rejected instead of falling
+  back to pool index 0.
 
 ### Implementation Steps
 
 - [x] Document endpoint scope and error contract.
-- [x] Do not change handler parsing until the endpoint list is approved.
+- [x] Harden pool mutation query parsing.
+- [x] Harden rebalance start/stop query parsing.
+- [x] Harden pool status `by-id` index parsing.
 - [x] Run:
 
 ```bash
+cargo test -p rustfs pools_handler_tests --lib
+cargo test -p rustfs rebalance_handler_tests --lib
+cargo test -p rustfs admin_query_pool_status_by_id --lib
 cargo fmt --all --check
 ```
 
 ### Acceptance Criteria
 
 - Strict query parsing is scoped to dangerous admin APIs.
-- Compatibility impact is explicit before implementation.
+- Read-only pool status keeps harmless unknown-key compatibility while rejecting
+  ambiguous known-key input.
+- Invalid `by-id` status queries no longer fall back to pool 0.
 
 ### Commit
 
 ```bash
 git add docs/architecture/rebalance-decommission-followup-review-plan.md
-git commit -m "docs(admin): plan strict query parsing"
+git commit -m "docs(admin): align query hardening contract"
 ```
 
 ---
@@ -1749,7 +1782,9 @@ After build-based verification, clean generated build artifacts to avoid unneces
 - R04 should be completed before any wider metadata hardening because it prevents newly strict decode from rejecting metadata produced by the current merge path.
 - R06 may require a product decision between rollback and durable degraded state. If that decision cannot be made during implementation, stop before code changes and record the trade-off.
 - R14 is a proof task first. If it demonstrates data loss or MinIO-incompatible behavior, create a separate implementation task instead of hiding behavior changes inside the test task.
-- R15 is documentation/test-only for the current single-pool contract. MinIO-like queued multi-pool decommission requires a separate product-approved task.
+- R15 was superseded by R24; the current contract is queued multi-pool
+  decommission on multi-pool deployments.
 - R18-R21 are data-safety fixes and should be completed before R22/R23 stop convergence unless a stop-specific regression is blocking the cluster.
 - R22 should precede R23 because terminal reload cancellation is the actual convergence mechanism; R23 makes partial failure visible.
-- R24-R26 are compatibility/design tasks. Do not mix their code changes into P1 data-safety commits without separate product approval.
+- R24 and R26 are now compatibility implementations with focused regression
+  coverage; R25 remains a larger design task.
