@@ -57,7 +57,8 @@ use super::object::{ObjectKeyMapper, head_object};
 use super::{SwiftError, SwiftResult};
 use rustfs_credentials::Credentials;
 use rustfs_ecstore::resolve_object_store_handle;
-use rustfs_ecstore::store_api::{ListOperations, ObjectOperations, ObjectOptions};
+use rustfs_ecstore::store_api::{ObjectOperations, ObjectOptions};
+use rustfs_storage_api::ListOperations as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error};
 

@@ -37,10 +37,7 @@ use crate::global::GLOBAL_LocalNodeName;
 use crate::global::{GLOBAL_LifecycleSys, GLOBAL_TierConfigMgr, get_global_deployment_id};
 use crate::set_disk::{MAX_PARTS_COUNT, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, SetDisks};
 use crate::store::ECStore;
-use crate::store_api::{
-    GetObjectReader, HTTPRangeSpec, ListOperations, MultipartOperations, ObjectInfo, ObjectOperations, ObjectOptions,
-    ObjectToDelete,
-};
+use crate::store_api::{GetObjectReader, MultipartOperations, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete};
 use crate::tier::warm_backend::WarmBackendGetOpts;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use futures::Future;
@@ -61,6 +58,7 @@ use rustfs_filemeta::{
     VersionPurgeStatusType, get_file_info, is_restored_object_on_disk,
 };
 use rustfs_s3_types::EventName;
+use rustfs_storage_api::{HTTPRangeSpec, ListOperations as _};
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
 use s3s::dto::{
     BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, ReplicationConfiguration, RestoreRequest,

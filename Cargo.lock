@@ -9120,6 +9120,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "pprof-pyroscope-fork",
+ "proptest",
  "rand 0.10.1",
  "rcgen",
  "reqwest",
@@ -9361,6 +9362,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "path-absolutize",
  "pin-project-lite",
+ "proptest",
  "quick-xml 0.40.1",
  "rand 0.10.1",
  "ratelimit",
@@ -9438,6 +9440,7 @@ dependencies = [
  "bytes",
  "crc-fast",
  "criterion",
+ "proptest",
  "regex",
  "rmp",
  "rmp-serde",
@@ -9974,6 +9977,7 @@ dependencies = [
  "pin-project-lite",
  "rustfs-common",
  "rustfs-ecstore",
+ "rustfs-storage-api",
  "s3s",
  "serde_json",
  "snafu 0.9.1",
@@ -10065,6 +10069,7 @@ dependencies = [
  "serde_json",
  "time",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -10178,6 +10183,7 @@ dependencies = [
  "lz4",
  "md-5 0.11.0",
  "netif",
+ "proptest",
  "regex",
  "rustix 1.1.4",
  "serde",

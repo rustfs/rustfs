@@ -353,6 +353,7 @@ pub fn check_put_object_args(bucket: &str, object: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     // Test validation functions
     #[test]
@@ -525,5 +526,29 @@ mod tests {
         assert!(check_put_object_args("test-bucket", "test-object").is_ok());
         assert!(check_put_object_args("", "test-object").is_err());
         assert!(check_put_object_args("test-bucket", "").is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn valid_object_prefixes_preserve_prefix_invariants(input in any::<String>()) {
+            if is_valid_object_prefix(&input) {
+                prop_assert!(!has_bad_path_component(&input));
+                prop_assert!(!input.contains("//"));
+                prop_assert!(!input.contains('\0'));
+            }
+        }
+
+        #[test]
+        fn valid_object_names_preserve_name_invariants(input in any::<String>()) {
+            if is_valid_object_name(&input) {
+                prop_assert!(!input.is_empty());
+                prop_assert!(is_valid_object_prefix(&input));
+            }
+        }
+
+        #[test]
+        fn object_name_validity_matches_prefix_validity_plus_non_empty(input in any::<String>()) {
+            prop_assert_eq!(is_valid_object_name(&input), !input.is_empty() && is_valid_object_prefix(&input));
+        }
     }
 }

@@ -159,6 +159,12 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
         "expected_behavior": "metadata maintenance can plan binpack candidates and commit a safe unpartitioned Parquet rewrite through the catalog; built-in periodic scheduling, sort compaction, delete-file rewrite, and row-level compaction are not claimed",
     },
     {
+        "capability": "row-level-delete-update-merge",
+        "status": "catalog-conflict-validation-supported",
+        "roadmap_area": "row-level-conflict-detection",
+        "expected_behavior": "standard catalog commit validates append, overwrite, delete, and replace snapshot manifests for table-warehouse scope, referenced object existence, current-live-file deletes, and stale add/delete conflicts; end-to-end SQL DML client coverage remains a compatibility validation item",
+    },
+    {
         "capability": "external-catalog-bridge",
         "status": "metadata-import-only",
         "roadmap_area": "external-catalog",
