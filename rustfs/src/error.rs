@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_compat::ecstore::bucket::quota::QuotaError;
-use crate::storage_compat::ecstore::error::StorageError;
+use crate::storage_compat::bucket::quota::QuotaError;
+use crate::storage_compat::error::StorageError;
 use rustfs_storage_api::HTTPRangeError;
 use s3s::{S3Error, S3ErrorCode};
 

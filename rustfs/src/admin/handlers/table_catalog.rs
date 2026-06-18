@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::storage_compat::ecstore::{
+use crate::admin::storage_compat::{
     bucket::{metadata::table_catalog_path_hash, metadata_sys},
     store::ECStore,
 };

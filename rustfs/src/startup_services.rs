@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_compat::ecstore::{
+use crate::storage_compat::{
     bucket::{
         metadata_sys::init_bucket_metadata_sys,
         migration::{try_migrate_bucket_metadata, try_migrate_iam_config},
@@ -597,16 +597,14 @@ where
     start_audit().await
 }
 
-pub async fn init_notification_system(endpoint_pools: EndpointServerPools) -> crate::storage_compat::ecstore::error::Result<()> {
+pub async fn init_notification_system(endpoint_pools: EndpointServerPools) -> crate::storage_compat::error::Result<()> {
     init_notification_system_with(|| new_global_notification_sys(endpoint_pools)).await
 }
 
-async fn init_notification_system_with<InitFn, InitFuture>(
-    init_notification: InitFn,
-) -> crate::storage_compat::ecstore::error::Result<()>
+async fn init_notification_system_with<InitFn, InitFuture>(init_notification: InitFn) -> crate::storage_compat::error::Result<()>
 where
     InitFn: FnOnce() -> InitFuture,
-    InitFuture: Future<Output = crate::storage_compat::ecstore::error::Result<()>>,
+    InitFuture: Future<Output = crate::storage_compat::error::Result<()>>,
 {
     init_notification().await
 }
@@ -664,8 +662,7 @@ mod tests {
 
     #[tokio::test]
     async fn notification_system_returns_source_error() {
-        let result =
-            init_notification_system_with(|| async { Err(crate::storage_compat::ecstore::error::Error::FaultyDisk) }).await;
+        let result = init_notification_system_with(|| async { Err(crate::storage_compat::error::Error::FaultyDisk) }).await;
 
         assert!(result.is_err());
     }
