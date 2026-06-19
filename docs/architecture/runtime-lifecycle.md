@@ -47,6 +47,14 @@ boundary, but they must not reorder ready publication, global init-time
 publication, scanner startup, shutdown-signal wait, shutdown delegation, or the
 final stopped-state log.
 
+## Startup Service Component Boundary
+
+`startup_service_components` owns individual runtime service startup component
+helpers while `startup_services` preserves their orchestration order. Migration
+PRs must not change KMS, optional runtime, audit, metadata, IAM, auth,
+notification, background service, or observability startup ordering while moving
+these helpers.
+
 ## Optional Runtime Boundary
 
 `startup_optional_runtimes` owns startup and shutdown handoff for optional
