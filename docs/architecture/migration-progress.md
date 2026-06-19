@@ -5,17 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-object-api-alias-prune`
-- Baseline: stacked after `rustfs/rustfs#3614`
-  (`3740e65246aed8c8ee9685ed0234997c7d54e1b5`).
+- Branch: `overtrue/arch-ecstore-object-boundary-guards`
+- Baseline: latest `main` after `rustfs/rustfs#3616`
+  (`8d91e2116f53fabc5f8a12a7cc48eb9d72cfcf10`).
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: remove unused public `rustfs-storage-api` passthrough
-  aliases from ECStore `object_api` and bind the ECStore contract test directly
-  to the storage-api generic list/delete/walk contracts.
-- CI/script changes: make the migration guard reject restoring ECStore
-  `object_api` storage-api passthrough aliases.
-- Docs changes: record the API-066 ECStore object API alias prune slice.
+- Rust code changes: none.
+- CI/script changes: snapshot the exact remaining external
+  `rustfs_ecstore::object_api` compatibility aliases and reject new
+  object-api names outside the approved boundary surface.
+- Docs changes: record the API-067 ECStore object API boundary guard slice.
 
 ## Phase 0 Tasks
 
@@ -317,6 +316,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: focused ECStore compile checks, storage contract test,
     downstream compile checks, migration and layer guards, formatting, diff
     hygiene, risk scan, full pre-commit, and three-expert review.
+
+- [x] `API-067` Guard remaining external ECStore object API aliases.
+  - Completed slice: add a migration guard that snapshots the exact external
+    `storage_compat.rs` aliases still allowed to reference
+    `rustfs_ecstore::object_api::{GetObjectReader,ObjectInfo,ObjectOptions,PutObjReader}`
+    and rejects new object-api names in compatibility boundaries.
+  - Acceptance: all remaining external `object_api` references are deliberate
+    compatibility aliases in `storage_compat.rs` modules, future additions fail
+    the migration guard, and the API-066 passthrough alias cleanup stays
+    protected.
+  - Must preserve: no runtime code changes, all existing compatibility aliases,
+    object metadata shape, options, and reader/writer ownership.
+  - Verification: bash syntax check, migration and layer guards, formatting,
+    diff hygiene, full pre-commit, and three-expert review.
 
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.
   - Acceptance: `./scripts/check_architecture_migration_rules.sh` parses the

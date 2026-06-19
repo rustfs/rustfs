@@ -59,6 +59,10 @@ STORE_API_LIST_HELPER_REEXPORTS_FILE="${TMP_DIR}/store_api_list_helper_reexports
 STORE_API_LIST_RESPONSE_REEXPORTS_FILE="${TMP_DIR}/store_api_list_response_reexports.txt"
 ECSTORE_OBJECT_API_LIST_ALIAS_INTERNAL_HITS_FILE="${TMP_DIR}/ecstore_object_api_list_alias_internal_hits.txt"
 ECSTORE_OBJECT_API_STORAGE_ALIAS_HITS_FILE="${TMP_DIR}/ecstore_object_api_storage_alias_hits.txt"
+ECSTORE_OBJECT_API_EXTERNAL_ALIAS_EXPECTED_FILE="${TMP_DIR}/ecstore_object_api_external_alias_expected.txt"
+ECSTORE_OBJECT_API_EXTERNAL_ALIAS_ACTUAL_FILE="${TMP_DIR}/ecstore_object_api_external_alias_actual.txt"
+ECSTORE_OBJECT_API_EXTERNAL_ALIAS_DIFF_FILE="${TMP_DIR}/ecstore_object_api_external_alias_diff.txt"
+ECSTORE_OBJECT_API_UNAPPROVED_NAME_HITS_FILE="${TMP_DIR}/ecstore_object_api_unapproved_name_hits.txt"
 STORE_API_DELETE_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_delete_dto_reexports.txt"
 STORE_API_DELETE_DTO_INTERNAL_HITS_FILE="${TMP_DIR}/store_api_delete_dto_internal_hits.txt"
 STORE_API_LIFECYCLE_HELPER_DEFINITION_HITS_FILE="${TMP_DIR}/store_api_lifecycle_helper_definition_hits.txt"
@@ -523,6 +527,62 @@ fi
 
 if [[ -s "$ECSTORE_OBJECT_API_STORAGE_ALIAS_HITS_FILE" ]]; then
   report_failure "ECStore object_api must not re-export storage-api passthrough aliases: $(paste -sd '; ' "$ECSTORE_OBJECT_API_STORAGE_ALIAS_HITS_FILE")"
+fi
+
+cat >"$ECSTORE_OBJECT_API_EXTERNAL_ALIAS_EXPECTED_FILE" <<'EOF'
+crates/heal/src/heal/storage_compat.rs:HealObjectInfo=ObjectInfo
+crates/heal/src/heal/storage_compat.rs:HealObjectOptions=ObjectOptions
+crates/heal/src/heal/storage_compat.rs:HealPutObjReader=PutObjReader
+crates/iam/src/storage_compat.rs:IamConfigObjectInfo=ObjectInfo
+crates/iam/src/storage_compat.rs:IamConfigObjectOptions=ObjectOptions
+crates/iam/src/store/storage_compat.rs:IamObjectInfo=ObjectInfo
+crates/iam/src/store/storage_compat.rs:IamObjectOptions=ObjectOptions
+crates/notify/src/storage_compat.rs:EcstoreObjectInfo=ObjectInfo
+crates/protocols/src/swift/storage_compat.rs:SwiftGetObjectReader=GetObjectReader
+crates/protocols/src/swift/storage_compat.rs:SwiftObjectInfo=ObjectInfo
+crates/protocols/src/swift/storage_compat.rs:SwiftObjectOptions=ObjectOptions
+crates/protocols/src/swift/storage_compat.rs:SwiftPutObjReader=PutObjReader
+crates/s3select-api/src/storage_compat.rs:SelectGetObjectReader=GetObjectReader
+crates/s3select-api/src/storage_compat.rs:SelectObjectInfo=ObjectInfo
+crates/s3select-api/src/storage_compat.rs:SelectObjectOptions=ObjectOptions
+crates/scanner/src/storage_compat.rs:ScannerGetObjectReader=GetObjectReader
+crates/scanner/src/storage_compat.rs:ScannerObjectInfo=ObjectInfo
+crates/scanner/src/storage_compat.rs:ScannerObjectOptions=ObjectOptions
+crates/scanner/src/storage_compat.rs:ScannerPutObjReader=PutObjReader
+rustfs/src/storage/storage_compat.rs:GetObjectReader=GetObjectReader
+rustfs/src/storage/storage_compat.rs:ObjectInfo=ObjectInfo
+rustfs/src/storage/storage_compat.rs:ObjectOptions=ObjectOptions
+rustfs/src/storage/storage_compat.rs:PutObjReader=PutObjReader
+EOF
+
+(
+  cd "$ROOT_DIR"
+  find rustfs/src crates -type f -name 'storage_compat.rs' -print0 |
+    xargs -0 perl -ne '
+      if (/^\s*(?:(?:pub(?:\([^)]*\))?)\s+)?type\s+([A-Za-z0-9_]+)\s*=\s*rustfs_ecstore::object_api::(GetObjectReader|ObjectInfo|ObjectOptions|PutObjReader)\s*;/) {
+        print "$ARGV:$1=$2\n";
+      }
+    ' | sort
+) >"$ECSTORE_OBJECT_API_EXTERNAL_ALIAS_ACTUAL_FILE"
+
+if ! diff -u "$ECSTORE_OBJECT_API_EXTERNAL_ALIAS_EXPECTED_FILE" "$ECSTORE_OBJECT_API_EXTERNAL_ALIAS_ACTUAL_FILE" >"$ECSTORE_OBJECT_API_EXTERNAL_ALIAS_DIFF_FILE"; then
+  report_failure "external ECStore object_api compatibility aliases changed without migration-plan approval: $(paste -sd '; ' "$ECSTORE_OBJECT_API_EXTERNAL_ALIAS_DIFF_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  find rustfs/src crates -type f -name 'storage_compat.rs' -print0 |
+    xargs -0 perl -ne '
+      while (/rustfs_ecstore::object_api::([A-Za-z0-9_]+)/g) {
+        my $name = $1;
+        next if $name =~ /^(?:GetObjectReader|ObjectInfo|ObjectOptions|PutObjReader)$/;
+        print "$ARGV:$.:rustfs_ecstore::object_api::$name\n";
+      }
+    ' | sort
+) >"$ECSTORE_OBJECT_API_UNAPPROVED_NAME_HITS_FILE"
+
+if [[ -s "$ECSTORE_OBJECT_API_UNAPPROVED_NAME_HITS_FILE" ]]; then
+  report_failure "external storage compatibility boundaries must not expose new ECStore object_api names: $(paste -sd '; ' "$ECSTORE_OBJECT_API_UNAPPROVED_NAME_HITS_FILE")"
 fi
 
 (
