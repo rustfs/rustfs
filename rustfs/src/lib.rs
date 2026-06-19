@@ -84,6 +84,7 @@ pub mod startup_service_components;
 pub mod startup_services;
 pub mod startup_shutdown;
 pub mod startup_storage;
+pub mod startup_tls_material;
 pub mod storage;
 pub(crate) mod storage_compat;
 pub(crate) mod table_catalog;

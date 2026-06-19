@@ -74,6 +74,13 @@ preserves BOOT-006 orchestration and outbound TLS fatal behavior, while
 `startup_profiling` remains a compatibility handoff for the old profiling hook
 path.
 
+## Startup TLS Material Boundary
+
+`startup_tls_material` owns configured outbound TLS material loading, global
+outbound TLS publication, generation recording, and TLS metrics initialization.
+`startup_runtime` still owns BOOT-006 ordering and must preserve the fatal
+boundary when configured TLS material fails to load.
+
 ## AppContext Foundation
 
 Early AppContext work should split resolver files and add compatibility tests before
