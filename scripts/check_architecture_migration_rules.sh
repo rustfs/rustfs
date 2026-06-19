@@ -673,25 +673,9 @@ require_source_contains \
   "rustfs_storage_api::MultipartOperations<" \
   "ECStore MultipartOperations compatibility binding"
 require_source_contains \
-  "crates/ecstore/src/store_api/traits.rs" \
-  "rustfs_storage_api::HealOperations<" \
-  "ECStore HealOperations compatibility binding"
-require_source_contains \
-  "crates/ecstore/src/store_api/traits.rs" \
-  "rustfs_storage_api::NamespaceLocking<" \
-  "ECStore NamespaceLocking compatibility binding"
-require_source_contains \
   "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
   "fn ecstore_implements_storage_admin_api_contract()" \
   "ECStore StorageAdminApi compile-time coverage test"
-require_source_contains \
-  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
-  "fn ecstore_implements_namespace_locking_contract()" \
-  "ECStore NamespaceLocking compile-time coverage test"
-require_source_contains \
-  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
-  "fn ecstore_implements_heal_operations_contract()" \
-  "ECStore HealOperations compile-time coverage test"
 require_source_contains \
   "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
   "fn ecstore_implements_storage_namespace_locking_contract()" \

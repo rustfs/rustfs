@@ -132,29 +132,3 @@ impl<T> MultipartOperations for T where
         + Debug
 {
 }
-
-/// Healing and repair operations.
-pub trait HealOperations:
-    rustfs_storage_api::HealOperations<Error = Error, HealResultItem = HealResultItem, HealOptions = HealOpts> + Send + Sync + Debug
-{
-}
-
-impl<T> HealOperations for T where
-    T: rustfs_storage_api::HealOperations<Error = Error, HealResultItem = HealResultItem, HealOptions = HealOpts>
-        + Send
-        + Sync
-        + Debug
-{
-}
-
-/// Namespace lock operations needed by consumers that only coordinate object
-/// mutations but do not require the full storage API surface.
-pub trait NamespaceLocking:
-    rustfs_storage_api::NamespaceLocking<Error = Error, NamespaceLock = NamespaceLockWrapper> + Send + Sync + Debug + 'static
-{
-}
-
-impl<T> NamespaceLocking for T where
-    T: rustfs_storage_api::NamespaceLocking<Error = Error, NamespaceLock = NamespaceLockWrapper> + Send + Sync + Debug + 'static
-{
-}

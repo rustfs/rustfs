@@ -5,19 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-foreground-scanner-admission-snapshots`
-- Baseline: `origin/main` after `rustfs/rustfs#3606`
-  (`7cb7aefc3bfd33cfaa46c718db15f00b0471fe88`).
+- Branch: `overtrue/arch-ecstore-operation-compat-cleanup`
+- Baseline: stacked after `rustfs/rustfs#3607`
+  (`43666b2e005b7f4ed51b41d0cda56094e40d90c1`).
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: extend the RustFS workload admission registry from
-  repair/replication snapshots to foreground-read, scanner, and metadata owner
-  snapshots.
-- CI/script changes: extend migration guard coverage for RustFS workload
-  admission provider implementations.
-- Docs changes: add RustFS runtime owner provider notes to
-  [`workload-admission-contracts.md`](workload-admission-contracts.md) and
-  record the API-059/R-019 provider slice.
+- Rust code changes: remove the remaining ECStore `store_api` compatibility
+  subtraits for heal and namespace-lock operations, and make internal coverage
+  use the shared `rustfs_storage_api` contracts directly.
+- CI/script changes: shrink migration guard coverage so it no longer requires
+  the removed operation facade bindings.
+- Docs changes: record the API-060 operation compatibility cleanup slice.
 
 ## Phase 0 Tasks
 
@@ -211,6 +209,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     bucket metadata initialization and loading, object write paths, request
     guards, and queue behavior.
   - Verification: focused workload admission tests, focused RustFS library
+    check, migration and layer guards, formatting, diff hygiene, risk scan, and
+    three-expert review.
+
+- [x] `API-060` Remove heal and namespace-lock operation compatibility facades.
+  - Completed slice: remove the old ECStore `store_api::HealOperations` and
+    `store_api::NamespaceLocking` compatibility subtraits after ECStore storage
+    types already implemented the shared `rustfs_storage_api` contracts
+    directly.
+  - Acceptance: internal ECStore bounds and compile-time coverage use the
+    shared storage-api heal and namespace-lock contracts directly, while the
+    remaining object/list/multipart compatibility bindings stay unchanged for
+    their active internal consumers.
+  - Must preserve: heal operation behavior, namespace-lock acquisition,
+    replication resync locking, rebalance metadata locking, object I/O,
+    multipart, list, and storage hot paths.
+  - Verification: focused ECStore contract tests, focused ECStore library
     check, migration and layer guards, formatting, diff hygiene, risk scan, and
     three-expert review.
 

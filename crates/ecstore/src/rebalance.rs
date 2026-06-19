@@ -23,11 +23,13 @@ use crate::global::get_global_endpoints;
 use crate::pools::ListCallback;
 use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
 use crate::store::ECStore;
-use crate::store_api::{GetObjectReader, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOptions};
+use crate::store_api::{GetObjectReader, ObjectIO, ObjectInfo, ObjectOptions};
 use http::HeaderMap;
 use rand::RngExt as _;
 use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
-use rustfs_storage_api::{HTTPRangeSpec, ObjectIO as _, ObjectOperations as _, StorageAdminApi};
+use rustfs_storage_api::{
+    HTTPRangeSpec, NamespaceLocking as StorageNamespaceLocking, ObjectIO as _, ObjectOperations as _, StorageAdminApi,
+};
 use rustfs_utils::path::encode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -667,12 +669,10 @@ impl RebalanceMeta {
 }
 
 impl ECStore {
-    async fn save_rebalance_meta_with_merge<S: ObjectIO + NamespaceLocking>(
-        &self,
-        pool: Arc<S>,
-        local_snapshot: &RebalanceMeta,
-        stage: &str,
-    ) -> Result<()> {
+    async fn save_rebalance_meta_with_merge<S>(&self, pool: Arc<S>, local_snapshot: &RebalanceMeta, stage: &str) -> Result<()>
+    where
+        S: ObjectIO + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
+    {
         let ns_lock = pool.new_ns_lock(crate::disk::RUSTFS_META_BUCKET, REBAL_META_NAME).await?;
         let _guard = ns_lock
             .get_write_lock(get_lock_acquire_timeout())

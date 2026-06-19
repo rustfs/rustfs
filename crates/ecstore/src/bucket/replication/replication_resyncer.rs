@@ -33,7 +33,7 @@ use crate::global::GLOBAL_LocalNodeName;
 use crate::global::get_global_bucket_monitor;
 use crate::resolve_object_store_handle;
 use crate::set_disk::get_lock_acquire_timeout;
-use crate::store_api::{ListOperations, NamespaceLocking, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, WalkOptions};
+use crate::store_api::{ListOperations, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, WalkOptions};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
 use aws_sdk_s3::primitives::ByteStream;
@@ -58,7 +58,7 @@ use rustfs_filemeta::{
     get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
 use rustfs_s3_types::EventName;
-use rustfs_storage_api::{DeletedObject, HTTPRangeSpec, ObjectToDelete};
+use rustfs_storage_api::{DeletedObject, HTTPRangeSpec, NamespaceLocking as StorageNamespaceLocking, ObjectToDelete};
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, AMZ_TAGGING_DIRECTIVE, CONTENT_ENCODING, HeaderExt as _,
     SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
@@ -103,9 +103,21 @@ const EVENT_RESYNC_TARGET_OPERATION_FAILED: &str = "replication_resync_target_op
 const EVENT_RESYNC_RUNTIME_CHANNEL_FAILED: &str = "replication_resync_runtime_channel_failed";
 
 /// Storage capabilities required by bucket replication workers.
-pub trait ReplicationStorage: ObjectIO + ObjectOperations + ListOperations + NamespaceLocking {}
+pub trait ReplicationStorage:
+    ObjectIO
+    + ObjectOperations
+    + ListOperations
+    + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
+{
+}
 
-impl<T> ReplicationStorage for T where T: ObjectIO + ObjectOperations + ListOperations + NamespaceLocking {}
+impl<T> ReplicationStorage for T where
+    T: ObjectIO
+        + ObjectOperations
+        + ListOperations
+        + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
+{
+}
 
 pub(crate) const REPLICATION_DIR: &str = ".replication";
 pub(crate) const RESYNC_FILE_NAME: &str = "resync.bin";

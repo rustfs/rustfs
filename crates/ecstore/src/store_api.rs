@@ -21,14 +21,11 @@ use crate::store_utils::clean_metadata;
 use crate::{bucket::lifecycle::bucket_lifecycle_audit::LcAuditEvent, bucket::lifecycle::lifecycle::TransitionOptions};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
-use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::{
     FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, ReplicateDecision, ReplicationState, ReplicationStatusType,
     RestoreStatusOps as _, VersionPurgeStatusType, parse_restore_obj_status, replication_statuses_map,
     version_purge_statuses_map,
 };
-use rustfs_lock::NamespaceLockWrapper;
-use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_rio::Checksum;
 use rustfs_storage_api::{ExpirationOptions, HTTPRangeSpec, TransitionedObject};
 use rustfs_utils::CompressionAlgorithm;

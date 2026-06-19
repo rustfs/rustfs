@@ -13,12 +13,7 @@
 // limitations under the License.
 
 use rustfs_common::heal_channel::HealOpts;
-use rustfs_ecstore::{
-    disk::DiskStore,
-    error::Error,
-    store::ECStore,
-    store_api::{HealOperations, NamespaceLocking},
-};
+use rustfs_ecstore::{disk::DiskStore, error::Error, store::ECStore};
 use rustfs_lock::NamespaceLockWrapper;
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_storage_api::{HealOperations as StorageHealOperations, NamespaceLocking as StorageNamespaceLocking, StorageAdminApi};
@@ -31,20 +26,6 @@ where
             Disk = DiskStore,
             Error = Error,
         >,
-{
-    std::any::type_name::<T>()
-}
-
-fn namespace_locking_type_name<T>() -> &'static str
-where
-    T: NamespaceLocking,
-{
-    std::any::type_name::<T>()
-}
-
-fn heal_operations_type_name<T>() -> &'static str
-where
-    T: HealOperations,
 {
     std::any::type_name::<T>()
 }
@@ -66,16 +47,6 @@ where
 #[test]
 fn ecstore_implements_storage_admin_api_contract() {
     assert!(storage_admin_api_type_name::<ECStore>().ends_with("::ECStore"));
-}
-
-#[test]
-fn ecstore_implements_namespace_locking_contract() {
-    assert!(namespace_locking_type_name::<ECStore>().ends_with("::ECStore"));
-}
-
-#[test]
-fn ecstore_implements_heal_operations_contract() {
-    assert!(heal_operations_type_name::<ECStore>().ends_with("::ECStore"));
 }
 
 #[test]
