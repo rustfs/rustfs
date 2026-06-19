@@ -543,7 +543,7 @@ async fn handle_shutdown(
         state = "stopping",
         "Profiling shutdown started"
     );
-    crate::profiling::shutdown_profiling();
+    crate::startup_profiling::shutdown_profiling_runtime();
 
     info!(
         target: "rustfs::main::handle_shutdown",

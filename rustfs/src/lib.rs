@@ -72,6 +72,7 @@ pub mod startup_entrypoint;
 pub mod startup_fs_guard;
 pub mod startup_iam;
 pub mod startup_preflight;
+pub mod startup_profiling;
 pub mod startup_protocols;
 pub mod startup_runtime;
 pub mod startup_server;

@@ -33,7 +33,7 @@ pub async fn init_startup_runtime_foundation(config: &Config) -> Result<()> {
 
     debug!("{}", crate::server::LOGO);
 
-    crate::profiling::init_from_env().await;
+    crate::startup_profiling::init_profiling_runtime().await;
     rustfs_trusted_proxies::init();
     install_default_crypto_provider();
     init_outbound_tls_material(config).await
