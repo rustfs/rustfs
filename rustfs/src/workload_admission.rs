@@ -17,8 +17,12 @@ use rustfs_concurrency::{
     WorkloadClass,
 };
 
+use crate::storage_compat::{GLOBAL_REPLICATION_STATS, get_global_replication_pool};
+
 const HEAL_MANAGER_NOT_INITIALIZED: &str = "heal manager not initialized";
 const NOT_EXPOSED_BY_PROVIDER: &str = "not exposed by RustFS workload admission provider";
+const REPLICATION_RUNTIME_NOT_INITIALIZED: &str = "replication runtime not initialized";
+const REPLICATION_QUEUE_STATS_UNAVAILABLE: &str = "replication queue stats unavailable";
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RustFsWorkloadAdmissionSnapshotProvider;
@@ -35,6 +39,7 @@ pub fn workload_admission_registry_snapshot() -> WorkloadAdmissionRegistrySnapsh
         .copied()
         .map(|class| match class {
             WorkloadClass::Repair => repair_workload_admission_snapshot(),
+            WorkloadClass::Replication => replication_workload_admission_snapshot(),
             class => WorkloadAdmissionSnapshot::new(class, AdmissionState::Unknown).with_reason(NOT_EXPOSED_BY_PROVIDER),
         })
         .collect();
@@ -74,8 +79,58 @@ fn repair_workload_admission_snapshot_from_counts(
     }
 }
 
+pub fn replication_workload_admission_snapshot() -> WorkloadAdmissionSnapshot {
+    let Some(pool) = get_global_replication_pool() else {
+        return replication_workload_admission_snapshot_from_counts(false, None, None);
+    };
+
+    let active = pool
+        .active_workers()
+        .saturating_add(pool.active_lrg_workers())
+        .saturating_add(pool.active_mrf_workers());
+    let queued = GLOBAL_REPLICATION_STATS.get().and_then(|stats| {
+        stats
+            .q_cache
+            .try_lock()
+            .ok()
+            .map(|cache| i64_to_usize_saturated(cache.sr_queue_stats.curr.get_current_count()))
+    });
+
+    replication_workload_admission_snapshot_from_counts(true, Some(i32_to_usize_saturated(active)), queued)
+}
+
+fn replication_workload_admission_snapshot_from_counts(
+    runtime_initialized: bool,
+    active: Option<usize>,
+    queued: Option<usize>,
+) -> WorkloadAdmissionSnapshot {
+    let state = if runtime_initialized && queued.is_some() {
+        AdmissionState::Open
+    } else {
+        AdmissionState::Unknown
+    };
+
+    let snapshot = WorkloadAdmissionSnapshot::new(WorkloadClass::Replication, state).with_counts(active, queued, None);
+
+    if !runtime_initialized {
+        snapshot.with_reason(REPLICATION_RUNTIME_NOT_INITIALIZED)
+    } else if queued.is_none() {
+        snapshot.with_reason(REPLICATION_QUEUE_STATS_UNAVAILABLE)
+    } else {
+        snapshot
+    }
+}
+
 fn u64_to_usize_saturated(value: u64) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+fn i64_to_usize_saturated(value: i64) -> usize {
+    usize::try_from(value.max(0)).unwrap_or(usize::MAX)
+}
+
+fn i32_to_usize_saturated(value: i32) -> usize {
+    usize::try_from(value.max(0)).unwrap_or(usize::MAX)
 }
 
 #[cfg(test)]
@@ -106,6 +161,40 @@ mod tests {
     }
 
     #[test]
+    fn replication_snapshot_reports_worker_and_queue_counts() {
+        let snapshot = replication_workload_admission_snapshot_from_counts(true, Some(4), Some(9));
+
+        assert_eq!(snapshot.class, WorkloadClass::Replication);
+        assert_eq!(snapshot.state, AdmissionState::Open);
+        assert_eq!(snapshot.active, Some(4));
+        assert_eq!(snapshot.queued, Some(9));
+        assert_eq!(snapshot.limit, None);
+        assert_eq!(snapshot.reason, None);
+    }
+
+    #[test]
+    fn replication_snapshot_is_unknown_before_runtime_initializes() {
+        let snapshot = replication_workload_admission_snapshot_from_counts(false, None, None);
+
+        assert_eq!(snapshot.class, WorkloadClass::Replication);
+        assert_eq!(snapshot.state, AdmissionState::Unknown);
+        assert_eq!(snapshot.active, None);
+        assert_eq!(snapshot.queued, None);
+        assert_eq!(snapshot.reason.as_deref(), Some(REPLICATION_RUNTIME_NOT_INITIALIZED));
+    }
+
+    #[test]
+    fn replication_snapshot_is_unknown_when_queue_stats_are_unavailable() {
+        let snapshot = replication_workload_admission_snapshot_from_counts(true, Some(2), None);
+
+        assert_eq!(snapshot.class, WorkloadClass::Replication);
+        assert_eq!(snapshot.state, AdmissionState::Unknown);
+        assert_eq!(snapshot.active, Some(2));
+        assert_eq!(snapshot.queued, None);
+        assert_eq!(snapshot.reason.as_deref(), Some(REPLICATION_QUEUE_STATS_UNAVAILABLE));
+    }
+
+    #[test]
     fn provider_covers_required_classes() {
         let provider = RustFsWorkloadAdmissionSnapshotProvider;
         let registry = provider.workload_admission_snapshot();
@@ -116,6 +205,7 @@ mod tests {
         }
 
         assert!(registry.get(WorkloadClass::Repair).is_some());
+        assert!(registry.get(WorkloadClass::Replication).is_some());
         assert_eq!(
             registry.get(WorkloadClass::ForegroundRead).map(|snapshot| snapshot.state),
             Some(AdmissionState::Unknown)

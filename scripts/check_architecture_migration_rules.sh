@@ -312,6 +312,14 @@ require_source_contains \
   "rustfs/src/workload_admission.rs" \
   "WorkloadClass::Repair => repair_workload_admission_snapshot()" \
   "RustFS repair workload admission class mapping"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "pub fn replication_workload_admission_snapshot() -> WorkloadAdmissionSnapshot" \
+  "RustFS replication workload admission snapshot helper"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "WorkloadClass::Replication => replication_workload_admission_snapshot()" \
+  "RustFS replication workload admission class mapping"
 
 (
   cd "$ROOT_DIR"
