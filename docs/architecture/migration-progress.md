@@ -5,18 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-workload-admission-owner-snapshots`
-- Baseline: `origin/main` after `rustfs/rustfs#3590`
-  (`8cf3c0bf0100d9d2234f08b48df31fd73b92ed43`).
+- Branch: `overtrue/arch-scanner-replication-admission-snapshots`
+- Baseline: `origin/main` after `rustfs/rustfs#3605`
+  (`00ca3b7c1c4ffbe98c0dd8530cb26b63e94c586a`).
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: expose read-only repair workload admission snapshots from
-  existing heal runtime counters.
+- Rust code changes: extend read-only workload admission snapshots from heal
+  repair counters to replication runtime worker and queue counters.
 - CI/script changes: extend migration guard coverage for RustFS workload
   admission provider implementations.
-- Docs changes: add RustFS heal provider notes to
+- Docs changes: add RustFS replication provider notes to
   [`workload-admission-contracts.md`](workload-admission-contracts.md) and
-  record the API-057/R-017 provider slice.
+  record the API-058/R-018 provider slice.
 
 ## Phase 0 Tasks
 
@@ -179,6 +179,21 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     queueing, scheduling, retry, priority merge/drop, or repair behavior.
   - Must preserve: heal request admission, queue capacity, scheduler wakeups,
     task retry handling, active-task accounting, and repair execution.
+  - Verification: focused workload admission tests, focused RustFS library
+    check, migration and layer guards, formatting, diff hygiene, risk scan, and
+    three-expert review.
+
+- [x] `API-058/R-018` Expose replication admission snapshot.
+  - Completed slice: extend the RustFS workload admission provider to map
+    existing replication worker and site queue counters to the `Replication`
+    workload class.
+  - Acceptance: replication admission pressure is observable through the
+    `rustfs-concurrency` workload snapshot contract without changing
+    replication queueing, channel capacity, worker resize, MRF, target dispatch,
+    or resync behavior.
+  - Must preserve: replication admission, queue channel capacity, worker resize
+    policy, MRF handling, target dispatch, resync behavior, and queue stats
+    accounting.
   - Verification: focused workload admission tests, focused RustFS library
     check, migration and layer guards, formatting, diff hygiene, risk scan, and
     three-expert review.

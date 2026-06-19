@@ -14,7 +14,9 @@
 
 pub(crate) use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
 pub(crate) use rustfs_ecstore::bucket::migration::{try_migrate_bucket_metadata, try_migrate_iam_config};
-pub(crate) use rustfs_ecstore::bucket::replication::{get_global_replication_pool, init_background_replication};
+pub(crate) use rustfs_ecstore::bucket::replication::{
+    GLOBAL_REPLICATION_STATS, get_global_replication_pool, init_background_replication,
+};
 pub(crate) use rustfs_ecstore::bucket::{metadata, metadata_sys, quota};
 pub(crate) use rustfs_ecstore::config::{com, init, init_global_config_sys, try_migrate_server_config};
 pub(crate) use rustfs_ecstore::disk::{DiskAPI, RUSTFS_META_BUCKET, endpoint::Endpoint};

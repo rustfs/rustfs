@@ -75,3 +75,20 @@ from the heal runtime counters:
 This is an observation surface only. Heal request admission, queue capacity,
 priority merge/drop policy, task scheduling, retry handling, and repair
 behavior are unchanged.
+
+## Replication Snapshot Extraction
+
+The RustFS integration layer now exposes a read-only replication admission
+snapshot from the existing replication pool and queue statistics:
+
+- `Replication` reports active regular, large-object, and MRF worker counts.
+- `queued` reports the current site replication queue count when queue stats
+  are immediately observable.
+- `limit` remains `None` because replication worker limits remain owned by the
+  async replication pool and resize policy.
+- If the replication runtime has not initialized, or queue stats are currently
+  locked, the snapshot reports `Unknown` instead of blocking or guessing.
+
+This is an observation surface only. Replication admission, queue channel
+capacity, worker resize behavior, MRF handling, target dispatch, and resync
+behavior are unchanged.
