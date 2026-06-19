@@ -4,14 +4,6 @@ use rustfs_storage_api::{
     VersionMarker,
 };
 
-pub type ListObjectsInfo = rustfs_storage_api::ListObjectsInfo<ObjectInfo>;
-pub type ListObjectsV2Info = rustfs_storage_api::ListObjectsV2Info<ObjectInfo>;
-pub type ListObjectVersionsInfo = rustfs_storage_api::ListObjectVersionsInfo<ObjectInfo>;
-pub type ObjectInfoOrErr = rustfs_storage_api::ObjectInfoOrErr<ObjectInfo, Error>;
-pub type WalkOptions = rustfs_storage_api::WalkOptions<WalkFilter>;
-pub type ObjectToDelete = rustfs_storage_api::ObjectToDelete;
-pub type DeletedObject = rustfs_storage_api::DeletedObject;
-
 #[derive(Debug, Default, Clone)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
@@ -715,9 +707,6 @@ fn versions_after_marker(file_infos: &rustfs_filemeta::FileInfoVersions, marker:
         .map(|idx| &file_infos.versions[idx + 1..])
         .unwrap_or(&file_infos.versions)
 }
-
-type WalkFilter = fn(&FileInfo) -> bool;
-
 #[cfg(test)]
 mod tests {
     use super::*;
