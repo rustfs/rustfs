@@ -27,9 +27,11 @@ use crate::{
         start_audit_system, stop_audit_system, wait_for_shutdown,
     },
     startup_iam::{IamBootstrapDisposition, bootstrap_or_defer_iam_init, publish_ready_for_iam_bootstrap},
-    startup_protocols::{ProtocolShutdownSenders, init_protocol_shutdown_senders},
+    startup_optional_runtimes::{
+        OptionalRuntimeServices, prepare_optional_runtime_shutdowns, shutdown_optional_runtime_services,
+    },
+    startup_protocols::init_protocol_shutdown_senders,
 };
-use futures_util::future::join_all;
 use rustfs_audit::AuditResult;
 use rustfs_common::GlobalReadiness;
 use rustfs_heal::{
@@ -56,7 +58,6 @@ const LOG_COMPONENT_MAIN: &str = "main";
 const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const LOG_SUBSYSTEM_AUTH: &str = "auth";
 const EVENT_AUDIT_SYSTEM_STATE: &str = "audit_system_state";
-const EVENT_PROTOCOL_SYSTEM_STATE: &str = "protocol_system_state";
 const EVENT_DEADLOCK_DETECTOR_STATE: &str = "deadlock_detector_state";
 const EVENT_KEYSTONE_AUTH_INITIALIZED: &str = "keystone_auth_initialized";
 const EVENT_KEYSTONE_AUTH_INITIALIZATION_FAILED: &str = "keystone_auth_initialization_failed";
@@ -71,7 +72,7 @@ const EVENT_PROFILING_SHUTDOWN: &str = "profiling_shutdown";
 const EVENT_SERVER_SHUTDOWN_STATE: &str = "server_shutdown_state";
 
 pub struct StartupServiceRuntime {
-    pub protocol_shutdowns: ProtocolShutdownSenders,
+    pub optional_runtimes: OptionalRuntimeServices,
     pub iam_bootstrap: IamBootstrapDisposition,
     pub enable_scanner: bool,
 }
@@ -98,6 +99,7 @@ pub async fn init_startup_runtime_services(
     init_kms_system(config).await?;
 
     let protocol_shutdowns = init_protocol_shutdown_senders().await?;
+    let optional_runtimes = OptionalRuntimeServices::new(protocol_shutdowns);
 
     init_buffer_profile_system(config);
     init_audit_runtime().await;
@@ -111,7 +113,7 @@ pub async fn init_startup_runtime_services(
     init_observability_runtime(ctx.clone()).await;
 
     Ok(StartupServiceRuntime {
-        protocol_shutdowns,
+        optional_runtimes,
         iam_bootstrap,
         enable_scanner,
     })
@@ -129,7 +131,7 @@ pub async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifecycle) -
         readiness,
     } = lifecycle;
     let StartupServiceRuntime {
-        protocol_shutdowns,
+        optional_runtimes,
         iam_bootstrap,
         enable_scanner,
     } = service_runtime;
@@ -158,7 +160,7 @@ pub async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifecycle) -
         shutdown_signal,
         s3_shutdown_tx,
         console_shutdown_tx,
-        protocol_shutdowns,
+        optional_runtimes,
         shutdown_token,
     )
     .await;
@@ -377,15 +379,9 @@ async fn handle_shutdown(
     shutdown_signal: ShutdownSignal,
     s3_shutdown_handle: Option<ShutdownHandle>,
     console_shutdown_handle: Option<ShutdownHandle>,
-    protocols: ProtocolShutdownSenders,
+    optional_runtimes: OptionalRuntimeServices,
     ctx: CancellationToken,
 ) {
-    let ProtocolShutdownSenders {
-        ftp: ftp_shutdown_tx,
-        ftps: ftps_shutdown_tx,
-        webdav: webdav_shutdown_tx,
-        sftp: sftp_shutdown_tx,
-    } = protocols;
     ctx.cancel();
 
     info!(
@@ -444,58 +440,7 @@ async fn handle_shutdown(
         );
     }
 
-    let mut protocol_shutdowns = Vec::new();
-    if let Some(ftp_shutdown_tx) = ftp_shutdown_tx {
-        info!(
-            target: "rustfs::main::handle_shutdown",
-            event = EVENT_PROTOCOL_SYSTEM_STATE,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            protocol = "ftp",
-            state = "stopping",
-            "Protocol runtime stopping"
-        );
-        protocol_shutdowns.push(ftp_shutdown_tx.shutdown());
-    }
-
-    if let Some(ftps_shutdown_tx) = ftps_shutdown_tx {
-        info!(
-            target: "rustfs::main::handle_shutdown",
-            event = EVENT_PROTOCOL_SYSTEM_STATE,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            protocol = "ftps",
-            state = "stopping",
-            "Protocol runtime stopping"
-        );
-        protocol_shutdowns.push(ftps_shutdown_tx.shutdown());
-    }
-
-    if let Some(webdav_shutdown_tx) = webdav_shutdown_tx {
-        info!(
-            target: "rustfs::main::handle_shutdown",
-            event = EVENT_PROTOCOL_SYSTEM_STATE,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            protocol = "webdav",
-            state = "stopping",
-            "Protocol runtime stopping"
-        );
-        protocol_shutdowns.push(webdav_shutdown_tx.shutdown());
-    }
-
-    if let Some(sftp_shutdown_tx) = sftp_shutdown_tx {
-        info!(
-            target: "rustfs::main::handle_shutdown",
-            event = EVENT_PROTOCOL_SYSTEM_STATE,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            protocol = "sftp",
-            state = "stopping",
-            "Protocol runtime stopping"
-        );
-        protocol_shutdowns.push(sftp_shutdown_tx.shutdown());
-    }
+    let optional_runtime_shutdowns = prepare_optional_runtime_shutdowns(optional_runtimes);
 
     info!(
         target: "rustfs::main::handle_shutdown",
@@ -559,8 +504,7 @@ async fn handle_shutdown(
     if let Some(console_shutdown_handle) = console_shutdown_handle {
         console_shutdown_handle.shutdown().await;
     }
-    join_all(protocol_shutdowns).await;
-
+    shutdown_optional_runtime_services(optional_runtime_shutdowns).await;
     state_manager.update(ServiceState::Stopped);
     info!(
         target: "rustfs::main::handle_shutdown",
