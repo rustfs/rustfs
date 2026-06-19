@@ -41,3 +41,21 @@ scanner, heal, replication, or ECStore placement behavior.
 - No scheduler decision logic, queue capacity, Tokio runtime default, scanner
   admission, heal admission, replication admission, placement, membership, or
   NUMA behavior changes are part of this slice.
+
+## Set-Local Snapshot Extraction
+
+The RustFS storage `ConcurrencyManager` now implements
+`WorkloadAdmissionSnapshotProvider` for local foreground-read admission:
+
+- `ForegroundRead` reports local disk-read permit usage through
+  `GetObjectQueueSnapshot`.
+- `active` is the number of disk-read permits currently in use.
+- `limit` is the configured maximum concurrent disk reads.
+- `queued` remains `None` because the current semaphore does not expose waiter
+  counts.
+- Scanner, repair, replication, foreground write, and metadata entries remain
+  `Unknown` until their owning runtime components expose read-only status.
+
+This is an observation surface only. Permit acquisition, priority assignment,
+buffer sizing, storage media detection, request guards, and queue behavior are
+unchanged.

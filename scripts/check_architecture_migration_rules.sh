@@ -224,6 +224,18 @@ require_source_contains \
   "crates/concurrency/src/lib.rs" \
   "WorkloadClass," \
   "concurrency public workload class re-export"
+require_source_contains \
+  "rustfs/src/storage/concurrency/manager.rs" \
+  "impl WorkloadAdmissionSnapshotProvider for ConcurrencyManager" \
+  "storage concurrency workload admission snapshot provider"
+require_source_contains \
+  "rustfs/src/storage/concurrency/manager.rs" \
+  "pub fn workload_admission_registry_snapshot(&self) -> WorkloadAdmissionRegistrySnapshot" \
+  "storage concurrency workload admission registry snapshot"
+require_source_contains \
+  "rustfs/src/storage/concurrency/manager.rs" \
+  "WorkloadClass::ForegroundRead => self.get_object_admission_snapshot()" \
+  "storage concurrency foreground read admission snapshot"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
   "pub use multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};" \
