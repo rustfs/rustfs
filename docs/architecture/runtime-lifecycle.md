@@ -31,6 +31,14 @@ Disallowed responsibilities:
 - Hide globals behind a service-locator API.
 - Change startup side effects while moving code.
 
+## Optional Runtime Boundary
+
+`startup_optional_runtimes` owns shutdown for optional runtime services that are
+not readiness or fatal startup boundaries. The current owner set is protocol
+servers only. Future optional sidecars must enter this boundary with explicit
+shutdown handles and status snapshots instead of adding ad hoc shutdown work to
+`startup_services`.
+
 ## AppContext Foundation
 
 Early AppContext work should split resolver files and add compatibility tests before

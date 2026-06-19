@@ -5,15 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ops-profiler-capability-tests`
+- Branch: `overtrue/arch-optional-runtime-sidecar-boundary`
 - Baseline: latest `origin/main`
-  (`71809ba02ea405c3a2f0e4cb82ff608915dd519c`).
-- PR type for this branch: `contract`
+  (`e6391598f0b62a66ca6eac405c26b53a9a77d5f1`).
+- PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: add the `ops.profiler.v1` extension capability snapshot
-  contract for disabled, unsupported, and enabled profiler runtime states.
+- Rust code changes: move optional protocol shutdown ownership from
+  `startup_services` into the optional runtime boundary.
 - CI/script changes: none.
-- Docs changes: record the X-013 profiler capability snapshot slice.
+- Docs changes: record the R-021 optional runtime shutdown boundary slice.
 
 ## Phase 0 Tasks
 
@@ -2016,6 +2016,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     guards, diff hygiene, Rust risk scan, branch freshness check, and
     pre-commit quality gate.
 
+- [x] `R-021` Extract optional runtime shutdown boundary.
+  - Do: add `startup_optional_runtimes` and move optional protocol shutdown
+    ownership/logging out of `startup_services`.
+  - Acceptance: optional protocol shutdown plan order stays FTP, FTPS, WebDAV,
+    SFTP; stopping logs remain before event notifier/audit/profiling shutdown;
+    signal/wait remains after S3/console HTTP shutdown; later optional
+    sidecars have an explicit owner without startup behavior changes.
+  - Must preserve: protocol initialization, protocol shutdown signaling and
+    waiting, shutdown order, profiling/audit/event notifier shutdown, HTTP
+    shutdown, readiness state, and fatal boundaries.
+  - Verification: focused startup optional runtime/service tests, RustFS lib
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
 ## Next PRs
 
 1. `pure-move`: continue larger lifecycle hook slices for optional runtime
@@ -2027,9 +2041,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | X-013 keeps the capability snapshot contract in `rustfs-extension-schema`, reuses explicit profiler backend/runtime DTOs, and adds no runtime dependency edges. |
-| Migration preservation | passed | Runtime profiling, admin pprof routes, exporters, storage paths, telemetry, sidecar startup, and plugin execution are untouched; validation only rejects unsafe snapshot declarations. |
-| Testing/verification | passed | Extension schema tests cover enabled, disabled, unsupported, snapshot JSON shape, disabled external runtime policy, and startup-fatal rejection; focused checks, guards, formatting, diff hygiene, and final pre-commit passed. |
+| Quality/architecture | passed | R-021 isolates optional runtime shutdown ownership in `startup_optional_runtimes` and keeps `startup_services` as the startup/shutdown orchestrator. |
+| Migration preservation | passed | Protocol startup, shutdown order, readiness, HTTP shutdown, event notifier, audit, and profiling behavior remain unchanged. |
+| Testing/verification | passed | Focused optional runtime and startup service tests pass; remaining checks and final pre-commit are tracked below before push. |
 
 ## Verification Notes
 
@@ -2049,6 +2063,19 @@ Passed before push:
 - Issue #660 X-013 current slice:
   - `cargo test -p rustfs-extension-schema`: passed.
   - `cargo check -p rustfs-extension-schema`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 R-021 current slice:
+  - `cargo test -p rustfs --lib startup_optional_runtimes -- --nocapture`:
+    passed.
+  - `cargo test -p rustfs --lib startup_services -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
   - `./scripts/check_architecture_migration_rules.sh`: passed.
   - `./scripts/check_layer_dependencies.sh`: passed.
   - `cargo fmt --all --check`: passed.

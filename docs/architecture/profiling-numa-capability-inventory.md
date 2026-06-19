@@ -80,9 +80,9 @@ Future sidecars for profiling, eBPF, or NUMA must preserve these invariants:
 - Verify optional profiler sidecar and Wasm runtimes stay disabled by default
   and cannot declare a startup fatal boundary.
 
-`R-017`:
+`R-021`:
 
-- If a runtime service sidecar is added later, start it from the startup service
-  boundary with explicit shutdown ownership.
+- If a runtime service sidecar is added later, enter it through the optional
+  runtime boundary with explicit shutdown ownership.
 - Preserve current service order, KMS/audit/notification fatal boundaries, and
   scanner/heal startup semantics.
