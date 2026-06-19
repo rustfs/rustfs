@@ -5,19 +5,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-scheduler-workload-contracts`
-- Baseline: stacked on `origin/overtrue/arch-test-harness-compat-aliases`
-  after `rustfs/rustfs#3601`
-  (`dc099f415670d94c0f79a7f9015653a08cdf458f`).
-- PR type for this branch: `test-only` plus `contract`
+- Branch: `overtrue/arch-set-local-scheduler-snapshots`
+- Baseline: `origin/main` after `rustfs/rustfs#3602`
+  (`56c3cf50ae93d6705cf9f615e49b66787cb99954`).
+- PR type for this branch: `api-extraction`
 - Runtime behavior changes: none.
-- Rust code changes: add scheduler preservation tests and workload admission
-  contract types to `rustfs-concurrency`.
-- CI/script changes: extend migration re-export guard coverage for workload
-  admission contract exports.
+- Rust code changes: expose local foreground-read admission snapshots from
+  RustFS storage concurrency through the `rustfs-concurrency` workload contract.
+- CI/script changes: extend migration guard coverage for the storage
+  `WorkloadAdmissionSnapshotProvider` implementation.
 - Docs changes: add
+  set-local snapshot extraction notes to
   [`workload-admission-contracts.md`](workload-admission-contracts.md) and
-  record the combined PR-05/TEST-SCH-001 plus PR-07/R-015 slice.
+  record the API-055/SCH-001 extraction slice.
 
 ## Phase 0 Tasks
 
@@ -144,6 +144,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     scheduling, placement, membership, or business call-site migration.
   - Verification: workload contract unit tests, focused concurrency check,
     migration guard, formatting, diff hygiene, and three-expert review.
+
+- [x] `API-055/SCH-001` Expose set-local scheduler admission snapshot.
+  - Completed slice: implement `WorkloadAdmissionSnapshotProvider` for the
+    RustFS storage `ConcurrencyManager` and expose foreground-read disk-read
+    permit usage through a local read-only workload registry snapshot.
+  - Acceptance: local foreground read admission reports active permit usage,
+    configured limit, and open/saturated/disabled state without ECStore,
+    admin-route, cluster, or scheduler mutation dependencies.
+  - Must preserve: disk-read semaphore acquisition, priority assignment,
+    buffer sizing, storage media detection, request guards, and queue behavior.
+  - Verification: storage concurrency tests, focused RustFS library check,
+    migration guard, formatting, diff hygiene, and three-expert review.
+
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.
   - Acceptance: `./scripts/check_architecture_migration_rules.sh` parses the
     allowed PR types from [`crate-boundaries.md`](crate-boundaries.md) and fails
@@ -1729,8 +1742,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 1. `contract`/`consumer-migration`: wire read-only observability and topology
    snapshots to implementation owners without changing runtime, profiling,
    placement, or admin route behavior.
-2. `api-extraction`: expose the set-local scheduler snapshot after the
-   TEST-SCH-001 and R-015 protection/contract slice.
+2. `consumer-migration`: connect additional scanner, repair, replication, and
+   metadata admission owners to the workload registry only after each owner has
+   dedicated preservation coverage.
 3. `pure-move`/`consumer-migration`: continue larger cleanup slices with the
    loss-prevention guards active for remaining ECStore compatibility contracts
    now that broad compatibility passthroughs are fully closed.
@@ -1739,13 +1753,23 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | S-015 removes obsolete KMS admin policy action variants after the handler fallback cleanup; API-042/API-043/API-044/API-045/API-046/API-047/API-048/API-049/API-050/API-051/API-052/API-053/API-054 narrow notify, S3 Select, OBS, IAM, Swift, heal, scanner, RustFS runtime, test, fuzz, lifecycle helper, harness, and RustFS runtime compatibility contracts without moving ECStore storage metadata ownership; G-011/G-012/G-013 add docs-only baselines for scheduler, placement/repair, and profiling/NUMA work; Issue #660 PR-08/PR-09 add read-only observability and topology contracts in storage-api only; current PR-05/PR-07 slice adds scheduler preservation tests and a small workload admission contract in concurrency only. |
-| Migration preservation | passed | KMS endpoint URLs, query aliases, request bodies, response contracts, and dedicated `kms:*` authorization behavior are preserved; event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, OBS metrics state reads, IAM config/notification/error semantics, Swift bucket metadata access, heal disk/resume/task behavior, scanner lifecycle/replication/data-usage behavior, RustFS startup/admin/app/storage runtime access, e2e/test/fuzz import behavior, lifecycle expiration/transition helper DTO field contracts, flattened harness and RustFS runtime scalar/secondary alias behavior, unchanged no-op handling, remove-event behavior, scheduler/readiness/placement/profiling runtime behavior, platform gates, missing/unknown capability states, placement/topology labels, scheduler thresholds, queue snapshot semantics, and admission behavior are preserved. |
-| Testing/verification | passed | Focused compiles/tests, fuzz target compile, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed for prior code slices; current Issue #660 PR-05/PR-07 slice uses concurrency tests/checks, migration guard, formatting, diff hygiene, and three-expert review. |
+| Quality/architecture | passed | S-015 removes obsolete KMS admin policy action variants after the handler fallback cleanup; API-042/API-043/API-044/API-045/API-046/API-047/API-048/API-049/API-050/API-051/API-052/API-053/API-054 narrow notify, S3 Select, OBS, IAM, Swift, heal, scanner, RustFS runtime, test, fuzz, lifecycle helper, harness, and RustFS runtime compatibility contracts without moving ECStore storage metadata ownership; G-011/G-012/G-013 add docs-only baselines for scheduler, placement/repair, and profiling/NUMA work; Issue #660 PR-08/PR-09 add read-only observability and topology contracts in storage-api only; PR-05/PR-07 add scheduler preservation tests and workload contracts; current API-055/SCH-001 adds a local storage concurrency provider only. |
+| Migration preservation | passed | KMS endpoint URLs, query aliases, request bodies, response contracts, and dedicated `kms:*` authorization behavior are preserved; event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, OBS metrics state reads, IAM config/notification/error semantics, Swift bucket metadata access, heal disk/resume/task behavior, scanner lifecycle/replication/data-usage behavior, RustFS startup/admin/app/storage runtime access, e2e/test/fuzz import behavior, lifecycle expiration/transition helper DTO field contracts, flattened harness and RustFS runtime scalar/secondary alias behavior, unchanged no-op handling, remove-event behavior, scheduler/readiness/placement/profiling runtime behavior, platform gates, missing/unknown capability states, placement/topology labels, scheduler thresholds, queue snapshot semantics, disk-read semaphore behavior, and admission behavior are preserved. |
+| Testing/verification | passed | Focused compiles/tests, fuzz target compile, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed for prior code slices; current Issue #660 API-055/SCH-001 slice uses storage concurrency tests, focused RustFS library check, migration guard, formatting, diff hygiene, and three-expert review. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-055/SCH-001 current slice:
+  - `cargo test -p rustfs --lib storage::concurrency::manager::integration_tests -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
 
 - Issue #660 PR-05/PR-07 current slice:
   - `cargo test -p rustfs-concurrency --no-fail-fast`: passed.
