@@ -1762,6 +1762,7 @@ pub trait SseDekProvider: Send + Sync {
     ) -> Result<[u8; 32], ApiError>;
 
     /// Decrypt a DEK from positively identified legacy managed metadata.
+    #[cfg(feature = "rio-v2")]
     async fn decrypt_legacy_sse_dek(
         &self,
         encrypted_dek: &[u8],
@@ -1830,6 +1831,7 @@ impl SseDekProvider for KmsSseDekProvider {
         Ok(data_key.plaintext_key)
     }
 
+    #[cfg(feature = "rio-v2")]
     async fn decrypt_legacy_sse_dek(
         &self,
         encrypted_dek: &[u8],
