@@ -5,17 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-protocol-runtime-sidecar-boundary`
+- Branch: `overtrue/arch-startup-runtime-hooks-boundary`
 - Baseline: `origin/main`
-  (`aa5de1c908d6ffb778533c895c200f3c60ca1ed5`).
-- Stacked on: rustfs/rustfs#3636.
+  (`5e96151d9c57cc8764f187cc0838dc111ddf0636`).
+- Stacked on: rustfs/rustfs#3637.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move optional runtime sidecar ownership and protocol
-  shutdown planning from `startup_optional_runtimes` into
-  `startup_optional_runtime_sidecars`.
+- Rust code changes: add `startup_runtime_hooks` and move runtime diagnostics,
+  profiling hook dispatch, and crypto provider installation out of
+  `startup_runtime` and `startup_profiling`.
 - CI/script changes: none.
-- Docs changes: record the R-026 optional runtime sidecar boundary slice.
+- Docs changes: record the R-027 startup runtime hook boundary slice.
 
 ## Phase 0 Tasks
 
@@ -2110,6 +2110,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     risk scan, branch freshness check, pre-commit quality gate, and
     three-expert review.
 
+- [x] `R-027` Extract startup runtime hook boundary.
+  - Do: add `startup_runtime_hooks` and move startup runtime diagnostics,
+    profiling hook dispatch, shutdown profiling dispatch, and default crypto
+    provider installation out of `startup_runtime` and `startup_profiling`.
+  - Acceptance: BOOT-006 keeps diagnostics, profiling init, trusted proxy init,
+    provider install, and outbound TLS material load in the same order, while
+    STOP-004 still stops profiling through the existing compatibility path.
+  - Must preserve: startup logo and telemetry/license log behavior, profiling
+    hook dispatch behavior, rustls provider install behavior, trusted proxy init
+    order, outbound TLS fatal boundary, and profiling shutdown call path.
+  - Verification: focused runtime hook/profiling/runtime/shutdown tests, RustFS
+    lib check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
 ## Next PRs
 
 1. `pure-move`: continue larger lifecycle hook slices for startup profiling and
@@ -2121,9 +2135,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-026 moves optional runtime sidecar ownership into `startup_optional_runtime_sidecars` while keeping the old module path as a compatibility handoff. |
-| Migration preservation | passed | Protocol startup order, shutdown planning order, and HTTP-before-optional-runtime shutdown ordering remain unchanged. |
-| Testing/verification | passed | Focused optional runtime sidecar/runtime/shutdown checks, guards, final hygiene, and full pre-commit passed. |
+| Quality/architecture | passed | R-027 moves runtime hook side effects into `startup_runtime_hooks` while keeping old profiling entrypoints as compatibility handoffs. |
+| Migration preservation | passed | BOOT-006 and STOP-004 ordering remain unchanged, including trusted proxy and outbound TLS ordering. |
+| Testing/verification | passed | Focused runtime hook/profiling/runtime/shutdown checks, guards, final hygiene, and full pre-commit passed. |
 
 ## Verification Notes
 
@@ -2224,6 +2238,21 @@ Passed before push:
     passed.
   - `cargo test -p rustfs --lib startup_optional_runtimes -- --nocapture`:
     passed.
+  - `cargo test -p rustfs --lib startup_shutdown -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 R-027 current slice:
+  - `cargo test -p rustfs --lib startup_runtime_hooks -- --nocapture`:
+    passed.
+  - `cargo test -p rustfs --lib startup_profiling -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_runtime -- --nocapture`: passed.
   - `cargo test -p rustfs --lib startup_shutdown -- --nocapture`: passed.
   - `cargo check -p rustfs --lib`: passed.
   - `./scripts/check_architecture_migration_rules.sh`: passed.

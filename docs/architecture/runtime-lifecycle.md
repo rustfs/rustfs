@@ -65,6 +65,15 @@ sidecars must enter this boundary with explicit shutdown handles and status
 snapshots instead of adding ad hoc startup or shutdown work to
 `startup_services`.
 
+## Startup Runtime Hook Boundary
+
+`startup_runtime_hooks` owns runtime hook side effects that wrap the startup
+foundation but are not TLS material loading: startup diagnostics, profiling
+hook dispatch, and default crypto provider installation. `startup_runtime`
+preserves BOOT-006 orchestration and outbound TLS fatal behavior, while
+`startup_profiling` remains a compatibility handoff for the old profiling hook
+path.
+
 ## AppContext Foundation
 
 Early AppContext work should split resolver files and add compatibility tests before

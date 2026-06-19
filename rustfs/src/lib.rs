@@ -78,6 +78,7 @@ pub mod startup_preflight;
 pub mod startup_profiling;
 pub mod startup_protocols;
 pub mod startup_runtime;
+pub mod startup_runtime_hooks;
 pub mod startup_server;
 pub mod startup_service_components;
 pub mod startup_services;
