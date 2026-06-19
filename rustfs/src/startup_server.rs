@@ -44,6 +44,12 @@ pub struct StartupListenContext {
     pub server_address: String,
 }
 
+pub struct EmbeddedStartupListenContext {
+    pub readiness: Arc<GlobalReadiness>,
+    pub server_addr: SocketAddr,
+    pub server_address: String,
+}
+
 pub struct StartupHttpServers {
     pub state_manager: Arc<ServiceStateManager>,
     pub s3_shutdown_tx: Option<ShutdownHandle>,
@@ -96,6 +102,39 @@ pub async fn init_startup_listen_context(config: &Config) -> Result<StartupListe
         readiness,
         server_addr,
         server_address,
+    })
+}
+
+pub async fn init_embedded_startup_listen_context(config: &Config) -> Result<EmbeddedStartupListenContext> {
+    let readiness = Arc::new(GlobalReadiness::new());
+
+    let server_addr =
+        parse_and_resolve_address(config.address.as_str()).map_err(|err| Error::other(format!("address: {err}")))?;
+    if server_addr.port() == 0 {
+        return Err(Error::other(
+            "port 0 is not supported in embedded mode because startup requires \
+             a stable listen address and port before endpoint/global initialization. \
+             Use `find_available_port()` to obtain a free port.",
+        ));
+    }
+
+    init_global_action_credentials(Some(config.access_key.clone()), Some(config.secret_key.clone()))
+        .map_err(|err| Error::other(format!("credentials: {err:?}")))?;
+
+    if let Some(region_str) = &config.region {
+        region_str
+            .parse::<s3s::region::Region>()
+            .map(crate::storage_compat::set_global_region)
+            .map_err(|err| Error::other(format!("invalid region '{region_str}': {err}")))?;
+    }
+
+    set_global_rustfs_port(server_addr.port());
+    set_global_addr(&config.address).await;
+
+    Ok(EmbeddedStartupListenContext {
+        readiness,
+        server_addr,
+        server_address: server_addr.to_string(),
     })
 }
 
