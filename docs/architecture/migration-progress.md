@@ -5,17 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-notify-object-info-boundary-prune`
-- Baseline: stacked after `rustfs/rustfs#3619`
-  (`dd2c1846ad8b35f589492885cca2154dd13ea918`).
+- Branch: `overtrue/arch-iam-object-boundary-prune`
+- Baseline: stacked after `rustfs/rustfs#3620`
+  (`c7bee5de904c9a1ea70f73ad6621895a30b3c387`).
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: remove notify's private ECStore `ObjectInfo` conversion
-  alias and perform the ECStore event object to `NotifyObjectInfo` mapping in
-  RustFS event/operation notification bridges.
+- Rust code changes: route IAM config/store object metadata and options aliases
+  through `rustfs_storage_api::ObjectOperations` associated types.
 - CI/script changes: shrink the remaining external `rustfs_ecstore::object_api`
-  compatibility alias snapshot by removing notify's object-info alias.
-- Docs changes: record the API-068 notify object-info boundary prune slice.
+  compatibility alias snapshot by removing IAM object-info/options aliases.
+- Docs changes: record the API-069 IAM object boundary prune slice.
 
 ## Phase 0 Tasks
 
@@ -347,6 +346,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: focused RustFS event conversion test, focused notify/RustFS
     compile checks, migration and layer guards, formatting, diff hygiene, full
     pre-commit, and three-expert review.
+
+- [x] `API-069` Prune IAM direct ECStore object metadata/options aliases.
+  - Completed slice: replace IAM config and store `ObjectInfo`/`ObjectOptions`
+    compatibility aliases with `IamStore` `ObjectOperations` associated types.
+  - Acceptance: IAM no longer names
+    `rustfs_ecstore::object_api::{ObjectInfo,ObjectOptions}` directly, the
+    remaining object-api alias allowlist shrinks by four entries, and IAM config
+    read/write metadata and lazy-rewrite precondition behavior are unchanged.
+  - Must preserve: IAM config encryption/decryption, lazy rewrite ETag matching,
+    list walk item/error typing, metadata return shape, storage preconditions,
+    system-path failure classification, and notification peer behavior.
+  - Verification: focused IAM compile/tests, migration and layer guards,
+    formatting, diff hygiene, full pre-commit, and three-expert review.
 
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.
   - Acceptance: `./scripts/check_architecture_migration_rules.sh` parses the
