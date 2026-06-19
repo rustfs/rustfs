@@ -44,7 +44,7 @@ use crate::client::{
 };
 use crate::{
     disk::DiskAPI,
-    store_api::{GetObjectReader, ObjectInfo},
+    object_api::{GetObjectReader, ObjectInfo},
 };
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 

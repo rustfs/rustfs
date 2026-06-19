@@ -36,9 +36,9 @@ use crate::error::{
     is_err_operation_canceled, is_err_version_not_found,
 };
 use crate::notification_sys::get_global_notification_sys;
+use crate::object_api::{GetObjectReader, ObjectOptions};
 use crate::resolve_object_store_handle;
 use crate::set_disk::SetDisks;
-use crate::store_api::{GetObjectReader, ObjectOptions};
 use crate::{global::GLOBAL_LifecycleSys, sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
@@ -1348,7 +1348,7 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
     };
 
     let versioned = BucketVersioningSys::prefix_enabled(bucket, &version.name).await;
-    let object_info = crate::store_api::ObjectInfo::from_file_info(version, bucket, &version.name, versioned);
+    let object_info = crate::object_api::ObjectInfo::from_file_info(version, bucket, &version.name, versioned);
     let event = eval_action_from_lifecycle(lifecycle_config, lock_retention, replication_config, &object_info).await;
 
     match event.action {
