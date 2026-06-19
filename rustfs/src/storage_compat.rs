@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
+pub(crate) use rustfs_ecstore::bucket::metadata_sys::{get_global_bucket_metadata_sys, init_bucket_metadata_sys};
 pub(crate) use rustfs_ecstore::bucket::migration::{try_migrate_bucket_metadata, try_migrate_iam_config};
 pub(crate) use rustfs_ecstore::bucket::replication::{
     GLOBAL_REPLICATION_STATS, get_global_replication_pool, init_background_replication,

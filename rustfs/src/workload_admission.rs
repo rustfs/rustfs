@@ -17,12 +17,15 @@ use rustfs_concurrency::{
     WorkloadClass,
 };
 
-use crate::storage_compat::{GLOBAL_REPLICATION_STATS, get_global_replication_pool};
+use crate::storage::concurrency::get_concurrency_manager;
+use crate::storage_compat::{GLOBAL_REPLICATION_STATS, get_global_bucket_metadata_sys, get_global_replication_pool};
 
+const BUCKET_METADATA_RUNTIME_NOT_INITIALIZED: &str = "bucket metadata runtime not initialized";
 const HEAL_MANAGER_NOT_INITIALIZED: &str = "heal manager not initialized";
 const NOT_EXPOSED_BY_PROVIDER: &str = "not exposed by RustFS workload admission provider";
 const REPLICATION_RUNTIME_NOT_INITIALIZED: &str = "replication runtime not initialized";
 const REPLICATION_QUEUE_STATS_UNAVAILABLE: &str = "replication queue stats unavailable";
+const SCANNER_ACTIVITY_IDLE_OR_NOT_INITIALIZED: &str = "scanner activity idle or not initialized";
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RustFsWorkloadAdmissionSnapshotProvider;
@@ -38,6 +41,9 @@ pub fn workload_admission_registry_snapshot() -> WorkloadAdmissionRegistrySnapsh
         .iter()
         .copied()
         .map(|class| match class {
+            WorkloadClass::ForegroundRead => foreground_read_workload_admission_snapshot(),
+            WorkloadClass::Metadata => metadata_workload_admission_snapshot(),
+            WorkloadClass::Scanner => scanner_workload_admission_snapshot(),
             WorkloadClass::Repair => repair_workload_admission_snapshot(),
             WorkloadClass::Replication => replication_workload_admission_snapshot(),
             class => WorkloadAdmissionSnapshot::new(class, AdmissionState::Unknown).with_reason(NOT_EXPOSED_BY_PROVIDER),
@@ -45,6 +51,54 @@ pub fn workload_admission_registry_snapshot() -> WorkloadAdmissionRegistrySnapsh
         .collect();
 
     WorkloadAdmissionRegistrySnapshot::new(entries)
+}
+
+pub fn foreground_read_workload_admission_snapshot() -> WorkloadAdmissionSnapshot {
+    get_concurrency_manager().get_object_admission_snapshot()
+}
+
+pub fn metadata_workload_admission_snapshot() -> WorkloadAdmissionSnapshot {
+    metadata_workload_admission_snapshot_from_initialized(get_global_bucket_metadata_sys().is_some())
+}
+
+fn metadata_workload_admission_snapshot_from_initialized(runtime_initialized: bool) -> WorkloadAdmissionSnapshot {
+    let state = if runtime_initialized {
+        AdmissionState::Open
+    } else {
+        AdmissionState::Unknown
+    };
+
+    let snapshot = WorkloadAdmissionSnapshot::new(WorkloadClass::Metadata, state);
+
+    if runtime_initialized {
+        snapshot
+    } else {
+        snapshot.with_reason(BUCKET_METADATA_RUNTIME_NOT_INITIALIZED)
+    }
+}
+
+pub fn scanner_workload_admission_snapshot() -> WorkloadAdmissionSnapshot {
+    scanner_workload_admission_snapshot_from_activity(rustfs_scanner::current_scanner_activity())
+}
+
+fn scanner_workload_admission_snapshot_from_activity(active: u64) -> WorkloadAdmissionSnapshot {
+    let state = if active > 0 {
+        AdmissionState::Open
+    } else {
+        AdmissionState::Unknown
+    };
+
+    let snapshot = WorkloadAdmissionSnapshot::new(WorkloadClass::Scanner, state).with_counts(
+        Some(u64_to_usize_saturated(active)),
+        None,
+        None,
+    );
+
+    if state == AdmissionState::Unknown {
+        snapshot.with_reason(SCANNER_ACTIVITY_IDLE_OR_NOT_INITIALIZED)
+    } else {
+        snapshot
+    }
 }
 
 pub fn repair_workload_admission_snapshot() -> WorkloadAdmissionSnapshot {
@@ -138,6 +192,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn foreground_read_snapshot_uses_storage_concurrency_admission() {
+        let snapshot = foreground_read_workload_admission_snapshot();
+
+        assert_eq!(snapshot.class, WorkloadClass::ForegroundRead);
+        assert_ne!(snapshot.state, AdmissionState::Unknown);
+        assert!(snapshot.active.is_some());
+        assert!(snapshot.limit.is_some());
+    }
+
+    #[test]
+    fn metadata_snapshot_reports_initialized_runtime() {
+        let snapshot = metadata_workload_admission_snapshot_from_initialized(true);
+
+        assert_eq!(snapshot.class, WorkloadClass::Metadata);
+        assert_eq!(snapshot.state, AdmissionState::Open);
+        assert_eq!(snapshot.active, None);
+        assert_eq!(snapshot.queued, None);
+        assert_eq!(snapshot.limit, None);
+        assert_eq!(snapshot.reason, None);
+    }
+
+    #[test]
+    fn metadata_snapshot_is_unknown_before_runtime_initializes() {
+        let snapshot = metadata_workload_admission_snapshot_from_initialized(false);
+
+        assert_eq!(snapshot.class, WorkloadClass::Metadata);
+        assert_eq!(snapshot.state, AdmissionState::Unknown);
+        assert_eq!(snapshot.reason.as_deref(), Some(BUCKET_METADATA_RUNTIME_NOT_INITIALIZED));
+    }
+
+    #[test]
+    fn scanner_snapshot_reports_active_work_units() {
+        let snapshot = scanner_workload_admission_snapshot_from_activity(5);
+
+        assert_eq!(snapshot.class, WorkloadClass::Scanner);
+        assert_eq!(snapshot.state, AdmissionState::Open);
+        assert_eq!(snapshot.active, Some(5));
+        assert_eq!(snapshot.queued, None);
+        assert_eq!(snapshot.limit, None);
+        assert_eq!(snapshot.reason, None);
+    }
+
+    #[test]
+    fn scanner_snapshot_is_unknown_when_idle_or_uninitialized() {
+        let snapshot = scanner_workload_admission_snapshot_from_activity(0);
+
+        assert_eq!(snapshot.class, WorkloadClass::Scanner);
+        assert_eq!(snapshot.state, AdmissionState::Unknown);
+        assert_eq!(snapshot.active, Some(0));
+        assert_eq!(snapshot.reason.as_deref(), Some(SCANNER_ACTIVITY_IDLE_OR_NOT_INITIALIZED));
+    }
+
+    #[test]
     fn repair_snapshot_reports_heal_counters() {
         let snapshot = repair_workload_admission_snapshot_from_counts(true, 2, 3);
 
@@ -206,9 +313,10 @@ mod tests {
 
         assert!(registry.get(WorkloadClass::Repair).is_some());
         assert!(registry.get(WorkloadClass::Replication).is_some());
-        assert_eq!(
+        assert_ne!(
             registry.get(WorkloadClass::ForegroundRead).map(|snapshot| snapshot.state),
             Some(AdmissionState::Unknown)
         );
+        assert_eq!(registry.get(WorkloadClass::Scanner).and_then(|snapshot| snapshot.active), Some(0));
     }
 }
