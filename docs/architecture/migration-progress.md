@@ -5,15 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-optional-runtime-sidecar-boundary`
+- Branch: `overtrue/arch-optional-runtime-start-boundary`
 - Baseline: latest `origin/main`
-  (`e6391598f0b62a66ca6eac405c26b53a9a77d5f1`).
+  (`74fcfddd7fd98d69358e02908617261d962725d1`).
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move optional protocol shutdown ownership from
+- Rust code changes: move optional protocol startup and shutdown ownership from
   `startup_services` into the optional runtime boundary.
 - CI/script changes: none.
-- Docs changes: record the R-021 optional runtime shutdown boundary slice.
+- Docs changes: record the R-022 optional runtime startup boundary slice.
 
 ## Phase 0 Tasks
 
@@ -2030,6 +2030,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
     branch freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `R-022` Extract optional runtime startup boundary.
+  - Do: add `init_optional_runtime_services` so optional protocol startup is
+    owned by `startup_optional_runtimes`, while `startup_protocols` remains the
+    protocol implementation adapter.
+  - Acceptance: optional protocol startup order stays FTP, FTPS, WebDAV, SFTP;
+    KMS initialization still happens before optional protocol startup; buffer
+    profiling, audit, deadlock detection, metadata, IAM, notification, scanner,
+    heal, and observability startup remain after optional protocol startup.
+  - Must preserve: protocol feature gates, disabled protocol behavior,
+    protocol startup error mapping, fatal boundary on protocol startup errors,
+    startup order, shutdown order, readiness state, and runtime behavior.
+  - Verification: focused optional runtime/protocol/startup service tests,
+    RustFS lib check, migration/layer guards, formatting, diff hygiene, Rust
+    risk scan, branch freshness check, pre-commit quality gate, and
+    three-expert review.
+
 ## Next PRs
 
 1. `pure-move`: continue larger lifecycle hook slices for optional runtime
@@ -2041,9 +2057,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-021 isolates optional runtime shutdown ownership in `startup_optional_runtimes` and keeps `startup_services` as the startup/shutdown orchestrator. |
-| Migration preservation | passed | Protocol startup, shutdown order, readiness, HTTP shutdown, event notifier, audit, and profiling behavior remain unchanged. |
-| Testing/verification | passed | Focused optional runtime and startup service tests pass; remaining checks and final pre-commit are tracked below before push. |
+| Quality/architecture | passed | R-022 keeps protocol implementation details in `startup_protocols` and moves optional runtime startup ownership into `startup_optional_runtimes`. |
+| Migration preservation | passed | KMS-before-protocol ordering, protocol fatal boundary, protocol startup order, shutdown order, readiness, and HTTP shutdown behavior remain unchanged. |
+| Testing/verification | passed | Focused optional runtime, protocol, and startup service tests plus final checks are tracked below before push. |
 
 ## Verification Notes
 
@@ -2074,6 +2090,20 @@ Passed before push:
 - Issue #660 R-021 current slice:
   - `cargo test -p rustfs --lib startup_optional_runtimes -- --nocapture`:
     passed.
+  - `cargo test -p rustfs --lib startup_services -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 R-022 current slice:
+  - `cargo test -p rustfs --lib startup_optional_runtimes -- --nocapture`:
+    passed.
+  - `cargo test -p rustfs --lib startup_protocols -- --nocapture`: passed.
   - `cargo test -p rustfs --lib startup_services -- --nocapture`: passed.
   - `cargo check -p rustfs --lib`: passed.
   - `./scripts/check_architecture_migration_rules.sh`: passed.

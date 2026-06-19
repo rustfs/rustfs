@@ -28,9 +28,9 @@ use crate::{
     },
     startup_iam::{IamBootstrapDisposition, bootstrap_or_defer_iam_init, publish_ready_for_iam_bootstrap},
     startup_optional_runtimes::{
-        OptionalRuntimeServices, prepare_optional_runtime_shutdowns, shutdown_optional_runtime_services,
+        OptionalRuntimeServices, init_optional_runtime_services, prepare_optional_runtime_shutdowns,
+        shutdown_optional_runtime_services,
     },
-    startup_protocols::init_protocol_shutdown_senders,
 };
 use rustfs_audit::AuditResult;
 use rustfs_common::GlobalReadiness;
@@ -98,8 +98,7 @@ pub async fn init_startup_runtime_services(
 ) -> Result<StartupServiceRuntime> {
     init_kms_system(config).await?;
 
-    let protocol_shutdowns = init_protocol_shutdown_senders().await?;
-    let optional_runtimes = OptionalRuntimeServices::new(protocol_shutdowns);
+    let optional_runtimes = init_optional_runtime_services().await?;
 
     init_buffer_profile_system(config);
     init_audit_runtime().await;
