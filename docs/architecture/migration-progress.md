@@ -5,18 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-runtime-capability-snapshots`
-- Baseline: `origin/main` after `rustfs/rustfs#3603`
-  (`b106b628c164bf6cdca9e71ff5118711f99d4ab0`).
+- Branch: `overtrue/arch-workload-admission-owner-snapshots`
+- Baseline: `origin/main` after `rustfs/rustfs#3590`
+  (`8cf3c0bf0100d9d2234f08b48df31fd73b92ed43`).
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: wire read-only observability and endpoint-topology
-  snapshot providers in the RustFS runtime.
-- CI/script changes: extend migration guard coverage for RustFS runtime
-  capability provider implementations.
-- Docs changes: add RustFS provider notes to
-  [`runtime-capability-contracts.md`](runtime-capability-contracts.md) and
-  record the API-056/R-016 provider slice.
+- Rust code changes: expose read-only repair workload admission snapshots from
+  existing heal runtime counters.
+- CI/script changes: extend migration guard coverage for RustFS workload
+  admission provider implementations.
+- Docs changes: add RustFS heal provider notes to
+  [`workload-admission-contracts.md`](workload-admission-contracts.md) and
+  record the API-057/R-017 provider slice.
 
 ## Phase 0 Tasks
 
@@ -167,6 +167,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     behavior, endpoint pool/set/disk assignment, placement, readiness, locks,
     and local path privacy.
   - Verification: focused runtime capability tests, focused RustFS library
+    check, migration and layer guards, formatting, diff hygiene, risk scan, and
+    three-expert review.
+
+- [x] `API-057/R-017` Expose heal repair admission snapshot.
+  - Completed slice: implement a RustFS workload admission snapshot provider
+    that maps existing heal active-task and queue-length counters to the
+    `Repair` workload class.
+  - Acceptance: repair admission state is observable through the
+    `rustfs-concurrency` workload snapshot contract without changing heal
+    queueing, scheduling, retry, priority merge/drop, or repair behavior.
+  - Must preserve: heal request admission, queue capacity, scheduler wakeups,
+    task retry handling, active-task accounting, and repair execution.
+  - Verification: focused workload admission tests, focused RustFS library
     check, migration and layer guards, formatting, diff hygiene, risk scan, and
     three-expert review.
 
