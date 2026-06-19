@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-embedded-runtime-service-reuse`
-- Baseline: `origin/main`
-  (`131e9dc804a371b3384028da5797ca32a91ac493`).
+- Branch: `overtrue/arch-embedded-lifecycle-publication-reuse`
+- Baseline: `overtrue/arch-embedded-runtime-service-reuse`
+  (`00cf2509338ec6acdddc3b5fdf1a02dd52ed309a`).
+- Stacked on: rustfs/rustfs#3641.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: route embedded runtime services and shutdown cleanup
-  through startup service/shutdown helpers while preserving embedded-only fatal
-  and non-fatal behavior.
+- Rust code changes: route embedded ready publication, global init-time
+  publication, and ready logging through startup lifecycle helpers.
 - CI/script changes: none.
-- Docs changes: record the R-030 embedded runtime service reuse slice.
+- Docs changes: record the R-031 embedded lifecycle publication reuse slice.
 
 ## Phase 0 Tasks
 
@@ -2168,31 +2168,43 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
     freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `R-031` Reuse lifecycle publication boundaries in embedded mode.
+  - Do: move embedded IAM readiness publication, global init-time publication,
+    and ready-state logging behind startup lifecycle helpers.
+  - Acceptance: embedded startup still publishes readiness after runtime
+    service setup, preserves the `runtime readiness` error prefix on failure,
+    records global init time after successful readiness publication, and logs
+    the same ready endpoint message after the server handle is built.
+  - Must preserve: deferred IAM bootstrap readiness behavior, ready-inline
+    runtime readiness publication, startup failure shutdown signaling, global
+    init-time publication ordering, and endpoint-address normalization used by
+    the ready log.
+  - Verification: focused embedded/lifecycle checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
 ## Next PRs
 
-1. `pure-move`: continue embedded lifecycle reuse for final server-ready and
-   lifecycle publication edges.
-2. `contract`: continue extension contract coverage for future diagnostics and
+1. `contract`: continue extension contract coverage for future diagnostics and
    profiler handoff surfaces after runtime owners are stable.
+2. `pure-move`: continue pruning residual embedded startup-only orchestration
+   once the lifecycle helpers are merged.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-030 moves embedded runtime service and shutdown cleanup ownership into startup service/shutdown helpers while keeping binary-only runtime services separate. |
-| Migration preservation | passed | Embedded non-fatal KMS/audit/notification policy, bucket metadata/IAM ordering, readiness publication, and shutdown cleanup behavior remain unchanged. |
-| Testing/verification | passed | Focused embedded/service/shutdown checks, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
+| Quality/architecture | passed | R-031 keeps embedded server-handle ownership in `embedded.rs` while moving readiness/global-init/ready-log publication into `startup_lifecycle`. |
+| Migration preservation | passed | Runtime readiness error wrapping, IAM bootstrap disposition handling, global init-time ordering, and endpoint-address normalization remain unchanged. |
+| Testing/verification | passed | Focused embedded/lifecycle checks, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
 
 ## Verification Notes
 
 Passed before push:
 
-- Issue #660 R-030 current slice:
-  - `cargo test -p rustfs --lib startup_service_components -- --nocapture`:
-    passed.
-  - `cargo test -p rustfs --lib startup_services -- --nocapture`: passed; no
-    matching unit tests currently exist.
-  - `cargo test -p rustfs --lib startup_shutdown -- --nocapture`: passed.
+- Issue #660 R-031 current slice:
+  - `cargo test -p rustfs --lib startup_lifecycle -- --nocapture`: passed;
+    no matching unit tests currently exist.
   - `cargo test -p rustfs --lib embedded -- --nocapture`: passed; no
     matching unit tests currently exist.
   - `cargo check -p rustfs --lib`: passed.
@@ -2200,8 +2212,8 @@ Passed before push:
   - `./scripts/check_layer_dependencies.sh`: passed.
   - `cargo fmt --all --check`: passed.
   - `git diff --check`: passed.
-  - Rust risk scan on changed Rust files: passed; only existing doc-example
-    `Box<dyn Error>` / `println!` and existing test-only `panic!`.
+  - Rust risk scan on changed Rust files: passed; only existing embedded doc
+    examples use `Box<dyn Error>` / `println!`.
   - `make pre-commit`: passed.
 
 - Issue #660 X-012 current slice:

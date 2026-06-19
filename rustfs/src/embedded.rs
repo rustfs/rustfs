@@ -48,7 +48,7 @@
 
 use crate::config::Config;
 use crate::server::{ShutdownHandle, start_http_server};
-use crate::startup_iam::publish_ready_for_iam_bootstrap;
+use crate::startup_lifecycle::{log_embedded_server_ready, publish_embedded_startup_ready};
 use crate::startup_server::init_embedded_startup_listen_context;
 use crate::startup_services::init_embedded_startup_runtime_services;
 use crate::startup_shutdown::run_embedded_shutdown_cleanup;
@@ -335,14 +335,12 @@ impl RustFSServerBuilder {
                     ServerError::Init(e.to_string())
                 })?;
 
-        publish_ready_for_iam_bootstrap(service_runtime.iam_bootstrap, listen_context.readiness.as_ref(), None)
+        publish_embedded_startup_ready(service_runtime.iam_bootstrap, listen_context.readiness.as_ref())
             .await
             .map_err(|e| {
                 shutdown_embedded_server();
                 ServerError::Init(format!("runtime readiness: {e}"))
             })?;
-
-        rustfs_common::set_global_init_time_now().await;
 
         let server = RustFSServer {
             address: bound_addr,
@@ -354,15 +352,7 @@ impl RustFSServerBuilder {
             temp_dir: temp_dir_guard.map(|g| g.keep()),
         };
 
-        info!(
-            target: "rustfs::embedded",
-            component = LOG_COMPONENT_EMBEDDED,
-            subsystem = LOG_SUBSYSTEM_EMBEDDED,
-            event = "embedded_server_state",
-            state = "ready",
-            "RustFS embedded server ready at http://{}",
-            server.endpoint_address()
-        );
+        log_embedded_server_ready(server.endpoint_address());
 
         Ok(server)
     }

@@ -14,21 +14,24 @@
 
 use crate::{
     server::{ServiceStateManager, ShutdownHandle, wait_for_shutdown},
-    startup_iam::publish_ready_for_iam_bootstrap,
+    startup_iam::{IamBootstrapDisposition, publish_ready_for_iam_bootstrap},
     startup_services::StartupServiceRuntime,
     startup_shutdown::run_startup_shutdown_sequence,
     storage_compat::ECStore,
 };
 use rustfs_common::GlobalReadiness;
 use rustfs_scanner::init_data_scanner;
-use std::{io::Result, sync::Arc};
+use std::{io::Result, net::SocketAddr, sync::Arc};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 const LOG_COMPONENT_MAIN: &str = "main";
+const LOG_COMPONENT_EMBEDDED: &str = "embedded";
 const LOG_SUBSYSTEM_STARTUP: &str = "startup";
+const LOG_SUBSYSTEM_EMBEDDED: &str = "embedded";
 const EVENT_SERVER_READY: &str = "server_ready";
 const EVENT_SERVER_SHUTDOWN_STATE: &str = "server_shutdown_state";
+const EVENT_EMBEDDED_SERVER_STATE: &str = "embedded_server_state";
 
 pub struct StartupRuntimeLifecycle {
     pub server_address: String,
@@ -97,4 +100,22 @@ pub async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifecycle) -
         "RustFS server stopped"
     );
     Ok(())
+}
+
+pub async fn publish_embedded_startup_ready(iam_bootstrap: IamBootstrapDisposition, readiness: &GlobalReadiness) -> Result<()> {
+    publish_ready_for_iam_bootstrap(iam_bootstrap, readiness, None).await?;
+    rustfs_common::set_global_init_time_now().await;
+    Ok(())
+}
+
+pub fn log_embedded_server_ready(endpoint_address: SocketAddr) {
+    info!(
+        target: "rustfs::embedded",
+        component = LOG_COMPONENT_EMBEDDED,
+        subsystem = LOG_SUBSYSTEM_EMBEDDED,
+        event = EVENT_EMBEDDED_SERVER_STATE,
+        state = "ready",
+        "RustFS embedded server ready at http://{}",
+        endpoint_address
+    );
 }

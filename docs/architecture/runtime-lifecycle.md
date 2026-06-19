@@ -97,6 +97,13 @@ shutdown cleanup. Embedded-specific behavior still owns warning-only
 KMS/audit/notification failures, no binary-only background sidecars, no state
 manager, and the one-shot server handle cleanup used by embedded shutdown.
 
+## Embedded Lifecycle Publication Reuse
+
+Embedded ready publication should share startup lifecycle helpers for IAM
+readiness publication, global init-time publication, and ready-state logging.
+Embedded-specific behavior still owns server handle construction, endpoint
+address normalization, and process-local shutdown cleanup.
+
 ## AppContext Foundation
 
 Early AppContext work should split resolver files and add compatibility tests before
