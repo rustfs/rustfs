@@ -533,10 +533,6 @@ cat >"$ECSTORE_OBJECT_API_EXTERNAL_ALIAS_EXPECTED_FILE" <<'EOF'
 crates/heal/src/heal/storage_compat.rs:HealObjectInfo=ObjectInfo
 crates/heal/src/heal/storage_compat.rs:HealObjectOptions=ObjectOptions
 crates/heal/src/heal/storage_compat.rs:HealPutObjReader=PutObjReader
-crates/iam/src/storage_compat.rs:IamConfigObjectInfo=ObjectInfo
-crates/iam/src/storage_compat.rs:IamConfigObjectOptions=ObjectOptions
-crates/iam/src/store/storage_compat.rs:IamObjectInfo=ObjectInfo
-crates/iam/src/store/storage_compat.rs:IamObjectOptions=ObjectOptions
 crates/protocols/src/swift/storage_compat.rs:SwiftGetObjectReader=GetObjectReader
 crates/protocols/src/swift/storage_compat.rs:SwiftObjectInfo=ObjectInfo
 crates/protocols/src/swift/storage_compat.rs:SwiftObjectOptions=ObjectOptions
