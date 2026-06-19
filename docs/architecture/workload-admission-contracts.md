@@ -92,3 +92,23 @@ snapshot from the existing replication pool and queue statistics:
 This is an observation surface only. Replication admission, queue channel
 capacity, worker resize behavior, MRF handling, target dispatch, and resync
 behavior are unchanged.
+
+## RustFS Runtime Owner Snapshot Extraction
+
+The RustFS integration layer now extends the workload admission registry with
+additional read-only owner mappings:
+
+- `ForegroundRead` reuses the storage `ConcurrencyManager` disk-read permit
+  snapshot so the RustFS-level provider exposes the same active and limit
+  counts as the storage-local provider.
+- `Scanner` reports the existing scanner active work-unit counter. When the
+  counter is zero, the snapshot remains `Unknown` because the current counter
+  cannot distinguish an idle scanner from a scanner that has not initialized.
+- `Metadata` reports `Open` once the bucket metadata runtime handle is
+  available, and `Unknown` before initialization.
+- `ForegroundWrite` remains `Unknown` until a write-specific admission owner
+  exposes a read-only surface.
+
+This is an observation surface only. Disk-read permit acquisition, scanner
+cycle scheduling, bucket metadata loading, metadata locks, object write paths,
+and queue behavior are unchanged.

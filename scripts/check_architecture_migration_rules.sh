@@ -306,6 +306,30 @@ require_source_contains \
   "RustFS workload admission snapshot provider implementation"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
+  "pub fn foreground_read_workload_admission_snapshot() -> WorkloadAdmissionSnapshot" \
+  "RustFS foreground-read workload admission snapshot helper"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "WorkloadClass::ForegroundRead => foreground_read_workload_admission_snapshot()" \
+  "RustFS foreground-read workload admission class mapping"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "pub fn metadata_workload_admission_snapshot() -> WorkloadAdmissionSnapshot" \
+  "RustFS metadata workload admission snapshot helper"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "WorkloadClass::Metadata => metadata_workload_admission_snapshot()" \
+  "RustFS metadata workload admission class mapping"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "pub fn scanner_workload_admission_snapshot() -> WorkloadAdmissionSnapshot" \
+  "RustFS scanner workload admission snapshot helper"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "WorkloadClass::Scanner => scanner_workload_admission_snapshot()" \
+  "RustFS scanner workload admission class mapping"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
   "pub fn repair_workload_admission_snapshot() -> WorkloadAdmissionSnapshot" \
   "RustFS repair workload admission snapshot helper"
 require_source_contains \

@@ -5,18 +5,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-scanner-replication-admission-snapshots`
-- Baseline: `origin/main` after `rustfs/rustfs#3605`
-  (`00ca3b7c1c4ffbe98c0dd8530cb26b63e94c586a`).
+- Branch: `overtrue/arch-foreground-scanner-admission-snapshots`
+- Baseline: `origin/main` after `rustfs/rustfs#3606`
+  (`7cb7aefc3bfd33cfaa46c718db15f00b0471fe88`).
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: extend read-only workload admission snapshots from heal
-  repair counters to replication runtime worker and queue counters.
+- Rust code changes: extend the RustFS workload admission registry from
+  repair/replication snapshots to foreground-read, scanner, and metadata owner
+  snapshots.
 - CI/script changes: extend migration guard coverage for RustFS workload
   admission provider implementations.
-- Docs changes: add RustFS replication provider notes to
+- Docs changes: add RustFS runtime owner provider notes to
   [`workload-admission-contracts.md`](workload-admission-contracts.md) and
-  record the API-058/R-018 provider slice.
+  record the API-059/R-019 provider slice.
 
 ## Phase 0 Tasks
 
@@ -194,6 +195,21 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Must preserve: replication admission, queue channel capacity, worker resize
     policy, MRF handling, target dispatch, resync behavior, and queue stats
     accounting.
+  - Verification: focused workload admission tests, focused RustFS library
+    check, migration and layer guards, formatting, diff hygiene, risk scan, and
+    three-expert review.
+
+- [x] `API-059/R-019` Expose RustFS runtime owner admission snapshots.
+  - Completed slice: extend the RustFS workload admission provider to map
+    foreground-read disk permit state, scanner active work units, and bucket
+    metadata runtime initialization into the workload registry.
+  - Acceptance: RustFS-level workload admission snapshots expose existing
+    foreground-read, scanner, and metadata owner state without changing
+    admission, queueing, scanner scheduling, metadata loading, metadata locks,
+    or object write behavior.
+  - Must preserve: disk-read semaphore acquisition, scanner cycle scheduling,
+    bucket metadata initialization and loading, object write paths, request
+    guards, and queue behavior.
   - Verification: focused workload admission tests, focused RustFS library
     check, migration and layer guards, formatting, diff hygiene, risk scan, and
     three-expert review.
