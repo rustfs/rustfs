@@ -58,11 +58,11 @@ pub(crate) use rustfs_ecstore::config::init as init_ecstore_config_for_scanner_t
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::disk::{DiskOption, endpoint::Endpoint, new_disk};
 
-pub type ScannerGetObjectReader = rustfs_ecstore::store_api::GetObjectReader;
-pub type ScannerObjectInfo = rustfs_ecstore::store_api::ObjectInfo;
-pub type ScannerObjectOptions = rustfs_ecstore::store_api::ObjectOptions;
+pub type ScannerGetObjectReader = rustfs_ecstore::object_api::GetObjectReader;
+pub type ScannerObjectInfo = rustfs_ecstore::object_api::ObjectInfo;
+pub type ScannerObjectOptions = rustfs_ecstore::object_api::ObjectOptions;
 pub type ScannerObjectToDelete = ObjectToDelete;
-pub type ScannerPutObjReader = rustfs_ecstore::store_api::PutObjReader;
+pub type ScannerPutObjReader = rustfs_ecstore::object_api::PutObjReader;
 
 pub(crate) fn resolve_scanner_object_store_handle() -> Option<Arc<ECStore>> {
     rustfs_ecstore::resolve_object_store_handle()

@@ -29,6 +29,6 @@ pub(crate) use rustfs_ecstore::global::GLOBAL_LOCAL_DISK_MAP;
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::disk::{DiskOption, new_disk};
 
-pub type HealObjectInfo = rustfs_ecstore::store_api::ObjectInfo;
-pub type HealObjectOptions = rustfs_ecstore::store_api::ObjectOptions;
-pub type HealPutObjReader = rustfs_ecstore::store_api::PutObjReader;
+pub type HealObjectInfo = rustfs_ecstore::object_api::ObjectInfo;
+pub type HealObjectOptions = rustfs_ecstore::object_api::ObjectOptions;
+pub type HealPutObjReader = rustfs_ecstore::object_api::PutObjReader;

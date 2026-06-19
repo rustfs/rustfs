@@ -5,18 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-direct-storage-ops`
-- Baseline: stacked after `rustfs/rustfs#3608`
-  (`d9a08f00bdc0422d519d3f3f69f75761cfa76bed`).
+- Branch: `overtrue/arch-ecstore-object-api-boundary`
+- Baseline: stacked after `rustfs/rustfs#3609`
+  (`57bde45c88d0be7f1d9264ad6b5b174e45a4f7cb`).
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: remove the remaining public ECStore `store_api`
-  operation compatibility subtraits and move internal generic bounds to
-  crate-private shared storage-api contract constraints.
-- CI/script changes: shrink migration guard coverage so it rejects restored
-  store-api operation method signatures without requiring the removed facade
-  module, and extend direct storage-api contract coverage.
-- Docs changes: record the API-061 operation compatibility cleanup slice.
+- Rust code changes: introduce an explicit ECStore `object_api` public boundary
+  for ECStore-owned object DTO and reader contracts, then migrate external
+  compatibility boundaries off the legacy `store_api` path.
+- CI/script changes: make the migration guard reject external storage
+  compatibility aliases that keep using `rustfs_ecstore::store_api`.
+- Docs changes: record the API-062 object API boundary slice.
 
 ## Phase 0 Tasks
 
@@ -246,6 +245,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: focused ECStore contract tests, focused ECStore library
     check, migration and layer guards, formatting, diff hygiene, risk scan, and
     three-expert review.
+
+- [x] `API-062` Establish explicit ECStore object API boundary.
+  - Completed slice: add `rustfs_ecstore::object_api` as the explicit public
+    path for ECStore-owned object DTO and reader contracts, then migrate
+    RustFS, scanner, heal, IAM, Swift, S3 Select, notify, and ECStore
+    integration-test compatibility aliases away from the legacy public
+    `store_api` path.
+  - Acceptance: external compatibility boundary modules no longer reference
+    `rustfs_ecstore::store_api` for ECStore-owned object DTO and reader
+    aliases, while `store_api` remains available only as the old internal
+    implementation module pending final compatibility removal.
+  - Must preserve: object metadata shape, option defaults, reader/writer
+    behavior, Swift/scanner/heal/IAM/S3 Select/notify boundary semantics, and
+    all storage hot paths.
+  - Verification: focused ECStore/RustFS/downstream compile checks, migration
+    guard, formatting, diff hygiene, risk scan, and three-expert review.
 
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.
   - Acceptance: `./scripts/check_architecture_migration_rules.sh` parses the

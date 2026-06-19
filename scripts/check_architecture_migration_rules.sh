@@ -617,14 +617,10 @@ fi
     --glob '*storage_compat.rs' \
     --glob '!crates/ecstore/**' \
     --glob '!crates/e2e_test/**' || true
-) | awk '
-  $0 !~ /^[^:]+:[0-9]+:[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?type[[:space:]]+[A-Za-z0-9_]+[[:space:]]*=[[:space:]]*rustfs_ecstore::store_api::(GetObjectReader|ObjectInfo|ObjectOptions|PutObjReader);$/ {
-    print
-  }
-' >"$UNAPPROVED_STORE_API_COMPAT_ALIAS_HITS_FILE"
+) >"$UNAPPROVED_STORE_API_COMPAT_ALIAS_HITS_FILE"
 
 if [[ -s "$UNAPPROVED_STORE_API_COMPAT_ALIAS_HITS_FILE" ]]; then
-  report_failure "storage compatibility boundaries may only keep explicit ECStore-owned store_api type aliases: $(paste -sd '; ' "$UNAPPROVED_STORE_API_COMPAT_ALIAS_HITS_FILE")"
+  report_failure "storage compatibility boundaries must use rustfs_ecstore::object_api for ECStore-owned object DTO and reader aliases: $(paste -sd '; ' "$UNAPPROVED_STORE_API_COMPAT_ALIAS_HITS_FILE")"
 fi
 
 cat >"$ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE" <<'EOF'

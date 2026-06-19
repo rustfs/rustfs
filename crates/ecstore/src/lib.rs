@@ -32,6 +32,7 @@ pub mod error;
 pub mod global;
 pub mod metrics_realtime;
 pub mod notification_sys;
+pub mod object_api;
 pub mod pools;
 pub mod rebalance;
 pub mod rio;
