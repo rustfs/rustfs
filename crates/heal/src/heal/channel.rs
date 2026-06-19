@@ -262,7 +262,13 @@ impl HealChannelProcessor {
             "Heal query received"
         );
 
-        let (summary, detail, items) = match self.heal_manager.get_task_report_for_path(&heal_path, &client_token).await {
+        let report = if heal_path.trim_matches('/').is_empty() {
+            self.heal_manager.get_task_report(&client_token).await
+        } else {
+            self.heal_manager.get_task_report_for_path(&heal_path, &client_token).await
+        };
+
+        let (summary, detail, items) = match report {
             Ok(HealTaskReport {
                 status: HealTaskStatus::Pending | HealTaskStatus::Running,
                 result_items,
@@ -291,7 +297,9 @@ impl HealChannelProcessor {
                 status: HealTaskStatus::Failed { error },
                 result_items,
             }) => ("stopped".to_string(), Some(error), result_items),
-            Err(crate::Error::TaskNotFound { .. }) => ("finished".to_string(), None, Vec::new()),
+            Err(crate::Error::TaskNotFound { .. }) => {
+                ("notFound".to_string(), Some("heal task not found or expired".to_string()), Vec::new())
+            }
             Err(crate::Error::InvalidClientToken) => {
                 let response = HealChannelResponse {
                     request_id: client_token,
@@ -908,7 +916,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_query_request_reports_finished_when_task_is_not_active() {
+    async fn test_process_query_request_reports_not_found_when_task_is_unknown() {
         let heal_manager = create_test_heal_manager();
         let processor = HealChannelProcessor::new(heal_manager);
         let (tx, rx) = oneshot::channel();
@@ -924,10 +932,11 @@ mod tests {
             .expect("query response should be returned");
         assert!(response.success);
         assert_eq!(response.request_id, "completed-token");
+        assert_eq!(response.error.as_deref(), Some("heal task not found or expired"));
         let payload: serde_json::Value =
             serde_json::from_slice(response.data.as_deref().expect("status payload should be present"))
                 .expect("status payload should be json");
-        assert_eq!(payload["summary"], "finished");
+        assert_eq!(payload["summary"], "notFound");
         assert_eq!(payload["items"].as_array().expect("items should be an array").len(), 0);
     }
 
@@ -1018,7 +1027,46 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_slice(response.data.as_deref().expect("status payload should be present"))
                 .expect("status payload should be json");
-        assert_eq!(payload["summary"], "finished");
+        assert_eq!(payload["summary"], "notFound");
+        assert_eq!(payload["items"].as_array().expect("items should be an array").len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_process_query_request_empty_path_uses_client_token_directly() {
+        let heal_manager = create_test_heal_manager();
+        let request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec![],
+                set_disk_id: "pool_0_set_1".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::High,
+        );
+        let task_id = request.id.clone();
+        heal_manager
+            .submit_heal_request(request)
+            .await
+            .expect("request should be accepted");
+
+        let processor = HealChannelProcessor::new(heal_manager);
+        let (tx, rx) = oneshot::channel();
+
+        processor
+            .process_query_request(String::new(), task_id.clone(), tx)
+            .await
+            .expect("query should process");
+
+        let response = rx
+            .await
+            .expect("oneshot should resolve")
+            .expect("query response should be returned");
+        assert!(response.success);
+        assert_eq!(response.request_id, task_id);
+        assert!(response.error.is_none());
+        let payload: serde_json::Value =
+            serde_json::from_slice(response.data.as_deref().expect("status payload should be present"))
+                .expect("status payload should be json");
+        assert_eq!(payload["summary"], "running");
         assert_eq!(payload["items"].as_array().expect("items should be an array").len(), 0);
     }
 
