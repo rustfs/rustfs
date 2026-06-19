@@ -530,13 +530,6 @@ if [[ -s "$ECSTORE_OBJECT_API_STORAGE_ALIAS_HITS_FILE" ]]; then
 fi
 
 cat >"$ECSTORE_OBJECT_API_EXTERNAL_ALIAS_EXPECTED_FILE" <<'EOF'
-crates/heal/src/heal/storage_compat.rs:HealObjectInfo=ObjectInfo
-crates/heal/src/heal/storage_compat.rs:HealObjectOptions=ObjectOptions
-crates/heal/src/heal/storage_compat.rs:HealPutObjReader=PutObjReader
-rustfs/src/storage/storage_compat.rs:GetObjectReader=GetObjectReader
-rustfs/src/storage/storage_compat.rs:ObjectInfo=ObjectInfo
-rustfs/src/storage/storage_compat.rs:ObjectOptions=ObjectOptions
-rustfs/src/storage/storage_compat.rs:PutObjReader=PutObjReader
 EOF
 
 (
