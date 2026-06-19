@@ -17,11 +17,11 @@ use std::sync::Arc;
 pub(crate) const IAM_CONFIG_ROOT_PREFIX: &str = rustfs_ecstore::config::RUSTFS_CONFIG_PREFIX;
 
 pub(crate) type IamEcstoreError = rustfs_ecstore::error::Error;
-pub(crate) type IamConfigObjectInfo = rustfs_ecstore::object_api::ObjectInfo;
-pub(crate) type IamConfigObjectOptions = rustfs_ecstore::object_api::ObjectOptions;
 pub(crate) type IamStorageError = rustfs_ecstore::error::StorageError;
 pub(crate) type IamStorageResult<T> = rustfs_ecstore::error::Result<T>;
 pub(crate) type IamStore = rustfs_ecstore::store::ECStore;
+pub(crate) type IamConfigObjectInfo = <IamStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
+pub(crate) type IamConfigObjectOptions = <IamStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
 
 pub(crate) async fn read_iam_config_no_lock(api: Arc<IamStore>, file: &str) -> IamStorageResult<Vec<u8>> {
     rustfs_ecstore::config::com::read_config_no_lock(api, file).await

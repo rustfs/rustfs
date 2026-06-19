@@ -41,6 +41,7 @@ pub use service_state::ShutdownSignal;
 pub use service_state::wait_for_shutdown;
 
 // Items only used within the library crate (admin handlers, server/http.rs, etc.).
+pub(crate) use event::convert_ecstore_object_info;
 pub(crate) use http::HeaderMapCarrier;
 pub(crate) use http::active_http_requests;
 pub(crate) use layer::RequestContextLayer;

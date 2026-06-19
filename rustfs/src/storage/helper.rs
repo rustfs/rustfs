@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::server::{is_audit_module_enabled, is_notify_module_enabled};
+use crate::server::{convert_ecstore_object_info, is_audit_module_enabled, is_notify_module_enabled};
 use crate::storage::access::{ReqInfo, request_context_from_req};
 use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
 use hashbrown::HashMap;
@@ -206,7 +206,7 @@ impl OperationHelper {
         // initialize event builder
         // object is a placeholder that must be set later using the `object()` method.
         let event_builder = if notify_enabled {
-            let mut event_builder = EventArgsBuilder::new(event, bucket, event_object)
+            let mut event_builder = EventArgsBuilder::new(event, bucket, convert_ecstore_object_info(event_object))
                 .host(get_request_host(&req.headers))
                 .port(get_request_port(&req.headers))
                 .user_agent(get_request_user_agent(&req.headers))
@@ -241,7 +241,7 @@ impl OperationHelper {
         if let Self::Enabled(state) = &mut self
             && let Some(builder) = state.event_builder.take()
         {
-            state.event_builder = Some(builder.object(object_info));
+            state.event_builder = Some(builder.object(convert_ecstore_object_info(object_info)));
         }
         self
     }

@@ -79,6 +79,7 @@ use crate::app::storage_compat::{
     versioning::VersioningApi,
     versioning_sys::BucketVersioningSys,
 };
+use crate::server::convert_ecstore_object_info;
 use rustfs_concurrency::GetObjectQueueSnapshot;
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateTargetDecision, ReplicationState, ReplicationStatusType,
@@ -3663,11 +3664,11 @@ impl DefaultObjectUsecase {
                     let event_args = EventArgsBuilder::new(
                         event_name,
                         notify_bucket.clone(),
-                        ObjectInfo {
+                        convert_ecstore_object_info(ObjectInfo {
                             name: dobj.object_name.clone(),
                             bucket: notify_bucket.clone(),
                             ..Default::default()
-                        },
+                        }),
                     )
                     .version_id(dobj.version_id.map(|v| v.to_string()).unwrap_or_default())
                     .req_params(extract_params_header(&req_headers))
@@ -4826,7 +4827,7 @@ impl DefaultObjectUsecase {
             let event_args = rustfs_notify::EventArgs {
                 event_name: put_event_name_for_post_object(false),
                 bucket_name: bucket.clone(),
-                object: obj_info.clone().into(),
+                object: convert_ecstore_object_info(obj_info.clone()),
                 req_params: req_params.clone(),
                 resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
                 version_id: version_id.clone(),
