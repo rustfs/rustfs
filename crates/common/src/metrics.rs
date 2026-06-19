@@ -319,6 +319,36 @@ pub enum ScannerReplicationRepairKind {
     SiteActiveResync,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScannerReplicationRepairRole {
+    RepairAdmission,
+    BoundarySignal,
+}
+
+impl ScannerReplicationRepairRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RepairAdmission => "repair_admission",
+            Self::BoundarySignal => "boundary_signal",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScannerReplicationExecutionOwner {
+    BucketReplicationQueue,
+    SiteReplicationRuntime,
+}
+
+impl ScannerReplicationExecutionOwner {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BucketReplicationQueue => "bucket_replication_queue",
+            Self::SiteReplicationRuntime => "site_replication_runtime",
+        }
+    }
+}
+
 impl ScannerReplicationRepairKind {
     const ALL: [Self; 6] = [
         Self::BucketObject,
@@ -335,6 +365,24 @@ impl ScannerReplicationRepairKind {
                 ScannerWorkSource::BucketReplication
             }
             Self::SitePassiveRequeue | Self::SiteActiveResync => ScannerWorkSource::SiteReplication,
+        }
+    }
+
+    pub fn scanner_role(self) -> ScannerReplicationRepairRole {
+        match self {
+            Self::BucketObject | Self::BucketDeleteMarker | Self::BucketVersionPurge | Self::BucketExistingObject => {
+                ScannerReplicationRepairRole::RepairAdmission
+            }
+            Self::SitePassiveRequeue | Self::SiteActiveResync => ScannerReplicationRepairRole::BoundarySignal,
+        }
+    }
+
+    pub fn execution_owner(self) -> ScannerReplicationExecutionOwner {
+        match self {
+            Self::BucketObject | Self::BucketDeleteMarker | Self::BucketVersionPurge | Self::BucketExistingObject => {
+                ScannerReplicationExecutionOwner::BucketReplicationQueue
+            }
+            Self::SitePassiveRequeue | Self::SiteActiveResync => ScannerReplicationExecutionOwner::SiteReplicationRuntime,
         }
     }
 
@@ -515,6 +563,8 @@ impl ScannerSourceWorkValues {
         ScannerReplicationRepairSnapshot {
             source: kind.source().as_str().to_string(),
             kind: kind.as_str().to_string(),
+            scanner_role: kind.scanner_role().as_str().to_string(),
+            execution_owner: kind.execution_owner().as_str().to_string(),
             checked: self.checked,
             queued: self.queued,
             executed: self.executed,
@@ -896,6 +946,10 @@ pub struct ScannerSourceWorkSnapshot {
 pub struct ScannerReplicationRepairSnapshot {
     pub source: String,
     pub kind: String,
+    #[serde(default)]
+    pub scanner_role: String,
+    #[serde(default)]
+    pub execution_owner: String,
     pub checked: u64,
     pub queued: u64,
     pub executed: u64,
@@ -3407,6 +3461,14 @@ mod tests {
             ScannerReplicationRepairKind::BucketExistingObject,
             ScannerSourceWorkUpdate::queued(4),
         );
+        metrics.record_scanner_replication_repair_work(
+            ScannerReplicationRepairKind::SitePassiveRequeue,
+            ScannerSourceWorkUpdate::missed(5),
+        );
+        metrics.record_scanner_replication_repair_work(
+            ScannerReplicationRepairKind::SiteActiveResync,
+            ScannerSourceWorkUpdate::queued(6),
+        );
 
         let report = metrics.report().await;
         let object = report
@@ -3414,6 +3476,8 @@ mod tests {
             .iter()
             .find(|repair| repair.source == "bucket_replication" && repair.kind == "object")
             .expect("bucket object repair work should be visible");
+        assert_eq!(object.scanner_role, "repair_admission");
+        assert_eq!(object.execution_owner, "bucket_replication_queue");
         assert_eq!(object.queued, 2);
 
         let delete_marker = report
@@ -3421,6 +3485,8 @@ mod tests {
             .iter()
             .find(|repair| repair.source == "bucket_replication" && repair.kind == "delete_marker")
             .expect("bucket delete-marker repair work should be visible");
+        assert_eq!(delete_marker.scanner_role, "repair_admission");
+        assert_eq!(delete_marker.execution_owner, "bucket_replication_queue");
         assert_eq!(delete_marker.missed, 1);
 
         let version_purge = report
@@ -3428,6 +3494,8 @@ mod tests {
             .iter()
             .find(|repair| repair.source == "bucket_replication" && repair.kind == "version_purge")
             .expect("bucket version purge repair work should be visible");
+        assert_eq!(version_purge.scanner_role, "repair_admission");
+        assert_eq!(version_purge.execution_owner, "bucket_replication_queue");
         assert_eq!(version_purge.skipped, 3);
 
         let existing_object = report
@@ -3435,7 +3503,69 @@ mod tests {
             .iter()
             .find(|repair| repair.source == "bucket_replication" && repair.kind == "existing_object")
             .expect("bucket existing object repair work should be visible");
+        assert_eq!(existing_object.scanner_role, "repair_admission");
+        assert_eq!(existing_object.execution_owner, "bucket_replication_queue");
         assert_eq!(existing_object.queued, 4);
+
+        let passive_requeue = report
+            .replication_repair
+            .iter()
+            .find(|repair| repair.source == "site_replication" && repair.kind == "passive_requeue")
+            .expect("site passive requeue boundary work should be visible");
+        assert_eq!(passive_requeue.scanner_role, "boundary_signal");
+        assert_eq!(passive_requeue.execution_owner, "site_replication_runtime");
+        assert_eq!(passive_requeue.missed, 5);
+
+        let active_resync = report
+            .replication_repair
+            .iter()
+            .find(|repair| repair.source == "site_replication" && repair.kind == "active_resync")
+            .expect("site active resync boundary work should be visible");
+        assert_eq!(active_resync.scanner_role, "boundary_signal");
+        assert_eq!(active_resync.execution_owner, "site_replication_runtime");
+        assert_eq!(active_resync.queued, 6);
+    }
+
+    #[test]
+    fn scanner_replication_repair_kind_sources_are_stable() {
+        let bucket_kinds = [
+            ScannerReplicationRepairKind::BucketObject,
+            ScannerReplicationRepairKind::BucketDeleteMarker,
+            ScannerReplicationRepairKind::BucketVersionPurge,
+            ScannerReplicationRepairKind::BucketExistingObject,
+        ];
+        for kind in bucket_kinds {
+            assert_eq!(kind.source(), ScannerWorkSource::BucketReplication);
+            assert_eq!(kind.scanner_role(), ScannerReplicationRepairRole::RepairAdmission);
+            assert_eq!(kind.execution_owner(), ScannerReplicationExecutionOwner::BucketReplicationQueue);
+        }
+
+        assert_eq!(
+            ScannerReplicationRepairKind::SitePassiveRequeue.source(),
+            ScannerWorkSource::SiteReplication
+        );
+        assert_eq!(
+            ScannerReplicationRepairKind::SiteActiveResync.source(),
+            ScannerWorkSource::SiteReplication
+        );
+        assert_eq!(
+            ScannerReplicationRepairKind::SitePassiveRequeue.scanner_role(),
+            ScannerReplicationRepairRole::BoundarySignal
+        );
+        assert_eq!(
+            ScannerReplicationRepairKind::SiteActiveResync.scanner_role(),
+            ScannerReplicationRepairRole::BoundarySignal
+        );
+        assert_eq!(
+            ScannerReplicationRepairKind::SitePassiveRequeue.execution_owner(),
+            ScannerReplicationExecutionOwner::SiteReplicationRuntime
+        );
+        assert_eq!(
+            ScannerReplicationRepairKind::SiteActiveResync.execution_owner(),
+            ScannerReplicationExecutionOwner::SiteReplicationRuntime
+        );
+        assert_eq!(ScannerReplicationRepairKind::SitePassiveRequeue.as_str(), "passive_requeue");
+        assert_eq!(ScannerReplicationRepairKind::SiteActiveResync.as_str(), "active_resync");
     }
 
     #[tokio::test]
