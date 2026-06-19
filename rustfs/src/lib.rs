@@ -83,6 +83,7 @@ pub(crate) mod table_catalog;
 pub mod tls;
 pub mod update;
 pub mod version;
+pub mod workload_admission;
 
 // Re-export from rustfs_utils so that config sub-modules can use
 // `crate::apply_external_env_compat` without breaking.

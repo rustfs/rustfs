@@ -59,3 +59,19 @@ The RustFS storage `ConcurrencyManager` now implements
 This is an observation surface only. Permit acquisition, priority assignment,
 buffer sizing, storage media detection, request guards, and queue behavior are
 unchanged.
+
+## Heal Repair Snapshot Extraction
+
+The RustFS integration layer now exposes a read-only repair admission snapshot
+from the heal runtime counters:
+
+- `Repair` reports the current heal active task count.
+- `queued` reports the current heal queue length.
+- `limit` remains `None` because the configured heal queue and concurrency
+  limits live behind the async heal manager state.
+- Other workload classes remain `Unknown` in this provider until their owning
+  runtime components expose read-only status.
+
+This is an observation surface only. Heal request admission, queue capacity,
+priority merge/drop policy, task scheduling, retry handling, and repair
+behavior are unchanged.

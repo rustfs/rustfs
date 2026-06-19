@@ -284,6 +284,10 @@ require_source_line \
   "rustfs/src/lib.rs" \
   "pub mod runtime_capabilities;" \
   "RustFS runtime capability provider module"
+require_source_line \
+  "rustfs/src/lib.rs" \
+  "pub mod workload_admission;" \
+  "RustFS workload admission provider module"
 require_source_contains \
   "rustfs/src/runtime_capabilities.rs" \
   "impl ObservabilitySnapshotProvider for RustFsObservabilitySnapshotProvider" \
@@ -296,6 +300,18 @@ require_source_contains \
   "rustfs/src/runtime_capabilities.rs" \
   "pub fn topology_snapshot_from_endpoint_pools(endpoint_pools: &EndpointServerPools) -> TopologySnapshot" \
   "RustFS endpoint topology snapshot helper"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "impl WorkloadAdmissionSnapshotProvider for RustFsWorkloadAdmissionSnapshotProvider" \
+  "RustFS workload admission snapshot provider implementation"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "pub fn repair_workload_admission_snapshot() -> WorkloadAdmissionSnapshot" \
+  "RustFS repair workload admission snapshot helper"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "WorkloadClass::Repair => repair_workload_admission_snapshot()" \
+  "RustFS repair workload admission class mapping"
 
 (
   cd "$ROOT_DIR"
