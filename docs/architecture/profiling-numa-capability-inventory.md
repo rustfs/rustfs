@@ -66,9 +66,12 @@ Future sidecars for profiling, eBPF, or NUMA must preserve these invariants:
 
 `X-012`:
 
-- Add an optional profiling/eBPF extension point that can observe capability
-  status.
-- Keep unsupported targets and disabled sidecars as no-op.
+- Define the `ops.profiler.v1` extension schema for profiling capability
+  reporting, backend status, redaction requirements, and provenance.
+- Keep the schema capability-only; it must not request profiler execution,
+  start sidecars, or change profile export behavior.
+- Keep unsupported targets, disabled sidecars, and unknown future backends
+  representable as no-op capability states.
 
 `X-013`:
 
