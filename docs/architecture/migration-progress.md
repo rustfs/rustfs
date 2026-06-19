@@ -5,17 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-object-api-boundary`
-- Baseline: stacked after `rustfs/rustfs#3609`
-  (`57bde45c88d0be7f1d9264ad6b5b174e45a4f7cb`).
+- Branch: `overtrue/arch-ecstore-private-store-api`
+- Baseline: stacked after `rustfs/rustfs#3610`
+  (`f667ef5393c5a2b1e04f19c140111d9c7435028b`).
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: introduce an explicit ECStore `object_api` public boundary
-  for ECStore-owned object DTO and reader contracts, then migrate external
-  compatibility boundaries off the legacy `store_api` path.
-- CI/script changes: make the migration guard reject external storage
-  compatibility aliases that keep using `rustfs_ecstore::store_api`.
-- Docs changes: record the API-062 object API boundary slice.
+- Rust code changes: make ECStore `store_api` private and keep the public
+  object DTO and reader compatibility path behind `rustfs_ecstore::object_api`.
+- CI/script changes: make the migration guard reject restoring the public
+  ECStore `store_api` module.
+- Docs changes: record the API-063 public `store_api` cleanup slice.
 
 ## Phase 0 Tasks
 
@@ -261,6 +260,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     all storage hot paths.
   - Verification: focused ECStore/RustFS/downstream compile checks, migration
     guard, formatting, diff hygiene, risk scan, and three-expert review.
+
+- [x] `API-063` Make legacy ECStore store API module private.
+  - Completed slice: remove `rustfs_ecstore::store_api` from the public crate
+    module surface after external compatibility boundaries moved to
+    `rustfs_ecstore::object_api`.
+  - Acceptance: ECStore object DTO and reader compatibility remains available
+    through `object_api`, integration contract tests consume the new public
+    path, and migration rules reject restoring `pub mod store_api`.
+  - Must preserve: internal ECStore object DTO definitions, reader/writer
+    behavior, storage-api trait bindings, and downstream object/list/multipart
+    compile-time contracts.
+  - Verification: focused ECStore contract tests, migration guard, formatting,
+    diff hygiene, risk scan, and three-expert review.
 
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.
   - Acceptance: `./scripts/check_architecture_migration_rules.sh` parses the

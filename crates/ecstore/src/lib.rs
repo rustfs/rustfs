@@ -41,7 +41,7 @@ pub mod set_disk;
 mod sets;
 mod storage_api_contracts;
 pub mod store;
-pub mod store_api;
+mod store_api;
 mod store_init;
 pub mod store_list_objects;
 pub mod store_utils;

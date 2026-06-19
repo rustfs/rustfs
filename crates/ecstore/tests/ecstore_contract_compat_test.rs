@@ -16,11 +16,11 @@ use rustfs_common::heal_channel::HealOpts;
 use rustfs_ecstore::{
     disk::DiskStore,
     error::Error,
-    store::ECStore,
-    store_api::{
+    object_api::{
         GetObjectReader, ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo, ObjectInfoOrErr, ObjectOptions, PutObjReader,
         WalkOptions,
     },
+    store::ECStore,
 };
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::NamespaceLockWrapper;
