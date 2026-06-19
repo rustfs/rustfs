@@ -26,7 +26,7 @@ use time::{self, Duration, OffsetDateTime};
 use tracing::debug;
 use uuid::Uuid;
 
-use crate::store_api::ObjectInfo;
+use crate::object_api::ObjectInfo;
 
 pub const TRANSITION_COMPLETE: &str = "complete";
 pub const TRANSITION_PENDING: &str = "pending";

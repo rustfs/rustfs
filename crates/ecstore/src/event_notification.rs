@@ -17,8 +17,8 @@
 use crate::bucket::metadata::BucketMetadata;
 // use crate::event::name::EventName;
 use crate::event::targetlist::TargetList;
+use crate::object_api::ObjectInfo;
 use crate::store::ECStore;
-use crate::store_api::ObjectInfo;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;

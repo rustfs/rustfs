@@ -23,8 +23,8 @@ use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_t
 use crate::config::com::{delete_config, read_config, save_config};
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result};
+use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use crate::store::ECStore;
-use crate::store_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use rustfs_filemeta::FileInfo;
 use rustfs_storage_api::{DeletedObject, HTTPRangeSpec, ListOperations as _, ObjectIO, ObjectOperations, ObjectToDelete};
 
