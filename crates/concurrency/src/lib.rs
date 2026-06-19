@@ -125,6 +125,7 @@ mod backpressure;
 mod scheduler;
 
 pub mod workers;
+pub mod workload;
 
 // Public module exports with feature gates
 #[cfg(feature = "timeout")]
@@ -149,6 +150,10 @@ pub use config::{ConcurrencyConfig, ConcurrencyFeatures};
 // Manager
 mod manager;
 pub use manager::{ConcurrencyManager, GetObjectQueueSnapshot};
+pub use workload::{
+    AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadAdmissionSnapshotProvider,
+    WorkloadClass,
+};
 
 // Prelude for convenient imports
 pub mod prelude {
@@ -169,5 +174,5 @@ pub mod prelude {
     #[cfg(feature = "scheduler")]
     pub use crate::scheduler::{IoStrategy, SchedulerManager, SchedulerPolicy};
 
-    pub use crate::{ConcurrencyConfig, ConcurrencyFeatures, ConcurrencyManager};
+    pub use crate::{AdmissionState, ConcurrencyConfig, ConcurrencyFeatures, ConcurrencyManager, WorkloadAdmissionSnapshot};
 }

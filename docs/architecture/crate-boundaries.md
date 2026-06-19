@@ -104,6 +104,10 @@ Required `rustfs-storage-api` public re-exports:
 - `pub use object::{VersionMarker, WalkOptions, WalkVersionsSortOrder};`
 - `pub use topology::{DiskCapabilities, TopologyCapabilities, TopologyDisk, TopologyLabels, TopologyPool, TopologySet, TopologySnapshot, TopologySnapshotProvider};`
 
+Required `rustfs-concurrency` public workload admission contract re-exports:
+
+- `pub use workload::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadAdmissionSnapshotProvider, WorkloadClass};`
+
 ECStore must keep compile-time coverage for `StorageAdminApi`, `HealOperations`,
 and the separate `NamespaceLocking` operation group.
 

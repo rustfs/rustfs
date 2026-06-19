@@ -212,6 +212,18 @@ require_source_line \
   "crates/storage-api/src/lib.rs" \
   "pub use capability::{CapabilitySnapshotError, CapabilityState, CapabilityStatus};" \
   "storage-api public capability contract re-export"
+require_source_contains \
+  "crates/concurrency/src/lib.rs" \
+  "pub use workload::{" \
+  "concurrency public workload admission contract re-export"
+require_source_contains \
+  "crates/concurrency/src/lib.rs" \
+  "AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadAdmissionSnapshotProvider," \
+  "concurrency public workload admission contract status re-exports"
+require_source_contains \
+  "crates/concurrency/src/lib.rs" \
+  "WorkloadClass," \
+  "concurrency public workload class re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
   "pub use multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};" \
