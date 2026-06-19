@@ -5,15 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ops-profiler-schema`
+- Branch: `overtrue/arch-ops-profiler-capability-tests`
 - Baseline: latest `origin/main`
   (`71809ba02ea405c3a2f0e4cb82ff608915dd519c`).
 - PR type for this branch: `contract`
 - Runtime behavior changes: none.
-- Rust code changes: define the `ops.profiler.v1` extension schema contract for
-  profiler capability reporting, backend state, redaction, and provenance.
+- Rust code changes: add the `ops.profiler.v1` extension capability snapshot
+  contract for disabled, unsupported, and enabled profiler runtime states.
 - CI/script changes: none.
-- Docs changes: record the X-012 profiler schema contract slice.
+- Docs changes: record the X-013 profiler capability snapshot slice.
 
 ## Phase 0 Tasks
 
@@ -2000,26 +2000,53 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     guards, diff hygiene, Rust risk scan, branch freshness check, and
     pre-commit quality gate.
 
+- [x] `X-013` Add ops profiler capability snapshot contract.
+  - Do: add `OpsProfilerCapabilitySnapshot` and `OpsProfilerRuntimeSnapshot`
+    DTOs plus validation for the `ops.profiler.v1` capability, disabled
+    external runtimes, and non-fatal profiler startup behavior.
+  - Acceptance: disabled, unsupported, and enabled profiler backend states
+    round-trip through the snapshot contract; sidecar/Wasm profiler runtimes
+    remain disabled by default; profiler snapshots cannot declare a startup
+    fatal boundary.
+  - Must preserve: no plugin execution, no sidecar startup, no profile route,
+    no admin API behavior changes, no runtime startup/shutdown behavior
+    changes, and no dependency edge from `extension-schema` to runtime or
+    storage implementation crates.
+  - Verification: extension schema check/tests, formatting, migration/layer
+    guards, diff hygiene, Rust risk scan, branch freshness check, and
+    pre-commit quality gate.
+
 ## Next PRs
 
-1. `contract`: continue larger extension contract coverage for disabled and
-   unsupported runtime capability snapshots.
-2. `pure-move`: continue larger lifecycle hook slices for optional runtime
+1. `pure-move`: continue larger lifecycle hook slices for optional runtime
    sidecars while preserving startup and shutdown ordering.
+2. `contract`: continue extension contract coverage for future diagnostics and
+   profiler handoff surfaces after runtime owners are stable.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | X-012 keeps the profiler schema in `rustfs-extension-schema`, uses explicit backend/status/redaction/provenance DTOs, and adds no new dependency edges or runtime abstractions. |
-| Migration preservation | passed | Runtime profiling, admin pprof routes, exporters, storage paths, telemetry, sidecar startup, and plugin execution are untouched; the new contract only describes capabilities. |
-| Testing/verification | passed | Extension schema tests cover enabled, disabled, unsupported, unknown, missing-field, redaction, provenance, and credential-field rejection; focused checks, guards, formatting, diff hygiene, and final pre-commit passed. |
+| Quality/architecture | passed | X-013 keeps the capability snapshot contract in `rustfs-extension-schema`, reuses explicit profiler backend/runtime DTOs, and adds no runtime dependency edges. |
+| Migration preservation | passed | Runtime profiling, admin pprof routes, exporters, storage paths, telemetry, sidecar startup, and plugin execution are untouched; validation only rejects unsafe snapshot declarations. |
+| Testing/verification | passed | Extension schema tests cover enabled, disabled, unsupported, snapshot JSON shape, disabled external runtime policy, and startup-fatal rejection; focused checks, guards, formatting, diff hygiene, and final pre-commit passed. |
 
 ## Verification Notes
 
 Passed before push:
 
 - Issue #660 X-012 current slice:
+  - `cargo test -p rustfs-extension-schema`: passed.
+  - `cargo check -p rustfs-extension-schema`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 X-013 current slice:
   - `cargo test -p rustfs-extension-schema`: passed.
   - `cargo check -p rustfs-extension-schema`: passed.
   - `./scripts/check_architecture_migration_rules.sh`: passed.

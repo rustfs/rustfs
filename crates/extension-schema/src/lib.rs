@@ -28,6 +28,7 @@ pub enum ExtensionKind {
     TargetPlugin,
     S3Hook,
     OpsDiagnostics,
+    OpsProfiler,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -191,6 +192,22 @@ pub struct OpsProfilerContract {
     pub backends: Vec<OpsProfilerBackendCapability>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsProfilerRuntimeSnapshot {
+    pub boundary: ExtensionRuntimeBoundary,
+    pub disabled_by_default: bool,
+    pub startup_fatal: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsProfilerCapabilitySnapshot {
+    pub capability: ExtensionCapabilityRef,
+    pub runtime: OpsProfilerRuntimeSnapshot,
+    pub contract: OpsProfilerContract,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ExtensionSchemaError {
     #[error("extension schema at index {index} has an empty extension id")]
@@ -279,6 +296,15 @@ pub enum ExtensionContractError {
 
     #[error("ops profiler backend {backend} has an empty collection boundary")]
     EmptyOpsProfilerCollectionBoundary { backend: String },
+
+    #[error("ops profiler snapshot has unsupported capability {capability}")]
+    UnsupportedOpsProfilerCapability { capability: String },
+
+    #[error("ops profiler external runtime must be disabled by default")]
+    OpsProfilerExternalRuntimeEnabledByDefault,
+
+    #[error("ops profiler runtime snapshot cannot add a startup fatal boundary")]
+    OpsProfilerStartupFatalBoundary,
 }
 
 pub fn validate_extension_schemas(schemas: &[ExtensionSchema]) -> Result<(), ExtensionSchemaError> {
@@ -459,15 +485,34 @@ pub fn validate_ops_profiler_contract(contract: &OpsProfilerContract) -> Result<
     Ok(())
 }
 
+pub fn validate_ops_profiler_capability_snapshot(snapshot: &OpsProfilerCapabilitySnapshot) -> Result<(), ExtensionContractError> {
+    if snapshot.capability.as_str() != OPS_PROFILER_CAPABILITY {
+        return Err(ExtensionContractError::UnsupportedOpsProfilerCapability {
+            capability: snapshot.capability.as_str().to_string(),
+        });
+    }
+
+    if snapshot.runtime.boundary.requires_disabled_by_default() && !snapshot.runtime.disabled_by_default {
+        return Err(ExtensionContractError::OpsProfilerExternalRuntimeEnabledByDefault);
+    }
+
+    if snapshot.runtime.startup_fatal {
+        return Err(ExtensionContractError::OpsProfilerStartupFatalBoundary);
+    }
+
+    validate_ops_profiler_contract(&snapshot.contract)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         EXTENSION_SCHEMA_VERSION, ExtensionCapabilityRef, ExtensionContractError, ExtensionKind, ExtensionRuntimeBoundary,
         ExtensionRuntimeContract, ExtensionSchema, ExtensionSchemaError, OPS_DIAGNOSTICS_CAPABILITY, OPS_PROFILER_CAPABILITY,
         OpsDiagnosticSurface, OpsDiagnosticsContract, OpsProfilerBackendCapability, OpsProfilerBackendName,
-        OpsProfilerBackendStatus, OpsProfilerContract, OpsProfilerContractMode, OpsProfilerProvenance, OpsProfilerRedactionField,
-        OpsProfilerTrustLevel, S3_POST_AUTH_HOOK_CAPABILITY, S3HookContract, S3HookPoint, validate_extension_schemas,
-        validate_ops_diagnostics_contract, validate_ops_profiler_contract, validate_s3_hook_contract,
+        OpsProfilerBackendStatus, OpsProfilerCapabilitySnapshot, OpsProfilerContract, OpsProfilerContractMode,
+        OpsProfilerProvenance, OpsProfilerRedactionField, OpsProfilerRuntimeSnapshot, OpsProfilerTrustLevel,
+        S3_POST_AUTH_HOOK_CAPABILITY, S3HookContract, S3HookPoint, validate_extension_schemas, validate_ops_diagnostics_contract,
+        validate_ops_profiler_capability_snapshot, validate_ops_profiler_contract, validate_s3_hook_contract,
     };
     use serde_json::json;
 
@@ -541,7 +586,7 @@ mod tests {
                 display_name: "Ops Profiler".to_string(),
                 provider: "rustfs".to_string(),
                 version: "1.0.0".to_string(),
-                kind: ExtensionKind::OpsDiagnostics,
+                kind: ExtensionKind::OpsProfiler,
                 runtime: ExtensionRuntimeContract {
                     api_version: "rustfs.extension.v1".to_string(),
                     boundary: ExtensionRuntimeBoundary::Builtin,
@@ -801,6 +846,130 @@ mod tests {
         .expect("unknown future backend names should remain representable");
 
         assert!(validate_ops_profiler_contract(&contract).is_ok());
+    }
+
+    #[test]
+    fn ops_profiler_capability_snapshot_preserves_runtime_states() {
+        let snapshot = OpsProfilerCapabilitySnapshot {
+            capability: ExtensionCapabilityRef::new(OPS_PROFILER_CAPABILITY),
+            runtime: OpsProfilerRuntimeSnapshot {
+                boundary: ExtensionRuntimeBoundary::Sidecar,
+                disabled_by_default: true,
+                startup_fatal: false,
+            },
+            contract: OpsProfilerContract {
+                mode: OpsProfilerContractMode::CapabilityDescription,
+                backends: vec![
+                    profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true),
+                    profiler_backend("memory_pprof", OpsProfilerBackendStatus::Disabled, false),
+                    profiler_backend("ebpf", OpsProfilerBackendStatus::Unsupported, false),
+                ],
+            },
+        };
+
+        assert!(validate_ops_profiler_capability_snapshot(&snapshot).is_ok());
+
+        let encoded = serde_json::to_string(&snapshot).expect("ops profiler snapshot should serialize");
+        let decoded: OpsProfilerCapabilitySnapshot =
+            serde_json::from_str(&encoded).expect("ops profiler snapshot should deserialize");
+
+        let states: Vec<_> = decoded.contract.backends.iter().map(|backend| backend.status).collect();
+        assert_eq!(
+            states,
+            vec![
+                OpsProfilerBackendStatus::Enabled,
+                OpsProfilerBackendStatus::Disabled,
+                OpsProfilerBackendStatus::Unsupported,
+            ]
+        );
+        assert_eq!(decoded.runtime.boundary, ExtensionRuntimeBoundary::Sidecar);
+        assert!(decoded.runtime.disabled_by_default);
+        assert!(!decoded.runtime.startup_fatal);
+    }
+
+    #[test]
+    fn ops_profiler_capability_snapshot_serializes_stable_json_shape() {
+        let snapshot = OpsProfilerCapabilitySnapshot {
+            capability: ExtensionCapabilityRef::new(OPS_PROFILER_CAPABILITY),
+            runtime: OpsProfilerRuntimeSnapshot {
+                boundary: ExtensionRuntimeBoundary::Builtin,
+                disabled_by_default: false,
+                startup_fatal: false,
+            },
+            contract: OpsProfilerContract {
+                mode: OpsProfilerContractMode::CapabilityDescription,
+                backends: vec![profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true)],
+            },
+        };
+
+        let value = serde_json::to_value(snapshot).expect("ops profiler snapshot should serialize");
+
+        assert_eq!(
+            value,
+            json!({
+                "capability": "ops.profiler.v1",
+                "runtime": {
+                    "boundary": "builtin",
+                    "disabled_by_default": false,
+                    "startup_fatal": false
+                },
+                "contract": {
+                    "mode": "capability_description",
+                    "backends": [{
+                        "backend": "cpu_pprof",
+                        "status": "enabled",
+                        "supports_profile_export": true,
+                        "redaction_required": ["secret", "token", "local_path", "host"],
+                        "provenance": {
+                            "source": "rustfs.profiling",
+                            "collection_boundary": "rustfs-process",
+                            "trust_level": "runtime_trusted"
+                        }
+                    }]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_ops_profiler_snapshot_wrong_capability_or_fatal_runtime() {
+        let mut snapshot = OpsProfilerCapabilitySnapshot {
+            capability: ExtensionCapabilityRef::new("ops.not-profiler.v1"),
+            runtime: OpsProfilerRuntimeSnapshot {
+                boundary: ExtensionRuntimeBoundary::Sidecar,
+                disabled_by_default: true,
+                startup_fatal: false,
+            },
+            contract: OpsProfilerContract {
+                mode: OpsProfilerContractMode::CapabilityDescription,
+                backends: vec![profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true)],
+            },
+        };
+
+        assert_eq!(
+            validate_ops_profiler_capability_snapshot(&snapshot).expect_err("only ops.profiler.v1 snapshots are accepted"),
+            ExtensionContractError::UnsupportedOpsProfilerCapability {
+                capability: "ops.not-profiler.v1".to_string()
+            }
+        );
+
+        snapshot.capability = ExtensionCapabilityRef::new(OPS_PROFILER_CAPABILITY);
+        snapshot.runtime.disabled_by_default = false;
+
+        assert_eq!(
+            validate_ops_profiler_capability_snapshot(&snapshot)
+                .expect_err("external profiler runtimes must stay disabled by default"),
+            ExtensionContractError::OpsProfilerExternalRuntimeEnabledByDefault
+        );
+
+        snapshot.runtime.disabled_by_default = true;
+        snapshot.runtime.startup_fatal = true;
+
+        assert_eq!(
+            validate_ops_profiler_capability_snapshot(&snapshot)
+                .expect_err("optional profiler runtimes must not become startup fatal"),
+            ExtensionContractError::OpsProfilerStartupFatalBoundary
+        );
     }
 
     #[test]
