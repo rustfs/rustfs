@@ -5,16 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-object-api-module`
-- Baseline: stacked after `rustfs/rustfs#3611`
-  (`b3af0d584ea29acc4273cee57fbdbaf35870ca67`).
+- Branch: `overtrue/arch-ecstore-list-contracts-direct`
+- Baseline: stacked after `rustfs/rustfs#3613`
+  (`28fce7b377c38b286b69c62f1ab15711d0f59589`).
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: move the ECStore object DTO and reader implementation
-  module from the retired private `store_api` name into `object_api`.
-- CI/script changes: make the migration guard reject restoring ECStore
-  `store_api` module files or directories.
-- Docs changes: record the API-064 ECStore object API module cleanup slice.
+- Rust code changes: migrate ECStore internal list/walk consumers to direct
+  aliases over the generic `rustfs-storage-api` list contracts, including
+  replication worker trait bounds.
+- CI/script changes: make the migration guard reject ECStore internal
+  `crate::object_api` imports of list/walk compatibility aliases, including
+  multi-line import forms.
+- Docs changes: record the API-065 ECStore list contract cleanup slice.
 
 ## Phase 0 Tasks
 
@@ -284,6 +286,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Must preserve: object metadata shape, reader/writer behavior, storage-api
     contract bindings, object/list/multipart behavior, and downstream public
     object API compatibility.
+  - Verification: focused ECStore compile checks, migration guard, formatting,
+    diff hygiene, risk scan, and three-expert review.
+
+- [x] `API-065` Use storage-api list contracts inside ECStore.
+  - Completed slice: migrate ECStore internal list response, walk options, and
+    walk result bindings to local aliases over the generic `rustfs-storage-api`
+    contracts, including replication worker trait bounds, while retaining
+    public `rustfs_ecstore::object_api` aliases for downstream compatibility.
+  - Acceptance: ECStore implementation modules no longer import list/walk
+    compatibility aliases from `crate::object_api`, and migration rules reject
+    reintroducing those internal imports.
+  - Must preserve: list response shape, walk result item shape, object metadata
+    shape, storage-api trait bindings, and downstream public object API
+    compatibility.
   - Verification: focused ECStore compile checks, migration guard, formatting,
     diff hygiene, risk scan, and three-expert review.
 

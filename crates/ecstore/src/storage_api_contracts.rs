@@ -1,12 +1,18 @@
 use crate::error::Error;
-use crate::object_api::{
-    GetObjectReader, ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo, ObjectInfoOrErr, ObjectOptions, PutObjReader,
-    WalkOptions,
-};
+use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use rustfs_filemeta::FileInfo;
-use rustfs_storage_api::{DeletedObject, HTTPRangeSpec, ObjectToDelete};
+use rustfs_storage_api::{
+    DeletedObject, HTTPRangeSpec, ListObjectVersionsInfo as StorageListObjectVersionsInfo,
+    ListObjectsV2Info as StorageListObjectsV2Info, ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectToDelete,
+    WalkOptions as StorageWalkOptions,
+};
 use std::fmt::Debug;
 use tokio_util::sync::CancellationToken;
+
+type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
+type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
+type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
+type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
 pub(crate) trait EcstoreObjectIO:
     rustfs_storage_api::ObjectIO<

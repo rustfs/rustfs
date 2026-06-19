@@ -31,10 +31,7 @@ use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_fo
 use crate::event_notification::{EventArgs, send_event};
 use crate::global::GLOBAL_LocalNodeName;
 use crate::global::get_global_bucket_monitor;
-use crate::object_api::{
-    GetObjectReader, ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo, ObjectInfoOrErr, ObjectOptions, PutObjReader,
-    WalkOptions,
-};
+use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use crate::resolve_object_store_handle;
 use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::{EcstoreObjectIO, EcstoreObjectOperations};
@@ -63,8 +60,9 @@ use rustfs_filemeta::{
 };
 use rustfs_s3_types::EventName;
 use rustfs_storage_api::{
-    DeletedObject, HTTPRangeSpec, ListOperations, NamespaceLocking as StorageNamespaceLocking, ObjectIO, ObjectOperations,
-    ObjectToDelete,
+    DeletedObject, HTTPRangeSpec, ListObjectVersionsInfo as StorageListObjectVersionsInfo,
+    ListObjectsV2Info as StorageListObjectsV2Info, ListOperations, NamespaceLocking as StorageNamespaceLocking, ObjectIO,
+    ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectOperations, ObjectToDelete, WalkOptions as StorageWalkOptions,
 };
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, AMZ_TAGGING_DIRECTIVE, CONTENT_ENCODING, HeaderExt as _,
@@ -108,6 +106,11 @@ const EVENT_REPLICATION_FORCE_DELETE_SKIPPED: &str = "replication_force_delete_s
 const EVENT_RESYNC_TASK_FAILED: &str = "replication_resync_task_failed";
 const EVENT_RESYNC_TARGET_OPERATION_FAILED: &str = "replication_resync_target_operation_failed";
 const EVENT_RESYNC_RUNTIME_CHANNEL_FAILED: &str = "replication_resync_runtime_channel_failed";
+
+type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
+type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
+type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
+type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
 /// Storage capabilities required by bucket replication workers.
 pub trait ReplicationStorage:
