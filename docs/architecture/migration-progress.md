@@ -5,16 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-final-object-boundary-prune`
-- Baseline: stacked after `rustfs/rustfs#3622`
-  (`4300bf04f3a82ef4cc2605f417f89e7b4643b99e`).
-- PR type for this branch: `consumer-migration`
+- Branch: `overtrue/arch-ops-profiler-capability-tests`
+- Baseline: latest `origin/main`
+  (`71809ba02ea405c3a2f0e4cb82ff608915dd519c`).
+- PR type for this branch: `contract`
 - Runtime behavior changes: none.
-- Rust code changes: route heal and RustFS storage object reader, writer,
-  metadata, and options aliases through `rustfs_storage_api` associated types.
-- CI/script changes: shrink the remaining external `rustfs_ecstore::object_api`
-  compatibility alias snapshot to empty.
-- Docs changes: record the API-071 final object boundary prune slice.
+- Rust code changes: add the `ops.profiler.v1` extension capability snapshot
+  contract for disabled, unsupported, and enabled profiler runtime states.
+- CI/script changes: none.
+- Docs changes: record the X-013 profiler capability snapshot slice.
 
 ## Phase 0 Tasks
 
@@ -1985,25 +1984,78 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     checks, formatting, migration guards, Rust risk scan, branch freshness
     check, and pre-commit quality gate.
 
+- [x] `X-012` Define ops profiler extension schema contract.
+  - Do: add `ops.profiler.v1` capability DTOs for profiler backend status,
+    capability-description mode, profile export redaction requirements, and
+    provenance in the extension schema contract crate.
+  - Acceptance: disabled, unsupported, enabled, and unknown backend states are
+    representable; execution requests are rejected; profile export declarations
+    require local path redaction; provenance records source, collection
+    boundary, and trust level without credentials.
+  - Must preserve: no plugin execution, no sidecar startup, no profile route or
+    admin API behavior changes, no exporter/storage/object-path/telemetry
+    behavior changes, and no dependency edge from `extension-schema` to
+    implementation crates.
+  - Verification: extension schema check/tests, formatting, migration/layer
+    guards, diff hygiene, Rust risk scan, branch freshness check, and
+    pre-commit quality gate.
+
+- [x] `X-013` Add ops profiler capability snapshot contract.
+  - Do: add `OpsProfilerCapabilitySnapshot` and `OpsProfilerRuntimeSnapshot`
+    DTOs plus validation for the `ops.profiler.v1` capability, disabled
+    external runtimes, and non-fatal profiler startup behavior.
+  - Acceptance: disabled, unsupported, and enabled profiler backend states
+    round-trip through the snapshot contract; sidecar/Wasm profiler runtimes
+    remain disabled by default; profiler snapshots cannot declare a startup
+    fatal boundary.
+  - Must preserve: no plugin execution, no sidecar startup, no profile route,
+    no admin API behavior changes, no runtime startup/shutdown behavior
+    changes, and no dependency edge from `extension-schema` to runtime or
+    storage implementation crates.
+  - Verification: extension schema check/tests, formatting, migration/layer
+    guards, diff hygiene, Rust risk scan, branch freshness check, and
+    pre-commit quality gate.
+
 ## Next PRs
 
 1. `pure-move`: continue larger lifecycle hook slices for optional runtime
    sidecars while preserving startup and shutdown ordering.
-2. `consumer-migration`: continue larger cleanup slices with the
-   loss-prevention guards active for remaining ECStore compatibility contracts
-   that still have dedicated preservation coverage.
+2. `contract`: continue extension contract coverage for future diagnostics and
+   profiler handoff surfaces after runtime owners are stable.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-020 moves profiling init/shutdown call sites behind `startup_profiling` hook functions without moving CPU/memory profiling implementation ownership or admin pprof APIs. |
-| Migration preservation | passed | BOOT-006 still initializes profiling before trusted proxies/provider/TLS setup; STOP-004 still stops profiling after notifier/audit shutdown and before HTTP shutdown; profiling env flags, platform gates, target unsupported behavior, and cancellation-token ownership remain in `profiling.rs`. |
-| Testing/verification | passed | Focused startup profiling hook tests, RustFS library check, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` validate the current R-020 slice. |
+| Quality/architecture | passed | X-013 keeps the capability snapshot contract in `rustfs-extension-schema`, reuses explicit profiler backend/runtime DTOs, and adds no runtime dependency edges. |
+| Migration preservation | passed | Runtime profiling, admin pprof routes, exporters, storage paths, telemetry, sidecar startup, and plugin execution are untouched; validation only rejects unsafe snapshot declarations. |
+| Testing/verification | passed | Extension schema tests cover enabled, disabled, unsupported, snapshot JSON shape, disabled external runtime policy, and startup-fatal rejection; focused checks, guards, formatting, diff hygiene, and final pre-commit passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 X-012 current slice:
+  - `cargo test -p rustfs-extension-schema`: passed.
+  - `cargo check -p rustfs-extension-schema`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 X-013 current slice:
+  - `cargo test -p rustfs-extension-schema`: passed.
+  - `cargo check -p rustfs-extension-schema`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
 
 - Issue #660 R-020 current slice:
   - `cargo test -p rustfs --lib startup_profiling -- --nocapture`: passed.
