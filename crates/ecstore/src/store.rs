@@ -53,16 +53,15 @@ use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
 use crate::rebalance::RebalanceMeta;
 use crate::rpc::RemoteClient;
-use crate::store_api::{ListObjectVersionsInfo, ObjectInfoOrErr, WalkOptions};
 use crate::store_init::{check_disk_fatal_errs, ec_drives_no_config};
 use crate::tier::tier::TierConfigMgr;
 use crate::{
     bucket::{lifecycle::bucket_lifecycle_ops::TransitionState, metadata::BucketMetadata},
     disk::{BUCKET_META_PREFIX, DiskOption, DiskStore, RUSTFS_META_BUCKET, new_disk},
     endpoints::EndpointServerPools,
+    object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
     rpc::S3PeerSys,
     sets::Sets,
-    store_api::{GetObjectReader, ListObjectsV2Info, ObjectInfo, ObjectOptions, PutObjReader},
     store_init,
 };
 use futures::future::join_all;
@@ -75,10 +74,13 @@ use rustfs_config::server_config::{Config, get_global_server_config, set_global_
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::{LocalClient, LockClient, NamespaceLockWrapper};
 use rustfs_madmin::heal_commands::HealResultItem;
-use rustfs_storage_api::HTTPRangeSpec;
 use rustfs_storage_api::{
     BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, ListMultipartsInfo,
     ListPartsInfo, MakeBucketOptions, MultipartInfo, MultipartUploadResult, ObjectToDelete, PartInfo,
+};
+use rustfs_storage_api::{
+    HTTPRangeSpec, ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
+    ObjectInfoOrErr as StorageObjectInfoOrErr, WalkOptions as StorageWalkOptions,
 };
 use rustfs_utils::path::{decode_dir_object, encode_dir_object, path_join_buf};
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
@@ -99,6 +101,11 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
+
+type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
+type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
+type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
+type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
 /// Check if a directory contains any xl.meta files (indicating actual S3 objects)
 /// This is used to determine if a bucket is empty for deletion purposes.
@@ -841,16 +848,10 @@ impl ServerPoolsAvailableSpace {
 mod tests {
     use super::*;
     use crate::endpoints::{Endpoints, PoolEndpoints};
-    use crate::global::{GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES};
+    use crate::global::{GLOBAL_LOCAL_DISK_ID_MAP, reset_local_disk_test_state};
     use crate::store_init::{connect_load_init_formats, init_disks};
     use serial_test::serial;
     use tempfile::TempDir;
-
-    async fn reset_local_disk_globals() {
-        GLOBAL_LOCAL_DISK_MAP.write().await.clear();
-        GLOBAL_LOCAL_DISK_ID_MAP.write().await.clear();
-        GLOBAL_LOCAL_DISK_SET_DRIVES.write().await.clear();
-    }
 
     #[tokio::test]
     async fn test_get_disk_infos() {
@@ -906,7 +907,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_find_local_disk_by_ref_backfills_uuid_map() {
-        reset_local_disk_globals().await;
+        reset_local_disk_test_state().await;
 
         let temp_dir = TempDir::new().expect("create temp dir for local disk ref test");
         let disk_paths = (0..4)
@@ -967,7 +968,7 @@ mod tests {
             Some(first_disk.endpoint().to_string())
         );
 
-        reset_local_disk_globals().await;
+        reset_local_disk_test_state().await;
     }
 
     #[tokio::test]

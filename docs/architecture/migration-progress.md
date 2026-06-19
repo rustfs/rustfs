@@ -5,18 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-delete-object-contracts`
-- Baseline: stacked on `rustfs/rustfs#3579` head
-  (`903aff047d2faffaec907637d64440c84053f62e`).
+- Branch: `overtrue/arch-final-object-boundary-prune`
+- Baseline: stacked after `rustfs/rustfs#3622`
+  (`4300bf04f3a82ef4cc2605f417f89e7b4643b99e`).
 - PR type for this branch: `consumer-migration`
-- Runtime behavior changes: no migration behavior change expected.
-- Rust code changes: move delete-object DTO contracts from ECStore store_api to
-  rustfs-storage-api, keep ECStore old-path type aliases, and migrate RustFS,
-  scanner, and ECStore internal consumers to the storage-api contracts.
-- CI/script changes: add a migration guard rejecting reintroduced ECStore
-  delete DTO definitions, public re-exports, or internal old-path consumers.
-- Docs changes: record the delete-object contract move and consumer cleanup
-  slices.
+- Runtime behavior changes: none.
+- Rust code changes: route heal and RustFS storage object reader, writer,
+  metadata, and options aliases through `rustfs_storage_api` associated types.
+- CI/script changes: shrink the remaining external `rustfs_ecstore::object_api`
+  compatibility alias snapshot to empty.
+- Docs changes: record the API-071 final object boundary prune slice.
 
 ## Phase 0 Tasks
 
@@ -64,6 +62,334 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     [`ecstore-config-consumer-inventory.md`](ecstore-config-consumer-inventory.md)
     records the current model definitions, global accessors, persistence helpers,
     consumer groups, migration risks, and do-not-change contract.
+- [x] `G-011` Inventory scheduler baseline.
+  - Acceptance:
+    [`scheduler-baseline.md`](scheduler-baseline.md) records current owners for
+    request admission, reusable scheduler/backpressure facades, workers, scanner
+    budget, heal admission, and the Tokio runtime builder.
+  - Must preserve: no Rust source changes, no scheduler/controller contract
+    changes, and no runtime behavior changes.
+- [x] `G-012` Inventory placement and repair invariants.
+  - Acceptance:
+    [`placement-repair-invariants.md`](placement-repair-invariants.md) records
+    object-to-set hashing, pool/set/disk assignment boundaries, set-aware
+    readiness and lock quorum, scanner budget, and heal admission preservation
+    gates.
+  - Must preserve: no placement, repair, scanner, heal, readiness, lock, or
+    storage metadata behavior changes.
+- [x] `G-013` Inventory profiling and NUMA capabilities.
+  - Acceptance:
+    [`profiling-numa-capability-inventory.md`](profiling-numa-capability-inventory.md)
+    records current CPU/memory profiling, cgroup memory sampling, allocator
+    backend, eBPF, and NUMA capability support plus no-op fallback invariants.
+  - Must preserve: no startup, profiling, allocator, runtime, or platform-gate
+    behavior changes.
+
+## Issue #660 Capability Contract Tasks
+
+- [x] `PR-08/API-013` Add observability snapshot contract.
+  - Completed slice: add `CapabilityState`, `CapabilityStatus`,
+    `CapabilitySnapshotError`, `ObservabilitySnapshot`,
+    `UserspaceProfilingCapability`, `MemorySamplingState`,
+    `PlatformSupport`, and `ObservabilitySnapshotProvider` to
+    `rustfs-storage-api`.
+  - Acceptance: runtime telemetry, userspace profiling, memory sampling, and
+    platform support states are representable without runtime, ECStore, admin,
+    profiling, exporter, sidecar, eBPF, or OTEL implementation dependencies.
+  - Must preserve: no profiling, startup, admin route, exporter, sidecar, eBPF,
+    OTEL, or runtime behavior changes.
+  - Verification: storage-api contract tests for unknown, unsupported,
+    disabled, and supported capability states; focused storage-api check;
+    migration guard; formatting; diff hygiene; and three-expert review.
+
+- [x] `PR-09/API-014` Add topology capability contract.
+  - Completed slice: add `TopologySnapshot`, `TopologyCapabilities`,
+    `TopologyPool`, `TopologySet`, `TopologyDisk`, `TopologyLabels`,
+    `DiskCapabilities`, and `TopologySnapshotProvider` to
+    `rustfs-storage-api`.
+  - Acceptance: pool, set, and disk identity fields plus optional zone, rack,
+    node, media, NUMA, and additional labels are representable without
+    `rustfs-ecstore`.
+  - Must preserve: no ECStore endpoint/set implementation, placement,
+    membership, NUMA pinning, or runtime behavior changes.
+  - Verification: storage-api contract tests for missing and additional labels
+    plus supported, unsupported, unknown, and disabled capability states;
+    focused storage-api check; migration guard; formatting; diff hygiene; and
+    three-expert review.
+
+- [x] `PR-05/TEST-SCH-001` Add scheduler preservation tests.
+  - Completed slice: pin worker over-release clamping, reusable scheduler
+    default thresholds and priority boundaries, backpressure pipe metadata
+    reads, and get-object queue snapshot saturation/zero-total semantics.
+  - Acceptance: current reusable scheduling and admission-facing behavior is
+    covered before later read-only snapshot extraction.
+  - Must preserve: scheduler algorithm, queue capacity, threshold defaults,
+    Tokio runtime settings, request admission, scanner admission, heal
+    admission, replication admission, and background task admission behavior.
+  - Verification: focused concurrency tests, focused concurrency check,
+    migration guard, formatting, diff hygiene, and three-expert review.
+
+- [x] `PR-07/R-015` Add runtime workload class contract.
+  - Completed slice: add `WorkloadClass`, `AdmissionState`,
+    `WorkloadAdmissionSnapshot`, `WorkloadAdmissionRegistrySnapshot`, and
+    `WorkloadAdmissionSnapshotProvider` to `rustfs-concurrency`.
+  - Acceptance: foreground read, foreground write, metadata, scanner, repair,
+    and replication workload classes are representable through read-only
+    admission registry snapshots without ECStore dependency.
+  - Must preserve: no SchedulerManager decision logic, Tokio worker defaults,
+    scanner/heal admission behavior, replication admission behavior, cluster
+    scheduling, placement, membership, or business call-site migration.
+  - Verification: workload contract unit tests, focused concurrency check,
+    migration guard, formatting, diff hygiene, and three-expert review.
+
+- [x] `API-055/SCH-001` Expose set-local scheduler admission snapshot.
+  - Completed slice: implement `WorkloadAdmissionSnapshotProvider` for the
+    RustFS storage `ConcurrencyManager` and expose foreground-read disk-read
+    permit usage through a local read-only workload registry snapshot.
+  - Acceptance: local foreground read admission reports active permit usage,
+    configured limit, and open/saturated/disabled state without ECStore,
+    admin-route, cluster, or scheduler mutation dependencies.
+  - Must preserve: disk-read semaphore acquisition, priority assignment,
+    buffer sizing, storage media detection, request guards, and queue behavior.
+  - Verification: storage concurrency tests, focused RustFS library check,
+    migration guard, formatting, diff hygiene, and three-expert review.
+
+- [x] `API-056/R-016` Wire runtime capability snapshot providers.
+  - Completed slice: implement `ObservabilitySnapshotProvider` for RustFS
+    runtime capability state and `TopologySnapshotProvider` for
+    `EndpointServerPools` topology snapshots.
+  - Acceptance: observability and endpoint topology snapshots are available
+    through the storage-api contracts without admin routes, sidecars, ECStore
+    placement mutation, profiling startup changes, or endpoint behavior changes.
+  - Must preserve: profiling opt-in behavior, memory and cgroup sampling
+    behavior, endpoint pool/set/disk assignment, placement, readiness, locks,
+    and local path privacy.
+  - Verification: focused runtime capability tests, focused RustFS library
+    check, migration and layer guards, formatting, diff hygiene, risk scan, and
+    three-expert review.
+
+- [x] `API-057/R-017` Expose heal repair admission snapshot.
+  - Completed slice: implement a RustFS workload admission snapshot provider
+    that maps existing heal active-task and queue-length counters to the
+    `Repair` workload class.
+  - Acceptance: repair admission state is observable through the
+    `rustfs-concurrency` workload snapshot contract without changing heal
+    queueing, scheduling, retry, priority merge/drop, or repair behavior.
+  - Must preserve: heal request admission, queue capacity, scheduler wakeups,
+    task retry handling, active-task accounting, and repair execution.
+  - Verification: focused workload admission tests, focused RustFS library
+    check, migration and layer guards, formatting, diff hygiene, risk scan, and
+    three-expert review.
+
+- [x] `API-058/R-018` Expose replication admission snapshot.
+  - Completed slice: extend the RustFS workload admission provider to map
+    existing replication worker and site queue counters to the `Replication`
+    workload class.
+  - Acceptance: replication admission pressure is observable through the
+    `rustfs-concurrency` workload snapshot contract without changing
+    replication queueing, channel capacity, worker resize, MRF, target dispatch,
+    or resync behavior.
+  - Must preserve: replication admission, queue channel capacity, worker resize
+    policy, MRF handling, target dispatch, resync behavior, and queue stats
+    accounting.
+  - Verification: focused workload admission tests, focused RustFS library
+    check, migration and layer guards, formatting, diff hygiene, risk scan, and
+    three-expert review.
+
+- [x] `API-059/R-019` Expose RustFS runtime owner admission snapshots.
+  - Completed slice: extend the RustFS workload admission provider to map
+    foreground-read disk permit state, scanner active work units, and bucket
+    metadata runtime initialization into the workload registry.
+  - Acceptance: RustFS-level workload admission snapshots expose existing
+    foreground-read, scanner, and metadata owner state without changing
+    admission, queueing, scanner scheduling, metadata loading, metadata locks,
+    or object write behavior.
+  - Must preserve: disk-read semaphore acquisition, scanner cycle scheduling,
+    bucket metadata initialization and loading, object write paths, request
+    guards, and queue behavior.
+  - Verification: focused workload admission tests, focused RustFS library
+    check, migration and layer guards, formatting, diff hygiene, risk scan, and
+    three-expert review.
+
+- [x] `API-060` Remove heal and namespace-lock operation compatibility facades.
+  - Completed slice: remove the old ECStore `store_api::HealOperations` and
+    `store_api::NamespaceLocking` compatibility subtraits after ECStore storage
+    types already implemented the shared `rustfs_storage_api` contracts
+    directly.
+  - Acceptance: internal ECStore bounds and compile-time coverage use the
+    shared storage-api heal and namespace-lock contracts directly, while the
+    remaining object/list/multipart compatibility bindings stay unchanged for
+    their active internal consumers.
+  - Must preserve: heal operation behavior, namespace-lock acquisition,
+    replication resync locking, rebalance metadata locking, object I/O,
+    multipart, list, and storage hot paths.
+  - Verification: focused ECStore contract tests, focused ECStore library
+    check, migration and layer guards, formatting, diff hygiene, risk scan, and
+    three-expert review.
+
+- [x] `API-061` Remove public ECStore object operation compatibility facades.
+  - Completed slice: remove the old public ECStore `store_api` object, list,
+    and multipart operation compatibility subtraits, and keep internal generic
+    bounds on crate-private storage-api contract constraints instead of public
+    downstream compatibility traits.
+  - Acceptance: `store_api` no longer exports public operation compatibility
+    traits, ECStore direct storage-api compile-time coverage includes object,
+    object-operation, list, multipart, namespace-lock, heal, and admin
+    contracts, and remaining public `store_api` exports are DTO/reader
+    compatibility paths only.
+  - Must preserve: object I/O, list/walk behavior, multipart behavior, config
+    persistence, tier config migration, rebalance metadata locking, lifecycle
+    journal handling, replication MRF/resync persistence, and downstream DTO
+    import compatibility.
+  - Verification: focused ECStore contract tests, focused ECStore library
+    check, migration and layer guards, formatting, diff hygiene, risk scan, and
+    three-expert review.
+
+- [x] `API-062` Establish explicit ECStore object API boundary.
+  - Completed slice: add `rustfs_ecstore::object_api` as the explicit public
+    path for ECStore-owned object DTO and reader contracts, then migrate
+    RustFS, scanner, heal, IAM, Swift, S3 Select, notify, and ECStore
+    integration-test compatibility aliases away from the legacy public
+    `store_api` path.
+  - Acceptance: external compatibility boundary modules no longer reference
+    `rustfs_ecstore::store_api` for ECStore-owned object DTO and reader
+    aliases, while `store_api` remains available only as the old internal
+    implementation module pending final compatibility removal.
+  - Must preserve: object metadata shape, option defaults, reader/writer
+    behavior, Swift/scanner/heal/IAM/S3 Select/notify boundary semantics, and
+    all storage hot paths.
+  - Verification: focused ECStore/RustFS/downstream compile checks, migration
+    guard, formatting, diff hygiene, risk scan, and three-expert review.
+
+- [x] `API-063` Make legacy ECStore store API module private.
+  - Completed slice: remove `rustfs_ecstore::store_api` from the public crate
+    module surface after external compatibility boundaries moved to
+    `rustfs_ecstore::object_api`.
+  - Acceptance: ECStore object DTO and reader compatibility remains available
+    through `object_api`, integration contract tests consume the new public
+    path, and migration rules reject restoring `pub mod store_api`.
+  - Must preserve: internal ECStore object DTO definitions, reader/writer
+    behavior, storage-api trait bindings, and downstream object/list/multipart
+    compile-time contracts.
+  - Verification: focused ECStore contract tests, migration guard, formatting,
+    diff hygiene, risk scan, and three-expert review.
+
+- [x] `API-064` Retire the ECStore store API module name.
+  - Completed slice: move ECStore object DTO, reader, and option definitions
+    from the private `store_api` module into the public `object_api` module,
+    then migrate ECStore internal imports to `crate::object_api`.
+  - Acceptance: no ECStore `store_api` module file or directory remains, public
+    consumers keep using `rustfs_ecstore::object_api`, and migration rules
+    reject restoring the retired module path.
+  - Must preserve: object metadata shape, reader/writer behavior, storage-api
+    contract bindings, object/list/multipart behavior, and downstream public
+    object API compatibility.
+  - Verification: focused ECStore compile checks, migration guard, formatting,
+    diff hygiene, risk scan, and three-expert review.
+
+- [x] `API-065` Use storage-api list contracts inside ECStore.
+  - Completed slice: migrate ECStore internal list response, walk options, and
+    walk result bindings to local aliases over the generic `rustfs-storage-api`
+    contracts, including replication worker trait bounds, while retaining
+    public `rustfs_ecstore::object_api` aliases for downstream compatibility.
+  - Acceptance: ECStore implementation modules no longer import list/walk
+    compatibility aliases from `crate::object_api`, and migration rules reject
+    reintroducing those internal imports.
+  - Must preserve: list response shape, walk result item shape, object metadata
+    shape, storage-api trait bindings, and downstream public object API
+    compatibility.
+  - Verification: focused ECStore compile checks, migration guard, formatting,
+    diff hygiene, risk scan, and three-expert review.
+
+- [x] `API-066` Prune ECStore object API storage aliases.
+  - Completed slice: remove unused public storage-api passthrough aliases from
+    ECStore `object_api` for list responses, walk options, walk result items,
+    and delete-object DTOs, then bind the ECStore contract test directly to the
+    generic `rustfs-storage-api` contracts.
+  - Acceptance: ECStore `object_api` no longer exposes storage-api passthrough
+    aliases, the storage contract test still proves ECStore implements the
+    storage-api traits with the same associated concrete types, and migration
+    rules reject restoring the object_api passthrough aliases.
+  - Must preserve: ECStore-owned object metadata, object options, reader/writer
+    types, storage-api trait associated type bindings, list/delete/walk response
+    shapes, and runtime behavior.
+  - Verification: focused ECStore compile checks, storage contract test,
+    downstream compile checks, migration and layer guards, formatting, diff
+    hygiene, risk scan, full pre-commit, and three-expert review.
+
+- [x] `API-067` Guard remaining external ECStore object API aliases.
+  - Completed slice: add a migration guard that snapshots the exact external
+    `storage_compat.rs` aliases still allowed to reference
+    `rustfs_ecstore::object_api::{GetObjectReader,ObjectInfo,ObjectOptions,PutObjReader}`
+    and rejects new object-api names in compatibility boundaries.
+  - Acceptance: all remaining external `object_api` references are deliberate
+    compatibility aliases in `storage_compat.rs` modules, future additions fail
+    the migration guard, and the API-066 passthrough alias cleanup stays
+    protected.
+  - Must preserve: no runtime code changes, all existing compatibility aliases,
+    object metadata shape, options, and reader/writer ownership.
+  - Verification: bash syntax check, migration and layer guards, formatting,
+    diff hygiene, full pre-commit, and three-expert review.
+
+- [x] `API-068` Prune notify ECStore object-info compatibility alias.
+  - Completed slice: remove notify's private `EcstoreObjectInfo` alias and
+    ECStore-object conversion implementation, then map ECStore event objects to
+    `NotifyObjectInfo` inside the RustFS event and operation notification
+    bridges.
+  - Acceptance: `crates/notify` no longer references
+    `rustfs_ecstore::object_api::ObjectInfo`, the remaining object-api alias
+    allowlist shrinks accordingly, and notify event payload fields keep the
+    same serialized values.
+  - Must preserve: live event dispatch behavior, event names, bucket/object
+    fields, version IDs, metadata, restore-completed timestamps, storage class,
+    transitioned tier, host/port parsing, and replication request filtering.
+  - Verification: focused RustFS event conversion test, focused notify/RustFS
+    compile checks, migration and layer guards, formatting, diff hygiene, full
+    pre-commit, and three-expert review.
+
+- [x] `API-069` Prune IAM direct ECStore object metadata/options aliases.
+  - Completed slice: replace IAM config and store `ObjectInfo`/`ObjectOptions`
+    compatibility aliases with `IamStore` `ObjectOperations` associated types.
+  - Acceptance: IAM no longer names
+    `rustfs_ecstore::object_api::{ObjectInfo,ObjectOptions}` directly, the
+    remaining object-api alias allowlist shrinks by four entries, and IAM config
+    read/write metadata and lazy-rewrite precondition behavior are unchanged.
+  - Must preserve: IAM config encryption/decryption, lazy rewrite ETag matching,
+    list walk item/error typing, metadata return shape, storage preconditions,
+    system-path failure classification, and notification peer behavior.
+  - Verification: focused IAM compile/tests, migration and layer guards,
+    formatting, diff hygiene, full pre-commit, and three-expert review.
+
+- [x] `API-070` Prune consumer direct ECStore object aliases.
+  - Completed slice: replace scanner, s3select, and Swift
+    `GetObjectReader`/`ObjectInfo`/`ObjectOptions`/`PutObjReader`
+    compatibility aliases with concrete store `rustfs_storage_api` associated
+    types.
+  - Acceptance: scanner, s3select, and Swift no longer name
+    `rustfs_ecstore::object_api::{GetObjectReader,ObjectInfo,ObjectOptions,PutObjReader}`
+    directly, and the remaining object-api alias allowlist shrinks by eleven
+    entries.
+  - Must preserve: scanner lifecycle/replication IO bounds and config helpers,
+    s3select read buffer/object error handling, Swift bucket metadata helpers,
+    and object reader/writer concrete types exposed through each local
+    compatibility boundary.
+  - Verification: focused consumer compile/tests, migration and layer guards,
+    formatting, diff hygiene, full pre-commit, and three-expert review.
+
+- [x] `API-071` Prune final direct ECStore object aliases.
+  - Completed slice: replace heal and RustFS storage
+    `GetObjectReader`/`ObjectInfo`/`ObjectOptions`/`PutObjReader`
+    compatibility aliases with concrete store `rustfs_storage_api` associated
+    types.
+  - Acceptance: no external `storage_compat.rs` module names
+    `rustfs_ecstore::object_api::{GetObjectReader,ObjectInfo,ObjectOptions,PutObjReader}`
+    directly, and the external object-api alias allowlist is empty.
+  - Must preserve: heal object metadata and rewrite reader construction,
+    RustFS storage object read/write paths, S3 response metadata semantics,
+    SSE/encryption handling, and storage object option behavior.
+  - Verification: focused heal/storage compile/tests, migration and layer
+    guards, formatting, diff hygiene, full pre-commit, and three-expert review.
+
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.
   - Acceptance: `./scripts/check_architecture_migration_rules.sh` parses the
     allowed PR types from [`crate-boundaries.md`](crate-boundaries.md) and fails
@@ -304,6 +630,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     and persisted config serialization still writes the original secret values.
   - Verification: focused KMS redaction/status tests, full KMS tests, migration
     guards, Rust quality scan, clippy, and `make pre-commit` passed.
+- [x] `S-014` Remove legacy KMS admin action fallbacks.
+  - Acceptance: KMS create, describe, and list-key handlers authorize only the
+    dedicated `kms:*` actions and no longer retain legacy admin grant fallbacks.
+  - Must preserve: legacy KMS endpoint URLs, query aliases, request bodies, and
+    response contracts remain unchanged.
+  - Verification: focused KMS auth and route-policy tests, migration guards,
+    formatting, diff hygiene, risk scan, full pre-commit, and required
+    three-expert review passed before push.
+- [x] `S-015` Remove legacy KMS admin policy action taxonomy.
+  - Acceptance: `admin:KMSCreateKey` and `admin:KMSKeyStatus` no longer parse as
+    valid policy actions; KMS key handlers keep using dedicated `kms:*` actions.
+  - Must preserve: legacy KMS endpoint URLs, query aliases, request bodies, and
+    response contracts remain unchanged.
+  - Verification: focused policy and KMS auth tests, route-policy tests,
+    migration guards, formatting, diff hygiene, risk scan, full pre-commit, and
+    required three-expert review passed before push.
 - [x] `KMSD-001` Inventory KMS development defaults.
   - Acceptance:
     [`kms-development-defaults-inventory.md`](kms-development-defaults-inventory.md)
@@ -1105,6 +1447,263 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: migration guard, formatting check, diff hygiene, risk scan,
     focused script check, and full pre-commit required before push.
 
+- [x] `API-042` Split notify event object contract from ECStore ObjectInfo.
+  - Current branch: `overtrue/arch-compat-passthrough-contracts`.
+  - Current slice: give `rustfs-notify` its own lightweight
+    `NotifyObjectInfo` event DTO, keep ECStore-to-notify conversion private to
+    the notify compatibility boundary, and update RustFS event handoff sites to
+    use the conversion explicitly.
+  - Acceptance: notify no longer publicly re-exports ECStore `ObjectInfo` as
+    its event object type; existing RustFS event generation, restore-completed
+    event data, version IDs, object metadata filtering, and ECStore bridge
+    behavior are preserved.
+  - Must preserve: S3 event JSON shape, remove-event metadata suppression,
+    restore-completed glacier data formatting, object key URL encoding,
+    request/response headers, replication request filtering, and existing
+    EventArgsBuilder call sites.
+  - Risk defense: this is a consumer contract split only; ECStore remains the
+    producer of storage metadata, while notify owns the event-facing DTO.
+  - Verification: focused notify/RustFS compile, migration and layer guards,
+    formatting check, diff hygiene, risk scan, full pre-commit, and required
+    three-expert review passed.
+
+- [x] `API-043` Remove notify ECStore config passthroughs.
+  - Current branch: `overtrue/arch-compat-passthrough-contracts`.
+  - Current slice: replace notify's public compatibility passthroughs for
+    ECStore config/global modules with a crate-local config update boundary,
+    then shrink the passthrough guard snapshot.
+  - Acceptance: notify config mutation code no longer reaches through
+    ECStore config/global modules directly; the storage compatibility boundary
+    owns ECStore handle resolution, read, save, and error classification.
+  - Must preserve: target config read-modify-save behavior, unchanged-config
+    no-op handling, storage-not-initialized error wording, read/save error
+    mapping, target reload ordering, and runtime lifecycle logging.
+  - Risk defense: this keeps persistence semantics unchanged while reducing
+    the compatibility surface visible to notify business logic.
+  - Verification: focused notify/RustFS compile, migration and layer guards,
+    formatting check, diff hygiene, risk scan, full pre-commit, and required
+    three-expert review required before push.
+
+- [x] `API-044` Remove S3 Select ECStore module passthroughs.
+  - Current branch: `overtrue/arch-compat-passthrough-contracts`.
+  - Current slice: replace S3 Select's public compatibility passthroughs for
+    ECStore error, store, set-disk, and resolver modules with crate-local
+    aliases/functions, then shrink the passthrough guard snapshot.
+  - Acceptance: S3 Select object-store code no longer reaches through ECStore
+    modules directly; storage errors, store handle resolution, ECStore store
+    type ownership, and default read-buffer sizing remain behind the local
+    storage compatibility boundary.
+  - Must preserve: S3 Select object-store initialization, not-found error
+    mapping, scan-range defaults, stream buffer sizing, JSON document handling,
+    CSV conversion streams, and ECStore object reader/info calls.
+  - Risk defense: this changes import ownership only; S3 Select still uses the
+    same ECStore runtime APIs through narrower local compatibility names.
+  - Verification: focused S3 Select/notify/RustFS compile, migration and layer
+    guards, formatting check, diff hygiene, risk scan, full pre-commit, and
+    required three-expert review required before push.
+
+- [x] `API-045` Remove observability ECStore module passthroughs.
+  - Current branch: `overtrue/arch-compat-passthrough-contracts`.
+  - Current slice: replace OBS metrics passthroughs for ECStore bucket,
+    data-usage, global, pools, and object-store resolver modules with
+    crate-local storage compatibility functions and snapshots, then shrink the
+    passthrough guard snapshot.
+  - Acceptance: OBS metrics collection no longer reaches through ECStore
+    modules directly; object-store resolution, data-usage loading, capacity
+    calculation, quota reads, replication state, bucket bandwidth monitor
+    access, and ILM runtime counters remain behind the OBS compatibility
+    boundary.
+  - Must preserve: cluster/health metrics, bucket usage metrics, replication
+    and bandwidth metrics, scheduler tombstone behavior, disk/drive metrics,
+    erasure-set metrics, ILM metrics, existing warning paths, and no-data
+    fallback behavior.
+  - Risk defense: this changes compatibility ownership only; OBS still reads
+    the same ECStore runtime state through narrower local compatibility names.
+  - Verification: focused OBS/notify/S3 Select/RustFS compile, migration and
+    layer guards, formatting check, diff hygiene, risk scan, full pre-commit,
+    and required three-expert review required before push.
+
+- [x] `API-046` Remove IAM and Swift ECStore module passthroughs.
+  - Current branch: `overtrue/arch-compat-iam-swift-boundaries`.
+  - Current slice: replace IAM's ECStore config/error/global/notification/store
+    module passthroughs and Swift's ECStore bucket/error/store resolver
+    passthroughs with local compatibility aliases and wrapper functions, then
+    shrink the passthrough guard snapshot.
+  - Acceptance: IAM store, IAM notification fanout, IAM error conversion, IAM
+    first-node checks, and Swift bucket metadata/object-store access no longer
+    reach through ECStore modules directly from consumer code.
+  - Must preserve: IAM config prefix layout, IAM config read/write/delete
+    semantics, lazy rewrite precondition behavior, config-not-found mapping,
+    peer notification fanout error logging, first-node initial load behavior,
+    Swift object-store resolution, and Swift bucket metadata get/set behavior.
+  - Risk defense: this is an import ownership and compatibility-boundary
+    cleanup only; ECStore remains the owner of concrete storage/runtime state
+    while IAM and Swift expose narrower local names to their consumers.
+  - Verification: focused IAM/Swift compile, IAM unit tests, migration and
+    layer guards, formatting check, diff hygiene, risk scan, full pre-commit,
+    and required three-expert review required before push.
+
+- [x] `API-047` Remove heal and scanner production ECStore module passthroughs.
+  - Current branch: `overtrue/arch-heal-scanner-compat-boundaries`.
+  - Current slice: replace heal and scanner production compatibility
+    passthrough modules with explicit local aliases and wrapper functions,
+    while leaving test-only ECStore compatibility harnesses for later cleanup.
+  - Acceptance: heal and scanner production code no longer exposes broad
+    ECStore module passthroughs for bucket/config/data-usage/disk/error/global,
+    pools, set-disk, store, or store-utils through `storage_compat.rs`.
+  - Must preserve: heal disk/resume/task behavior, scanner config persistence,
+    scanner lifecycle/replication actions, bucket cache scanning, object-store
+    resolution, erasure-mode checks, storage-class accounting, and data-usage
+    memory updates.
+  - Risk defense: this narrows import ownership only; ECStore remains the owner
+    of concrete storage/runtime state and scanner/heal keep the same local
+    compatibility names for existing call sites.
+  - Verification: focused heal/scanner compile, migration and layer guards,
+    formatting check, diff hygiene, risk scan, full pre-commit, and required
+    three-expert review required before push.
+
+- [x] `API-048` Remove RustFS runtime ECStore module passthroughs.
+  - Current branch: `overtrue/arch-rustfs-runtime-compat-boundaries`.
+  - Current slice: replace the RustFS app, admin, storage, and root runtime
+    compatibility passthrough modules with explicit local aliases and nested
+    compatibility exports, while preserving existing consumer paths.
+  - Acceptance: RustFS runtime compatibility files no longer expose broad
+    ECStore top-level module passthroughs for app/admin/storage/root runtime
+    consumers, and the passthrough guard snapshot keeps only test/fuzz
+    harness allowances.
+  - Must preserve: startup config/bootstrap behavior, server readiness checks,
+    admin replication/rebalance/tier/config handlers, app object/bucket/
+    multipart usecases, storage RPC/SSE/access paths, table catalog storage
+    access, and existing test-only harness imports.
+  - Risk defense: this is an import ownership and compatibility-boundary
+    cleanup only; ECStore remains the owner of concrete storage/runtime state
+    while RustFS runtime modules retain stable local compatibility paths.
+  - Verification: focused RustFS test compile, migration and layer guards,
+    formatting check, diff hygiene, risk scan, full pre-commit, and required
+    three-expert review passed before push.
+
+- [x] `API-049` Remove test and fuzz ECStore module passthroughs.
+  - Current branch: `overtrue/arch-test-fuzz-compat-boundaries`.
+  - Current slice: replace the remaining e2e, heal-test, scanner-test, and
+    fuzz-target ECStore module passthroughs with explicit local compatibility
+    aliases, split fuzz storage compatibility by target, and empty the
+    passthrough guard snapshot.
+  - Acceptance: no `storage_compat.rs` file may expose broad
+    `rustfs_ecstore` module passthroughs; the migration guard now rejects any
+    new passthrough unless a later slice deliberately adds a reviewed
+    allowlist entry.
+  - Must preserve: e2e bucket target and RPC helper imports, heal test disk and
+    store setup imports, scanner test lifecycle/tier/disk/storage imports,
+    fuzz bucket validation behavior, and fuzz path containment behavior.
+  - Risk defense: this is test-harness and fuzz-harness import ownership
+    cleanup only; ECStore remains the owner of the same concrete APIs and no
+    production runtime path is changed.
+  - Verification: focused test/fuzz compiles, migration and layer guards,
+    formatting check, diff hygiene, risk scan, full pre-commit, and required
+    three-expert review passed before push.
+
+- [x] `API-050` Move lifecycle helper DTO contracts.
+  - Current branch: `overtrue/arch-storage-api-lifecycle-contracts`.
+  - Current slice: move `ExpirationOptions` and `TransitionedObject` into
+    rustfs-storage-api, update ECStore internal consumers plus notify test
+    coverage to import them directly, and keep ECStore old-path re-exports for
+    downstream compatibility callers.
+  - Acceptance: rustfs-storage-api exports both lifecycle helper DTOs, ECStore
+    no longer owns their concrete struct definitions, ECStore internal
+    consumers and notify coverage use the storage-api contracts directly, old
+    ECStore lifecycle paths remain available as re-exports, and migration rules
+    reject restoring the ECStore definitions or old internal imports.
+  - Must preserve: lifecycle expiration flags, transitioned object journal
+    metadata, object info construction, notify event conversion, and all old
+    ECStore import paths used by existing callers.
+  - Risk defense: this is a pure DTO move; no lifecycle scheduling, object I/O,
+    transition journal, replication, or reader behavior is changed.
+  - Verification: storage-api lifecycle helper unit test, ECStore transitioned
+    lifecycle tests, notify event conversion test, focused compile checks,
+    migration and layer guards, formatting check, diff hygiene, risk scan, full
+    pre-commit, and required three-expert review passed before push.
+
+- [x] `API-051` Flatten test harness storage compatibility aliases.
+  - Current branch: `overtrue/arch-test-harness-compat-aliases`.
+  - Current slice: flatten e2e, heal, scanner, and fuzz storage compatibility
+    harnesses from nested `storage_compat::ecstore` modules into direct
+    crate-local aliases, constants, and function imports.
+  - Acceptance: no e2e, heal-test, scanner-test, or fuzz-target harness file
+    may expose or consume nested `storage_compat::ecstore` paths, and migration
+    rules reject reintroducing nested test/fuzz ECStore compatibility modules.
+  - Must preserve: e2e bucket target/RPC/disk helper imports, heal ECStore disk
+    and endpoint setup, scanner lifecycle/tier/disk/storage setup, fuzz bucket
+    validation behavior, and fuzz path-containment validation behavior.
+  - Risk defense: this is test-harness and fuzz-harness import cleanup only; no
+    production runtime behavior, ECStore ownership, storage metadata format, or
+    scanner/heal lifecycle logic is changed.
+  - Verification: focused e2e/heal/scanner test compile, harness tests,
+    migration and layer guards, formatting check, diff hygiene, risk scan, full
+    pre-commit, and required three-expert review passed before push.
+
+- [x] `API-052` Flatten RustFS runtime storage compatibility aliases.
+  - Current branch: `overtrue/arch-rustfs-storage-compat-aliases`.
+  - Current slice: flatten RustFS root, app, admin, and storage runtime
+    compatibility facades from nested `storage_compat::ecstore` modules into
+    direct crate-local aliases, constants, and function imports.
+  - Acceptance: no RustFS runtime source file may expose or consume nested
+    `storage_compat::ecstore` paths, and migration rules reject reintroducing
+    nested RustFS runtime ECStore compatibility modules.
+  - Must preserve: startup/config/bootstrap behavior, server readiness checks,
+    admin replication/rebalance/tier/config handlers, app object/bucket/
+    multipart usecases, storage RPC/SSE/access paths, table catalog storage
+    access, and existing local compatibility ownership.
+  - Risk defense: this is RustFS runtime import cleanup only; no production
+    runtime behavior, ECStore ownership, storage metadata format, object I/O,
+    admin authorization, or readiness semantics are changed.
+  - Verification: focused RustFS compile, migration and layer guards,
+    formatting check, diff hygiene, risk scan, full pre-commit, and required
+    three-expert review passed before push.
+
+- [x] `API-053` Flatten RustFS runtime scalar storage compatibility aliases.
+  - Current branch: `overtrue/arch-runtime-compat-surface-prune`.
+  - Current slice: flatten RustFS root, app, admin, and storage runtime scalar
+    compatibility facades such as store, error, global, endpoints, RPC,
+    metrics, notification, set-disk, and data-usage paths into direct
+    crate-local aliases and functions.
+  - Acceptance: RustFS runtime source no longer consumes those scalar
+    compatibility surfaces through secondary modules, while higher-coupling
+    bucket/config/rio compatibility modules remain unchanged; migration rules
+    reject restoring the flattened scalar paths.
+  - Must preserve: startup config/bootstrap behavior, server readiness checks,
+    admin replication/rebalance/tier/config handlers, app object/bucket/
+    multipart usecases, storage RPC/SSE/access paths, table catalog storage
+    access, and existing ECStore concrete type ownership.
+  - Risk defense: this is import ownership and facade-shape cleanup only; no
+    production runtime behavior, ECStore ownership, storage metadata format,
+    object I/O, admin authorization, or readiness semantics are changed.
+  - Verification: focused RustFS compile, migration and layer guards,
+    formatting check, diff hygiene, risk scan, full pre-commit, and required
+    three-expert review passed before push.
+
+- [x] `API-054` Flatten RustFS runtime secondary storage compatibility aliases.
+  - Current branch: `overtrue/arch-runtime-secondary-compat-flatten`.
+  - Current slice: flatten RustFS root, app, admin, and storage runtime
+    secondary compatibility modules such as bucket, config, rio, client, tier,
+    compress, disk, and rebalance into direct crate-local aliases, modules, and
+    functions.
+  - Acceptance: RustFS runtime source no longer consumes those compatibility
+    surfaces through broad secondary modules, the runtime compatibility files no
+    longer define those wrapper modules, and migration rules reject restoring
+    the flattened secondary paths.
+  - Must preserve: startup config/bootstrap behavior, server module-switch
+    config reads, embedded startup storage initialization, admin bucket/meta/
+    tier/rebalance/config handlers, app object/bucket/multipart usecases,
+    storage RPC/SSE/access paths, table catalog storage access, and ECStore
+    concrete type ownership.
+  - Risk defense: this is import ownership and facade-shape cleanup only; no
+    production runtime behavior, ECStore ownership, storage metadata format,
+    object I/O, admin authorization, tier behavior, or readiness semantics are
+    changed.
+  - Verification: focused RustFS compile, migration and layer guards,
+    formatting check, diff hygiene, risk scan, and required three-expert review
+    passed before push.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -1371,23 +1970,298 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     binary/lib compile checks, formatting, migration guards, Rust risk scan,
     branch freshness check, and pre-commit quality gate.
 
+- [x] `R-020` Isolate profiling lifecycle hooks.
+  - Do: route BOOT-006 profiling initialization and STOP-004 profiling shutdown
+    through `startup_profiling` hook functions while keeping `profiling.rs` as
+    the CPU/memory profiling implementation and admin dump API owner.
+  - Acceptance: startup still initializes profiling before trusted proxies and
+    outbound TLS material; shutdown still stops profiling after notifier/audit
+    shutdown and before HTTP shutdown; unsupported targets and disabled
+    profiling keep their existing no-op behavior.
+  - Must preserve: profiling env flags, CPU/memory mode handling, target gates,
+    cancellation-token ownership, admin pprof routes, non-fatal startup
+    behavior, and shutdown ordering.
+  - Verification: focused startup profiling hook tests, binary/lib compile
+    checks, formatting, migration guards, Rust risk scan, branch freshness
+    check, and pre-commit quality gate.
+
 ## Next PRs
 
-1. `pure-move`/`consumer-migration`: continue larger cleanup slices with the
+1. `pure-move`: continue larger lifecycle hook slices for optional runtime
+   sidecars while preserving startup and shutdown ordering.
+2. `consumer-migration`: continue larger cleanup slices with the
    loss-prevention guards active for remaining ECStore compatibility contracts
-   outside the production compatibility boundaries already cleaned.
+   that still have dedicated preservation coverage.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-041 is guard-only and snapshots local ECStore compatibility passthroughs without changing runtime boundaries. |
-| Migration preservation | passed | Existing local `storage_compat.rs` paths and ECStore concrete ownership remain unchanged; the guard only reports passthrough drift. |
-| Testing/verification | passed | Script syntax, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed. |
+| Quality/architecture | passed | R-020 moves profiling init/shutdown call sites behind `startup_profiling` hook functions without moving CPU/memory profiling implementation ownership or admin pprof APIs. |
+| Migration preservation | passed | BOOT-006 still initializes profiling before trusted proxies/provider/TLS setup; STOP-004 still stops profiling after notifier/audit shutdown and before HTTP shutdown; profiling env flags, platform gates, target unsupported behavior, and cancellation-token ownership remain in `profiling.rs`. |
+| Testing/verification | passed | Focused startup profiling hook tests, RustFS library check, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` validate the current R-020 slice. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 R-020 current slice:
+  - `cargo test -p rustfs --lib startup_profiling -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 API-056/R-016 current slice:
+  - `cargo test -p rustfs --lib runtime_capabilities -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 API-055/SCH-001 current slice:
+  - `cargo test -p rustfs --lib storage::concurrency::manager::integration_tests -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 PR-05/PR-07 current slice:
+  - `cargo test -p rustfs-concurrency --no-fail-fast`: passed.
+  - `cargo check -p rustfs-concurrency`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 PR-08/PR-09 current slice:
+  - `cargo test -p rustfs-storage-api`: passed.
+  - `cargo check -p rustfs-storage-api`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- G-011/G-012/G-013 current slice:
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `git diff --check`: passed.
+  - Three-expert review: passed.
+  - Full `make pre-commit`: not run because this slice is documentation-only.
+
+- API-054 current slice:
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo check --tests -p rustfs`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: passed; only existing import and path rewrites were
+    reviewed, with no new unwrap/expect, panic/todo/unsafe, risky casts,
+    ad-hoc error construction, or sensitive-token handling semantics.
+
+- API-053 current slice:
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo check --tests -p rustfs`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: passed; only existing import and path rewrites were
+    reviewed, with no new unwrap/expect, panic/todo/unsafe, risky casts,
+    ad-hoc error construction, or sensitive-token handling semantics.
+  - `make pre-commit`: passed.
+
+- API-052 current slice:
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo check --tests -p rustfs`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: passed; only existing-semantic path replacement hits were
+    reviewed, with no new unwrap/expect, panic/todo/unsafe, risky casts,
+    ad-hoc error construction, or sensitive-token handling semantics.
+  - `make pre-commit`: passed, including 6250 nextest tests and doctests.
+
+- API-050 current slice:
+  - `cargo test -p rustfs-storage-api lifecycle_helper_defaults_preserve_existing_contracts --no-fail-fast`:
+    passed.
+  - `cargo check --tests -p rustfs-storage-api -p rustfs-ecstore -p rustfs-notify`:
+    passed.
+  - `cargo test -p rustfs-ecstore transitioned --no-fail-fast`: passed.
+  - `cargo test -p rustfs-notify ecstore_object_info_conversion_preserves_notify_event_fields --no-fail-fast`:
+    passed.
+  - `cargo check --tests -p rustfs`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: passed; no new unwrap/expect, panic/todo/unsafe, risky
+    casts, ad-hoc error construction, or sensitive-token handling in added
+    lines.
+  - `make pre-commit`: passed.
+
+- API-051 current slice:
+  - `cargo check --tests -p e2e_test -p rustfs-heal -p rustfs-scanner`:
+    passed.
+  - `cargo check --manifest-path fuzz/Cargo.toml --all-targets`: passed.
+  - `cargo test -p rustfs-heal --test endpoint_index_test test_endpoint_index_settings --no-fail-fast`:
+    passed.
+  - `cargo test -p rustfs-scanner --test lifecycle_integration_test --no-run`:
+    passed.
+  - `cargo test -p e2e_test --no-run`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: passed; only existing test `unwrap` calls were touched by
+    import path rewrites, with no new unwrap/expect, panic/todo/unsafe, risky
+    casts, ad-hoc error construction, or sensitive-token handling semantics.
+  - `make pre-commit`: passed.
+
+- S-015 current slice:
+  - `cargo test -p rustfs-policy test_legacy_kms_admin_actions_are_rejected --no-fail-fast`:
+    passed.
+  - `cargo test -p rustfs kms_key_auth_actions_use_dedicated_kms_actions --no-fail-fast`:
+    passed.
+  - `cargo test -p rustfs route_policy_records_dedicated_kms_actions --no-fail-fast`:
+    passed.
+  - `cargo test -p rustfs route_policy_rejects_server_info_for_sensitive_kms_actions --no-fail-fast`:
+    passed.
+  - `cargo check --tests -p rustfs-policy -p rustfs`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `make pre-commit`: passed.
+
+- S-014 previous slice:
+  - `cargo test -p rustfs kms_key_auth_actions_use_dedicated_kms_actions --no-fail-fast`:
+    passed.
+  - `cargo test -p rustfs route_policy_records_dedicated_kms_actions --no-fail-fast`:
+    passed.
+  - `cargo test -p rustfs route_policy_rejects_server_info_for_sensitive_kms_actions --no-fail-fast`:
+    passed.
+  - `cargo check --tests -p rustfs`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Source marker scan: passed; no non-doc `RUSTFS_COMPAT_TODO` markers remain.
+  - Rust risk scan: passed; no new unwrap/expect, panic/todo/unsafe, risky
+    casts, ad-hoc error construction, or sensitive-token handling in added
+    lines.
+  - `make pre-commit`: passed.
+
+- API-049 current slice:
+  - `cargo check --tests -p rustfs-heal -p rustfs-scanner -p e2e_test`:
+    passed.
+  - `cargo check --manifest-path fuzz/Cargo.toml --all-targets`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: passed; no new unwrap/expect, panic/todo/unsafe, risky
+    casts, ad-hoc error construction, or sensitive-token handling in added
+    lines.
+  - `make pre-commit`: passed.
+
+- API-048 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Rust risk scan: passed; no new unwrap/expect, panic/todo/unsafe, risky
+    casts, ad-hoc error construction, or sensitive-token handling in added
+    lines.
+  - `make pre-commit`: passed.
+
+- API-047 current slice:
+  - `cargo check --tests -p rustfs-heal -p rustfs-scanner`: passed.
+  - `cargo test -p rustfs-heal -p rustfs-scanner`: passed, 290 tests passed
+    and 14 ignored.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: passed; the only match was a test-only scanner config init
+    re-export.
+
+- API-046 current slice:
+  - `cargo check --tests -p rustfs-iam -p rustfs-protos`: passed.
+  - `cargo test -p rustfs-iam`: passed, 150 tests.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: reviewed added lines; only existing error-mapping behavior
+    was renamed to IAM-local compatibility aliases.
+  - `make pre-commit`: passed.
+
+- API-042 current slice:
+  - `cargo check --tests -p rustfs-notify -p rustfs`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: passed; no new unwrap/expect, numeric casts, string error
+    public APIs, boxed public errors, production println/eprintln, or relaxed
+    ordering introduced in changed Rust files.
+  - `make pre-commit`: passed.
+
+- API-043 current slice:
+  - `cargo test -p rustfs-notify
+    storage_compat::tests::ecstore_object_info_conversion_preserves_notify_event_fields`:
+    passed.
+  - `cargo check --tests -p rustfs-notify -p rustfs`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: passed; no new unwrap/expect, numeric casts, string error
+    public APIs, boxed public errors, production println/eprintln, or relaxed
+    ordering introduced in changed Rust files.
+  - `make pre-commit`: passed, including 6245 nextest tests passed and 111
+    skipped.
+
+- API-044 current slice:
+  - `cargo check --tests -p rustfs-s3select-api -p rustfs-notify -p
+    rustfs`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: passed; no new unwrap/expect, numeric casts, string error
+    public APIs, boxed public errors, production println/eprintln, or relaxed
+    ordering introduced in changed Rust files.
+  - `make pre-commit`: passed, including 6245 nextest tests passed and 111
+    skipped.
+
+- API-045 current slice:
+  - `cargo check --tests -p rustfs-obs -p rustfs-s3select-api -p
+    rustfs-notify -p rustfs`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: passed; no new unwrap/expect, numeric casts, string error
+    public APIs, boxed public errors, production println/eprintln, or relaxed
+    ordering introduced in changed Rust files.
+  - `make pre-commit`: passed, including 6245 nextest tests passed and 111
+    skipped.
 
 - API-041 current slice:
   - `bash -n scripts/check_architecture_migration_rules.sh`: passed.

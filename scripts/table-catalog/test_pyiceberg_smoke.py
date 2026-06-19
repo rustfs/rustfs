@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -72,6 +73,56 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         )
         self.assertEqual(profiles["minio-aistor"]["rest_signing_name"], "s3tables")
         self.assertEqual(profiles["cloudflare-r2-data-catalog"]["credential_mode"], "catalog-vended")
+
+    def test_vendor_profiles_publish_migration_boundaries(self) -> None:
+        profiles = pyiceberg_smoke.vendor_profiles()
+
+        aws = profiles["aws-s3tables"]
+        self.assertEqual(aws["compatibility_stage"], "reference-only")
+        self.assertEqual(aws["warehouse_shape"], "arn:aws:s3tables:{region}:{account_id}:bucket/{table_bucket}")
+        self.assertEqual(aws["namespace_model"], "single-level")
+        self.assertEqual(aws["pagination_model"], "vendor-specific")
+        self.assertIn("full AWS S3 Tables API parity", aws["not_claimed"])
+
+        cloudflare = profiles["cloudflare-r2-data-catalog"]
+        self.assertEqual(cloudflare["catalog_uri_shape"], "{catalog_uri}")
+        self.assertEqual(cloudflare["credential_mode"], "catalog-vended")
+        self.assertIn("live RustFS interoperability", cloudflare["not_claimed"])
+
+    def test_aws_reference_profile_formats_s3tables_warehouse_arn(self) -> None:
+        args = self.parse_with_args([
+            "--profile",
+            "aws-s3tables",
+            "--endpoint",
+            "https://s3tables.us-east-1.amazonaws.com",
+            "--region",
+            "us-east-1",
+            "--account-id",
+            "123456789012",
+            "--table-bucket",
+            "analytics",
+        ])
+
+        properties = pyiceberg_smoke.catalog_properties(args)
+
+        self.assertEqual(properties["uri"], "https://s3tables.us-east-1.amazonaws.com/iceberg")
+        self.assertEqual(properties["warehouse"], "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics")
+        self.assertEqual(properties["rest.signing-name"], "s3tables")
+
+    def test_cloudflare_reference_profile_uses_catalog_uri_and_warehouse_name(self) -> None:
+        args = self.parse_with_args([
+            "--profile",
+            "cloudflare-r2-data-catalog",
+            "--catalog-uri",
+            "https://catalog.example.com/iceberg",
+            "--warehouse-name",
+            "analytics",
+        ])
+
+        properties = pyiceberg_smoke.catalog_properties(args)
+
+        self.assertEqual(properties["uri"], "https://catalog.example.com/iceberg")
+        self.assertEqual(properties["warehouse"], "analytics")
 
     def test_vended_profile_requires_catalog_credentials_and_keeps_canonical_path(self) -> None:
         args = self.parse_with_args([
@@ -766,12 +817,84 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             self.assertIn("status", entry)
             self.assertIn("validation", entry)
 
+    def test_print_engine_compatibility_outputs_machine_readable_matrix(self) -> None:
+        args = self.parse_with_args(["--print-engine-compatibility"])
+
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            self.assertTrue(pyiceberg_smoke.printed_metadata(args))
+
+        document = json.loads(stdout.getvalue())
+        self.assertIn("engine_compatibility", document)
+        clients = {entry["client"] for entry in document["engine_compatibility"]}
+        self.assertIn("PyIceberg", clients)
+        self.assertIn("Spark Iceberg REST catalog", clients)
+
+    def test_print_production_failure_coverage_outputs_machine_readable_matrix(self) -> None:
+        args = self.parse_with_args(["--print-production-failure-coverage"])
+
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            self.assertTrue(pyiceberg_smoke.printed_metadata(args))
+
+        document = json.loads(stdout.getvalue())
+        self.assertIn("production_failure_coverage", document)
+        cases = {entry["case"] for entry in document["production_failure_coverage"]}
+        self.assertIn("commit-cas-conflict", cases)
+        self.assertIn("post-cas-finalization-gap", cases)
+
+    def test_print_vendor_profiles_outputs_migration_boundaries(self) -> None:
+        args = self.parse_with_args(["--print-vendor-profiles"])
+
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            self.assertTrue(pyiceberg_smoke.printed_metadata(args))
+
+        document = json.loads(stdout.getvalue())
+        self.assertIn("vendor_profiles", document)
+        aws = document["vendor_profiles"]["aws-s3tables"]
+        self.assertEqual(aws["rest_signing_name"], "s3tables")
+        self.assertEqual(aws["compatibility_stage"], "reference-only")
+        self.assertIn("full AWS S3 Tables API parity", aws["not_claimed"])
+
+        selected = document["selected_vendor_profile"]
+        self.assertEqual(selected["name"], "rustfs")
+        self.assertEqual(selected["catalog_uri"], "http://127.0.0.1:9000/iceberg")
+        self.assertEqual(selected["warehouse"], "rustfs-s3table-smoke")
+
+    def test_print_vendor_profiles_renders_selected_aws_profile(self) -> None:
+        args = self.parse_with_args(
+            [
+                "--profile",
+                "aws-s3tables",
+                "--region",
+                "us-east-1",
+                "--account-id",
+                "123456789012",
+                "--table-bucket",
+                "analytics",
+                "--print-vendor-profiles",
+            ]
+        )
+
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            self.assertTrue(pyiceberg_smoke.printed_metadata(args))
+
+        document = json.loads(stdout.getvalue())
+        selected = document["selected_vendor_profile"]
+        self.assertEqual(selected["name"], "aws-s3tables")
+        self.assertEqual(selected["catalog_uri"], "https://s3tables.us-east-1.amazonaws.com/iceberg")
+        self.assertEqual(selected["warehouse"], "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics")
+        self.assertEqual(selected["rest_signing_name"], "s3tables")
+
     def test_published_table_catalog_docs_do_not_use_internal_roadmap_labels(self) -> None:
         readme = (SCRIPT_DIR / "README.md").read_text(encoding="utf-8")
 
         self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(readme))
         self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(str(pyiceberg_smoke.unsupported_inventory())))
         self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(str(pyiceberg_smoke.production_readiness_inventory())))
+        self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(str(pyiceberg_smoke.failure_coverage.production_failure_matrix())))
 
 
 if __name__ == "__main__":

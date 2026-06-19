@@ -15,7 +15,7 @@
 use super::sts::create_oidc_sts_credentials;
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::storage_compat::ecstore::config::com::{read_config_without_migrate, save_server_config};
+use crate::admin::storage_compat::com::{read_config_without_migrate, save_server_config};
 use crate::app::context::resolve_object_store_handle;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, MINIO_ADMIN_PREFIX, RemoteAddr};

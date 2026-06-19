@@ -37,7 +37,7 @@ use std::sync::{LazyLock, Mutex as StdMutex, MutexGuard};
 use std::time::{Instant, SystemTime};
 use std::{fmt::Debug, sync::Arc};
 use time::OffsetDateTime;
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
@@ -86,6 +86,7 @@ impl ScannerBucketScanPlan {
 
 static DIRTY_USAGE_BUCKET_GENERATION: AtomicU64 = AtomicU64::new(0);
 static DIRTY_USAGE_BUCKETS: LazyLock<StdMutex<DirtyUsageBuckets>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
+static DIRTY_USAGE_BUCKET_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 
 fn dirty_usage_buckets() -> MutexGuard<'static, DirtyUsageBuckets> {
     DIRTY_USAGE_BUCKETS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -107,6 +108,7 @@ pub fn record_dirty_usage_bucket(bucket: &str) {
         dirty_buckets.len()
     };
     global_metrics().record_scanner_dirty_usage_pending(usize_to_u64_saturated(pending_buckets));
+    DIRTY_USAGE_BUCKET_NOTIFY.notify_one();
 }
 
 pub fn clear_dirty_usage_bucket(bucket: &str) {
@@ -136,6 +138,14 @@ fn snapshot_dirty_usage_buckets(buckets: &[BucketInfo]) -> DirtyUsageBuckets {
     };
     global_metrics().record_scanner_dirty_usage_cycle_snapshot(usize_to_u64_saturated(snapshot.len()));
     snapshot
+}
+
+pub(crate) fn dirty_usage_buckets_pending() -> bool {
+    !dirty_usage_buckets().is_empty()
+}
+
+pub(crate) async fn dirty_usage_bucket_notified() {
+    DIRTY_USAGE_BUCKET_NOTIFY.notified().await;
 }
 
 fn clear_dirty_usage_buckets(snapshot: &DirtyUsageBuckets) {

@@ -57,16 +57,30 @@ STORE_API_OBJECT_HELPER_REEXPORTS_FILE="${TMP_DIR}/store_api_object_helper_reexp
 STORE_API_RANGE_HELPER_REEXPORTS_FILE="${TMP_DIR}/store_api_range_helper_reexports.txt"
 STORE_API_LIST_HELPER_REEXPORTS_FILE="${TMP_DIR}/store_api_list_helper_reexports.txt"
 STORE_API_LIST_RESPONSE_REEXPORTS_FILE="${TMP_DIR}/store_api_list_response_reexports.txt"
+ECSTORE_OBJECT_API_LIST_ALIAS_INTERNAL_HITS_FILE="${TMP_DIR}/ecstore_object_api_list_alias_internal_hits.txt"
+ECSTORE_OBJECT_API_STORAGE_ALIAS_HITS_FILE="${TMP_DIR}/ecstore_object_api_storage_alias_hits.txt"
+ECSTORE_OBJECT_API_EXTERNAL_ALIAS_EXPECTED_FILE="${TMP_DIR}/ecstore_object_api_external_alias_expected.txt"
+ECSTORE_OBJECT_API_EXTERNAL_ALIAS_ACTUAL_FILE="${TMP_DIR}/ecstore_object_api_external_alias_actual.txt"
+ECSTORE_OBJECT_API_EXTERNAL_ALIAS_DIFF_FILE="${TMP_DIR}/ecstore_object_api_external_alias_diff.txt"
+ECSTORE_OBJECT_API_UNAPPROVED_NAME_HITS_FILE="${TMP_DIR}/ecstore_object_api_unapproved_name_hits.txt"
 STORE_API_DELETE_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_delete_dto_reexports.txt"
 STORE_API_DELETE_DTO_INTERNAL_HITS_FILE="${TMP_DIR}/store_api_delete_dto_internal_hits.txt"
+STORE_API_LIFECYCLE_HELPER_DEFINITION_HITS_FILE="${TMP_DIR}/store_api_lifecycle_helper_definition_hits.txt"
+STORE_API_LIFECYCLE_HELPER_OLD_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_lifecycle_helper_old_consumer_hits.txt"
 STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_list_consumer_hits.txt"
 STORE_API_EXTERNAL_OPERATION_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_operation_consumer_hits.txt"
 STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE="${TMP_DIR}/store_api_object_operation_local_method_hits.txt"
 DIRECT_ECSTORE_IMPORT_HITS_FILE="${TMP_DIR}/direct_ecstore_import_hits.txt"
+TEST_HARNESS_NESTED_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/test_harness_nested_storage_compat_hits.txt"
+RUSTFS_NESTED_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/rustfs_nested_storage_compat_hits.txt"
+RUSTFS_RUNTIME_SCALAR_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/rustfs_runtime_scalar_storage_compat_hits.txt"
+RUSTFS_RUNTIME_SECONDARY_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/rustfs_runtime_secondary_storage_compat_hits.txt"
 PRODUCTION_UNUSED_COMPAT_ALLOW_HITS_FILE="${TMP_DIR}/production_unused_compat_allow_hits.txt"
 BROAD_STORE_API_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/broad_store_api_compat_reexport_hits.txt"
 NESTED_STORE_API_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/nested_store_api_compat_module_hits.txt"
 UNAPPROVED_STORE_API_COMPAT_ALIAS_HITS_FILE="${TMP_DIR}/unapproved_store_api_compat_alias_hits.txt"
+PUBLIC_STORE_API_MODULE_HITS_FILE="${TMP_DIR}/public_store_api_module_hits.txt"
+STORE_API_MODULE_PATH_HITS_FILE="${TMP_DIR}/store_api_module_path_hits.txt"
 ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE="${TMP_DIR}/ecstore_compat_passthrough_expected.txt"
 ECSTORE_COMPAT_PASSTHROUGH_ACTUAL_FILE="${TMP_DIR}/ecstore_compat_passthrough_actual.txt"
 ECSTORE_COMPAT_PASSTHROUGH_DIFF_FILE="${TMP_DIR}/ecstore_compat_passthrough_diff.txt"
@@ -204,8 +218,40 @@ require_source_line \
   "storage-api public bucket contract re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
+  "pub use capability::{CapabilitySnapshotError, CapabilityState, CapabilityStatus};" \
+  "storage-api public capability contract re-export"
+require_source_contains \
+  "crates/concurrency/src/lib.rs" \
+  "pub use workload::{" \
+  "concurrency public workload admission contract re-export"
+require_source_contains \
+  "crates/concurrency/src/lib.rs" \
+  "AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadAdmissionSnapshotProvider," \
+  "concurrency public workload admission contract status re-exports"
+require_source_contains \
+  "crates/concurrency/src/lib.rs" \
+  "WorkloadClass," \
+  "concurrency public workload class re-export"
+require_source_contains \
+  "rustfs/src/storage/concurrency/manager.rs" \
+  "impl WorkloadAdmissionSnapshotProvider for ConcurrencyManager" \
+  "storage concurrency workload admission snapshot provider"
+require_source_contains \
+  "rustfs/src/storage/concurrency/manager.rs" \
+  "pub fn workload_admission_registry_snapshot(&self) -> WorkloadAdmissionRegistrySnapshot" \
+  "storage concurrency workload admission registry snapshot"
+require_source_contains \
+  "rustfs/src/storage/concurrency/manager.rs" \
+  "WorkloadClass::ForegroundRead => self.get_object_admission_snapshot()" \
+  "storage concurrency foreground read admission snapshot"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
   "pub use multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};" \
   "storage-api public multipart DTO re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
+  "pub use observability::{" \
+  "storage-api public observability contract re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
   "pub use object::{HTTPPreconditions, HTTPRangeError, HTTPRangeSpec, ObjectLockRetentionOptions};" \
@@ -214,6 +260,10 @@ require_source_line \
   "crates/storage-api/src/lib.rs" \
   "pub use object::{DeletedObject, ObjectToDelete};" \
   "storage-api public delete object contract re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
+  "pub use object::{ExpirationOptions, TransitionedObject};" \
+  "storage-api public lifecycle helper contract re-export"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
   "pub use object::{ListObjectVersionsInfo, ListObjectsInfo, ListObjectsV2Info, ListOperations, ObjectInfoOrErr};" \
@@ -234,6 +284,74 @@ require_source_line \
   "crates/storage-api/src/lib.rs" \
   "pub use error::{StorageErrorCode, StorageResult};" \
   "storage-api public error contract re-export"
+require_source_line \
+  "crates/storage-api/src/lib.rs" \
+  "pub use topology::{" \
+  "storage-api public topology contract re-export"
+require_source_line \
+  "rustfs/src/lib.rs" \
+  "pub mod runtime_capabilities;" \
+  "RustFS runtime capability provider module"
+require_source_line \
+  "rustfs/src/lib.rs" \
+  "pub mod workload_admission;" \
+  "RustFS workload admission provider module"
+require_source_contains \
+  "rustfs/src/runtime_capabilities.rs" \
+  "impl ObservabilitySnapshotProvider for RustFsObservabilitySnapshotProvider" \
+  "RustFS observability snapshot provider implementation"
+require_source_contains \
+  "rustfs/src/runtime_capabilities.rs" \
+  "impl TopologySnapshotProvider for EndpointTopologySnapshotProvider" \
+  "RustFS endpoint topology snapshot provider implementation"
+require_source_contains \
+  "rustfs/src/runtime_capabilities.rs" \
+  "pub fn topology_snapshot_from_endpoint_pools(endpoint_pools: &EndpointServerPools) -> TopologySnapshot" \
+  "RustFS endpoint topology snapshot helper"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "impl WorkloadAdmissionSnapshotProvider for RustFsWorkloadAdmissionSnapshotProvider" \
+  "RustFS workload admission snapshot provider implementation"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "pub fn foreground_read_workload_admission_snapshot() -> WorkloadAdmissionSnapshot" \
+  "RustFS foreground-read workload admission snapshot helper"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "WorkloadClass::ForegroundRead => foreground_read_workload_admission_snapshot()" \
+  "RustFS foreground-read workload admission class mapping"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "pub fn metadata_workload_admission_snapshot() -> WorkloadAdmissionSnapshot" \
+  "RustFS metadata workload admission snapshot helper"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "WorkloadClass::Metadata => metadata_workload_admission_snapshot()" \
+  "RustFS metadata workload admission class mapping"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "pub fn scanner_workload_admission_snapshot() -> WorkloadAdmissionSnapshot" \
+  "RustFS scanner workload admission snapshot helper"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "WorkloadClass::Scanner => scanner_workload_admission_snapshot()" \
+  "RustFS scanner workload admission class mapping"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "pub fn repair_workload_admission_snapshot() -> WorkloadAdmissionSnapshot" \
+  "RustFS repair workload admission snapshot helper"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "WorkloadClass::Repair => repair_workload_admission_snapshot()" \
+  "RustFS repair workload admission class mapping"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "pub fn replication_workload_admission_snapshot() -> WorkloadAdmissionSnapshot" \
+  "RustFS replication workload admission snapshot helper"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "WorkloadClass::Replication => replication_workload_admission_snapshot()" \
+  "RustFS replication workload admission class mapping"
 
 (
   cd "$ROOT_DIR"
@@ -247,7 +365,7 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api::\{[^}]*\b(?:BucketInfo|BucketOptions|DeleteBucketOptions|MakeBucketOptions|SRBucketDeleteOp)\b' \
-    crates/ecstore/src/store_api.rs || true
+    crates/ecstore/src/store_api.rs 2>/dev/null || true
 ) >"$STORE_API_BUCKET_DTO_REEXPORTS_FILE"
 
 if [[ -s "$STORE_API_BUCKET_DTO_REEXPORTS_FILE" ]]; then
@@ -256,8 +374,17 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api::\{[^}]*\bBucketOperations\b|pub trait BucketOperations\b' \
-    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/traits.rs || true
+  store_api_bucket_operation_scan_targets=()
+  if [[ -f crates/ecstore/src/store_api.rs ]]; then
+    store_api_bucket_operation_scan_targets+=(crates/ecstore/src/store_api.rs)
+  fi
+  if [[ -f crates/ecstore/src/store_api/traits.rs ]]; then
+    store_api_bucket_operation_scan_targets+=(crates/ecstore/src/store_api/traits.rs)
+  fi
+  if (( ${#store_api_bucket_operation_scan_targets[@]} > 0 )); then
+    rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api::\{[^}]*\bBucketOperations\b|pub trait BucketOperations\b' \
+      "${store_api_bucket_operation_scan_targets[@]}" || true
+  fi
 ) >"$STORE_API_BUCKET_OPERATION_HITS_FILE"
 
 if [[ -s "$STORE_API_BUCKET_OPERATION_HITS_FILE" ]]; then
@@ -267,7 +394,7 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api::\{[^}]*\b(?:CompletePart|ListMultipartsInfo|ListPartsInfo|MultipartInfo|MultipartUploadResult|PartInfo)\b|pub struct (?:CompletePart|ListMultipartsInfo|ListPartsInfo|MultipartInfo|MultipartUploadResult|PartInfo)\b' \
-    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs 2>/dev/null || true
 ) >"$STORE_API_MULTIPART_DTO_REEXPORTS_FILE"
 
 if [[ -s "$STORE_API_MULTIPART_DTO_REEXPORTS_FILE" ]]; then
@@ -277,7 +404,7 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:HTTPPreconditions|ObjectLockRetentionOptions|ObjectPreconditionError|ObjectPreconditionPart|ObjectPreconditionState)\b|::(?:HTTPPreconditions|ObjectLockRetentionOptions|ObjectPreconditionError|ObjectPreconditionPart|ObjectPreconditionState)\b)|pub (?:enum ObjectPreconditionError|struct (?:HTTPPreconditions|ObjectLockRetentionOptions|ObjectPreconditionPart|ObjectPreconditionState))\b' \
-    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs 2>/dev/null || true
 ) >"$STORE_API_OBJECT_HELPER_REEXPORTS_FILE"
 
 if [[ -s "$STORE_API_OBJECT_HELPER_REEXPORTS_FILE" ]]; then
@@ -287,7 +414,7 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:HTTPRangeError|HTTPRangeSpec)\b|::(?:HTTPRangeError|HTTPRangeSpec)\b)|pub (?:enum HTTPRangeError|struct HTTPRangeSpec)\b' \
-    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs crates/ecstore/src/store_api/readers.rs || true
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs crates/ecstore/src/store_api/readers.rs 2>/dev/null || true
 ) >"$STORE_API_RANGE_HELPER_REEXPORTS_FILE"
 
 if [[ -s "$STORE_API_RANGE_HELPER_REEXPORTS_FILE" ]]; then
@@ -297,7 +424,7 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:VersionMarker|WalkOptions|WalkVersionsSortOrder)\b|::(?:VersionMarker|WalkOptions|WalkVersionsSortOrder)\b)|pub (?:enum (?:VersionMarker|WalkVersionsSortOrder)|struct WalkOptions)\b' \
-    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs 2>/dev/null || true
 ) >"$STORE_API_LIST_HELPER_REEXPORTS_FILE"
 
 if [[ -s "$STORE_API_LIST_HELPER_REEXPORTS_FILE" ]]; then
@@ -307,7 +434,7 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:ListObjectVersionsInfo|ListObjectsInfo|ListObjectsV2Info|ListOperations|ObjectInfoOrErr)\b|::(?:ListObjectVersionsInfo|ListObjectsInfo|ListObjectsV2Info|ListOperations|ObjectInfoOrErr)\b)|pub struct (?:ListObjectVersionsInfo|ListObjectsInfo|ListObjectsV2Info|ObjectInfoOrErr)\b' \
-    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs 2>/dev/null || true
 ) >"$STORE_API_LIST_RESPONSE_REEXPORTS_FILE"
 
 if [[ -s "$STORE_API_LIST_RESPONSE_REEXPORTS_FILE" ]]; then
@@ -317,7 +444,7 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:DeletedObject|ObjectToDelete)\b|::(?:DeletedObject|ObjectToDelete)\b)|pub struct (?:DeletedObject|ObjectToDelete)\b' \
-    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs 2>/dev/null || true
 ) >"$STORE_API_DELETE_DTO_REEXPORTS_FILE"
 
 if [[ -s "$STORE_API_DELETE_DTO_REEXPORTS_FILE" ]]; then
@@ -336,12 +463,103 @@ fi
 
 (
   cd "$ROOT_DIR"
+  rg -n --no-heading 'pub struct (?:ExpirationOptions|TransitionedObject)\b' \
+    crates/ecstore/src/bucket/lifecycle/core.rs \
+    crates/ecstore/src/bucket/lifecycle/bucket_lifecycle_ops.rs || true
+) >"$STORE_API_LIFECYCLE_HELPER_DEFINITION_HITS_FILE"
+
+if [[ -s "$STORE_API_LIFECYCLE_HELPER_DEFINITION_HITS_FILE" ]]; then
+  report_failure "ECStore lifecycle helper DTO definitions must stay in rustfs-storage-api: $(paste -sd '; ' "$STORE_API_LIFECYCLE_HELPER_DEFINITION_HITS_FILE")"
+fi
+
+require_source_line \
+  "crates/ecstore/src/bucket/lifecycle/core.rs" \
+  "pub use rustfs_storage_api::ExpirationOptions;" \
+  "ECStore ExpirationOptions compatibility re-export"
+require_source_line \
+  "crates/ecstore/src/bucket/lifecycle/bucket_lifecycle_ops.rs" \
+  "pub use rustfs_storage_api::TransitionedObject;" \
+  "ECStore TransitionedObject compatibility re-export"
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'crate::bucket::lifecycle::(?:bucket_lifecycle_ops::TransitionedObject|core::ExpirationOptions|lifecycle::ExpirationOptions)|use crate::bucket::lifecycle::(?:bucket_lifecycle_ops::TransitionedObject|core::ExpirationOptions|lifecycle::ExpirationOptions)|rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::TransitionedObject' \
+    crates/ecstore/src rustfs/src crates/scanner/src crates/scanner/tests crates/notify/src --glob '*.rs' || true
+) >"$STORE_API_LIFECYCLE_HELPER_OLD_CONSUMER_HITS_FILE"
+
+if [[ -s "$STORE_API_LIFECYCLE_HELPER_OLD_CONSUMER_HITS_FILE" ]]; then
+  report_failure "lifecycle helper DTO consumers must import rustfs-storage-api directly: $(paste -sd '; ' "$STORE_API_LIFECYCLE_HELPER_OLD_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
   rg -n --no-heading 'rustfs_ecstore::store_api(?:::\{[^}]*\b(?:ListObjectVersionsInfo|ListObjectsV2Info|ObjectInfoOrErr)\b|::(?:ListObjectVersionsInfo|ListObjectsV2Info|ObjectInfoOrErr)\b)' \
     rustfs/src crates/iam/src || true
 ) >"$STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE"
 
 if [[ -s "$STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE" ]]; then
   report_failure "external list response consumers must use rustfs-storage-api contracts: $(paste -sd '; ' "$STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  find crates/ecstore/src -type f -name '*.rs' -print0 |
+    xargs -0 perl -0ne '
+      while (/crate::object_api(?:::\{[^}]*\b(?:ListObjectsInfo|ListObjectsV2Info|ListObjectVersionsInfo|ObjectInfoOrErr|WalkOptions)\b|::(?:ListObjectsInfo|ListObjectsV2Info|ListObjectVersionsInfo|ObjectInfoOrErr|WalkOptions)\b)/sg) {
+        my $prefix = substr($_, 0, $-[0]);
+        my $line = ($prefix =~ tr/\n//) + 1;
+        my $match = $&;
+        $match =~ s/\s+/ /g;
+        print "$ARGV:$line:$match\n";
+      }
+    ' || true
+) >"$ECSTORE_OBJECT_API_LIST_ALIAS_INTERNAL_HITS_FILE"
+
+if [[ -s "$ECSTORE_OBJECT_API_LIST_ALIAS_INTERNAL_HITS_FILE" ]]; then
+  report_failure "ECStore internal list/walk consumers must bind rustfs-storage-api generic contracts directly: $(paste -sd '; ' "$ECSTORE_OBJECT_API_LIST_ALIAS_INTERNAL_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub type (?:ListObjectsInfo|ListObjectsV2Info|ListObjectVersionsInfo|ObjectInfoOrErr|WalkOptions|ObjectToDelete|DeletedObject)\b' \
+    crates/ecstore/src/object_api/types.rs || true
+) >"$ECSTORE_OBJECT_API_STORAGE_ALIAS_HITS_FILE"
+
+if [[ -s "$ECSTORE_OBJECT_API_STORAGE_ALIAS_HITS_FILE" ]]; then
+  report_failure "ECStore object_api must not re-export storage-api passthrough aliases: $(paste -sd '; ' "$ECSTORE_OBJECT_API_STORAGE_ALIAS_HITS_FILE")"
+fi
+
+cat >"$ECSTORE_OBJECT_API_EXTERNAL_ALIAS_EXPECTED_FILE" <<'EOF'
+EOF
+
+(
+  cd "$ROOT_DIR"
+  find rustfs/src crates -type f -name 'storage_compat.rs' -print0 |
+    xargs -0 perl -ne '
+      if (/^\s*(?:(?:pub(?:\([^)]*\))?)\s+)?type\s+([A-Za-z0-9_]+)\s*=\s*rustfs_ecstore::object_api::(GetObjectReader|ObjectInfo|ObjectOptions|PutObjReader)\s*;/) {
+        print "$ARGV:$1=$2\n";
+      }
+    ' | sort
+) >"$ECSTORE_OBJECT_API_EXTERNAL_ALIAS_ACTUAL_FILE"
+
+if ! diff -u "$ECSTORE_OBJECT_API_EXTERNAL_ALIAS_EXPECTED_FILE" "$ECSTORE_OBJECT_API_EXTERNAL_ALIAS_ACTUAL_FILE" >"$ECSTORE_OBJECT_API_EXTERNAL_ALIAS_DIFF_FILE"; then
+  report_failure "external ECStore object_api compatibility aliases changed without migration-plan approval: $(paste -sd '; ' "$ECSTORE_OBJECT_API_EXTERNAL_ALIAS_DIFF_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  find rustfs/src crates -type f -name 'storage_compat.rs' -print0 |
+    xargs -0 perl -ne '
+      while (/rustfs_ecstore::object_api::([A-Za-z0-9_]+)/g) {
+        my $name = $1;
+        next if $name =~ /^(?:GetObjectReader|ObjectInfo|ObjectOptions|PutObjReader)$/;
+        print "$ARGV:$.:rustfs_ecstore::object_api::$name\n";
+      }
+    ' | sort
+) >"$ECSTORE_OBJECT_API_UNAPPROVED_NAME_HITS_FILE"
+
+if [[ -s "$ECSTORE_OBJECT_API_UNAPPROVED_NAME_HITS_FILE" ]]; then
+  report_failure "external storage compatibility boundaries must not expose new ECStore object_api names: $(paste -sd '; ' "$ECSTORE_OBJECT_API_UNAPPROVED_NAME_HITS_FILE")"
 fi
 
 (
@@ -365,6 +583,66 @@ fi
 
 if [[ -s "$DIRECT_ECSTORE_IMPORT_HITS_FILE" ]]; then
   report_failure "direct rustfs_ecstore imports outside compatibility boundaries are forbidden: $(paste -sd '; ' "$DIRECT_ECSTORE_IMPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading '\bstorage_compat::ecstore\b|\bmod\s+ecstore\b' \
+    crates/e2e_test/src crates/heal/tests crates/scanner/tests fuzz/fuzz_targets \
+    --glob '*.rs' \
+    --glob '!target/**' || true
+) >"$TEST_HARNESS_NESTED_STORAGE_COMPAT_HITS_FILE"
+
+if [[ -s "$TEST_HARNESS_NESTED_STORAGE_COMPAT_HITS_FILE" ]]; then
+  report_failure "test and fuzz storage compatibility harnesses must use direct aliases instead of nested ecstore modules: $(paste -sd '; ' "$TEST_HARNESS_NESTED_STORAGE_COMPAT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading '\bstorage_compat::ecstore\b|\bmod\s+ecstore\b' \
+    rustfs/src \
+    --glob '*.rs' \
+    --glob '!target/**' || true
+) >"$RUSTFS_NESTED_STORAGE_COMPAT_HITS_FILE"
+
+if [[ -s "$RUSTFS_NESTED_STORAGE_COMPAT_HITS_FILE" ]]; then
+  report_failure "RustFS runtime storage compatibility paths must use direct aliases instead of nested ecstore modules: $(paste -sd '; ' "$RUSTFS_NESTED_STORAGE_COMPAT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading '\bstorage_compat::(?:store|error|global|endpoints|set_disk|rpc|metrics_realtime|notification_sys|admin_server_info|store_utils|data_usage|disks_layout|event_notification)::|\bstorage_compat::disk::(?:RUSTFS_META_BUCKET|DiskAPI|endpoint::Endpoint)\b|\bstorage_compat::\{[^}\n]*(?:store|error|global|endpoints|set_disk|rpc|metrics_realtime|notification_sys|admin_server_info|store_utils|data_usage|disks_layout|event_notification|disk)::' \
+    rustfs/src \
+    --glob '*.rs' \
+    --glob '!target/**' || true
+) >"$RUSTFS_RUNTIME_SCALAR_STORAGE_COMPAT_HITS_FILE"
+
+if [[ -s "$RUSTFS_RUNTIME_SCALAR_STORAGE_COMPAT_HITS_FILE" ]]; then
+  report_failure "RustFS runtime scalar storage compatibility paths must use direct aliases instead of secondary modules: $(paste -sd '; ' "$RUSTFS_RUNTIME_SCALAR_STORAGE_COMPAT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --no-heading '\bstorage_compat::(?:bucket|config|rio|client|tier|compress|disk|rebalance)::' \
+      rustfs/src \
+      --glob '*.rs' \
+      --glob '!target/**' || true
+    rg -n --no-heading '\bpub\(crate\)\s+mod\s+(?:bucket|config|rio|client|tier|compress|disk|rebalance)\b' \
+      rustfs/src \
+      --glob '*storage_compat.rs' \
+      --glob '!target/**' || true
+    find rustfs/src -type f -name '*.rs' -print0 |
+      xargs -0 perl -0ne '
+        while (/use\s+crate::(?:app::|admin::|storage::)?storage_compat::\{[^;]*?\b(bucket|config|rio|client|tier|compress|disk|rebalance)::/sg) {
+          print "$ARGV:grouped storage_compat::$1 import\n";
+        }
+      '
+  }
+) >"$RUSTFS_RUNTIME_SECONDARY_STORAGE_COMPAT_HITS_FILE"
+
+if [[ -s "$RUSTFS_RUNTIME_SECONDARY_STORAGE_COMPAT_HITS_FILE" ]]; then
+  report_failure "RustFS runtime secondary storage compatibility paths must use direct aliases instead of bucket/config/rio/client/tier/compress/disk/rebalance modules: $(paste -sd '; ' "$RUSTFS_RUNTIME_SECONDARY_STORAGE_COMPAT_HITS_FILE")"
 fi
 
 (
@@ -413,132 +691,30 @@ fi
     --glob '*storage_compat.rs' \
     --glob '!crates/ecstore/**' \
     --glob '!crates/e2e_test/**' || true
-) | awk '
-  $0 !~ /^[^:]+:[0-9]+:[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?type[[:space:]]+[A-Za-z0-9_]+[[:space:]]*=[[:space:]]*rustfs_ecstore::store_api::(GetObjectReader|ObjectInfo|ObjectOptions|PutObjReader);$/ {
-    print
-  }
-' >"$UNAPPROVED_STORE_API_COMPAT_ALIAS_HITS_FILE"
+) >"$UNAPPROVED_STORE_API_COMPAT_ALIAS_HITS_FILE"
 
 if [[ -s "$UNAPPROVED_STORE_API_COMPAT_ALIAS_HITS_FILE" ]]; then
-  report_failure "storage compatibility boundaries may only keep explicit ECStore-owned store_api type aliases: $(paste -sd '; ' "$UNAPPROVED_STORE_API_COMPAT_ALIAS_HITS_FILE")"
+  report_failure "storage compatibility boundaries must use rustfs_ecstore::object_api for ECStore-owned object DTO and reader aliases: $(paste -sd '; ' "$UNAPPROVED_STORE_API_COMPAT_ALIAS_HITS_FILE")"
+fi
+
+if rg -n --no-heading '^\s*pub\s+mod\s+store_api\s*;' "$ROOT_DIR/crates/ecstore/src/lib.rs" >"$PUBLIC_STORE_API_MODULE_HITS_FILE"; then
+  report_failure "ECStore store_api must remain private; expose ECStore-owned object DTO and reader aliases through rustfs_ecstore::object_api"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e crates/ecstore/src/store_api.rs ]] && printf '%s\n' 'crates/ecstore/src/store_api.rs'
+    [[ -d crates/ecstore/src/store_api ]] && printf '%s\n' 'crates/ecstore/src/store_api'
+    true
+  }
+) >"$STORE_API_MODULE_PATH_HITS_FILE"
+
+if [[ -s "$STORE_API_MODULE_PATH_HITS_FILE" ]]; then
+  report_failure "legacy ECStore store_api module files must not be restored: $(paste -sd '; ' "$STORE_API_MODULE_PATH_HITS_FILE")"
 fi
 
 cat >"$ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE" <<'EOF'
-crates/e2e_test/src/storage_compat.rs:bucket
-crates/e2e_test/src/storage_compat.rs:disk
-crates/e2e_test/src/storage_compat.rs:rpc
-crates/heal/src/heal/storage_compat.rs:data_usage
-crates/heal/src/heal/storage_compat.rs:disk
-crates/heal/src/heal/storage_compat.rs:error
-crates/heal/src/heal/storage_compat.rs:global
-crates/heal/src/heal/storage_compat.rs:store
-crates/heal/tests/common/storage_compat.rs:bucket
-crates/heal/tests/common/storage_compat.rs:disk
-crates/heal/tests/common/storage_compat.rs:endpoints
-crates/heal/tests/common/storage_compat.rs:store
-crates/iam/src/storage_compat.rs:config
-crates/iam/src/storage_compat.rs:error
-crates/iam/src/storage_compat.rs:global
-crates/iam/src/storage_compat.rs:notification_sys
-crates/iam/src/storage_compat.rs:store
-crates/notify/src/storage_compat.rs:config
-crates/notify/src/storage_compat.rs:global
-crates/obs/src/storage_compat.rs:bucket
-crates/obs/src/storage_compat.rs:data_usage
-crates/obs/src/storage_compat.rs:global
-crates/obs/src/storage_compat.rs:pools
-crates/obs/src/storage_compat.rs:resolve_object_store_handle
-crates/protocols/src/swift/storage_compat.rs:bucket
-crates/protocols/src/swift/storage_compat.rs:error
-crates/protocols/src/swift/storage_compat.rs:resolve_object_store_handle
-crates/protocols/src/swift/storage_compat.rs:store
-crates/s3select-api/src/storage_compat.rs:error
-crates/s3select-api/src/storage_compat.rs:resolve_object_store_handle
-crates/s3select-api/src/storage_compat.rs:set_disk
-crates/s3select-api/src/storage_compat.rs:store
-crates/scanner/src/storage_compat.rs:bucket
-crates/scanner/src/storage_compat.rs:cache_value
-crates/scanner/src/storage_compat.rs:config
-crates/scanner/src/storage_compat.rs:data_usage
-crates/scanner/src/storage_compat.rs:disk
-crates/scanner/src/storage_compat.rs:error
-crates/scanner/src/storage_compat.rs:global
-crates/scanner/src/storage_compat.rs:pools
-crates/scanner/src/storage_compat.rs:resolve_object_store_handle
-crates/scanner/src/storage_compat.rs:set_disk
-crates/scanner/src/storage_compat.rs:store
-crates/scanner/src/storage_compat.rs:store_utils
-crates/scanner/tests/common/storage_compat.rs:bucket
-crates/scanner/tests/common/storage_compat.rs:client
-crates/scanner/tests/common/storage_compat.rs:disk
-crates/scanner/tests/common/storage_compat.rs:endpoints
-crates/scanner/tests/common/storage_compat.rs:global
-crates/scanner/tests/common/storage_compat.rs:pools
-crates/scanner/tests/common/storage_compat.rs:store
-crates/scanner/tests/common/storage_compat.rs:tier
-fuzz/fuzz_targets/storage_compat.rs:bucket
-rustfs/src/admin/storage_compat.rs:bucket
-rustfs/src/admin/storage_compat.rs:client
-rustfs/src/admin/storage_compat.rs:config
-rustfs/src/admin/storage_compat.rs:data_usage
-rustfs/src/admin/storage_compat.rs:disk
-rustfs/src/admin/storage_compat.rs:endpoints
-rustfs/src/admin/storage_compat.rs:error
-rustfs/src/admin/storage_compat.rs:global
-rustfs/src/admin/storage_compat.rs:metrics_realtime
-rustfs/src/admin/storage_compat.rs:notification_sys
-rustfs/src/admin/storage_compat.rs:rebalance
-rustfs/src/admin/storage_compat.rs:rpc
-rustfs/src/admin/storage_compat.rs:store
-rustfs/src/admin/storage_compat.rs:store_utils
-rustfs/src/admin/storage_compat.rs:tier
-rustfs/src/app/storage_compat.rs:admin_server_info
-rustfs/src/app/storage_compat.rs:bucket
-rustfs/src/app/storage_compat.rs:client
-rustfs/src/app/storage_compat.rs:compress
-rustfs/src/app/storage_compat.rs:config
-rustfs/src/app/storage_compat.rs:data_usage
-rustfs/src/app/storage_compat.rs:disk
-rustfs/src/app/storage_compat.rs:endpoints
-rustfs/src/app/storage_compat.rs:error
-rustfs/src/app/storage_compat.rs:global
-rustfs/src/app/storage_compat.rs:new_object_layer_fn
-rustfs/src/app/storage_compat.rs:notification_sys
-rustfs/src/app/storage_compat.rs:pools
-rustfs/src/app/storage_compat.rs:rio
-rustfs/src/app/storage_compat.rs:set_disk
-rustfs/src/app/storage_compat.rs:set_object_store_resolver
-rustfs/src/app/storage_compat.rs:store
-rustfs/src/app/storage_compat.rs:tier
-rustfs/src/storage/storage_compat.rs:admin_server_info
-rustfs/src/storage/storage_compat.rs:bucket
-rustfs/src/storage/storage_compat.rs:client
-rustfs/src/storage/storage_compat.rs:config
-rustfs/src/storage/storage_compat.rs:disk
-rustfs/src/storage/storage_compat.rs:error
-rustfs/src/storage/storage_compat.rs:get_global_lock_client
-rustfs/src/storage/storage_compat.rs:global
-rustfs/src/storage/storage_compat.rs:metrics_realtime
-rustfs/src/storage/storage_compat.rs:resolve_object_store_handle
-rustfs/src/storage/storage_compat.rs:rio
-rustfs/src/storage/storage_compat.rs:rpc
-rustfs/src/storage/storage_compat.rs:set_disk
-rustfs/src/storage/storage_compat.rs:store
-rustfs/src/storage_compat.rs:bucket
-rustfs/src/storage_compat.rs:config
-rustfs/src/storage_compat.rs:disk
-rustfs/src/storage_compat.rs:disks_layout
-rustfs/src/storage_compat.rs:endpoints
-rustfs/src/storage_compat.rs:error
-rustfs/src/storage_compat.rs:event_notification
-rustfs/src/storage_compat.rs:global
-rustfs/src/storage_compat.rs:notification_sys
-rustfs/src/storage_compat.rs:resolve_object_store_handle
-rustfs/src/storage_compat.rs:rpc
-rustfs/src/storage_compat.rs:set_disk
-rustfs/src/storage_compat.rs:set_global_endpoints
-rustfs/src/storage_compat.rs:store
-rustfs/src/storage_compat.rs:update_erasure_type
 EOF
 sort -o "$ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE" "$ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE"
 
@@ -567,8 +743,10 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --no-heading 'async fn (get_object_reader|put_object|get_object_info|verify_object_integrity|copy_object|delete_object_version|delete_object|delete_objects|put_object_metadata|get_object_tags|put_object_tags|delete_object_tags|add_partial|transition_object|restore_transitioned_object|list_multipart_uploads|new_multipart_upload|copy_object_part|put_object_part|get_multipart_info|list_object_parts|abort_multipart_upload|complete_multipart_upload|heal_format|heal_bucket|heal_object|get_pool_and_set|check_abandoned_parts|new_ns_lock)\b' \
-    crates/ecstore/src/store_api/traits.rs || true
+  if [[ -f crates/ecstore/src/store_api/traits.rs ]]; then
+    rg -n --no-heading 'async fn (get_object_reader|put_object|get_object_info|verify_object_integrity|copy_object|delete_object_version|delete_object|delete_objects|put_object_metadata|get_object_tags|put_object_tags|delete_object_tags|add_partial|transition_object|restore_transitioned_object|list_multipart_uploads|new_multipart_upload|copy_object_part|put_object_part|get_multipart_info|list_object_parts|abort_multipart_upload|complete_multipart_upload|heal_format|heal_bucket|heal_object|get_pool_and_set|check_abandoned_parts|new_ns_lock)\b' \
+      crates/ecstore/src/store_api/traits.rs || true
+  fi
 ) >"$STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE"
 
 if [[ -s "$STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE" ]]; then
@@ -576,41 +754,29 @@ if [[ -s "$STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE" ]]; then
 fi
 
 require_source_contains \
-  "crates/ecstore/src/store_api/traits.rs" \
-  "rustfs_storage_api::ObjectIO<" \
-  "ECStore ObjectIO compatibility binding"
-require_source_contains \
-  "crates/ecstore/src/store_api/traits.rs" \
-  "rustfs_storage_api::ObjectOperations<" \
-  "ECStore ObjectOperations compatibility binding"
-require_source_contains \
-  "crates/ecstore/src/store_api/traits.rs" \
-  "rustfs_storage_api::MultipartOperations<" \
-  "ECStore MultipartOperations compatibility binding"
-require_source_contains \
-  "crates/ecstore/src/store_api/traits.rs" \
-  "rustfs_storage_api::HealOperations<" \
-  "ECStore HealOperations compatibility binding"
-require_source_contains \
-  "crates/ecstore/src/store_api/traits.rs" \
-  "rustfs_storage_api::NamespaceLocking<" \
-  "ECStore NamespaceLocking compatibility binding"
-require_source_contains \
   "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
   "fn ecstore_implements_storage_admin_api_contract()" \
   "ECStore StorageAdminApi compile-time coverage test"
 require_source_contains \
   "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
-  "fn ecstore_implements_namespace_locking_contract()" \
-  "ECStore NamespaceLocking compile-time coverage test"
-require_source_contains \
-  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
-  "fn ecstore_implements_heal_operations_contract()" \
-  "ECStore HealOperations compile-time coverage test"
-require_source_contains \
-  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
   "fn ecstore_implements_storage_namespace_locking_contract()" \
   "ECStore storage-api NamespaceLocking compile-time coverage test"
+require_source_contains \
+  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
+  "fn ecstore_implements_storage_object_io_contract()" \
+  "ECStore storage-api ObjectIO compile-time coverage test"
+require_source_contains \
+  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
+  "fn ecstore_implements_storage_object_operations_contract()" \
+  "ECStore storage-api ObjectOperations compile-time coverage test"
+require_source_contains \
+  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
+  "fn ecstore_implements_storage_list_operations_contract()" \
+  "ECStore storage-api ListOperations compile-time coverage test"
+require_source_contains \
+  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
+  "fn ecstore_implements_storage_multipart_operations_contract()" \
+  "ECStore storage-api MultipartOperations compile-time coverage test"
 require_source_contains \
   "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
   "fn ecstore_implements_storage_heal_operations_contract()" \

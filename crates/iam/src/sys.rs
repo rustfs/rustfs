@@ -19,7 +19,10 @@ use crate::error::{Error, Result};
 use crate::manager::extract_jwt_claims;
 use crate::manager::get_default_policyes;
 use crate::manager::{IamCache, IamSyncMetricsSnapshot};
-use crate::storage_compat::ecstore::notification_sys::get_global_notification_sys;
+use crate::storage_compat::{
+    notify_iam_delete_policy, notify_iam_delete_service_account, notify_iam_delete_user, notify_iam_load_group,
+    notify_iam_load_policy, notify_iam_load_policy_mapping, notify_iam_load_service_account, notify_iam_load_user,
+};
 use crate::store::GroupInfo;
 use crate::store::MappedPolicy;
 use crate::store::Store;
@@ -249,12 +252,9 @@ impl<T: Store> IamSys<T> {
             return Ok(());
         }
 
-        if let Some(notification_sys) = get_global_notification_sys() {
-            let resp = notification_sys.delete_policy(name).await;
-            for r in resp {
-                if let Some(err) = r.err {
-                    warn!("notify delete_policy failed: {}", err);
-                }
+        for r in notify_iam_delete_policy(name).await {
+            if let Some(err) = r.err {
+                warn!("notify delete_policy failed: {}", err);
             }
         }
 
@@ -293,11 +293,8 @@ impl<T: Store> IamSys<T> {
     pub async fn set_policy(&self, name: &str, policy: Policy) -> Result<OffsetDateTime> {
         let updated_at = self.store.set_policy(name, policy).await?;
 
-        if !self.has_watcher()
-            && let Some(notification_sys) = get_global_notification_sys()
-        {
-            let resp = notification_sys.load_policy(name).await;
-            for r in resp {
+        if !self.has_watcher() {
+            for r in notify_iam_load_policy(name).await {
                 if let Some(err) = r.err {
                     warn!("notify load_policy failed: {}", err);
                 }
@@ -322,12 +319,8 @@ impl<T: Store> IamSys<T> {
     pub async fn delete_user(&self, name: &str, notify: bool) -> Result<()> {
         self.store.delete_user(name, UserType::Reg).await?;
 
-        if notify
-            && !self.has_watcher()
-            && let Some(notification_sys) = get_global_notification_sys()
-        {
-            let resp = notification_sys.delete_user(name).await;
-            for r in resp {
+        if notify && !self.has_watcher() {
+            for r in notify_iam_delete_user(name).await {
                 if let Some(err) = r.err {
                     warn!("notify delete_user failed: {}", err);
                 }
@@ -346,12 +339,9 @@ impl<T: Store> IamSys<T> {
         // This is critical for cluster recovery: login should not wait for dead peers
         let name = name.to_string();
         tokio::spawn(async move {
-            if let Some(notification_sys) = get_global_notification_sys() {
-                let resp = notification_sys.load_user(&name, is_temp).await;
-                for r in resp {
-                    if let Some(err) = r.err {
-                        warn!("notify load_user failed (non-blocking): {}", err);
-                    }
+            for r in notify_iam_load_user(&name, is_temp).await {
+                if let Some(err) = r.err {
+                    warn!("notify load_user failed (non-blocking): {}", err);
                 }
             }
         });
@@ -365,12 +355,9 @@ impl<T: Store> IamSys<T> {
         // Fire-and-forget notification to peers - don't block service account operations
         let name = name.to_string();
         tokio::spawn(async move {
-            if let Some(notification_sys) = get_global_notification_sys() {
-                let resp = notification_sys.load_service_account(&name).await;
-                for r in resp {
-                    if let Some(err) = r.err {
-                        warn!("notify load_service_account failed (non-blocking): {}", err);
-                    }
+            for r in notify_iam_load_service_account(&name).await {
+                if let Some(err) = r.err {
+                    warn!("notify load_service_account failed (non-blocking): {}", err);
                 }
             }
         });
@@ -687,12 +674,8 @@ impl<T: Store> IamSys<T> {
 
         self.store.delete_user(access_key, UserType::Svc).await?;
 
-        if notify
-            && !self.has_watcher()
-            && let Some(notification_sys) = get_global_notification_sys()
-        {
-            let resp = notification_sys.delete_service_account(access_key).await;
-            for r in resp {
+        if notify && !self.has_watcher() {
+            for r in notify_iam_delete_service_account(access_key).await {
                 if let Some(err) = r.err {
                     warn!("notify delete_service_account failed: {}", err);
                 }
@@ -710,12 +693,9 @@ impl<T: Store> IamSys<T> {
         // Fire-and-forget notification to peers - don't block group operations
         let group = group.to_string();
         tokio::spawn(async move {
-            if let Some(notification_sys) = get_global_notification_sys() {
-                let resp = notification_sys.load_group(&group).await;
-                for r in resp {
-                    if let Some(err) = r.err {
-                        warn!("notify load_group failed (non-blocking): {}", err);
-                    }
+            for r in notify_iam_load_group(&group).await {
+                if let Some(err) = r.err {
+                    warn!("notify load_group failed (non-blocking): {}", err);
                 }
             }
         });
@@ -842,11 +822,8 @@ impl<T: Store> IamSys<T> {
     pub async fn policy_db_set(&self, name: &str, user_type: UserType, is_group: bool, policy: &str) -> Result<OffsetDateTime> {
         let updated_at = self.store.policy_db_set(name, user_type, is_group, policy).await?;
 
-        if !self.has_watcher()
-            && let Some(notification_sys) = get_global_notification_sys()
-        {
-            let resp = notification_sys.load_policy_mapping(name, user_type.to_u64(), is_group).await;
-            for r in resp {
+        if !self.has_watcher() {
+            for r in notify_iam_load_policy_mapping(name, user_type.to_u64(), is_group).await {
                 if let Some(err) = r.err {
                     warn!("notify load_policy failed: {}", err);
                 }

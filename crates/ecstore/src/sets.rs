@@ -15,7 +15,6 @@
 
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
-use crate::store_api::{ObjectInfoOrErr, WalkOptions};
 use crate::{
     disk::{
         DiskAPI, DiskInfo, DiskOption, DiskStore,
@@ -26,8 +25,8 @@ use crate::{
     endpoints::{Endpoints, PoolEndpoints},
     error::StorageError,
     global::{GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_lock_clients, is_dist_erasure},
+    object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
     set_disk::SetDisks,
-    store_api::{GetObjectReader, ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo, ObjectOptions, PutObjReader},
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
 };
 use futures::{
@@ -47,8 +46,10 @@ use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_storage_api::CompletePart;
 use rustfs_storage_api::HTTPRangeSpec;
 use rustfs_storage_api::{
-    BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, DeletedObject, ListMultipartsInfo, ListPartsInfo,
-    MakeBucketOptions, MultipartInfo, MultipartUploadResult, ObjectToDelete, PartInfo,
+    BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, DeletedObject, ListMultipartsInfo,
+    ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info, ListPartsInfo,
+    MakeBucketOptions, MultipartInfo, MultipartUploadResult, ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectToDelete, PartInfo,
+    WalkOptions as StorageWalkOptions,
 };
 use rustfs_storage_api::{ObjectIO as _, ObjectOperations as _};
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
@@ -60,6 +61,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use tracing::{error, info};
 use uuid::Uuid;
+
+type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
+type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
+type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
+type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
 #[derive(Debug, Clone)]
 pub struct Sets {

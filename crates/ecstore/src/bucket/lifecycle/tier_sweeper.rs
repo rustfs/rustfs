@@ -18,12 +18,13 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use crate::bucket::lifecycle::bucket_lifecycle_ops::{ExpiryOp, GLOBAL_ExpiryState, TransitionedObject};
+use crate::bucket::lifecycle::bucket_lifecycle_ops::{ExpiryOp, GLOBAL_ExpiryState};
 use crate::bucket::lifecycle::lifecycle::{self, ObjectOpts};
 use crate::bucket::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry;
 use crate::client::signer_error::error_chain_contains_signer_header_marker;
 use crate::global::GLOBAL_TierConfigMgr;
 use crate::store::ECStore;
+use rustfs_storage_api::TransitionedObject;
 use rustfs_utils::get_env_usize;
 use sha2::{Digest, Sha256};
 use std::any::Any;

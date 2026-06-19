@@ -12,8 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod ecstore {
-    pub(crate) use rustfs_ecstore::{config, global};
+use rustfs_config::server_config::Config;
+use rustfs_ecstore::{config, global};
+
+#[derive(Debug)]
+pub(crate) enum NotifyConfigStoreError {
+    StorageNotAvailable,
+    Read(String),
+    Save(String),
 }
 
-pub type NotifyObjectInfo = rustfs_ecstore::store_api::ObjectInfo;
+pub(crate) async fn update_server_config<F>(mut modifier: F) -> Result<Option<Config>, NotifyConfigStoreError>
+where
+    F: FnMut(&mut Config) -> bool,
+{
+    let Some(store) = global::resolve_object_store_handle() else {
+        return Err(NotifyConfigStoreError::StorageNotAvailable);
+    };
+
+    let mut new_config = config::com::read_config_without_migrate(store.clone())
+        .await
+        .map_err(|err| NotifyConfigStoreError::Read(err.to_string()))?;
+
+    if !modifier(&mut new_config) {
+        return Ok(None);
+    }
+
+    config::com::save_server_config(store, &new_config)
+        .await
+        .map_err(|err| NotifyConfigStoreError::Save(err.to_string()))?;
+
+    Ok(Some(new_config))
+}

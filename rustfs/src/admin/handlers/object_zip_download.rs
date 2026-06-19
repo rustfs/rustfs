@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::admin::router::{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH, AdminOperation, Operation, S3Router};
-use crate::admin::storage_compat::ecstore::global::get_global_region;
+use crate::admin::storage_compat::get_global_region;
 use crate::app::context::resolve_object_store_handle;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
@@ -649,7 +649,7 @@ async fn preflight_zip_items(request: &CreateObjectZipDownloadRequest, items: &[
     Ok(())
 }
 
-fn storage_error_to_s3(err: crate::admin::storage_compat::ecstore::error::Error) -> s3s::S3Error {
+fn storage_error_to_s3(err: crate::admin::storage_compat::Error) -> s3s::S3Error {
     ApiError::from(err).into()
 }
 

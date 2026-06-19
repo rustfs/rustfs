@@ -21,21 +21,19 @@ use crate::storage::access::has_bypass_governance_header;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::get_opts;
 use crate::storage::s3_api::acl;
-use crate::storage::storage_compat::ecstore::{
-    bucket::{
-        metadata::{
-            BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_VERSIONING_CONFIG,
-            BUCKET_WEBSITE_CONFIG, OBJECT_LOCK_CONFIG,
-        },
-        metadata_sys,
-        object_lock::objectlock_sys::check_retention_for_modification,
-        replication::{GLOBAL_REPLICATION_STATS, ReplicationConfigurationExt},
-        tagging::{decode_tags, decode_tags_to_map, encode_tags},
-        utils::serialize,
-        versioning::VersioningApi,
-        versioning_sys::BucketVersioningSys,
+use crate::storage::storage_compat::{
+    StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
+    metadata::{
+        BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_VERSIONING_CONFIG,
+        BUCKET_WEBSITE_CONFIG, OBJECT_LOCK_CONFIG,
     },
-    error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
+    metadata_sys,
+    object_lock::objectlock_sys::check_retention_for_modification,
+    replication::{GLOBAL_REPLICATION_STATS, ReplicationConfigurationExt},
+    tagging::{decode_tags, decode_tags_to_map, encode_tags},
+    utils::serialize,
+    versioning::VersioningApi,
+    versioning_sys::BucketVersioningSys,
 };
 use crate::storage::{parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled};
 use crate::table_catalog;
@@ -464,6 +462,7 @@ impl S3 for FS {
 
         let result = Ok(S3Response::new(DeleteObjectTaggingOutput { version_id }));
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         let duration = start_time.elapsed();
         histogram!("rustfs_object_tagging_operation_duration_seconds", "operation" => "delete").record(duration.as_secs_f64());
         result
@@ -1298,6 +1297,7 @@ impl S3 for FS {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         result
     }
 
@@ -1366,6 +1366,7 @@ impl S3 for FS {
                 .map_err(ApiError::from)?;
         }
 
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(PutObjectLockConfigurationOutput::default()))
     }
 
@@ -1444,6 +1445,7 @@ impl S3 for FS {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         result
     }
 
@@ -1521,6 +1523,7 @@ impl S3 for FS {
             version_id: req.input.version_id.clone(),
         }));
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         let duration = start_time.elapsed();
         histogram!("rustfs_object_tagging_operation_duration_seconds", "operation" => "put").record(duration.as_secs_f64());
         result

@@ -240,6 +240,26 @@ mod tests {
     }
 
     #[test]
+    fn test_scheduler_default_thresholds_remain_stable() {
+        let policy = SchedulerPolicy::default();
+        assert_eq!(policy.base_buffer_size, 64 * 1024);
+        assert_eq!(policy.max_buffer_size, 4 * 1024 * 1024);
+        assert_eq!(policy.high_priority_threshold, 1024 * 1024);
+        assert_eq!(policy.low_priority_threshold, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_scheduler_priority_boundaries_remain_stable() {
+        let policy = SchedulerPolicy::default();
+        let manager = SchedulerManager::from_policy(policy);
+
+        assert_eq!(manager.get_priority(1_048_575), IoPriority::High);
+        assert_eq!(manager.get_priority(1_048_576), IoPriority::Normal);
+        assert_eq!(manager.get_priority(10_485_760), IoPriority::Normal);
+        assert_eq!(manager.get_priority(10_485_761), IoPriority::Low);
+    }
+
+    #[test]
     fn test_scheduler_manager() {
         let manager = SchedulerManager::new(1024, 4096, 512, 2048);
         let priority = manager.get_priority(100);

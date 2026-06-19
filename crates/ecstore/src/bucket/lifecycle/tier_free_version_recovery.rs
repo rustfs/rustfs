@@ -19,12 +19,19 @@ use tokio_util::sync::CancellationToken;
 
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::Result;
+use crate::object_api::ObjectInfo;
 use crate::store::ECStore;
-use crate::store_api::{ObjectInfo, ObjectInfoOrErr, WalkOptions};
-use rustfs_storage_api::{BucketOperations, BucketOptions, ListOperations as _};
+use rustfs_filemeta::FileInfo;
+use rustfs_storage_api::{
+    BucketOperations, BucketOptions, ListOperations as _, ObjectInfoOrErr as StorageObjectInfoOrErr,
+    WalkOptions as StorageWalkOptions,
+};
 
 pub const DEFAULT_FREE_VERSION_RECOVERY_LIMIT: usize = 1_000;
 const DEFAULT_FREE_VERSION_RECOVERY_SCAN_LIMIT: usize = 10_000;
+
+type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, crate::error::Error>;
+type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FreeVersionRecoveryStats {

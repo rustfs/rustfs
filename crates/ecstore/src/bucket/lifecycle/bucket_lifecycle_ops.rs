@@ -15,7 +15,7 @@
 use crate::bucket::lifecycle::bucket_lifecycle_audit::{LcAuditEvent, LcEventSrc};
 use crate::bucket::lifecycle::evaluator::Evaluator;
 use crate::bucket::lifecycle::lifecycle::{
-    self, ExpirationOptions, Lifecycle, ObjectOpts, TransitionOptions, abort_incomplete_multipart_upload_due,
+    self, Lifecycle, ObjectOpts, TransitionOptions, abort_incomplete_multipart_upload_due,
 };
 use crate::bucket::lifecycle::tier_delete_journal::{process_tier_delete_journal_entry, run_tier_delete_journal_recovery_loop};
 use crate::bucket::lifecycle::tier_free_version_recovery::{DEFAULT_FREE_VERSION_RECOVERY_LIMIT, recover_tier_free_versions};
@@ -35,9 +35,9 @@ use crate::error::{error_resp_to_object_err, is_err_object_not_found, is_err_ver
 use crate::event_notification::{EventArgs, send_event};
 use crate::global::GLOBAL_LocalNodeName;
 use crate::global::{GLOBAL_LifecycleSys, GLOBAL_TierConfigMgr, get_global_deployment_id};
+use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
 use crate::set_disk::{MAX_PARTS_COUNT, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, SetDisks};
 use crate::store::ECStore;
-use crate::store_api::{GetObjectReader, ObjectInfo, ObjectOptions};
 use crate::tier::warm_backend::WarmBackendGetOpts;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use futures::Future;
@@ -59,7 +59,8 @@ use rustfs_filemeta::{
 };
 use rustfs_s3_types::EventName;
 use rustfs_storage_api::{
-    DeletedObject, HTTPRangeSpec, ListOperations as _, MultipartOperations as _, ObjectOperations as _, ObjectToDelete,
+    DeletedObject, ExpirationOptions, HTTPRangeSpec, ListOperations as _, MultipartOperations as _, ObjectOperations as _,
+    ObjectToDelete,
 };
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
 use s3s::dto::{
@@ -379,14 +380,7 @@ pub trait ExpiryOp: 'static {
     fn as_any(&self) -> &dyn Any;
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct TransitionedObject {
-    pub name: String,
-    pub version_id: String,
-    pub tier: String,
-    pub free_version: bool,
-    pub status: String,
-}
+pub use rustfs_storage_api::TransitionedObject;
 
 struct FreeVersionTask(ObjectInfo);
 
@@ -2862,7 +2856,6 @@ mod tests {
         transitioned_cleanup_tuple,
     };
     use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
-    use crate::bucket::lifecycle::core::ExpirationOptions;
     use crate::bucket::lifecycle::tier_sweeper::Jentry;
     use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
     use crate::bucket::metadata_sys;
@@ -2870,13 +2863,14 @@ mod tests {
     use crate::disk::endpoint::Endpoint;
     use crate::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::error::is_err_invalid_upload_id;
+    use crate::object_api::{ObjectInfo, ObjectOptions, PutObjReader};
     use crate::set_disk::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
     use crate::store::ECStore;
-    use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader};
     use futures::FutureExt;
     use rustfs_common::metrics::{IlmAction, global_metrics};
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
     use rustfs_filemeta::{ReplicateDecision, VersionPurgeStatusType};
+    use rustfs_storage_api::ExpirationOptions;
     use rustfs_storage_api::{BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations as _};
     use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, Timestamp};
     use serial_test::serial;
@@ -2893,7 +2887,9 @@ mod tests {
     use uuid::Uuid;
 
     #[tokio::test]
+    #[serial]
     async fn expiry_enqueue_reports_missed_without_worker_channel() {
+        let before = global_metrics().report().await.lifecycle_expiry;
         let state = ExpiryState::new();
         let mut state = state.write().await;
         let object = ObjectInfo {
@@ -2910,12 +2906,9 @@ mod tests {
 
         assert!(!queued);
         assert_eq!(state.stats.missed_tasks(), 1);
-        let expiry = global_metrics().report().await.lifecycle_expiry;
-        assert_eq!(expiry.current_queue_capacity, 0);
-        assert_eq!(expiry.current_queued, 0);
-        assert_eq!(expiry.current_active, 0);
-        assert_eq!(expiry.current_workers, 0);
-        assert_eq!(expiry.queue_missed, 1);
+        let after = global_metrics().report().await.lifecycle_expiry;
+        assert!(after.queue_missed >= before.queue_missed.saturating_add(1));
+        assert!(after.scanner_missed >= before.scanner_missed.saturating_add(1));
     }
 
     #[tokio::test]

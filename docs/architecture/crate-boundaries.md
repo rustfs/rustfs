@@ -92,13 +92,21 @@ Required `rustfs-storage-api` public re-exports:
 
 - `pub use admin::{DiskSetSelector, StorageAdminApi};`
 - `pub use bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};`
+- `pub use capability::{CapabilitySnapshotError, CapabilityState, CapabilityStatus};`
 - `pub use error::{StorageErrorCode, StorageResult};`
 - `pub use multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};`
+- `pub use observability::{MemorySamplingState, ObservabilitySnapshot, ObservabilitySnapshotProvider, PlatformSupport, UserspaceProfilingCapability};`
 - `pub use object::{HTTPPreconditions, HTTPRangeError, HTTPRangeSpec, ObjectLockRetentionOptions};`
+- `pub use object::{ExpirationOptions, TransitionedObject};`
 - `pub use object::{HealOperations, MultipartOperations, NamespaceLocking, ObjectIO, ObjectOperations};`
 - `pub use object::{ListObjectVersionsInfo, ListObjectsInfo, ListObjectsV2Info, ListOperations, ObjectInfoOrErr};`
 - `pub use object::{ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState};`
 - `pub use object::{VersionMarker, WalkOptions, WalkVersionsSortOrder};`
+- `pub use topology::{DiskCapabilities, TopologyCapabilities, TopologyDisk, TopologyLabels, TopologyPool, TopologySet, TopologySnapshot, TopologySnapshotProvider};`
+
+Required `rustfs-concurrency` public workload admission contract re-exports:
+
+- `pub use workload::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadAdmissionSnapshotProvider, WorkloadClass};`
 
 ECStore must keep compile-time coverage for `StorageAdminApi`, `HealOperations`,
 and the separate `NamespaceLocking` operation group.
@@ -117,3 +125,7 @@ directly for `ObjectIO`, `ObjectOperations`, `ListOperations`,
 `MultipartOperations`, `HealOperations`, and `NamespaceLocking`; ECStore keeps
 the concrete compatibility traits only for internal implementation and
 downstream compatibility.
+
+ECStore internal consumers must use `rustfs-storage-api` lifecycle helper DTOs
+directly for `ExpirationOptions` and `TransitionedObject`; ECStore keeps the
+old lifecycle paths only as downstream compatibility re-exports.
