@@ -24,6 +24,9 @@ sidecars are designed.
 The current safe baseline is:
 
 - Profiling is opt-in through env flags and must not make startup fatal.
+- Startup and shutdown call profiling through `startup_profiling` lifecycle
+  hooks; `profiling.rs` remains the CPU/memory profiling implementation and
+  admin dump API owner.
 - Unsupported profiling targets return structured unsupported errors or skip
   startup tasks.
 - Memory observability records process/system metrics and adds cgroup split

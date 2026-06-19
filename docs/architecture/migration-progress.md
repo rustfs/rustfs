@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-iam-object-boundary-prune`
-- Baseline: stacked after `rustfs/rustfs#3620`
-  (`c7bee5de904c9a1ea70f73ad6621895a30b3c387`).
+- Branch: `overtrue/arch-final-object-boundary-prune`
+- Baseline: stacked after `rustfs/rustfs#3622`
+  (`4300bf04f3a82ef4cc2605f417f89e7b4643b99e`).
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: route IAM config/store object metadata and options aliases
-  through `rustfs_storage_api::ObjectOperations` associated types.
+- Rust code changes: route heal and RustFS storage object reader, writer,
+  metadata, and options aliases through `rustfs_storage_api` associated types.
 - CI/script changes: shrink the remaining external `rustfs_ecstore::object_api`
-  compatibility alias snapshot by removing IAM object-info/options aliases.
-- Docs changes: record the API-069 IAM object boundary prune slice.
+  compatibility alias snapshot to empty.
+- Docs changes: record the API-071 final object boundary prune slice.
 
 ## Phase 0 Tasks
 
@@ -359,6 +359,36 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     system-path failure classification, and notification peer behavior.
   - Verification: focused IAM compile/tests, migration and layer guards,
     formatting, diff hygiene, full pre-commit, and three-expert review.
+
+- [x] `API-070` Prune consumer direct ECStore object aliases.
+  - Completed slice: replace scanner, s3select, and Swift
+    `GetObjectReader`/`ObjectInfo`/`ObjectOptions`/`PutObjReader`
+    compatibility aliases with concrete store `rustfs_storage_api` associated
+    types.
+  - Acceptance: scanner, s3select, and Swift no longer name
+    `rustfs_ecstore::object_api::{GetObjectReader,ObjectInfo,ObjectOptions,PutObjReader}`
+    directly, and the remaining object-api alias allowlist shrinks by eleven
+    entries.
+  - Must preserve: scanner lifecycle/replication IO bounds and config helpers,
+    s3select read buffer/object error handling, Swift bucket metadata helpers,
+    and object reader/writer concrete types exposed through each local
+    compatibility boundary.
+  - Verification: focused consumer compile/tests, migration and layer guards,
+    formatting, diff hygiene, full pre-commit, and three-expert review.
+
+- [x] `API-071` Prune final direct ECStore object aliases.
+  - Completed slice: replace heal and RustFS storage
+    `GetObjectReader`/`ObjectInfo`/`ObjectOptions`/`PutObjReader`
+    compatibility aliases with concrete store `rustfs_storage_api` associated
+    types.
+  - Acceptance: no external `storage_compat.rs` module names
+    `rustfs_ecstore::object_api::{GetObjectReader,ObjectInfo,ObjectOptions,PutObjReader}`
+    directly, and the external object-api alias allowlist is empty.
+  - Must preserve: heal object metadata and rewrite reader construction,
+    RustFS storage object read/write paths, S3 response metadata semantics,
+    SSE/encryption handling, and storage object option behavior.
+  - Verification: focused heal/storage compile/tests, migration and layer
+    guards, formatting, diff hygiene, full pre-commit, and three-expert review.
 
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.
   - Acceptance: `./scripts/check_architecture_migration_rules.sh` parses the
@@ -1940,26 +1970,51 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     binary/lib compile checks, formatting, migration guards, Rust risk scan,
     branch freshness check, and pre-commit quality gate.
 
+- [x] `R-020` Isolate profiling lifecycle hooks.
+  - Do: route BOOT-006 profiling initialization and STOP-004 profiling shutdown
+    through `startup_profiling` hook functions while keeping `profiling.rs` as
+    the CPU/memory profiling implementation and admin dump API owner.
+  - Acceptance: startup still initializes profiling before trusted proxies and
+    outbound TLS material; shutdown still stops profiling after notifier/audit
+    shutdown and before HTTP shutdown; unsupported targets and disabled
+    profiling keep their existing no-op behavior.
+  - Must preserve: profiling env flags, CPU/memory mode handling, target gates,
+    cancellation-token ownership, admin pprof routes, non-fatal startup
+    behavior, and shutdown ordering.
+  - Verification: focused startup profiling hook tests, binary/lib compile
+    checks, formatting, migration guards, Rust risk scan, branch freshness
+    check, and pre-commit quality gate.
+
 ## Next PRs
 
-1. `consumer-migration`: connect additional scanner, repair, replication, and
-   metadata admission owners to the workload registry only after each owner has
-   dedicated preservation coverage.
-2. `pure-move`/`consumer-migration`: continue larger cleanup slices with the
+1. `pure-move`: continue larger lifecycle hook slices for optional runtime
+   sidecars while preserving startup and shutdown ordering.
+2. `consumer-migration`: continue larger cleanup slices with the
    loss-prevention guards active for remaining ECStore compatibility contracts
-   now that broad compatibility passthroughs are fully closed.
+   that still have dedicated preservation coverage.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | S-015 removes obsolete KMS admin policy action variants after the handler fallback cleanup; API-042/API-043/API-044/API-045/API-046/API-047/API-048/API-049/API-050/API-051/API-052/API-053/API-054 narrow notify, S3 Select, OBS, IAM, Swift, heal, scanner, RustFS runtime, test, fuzz, lifecycle helper, harness, and RustFS runtime compatibility contracts without moving ECStore storage metadata ownership; G-011/G-012/G-013 add docs-only baselines for scheduler, placement/repair, and profiling/NUMA work; Issue #660 PR-08/PR-09 add read-only observability and topology contracts in storage-api only; PR-05/PR-07 add scheduler preservation tests and workload contracts; API-055/SCH-001 adds a local storage concurrency provider; current API-056/R-016 wires runtime observability and endpoint topology providers without moving implementation ownership. |
-| Migration preservation | passed | KMS endpoint URLs, query aliases, request bodies, response contracts, and dedicated `kms:*` authorization behavior are preserved; event builder call sites, ECStore event bridge conversion, restore event data, version IDs, metadata filtering, config read/save semantics, S3 Select store/error/buffer semantics, OBS metrics state reads, IAM config/notification/error semantics, Swift bucket metadata access, heal disk/resume/task behavior, scanner lifecycle/replication/data-usage behavior, RustFS startup/admin/app/storage runtime access, e2e/test/fuzz import behavior, lifecycle expiration/transition helper DTO field contracts, flattened harness and RustFS runtime scalar/secondary alias behavior, unchanged no-op handling, remove-event behavior, scheduler/readiness/placement/profiling runtime behavior, platform gates, missing/unknown capability states, placement/topology labels, scheduler thresholds, queue snapshot semantics, disk-read semaphore behavior, and admission behavior are preserved. |
-| Testing/verification | passed | Focused compiles/tests, fuzz target compile, guards, formatting, diff hygiene, risk scan, and full `make pre-commit` passed for prior code slices; current Issue #660 API-056/R-016 slice uses runtime capability provider tests, focused RustFS library check, migration and layer guards, formatting, diff hygiene, and three-expert review. |
+| Quality/architecture | passed | R-020 moves profiling init/shutdown call sites behind `startup_profiling` hook functions without moving CPU/memory profiling implementation ownership or admin pprof APIs. |
+| Migration preservation | passed | BOOT-006 still initializes profiling before trusted proxies/provider/TLS setup; STOP-004 still stops profiling after notifier/audit shutdown and before HTTP shutdown; profiling env flags, platform gates, target unsupported behavior, and cancellation-token ownership remain in `profiling.rs`. |
+| Testing/verification | passed | Focused startup profiling hook tests, RustFS library check, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` validate the current R-020 slice. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 R-020 current slice:
+  - `cargo test -p rustfs --lib startup_profiling -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
 
 - Issue #660 API-056/R-016 current slice:
   - `cargo test -p rustfs --lib runtime_capabilities -- --nocapture`: passed.
