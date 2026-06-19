@@ -47,6 +47,12 @@ pub(crate) use rustfs_ecstore::bucket::{
 pub(crate) use rustfs_ecstore::disk::{DiskAPI, DiskInfoOptions};
 pub(crate) use rustfs_ecstore::global::GLOBAL_TierConfigMgr;
 
+pub type ScannerGetObjectReader = <ECStore as ObjectIO>::GetObjectReader;
+pub type ScannerObjectInfo = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
+pub type ScannerObjectOptions = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
+pub type ScannerObjectToDelete = ObjectToDelete;
+pub type ScannerPutObjReader = <ECStore as ObjectIO>::PutObjectReader;
+
 pub(crate) mod storageclass {
     pub(crate) const RRS: &str = rustfs_ecstore::config::storageclass::RRS;
     pub(crate) const STANDARD: &str = rustfs_ecstore::config::storageclass::STANDARD;
@@ -57,12 +63,6 @@ pub(crate) use rustfs_ecstore::config::init as init_ecstore_config_for_scanner_t
 
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::disk::{DiskOption, endpoint::Endpoint, new_disk};
-
-pub type ScannerGetObjectReader = rustfs_ecstore::object_api::GetObjectReader;
-pub type ScannerObjectInfo = rustfs_ecstore::object_api::ObjectInfo;
-pub type ScannerObjectOptions = rustfs_ecstore::object_api::ObjectOptions;
-pub type ScannerObjectToDelete = ObjectToDelete;
-pub type ScannerPutObjReader = rustfs_ecstore::object_api::PutObjReader;
 
 pub(crate) fn resolve_scanner_object_store_handle() -> Option<Arc<ECStore>> {
     rustfs_ecstore::resolve_object_store_handle()

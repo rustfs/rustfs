@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) type SelectGetObjectReader = rustfs_ecstore::object_api::GetObjectReader;
-pub(crate) type SelectObjectInfo = rustfs_ecstore::object_api::ObjectInfo;
-pub(crate) type SelectObjectOptions = rustfs_ecstore::object_api::ObjectOptions;
 pub(crate) type SelectStorageError = rustfs_ecstore::error::StorageError;
 pub(crate) type SelectStore = rustfs_ecstore::store::ECStore;
+pub(crate) type SelectGetObjectReader = <SelectStore as rustfs_storage_api::ObjectIO>::GetObjectReader;
+pub(crate) type SelectObjectInfo = <SelectStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
+pub(crate) type SelectObjectOptions = <SelectStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
 
 pub(crate) const SELECT_DEFAULT_READ_BUFFER_SIZE: usize = rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 

@@ -5,16 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-iam-object-boundary-prune`
-- Baseline: stacked after `rustfs/rustfs#3620`
-  (`c7bee5de904c9a1ea70f73ad6621895a30b3c387`).
+- Branch: `overtrue/arch-consumer-object-boundary-prune`
+- Baseline: latest `upstream/main`
+  (`08b8f58e64e87efac48c5a1c596fb4a8ea65e5f2`).
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: route IAM config/store object metadata and options aliases
-  through `rustfs_storage_api::ObjectOperations` associated types.
+- Rust code changes: route scanner, s3select, and Swift object reader,
+  metadata, and options aliases through `rustfs_storage_api` associated types.
 - CI/script changes: shrink the remaining external `rustfs_ecstore::object_api`
-  compatibility alias snapshot by removing IAM object-info/options aliases.
-- Docs changes: record the API-069 IAM object boundary prune slice.
+  compatibility alias snapshot by removing scanner, s3select, and Swift object
+  aliases.
+- Docs changes: record the API-070 consumer object boundary prune slice.
 
 ## Phase 0 Tasks
 
@@ -358,6 +359,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     list walk item/error typing, metadata return shape, storage preconditions,
     system-path failure classification, and notification peer behavior.
   - Verification: focused IAM compile/tests, migration and layer guards,
+    formatting, diff hygiene, full pre-commit, and three-expert review.
+
+- [x] `API-070` Prune consumer direct ECStore object aliases.
+  - Completed slice: replace scanner, s3select, and Swift
+    `GetObjectReader`/`ObjectInfo`/`ObjectOptions`/`PutObjReader`
+    compatibility aliases with concrete store `rustfs_storage_api` associated
+    types.
+  - Acceptance: scanner, s3select, and Swift no longer name
+    `rustfs_ecstore::object_api::{GetObjectReader,ObjectInfo,ObjectOptions,PutObjReader}`
+    directly, and the remaining object-api alias allowlist shrinks by eleven
+    entries.
+  - Must preserve: scanner lifecycle/replication IO bounds and config helpers,
+    s3select read buffer/object error handling, Swift bucket metadata helpers,
+    and object reader/writer concrete types exposed through each local
+    compatibility boundary.
+  - Verification: focused consumer compile/tests, migration and layer guards,
     formatting, diff hygiene, full pre-commit, and three-expert review.
 
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.

@@ -533,17 +533,6 @@ cat >"$ECSTORE_OBJECT_API_EXTERNAL_ALIAS_EXPECTED_FILE" <<'EOF'
 crates/heal/src/heal/storage_compat.rs:HealObjectInfo=ObjectInfo
 crates/heal/src/heal/storage_compat.rs:HealObjectOptions=ObjectOptions
 crates/heal/src/heal/storage_compat.rs:HealPutObjReader=PutObjReader
-crates/protocols/src/swift/storage_compat.rs:SwiftGetObjectReader=GetObjectReader
-crates/protocols/src/swift/storage_compat.rs:SwiftObjectInfo=ObjectInfo
-crates/protocols/src/swift/storage_compat.rs:SwiftObjectOptions=ObjectOptions
-crates/protocols/src/swift/storage_compat.rs:SwiftPutObjReader=PutObjReader
-crates/s3select-api/src/storage_compat.rs:SelectGetObjectReader=GetObjectReader
-crates/s3select-api/src/storage_compat.rs:SelectObjectInfo=ObjectInfo
-crates/s3select-api/src/storage_compat.rs:SelectObjectOptions=ObjectOptions
-crates/scanner/src/storage_compat.rs:ScannerGetObjectReader=GetObjectReader
-crates/scanner/src/storage_compat.rs:ScannerObjectInfo=ObjectInfo
-crates/scanner/src/storage_compat.rs:ScannerObjectOptions=ObjectOptions
-crates/scanner/src/storage_compat.rs:ScannerPutObjReader=PutObjReader
 rustfs/src/storage/storage_compat.rs:GetObjectReader=GetObjectReader
 rustfs/src/storage/storage_compat.rs:ObjectInfo=ObjectInfo
 rustfs/src/storage/storage_compat.rs:ObjectOptions=ObjectOptions

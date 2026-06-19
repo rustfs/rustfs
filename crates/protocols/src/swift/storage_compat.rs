@@ -17,11 +17,10 @@ use std::sync::Arc;
 pub(super) type SwiftBucketMetadata = rustfs_ecstore::bucket::metadata::BucketMetadata;
 pub(super) type SwiftStorageResult<T> = rustfs_ecstore::error::Result<T>;
 pub(super) type SwiftStore = rustfs_ecstore::store::ECStore;
-
-pub type SwiftGetObjectReader = rustfs_ecstore::object_api::GetObjectReader;
-pub type SwiftObjectInfo = rustfs_ecstore::object_api::ObjectInfo;
-pub type SwiftObjectOptions = rustfs_ecstore::object_api::ObjectOptions;
-pub type SwiftPutObjReader = rustfs_ecstore::object_api::PutObjReader;
+pub type SwiftGetObjectReader = <SwiftStore as rustfs_storage_api::ObjectIO>::GetObjectReader;
+pub type SwiftObjectInfo = <SwiftStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
+pub type SwiftObjectOptions = <SwiftStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
+pub type SwiftPutObjReader = <SwiftStore as rustfs_storage_api::ObjectIO>::PutObjectReader;
 
 pub fn resolve_swift_object_store_handle() -> Option<Arc<SwiftStore>> {
     rustfs_ecstore::resolve_object_store_handle()
