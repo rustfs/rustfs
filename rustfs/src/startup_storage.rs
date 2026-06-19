@@ -28,12 +28,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 const LOG_COMPONENT_MAIN: &str = "main";
+const LOG_COMPONENT_EMBEDDED: &str = "embedded";
 const LOG_SUBSYSTEM_STORAGE: &str = "storage";
+const LOG_SUBSYSTEM_EMBEDDED: &str = "embedded";
 const GLOBAL_CONFIG_INIT_MAX_RETRIES: usize = 15;
 const EVENT_ENDPOINT_PARSING_STARTED: &str = "endpoint_parsing_started";
 const EVENT_STARTUP_STORAGE_STAGE: &str = "startup_storage_stage";
 const EVENT_STORAGE_POOL_FORMATTING: &str = "storage_pool_formatting";
 const EVENT_STORAGE_POOL_HOST_RISK: &str = "storage_pool_host_risk";
+const EVENT_EMBEDDED_STORAGE_INIT_FAILED: &str = "embedded_storage_init_failed";
+const EVENT_EMBEDDED_STORAGE_INIT_RETRY: &str = "embedded_storage_init_retry";
 
 pub struct StartupStorageRuntime {
     pub store: Arc<ECStore>,
@@ -102,6 +106,23 @@ pub async fn init_startup_storage_foundation(server_address: &str, volumes: &[St
     Ok(endpoint_pools)
 }
 
+pub async fn init_embedded_startup_storage_foundation(server_address: &str, volumes: &[String]) -> Result<EndpointServerPools> {
+    let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address, volumes.to_vec())
+        .await
+        .map_err(|err| Error::other(format!("endpoints: {err}")))?;
+    enforce_unsupported_fs_policy(&endpoint_pools).map_err(|err| Error::other(format!("unsupported fs guard: {err}")))?;
+
+    set_global_endpoints(endpoint_pools.as_ref().clone());
+    update_erasure_type(setup_type).await;
+
+    init_local_disks(endpoint_pools.clone())
+        .await
+        .map_err(|err| Error::other(format!("local disks: {err}")))?;
+    init_lock_clients(endpoint_pools.clone());
+
+    Ok(endpoint_pools)
+}
+
 pub async fn init_startup_storage_runtime(
     server_addr: SocketAddr,
     endpoint_pools: &EndpointServerPools,
@@ -143,6 +164,34 @@ pub async fn init_startup_storage_runtime(
     })
 }
 
+pub async fn init_embedded_startup_storage_runtime(
+    server_addr: SocketAddr,
+    endpoint_pools: &EndpointServerPools,
+    readiness: Arc<GlobalReadiness>,
+    shutdown_token: CancellationToken,
+) -> Result<StartupStorageRuntime> {
+    let store = match ECStore::new(server_addr, endpoint_pools.clone(), shutdown_token.clone()).await {
+        Ok(store) => store,
+        Err(err) => {
+            error!(
+                component = LOG_COMPONENT_EMBEDDED,
+                subsystem = LOG_SUBSYSTEM_EMBEDDED,
+                event = EVENT_EMBEDDED_STORAGE_INIT_FAILED,
+                stage = "ecstore_new",
+                error = ?err,
+                "Embedded storage initialization failed"
+            );
+            return Err(Error::other(format!("ECStore: {err}")));
+        }
+    };
+
+    init_embedded_startup_storage_global_config(store.clone()).await?;
+    readiness.mark_stage(SystemStage::StorageReady);
+    init_background_replication(store.clone()).await;
+
+    Ok(StartupStorageRuntime { store, shutdown_token })
+}
+
 async fn init_startup_storage_global_config(store: Arc<ECStore>) -> Result<()> {
     init_ecstore_config();
     try_migrate_server_config(store.clone()).await;
@@ -166,6 +215,33 @@ async fn init_startup_storage_global_config(store: Arc<ECStore>) -> Result<()> {
         if global_config_retry_exhausted(retry_count) {
             return Err(Error::other("ecconfig::init_global_config_sys failed"));
         }
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    }
+
+    Ok(())
+}
+
+async fn init_embedded_startup_storage_global_config(store: Arc<ECStore>) -> Result<()> {
+    init_ecstore_config();
+    try_migrate_server_config(store.clone()).await;
+
+    let mut retry = 0;
+    while let Err(err) = init_global_config_sys(store.clone()).await {
+        retry += 1;
+        if retry > GLOBAL_CONFIG_INIT_MAX_RETRIES {
+            return Err(Error::other(format!(
+                "init_global_config_sys failed after {GLOBAL_CONFIG_INIT_MAX_RETRIES} retries: {err}"
+            )));
+        }
+        debug!(
+            component = LOG_COMPONENT_EMBEDDED,
+            subsystem = LOG_SUBSYSTEM_EMBEDDED,
+            event = EVENT_EMBEDDED_STORAGE_INIT_RETRY,
+            stage = "global_config_sys",
+            retry,
+            error = %err,
+            "Embedded storage initialization retry scheduled"
+        );
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
 

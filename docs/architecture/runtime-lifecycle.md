@@ -81,6 +81,14 @@ outbound TLS publication, generation recording, and TLS metrics initialization.
 `startup_runtime` still owns BOOT-006 ordering and must preserve the fatal
 boundary when configured TLS material fails to load.
 
+## Embedded Startup Phase Reuse
+
+Embedded startup should use the same startup server and storage phase owners for
+listen context, endpoint/local disk setup, storage runtime setup, readiness
+publication, and replication startup. Embedded-specific behavior still owns its
+stable-port requirement, one-shot global initialization guard placement, S3-only
+HTTP listener, and non-fatal KMS/audit/notification policy.
+
 ## AppContext Foundation
 
 Early AppContext work should split resolver files and add compatibility tests before

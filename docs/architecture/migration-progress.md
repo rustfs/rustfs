@@ -5,17 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-startup-tls-material-boundary`
+- Branch: `overtrue/arch-embedded-startup-phase-reuse`
 - Baseline: `origin/main`
-  (`46a02b6d03e2d8274222e7ef63ac2eb5d9124c69`).
-- Stacked on: rustfs/rustfs#3638.
+  (`f8117eb46bb6ae21481bd744cfc245e88fbdb74c`).
+- Stacked on: none.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: add `startup_tls_material` and move outbound TLS material
-  loading, generation recording, and TLS metrics initialization out of
-  `startup_runtime`.
+- Rust code changes: route embedded listen and storage startup phases through
+  the shared startup server/storage boundaries while preserving embedded-only
+  fatal and non-fatal behavior.
 - CI/script changes: none.
-- Docs changes: record the R-028 startup TLS material boundary slice.
+- Docs changes: record the R-029 embedded startup phase reuse slice.
 
 ## Phase 0 Tasks
 
@@ -2138,10 +2138,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
     freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `R-029` Reuse startup phase boundaries in embedded mode.
+  - Do: move embedded listen setup, endpoint/local disk setup, ECStore/global
+    config setup, storage readiness publication, and replication startup behind
+    startup server/storage helpers.
+  - Acceptance: embedded startup keeps its stable-port requirement, global
+    startup guard placement, S3-only HTTP startup, readiness publication, and
+    storage initialization order while sharing the same startup phase owners.
+  - Must preserve: embedded port 0 rejection, credential/region publication,
+    endpoint and unsupported filesystem validation, local disk and lock client
+    initialization, ECStore fatal shutdown behavior, global config retry limit,
+    and embedded-specific non-fatal KMS/audit/notification behavior.
+  - Verification: focused embedded/startup storage checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
 ## Next PRs
 
-1. `pure-move`: continue larger lifecycle hook slices for startup profiling and
-   diagnostics while preserving startup and shutdown ordering.
+1. `pure-move`: continue embedded lifecycle reuse for runtime services and
+   shutdown compatibility while preserving embedded-specific non-fatal service
+   behavior.
 2. `contract`: continue extension contract coverage for future diagnostics and
    profiler handoff surfaces after runtime owners are stable.
 
@@ -2149,26 +2165,27 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-028 moves outbound TLS material ownership into `startup_tls_material` while keeping `startup_runtime` as the BOOT-006 orchestrator. |
-| Migration preservation | passed | BOOT-006 ordering, configured TLS fatal behavior, path trimming, generation saturation, publication, and metrics behavior remain unchanged. |
-| Testing/verification | passed | Focused TLS material/runtime checks, guards, final hygiene, Rust risk scan, and full pre-commit passed. |
+| Quality/architecture | passed | R-029 moves embedded listen/storage phase ownership into startup server/storage helpers without routing embedded through binary-only service policy. |
+| Migration preservation | passed | Embedded stable-port rejection, global init guard placement, S3-only listener, storage readiness, retry limit, and non-fatal service policy remain unchanged. |
+| Testing/verification | passed | Focused startup server/storage/embedded checks, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
 
 ## Verification Notes
 
 Passed before push:
 
-- Issue #660 R-028 current slice:
-  - `cargo test -p rustfs --lib startup_tls_material -- --nocapture`: passed.
-  - `cargo test -p rustfs --lib startup_runtime -- --nocapture`: passed.
+- Issue #660 R-029 current slice:
+  - `cargo test -p rustfs --lib startup_storage -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_server -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib embedded -- --nocapture`: passed; no
+    matching unit tests currently exist.
   - `cargo check -p rustfs --lib`: passed.
   - `./scripts/check_architecture_migration_rules.sh`: passed.
   - `./scripts/check_layer_dependencies.sh`: passed.
   - `cargo fmt --all --check`: passed.
   - `git diff --check`: passed.
   - Rust risk scan on changed Rust files: passed; only existing doc-example
-    `println!` in `rustfs/src/lib.rs`.
-  - `make pre-commit`: passed; 6304 tests passed, 111 skipped, doctests
-    passed.
+    `Box<dyn Error>` / `println!` and existing test-only `panic!`.
+  - `make pre-commit`: passed.
 
 - Issue #660 X-012 current slice:
   - `cargo test -p rustfs-extension-schema`: passed.
