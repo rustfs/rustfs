@@ -61,6 +61,77 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertEqual(config["spark.sql.catalog.rustfs.s3.endpoint"], "http://127.0.0.1:9000")
         self.assertEqual(config["spark.sql.catalog.rustfs.rest.signing-name"], "s3")
 
+    def test_spark_vendor_config_formats_aws_s3tables_profile(self) -> None:
+        config = engine_compatibility.spark_vendor_catalog_config(
+            profile="aws-s3tables",
+            endpoint="https://s3tables.us-east-1.amazonaws.com",
+            warehouse="ignored",
+            access_key="rustfsadmin",
+            secret_key="rustfsadmin",
+            region="us-east-1",
+            catalog_name="rustfs",
+            account_id="123456789012",
+            table_bucket="analytics",
+            catalog_uri=None,
+            warehouse_name=None,
+        )
+
+        self.assertEqual(config["spark.sql.catalog.rustfs.uri"], "https://s3tables.us-east-1.amazonaws.com/iceberg")
+        self.assertEqual(
+            config["spark.sql.catalog.rustfs.warehouse"],
+            "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics",
+        )
+        self.assertEqual(config["spark.sql.catalog.rustfs.rest.signing-name"], "s3tables")
+        self.assertNotIn("spark.sql.catalog.rustfs.s3.endpoint", config)
+        self.assertNotIn("spark.sql.catalog.rustfs.s3.path-style-access", config)
+        self.assertNotIn("spark.sql.catalog.rustfs.s3.access-key-id", config)
+        self.assertNotIn("spark.sql.catalog.rustfs.s3.secret-access-key", config)
+
+    def test_spark_vendor_config_formats_cloudflare_catalog_profile(self) -> None:
+        config = engine_compatibility.spark_vendor_catalog_config(
+            profile="cloudflare-r2-data-catalog",
+            endpoint="https://example.r2.cloudflarestorage.com",
+            warehouse="ignored",
+            access_key="rustfsadmin",
+            secret_key="rustfsadmin",
+            region="auto",
+            catalog_name="rustfs",
+            account_id="000000000000",
+            table_bucket="ignored",
+            catalog_uri="https://catalog.example.com/iceberg",
+            warehouse_name="analytics",
+        )
+
+        self.assertEqual(config["spark.sql.catalog.rustfs.uri"], "https://catalog.example.com/iceberg")
+        self.assertEqual(config["spark.sql.catalog.rustfs.warehouse"], "analytics")
+        self.assertEqual(config["spark.sql.catalog.rustfs.rest.signing-name"], "s3")
+        self.assertNotIn("spark.sql.catalog.rustfs.s3.endpoint", config)
+        self.assertNotIn("spark.sql.catalog.rustfs.s3.path-style-access", config)
+        self.assertNotIn("spark.sql.catalog.rustfs.s3.access-key-id", config)
+        self.assertNotIn("spark.sql.catalog.rustfs.s3.secret-access-key", config)
+
+    def test_spark_vendor_config_keeps_endpoint_for_s3_compatible_profiles(self) -> None:
+        config = engine_compatibility.spark_vendor_catalog_config(
+            profile="minio-aistor",
+            endpoint="https://minio.example.com",
+            warehouse="analytics",
+            access_key="rustfsadmin",
+            secret_key="rustfsadmin",
+            region="us-east-1",
+            catalog_name="rustfs",
+            account_id="000000000000",
+            table_bucket="analytics",
+            catalog_uri=None,
+            warehouse_name=None,
+        )
+
+        self.assertEqual(config["spark.sql.catalog.rustfs.uri"], "https://minio.example.com/_iceberg")
+        self.assertEqual(config["spark.sql.catalog.rustfs.s3.endpoint"], "https://minio.example.com")
+        self.assertEqual(config["spark.sql.catalog.rustfs.s3.path-style-access"], "true")
+        self.assertEqual(config["spark.sql.catalog.rustfs.s3.access-key-id"], "rustfsadmin")
+        self.assertEqual(config["spark.sql.catalog.rustfs.s3.secret-access-key"], "rustfsadmin")
+        self.assertEqual(config["spark.sql.catalog.rustfs.rest.signing-name"], "s3tables")
+
     def test_spark_sql_smoke_covers_lifecycle_append_reload_and_cleanup(self) -> None:
         sql = engine_compatibility.spark_sql_smoke(
             catalog_name="rustfs",
@@ -92,6 +163,52 @@ class EngineCompatibilityTest(unittest.TestCase):
 
         self.assertIn("engine_compatibility", document)
         self.assertTrue(document["engine_compatibility"])
+
+    def test_cli_prints_vendor_spark_config(self) -> None:
+        payload = engine_compatibility.cli_json(
+            [
+                "--print-spark-config",
+                "--profile",
+                "aws-s3tables",
+                "--region",
+                "us-east-1",
+                "--account-id",
+                "123456789012",
+                "--table-bucket",
+                "analytics",
+            ]
+        )
+        document = json.loads(payload)
+        config = document["spark_config"]
+
+        self.assertEqual(config["spark.sql.catalog.rustfs.uri"], "https://s3tables.us-east-1.amazonaws.com/iceberg")
+        self.assertEqual(
+            config["spark.sql.catalog.rustfs.warehouse"],
+            "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics",
+        )
+        self.assertEqual(config["spark.sql.catalog.rustfs.rest.signing-name"], "s3tables")
+        self.assertNotIn("spark.sql.catalog.rustfs.s3.endpoint", config)
+        self.assertNotIn("spark.sql.catalog.rustfs.s3.path-style-access", config)
+        self.assertNotIn("spark.sql.catalog.rustfs.s3.access-key-id", config)
+        self.assertNotIn("spark.sql.catalog.rustfs.s3.secret-access-key", config)
+
+    def test_cli_spark_config_keeps_explicit_rest_overrides(self) -> None:
+        payload = engine_compatibility.cli_json(
+            [
+                "--print-spark-config",
+                "--endpoint",
+                "http://127.0.0.1:9000/",
+                "--rest-path",
+                "/_iceberg",
+                "--rest-signing-name",
+                "s3tables",
+            ]
+        )
+        document = json.loads(payload)
+        config = document["spark_config"]
+
+        self.assertEqual(config["spark.sql.catalog.rustfs.uri"], "http://127.0.0.1:9000/_iceberg")
+        self.assertEqual(config["spark.sql.catalog.rustfs.rest.signing-name"], "s3tables")
 
     def assertContainsScenario(self, entry: dict[str, object], name: str, status: str) -> None:
         scenarios = entry.get("scenarios")

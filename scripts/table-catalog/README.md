@@ -138,12 +138,54 @@ work items. They are intentionally conservative: only PyIceberg is automated by
 this script today. Spark now has generated configuration and SQL smoke input;
 other engines are documented until a repeatable harness is added.
 
+Vendor profiles are machine-readable connection references. They include the
+catalog URI shape, warehouse shape, signing name, credential model, namespace
+model, pagination model, and explicit not-claimed behavior. They are useful for
+building migration docs without turning provider references into compatibility
+claims. The `vendor_profiles` object lists every supported reference template;
+the `selected_vendor_profile` object renders the active profile with the
+provided endpoint, account, bucket, and warehouse arguments.
+
+Spark vendor config generation only emits S3-compatible data-plane endpoint,
+path-style, and static S3 credential properties for profiles that explicitly use
+the supplied endpoint as object storage, such as RustFS and MinIO AIStor. AWS S3
+Tables, Cloudflare R2 Data Catalog, and OSS Tables reference profiles leave
+provider object I/O endpoint and credential selection to the provider-specific
+Spark/Iceberg runtime configuration instead of inheriting RustFS local defaults.
+
+Generate an AWS S3 Tables-style reference profile:
+
+```bash
+python3 scripts/table-catalog/pyiceberg_smoke.py \
+  --profile aws-s3tables \
+  --region us-east-1 \
+  --account-id 123456789012 \
+  --table-bucket analytics \
+  --print-vendor-profiles
+```
+
+Generate a Cloudflare R2 Data Catalog-style reference profile:
+
+```bash
+python3 scripts/table-catalog/pyiceberg_smoke.py \
+  --profile cloudflare-r2-data-catalog \
+  --catalog-uri https://example.account.r2.cloudflarestorage.com/catalog \
+  --warehouse-name analytics \
+  --print-vendor-profiles
+```
+
 The standalone engine helper prints the same compatibility matrix and can also
 generate Spark REST catalog input without importing PyIceberg:
 
 ```bash
 python3 scripts/table-catalog/engine_compatibility.py --print-engine-matrix
 python3 scripts/table-catalog/engine_compatibility.py --print-spark-config
+python3 scripts/table-catalog/engine_compatibility.py \
+  --profile aws-s3tables \
+  --region us-east-1 \
+  --account-id 123456789012 \
+  --table-bucket analytics \
+  --print-spark-config
 python3 scripts/table-catalog/engine_compatibility.py --print-spark-sql --cleanup
 ```
 
@@ -228,15 +270,15 @@ RustFS build, client version, and expected response shape are recorded.
 
 ## Vendor Profile References
 
-| Profile | Catalog shape | Signing name | Credential model | RustFS claim |
+| Profile | Catalog shape | Warehouse shape | Signing name | RustFS claim |
 |---|---|---|---|---|
-| `rustfs` | `{endpoint}/iceberg` | `s3` | static S3 credentials | automated smoke target |
-| `rustfs-compat` | `{endpoint}/_iceberg` | `s3tables` by default | static S3 credentials | compatibility smoke target |
-| `rustfs-vended-credentials` | `{endpoint}/iceberg` | `s3` | catalog-vended table credentials after table creation | automated credential smoke target when server vending is enabled |
-| `aws-s3tables` | `https://s3tables.{region}.amazonaws.com/iceberg` | `s3tables` | AWS IAM/session credentials | reference only |
-| `minio-aistor` | `{endpoint}/_iceberg` | `s3tables` | policy-scoped S3 credentials | reference only |
-| `cloudflare-r2-data-catalog` | catalog URI returned by R2 | `s3` | catalog-vended credentials | reference only |
-| `oss-tables` | provider REST endpoint | `s3` | SigV4 S3FileIO credentials | reference only |
+| `rustfs` | `{endpoint}/iceberg` | `{bucket}` | `s3` | automated smoke target |
+| `rustfs-compat` | `{endpoint}/_iceberg` | `{bucket}` | `s3tables` by default | compatibility smoke target |
+| `rustfs-vended-credentials` | `{endpoint}/iceberg` | `{bucket}` | `s3` | automated credential smoke target when server vending is enabled |
+| `aws-s3tables` | `https://s3tables.{region}.amazonaws.com/iceberg` | `arn:aws:s3tables:{region}:{account_id}:bucket/{table_bucket}` | `s3tables` | profile generator only; full AWS S3 Tables API parity is not claimed |
+| `minio-aistor` | `{endpoint}/_iceberg` | `{warehouse}` | `s3tables` | profile generator plus RustFS alias smoke; full AIStor extension parity is not claimed |
+| `cloudflare-r2-data-catalog` | catalog URI returned by R2 | `{warehouse_name}` | `s3` | profile generator only; live RustFS interoperability is not claimed |
+| `oss-tables` | provider REST endpoint | `{warehouse}` | `s3` | profile generator only; live RustFS interoperability is not claimed |
 
 ## Unsupported Inventory
 
