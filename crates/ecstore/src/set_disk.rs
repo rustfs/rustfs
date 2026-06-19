@@ -33,9 +33,9 @@ use crate::erasure_coding;
 use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
 use crate::global::{GLOBAL_LocalNodeName, GLOBAL_TierConfigMgr};
-use crate::store_api::ListObjectVersionsInfo;
-use crate::store_api::ObjectOptions;
-use crate::store_api::{ObjectInfoOrErr, WalkOptions};
+use crate::object_api::ListObjectVersionsInfo;
+use crate::object_api::ObjectOptions;
+use crate::object_api::{ObjectInfoOrErr, WalkOptions};
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::{
         LifecycleOps, gen_transition_objname, get_transitioned_object_reader, put_restore_opts,
@@ -51,7 +51,7 @@ use crate::{
     // event::name::EventName,
     event_notification::{EventArgs, send_event},
     global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id, is_dist_erasure},
-    store_api::{GetObjectReader, ListObjectsV2Info, ObjectInfo, PutObjReader},
+    object_api::{GetObjectReader, ListObjectsV2Info, ObjectInfo, PutObjReader},
     store_init::load_format_erasure,
 };
 use bytes::Bytes;
@@ -5014,7 +5014,7 @@ mod tests {
     use crate::disk::health_state::RuntimeDriveHealthState;
     use crate::endpoints::SetupType;
     use crate::global::{is_dist_erasure, is_erasure, is_erasure_sd, update_erasure_type};
-    use crate::store_api::ObjectInfo;
+    use crate::object_api::ObjectInfo;
     use crate::store_init::save_format_file;
     use crate::store_list_objects::ListPathOptions;
     use rustfs_filemeta::ErasureInfo;

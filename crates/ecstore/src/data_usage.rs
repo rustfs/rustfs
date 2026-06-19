@@ -715,7 +715,7 @@ pub fn cache_to_data_usage_info(cache: &DataUsageCache, path: &str, buckets: &[r
 // Helper functions for DataUsageCache operations
 pub async fn load_data_usage_cache(store: &crate::set_disk::SetDisks, name: &str) -> crate::error::Result<DataUsageCache> {
     use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
-    use crate::store_api::ObjectOptions;
+    use crate::object_api::ObjectOptions;
     use http::HeaderMap;
     use rand::RngExt;
     use std::path::Path;

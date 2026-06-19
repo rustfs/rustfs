@@ -432,7 +432,7 @@ impl ObjectInfo {
             restore_expires = restore_status.expiry();
         }
 
-        // Convert parts from rustfs_filemeta::ObjectPartInfo to store_api::ObjectPartInfo
+        // Convert parts from rustfs_filemeta::ObjectPartInfo to object_api::ObjectPartInfo
         let parts = fi
             .parts
             .iter()

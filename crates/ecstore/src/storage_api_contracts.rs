@@ -1,5 +1,5 @@
 use crate::error::Error;
-use crate::store_api::{
+use crate::object_api::{
     GetObjectReader, ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo, ObjectInfoOrErr, ObjectOptions, PutObjReader,
     WalkOptions,
 };

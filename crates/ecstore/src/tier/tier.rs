@@ -49,9 +49,9 @@ use crate::{
     config::com::{CONFIG_PREFIX, read_config},
     disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET},
     global::is_first_cluster_node_local,
+    object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
     storage_api_contracts::{EcstoreObjectIO, EcstoreObjectOperations},
     store::ECStore,
-    store_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
 };
 use rustfs_filemeta::FileInfo;
 use rustfs_rio::HashReader;

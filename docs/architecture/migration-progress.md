@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-private-store-api`
-- Baseline: stacked after `rustfs/rustfs#3610`
-  (`f667ef5393c5a2b1e04f19c140111d9c7435028b`).
+- Branch: `overtrue/arch-ecstore-object-api-module`
+- Baseline: stacked after `rustfs/rustfs#3611`
+  (`b3af0d584ea29acc4273cee57fbdbaf35870ca67`).
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: make ECStore `store_api` private and keep the public
-  object DTO and reader compatibility path behind `rustfs_ecstore::object_api`.
-- CI/script changes: make the migration guard reject restoring the public
-  ECStore `store_api` module.
-- Docs changes: record the API-063 public `store_api` cleanup slice.
+- Rust code changes: move the ECStore object DTO and reader implementation
+  module from the retired private `store_api` name into `object_api`.
+- CI/script changes: make the migration guard reject restoring ECStore
+  `store_api` module files or directories.
+- Docs changes: record the API-064 ECStore object API module cleanup slice.
 
 ## Phase 0 Tasks
 
@@ -272,6 +272,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     behavior, storage-api trait bindings, and downstream object/list/multipart
     compile-time contracts.
   - Verification: focused ECStore contract tests, migration guard, formatting,
+    diff hygiene, risk scan, and three-expert review.
+
+- [x] `API-064` Retire the ECStore store API module name.
+  - Completed slice: move ECStore object DTO, reader, and option definitions
+    from the private `store_api` module into the public `object_api` module,
+    then migrate ECStore internal imports to `crate::object_api`.
+  - Acceptance: no ECStore `store_api` module file or directory remains, public
+    consumers keep using `rustfs_ecstore::object_api`, and migration rules
+    reject restoring the retired module path.
+  - Must preserve: object metadata shape, reader/writer behavior, storage-api
+    contract bindings, object/list/multipart behavior, and downstream public
+    object API compatibility.
+  - Verification: focused ECStore compile checks, migration guard, formatting,
     diff hygiene, risk scan, and three-expert review.
 
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.

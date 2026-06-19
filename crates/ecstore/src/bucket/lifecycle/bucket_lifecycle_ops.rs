@@ -35,9 +35,9 @@ use crate::error::{error_resp_to_object_err, is_err_object_not_found, is_err_ver
 use crate::event_notification::{EventArgs, send_event};
 use crate::global::GLOBAL_LocalNodeName;
 use crate::global::{GLOBAL_LifecycleSys, GLOBAL_TierConfigMgr, get_global_deployment_id};
+use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
 use crate::set_disk::{MAX_PARTS_COUNT, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, SetDisks};
 use crate::store::ECStore;
-use crate::store_api::{GetObjectReader, ObjectInfo, ObjectOptions};
 use crate::tier::warm_backend::WarmBackendGetOpts;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use futures::Future;
@@ -2863,9 +2863,9 @@ mod tests {
     use crate::disk::endpoint::Endpoint;
     use crate::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::error::is_err_invalid_upload_id;
+    use crate::object_api::{ObjectInfo, ObjectOptions, PutObjReader};
     use crate::set_disk::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
     use crate::store::ECStore;
-    use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader};
     use futures::FutureExt;
     use rustfs_common::metrics::{IlmAction, global_metrics};
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;

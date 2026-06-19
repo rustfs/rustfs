@@ -74,6 +74,7 @@ BROAD_STORE_API_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/broad_store_api_compat_ree
 NESTED_STORE_API_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/nested_store_api_compat_module_hits.txt"
 UNAPPROVED_STORE_API_COMPAT_ALIAS_HITS_FILE="${TMP_DIR}/unapproved_store_api_compat_alias_hits.txt"
 PUBLIC_STORE_API_MODULE_HITS_FILE="${TMP_DIR}/public_store_api_module_hits.txt"
+STORE_API_MODULE_PATH_HITS_FILE="${TMP_DIR}/store_api_module_path_hits.txt"
 ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE="${TMP_DIR}/ecstore_compat_passthrough_expected.txt"
 ECSTORE_COMPAT_PASSTHROUGH_ACTUAL_FILE="${TMP_DIR}/ecstore_compat_passthrough_actual.txt"
 ECSTORE_COMPAT_PASSTHROUGH_DIFF_FILE="${TMP_DIR}/ecstore_compat_passthrough_diff.txt"
@@ -358,7 +359,7 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api::\{[^}]*\b(?:BucketInfo|BucketOptions|DeleteBucketOptions|MakeBucketOptions|SRBucketDeleteOp)\b' \
-    crates/ecstore/src/store_api.rs || true
+    crates/ecstore/src/store_api.rs 2>/dev/null || true
 ) >"$STORE_API_BUCKET_DTO_REEXPORTS_FILE"
 
 if [[ -s "$STORE_API_BUCKET_DTO_REEXPORTS_FILE" ]]; then
@@ -367,12 +368,17 @@ fi
 
 (
   cd "$ROOT_DIR"
-  store_api_bucket_operation_scan_targets=(crates/ecstore/src/store_api.rs)
+  store_api_bucket_operation_scan_targets=()
+  if [[ -f crates/ecstore/src/store_api.rs ]]; then
+    store_api_bucket_operation_scan_targets+=(crates/ecstore/src/store_api.rs)
+  fi
   if [[ -f crates/ecstore/src/store_api/traits.rs ]]; then
     store_api_bucket_operation_scan_targets+=(crates/ecstore/src/store_api/traits.rs)
   fi
-  rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api::\{[^}]*\bBucketOperations\b|pub trait BucketOperations\b' \
-    "${store_api_bucket_operation_scan_targets[@]}" || true
+  if (( ${#store_api_bucket_operation_scan_targets[@]} > 0 )); then
+    rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api::\{[^}]*\bBucketOperations\b|pub trait BucketOperations\b' \
+      "${store_api_bucket_operation_scan_targets[@]}" || true
+  fi
 ) >"$STORE_API_BUCKET_OPERATION_HITS_FILE"
 
 if [[ -s "$STORE_API_BUCKET_OPERATION_HITS_FILE" ]]; then
@@ -382,7 +388,7 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api::\{[^}]*\b(?:CompletePart|ListMultipartsInfo|ListPartsInfo|MultipartInfo|MultipartUploadResult|PartInfo)\b|pub struct (?:CompletePart|ListMultipartsInfo|ListPartsInfo|MultipartInfo|MultipartUploadResult|PartInfo)\b' \
-    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs 2>/dev/null || true
 ) >"$STORE_API_MULTIPART_DTO_REEXPORTS_FILE"
 
 if [[ -s "$STORE_API_MULTIPART_DTO_REEXPORTS_FILE" ]]; then
@@ -392,7 +398,7 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:HTTPPreconditions|ObjectLockRetentionOptions|ObjectPreconditionError|ObjectPreconditionPart|ObjectPreconditionState)\b|::(?:HTTPPreconditions|ObjectLockRetentionOptions|ObjectPreconditionError|ObjectPreconditionPart|ObjectPreconditionState)\b)|pub (?:enum ObjectPreconditionError|struct (?:HTTPPreconditions|ObjectLockRetentionOptions|ObjectPreconditionPart|ObjectPreconditionState))\b' \
-    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs 2>/dev/null || true
 ) >"$STORE_API_OBJECT_HELPER_REEXPORTS_FILE"
 
 if [[ -s "$STORE_API_OBJECT_HELPER_REEXPORTS_FILE" ]]; then
@@ -402,7 +408,7 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:HTTPRangeError|HTTPRangeSpec)\b|::(?:HTTPRangeError|HTTPRangeSpec)\b)|pub (?:enum HTTPRangeError|struct HTTPRangeSpec)\b' \
-    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs crates/ecstore/src/store_api/readers.rs || true
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs crates/ecstore/src/store_api/readers.rs 2>/dev/null || true
 ) >"$STORE_API_RANGE_HELPER_REEXPORTS_FILE"
 
 if [[ -s "$STORE_API_RANGE_HELPER_REEXPORTS_FILE" ]]; then
@@ -412,7 +418,7 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:VersionMarker|WalkOptions|WalkVersionsSortOrder)\b|::(?:VersionMarker|WalkOptions|WalkVersionsSortOrder)\b)|pub (?:enum (?:VersionMarker|WalkVersionsSortOrder)|struct WalkOptions)\b' \
-    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs 2>/dev/null || true
 ) >"$STORE_API_LIST_HELPER_REEXPORTS_FILE"
 
 if [[ -s "$STORE_API_LIST_HELPER_REEXPORTS_FILE" ]]; then
@@ -422,7 +428,7 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:ListObjectVersionsInfo|ListObjectsInfo|ListObjectsV2Info|ListOperations|ObjectInfoOrErr)\b|::(?:ListObjectVersionsInfo|ListObjectsInfo|ListObjectsV2Info|ListOperations|ObjectInfoOrErr)\b)|pub struct (?:ListObjectVersionsInfo|ListObjectsInfo|ListObjectsV2Info|ObjectInfoOrErr)\b' \
-    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs 2>/dev/null || true
 ) >"$STORE_API_LIST_RESPONSE_REEXPORTS_FILE"
 
 if [[ -s "$STORE_API_LIST_RESPONSE_REEXPORTS_FILE" ]]; then
@@ -432,7 +438,7 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api(?:::\{[^}]*\b(?:DeletedObject|ObjectToDelete)\b|::(?:DeletedObject|ObjectToDelete)\b)|pub struct (?:DeletedObject|ObjectToDelete)\b' \
-    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs || true
+    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/types.rs 2>/dev/null || true
 ) >"$STORE_API_DELETE_DTO_REEXPORTS_FILE"
 
 if [[ -s "$STORE_API_DELETE_DTO_REEXPORTS_FILE" ]]; then
@@ -626,6 +632,19 @@ fi
 
 if rg -n --no-heading '^\s*pub\s+mod\s+store_api\s*;' "$ROOT_DIR/crates/ecstore/src/lib.rs" >"$PUBLIC_STORE_API_MODULE_HITS_FILE"; then
   report_failure "ECStore store_api must remain private; expose ECStore-owned object DTO and reader aliases through rustfs_ecstore::object_api"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e crates/ecstore/src/store_api.rs ]] && printf '%s\n' 'crates/ecstore/src/store_api.rs'
+    [[ -d crates/ecstore/src/store_api ]] && printf '%s\n' 'crates/ecstore/src/store_api'
+    true
+  }
+) >"$STORE_API_MODULE_PATH_HITS_FILE"
+
+if [[ -s "$STORE_API_MODULE_PATH_HITS_FILE" ]]; then
+  report_failure "legacy ECStore store_api module files must not be restored: $(paste -sd '; ' "$STORE_API_MODULE_PATH_HITS_FILE")"
 fi
 
 cat >"$ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE" <<'EOF'

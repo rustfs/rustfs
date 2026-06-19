@@ -15,7 +15,7 @@
 
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
-use crate::store_api::{ObjectInfoOrErr, WalkOptions};
+use crate::object_api::{ObjectInfoOrErr, WalkOptions};
 use crate::{
     disk::{
         DiskAPI, DiskInfo, DiskOption, DiskStore,
@@ -26,8 +26,8 @@ use crate::{
     endpoints::{Endpoints, PoolEndpoints},
     error::StorageError,
     global::{GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_lock_clients, is_dist_erasure},
+    object_api::{GetObjectReader, ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo, ObjectOptions, PutObjReader},
     set_disk::SetDisks,
-    store_api::{GetObjectReader, ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo, ObjectOptions, PutObjReader},
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
 };
 use futures::{

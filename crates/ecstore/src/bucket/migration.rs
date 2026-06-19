@@ -17,11 +17,11 @@
 use crate::bucket::metadata::BUCKET_METADATA_FILE;
 use crate::bucket::replication::{decode_resync_file, encode_resync_file};
 use crate::disk::{BUCKET_META_PREFIX, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
-use crate::storage_api_contracts::{EcstoreObjectIO, EcstoreObjectOperations};
-use crate::store_api::{
+use crate::object_api::{
     GetObjectReader, ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo, ObjectInfoOrErr, ObjectOptions, PutObjReader,
     WalkOptions,
 };
+use crate::storage_api_contracts::{EcstoreObjectIO, EcstoreObjectOperations};
 use http::HeaderMap;
 use rustfs_filemeta::FileInfo;
 use rustfs_policy::auth::UserIdentity;

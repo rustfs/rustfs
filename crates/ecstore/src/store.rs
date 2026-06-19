@@ -50,19 +50,19 @@ use crate::global::{
     set_object_layer,
 };
 use crate::notification_sys::get_global_notification_sys;
+use crate::object_api::{ListObjectVersionsInfo, ObjectInfoOrErr, WalkOptions};
 use crate::pools::PoolMeta;
 use crate::rebalance::RebalanceMeta;
 use crate::rpc::RemoteClient;
-use crate::store_api::{ListObjectVersionsInfo, ObjectInfoOrErr, WalkOptions};
 use crate::store_init::{check_disk_fatal_errs, ec_drives_no_config};
 use crate::tier::tier::TierConfigMgr;
 use crate::{
     bucket::{lifecycle::bucket_lifecycle_ops::TransitionState, metadata::BucketMetadata},
     disk::{BUCKET_META_PREFIX, DiskOption, DiskStore, RUSTFS_META_BUCKET, new_disk},
     endpoints::EndpointServerPools,
+    object_api::{GetObjectReader, ListObjectsV2Info, ObjectInfo, ObjectOptions, PutObjReader},
     rpc::S3PeerSys,
     sets::Sets,
-    store_api::{GetObjectReader, ListObjectsV2Info, ObjectInfo, ObjectOptions, PutObjReader},
     store_init,
 };
 use futures::future::join_all;
