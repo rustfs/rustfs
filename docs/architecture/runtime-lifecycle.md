@@ -57,11 +57,13 @@ these helpers.
 
 ## Optional Runtime Boundary
 
-`startup_optional_runtimes` owns startup and shutdown handoff for optional
-runtime services that are not readiness boundaries. The current owner set is
-protocol servers only. Future optional sidecars must enter this boundary with
-explicit shutdown handles and status snapshots instead of adding ad hoc startup
-or shutdown work to `startup_services`.
+`startup_optional_runtime_sidecars` owns startup handles, shutdown planning, and
+shutdown execution for optional runtime services that are not readiness
+boundaries. `startup_optional_runtimes` remains a compatibility handoff for the
+old module path. The current owner set is protocol servers only. Future optional
+sidecars must enter this boundary with explicit shutdown handles and status
+snapshots instead of adding ad hoc startup or shutdown work to
+`startup_services`.
 
 ## AppContext Foundation
 

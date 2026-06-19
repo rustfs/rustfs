@@ -18,7 +18,7 @@ use crate::{
     init::{init_buffer_profile_system, init_kms_system},
     server::ServiceStateManager,
     startup_iam::IamBootstrapDisposition,
-    startup_optional_runtimes::{OptionalRuntimeServices, init_optional_runtime_services},
+    startup_optional_runtime_sidecars::{OptionalRuntimeServices, init_optional_runtime_services},
     startup_service_components::{
         init_audit_runtime, init_auth_integrations, init_background_service_runtime, init_bucket_metadata_runtime,
         init_deadlock_detector_runtime, init_iam_runtime, init_notification_runtime, init_observability_runtime,

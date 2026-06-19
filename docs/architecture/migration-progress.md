@@ -5,16 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-startup-service-components-boundary`
-- Baseline: `overtrue/arch-startup-ready-lifecycle-boundary`
-  (`a518f40489515c1ec37c3cbc5738e04955a942f2`).
-- Stacked on: rustfs/rustfs#3635.
+- Branch: `overtrue/arch-protocol-runtime-sidecar-boundary`
+- Baseline: `origin/main`
+  (`aa5de1c908d6ffb778533c895c200f3c60ca1ed5`).
+- Stacked on: rustfs/rustfs#3636.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move startup service component initialization helpers from
-  `startup_services` into a dedicated startup service component boundary.
+- Rust code changes: move optional runtime sidecar ownership and protocol
+  shutdown planning from `startup_optional_runtimes` into
+  `startup_optional_runtime_sidecars`.
 - CI/script changes: none.
-- Docs changes: record the R-025 startup service component boundary slice.
+- Docs changes: record the R-026 optional runtime sidecar boundary slice.
 
 ## Phase 0 Tasks
 
@@ -2094,10 +2095,25 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     risk scan, branch freshness check, pre-commit quality gate, and
     three-expert review.
 
+- [x] `R-026` Extract optional runtime sidecar boundary.
+  - Do: add `startup_optional_runtime_sidecars` and move optional runtime
+    sidecar ownership, shutdown planning, shutdown execution, and protocol
+    shutdown order tests out of `startup_optional_runtimes`.
+  - Acceptance: optional protocol startup still happens after KMS and before
+    buffer profiling, while shutdown planning still records FTP, FTPS, WebDAV,
+    then SFTP handles before later shutdown signaling.
+  - Must preserve: feature-gated protocol startup behavior, disabled-protocol
+    handling, protocol shutdown ordering, HTTP shutdown before optional protocol
+    shutdown signaling, and the compatibility `startup_optional_runtimes` API.
+  - Verification: focused optional runtime sidecar/runtime/shutdown tests,
+    RustFS lib check, migration/layer guards, formatting, diff hygiene, Rust
+    risk scan, branch freshness check, pre-commit quality gate, and
+    three-expert review.
+
 ## Next PRs
 
-1. `pure-move`: continue larger lifecycle hook slices for optional runtime
-   sidecars while preserving startup and shutdown ordering.
+1. `pure-move`: continue larger lifecycle hook slices for startup profiling and
+   diagnostics while preserving startup and shutdown ordering.
 2. `contract`: continue extension contract coverage for future diagnostics and
    profiler handoff surfaces after runtime owners are stable.
 
@@ -2105,9 +2121,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-025 keeps `startup_services` as the orchestrator and moves component helpers into `startup_service_components`. |
-| Migration preservation | passed | Runtime service startup order and embedded helper reuse remain unchanged. |
-| Testing/verification | passed | Focused component, service, lifecycle, final hygiene, and full pre-commit checks passed. |
+| Quality/architecture | passed | R-026 moves optional runtime sidecar ownership into `startup_optional_runtime_sidecars` while keeping the old module path as a compatibility handoff. |
+| Migration preservation | passed | Protocol startup order, shutdown planning order, and HTTP-before-optional-runtime shutdown ordering remain unchanged. |
+| Testing/verification | passed | Focused optional runtime sidecar/runtime/shutdown checks, guards, final hygiene, and full pre-commit passed. |
 
 ## Verification Notes
 
@@ -2194,6 +2210,21 @@ Passed before push:
     passed.
   - `cargo test -p rustfs --lib startup_services -- --nocapture`: passed.
   - `cargo test -p rustfs --lib startup_lifecycle -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 R-026 current slice:
+  - `cargo test -p rustfs --lib startup_optional_runtime_sidecars -- --nocapture`:
+    passed.
+  - `cargo test -p rustfs --lib startup_optional_runtimes -- --nocapture`:
+    passed.
+  - `cargo test -p rustfs --lib startup_shutdown -- --nocapture`: passed.
   - `cargo check -p rustfs --lib`: passed.
   - `./scripts/check_architecture_migration_rules.sh`: passed.
   - `./scripts/check_layer_dependencies.sh`: passed.

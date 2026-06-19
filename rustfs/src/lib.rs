@@ -72,6 +72,7 @@ pub mod startup_entrypoint;
 pub mod startup_fs_guard;
 pub mod startup_iam;
 pub mod startup_lifecycle;
+pub mod startup_optional_runtime_sidecars;
 pub mod startup_optional_runtimes;
 pub mod startup_preflight;
 pub mod startup_profiling;
