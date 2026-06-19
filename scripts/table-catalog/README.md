@@ -4,6 +4,9 @@ This directory contains repeatable client-facing checks for the RustFS S3 Tables
 Iceberg REST Catalog surface. The goal is to keep S3 Tables compatibility claims
 grounded in runnable scripts or explicit unsupported entries.
 
+For the release-facing support and limitation matrix, see
+[`docs/architecture/s3-tables-support-matrix.md`](../../docs/architecture/s3-tables-support-matrix.md).
+
 ## PyIceberg Smoke Test
 
 Install the client dependencies:
