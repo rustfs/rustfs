@@ -5,17 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-startup-runtime-hooks-boundary`
+- Branch: `overtrue/arch-startup-tls-material-boundary`
 - Baseline: `origin/main`
-  (`5e96151d9c57cc8764f187cc0838dc111ddf0636`).
-- Stacked on: rustfs/rustfs#3637.
+  (`46a02b6d03e2d8274222e7ef63ac2eb5d9124c69`).
+- Stacked on: rustfs/rustfs#3638.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: add `startup_runtime_hooks` and move runtime diagnostics,
-  profiling hook dispatch, and crypto provider installation out of
-  `startup_runtime` and `startup_profiling`.
+- Rust code changes: add `startup_tls_material` and move outbound TLS material
+  loading, generation recording, and TLS metrics initialization out of
+  `startup_runtime`.
 - CI/script changes: none.
-- Docs changes: record the R-027 startup runtime hook boundary slice.
+- Docs changes: record the R-028 startup TLS material boundary slice.
 
 ## Phase 0 Tasks
 
@@ -2124,6 +2124,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     lib check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
     branch freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `R-028` Extract startup TLS material boundary.
+  - Do: add `startup_tls_material` and move outbound TLS material loading,
+    global TLS publication, generation recording, TLS metrics initialization,
+    and existing TLS path/generation tests out of `startup_runtime`.
+  - Acceptance: BOOT-006 keeps diagnostics, profiling init, trusted proxy init,
+    provider install, and outbound TLS material load in the same order.
+  - Must preserve: configured TLS material fatal behavior, TLS path trimming,
+    saturating TLS generation behavior, outbound TLS global state publication,
+    generation metric recording, and metrics initialization when observability
+    metrics are enabled.
+  - Verification: focused TLS material/runtime tests, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
 ## Next PRs
 
 1. `pure-move`: continue larger lifecycle hook slices for startup profiling and
@@ -2135,13 +2149,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-027 moves runtime hook side effects into `startup_runtime_hooks` while keeping old profiling entrypoints as compatibility handoffs. |
-| Migration preservation | passed | BOOT-006 and STOP-004 ordering remain unchanged, including trusted proxy and outbound TLS ordering. |
-| Testing/verification | passed | Focused runtime hook/profiling/runtime/shutdown checks, guards, final hygiene, and full pre-commit passed. |
+| Quality/architecture | passed | R-028 moves outbound TLS material ownership into `startup_tls_material` while keeping `startup_runtime` as the BOOT-006 orchestrator. |
+| Migration preservation | passed | BOOT-006 ordering, configured TLS fatal behavior, path trimming, generation saturation, publication, and metrics behavior remain unchanged. |
+| Testing/verification | passed | Focused TLS material/runtime checks, guards, final hygiene, Rust risk scan, and full pre-commit passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 R-028 current slice:
+  - `cargo test -p rustfs --lib startup_tls_material -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_runtime -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; only existing doc-example
+    `println!` in `rustfs/src/lib.rs`.
+  - `make pre-commit`: passed; 6304 tests passed, 111 skipped, doctests
+    passed.
 
 - Issue #660 X-012 current slice:
   - `cargo test -p rustfs-extension-schema`: passed.
