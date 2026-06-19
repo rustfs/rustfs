@@ -16,8 +16,8 @@ use crate::config::{audit, notify, oidc, set_global_storage_class, storageclass}
 use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::global::is_first_cluster_node_local;
+use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use crate::storage_api_contracts::EcstoreObjectIO;
-use crate::store_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use http::HeaderMap;
 use rustfs_config::audit::{
     AUDIT_AMQP_KEYS, AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS,
@@ -1313,8 +1313,8 @@ mod tests {
     use crate::endpoints::SetupType;
     use crate::error::{Error, Result};
     use crate::global::{is_dist_erasure, is_erasure, is_erasure_sd, update_erasure_type};
+    use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
     use crate::set_disk::SetDisks;
-    use crate::store_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
     use http::HeaderMap;
     use rustfs_config::audit::{AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
     use rustfs_config::notify::{

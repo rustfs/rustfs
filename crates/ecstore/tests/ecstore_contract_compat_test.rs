@@ -16,22 +16,25 @@ use rustfs_common::heal_channel::HealOpts;
 use rustfs_ecstore::{
     disk::DiskStore,
     error::Error,
+    object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
     store::ECStore,
-    store_api::{
-        GetObjectReader, ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo, ObjectInfoOrErr, ObjectOptions, PutObjReader,
-        WalkOptions,
-    },
 };
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::NamespaceLockWrapper;
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_storage_api::{
-    CompletePart, DeletedObject, HTTPRangeSpec, HealOperations as StorageHealOperations, ListMultipartsInfo, ListPartsInfo,
+    CompletePart, DeletedObject, HTTPRangeSpec, HealOperations as StorageHealOperations, ListMultipartsInfo,
+    ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info, ListPartsInfo,
     MultipartInfo, MultipartOperations as StorageMultipartOperations, MultipartUploadResult,
-    NamespaceLocking as StorageNamespaceLocking, ObjectIO as StorageObjectIO, ObjectOperations as StorageObjectOperations,
-    ObjectToDelete, PartInfo, StorageAdminApi,
+    NamespaceLocking as StorageNamespaceLocking, ObjectIO as StorageObjectIO, ObjectInfoOrErr as StorageObjectInfoOrErr,
+    ObjectOperations as StorageObjectOperations, ObjectToDelete, PartInfo, StorageAdminApi, WalkOptions as StorageWalkOptions,
 };
 use tokio_util::sync::CancellationToken;
+
+type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
+type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
+type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
+type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
 fn storage_admin_api_type_name<T>() -> &'static str
 where

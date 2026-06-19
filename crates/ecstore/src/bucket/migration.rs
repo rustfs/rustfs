@@ -17,17 +17,17 @@
 use crate::bucket::metadata::BUCKET_METADATA_FILE;
 use crate::bucket::replication::{decode_resync_file, encode_resync_file};
 use crate::disk::{BUCKET_META_PREFIX, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
+use crate::error::Error;
+use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use crate::storage_api_contracts::{EcstoreObjectIO, EcstoreObjectOperations};
-use crate::store_api::{
-    GetObjectReader, ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo, ObjectInfoOrErr, ObjectOptions, PutObjReader,
-    WalkOptions,
-};
 use http::HeaderMap;
 use rustfs_filemeta::FileInfo;
 use rustfs_policy::auth::UserIdentity;
 use rustfs_policy::policy::PolicyDoc;
 use rustfs_storage_api::{
-    BucketOperations, BucketOptions, DeletedObject, HTTPRangeSpec, ListOperations, ObjectIO, ObjectOperations, ObjectToDelete,
+    BucketOperations, BucketOptions, DeletedObject, HTTPRangeSpec, ListObjectVersionsInfo as StorageListObjectVersionsInfo,
+    ListObjectsV2Info as StorageListObjectsV2Info, ListOperations, ObjectIO, ObjectInfoOrErr as StorageObjectInfoOrErr,
+    ObjectOperations, ObjectToDelete, WalkOptions as StorageWalkOptions,
 };
 use rustfs_utils::path::SLASH_SEPARATOR;
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,11 @@ const IAM_POLICIES_PREFIX: &str = "config/iam/policies/";
 const IAM_POLICY_DB_PREFIX: &str = "config/iam/policydb/";
 const REPLICATION_META_DIR: &str = ".replication";
 const RESYNC_META_FILE: &str = "resync.bin";
+
+type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
+type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
+type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
+type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CompatIamFormat {

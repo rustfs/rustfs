@@ -18,7 +18,7 @@ use rustfs_ecstore::{config, global};
 
 use crate::event::NotifyObjectInfo;
 
-type EcstoreObjectInfo = rustfs_ecstore::store_api::ObjectInfo;
+type EcstoreObjectInfo = rustfs_ecstore::object_api::ObjectInfo;
 
 #[derive(Debug)]
 pub(crate) enum NotifyConfigStoreError {

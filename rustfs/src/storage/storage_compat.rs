@@ -39,7 +39,7 @@ pub(crate) use rustfs_ecstore::rpc::{
 pub(crate) use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 pub(crate) use rustfs_ecstore::store::{ECStore, all_local_disk_path, find_local_disk_by_ref};
 
-pub(crate) type GetObjectReader = rustfs_ecstore::store_api::GetObjectReader;
-pub(crate) type ObjectInfo = rustfs_ecstore::store_api::ObjectInfo;
-pub(crate) type ObjectOptions = rustfs_ecstore::store_api::ObjectOptions;
-pub(crate) type PutObjReader = rustfs_ecstore::store_api::PutObjReader;
+pub(crate) type GetObjectReader = rustfs_ecstore::object_api::GetObjectReader;
+pub(crate) type ObjectInfo = rustfs_ecstore::object_api::ObjectInfo;
+pub(crate) type ObjectOptions = rustfs_ecstore::object_api::ObjectOptions;
+pub(crate) type PutObjReader = rustfs_ecstore::object_api::PutObjReader;

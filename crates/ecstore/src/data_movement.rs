@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::error::{Error, Result, is_err_data_movement_overwrite, is_err_object_not_found, is_err_version_not_found};
+use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use crate::store::ECStore;
-use crate::store_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use bytes::Bytes;
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex};
 use rustfs_storage_api::{CompletePart, MultipartOperations as _, ObjectIO as _, ObjectOperations as _};
