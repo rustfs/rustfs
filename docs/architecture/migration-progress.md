@@ -5,17 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-consumer-object-boundary-prune`
-- Baseline: latest `upstream/main`
-  (`08b8f58e64e87efac48c5a1c596fb4a8ea65e5f2`).
+- Branch: `overtrue/arch-final-object-boundary-prune`
+- Baseline: stacked after `rustfs/rustfs#3622`
+  (`4300bf04f3a82ef4cc2605f417f89e7b4643b99e`).
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: route scanner, s3select, and Swift object reader,
+- Rust code changes: route heal and RustFS storage object reader, writer,
   metadata, and options aliases through `rustfs_storage_api` associated types.
 - CI/script changes: shrink the remaining external `rustfs_ecstore::object_api`
-  compatibility alias snapshot by removing scanner, s3select, and Swift object
-  aliases.
-- Docs changes: record the API-070 consumer object boundary prune slice.
+  compatibility alias snapshot to empty.
+- Docs changes: record the API-071 final object boundary prune slice.
 
 ## Phase 0 Tasks
 
@@ -376,6 +375,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     compatibility boundary.
   - Verification: focused consumer compile/tests, migration and layer guards,
     formatting, diff hygiene, full pre-commit, and three-expert review.
+
+- [x] `API-071` Prune final direct ECStore object aliases.
+  - Completed slice: replace heal and RustFS storage
+    `GetObjectReader`/`ObjectInfo`/`ObjectOptions`/`PutObjReader`
+    compatibility aliases with concrete store `rustfs_storage_api` associated
+    types.
+  - Acceptance: no external `storage_compat.rs` module names
+    `rustfs_ecstore::object_api::{GetObjectReader,ObjectInfo,ObjectOptions,PutObjReader}`
+    directly, and the external object-api alias allowlist is empty.
+  - Must preserve: heal object metadata and rewrite reader construction,
+    RustFS storage object read/write paths, S3 response metadata semantics,
+    SSE/encryption handling, and storage object option behavior.
+  - Verification: focused heal/storage compile/tests, migration and layer
+    guards, formatting, diff hygiene, full pre-commit, and three-expert review.
 
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.
   - Acceptance: `./scripts/check_architecture_migration_rules.sh` parses the
