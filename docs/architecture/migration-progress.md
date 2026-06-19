@@ -5,16 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-object-boundary-guards`
-- Baseline: latest `main` after `rustfs/rustfs#3616`
-  (`8d91e2116f53fabc5f8a12a7cc48eb9d72cfcf10`).
+- Branch: `overtrue/arch-notify-object-info-boundary-prune`
+- Baseline: stacked after `rustfs/rustfs#3619`
+  (`dd2c1846ad8b35f589492885cca2154dd13ea918`).
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: none.
-- CI/script changes: snapshot the exact remaining external
-  `rustfs_ecstore::object_api` compatibility aliases and reject new
-  object-api names outside the approved boundary surface.
-- Docs changes: record the API-067 ECStore object API boundary guard slice.
+- Rust code changes: remove notify's private ECStore `ObjectInfo` conversion
+  alias and perform the ECStore event object to `NotifyObjectInfo` mapping in
+  RustFS event/operation notification bridges.
+- CI/script changes: shrink the remaining external `rustfs_ecstore::object_api`
+  compatibility alias snapshot by removing notify's object-info alias.
+- Docs changes: record the API-068 notify object-info boundary prune slice.
 
 ## Phase 0 Tasks
 
@@ -330,6 +331,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     object metadata shape, options, and reader/writer ownership.
   - Verification: bash syntax check, migration and layer guards, formatting,
     diff hygiene, full pre-commit, and three-expert review.
+
+- [x] `API-068` Prune notify ECStore object-info compatibility alias.
+  - Completed slice: remove notify's private `EcstoreObjectInfo` alias and
+    ECStore-object conversion implementation, then map ECStore event objects to
+    `NotifyObjectInfo` inside the RustFS event and operation notification
+    bridges.
+  - Acceptance: `crates/notify` no longer references
+    `rustfs_ecstore::object_api::ObjectInfo`, the remaining object-api alias
+    allowlist shrinks accordingly, and notify event payload fields keep the
+    same serialized values.
+  - Must preserve: live event dispatch behavior, event names, bucket/object
+    fields, version IDs, metadata, restore-completed timestamps, storage class,
+    transitioned tier, host/port parsing, and replication request filtering.
+  - Verification: focused RustFS event conversion test, focused notify/RustFS
+    compile checks, migration and layer guards, formatting, diff hygiene, full
+    pre-commit, and three-expert review.
 
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.
   - Acceptance: `./scripts/check_architecture_migration_rules.sh` parses the

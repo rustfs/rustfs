@@ -537,7 +537,6 @@ crates/iam/src/storage_compat.rs:IamConfigObjectInfo=ObjectInfo
 crates/iam/src/storage_compat.rs:IamConfigObjectOptions=ObjectOptions
 crates/iam/src/store/storage_compat.rs:IamObjectInfo=ObjectInfo
 crates/iam/src/store/storage_compat.rs:IamObjectOptions=ObjectOptions
-crates/notify/src/storage_compat.rs:EcstoreObjectInfo=ObjectInfo
 crates/protocols/src/swift/storage_compat.rs:SwiftGetObjectReader=GetObjectReader
 crates/protocols/src/swift/storage_compat.rs:SwiftObjectInfo=ObjectInfo
 crates/protocols/src/swift/storage_compat.rs:SwiftObjectOptions=ObjectOptions
