@@ -1200,6 +1200,65 @@ impl HealManager {
         })
     }
 
+    pub async fn get_task_report(&self, task_id: &str) -> Result<HealTaskReport> {
+        let canonical_task_id = self.canonical_task_id(task_id).await;
+        {
+            let active_heals = self.active_heals.lock().await;
+            if let Some(task) = active_heals.get(&canonical_task_id) {
+                return Ok(HealTaskReport {
+                    status: task.get_status().await,
+                    result_items: task.get_result_items().await,
+                });
+            }
+        }
+
+        {
+            let retrying_heals = self.retrying_heals.lock().await;
+            if let Some(retrying) = retrying_heals.get(&canonical_task_id) {
+                return Ok(HealTaskReport {
+                    status: retrying.status(),
+                    result_items: Vec::new(),
+                });
+            }
+        }
+
+        {
+            let mut completed_heals = self.completed_heals.lock().await;
+            prune_completed_heal_statuses(&mut completed_heals);
+            if let Some(completed) = completed_heals.get(&canonical_task_id)
+                && completed_status_is_retrying(&completed.status)
+            {
+                return Ok(HealTaskReport {
+                    status: completed.status.clone(),
+                    result_items: completed.result_items.clone(),
+                });
+            }
+        }
+
+        {
+            let queue = self.heal_queue.lock().await;
+            if queue.contains_request_id(&canonical_task_id) {
+                return Ok(HealTaskReport {
+                    status: HealTaskStatus::Pending,
+                    result_items: Vec::new(),
+                });
+            }
+        }
+
+        let mut completed_heals = self.completed_heals.lock().await;
+        prune_completed_heal_statuses(&mut completed_heals);
+        if let Some(completed) = completed_heals.get(&canonical_task_id) {
+            return Ok(HealTaskReport {
+                status: completed.status.clone(),
+                result_items: completed.result_items.clone(),
+            });
+        }
+
+        Err(Error::TaskNotFound {
+            task_id: task_id.to_string(),
+        })
+    }
+
     pub async fn get_task_report_for_path(&self, heal_path: &str, task_id: &str) -> Result<HealTaskReport> {
         let canonical_task_id = self.canonical_task_id(task_id).await;
         {
@@ -3243,6 +3302,35 @@ mod tests {
             manager.get_task_status_for_path("", "wrong-token").await,
             Err(Error::TaskNotFound { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn test_get_task_report_queries_queued_task_by_token_without_path() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        let request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec![],
+                set_disk_id: "pool_0_set_1".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::High,
+        );
+        let request_id = request.id.clone();
+
+        manager
+            .submit_heal_request(request)
+            .await
+            .expect("request should be accepted");
+
+        let report = manager
+            .get_task_report(&request_id)
+            .await
+            .expect("queued task should be queryable by token");
+
+        assert_eq!(report.status, HealTaskStatus::Pending);
+        assert!(report.result_items.is_empty());
     }
 
     #[tokio::test]
