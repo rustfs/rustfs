@@ -50,7 +50,6 @@ use crate::global::{
     set_object_layer,
 };
 use crate::notification_sys::get_global_notification_sys;
-use crate::object_api::{ListObjectVersionsInfo, ObjectInfoOrErr, WalkOptions};
 use crate::pools::PoolMeta;
 use crate::rebalance::RebalanceMeta;
 use crate::rpc::RemoteClient;
@@ -60,7 +59,7 @@ use crate::{
     bucket::{lifecycle::bucket_lifecycle_ops::TransitionState, metadata::BucketMetadata},
     disk::{BUCKET_META_PREFIX, DiskOption, DiskStore, RUSTFS_META_BUCKET, new_disk},
     endpoints::EndpointServerPools,
-    object_api::{GetObjectReader, ListObjectsV2Info, ObjectInfo, ObjectOptions, PutObjReader},
+    object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
     rpc::S3PeerSys,
     sets::Sets,
     store_init,
@@ -75,10 +74,13 @@ use rustfs_config::server_config::{Config, get_global_server_config, set_global_
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::{LocalClient, LockClient, NamespaceLockWrapper};
 use rustfs_madmin::heal_commands::HealResultItem;
-use rustfs_storage_api::HTTPRangeSpec;
 use rustfs_storage_api::{
     BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, ListMultipartsInfo,
     ListPartsInfo, MakeBucketOptions, MultipartInfo, MultipartUploadResult, ObjectToDelete, PartInfo,
+};
+use rustfs_storage_api::{
+    HTTPRangeSpec, ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
+    ObjectInfoOrErr as StorageObjectInfoOrErr, WalkOptions as StorageWalkOptions,
 };
 use rustfs_utils::path::{decode_dir_object, encode_dir_object, path_join_buf};
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
@@ -99,6 +101,11 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
+
+type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
+type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
+type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
+type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
 /// Check if a directory contains any xl.meta files (indicating actual S3 objects)
 /// This is used to determine if a bucket is empty for deletion purposes.

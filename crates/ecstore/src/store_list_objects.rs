@@ -21,17 +21,21 @@ use crate::disk::{DiskInfo, DiskStore};
 use crate::error::{
     Error, Result, StorageError, is_all_not_found, is_all_volume_not_found, is_err_bucket_not_found, to_object_err,
 };
-use crate::object_api::{ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectInfoOrErr, ObjectOptions, WalkOptions};
+use crate::object_api::{ObjectInfo, ObjectOptions};
 use crate::set_disk::SetDisks;
+use crate::store::ECStore;
 use crate::store_utils::is_reserved_or_invalid_bucket;
-use crate::{object_api::ListObjectsV2Info, store::ECStore};
 use futures::future::join_all;
 use rand::seq::SliceRandom;
 use rustfs_filemeta::{
     MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry, MetadataResolutionParams,
     merge_file_meta_versions,
 };
-use rustfs_storage_api::{ObjectOperations as _, VersionMarker, WalkVersionsSortOrder};
+use rustfs_storage_api::{
+    ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsInfo as StorageListObjectsInfo,
+    ListObjectsV2Info as StorageListObjectsV2Info, ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectOperations as _,
+    VersionMarker, WalkOptions as StorageWalkOptions, WalkVersionsSortOrder,
+};
 use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -47,6 +51,12 @@ const MAX_OBJECT_LIST: i32 = 1000;
 // const MAX_PARTS_LIST: i32 = 10000;
 
 const METACACHE_SHARE_PREFIX: bool = false;
+
+type ListObjectsInfo = StorageListObjectsInfo<ObjectInfo>;
+type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
+type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
+type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
+type WalkOptions = StorageWalkOptions<fn(&rustfs_filemeta::FileInfo) -> bool>;
 
 fn normalize_max_keys(max_keys: i32) -> i32 {
     max_keys.min(MAX_OBJECT_LIST)
