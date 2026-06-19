@@ -280,6 +280,22 @@ require_source_line \
   "crates/storage-api/src/lib.rs" \
   "pub use topology::{" \
   "storage-api public topology contract re-export"
+require_source_line \
+  "rustfs/src/lib.rs" \
+  "pub mod runtime_capabilities;" \
+  "RustFS runtime capability provider module"
+require_source_contains \
+  "rustfs/src/runtime_capabilities.rs" \
+  "impl ObservabilitySnapshotProvider for RustFsObservabilitySnapshotProvider" \
+  "RustFS observability snapshot provider implementation"
+require_source_contains \
+  "rustfs/src/runtime_capabilities.rs" \
+  "impl TopologySnapshotProvider for EndpointTopologySnapshotProvider" \
+  "RustFS endpoint topology snapshot provider implementation"
+require_source_contains \
+  "rustfs/src/runtime_capabilities.rs" \
+  "pub fn topology_snapshot_from_endpoint_pools(endpoint_pools: &EndpointServerPools) -> TopologySnapshot" \
+  "RustFS endpoint topology snapshot helper"
 
 (
   cd "$ROOT_DIR"

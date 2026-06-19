@@ -42,3 +42,20 @@ ECStore type leakage.
   exporter behavior changes are part of this contract slice.
 - Providers must map implementation failures into `CapabilitySnapshotError`
   before crossing the contract boundary.
+
+## RustFS Provider Slice
+
+`rustfs/src/runtime_capabilities.rs` wires the contracts to RustFS runtime
+owners through read-only providers:
+
+- `RustFsObservabilitySnapshotProvider` maps current dial9, profiling,
+  memory-sampling, platform, allocator, eBPF, and NUMA capability state without
+  starting telemetry, profiling, allocator reclaim, or memory-observability
+  workers.
+- `EndpointTopologySnapshotProvider` maps `EndpointServerPools` into pool, set,
+  and disk topology snapshots without changing endpoint construction,
+  placement, readiness, locks, or ECStore metadata. Local file endpoint paths are
+  intentionally not used as disk IDs or labels.
+
+Unsupported or unavailable runtime capabilities are reported as `unsupported`
+or `unknown` contract states instead of activating fallback behavior.
