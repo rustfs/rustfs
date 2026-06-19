@@ -23,7 +23,7 @@ use crate::runtime_config::{
 };
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig, ScannerCycleBudgetReason};
 use crate::scanner_folder::{data_usage_update_dir_cycles, heal_object_select_prob};
-use crate::scanner_io::ScannerIO;
+use crate::scanner_io::{ScannerIO, dirty_usage_bucket_notified, dirty_usage_buckets_pending};
 use crate::sleeper::{SCANNER_SLEEPER, set_scanner_default_speed};
 use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError};
 use chrono::{DateTime, Utc};
@@ -129,6 +129,30 @@ fn randomized_cycle_delay_for(interval: Duration) -> Duration {
     let jitter_factor = (rand::random::<f64>() * 0.2) - 0.1;
     let delay = interval.mul_f64(1.0 + jitter_factor);
     delay.max(Duration::from_secs(1))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScannerCycleWakeReason {
+    Timer,
+    DirtyUsage,
+    Cancelled,
+}
+
+async fn wait_for_next_scanner_cycle(ctx: &CancellationToken, delay: Duration) -> ScannerCycleWakeReason {
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+
+    loop {
+        tokio::select! {
+            _ = ctx.cancelled() => return ScannerCycleWakeReason::Cancelled,
+            _ = &mut sleep => return ScannerCycleWakeReason::Timer,
+            _ = dirty_usage_bucket_notified() => {
+                if dirty_usage_buckets_pending() {
+                    return ScannerCycleWakeReason::DirtyUsage;
+                }
+            }
+        }
+    }
 }
 
 fn initial_scanner_delay_for(start_delay_secs: Option<u64>) -> Duration {
@@ -932,12 +956,22 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
             break;
         }
 
-        // Randomized inter-cycle delay
-        tokio::select! {
-            _ = ctx.cancelled() => break,
-            _ = tokio::time::sleep(randomized_cycle_delay()) => {
+        match wait_for_next_scanner_cycle(&ctx, randomized_cycle_delay()).await {
+            ScannerCycleWakeReason::Cancelled => break,
+            ScannerCycleWakeReason::Timer => {
                 run_data_scanner_cycle(&ctx, &storeapi, &mut cycle_info).await;
-            },
+            }
+            ScannerCycleWakeReason::DirtyUsage => {
+                debug!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_CYCLE_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    state = "dirty_usage_wakeup",
+                    "Scanner cycle woke for dirty usage work"
+                );
+                run_data_scanner_cycle(&ctx, &storeapi, &mut cycle_info).await;
+            }
         }
     }
 
@@ -1588,6 +1622,21 @@ mod tests {
         let delay = randomized_cycle_delay_for(Duration::from_secs(0));
         assert!(delay >= Duration::from_secs(1), "expected delay >= 1s");
         assert!(delay < Duration::from_secs(2), "expected delay < 2s");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_wait_for_next_scanner_cycle_wakes_for_dirty_usage() {
+        crate::scanner_io::clear_dirty_usage_bucket("photos");
+        crate::scanner_io::record_dirty_usage_bucket("photos");
+
+        let ctx = CancellationToken::new();
+        let reason = tokio::time::timeout(Duration::from_secs(1), wait_for_next_scanner_cycle(&ctx, Duration::from_secs(60)))
+            .await
+            .expect("dirty usage should wake scanner before timer");
+
+        assert_eq!(reason, ScannerCycleWakeReason::DirtyUsage);
+        crate::scanner_io::clear_dirty_usage_bucket("photos");
     }
 
     #[test]
