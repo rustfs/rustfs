@@ -164,6 +164,10 @@ pub struct ScannerReplicationRepairSnapshot {
     pub source: String,
     #[serde(rename = "kind", default)]
     pub kind: String,
+    #[serde(rename = "scanner_role", default)]
+    pub scanner_role: String,
+    #[serde(rename = "execution_owner", default)]
+    pub execution_owner: String,
     #[serde(rename = "checked", default)]
     pub checked: u64,
     #[serde(rename = "queued", default)]
@@ -1662,6 +1666,8 @@ mod tests {
             replication_repair: vec![ScannerReplicationRepairSnapshot {
                 source: "bucket_replication".to_string(),
                 kind: "object".to_string(),
+                scanner_role: "repair_admission".to_string(),
+                execution_owner: "bucket_replication_queue".to_string(),
                 queued: 2,
                 ..Default::default()
             }],
@@ -1674,18 +1680,24 @@ mod tests {
                 ScannerReplicationRepairSnapshot {
                     source: "bucket_replication".to_string(),
                     kind: "object".to_string(),
+                    scanner_role: "repair_admission".to_string(),
+                    execution_owner: "bucket_replication_queue".to_string(),
                     missed: 3,
                     ..Default::default()
                 },
                 ScannerReplicationRepairSnapshot {
                     source: "bucket_replication".to_string(),
                     kind: "delete_marker".to_string(),
+                    scanner_role: "repair_admission".to_string(),
+                    execution_owner: "bucket_replication_queue".to_string(),
                     skipped: 4,
                     ..Default::default()
                 },
                 ScannerReplicationRepairSnapshot {
                     source: "site_replication".to_string(),
                     kind: "active_resync".to_string(),
+                    scanner_role: "boundary_signal".to_string(),
+                    execution_owner: "site_replication_runtime".to_string(),
                     queued: 5,
                     ..Default::default()
                 },
@@ -1698,6 +1710,8 @@ mod tests {
             .iter()
             .find(|repair| repair.source == "bucket_replication" && repair.kind == "object")
             .expect("bucket object repair snapshot should be merged");
+        assert_eq!(object.scanner_role, "repair_admission");
+        assert_eq!(object.execution_owner, "bucket_replication_queue");
         assert_eq!(object.queued, 2);
         assert_eq!(object.missed, 3);
 
@@ -1706,6 +1720,8 @@ mod tests {
             .iter()
             .find(|repair| repair.source == "bucket_replication" && repair.kind == "delete_marker")
             .expect("bucket delete-marker repair snapshot should be merged");
+        assert_eq!(delete_marker.scanner_role, "repair_admission");
+        assert_eq!(delete_marker.execution_owner, "bucket_replication_queue");
         assert_eq!(delete_marker.skipped, 4);
 
         let site_resync = scanner
@@ -1713,6 +1729,8 @@ mod tests {
             .iter()
             .find(|repair| repair.source == "site_replication" && repair.kind == "active_resync")
             .expect("site active resync snapshot should remain separate");
+        assert_eq!(site_resync.scanner_role, "boundary_signal");
+        assert_eq!(site_resync.execution_owner, "site_replication_runtime");
         assert_eq!(site_resync.queued, 5);
     }
 
