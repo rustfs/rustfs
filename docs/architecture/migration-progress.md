@@ -5,17 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-embedded-startup-phase-reuse`
+- Branch: `overtrue/arch-embedded-runtime-service-reuse`
 - Baseline: `origin/main`
-  (`f8117eb46bb6ae21481bd744cfc245e88fbdb74c`).
-- Stacked on: none.
+  (`131e9dc804a371b3384028da5797ca32a91ac493`).
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: route embedded listen and storage startup phases through
-  the shared startup server/storage boundaries while preserving embedded-only
-  fatal and non-fatal behavior.
+- Rust code changes: route embedded runtime services and shutdown cleanup
+  through startup service/shutdown helpers while preserving embedded-only fatal
+  and non-fatal behavior.
 - CI/script changes: none.
-- Docs changes: record the R-029 embedded startup phase reuse slice.
+- Docs changes: record the R-030 embedded runtime service reuse slice.
 
 ## Phase 0 Tasks
 
@@ -2153,11 +2152,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
     freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `R-030` Reuse runtime service boundaries in embedded mode.
+  - Do: move embedded KMS/buffer/audit setup, bucket metadata migration, IAM
+    bootstrap, notification setup, and event/audit shutdown cleanup behind
+    startup service/shutdown helpers.
+  - Acceptance: embedded startup keeps KMS/audit/notification failures
+    non-fatal, preserves bucket metadata and IAM initialization order, and
+    keeps shutdown cleanup behavior unchanged.
+  - Must preserve: KMS warning-only behavior, buffer profile initialization,
+    audit warning-only behavior, bucket listing failure shutdown, bucket
+    metadata migration before IAM migration, IAM bootstrap fatal behavior,
+    notification warning-only behavior, readiness publication, event notifier
+    shutdown, audit stop warning behavior, and temp directory cleanup.
+  - Verification: focused embedded/service/shutdown checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
 ## Next PRs
 
-1. `pure-move`: continue embedded lifecycle reuse for runtime services and
-   shutdown compatibility while preserving embedded-specific non-fatal service
-   behavior.
+1. `pure-move`: continue embedded lifecycle reuse for final server-ready and
+   lifecycle publication edges.
 2. `contract`: continue extension contract coverage for future diagnostics and
    profiler handoff surfaces after runtime owners are stable.
 
@@ -2165,17 +2179,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-029 moves embedded listen/storage phase ownership into startup server/storage helpers without routing embedded through binary-only service policy. |
-| Migration preservation | passed | Embedded stable-port rejection, global init guard placement, S3-only listener, storage readiness, retry limit, and non-fatal service policy remain unchanged. |
-| Testing/verification | passed | Focused startup server/storage/embedded checks, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
+| Quality/architecture | passed | R-030 moves embedded runtime service and shutdown cleanup ownership into startup service/shutdown helpers while keeping binary-only runtime services separate. |
+| Migration preservation | passed | Embedded non-fatal KMS/audit/notification policy, bucket metadata/IAM ordering, readiness publication, and shutdown cleanup behavior remain unchanged. |
+| Testing/verification | passed | Focused embedded/service/shutdown checks, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
 
 ## Verification Notes
 
 Passed before push:
 
-- Issue #660 R-029 current slice:
-  - `cargo test -p rustfs --lib startup_storage -- --nocapture`: passed.
-  - `cargo test -p rustfs --lib startup_server -- --nocapture`: passed.
+- Issue #660 R-030 current slice:
+  - `cargo test -p rustfs --lib startup_service_components -- --nocapture`:
+    passed.
+  - `cargo test -p rustfs --lib startup_services -- --nocapture`: passed; no
+    matching unit tests currently exist.
+  - `cargo test -p rustfs --lib startup_shutdown -- --nocapture`: passed.
   - `cargo test -p rustfs --lib embedded -- --nocapture`: passed; no
     matching unit tests currently exist.
   - `cargo check -p rustfs --lib`: passed.

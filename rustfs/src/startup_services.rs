@@ -21,7 +21,9 @@ use crate::{
     startup_optional_runtime_sidecars::{OptionalRuntimeServices, init_optional_runtime_services},
     startup_service_components::{
         init_audit_runtime, init_auth_integrations, init_background_service_runtime, init_bucket_metadata_runtime,
-        init_deadlock_detector_runtime, init_iam_runtime, init_notification_runtime, init_observability_runtime,
+        init_deadlock_detector_runtime, init_embedded_bucket_metadata_runtime, init_embedded_iam_runtime,
+        init_embedded_notification_runtime, init_embedded_optional_service_runtime, init_iam_runtime, init_notification_runtime,
+        init_observability_runtime,
     },
 };
 use rustfs_common::GlobalReadiness;
@@ -32,6 +34,27 @@ pub struct StartupServiceRuntime {
     pub optional_runtimes: OptionalRuntimeServices,
     pub iam_bootstrap: IamBootstrapDisposition,
     pub enable_scanner: bool,
+}
+
+pub struct EmbeddedStartupServiceRuntime {
+    pub iam_bootstrap: IamBootstrapDisposition,
+}
+
+pub async fn init_embedded_startup_runtime_services(
+    config: &Config,
+    endpoint_pools: EndpointServerPools,
+    store: Arc<ECStore>,
+    ctx: CancellationToken,
+    readiness: Arc<GlobalReadiness>,
+) -> Result<EmbeddedStartupServiceRuntime> {
+    init_embedded_optional_service_runtime(config).await;
+    let buckets = init_embedded_bucket_metadata_runtime(store.clone()).await?;
+    let iam_bootstrap = init_embedded_iam_runtime(store, ctx, readiness)
+        .await
+        .map_err(|err| std::io::Error::other(format!("IAM bootstrap setup: {err}")))?;
+    init_embedded_notification_runtime(endpoint_pools, buckets).await;
+
+    Ok(EmbeddedStartupServiceRuntime { iam_bootstrap })
 }
 
 pub async fn init_startup_runtime_services(

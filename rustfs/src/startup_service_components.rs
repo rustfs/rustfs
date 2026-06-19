@@ -17,7 +17,11 @@ use crate::storage_compat::{
     try_migrate_bucket_metadata, try_migrate_iam_config,
 };
 use crate::{
-    init::{add_bucket_notification_configuration, init_auto_tuner, init_update_check, print_server_info},
+    config::Config,
+    init::{
+        add_bucket_notification_configuration, init_auto_tuner, init_buffer_profile_system, init_kms_system, init_update_check,
+        print_server_info,
+    },
     server::{ServiceStateManager, init_event_notifier, start_audit_system},
     startup_iam::{IamBootstrapDisposition, bootstrap_or_defer_iam_init},
 };
@@ -41,10 +45,13 @@ const ENV_SCANNER_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_SCANNER";
 const ENV_HEAL_ENABLED: &str = "RUSTFS_HEAL_ENABLED";
 const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
 const LOG_COMPONENT_MAIN: &str = "main";
+const LOG_COMPONENT_EMBEDDED: &str = "embedded";
 const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const LOG_SUBSYSTEM_AUTH: &str = "auth";
+const LOG_SUBSYSTEM_EMBEDDED: &str = "embedded";
 const EVENT_AUDIT_SYSTEM_STATE: &str = "audit_system_state";
 const EVENT_DEADLOCK_DETECTOR_STATE: &str = "deadlock_detector_state";
+const EVENT_EMBEDDED_OPTIONAL_SERVICE_SKIPPED: &str = "embedded_optional_service_skipped";
 const EVENT_KEYSTONE_AUTH_INITIALIZED: &str = "keystone_auth_initialized";
 const EVENT_KEYSTONE_AUTH_INITIALIZATION_FAILED: &str = "keystone_auth_initialization_failed";
 const EVENT_OIDC_INITIALIZATION_FAILED: &str = "oidc_initialization_failed";
@@ -73,6 +80,18 @@ pub(crate) async fn init_audit_runtime() {
     }
 }
 
+pub(crate) async fn init_embedded_optional_service_runtime(config: &Config) {
+    if let Err(err) = init_kms_system(config).await {
+        log_embedded_optional_service_skipped("kms", err);
+    }
+
+    init_buffer_profile_system(config);
+
+    if let Err(err) = init_event_notifier_and_audit().await {
+        log_embedded_optional_service_skipped("audit", err);
+    }
+}
+
 pub(crate) fn init_deadlock_detector_runtime() {
     let detector = crate::storage::deadlock_detector::get_deadlock_detector();
     if detector.is_enabled() {
@@ -95,6 +114,24 @@ pub(crate) fn init_deadlock_detector_runtime() {
             "Deadlock detector disabled"
         );
     }
+}
+
+pub(crate) async fn init_embedded_bucket_metadata_runtime(store: Arc<ECStore>) -> Result<Vec<String>> {
+    let buckets_list = store
+        .list_bucket(&BucketOptions {
+            no_metadata: true,
+            ..Default::default()
+        })
+        .await
+        .map_err(|err| Error::other(format!("list_bucket: {err}")))?;
+
+    let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
+
+    try_migrate_bucket_metadata(store.clone()).await;
+    init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
+    try_migrate_iam_config(store).await;
+
+    Ok(buckets)
 }
 
 pub(crate) async fn init_bucket_metadata_runtime(store: Arc<ECStore>, ctx: CancellationToken) -> Result<Vec<String>> {
@@ -120,6 +157,15 @@ pub(crate) async fn init_bucket_metadata_runtime(store: Arc<ECStore>, ctx: Cance
     Ok(buckets)
 }
 
+pub(crate) async fn init_embedded_iam_runtime(
+    store: Arc<ECStore>,
+    ctx: CancellationToken,
+    readiness: Arc<GlobalReadiness>,
+) -> Result<IamBootstrapDisposition> {
+    let kms_interface = rustfs_kms::get_global_kms_service_manager().unwrap_or_else(rustfs_kms::init_global_kms_service_manager);
+    bootstrap_or_defer_iam_init(store, kms_interface, readiness, None, Some(ctx)).await
+}
+
 pub(crate) async fn init_iam_runtime(
     store: Arc<ECStore>,
     ctx: CancellationToken,
@@ -128,6 +174,14 @@ pub(crate) async fn init_iam_runtime(
 ) -> Result<IamBootstrapDisposition> {
     let kms_interface = rustfs_kms::get_global_kms_service_manager().unwrap_or_else(rustfs_kms::init_global_kms_service_manager);
     bootstrap_or_defer_iam_init(store, kms_interface, readiness, Some(state_manager), Some(ctx)).await
+}
+
+pub(crate) async fn init_embedded_notification_runtime(endpoint_pools: EndpointServerPools, buckets: Vec<String>) {
+    add_bucket_notification_configuration(buckets).await;
+
+    if let Err(err) = init_notification_system(endpoint_pools).await {
+        log_embedded_optional_service_skipped("notification", err);
+    }
 }
 
 pub(crate) async fn init_auth_integrations() -> Result<()> {
@@ -259,6 +313,17 @@ where
     InitFuture: Future<Output = crate::storage_compat::EcstoreResult<()>>,
 {
     init_notification().await
+}
+
+fn log_embedded_optional_service_skipped(service: &str, err: impl std::fmt::Display) {
+    warn!(
+        component = LOG_COMPONENT_EMBEDDED,
+        subsystem = LOG_SUBSYSTEM_EMBEDDED,
+        event = EVENT_EMBEDDED_OPTIONAL_SERVICE_SKIPPED,
+        service,
+        error = %err,
+        "Embedded optional service initialization skipped"
+    );
 }
 
 #[cfg(test)]
