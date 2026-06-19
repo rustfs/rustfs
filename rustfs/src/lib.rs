@@ -66,6 +66,7 @@ pub mod memory_observability;
 pub mod profiling;
 #[cfg(any(feature = "ftps", feature = "webdav", feature = "sftp"))]
 pub mod protocols;
+pub mod runtime_capabilities;
 pub mod server;
 pub mod startup_entrypoint;
 pub mod startup_fs_guard;
