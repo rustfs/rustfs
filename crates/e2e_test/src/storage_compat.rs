@@ -12,8 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod ecstore {
-    #![allow(unused_imports)]
+#![allow(dead_code, unused_imports)]
 
-    pub(crate) use rustfs_ecstore::{bucket, disk, rpc};
-}
+pub(crate) type BucketTargetSys = rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
+pub(crate) type TonicInterceptor = rustfs_ecstore::rpc::TonicInterceptor;
+pub(crate) type VolumeInfo = rustfs_ecstore::disk::VolumeInfo;
+pub(crate) type WalkDirOptions = rustfs_ecstore::disk::WalkDirOptions;
+
+pub(crate) use rustfs_ecstore::rpc::{
+    gen_tonic_signature_interceptor, node_service_time_out_client, node_service_time_out_client_no_auth,
+};

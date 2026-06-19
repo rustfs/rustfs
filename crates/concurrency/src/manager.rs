@@ -282,6 +282,24 @@ mod tests {
     }
 
     #[test]
+    fn test_queue_snapshot_clamps_over_available_permits() {
+        let snapshot = GetObjectQueueSnapshot::from_available_permits(64, 96);
+        assert_eq!(snapshot.permits_in_use, 0);
+        assert_eq!(snapshot.permits_available(), 64);
+        assert_eq!(snapshot.utilization_percent(), 0.0);
+        assert!(!snapshot.is_congested(0.0));
+    }
+
+    #[test]
+    fn test_queue_snapshot_handles_zero_total_permits() {
+        let snapshot = GetObjectQueueSnapshot::from_available_permits(0, 0);
+        assert_eq!(snapshot.permits_in_use, 0);
+        assert_eq!(snapshot.permits_available(), 0);
+        assert_eq!(snapshot.utilization_percent(), 0.0);
+        assert!(!snapshot.is_congested(0.0));
+    }
+
+    #[test]
     fn test_manager_creation() {
         let manager = ConcurrencyManager::with_defaults();
         assert!(manager.config().validate().is_ok());

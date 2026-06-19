@@ -890,7 +890,7 @@ impl LocalDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn check_format_json(&self) -> Result<Metadata> {
-        let md = std::fs::metadata(&self.format_path).map_err(to_unformatted_disk_error)?;
+        let md = fs::metadata(&self.format_path).await.map_err(to_unformatted_disk_error)?;
         Ok(md)
     }
     async fn make_meta_volumes(&self) -> Result<()> {

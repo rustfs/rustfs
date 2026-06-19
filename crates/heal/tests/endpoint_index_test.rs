@@ -16,8 +16,7 @@
 
 mod common;
 
-use crate::common::storage_compat::ecstore::disk::endpoint::Endpoint;
-use crate::common::storage_compat::ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+use crate::common::storage_compat::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, init_local_disks};
 use std::net::SocketAddr;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -73,12 +72,10 @@ async fn test_endpoint_index_settings() -> anyhow::Result<()> {
     }
 
     // test ECStore initialization
-    crate::common::storage_compat::ecstore::store::init_local_disks(endpoint_pools.clone()).await?;
+    init_local_disks(endpoint_pools.clone()).await?;
 
     let server_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let ecstore =
-        crate::common::storage_compat::ecstore::store::ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
-            .await?;
+    let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new()).await?;
 
     println!("ECStore initialized successfully with {} pools", ecstore.pools.len());
 

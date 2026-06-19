@@ -79,7 +79,7 @@ impl From<EcstoreObjectInfo> for NotifyObjectInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::TransitionedObject;
+    use rustfs_storage_api::TransitionedObject;
     use std::{collections::HashMap, sync::Arc};
     use time::{Duration, OffsetDateTime};
 

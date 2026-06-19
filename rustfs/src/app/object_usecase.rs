@@ -48,8 +48,18 @@ use metrics::{counter, histogram};
 use pin_project_lite::pin_project;
 use rustfs_object_capacity::capacity_manager::get_capacity_manager;
 // Performance metrics recording (with zero-copy-metrics integration)
-use crate::app::storage_compat::ecstore::bucket::quota::checker::QuotaChecker;
-use crate::app::storage_compat::ecstore::bucket::{
+use crate::app::storage_compat::ECStore;
+use crate::app::storage_compat::object_api_utils::to_s3s_etag;
+use crate::app::storage_compat::quota::checker::QuotaChecker;
+use crate::app::storage_compat::storageclass;
+use crate::app::storage_compat::{DiskError, is_all_buckets_not_found};
+use crate::app::storage_compat::{DynReader, HashReader, WritePlan, wrap_reader};
+use crate::app::storage_compat::{
+    Error as EcstoreError, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
+};
+use crate::app::storage_compat::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
+use crate::app::storage_compat::{get_lock_acquire_timeout, is_valid_storage_class};
+use crate::app::storage_compat::{
     lifecycle::{
         bucket_lifecycle_audit::LcEventSrc,
         bucket_lifecycle_ops::{RestoreRequestOps, enqueue_transition_immediate, post_restore_opts},
@@ -69,16 +79,6 @@ use crate::app::storage_compat::ecstore::bucket::{
     versioning::VersioningApi,
     versioning_sys::BucketVersioningSys,
 };
-use crate::app::storage_compat::ecstore::client::object_api_utils::to_s3s_etag;
-use crate::app::storage_compat::ecstore::compress::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
-use crate::app::storage_compat::ecstore::config::storageclass;
-use crate::app::storage_compat::ecstore::disk::{error::DiskError, error_reduce::is_all_buckets_not_found};
-use crate::app::storage_compat::ecstore::error::{
-    Error as EcstoreError, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
-};
-use crate::app::storage_compat::ecstore::rio::{DynReader, HashReader, WritePlan, wrap_reader};
-use crate::app::storage_compat::ecstore::set_disk::{get_lock_acquire_timeout, is_valid_storage_class};
-use crate::app::storage_compat::ecstore::store::ECStore;
 use rustfs_concurrency::GetObjectQueueSnapshot;
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateTargetDecision, ReplicationState, ReplicationStatusType,
@@ -276,12 +276,12 @@ async fn enqueue_transitioned_delete_cleanup(
     let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Cleanup);
 
     let je = if opts.delete_prefix {
-        crate::app::storage_compat::ecstore::bucket::lifecycle::tier_sweeper::transitioned_force_delete_journal_entry(
+        crate::app::storage_compat::lifecycle::tier_sweeper::transitioned_force_delete_journal_entry(
             &existing.transitioned_object,
         )
     } else {
         let version_id = opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok());
-        crate::app::storage_compat::ecstore::bucket::lifecycle::tier_sweeper::transitioned_delete_journal_entry(
+        crate::app::storage_compat::lifecycle::tier_sweeper::transitioned_delete_journal_entry(
             version_id,
             opts.versioned,
             opts.version_suspended,
@@ -292,10 +292,9 @@ async fn enqueue_transitioned_delete_cleanup(
         return Ok(());
     };
 
-    crate::app::storage_compat::ecstore::bucket::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry(store, &je)
-        .await?;
+    crate::app::storage_compat::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry(store, &je).await?;
 
-    let mut expiry_state = crate::app::storage_compat::ecstore::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState
+    let mut expiry_state = crate::app::storage_compat::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState
         .write()
         .await;
     if let Err(err) = expiry_state.enqueue_tier_journal_entry(&je).await {
@@ -1540,7 +1539,7 @@ impl DefaultObjectUsecase {
     #[allow(clippy::too_many_arguments)]
     async fn prepare_get_object_read(
         req: &S3Request<GetObjectInput>,
-        store: &crate::app::storage_compat::ecstore::store::ECStore,
+        store: &crate::app::storage_compat::ECStore,
         manager: &ConcurrencyManager,
         bucket: &str,
         key: &str,
@@ -2134,7 +2133,7 @@ impl DefaultObjectUsecase {
             insert_str(
                 &mut metadata,
                 SUFFIX_COMPRESSION,
-                crate::app::storage_compat::ecstore::rio::compression_metadata_value(algorithm),
+                crate::app::storage_compat::compression_metadata_value(algorithm),
             );
             insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
@@ -2149,7 +2148,7 @@ impl DefaultObjectUsecase {
             insert_str(
                 &mut opts.user_defined,
                 SUFFIX_COMPRESSION,
-                crate::app::storage_compat::ecstore::rio::compression_metadata_value(algorithm),
+                crate::app::storage_compat::compression_metadata_value(algorithm),
             );
             insert_str(&mut opts.user_defined, SUFFIX_ACTUAL_SIZE, size.to_string());
 
@@ -2341,7 +2340,7 @@ impl DefaultObjectUsecase {
         maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
 
         // Fast in-memory update for immediate quota and admin usage consistency
-        crate::app::storage_compat::ecstore::data_usage::record_bucket_object_write_memory(
+        crate::app::storage_compat::record_bucket_object_write_memory(
             &bucket,
             previous_current_size,
             obj_info.size.max(0) as u64,
@@ -3211,7 +3210,7 @@ impl DefaultObjectUsecase {
             insert_str(
                 &mut compress_metadata,
                 SUFFIX_COMPRESSION,
-                crate::app::storage_compat::ecstore::rio::compression_metadata_value(CompressionAlgorithm::default()),
+                crate::app::storage_compat::compression_metadata_value(CompressionAlgorithm::default()),
             );
             insert_str(&mut compress_metadata, SUFFIX_ACTUAL_SIZE, actual_size.to_string());
         } else {
@@ -3304,12 +3303,8 @@ impl DefaultObjectUsecase {
 
         // Update quota tracking after successful copy
         if has_bucket_metadata {
-            crate::app::storage_compat::ecstore::data_usage::record_bucket_object_write_memory(
-                &bucket,
-                previous_current_size,
-                oi.size.max(0) as u64,
-            )
-            .await;
+            crate::app::storage_compat::record_bucket_object_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64)
+                .await;
         }
 
         let raw_dest_version = oi.version_id.map(|v| v.to_string());
@@ -3586,7 +3581,7 @@ impl DefaultObjectUsecase {
                     );
                 }
                 let size = object_sizes[i].max(0) as u64;
-                crate::app::storage_compat::ecstore::data_usage::record_bucket_object_delete_memory(
+                crate::app::storage_compat::record_bucket_object_delete_memory(
                     &bucket,
                     size,
                     existing_object_infos[i].is_some() && object_to_delete[i].version_id.is_none(),
@@ -3824,7 +3819,7 @@ impl DefaultObjectUsecase {
         }
 
         // Fast in-memory update for immediate quota and admin usage consistency
-        crate::app::storage_compat::ecstore::data_usage::record_bucket_object_delete_memory(
+        crate::app::storage_compat::record_bucket_object_delete_memory(
             &bucket,
             obj_info.size.max(0) as u64,
             opts.version_id.is_none(),
@@ -4757,7 +4752,7 @@ impl DefaultObjectUsecase {
                 insert_str(
                     &mut metadata,
                     SUFFIX_COMPRESSION,
-                    crate::app::storage_compat::ecstore::rio::compression_metadata_value(algorithm),
+                    crate::app::storage_compat::compression_metadata_value(algorithm),
                 );
                 insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 

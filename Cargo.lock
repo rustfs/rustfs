@@ -9570,6 +9570,7 @@ version = "1.0.0-beta.8"
 dependencies = [
  "aes-gcm",
  "arc-swap",
+ "argon2",
  "async-trait",
  "base64 0.22.1",
  "chacha20poly1305",
@@ -9648,6 +9649,7 @@ dependencies = [
  "rustfs-ecstore",
  "rustfs-s3-ops",
  "rustfs-s3-types",
+ "rustfs-storage-api",
  "rustfs-targets",
  "rustfs-utils",
  "serde",

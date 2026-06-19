@@ -14,13 +14,9 @@
 
 use super::{GroupInfo, MappedPolicy, Store, UserType};
 use crate::error::{Error, Result, is_err_config_not_found, is_err_no_such_group};
-use crate::storage_compat::ecstore::error::{Error as EcstoreError, StorageError, classify_system_path_failure_reason};
-use crate::storage_compat::ecstore::{
-    config::{
-        RUSTFS_CONFIG_PREFIX,
-        com::{delete_config, read_config_no_lock, read_config_with_metadata, save_config, save_config_with_opts},
-    },
-    store::ECStore,
+use crate::storage_compat::{
+    IAM_CONFIG_ROOT_PREFIX, IamStorageError, IamStore, classify_iam_system_path_failure_reason, delete_iam_config,
+    read_iam_config_no_lock, read_iam_config_with_metadata, save_iam_config, save_iam_config_with_opts,
 };
 use crate::{
     cache::{Cache, CacheEntity},
@@ -44,24 +40,24 @@ use tracing::{debug, error, warn};
 
 use super::storage_compat::{IamObjectInfo, IamObjectOptions};
 
-pub static IAM_CONFIG_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam"));
-pub static IAM_CONFIG_USERS_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam/users/"));
+pub static IAM_CONFIG_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam"));
+pub static IAM_CONFIG_USERS_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam/users/"));
 pub static IAM_CONFIG_SERVICE_ACCOUNTS_PREFIX: LazyLock<String> =
-    LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam/service-accounts/"));
-pub static IAM_CONFIG_GROUPS_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam/groups/"));
-pub static IAM_CONFIG_POLICIES_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam/policies/"));
-pub static IAM_CONFIG_STS_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam/sts/"));
-pub static IAM_CONFIG_POLICY_DB_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam/policydb/"));
+    LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam/service-accounts/"));
+pub static IAM_CONFIG_GROUPS_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam/groups/"));
+pub static IAM_CONFIG_POLICIES_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam/policies/"));
+pub static IAM_CONFIG_STS_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam/sts/"));
+pub static IAM_CONFIG_POLICY_DB_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam/policydb/"));
 pub static IAM_CONFIG_POLICY_DB_USERS_PREFIX: LazyLock<String> =
-    LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam/policydb/users/"));
+    LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam/policydb/users/"));
 pub static IAM_CONFIG_POLICY_DB_STS_USERS_PREFIX: LazyLock<String> =
-    LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam/policydb/sts-users/"));
+    LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam/policydb/sts-users/"));
 pub static IAM_CONFIG_POLICY_DB_SERVICE_ACCOUNTS_PREFIX: LazyLock<String> =
-    LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam/policydb/service-accounts/"));
+    LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam/policydb/service-accounts/"));
 pub static IAM_CONFIG_POLICY_DB_GROUPS_PREFIX: LazyLock<String> =
-    LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam/policydb/groups/"));
+    LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam/policydb/groups/"));
 
-type ObjectInfoOrErr = StorageObjectInfoOrErr<IamObjectInfo, EcstoreError>;
+type ObjectInfoOrErr = StorageObjectInfoOrErr<IamObjectInfo, IamStorageError>;
 
 const IAM_IDENTITY_FILE: &str = "identity.json";
 const IAM_POLICY_FILE: &str = "policy.json";
@@ -150,13 +146,13 @@ fn split_path(s: &str, last_index: bool) -> (&str, &str) {
 
 #[derive(Clone)]
 pub struct ObjectStore {
-    object_api: Arc<ECStore>,
+    object_api: Arc<IamStore>,
 }
 
 impl ObjectStore {
     const BUCKET_NAME: &'static str = ".rustfs.sys";
 
-    pub fn new(object_api: Arc<ECStore>) -> Self {
+    pub fn new(object_api: Arc<IamStore>) -> Self {
         Self { object_api }
     }
 
@@ -308,7 +304,7 @@ impl ObjectStore {
                 Ok(_) => {
                     Self::complete_lazy_rewrite(path.as_str(), true);
                 }
-                Err(StorageError::PreconditionFailed) => {
+                Err(IamStorageError::PreconditionFailed) => {
                     Self::complete_lazy_rewrite(path.as_str(), false);
                     debug!(path = %path, state = "stale_etag", "IAM lazy rewrite skipped");
                 }
@@ -320,8 +316,8 @@ impl ObjectStore {
         });
     }
 
-    async fn lazy_rewrite_iam_config(&self, path: &str, plain: &[u8], etag: &str) -> std::result::Result<(), StorageError> {
-        let encrypted = Self::encrypt_data_with_master_key(plain).map_err(StorageError::other)?;
+    async fn lazy_rewrite_iam_config(&self, path: &str, plain: &[u8], etag: &str) -> std::result::Result<(), IamStorageError> {
+        let encrypted = Self::encrypt_data_with_master_key(plain).map_err(IamStorageError::other)?;
 
         let mut opts = IamObjectOptions {
             max_parity: true,
@@ -332,7 +328,7 @@ impl ObjectStore {
             ..Default::default()
         });
 
-        save_config_with_opts(self.object_api.clone(), path, encrypted, &opts).await
+        save_iam_config_with_opts(self.object_api.clone(), path, encrypted, &opts).await
     }
 
     fn is_plaintext_json(data: &[u8]) -> bool {
@@ -346,7 +342,7 @@ impl ObjectStore {
 
     async fn load_iamconfig_bytes_with_metadata(&self, path: impl AsRef<str> + Send) -> Result<(Vec<u8>, IamObjectInfo)> {
         let path_ref = path.as_ref();
-        let (data, obj) = read_config_with_metadata(self.object_api.clone(), path_ref, &IamObjectOptions::default()).await?;
+        let (data, obj) = read_iam_config_with_metadata(self.object_api.clone(), path_ref, &IamObjectOptions::default()).await?;
         let outcome = Self::decrypt_data_with_source(&data)?;
         self.maybe_schedule_lazy_rewrite(path_ref, &outcome, &obj);
 
@@ -371,7 +367,7 @@ impl ObjectStore {
                 .walk(ctx.clone(), Self::BUCKET_NAME, &path, tx, Default::default())
                 .await
             {
-                let reason = classify_system_path_failure_reason(&err);
+                let reason = classify_iam_system_path_failure_reason(&err);
                 record_system_path_failure("iam_config", "walk", reason);
                 error!(
                     path_kind = "iam_config",
@@ -587,9 +583,9 @@ impl ObjectStore {
         // If it doesn't exist, the system bucket or metadata is not ready.
         let probe_path = format!("{}/format.json", *IAM_CONFIG_PREFIX);
 
-        match read_config_no_lock(self.object_api.clone(), &probe_path).await {
+        match read_iam_config_no_lock(self.object_api.clone(), &probe_path).await {
             Ok(_) => Ok(()),
-            Err(crate::storage_compat::ecstore::error::StorageError::ConfigNotFound) => Err(Error::other(format!(
+            Err(IamStorageError::ConfigNotFound) => Err(Error::other(format!(
                 "Storage metadata not ready: probe object '{}' not found (expected IAM config to be initialized)",
                 probe_path
             ))),
@@ -641,7 +637,7 @@ impl Store for ObjectStore {
     }
     async fn load_iam_config<Item: DeserializeOwned>(&self, path: impl AsRef<str> + Send) -> Result<Item> {
         let path_ref = path.as_ref();
-        let (data, obj) = read_config_with_metadata(self.object_api.clone(), path_ref, &IamObjectOptions::default()).await?;
+        let (data, obj) = read_iam_config_with_metadata(self.object_api.clone(), path_ref, &IamObjectOptions::default()).await?;
 
         let outcome = match Self::decrypt_data_with_source(&data) {
             Ok(v) => v,
@@ -679,7 +675,7 @@ impl Store for ObjectStore {
         let path_ref = path.as_ref();
 
         loop {
-            match save_config(self.object_api.clone(), path_ref, data.clone()).await {
+            match save_iam_config(self.object_api.clone(), path_ref, data.clone()).await {
                 Ok(_) => {
                     debug!("Successfully saved IAM config to {}", path_ref);
                     return Ok(());
@@ -702,7 +698,7 @@ impl Store for ObjectStore {
         }
     }
     async fn delete_iam_config(&self, path: impl AsRef<str> + Send) -> Result<()> {
-        delete_config(self.object_api.clone(), path.as_ref()).await?;
+        delete_iam_config(self.object_api.clone(), path.as_ref()).await?;
         Ok(())
     }
 

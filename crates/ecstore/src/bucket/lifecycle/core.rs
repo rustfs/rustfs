@@ -934,10 +934,7 @@ impl Default for Event {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ExpirationOptions {
-    pub expire: bool,
-}
+pub use rustfs_storage_api::ExpirationOptions;
 
 #[derive(Debug, Clone)]
 pub struct TransitionOptions {

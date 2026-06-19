@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod ecstore {
-    #![allow(unused_imports)]
+#![allow(unused_imports)]
 
-    pub(crate) use rustfs_ecstore::{bucket, disk, endpoints, store};
-}
+pub(crate) use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
+pub(crate) use rustfs_ecstore::disk::{DiskStore, endpoint::Endpoint};
+pub(crate) use rustfs_ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+pub(crate) use rustfs_ecstore::store::ECStore;
+pub(crate) use rustfs_ecstore::store::init_local_disks;

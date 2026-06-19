@@ -15,7 +15,7 @@
 use crate::bucket::lifecycle::bucket_lifecycle_audit::{LcAuditEvent, LcEventSrc};
 use crate::bucket::lifecycle::evaluator::Evaluator;
 use crate::bucket::lifecycle::lifecycle::{
-    self, ExpirationOptions, Lifecycle, ObjectOpts, TransitionOptions, abort_incomplete_multipart_upload_due,
+    self, Lifecycle, ObjectOpts, TransitionOptions, abort_incomplete_multipart_upload_due,
 };
 use crate::bucket::lifecycle::tier_delete_journal::{process_tier_delete_journal_entry, run_tier_delete_journal_recovery_loop};
 use crate::bucket::lifecycle::tier_free_version_recovery::{DEFAULT_FREE_VERSION_RECOVERY_LIMIT, recover_tier_free_versions};
@@ -59,7 +59,8 @@ use rustfs_filemeta::{
 };
 use rustfs_s3_types::EventName;
 use rustfs_storage_api::{
-    DeletedObject, HTTPRangeSpec, ListOperations as _, MultipartOperations as _, ObjectOperations as _, ObjectToDelete,
+    DeletedObject, ExpirationOptions, HTTPRangeSpec, ListOperations as _, MultipartOperations as _, ObjectOperations as _,
+    ObjectToDelete,
 };
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
 use s3s::dto::{
@@ -379,14 +380,7 @@ pub trait ExpiryOp: 'static {
     fn as_any(&self) -> &dyn Any;
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct TransitionedObject {
-    pub name: String,
-    pub version_id: String,
-    pub tier: String,
-    pub free_version: bool,
-    pub status: String,
-}
+pub use rustfs_storage_api::TransitionedObject;
 
 struct FreeVersionTask(ObjectInfo);
 
@@ -2862,7 +2856,6 @@ mod tests {
         transitioned_cleanup_tuple,
     };
     use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
-    use crate::bucket::lifecycle::core::ExpirationOptions;
     use crate::bucket::lifecycle::tier_sweeper::Jentry;
     use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
     use crate::bucket::metadata_sys;
@@ -2877,6 +2870,7 @@ mod tests {
     use rustfs_common::metrics::{IlmAction, global_metrics};
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
     use rustfs_filemeta::{ReplicateDecision, VersionPurgeStatusType};
+    use rustfs_storage_api::ExpirationOptions;
     use rustfs_storage_api::{BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations as _};
     use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, Timestamp};
     use serial_test::serial;

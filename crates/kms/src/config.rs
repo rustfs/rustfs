@@ -157,7 +157,7 @@ impl fmt::Debug for BackendConfig {
 pub struct LocalConfig {
     /// Directory to store key files
     pub key_dir: PathBuf,
-    /// Master key for encrypting stored keys (if None, keys are stored in plaintext)
+    /// Master key for encrypting stored keys (if None, only explicit development-mode plaintext storage is allowed)
     pub master_key: Option<String>,
     /// File permissions for key files (octal)
     pub file_permissions: Option<u32>,

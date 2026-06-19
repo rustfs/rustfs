@@ -5004,7 +5004,6 @@ pub fn is_infrequent_access_class(storage_class: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bucket::lifecycle::bucket_lifecycle_ops::TransitionedObject;
     use crate::disk::CHECK_PART_UNKNOWN;
     use crate::disk::CHECK_PART_VOLUME_NOT_FOUND;
     use crate::disk::RUSTFS_META_BUCKET;
@@ -5023,6 +5022,7 @@ mod tests {
     use rustfs_filemeta::ReplicationState;
     use rustfs_lock::client::local::LocalClient;
     use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
+    use rustfs_storage_api::TransitionedObject;
     use rustfs_storage_api::{CompletePart, NamespaceLocking as _, ObjectOperations as _};
     use serial_test::serial;
     use std::collections::HashMap;

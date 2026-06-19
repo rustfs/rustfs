@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -766,12 +767,39 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             self.assertIn("status", entry)
             self.assertIn("validation", entry)
 
+    def test_print_engine_compatibility_outputs_machine_readable_matrix(self) -> None:
+        args = self.parse_with_args(["--print-engine-compatibility"])
+
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            self.assertTrue(pyiceberg_smoke.printed_metadata(args))
+
+        document = json.loads(stdout.getvalue())
+        self.assertIn("engine_compatibility", document)
+        clients = {entry["client"] for entry in document["engine_compatibility"]}
+        self.assertIn("PyIceberg", clients)
+        self.assertIn("Spark Iceberg REST catalog", clients)
+
+    def test_print_production_failure_coverage_outputs_machine_readable_matrix(self) -> None:
+        args = self.parse_with_args(["--print-production-failure-coverage"])
+
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            self.assertTrue(pyiceberg_smoke.printed_metadata(args))
+
+        document = json.loads(stdout.getvalue())
+        self.assertIn("production_failure_coverage", document)
+        cases = {entry["case"] for entry in document["production_failure_coverage"]}
+        self.assertIn("commit-cas-conflict", cases)
+        self.assertIn("post-cas-finalization-gap", cases)
+
     def test_published_table_catalog_docs_do_not_use_internal_roadmap_labels(self) -> None:
         readme = (SCRIPT_DIR / "README.md").read_text(encoding="utf-8")
 
         self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(readme))
         self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(str(pyiceberg_smoke.unsupported_inventory())))
         self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(str(pyiceberg_smoke.production_readiness_inventory())))
+        self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(str(pyiceberg_smoke.failure_coverage.production_failure_matrix())))
 
 
 if __name__ == "__main__":
