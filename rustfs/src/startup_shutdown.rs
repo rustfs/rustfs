@@ -14,7 +14,7 @@
 
 use crate::{
     server::{ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, shutdown_event_notifier, stop_audit_system},
-    startup_optional_runtimes::{
+    startup_optional_runtime_sidecars::{
         OptionalRuntimeServices, prepare_optional_runtime_shutdowns, shutdown_optional_runtime_services,
     },
     storage_compat::shutdown_background_services,
