@@ -22,17 +22,15 @@ use crate::{
         add_bucket_notification_configuration, init_auto_tuner, init_buffer_profile_system, init_kms_system, init_update_check,
         print_server_info,
     },
-    server::{ServiceStateManager, ShutdownHandle, init_event_notifier, start_audit_system, wait_for_shutdown},
-    startup_iam::{IamBootstrapDisposition, bootstrap_or_defer_iam_init, publish_ready_for_iam_bootstrap},
+    server::{ServiceStateManager, init_event_notifier, start_audit_system},
+    startup_iam::{IamBootstrapDisposition, bootstrap_or_defer_iam_init},
     startup_optional_runtimes::{OptionalRuntimeServices, init_optional_runtime_services},
-    startup_shutdown::run_startup_shutdown_sequence,
 };
 use rustfs_audit::AuditResult;
 use rustfs_common::GlobalReadiness;
 use rustfs_heal::{create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager};
 use rustfs_iam::init_oidc_sys;
 use rustfs_obs::init_metrics_runtime;
-use rustfs_scanner::init_data_scanner;
 use rustfs_storage_api::{BucketOperations, BucketOptions};
 use rustfs_utils::get_env_bool_with_aliases;
 use std::{
@@ -57,24 +55,11 @@ const EVENT_KEYSTONE_AUTH_INITIALIZATION_FAILED: &str = "keystone_auth_initializ
 const EVENT_OIDC_INITIALIZATION_FAILED: &str = "oidc_initialization_failed";
 const EVENT_NOTIFICATION_SYSTEM_INITIALIZATION_FAILED: &str = "notification_system_initialization_failed";
 const EVENT_BACKGROUND_SERVICES_CONFIGURED: &str = "background_services_configured";
-const EVENT_SERVER_READY: &str = "server_ready";
-const EVENT_SERVER_SHUTDOWN_STATE: &str = "server_shutdown_state";
 
 pub struct StartupServiceRuntime {
     pub optional_runtimes: OptionalRuntimeServices,
     pub iam_bootstrap: IamBootstrapDisposition,
     pub enable_scanner: bool,
-}
-
-pub struct StartupRuntimeLifecycle {
-    pub server_address: String,
-    pub state_manager: Arc<ServiceStateManager>,
-    pub s3_shutdown_tx: Option<ShutdownHandle>,
-    pub console_shutdown_tx: Option<ShutdownHandle>,
-    pub service_runtime: StartupServiceRuntime,
-    pub store: Arc<ECStore>,
-    pub shutdown_token: CancellationToken,
-    pub readiness: Arc<GlobalReadiness>,
 }
 
 pub async fn init_startup_runtime_services(
@@ -105,64 +90,6 @@ pub async fn init_startup_runtime_services(
         iam_bootstrap,
         enable_scanner,
     })
-}
-
-pub async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifecycle) -> Result<()> {
-    let StartupRuntimeLifecycle {
-        server_address,
-        state_manager,
-        s3_shutdown_tx,
-        console_shutdown_tx,
-        service_runtime,
-        store,
-        shutdown_token,
-        readiness,
-    } = lifecycle;
-    let StartupServiceRuntime {
-        optional_runtimes,
-        iam_bootstrap,
-        enable_scanner,
-    } = service_runtime;
-
-    info!(
-        target: "rustfs::main::run",
-        event = EVENT_SERVER_READY,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        version = %crate::version::get_version(),
-        server_address = %server_address,
-        started_at = %jiff::Zoned::now(),
-        iam_bootstrap = ?iam_bootstrap,
-        "RustFS server ready"
-    );
-    publish_ready_for_iam_bootstrap(iam_bootstrap, readiness.as_ref(), Some(state_manager.as_ref())).await?;
-    rustfs_common::set_global_init_time_now().await;
-
-    if enable_scanner {
-        init_data_scanner(shutdown_token.clone(), store).await;
-    }
-
-    let shutdown_signal = wait_for_shutdown().await;
-    run_startup_shutdown_sequence(
-        &state_manager,
-        shutdown_signal,
-        s3_shutdown_tx,
-        console_shutdown_tx,
-        optional_runtimes,
-        shutdown_token,
-    )
-    .await;
-
-    info!(
-        target: "rustfs::main::run",
-        event = EVENT_SERVER_SHUTDOWN_STATE,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        state = ?state_manager.current_state(),
-        result = "stopped",
-        "RustFS server stopped"
-    );
-    Ok(())
 }
 
 async fn init_audit_runtime() {

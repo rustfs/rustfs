@@ -5,15 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-startup-shutdown-lifecycle-boundary`
-- Baseline: `origin/main`
-  (`eec1792c7bd1bf650dbb3c46d7873db6fed6150f`).
+- Branch: `overtrue/arch-startup-ready-lifecycle-boundary`
+- Baseline: `origin/main` (`e9037f9eb09fcbb31d980efac8b8e6b8f12bcaef`).
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move startup shutdown sequencing from `startup_services`
-  into a dedicated shutdown lifecycle boundary.
+- Rust code changes: move ready publication, scanner startup, shutdown-signal
+  wait, and stopped-state final logging from `startup_services` into a
+  dedicated startup lifecycle boundary.
 - CI/script changes: none.
-- Docs changes: record the R-023 startup shutdown lifecycle boundary slice.
+- Docs changes: record the R-024 startup lifecycle boundary slice.
 
 ## Phase 0 Tasks
 
@@ -2063,6 +2063,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
     branch freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `R-024` Extract startup ready lifecycle boundary.
+  - Do: add `startup_lifecycle` and move ready publication, global init time,
+    scanner startup, shutdown-signal wait, shutdown delegation, and final
+    stopped-state logging out of `startup_services`.
+  - Acceptance: lifecycle order stays server-ready log, IAM readiness
+    publication, global init time, optional scanner startup, shutdown wait,
+    shutdown sequence delegation, and final stopped log.
+  - Must preserve: inline/deferred IAM readiness behavior, scanner start timing,
+    global init-time timing, shutdown signal wait semantics, shutdown ordering,
+    service state reporting, and fatal boundary on readiness publication.
+  - Verification: focused lifecycle/service/shutdown tests, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
 ## Next PRs
 
 1. `pure-move`: continue larger lifecycle hook slices for optional runtime
@@ -2074,9 +2088,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-023 keeps startup orchestration in `startup_services` and moves shutdown sequencing into `startup_shutdown`. |
-| Migration preservation | passed | Runtime token cancellation, background shutdown, optional runtime planning, notifier/audit/profiling shutdown, HTTP shutdown, optional runtime waits, and service state transitions remain ordered. |
-| Testing/verification | passed | Focused shutdown, optional runtime, and startup service tests plus final checks are tracked below before push. |
+| Quality/architecture | passed | R-024 keeps runtime service initialization in `startup_services` and moves ready/scanner/shutdown-wait orchestration into `startup_lifecycle`. |
+| Migration preservation | passed | Ready publication, global init time, scanner startup, shutdown wait/delegation, and final stopped logging remain ordered. |
+| Testing/verification | passed | Focused lifecycle, shutdown, and startup service tests plus final checks are tracked below before push. |
 
 ## Verification Notes
 
@@ -2136,6 +2150,19 @@ Passed before push:
   - `cargo test -p rustfs --lib startup_services -- --nocapture`: passed.
   - `cargo test -p rustfs --lib startup_optional_runtimes -- --nocapture`:
     passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 R-024 current slice:
+  - `cargo test -p rustfs --lib startup_lifecycle -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_services -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_shutdown -- --nocapture`: passed.
   - `cargo check -p rustfs --lib`: passed.
   - `./scripts/check_architecture_migration_rules.sh`: passed.
   - `./scripts/check_layer_dependencies.sh`: passed.

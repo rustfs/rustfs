@@ -39,6 +39,14 @@ must not reorder runtime-token cancellation, background service shutdown,
 optional runtime shutdown planning, notifier/audit/profiling shutdown, HTTP
 shutdown, optional runtime waits, or final service-state publication.
 
+## Startup Lifecycle Boundary
+
+`startup_lifecycle` owns the ready-to-shutdown orchestration after runtime
+services initialize. Service modules may return initialized handles into this
+boundary, but they must not reorder ready publication, global init-time
+publication, scanner startup, shutdown-signal wait, shutdown delegation, or the
+final stopped-state log.
+
 ## Optional Runtime Boundary
 
 `startup_optional_runtimes` owns startup and shutdown handoff for optional
