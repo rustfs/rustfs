@@ -9,6 +9,45 @@ from collections import OrderedDict
 from io import StringIO
 from typing import Any
 
+VENDOR_SPARK_PROFILES: dict[str, dict[str, str]] = {
+    "rustfs": {
+        "catalog_uri": "{endpoint}/iceberg",
+        "warehouse": "{warehouse}",
+        "rest_signing_name": "s3",
+        "s3_endpoint": "{endpoint}",
+        "s3_path_style_access": "true",
+    },
+    "rustfs-compat": {
+        "catalog_uri": "{endpoint}/_iceberg",
+        "warehouse": "{warehouse}",
+        "rest_signing_name": "s3tables",
+        "s3_endpoint": "{endpoint}",
+        "s3_path_style_access": "true",
+    },
+    "aws-s3tables": {
+        "catalog_uri": "https://s3tables.{region}.amazonaws.com/iceberg",
+        "warehouse": "arn:aws:s3tables:{region}:{account_id}:bucket/{table_bucket}",
+        "rest_signing_name": "s3tables",
+    },
+    "minio-aistor": {
+        "catalog_uri": "{endpoint}/_iceberg",
+        "warehouse": "{warehouse}",
+        "rest_signing_name": "s3tables",
+        "s3_endpoint": "{endpoint}",
+        "s3_path_style_access": "true",
+    },
+    "cloudflare-r2-data-catalog": {
+        "catalog_uri": "{catalog_uri}",
+        "warehouse": "{warehouse_name}",
+        "rest_signing_name": "s3",
+    },
+    "oss-tables": {
+        "catalog_uri": "{endpoint}/iceberg",
+        "warehouse": "{warehouse}",
+        "rest_signing_name": "s3",
+    },
+}
+
 
 def scenario(name: str, status: str, evidence: str) -> dict[str, str]:
     return {
@@ -110,6 +149,36 @@ def normalized_rest_path(rest_path: str) -> str:
     return stripped.rstrip("/")
 
 
+def vendor_profile_context(
+    *,
+    endpoint: str,
+    warehouse: str,
+    region: str,
+    account_id: str,
+    table_bucket: str,
+    catalog_uri: str | None,
+    warehouse_name: str | None,
+) -> dict[str, str]:
+    endpoint = normalized_endpoint(endpoint)
+    return {
+        "account_id": account_id,
+        "catalog_uri": (catalog_uri or f"{endpoint}/iceberg").rstrip("/"),
+        "endpoint": endpoint,
+        "region": region,
+        "table_bucket": table_bucket,
+        "warehouse": warehouse,
+        "warehouse_name": warehouse_name or warehouse,
+    }
+
+
+def vendor_profile_value(profile: str, key: str, context: dict[str, str]) -> str:
+    try:
+        template = VENDOR_SPARK_PROFILES[profile][key]
+    except KeyError as err:
+        raise ValueError(f"unknown vendor profile field: {profile}.{key}") from err
+    return template.format(**context).rstrip("/")
+
+
 def spark_catalog_config(
     *,
     endpoint: str,
@@ -140,6 +209,62 @@ def spark_catalog_config(
             (f"{prefix}.s3.secret-access-key", secret_key),
         ]
     )
+
+
+def spark_vendor_catalog_config(
+    *,
+    profile: str,
+    endpoint: str,
+    warehouse: str,
+    access_key: str,
+    secret_key: str,
+    region: str,
+    catalog_name: str,
+    account_id: str,
+    table_bucket: str,
+    catalog_uri: str | None,
+    warehouse_name: str | None,
+    rest_path: str | None = None,
+    rest_signing_name: str | None = None,
+) -> OrderedDict[str, str]:
+    context = vendor_profile_context(
+        endpoint=endpoint,
+        warehouse=warehouse,
+        region=region,
+        account_id=account_id,
+        table_bucket=table_bucket,
+        catalog_uri=catalog_uri,
+        warehouse_name=warehouse_name,
+    )
+    profile_defaults = VENDOR_SPARK_PROFILES.get(profile)
+    if profile_defaults is None:
+        raise ValueError(f"unknown vendor profile: {profile}")
+    configured_catalog_uri = vendor_profile_value(profile, "catalog_uri", context)
+    if rest_path is not None:
+        configured_catalog_uri = f"{normalized_endpoint(endpoint)}{normalized_rest_path(rest_path)}"
+    config = spark_catalog_config(
+        endpoint=endpoint,
+        warehouse=vendor_profile_value(profile, "warehouse", context),
+        access_key=access_key,
+        secret_key=secret_key,
+        region=region,
+        catalog_name=catalog_name,
+        rest_path="/iceberg",
+        rest_signing_name=rest_signing_name or profile_defaults["rest_signing_name"],
+    )
+    prefix = f"spark.sql.catalog.{catalog_name}"
+    config[f"{prefix}.uri"] = configured_catalog_uri
+    if "s3_endpoint" in profile_defaults:
+        config[f"{prefix}.s3.endpoint"] = vendor_profile_value(profile, "s3_endpoint", context)
+    else:
+        config.pop(f"{prefix}.s3.endpoint", None)
+        config.pop(f"{prefix}.s3.access-key-id", None)
+        config.pop(f"{prefix}.s3.secret-access-key", None)
+    if "s3_path_style_access" in profile_defaults:
+        config[f"{prefix}.s3.path-style-access"] = profile_defaults["s3_path_style_access"]
+    else:
+        config.pop(f"{prefix}.s3.path-style-access", None)
+    return config
 
 
 def quote_spark_identifier(identifier: str) -> str:
@@ -192,11 +317,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--secret-key", default="rustfsadmin")
     parser.add_argument("--region", default="us-east-1")
     parser.add_argument("--warehouse", default="rustfs-s3table-smoke")
+    parser.add_argument("--profile", choices=sorted(VENDOR_SPARK_PROFILES), default="rustfs")
+    parser.add_argument("--account-id", default="000000000000")
+    parser.add_argument("--table-bucket", default="rustfs-s3table-smoke")
+    parser.add_argument("--catalog-uri")
+    parser.add_argument("--warehouse-name")
     parser.add_argument("--namespace", default="smoke")
     parser.add_argument("--table", default="events")
     parser.add_argument("--catalog-name", default="rustfs")
-    parser.add_argument("--rest-path", default="/iceberg")
-    parser.add_argument("--rest-signing-name", default="s3")
+    parser.add_argument("--rest-path")
+    parser.add_argument("--rest-signing-name")
     parser.add_argument("--cleanup", action="store_true")
     parser.add_argument("--print-engine-matrix", action="store_true")
     parser.add_argument("--print-spark-config", action="store_true")
@@ -226,13 +356,18 @@ def run(args: argparse.Namespace, output: StringIO | None = None) -> None:
     if args.print_spark_config:
         print_json(
             {
-                "spark_config": spark_catalog_config(
+                "spark_config": spark_vendor_catalog_config(
+                    profile=args.profile,
                     endpoint=args.endpoint,
                     warehouse=args.warehouse,
                     access_key=args.access_key,
                     secret_key=args.secret_key,
                     region=args.region,
                     catalog_name=args.catalog_name,
+                    account_id=args.account_id,
+                    table_bucket=args.table_bucket,
+                    catalog_uri=args.catalog_uri,
+                    warehouse_name=args.warehouse_name,
                     rest_path=args.rest_path,
                     rest_signing_name=args.rest_signing_name,
                 )

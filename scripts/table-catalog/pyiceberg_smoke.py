@@ -30,7 +30,7 @@ REQUIRED_STORAGE_CREDENTIAL_KEYS = (
 TABLE_MAINTENANCE_CONFIG_VERSION = 1
 IDENTIFIER_SEGMENT_MAX_LEN = 64
 
-PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
+PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
     "rustfs": {
         "catalog_uri": "{endpoint}/iceberg",
         "rest_path": "/iceberg",
@@ -38,6 +38,12 @@ PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
         "warehouse": "{bucket}",
         "credential_mode": "static-s3-credentials",
         "status": "automated-smoke-target",
+        "compatibility_stage": "automated",
+        "catalog_uri_shape": "{endpoint}/iceberg",
+        "warehouse_shape": "{bucket}",
+        "namespace_model": "single-level",
+        "pagination_model": "rustfs",
+        "not_claimed": [],
     },
     "rustfs-compat": {
         "catalog_uri": "{endpoint}/_iceberg",
@@ -46,6 +52,12 @@ PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
         "warehouse": "{bucket}",
         "credential_mode": "static-s3-credentials",
         "status": "compatibility-smoke-target",
+        "compatibility_stage": "automated",
+        "catalog_uri_shape": "{endpoint}/_iceberg",
+        "warehouse_shape": "{bucket}",
+        "namespace_model": "single-level",
+        "pagination_model": "rustfs",
+        "not_claimed": ["full MinIO AIStor private extension parity"],
     },
     CATALOG_VENDED_PROFILE: {
         "catalog_uri": "{endpoint}/iceberg",
@@ -54,6 +66,12 @@ PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
         "warehouse": "{bucket}",
         "credential_mode": "catalog-vended-temporary-credentials",
         "status": "automated-credential-smoke-target",
+        "compatibility_stage": "automated-when-enabled",
+        "catalog_uri_shape": "{endpoint}/iceberg",
+        "warehouse_shape": "{bucket}",
+        "namespace_model": "single-level",
+        "pagination_model": "rustfs",
+        "not_claimed": ["no-long-term-data-credential bootstrap"],
     },
     "aws-s3tables": {
         "catalog_uri": "https://s3tables.{region}.amazonaws.com/iceberg",
@@ -62,6 +80,12 @@ PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
         "warehouse": "arn:aws:s3tables:{region}:{account_id}:bucket/{table_bucket}",
         "credential_mode": "aws-iam-or-session-credentials",
         "status": "reference-only",
+        "compatibility_stage": "reference-only",
+        "catalog_uri_shape": "https://s3tables.{region}.amazonaws.com/iceberg",
+        "warehouse_shape": "arn:aws:s3tables:{region}:{account_id}:bucket/{table_bucket}",
+        "namespace_model": "single-level",
+        "pagination_model": "vendor-specific",
+        "not_claimed": ["full AWS S3 Tables API parity", "AWS IAM/Lake Formation policy parity"],
     },
     "minio-aistor": {
         "catalog_uri": "{endpoint}/_iceberg",
@@ -70,6 +94,12 @@ PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
         "warehouse": "{warehouse}",
         "credential_mode": "policy-scoped-s3-credentials",
         "status": "reference-only",
+        "compatibility_stage": "reference-only-plus-rustfs-alias",
+        "catalog_uri_shape": "{endpoint}/_iceberg",
+        "warehouse_shape": "{warehouse}",
+        "namespace_model": "single-level",
+        "pagination_model": "vendor-specific",
+        "not_claimed": ["full MinIO AIStor private extension parity"],
     },
     "cloudflare-r2-data-catalog": {
         "catalog_uri": "{catalog_uri}",
@@ -78,6 +108,12 @@ PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
         "warehouse": "{warehouse_name}",
         "credential_mode": "catalog-vended",
         "status": "reference-only",
+        "compatibility_stage": "reference-only",
+        "catalog_uri_shape": "{catalog_uri}",
+        "warehouse_shape": "{warehouse_name}",
+        "namespace_model": "provider-defined",
+        "pagination_model": "vendor-specific",
+        "not_claimed": ["live RustFS interoperability", "Cloudflare R2 catalog API parity"],
     },
     "oss-tables": {
         "catalog_uri": "{endpoint}/iceberg",
@@ -86,6 +122,12 @@ PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
         "warehouse": "{warehouse}",
         "credential_mode": "sigv4-s3fileio-credentials",
         "status": "reference-only",
+        "compatibility_stage": "reference-only",
+        "catalog_uri_shape": "{endpoint}/iceberg",
+        "warehouse_shape": "{warehouse}",
+        "namespace_model": "provider-defined",
+        "pagination_model": "vendor-specific",
+        "not_claimed": ["live RustFS interoperability", "Alibaba OSS Tables API parity"],
     },
 }
 
@@ -234,8 +276,30 @@ def env_or_none(key: str) -> str | None:
     return value
 
 
-def vendor_profiles() -> dict[str, dict[str, str]]:
+def vendor_profiles() -> dict[str, dict[str, Any]]:
     return {name: values.copy() for name, values in PROFILE_DEFAULTS.items()}
+
+
+def selected_vendor_profile(args: argparse.Namespace) -> dict[str, Any]:
+    defaults = PROFILE_DEFAULTS[args.profile]
+    not_claimed = defaults.get("not_claimed", [])
+    if not isinstance(not_claimed, list):
+        raise ValueError("profile not_claimed field must be a list")
+    return {
+        "name": args.profile,
+        "status": defaults["status"],
+        "compatibility_stage": defaults["compatibility_stage"],
+        "catalog_uri": profile_catalog_uri(args),
+        "catalog_uri_shape": defaults["catalog_uri_shape"],
+        "warehouse": profile_warehouse(args),
+        "warehouse_shape": defaults["warehouse_shape"],
+        "rest_path": args.rest_path,
+        "rest_signing_name": args.rest_signing_name,
+        "credential_mode": defaults["credential_mode"],
+        "namespace_model": defaults["namespace_model"],
+        "pagination_model": defaults["pagination_model"],
+        "not_claimed": not_claimed.copy(),
+    }
 
 
 def client_matrix() -> list[dict[str, str]]:
@@ -271,6 +335,43 @@ def apply_profile_defaults(args: argparse.Namespace) -> argparse.Namespace:
     return args
 
 
+def profile_template_context(args: argparse.Namespace) -> dict[str, str]:
+    endpoint = normalized_endpoint(args.endpoint)
+    warehouse = args.warehouse or args.bucket
+    table_bucket = args.table_bucket or args.bucket
+    warehouse_name = args.warehouse_name or warehouse
+    catalog_uri = args.catalog_uri or f"{endpoint}{args.rest_path}"
+    return {
+        "account_id": args.account_id,
+        "bucket": args.bucket,
+        "catalog_uri": catalog_uri,
+        "endpoint": endpoint,
+        "region": args.region,
+        "table_bucket": table_bucket,
+        "warehouse": warehouse,
+        "warehouse_name": warehouse_name,
+    }
+
+
+def formatted_profile_value(args: argparse.Namespace, key: str) -> str:
+    template = PROFILE_DEFAULTS[args.profile][key]
+    if not isinstance(template, str):
+        raise ValueError(f"profile field {key} is not a string")
+    return template.format(**profile_template_context(args))
+
+
+def profile_catalog_uri(args: argparse.Namespace) -> str:
+    if args.catalog_uri:
+        return args.catalog_uri.rstrip("/")
+    return formatted_profile_value(args, "catalog_uri").rstrip("/")
+
+
+def profile_warehouse(args: argparse.Namespace) -> str:
+    if args.warehouse:
+        return args.warehouse
+    return formatted_profile_value(args, "warehouse")
+
+
 def parse_args() -> argparse.Namespace:
     run_id = str(int(time.time()))
     parser = argparse.ArgumentParser(description="Run a PyIceberg smoke test against RustFS table catalog APIs.")
@@ -280,6 +381,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--secret-key", default=os.getenv("RUSTFS_SECRET_KEY", "rustfsadmin"))
     parser.add_argument("--region", default=os.getenv("RUSTFS_REGION", os.getenv("AWS_REGION", "us-east-1")))
     parser.add_argument("--bucket", default=os.getenv("RUSTFS_TABLE_BUCKET", "rustfs-s3table-smoke"))
+    parser.add_argument("--warehouse", default=env_or_none("RUSTFS_TABLE_WAREHOUSE"))
+    parser.add_argument("--table-bucket", default=env_or_none("RUSTFS_TABLE_BUCKET_NAME"))
+    parser.add_argument("--account-id", default=os.getenv("RUSTFS_TABLE_ACCOUNT_ID", "000000000000"))
+    parser.add_argument("--warehouse-name", default=env_or_none("RUSTFS_TABLE_WAREHOUSE_NAME"))
+    parser.add_argument("--catalog-uri", default=env_or_none("RUSTFS_TABLE_CATALOG_URI"))
     parser.add_argument("--namespace", default=os.getenv("RUSTFS_TABLE_NAMESPACE", f"smoke{run_id}"))
     parser.add_argument("--table", default=os.getenv("RUSTFS_TABLE_NAME", f"events{run_id}"))
     parser.add_argument("--catalog-name", default=os.getenv("RUSTFS_TABLE_CATALOG_NAME", "rustfs"))
@@ -699,11 +805,12 @@ def verify_vended_credential_data_plane_scope(
 
 def catalog_properties(args: argparse.Namespace, storage_credential: StorageCredential | None = None) -> dict[str, str]:
     endpoint = normalized_endpoint(args.endpoint)
+    warehouse = profile_warehouse(args)
     properties = {
         "type": "rest",
-        "uri": f"{endpoint}{args.rest_path}",
-        "warehouse": args.bucket,
-        "prefix": args.bucket,
+        "uri": profile_catalog_uri(args),
+        "warehouse": warehouse,
+        "prefix": warehouse,
         "py-io-impl": "pyiceberg.io.pyarrow.PyArrowFileIO",
         "s3.endpoint": endpoint,
         "s3.access-key-id": args.access_key,
@@ -737,7 +844,12 @@ def printed_metadata(args: argparse.Namespace) -> bool:
         print_json_document({"production_failure_coverage": failure_coverage.production_failure_matrix()})
         printed = True
     if args.print_vendor_profiles:
-        print_json_document({"vendor_profiles": vendor_profiles()})
+        print_json_document(
+            {
+                "selected_vendor_profile": selected_vendor_profile(args),
+                "vendor_profiles": vendor_profiles(),
+            }
+        )
         printed = True
     if args.print_unsupported_inventory:
         print_json_document({"unsupported_inventory": unsupported_inventory()})

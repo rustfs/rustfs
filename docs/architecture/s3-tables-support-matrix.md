@@ -30,10 +30,10 @@ catalog extension.
 | S3 object data plane | Supported | Data, metadata, manifest, and delete files remain ordinary S3 objects, with table-aware policy checks for table warehouse paths. |
 | Table bucket enablement | Supported | A regular RustFS bucket can be enabled for table catalog use and then addressed as the REST catalog warehouse. |
 | Catalog-vended table credentials | Automated when enabled | Disabled by default. When enabled, the credentials endpoint returns short-lived table-scoped S3 credentials. |
-| AWS S3 Tables endpoint shape | Reference only | The AWS profile is recorded for comparison, not as a RustFS parity claim. |
-| MinIO AIStor Tables profile | Reference only plus RustFS alias smoke | RustFS exposes the alias shape, but does not claim all AIStor private extensions. |
-| Cloudflare R2 Data Catalog profile | Reference only | Kept as an interoperability reference. Live RustFS compatibility is not claimed. |
-| Alibaba OSS Tables profile | Reference only | Kept as an interoperability reference. Live RustFS compatibility is not claimed. |
+| AWS S3 Tables endpoint shape | Profile generator | Generates the AWS catalog URI and S3 Tables warehouse ARN shape for migration docs. Full AWS S3 Tables API parity is not claimed. |
+| MinIO AIStor Tables profile | Profile generator plus RustFS alias smoke | RustFS exposes the alias shape, but does not claim all AIStor private extensions. |
+| Cloudflare R2 Data Catalog profile | Profile generator | Generates the catalog URI and warehouse-name shape for migration docs. Live RustFS interoperability is not claimed. |
+| Alibaba OSS Tables profile | Profile generator | Generates provider endpoint and warehouse shapes for migration docs. Live RustFS interoperability is not claimed. |
 
 ## Client And Engine Matrix
 
@@ -157,8 +157,15 @@ python3 scripts/table-catalog/test_failure_coverage.py
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-client-matrix
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-engine-compatibility
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-production-failure-coverage
+python3 scripts/table-catalog/pyiceberg_smoke.py --print-vendor-profiles
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-production-readiness
 python3 scripts/table-catalog/engine_compatibility.py --print-spark-config
+python3 scripts/table-catalog/engine_compatibility.py \
+  --profile aws-s3tables \
+  --region us-east-1 \
+  --account-id 123456789012 \
+  --table-bucket analytics \
+  --print-spark-config
 python3 scripts/table-catalog/failure_coverage.py \
   --warehouse rustfs-s3table-smoke \
   --namespace smoke \
