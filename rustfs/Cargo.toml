@@ -171,6 +171,7 @@ zip = { workspace = true }
 libc = { workspace = true }
 rand = { workspace = true }
 aes-gcm = { workspace = true }
+chacha20poly1305 = { workspace = true }
 
 # Observability and Metrics
 metrics = { workspace = true }

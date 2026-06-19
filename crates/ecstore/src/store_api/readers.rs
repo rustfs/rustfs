@@ -1,9 +1,13 @@
 use super::*;
+#[cfg(feature = "rio-v2")]
+use aes_gcm::aead::Payload;
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+#[cfg(feature = "rio-v2")]
+use chacha20poly1305::ChaCha20Poly1305;
 #[cfg(feature = "rio-v2")]
 use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
@@ -52,6 +56,8 @@ const MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM: &str = "DAREv2-HMAC-SHA256";
 const DARE_VERSION_20: u8 = 0x20;
 #[cfg(feature = "rio-v2")]
 const DARE_CIPHER_AES_256_GCM: u8 = 0x00;
+#[cfg(feature = "rio-v2")]
+const DARE_CIPHER_CHACHA20_POLY1305: u8 = 0x01;
 #[cfg(feature = "rio-v2")]
 const DARE_HEADER_SIZE: usize = 16;
 #[cfg(feature = "rio-v2")]
@@ -1025,6 +1031,35 @@ fn metadata_get<'a>(metadata: &'a HashMap<String, String>, key: &str) -> Option<
     })
 }
 
+#[cfg(feature = "rio-v2")]
+fn is_supported_sealed_object_key_cipher(cipher: u8) -> bool {
+    matches!(cipher, DARE_CIPHER_AES_256_GCM | DARE_CIPHER_CHACHA20_POLY1305)
+}
+
+#[cfg(feature = "rio-v2")]
+fn decrypt_sealed_object_key_payload(sealing_key: [u8; 32], header: &[u8], sealed_key: &[u8]) -> Result<Vec<u8>> {
+    let nonce = &header[4..16];
+    let ciphertext = &sealed_key[DARE_HEADER_SIZE..];
+    let aad = &header[..4];
+    match header[1] {
+        DARE_CIPHER_AES_256_GCM => {
+            let cipher = Aes256Gcm::new_from_slice(&sealing_key)
+                .map_err(|err| Error::other(format!("invalid AES-GCM sealing key: {err}")))?;
+            let nonce = Nonce::try_from(nonce).map_err(|_| Error::other("invalid sealed object-key package nonce"))?;
+            cipher.decrypt(&nonce, Payload { msg: ciphertext, aad })
+        }
+        DARE_CIPHER_CHACHA20_POLY1305 => {
+            let cipher = ChaCha20Poly1305::new_from_slice(&sealing_key)
+                .map_err(|err| Error::other(format!("invalid ChaCha20-Poly1305 sealing key: {err}")))?;
+            let nonce =
+                chacha20poly1305::Nonce::try_from(nonce).map_err(|_| Error::other("invalid sealed object-key package nonce"))?;
+            cipher.decrypt(&nonce, Payload { msg: ciphertext, aad })
+        }
+        _ => return Err(Error::other("unsupported sealed object-key DARE header")),
+    }
+    .map_err(|err| Error::other(format!("failed to unseal object key: {err}")))
+}
+
 async fn resolve_encryption_material(oi: &ObjectInfo, headers: &HeaderMap<HeaderValue>) -> Result<EncryptionMaterial> {
     if metadata_get(&oi.user_defined, SSEC_ALGORITHM_HEADER).is_some() {
         return resolve_ssec_material(oi, headers);
@@ -1154,7 +1189,7 @@ fn try_unseal_minio_object_key(
         return Ok(None);
     };
     let header = &sealed_key[..DARE_HEADER_SIZE];
-    if header[0] != DARE_VERSION_20 || header[1] != DARE_CIPHER_AES_256_GCM {
+    if header[0] != DARE_VERSION_20 || !is_supported_sealed_object_key_cipher(header[1]) {
         return Err(Error::other("unsupported sealed object-key DARE header"));
     }
     if u16::from_le_bytes([header[2], header[3]]) != 31 || header[4] & 0x80 == 0 {
@@ -1162,17 +1197,7 @@ fn try_unseal_minio_object_key(
     }
 
     let sealing_key = derive_sealing_key(external_key, iv, managed_sse_domain(metadata), bucket, object);
-    let cipher = Aes256Gcm::new_from_slice(&sealing_key).map_err(|err| Error::other(format!("invalid sealing key: {err}")))?;
-    let nonce = Nonce::try_from(&header[4..16]).map_err(|_| Error::other("invalid sealed object-key package nonce"))?;
-    let plaintext = cipher
-        .decrypt(
-            &nonce,
-            aes_gcm::aead::Payload {
-                msg: &sealed_key[DARE_HEADER_SIZE..],
-                aad: &header[..4],
-            },
-        )
-        .map_err(|err| Error::other(format!("failed to unseal object key: {err}")))?;
+    let plaintext = decrypt_sealed_object_key_payload(sealing_key, header, &sealed_key)?;
     let object_key: [u8; 32] = plaintext
         .as_slice()
         .try_into()
@@ -1889,31 +1914,67 @@ mod tests {
         data_key: [u8; 32],
         object_key: [u8; 32],
     ) -> ([u8; 32], Vec<u8>) {
+        seal_managed_s3_object_key_for_test_with_cipher(bucket, object, data_key, object_key, DARE_CIPHER_AES_256_GCM)
+    }
+
+    #[cfg(feature = "rio-v2")]
+    fn seal_managed_s3_object_key_for_test_with_cipher(
+        bucket: &str,
+        object: &str,
+        data_key: [u8; 32],
+        object_key: [u8; 32],
+        cipher_id: u8,
+    ) -> ([u8; 32], Vec<u8>) {
         let iv = [0x24u8; SEALED_KEY_IV_SIZE];
         let sealing_key = derive_sealing_key(data_key, iv, "SSE-S3", bucket, object);
-        let cipher = Aes256Gcm::new_from_slice(&sealing_key).expect("valid sealing key");
 
         let mut header = [0u8; DARE_HEADER_SIZE];
         header[0] = DARE_VERSION_20;
-        header[1] = DARE_CIPHER_AES_256_GCM;
+        header[1] = cipher_id;
         header[2..4].copy_from_slice(&31u16.to_le_bytes());
         header[4] = 0x80;
         header[5..16].copy_from_slice(&[0x46u8; 11]);
 
-        let nonce = Nonce::try_from(&header[4..16]).expect("valid nonce");
+        let ciphertext = match cipher_id {
+            DARE_CIPHER_AES_256_GCM => {
+                let cipher = Aes256Gcm::new_from_slice(&sealing_key).expect("valid sealing key");
+                let nonce = Nonce::try_from(&header[4..16]).expect("valid nonce");
+                cipher
+                    .encrypt(
+                        &nonce,
+                        Payload {
+                            msg: &object_key,
+                            aad: &header[..4],
+                        },
+                    )
+                    .expect("seal managed object key")
+            }
+            DARE_CIPHER_CHACHA20_POLY1305 => {
+                let cipher = ChaCha20Poly1305::new_from_slice(&sealing_key).expect("valid sealing key");
+                let nonce = chacha20poly1305::Nonce::try_from(&header[4..16]).expect("valid nonce");
+                cipher
+                    .encrypt(
+                        &nonce,
+                        Payload {
+                            msg: &object_key,
+                            aad: &header[..4],
+                        },
+                    )
+                    .expect("seal managed object key")
+            }
+            _ => panic!("unsupported test cipher"),
+        };
         let mut sealed = header.to_vec();
-        sealed.extend_from_slice(
-            &cipher
-                .encrypt(
-                    &nonce,
-                    aes_gcm::aead::Payload {
-                        msg: &object_key,
-                        aad: &header[..4],
-                    },
-                )
-                .expect("seal managed object key"),
-        );
+        sealed.extend_from_slice(&ciphertext);
         (iv, sealed)
+    }
+
+    #[cfg(feature = "rio-v2")]
+    #[test]
+    fn test_supported_sealed_object_key_cipher_accepts_current_minio_fixture_value() {
+        assert!(is_supported_sealed_object_key_cipher(DARE_CIPHER_AES_256_GCM));
+        assert!(is_supported_sealed_object_key_cipher(DARE_CIPHER_CHACHA20_POLY1305));
+        assert!(!is_supported_sealed_object_key_cipher(0x02));
     }
 
     #[tokio::test]
@@ -1933,6 +1994,47 @@ mod tests {
 
             assert_eq!(material.key_bytes, data_key);
             assert_eq!(material.base_nonce, base_nonce);
+        })
+        .await;
+    }
+
+    #[cfg(feature = "rio-v2")]
+    #[tokio::test]
+    async fn resolve_managed_material_accepts_chacha20_poly1305_header_variant() {
+        async_with_vars([("__RUSTFS_SSE_SIMPLE_CMK", Some(BASE64_STANDARD.encode([0u8; 32])))], async {
+            let data_key = [0x24; 32];
+            let object_key = [0x33; 32];
+            let (iv, sealed_key) = seal_managed_s3_object_key_for_test_with_cipher(
+                "bucket",
+                "object",
+                data_key,
+                object_key,
+                DARE_CIPHER_CHACHA20_POLY1305,
+            );
+
+            let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
+            let metadata = HashMap::from([
+                (
+                    MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER.to_string(),
+                    BASE64_STANDARD.encode(sealed_key),
+                ),
+                (MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode(iv)),
+                (
+                    MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(),
+                    MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.to_string(),
+                ),
+                (
+                    MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER.to_string(),
+                    BASE64_STANDARD.encode(encrypted_dek.as_bytes()),
+                ),
+                (MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER.to_string(), "default".to_string()),
+            ]);
+
+            let material = resolve_managed_material("bucket", "object", &metadata)
+                .await
+                .expect("managed material should accept current MinIO header variant");
+            assert_eq!(material.key_kind, EncryptionKeyKind::Object);
+            assert_eq!(material.key_bytes, object_key);
         })
         .await;
     }

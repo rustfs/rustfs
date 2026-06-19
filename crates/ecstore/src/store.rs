@@ -841,16 +841,10 @@ impl ServerPoolsAvailableSpace {
 mod tests {
     use super::*;
     use crate::endpoints::{Endpoints, PoolEndpoints};
-    use crate::global::{GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES};
+    use crate::global::{GLOBAL_LOCAL_DISK_ID_MAP, reset_local_disk_test_state};
     use crate::store_init::{connect_load_init_formats, init_disks};
     use serial_test::serial;
     use tempfile::TempDir;
-
-    async fn reset_local_disk_globals() {
-        GLOBAL_LOCAL_DISK_MAP.write().await.clear();
-        GLOBAL_LOCAL_DISK_ID_MAP.write().await.clear();
-        GLOBAL_LOCAL_DISK_SET_DRIVES.write().await.clear();
-    }
 
     #[tokio::test]
     async fn test_get_disk_infos() {
@@ -906,7 +900,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_find_local_disk_by_ref_backfills_uuid_map() {
-        reset_local_disk_globals().await;
+        reset_local_disk_test_state().await;
 
         let temp_dir = TempDir::new().expect("create temp dir for local disk ref test");
         let disk_paths = (0..4)
@@ -967,7 +961,7 @@ mod tests {
             Some(first_disk.endpoint().to_string())
         );
 
-        reset_local_disk_globals().await;
+        reset_local_disk_test_state().await;
     }
 
     #[tokio::test]

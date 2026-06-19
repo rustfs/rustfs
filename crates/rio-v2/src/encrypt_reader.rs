@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use aes_gcm::aead::Aead;
+use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use chacha20poly1305::ChaCha20Poly1305;
 use hmac::{Hmac, Mac};
 use pin_project_lite::pin_project;
 use rand::RngExt;
@@ -27,11 +28,48 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 const DARE_VERSION_20: u8 = 0x20;
 const DARE_CIPHER_AES_256_GCM: u8 = 0x00;
+const DARE_CIPHER_CHACHA20_POLY1305: u8 = 0x01;
 const DARE_HEADER_SIZE: usize = 16;
 const DARE_TAG_SIZE: usize = 16;
 const DARE_PAYLOAD_SIZE: usize = 64 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
+
+enum DareDecryptCipher {
+    Aes256Gcm(Box<Aes256Gcm>),
+    ChaCha20Poly1305(ChaCha20Poly1305),
+}
+
+impl DareDecryptCipher {
+    fn new(cipher_id: u8, key: [u8; 32]) -> io::Result<Self> {
+        match cipher_id {
+            DARE_CIPHER_AES_256_GCM => Aes256Gcm::new_from_slice(&key)
+                .map(Box::new)
+                .map(Self::Aes256Gcm)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid AES-GCM key: {err}"))),
+            DARE_CIPHER_CHACHA20_POLY1305 => ChaCha20Poly1305::new_from_slice(&key)
+                .map(Self::ChaCha20Poly1305)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid ChaCha20-Poly1305 key: {err}"))),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported DARE cipher suite")),
+        }
+    }
+
+    fn cipher_id(&self) -> u8 {
+        match self {
+            Self::Aes256Gcm(_) => DARE_CIPHER_AES_256_GCM,
+            Self::ChaCha20Poly1305(_) => DARE_CIPHER_CHACHA20_POLY1305,
+        }
+    }
+
+    fn decrypt(&self, nonce: &[u8; 12], ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, aes_gcm::aead::Error> {
+        match self {
+            Self::Aes256Gcm(cipher) => cipher.decrypt(&Nonce::from(*nonce), Payload { msg: ciphertext, aad }),
+            Self::ChaCha20Poly1305(cipher) => {
+                cipher.decrypt(&chacha20poly1305::Nonce::from(*nonce), Payload { msg: ciphertext, aad })
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum MultipartKeySource {
@@ -215,7 +253,8 @@ pin_project! {
     pub struct DecryptReader<R> {
         #[pin]
         inner: R,
-        cipher: Aes256Gcm,
+        key: [u8; 32],
+        cipher: Option<DareDecryptCipher>,
         expected_base_nonce: Option<[u8; 12]>,
         sequence_number: u32,
         multipart_parts: Vec<usize>,
@@ -250,7 +289,8 @@ where
     pub fn new_with_object_key_and_sequence(inner: R, object_key: [u8; 32], sequence_number: u32) -> Self {
         Self {
             inner,
-            cipher: Aes256Gcm::new_from_slice(&object_key).expect("valid AES-256-GCM key"),
+            key: object_key,
+            cipher: None,
             expected_base_nonce: None,
             sequence_number,
             multipart_parts: Vec::new(),
@@ -273,7 +313,8 @@ where
     pub fn new_with_sequence(inner: R, key: [u8; 32], nonce: [u8; 12], sequence_number: u32) -> Self {
         Self {
             inner,
-            cipher: Aes256Gcm::new_from_slice(&key).expect("valid AES-256-GCM key"),
+            key,
+            cipher: None,
             expected_base_nonce: Some(nonce),
             sequence_number,
             multipart_parts: Vec::new(),
@@ -311,7 +352,8 @@ where
         let first_part = multipart_parts.first().copied().unwrap_or(1);
         Self {
             inner,
-            cipher: Aes256Gcm::new_from_slice(&key).expect("valid AES-256-GCM key"),
+            key,
+            cipher: None,
             expected_base_nonce: Some(multipart_part_nonce(base_nonce, first_part)),
             sequence_number,
             multipart_parts,
@@ -341,7 +383,8 @@ where
         let first_key = derive_part_key(object_key, first_part as u32);
         Self {
             inner,
-            cipher: Aes256Gcm::new_from_slice(&first_key).expect("valid AES-256-GCM key"),
+            key: first_key,
+            cipher: None,
             expected_base_nonce: None,
             sequence_number,
             multipart_parts,
@@ -395,7 +438,8 @@ where
                         }
                         Some(MultipartKeySource::ObjectKey { object_key }) => {
                             let part_key = derive_part_key(object_key, next_part as u32);
-                            *this.cipher = Aes256Gcm::new_from_slice(&part_key).expect("valid AES-256-GCM key");
+                            *this.key = part_key;
+                            *this.cipher = None;
                             *this.expected_base_nonce = None;
                         }
                         None => {}
@@ -433,6 +477,12 @@ where
             }
 
             let header = this.header_buf;
+            if header[0] != DARE_VERSION_20 {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported DARE version")));
+            }
+            if !matches!(header[1], DARE_CIPHER_AES_256_GCM | DARE_CIPHER_CHACHA20_POLY1305) {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported DARE cipher suite")));
+            }
             let payload_len = usize::from(u16::from_le_bytes([header[2], header[3]])) + 1;
             let package_len = payload_len + DARE_TAG_SIZE;
             if payload_len == 0 || payload_len > DARE_PAYLOAD_SIZE {
@@ -441,7 +491,10 @@ where
             if !is_final_header(*header) && payload_len != DARE_PAYLOAD_SIZE {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "non-final DARE package must carry a full 64KiB payload",
+                    format!(
+                        "non-final DARE package must carry a full 64KiB payload: cipher={}, payload_len={}, sequence_number={}, header={:02x?}",
+                        header[1], payload_len, *this.sequence_number, header
+                    ),
                 )));
             }
             if this.ciphertext_buf.len() < package_len {
@@ -469,6 +522,7 @@ where
             }
 
             match open_dare_package(
+                *this.key,
                 this.cipher,
                 *this.sequence_number,
                 *this.expected_base_nonce,
@@ -573,7 +627,8 @@ fn build_dare_package(
 }
 
 fn open_dare_package(
-    cipher: &Aes256Gcm,
+    key: [u8; 32],
+    cipher: &mut Option<DareDecryptCipher>,
     sequence_number: u32,
     expected_base_nonce: Option<[u8; 12]>,
     header: [u8; DARE_HEADER_SIZE],
@@ -583,8 +638,18 @@ fn open_dare_package(
     if header[0] != DARE_VERSION_20 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported DARE version"));
     }
-    if header[1] != DARE_CIPHER_AES_256_GCM {
+    if !matches!(header[1], DARE_CIPHER_AES_256_GCM | DARE_CIPHER_CHACHA20_POLY1305) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported DARE cipher suite"));
+    }
+    if let Some(cipher) = cipher.as_ref() {
+        if cipher.cipher_id() != header[1] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DARE package cipher suite does not match the stream reference cipher",
+            ));
+        }
+    } else {
+        *cipher = Some(DareDecryptCipher::new(header[1], key)?);
     }
     let header_nonce: [u8; 12] = header[4..16].try_into().expect("nonce slice");
     if let Some(expected_base_nonce) = expected_base_nonce {
@@ -608,16 +673,10 @@ fn open_dare_package(
 
     let mut package_nonce = header_nonce;
     xor_sequence_into_nonce(&mut package_nonce, sequence_number);
-    let nonce = Nonce::try_from(package_nonce.as_slice())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid DARE nonce length"))?;
     let plaintext = cipher
-        .decrypt(
-            &nonce,
-            aes_gcm::aead::Payload {
-                msg: ciphertext,
-                aad: &header[..4],
-            },
-        )
+        .as_ref()
+        .expect("DARE cipher is initialized")
+        .decrypt(&package_nonce, ciphertext, &header[..4])
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("DARE authentication failed: {err}")))?;
 
     Ok((plaintext, *current_ref, is_final_header(header)))
@@ -703,6 +762,42 @@ mod tests {
             .read_to_end(&mut decrypted)
             .await
             .expect("decrypt object-key singlepart stream");
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[tokio::test]
+    async fn decrypt_reader_accepts_chacha20_poly1305_dare_v2_package() {
+        let object_key = [0x72u8; 32];
+        let plaintext = b"minio may emit ChaCha20-Poly1305 DARE packages".to_vec();
+
+        let mut header = [0u8; DARE_HEADER_SIZE];
+        header[0] = DARE_VERSION_20;
+        header[1] = DARE_CIPHER_CHACHA20_POLY1305;
+        header[2..4].copy_from_slice(&(u16::try_from(plaintext.len() - 1).expect("test payload fits")).to_le_bytes());
+        header[4] = 0x80;
+        header[5..16].copy_from_slice(&[0x27; 11]);
+
+        let cipher = ChaCha20Poly1305::new_from_slice(&object_key).expect("valid test key");
+        let nonce = chacha20poly1305::Nonce::try_from(&header[4..16]).expect("valid test nonce");
+        let ciphertext = cipher
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: &plaintext,
+                    aad: &header[..4],
+                },
+            )
+            .expect("encrypt chacha DARE package");
+
+        let mut encrypted = header.to_vec();
+        encrypted.extend_from_slice(&ciphertext);
+
+        let mut decrypted = Vec::new();
+        DecryptReader::new_with_object_key(Cursor::new(encrypted), object_key)
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("decrypt chacha DARE package");
 
         assert_eq!(decrypted, plaintext);
     }
