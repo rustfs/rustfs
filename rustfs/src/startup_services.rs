@@ -14,7 +14,7 @@
 
 use crate::storage_compat::{
     ECStore, EndpointServerPools, get_global_replication_pool, init_bucket_metadata_sys, new_global_notification_sys,
-    shutdown_background_services, try_migrate_bucket_metadata, try_migrate_iam_config,
+    try_migrate_bucket_metadata, try_migrate_iam_config,
 };
 use crate::{
     config::Config,
@@ -22,21 +22,14 @@ use crate::{
         add_bucket_notification_configuration, init_auto_tuner, init_buffer_profile_system, init_kms_system, init_update_check,
         print_server_info,
     },
-    server::{
-        ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
-        start_audit_system, stop_audit_system, wait_for_shutdown,
-    },
+    server::{ServiceStateManager, ShutdownHandle, init_event_notifier, start_audit_system, wait_for_shutdown},
     startup_iam::{IamBootstrapDisposition, bootstrap_or_defer_iam_init, publish_ready_for_iam_bootstrap},
-    startup_optional_runtimes::{
-        OptionalRuntimeServices, init_optional_runtime_services, prepare_optional_runtime_shutdowns,
-        shutdown_optional_runtime_services,
-    },
+    startup_optional_runtimes::{OptionalRuntimeServices, init_optional_runtime_services},
+    startup_shutdown::run_startup_shutdown_sequence,
 };
 use rustfs_audit::AuditResult;
 use rustfs_common::GlobalReadiness;
-use rustfs_heal::{
-    create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
-};
+use rustfs_heal::{create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager};
 use rustfs_iam::init_oidc_sys;
 use rustfs_obs::init_metrics_runtime;
 use rustfs_scanner::init_data_scanner;
@@ -65,10 +58,6 @@ const EVENT_OIDC_INITIALIZATION_FAILED: &str = "oidc_initialization_failed";
 const EVENT_NOTIFICATION_SYSTEM_INITIALIZATION_FAILED: &str = "notification_system_initialization_failed";
 const EVENT_BACKGROUND_SERVICES_CONFIGURED: &str = "background_services_configured";
 const EVENT_SERVER_READY: &str = "server_ready";
-const EVENT_SHUTDOWN_SIGNAL_RECEIVED: &str = "shutdown_signal_received";
-const EVENT_BACKGROUND_SERVICE_SHUTDOWN: &str = "background_service_shutdown";
-const EVENT_EVENT_NOTIFIER_SHUTDOWN: &str = "event_notifier_shutdown";
-const EVENT_PROFILING_SHUTDOWN: &str = "profiling_shutdown";
 const EVENT_SERVER_SHUTDOWN_STATE: &str = "server_shutdown_state";
 
 pub struct StartupServiceRuntime {
@@ -154,7 +143,7 @@ pub async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifecycle) -
     }
 
     let shutdown_signal = wait_for_shutdown().await;
-    handle_shutdown(
+    run_startup_shutdown_sequence(
         &state_manager,
         shutdown_signal,
         s3_shutdown_tx,
@@ -356,165 +345,6 @@ async fn init_observability_runtime(ctx: CancellationToken) {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackgroundShutdownStep {
-    DataScanner,
-    Ahm,
-}
-
-fn background_shutdown_steps(enable_scanner: bool, enable_heal: bool) -> Vec<BackgroundShutdownStep> {
-    let mut steps = Vec::with_capacity(2);
-    if enable_scanner {
-        steps.push(BackgroundShutdownStep::DataScanner);
-    }
-    if enable_heal || enable_scanner {
-        steps.push(BackgroundShutdownStep::Ahm);
-    }
-    steps
-}
-
-async fn handle_shutdown(
-    state_manager: &ServiceStateManager,
-    shutdown_signal: ShutdownSignal,
-    s3_shutdown_handle: Option<ShutdownHandle>,
-    console_shutdown_handle: Option<ShutdownHandle>,
-    optional_runtimes: OptionalRuntimeServices,
-    ctx: CancellationToken,
-) {
-    ctx.cancel();
-
-    info!(
-        target: "rustfs::main::handle_shutdown",
-        event = EVENT_SHUTDOWN_SIGNAL_RECEIVED,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        signal = shutdown_signal.log_label(),
-        "Shutdown signal received"
-    );
-    state_manager.update(ServiceState::Stopping);
-
-    let enable_scanner = get_env_bool_with_aliases(ENV_SCANNER_ENABLED, &[ENV_SCANNER_ENABLED_DEPRECATED], true);
-    let enable_heal = get_env_bool_with_aliases(ENV_HEAL_ENABLED, &[ENV_HEAL_ENABLED_DEPRECATED], true);
-
-    let background_steps = background_shutdown_steps(enable_scanner, enable_heal);
-    for step in &background_steps {
-        match step {
-            BackgroundShutdownStep::DataScanner => {
-                info!(
-                    target: "rustfs::main::handle_shutdown",
-                    event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
-                    component = LOG_COMPONENT_MAIN,
-                    subsystem = LOG_SUBSYSTEM_STARTUP,
-                    service = "data_scanner",
-                    state = "stopping",
-                    "Background service shutdown started"
-                );
-                shutdown_background_services();
-            }
-            BackgroundShutdownStep::Ahm => {
-                info!(
-                    target: "rustfs::main::handle_shutdown",
-                    event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
-                    component = LOG_COMPONENT_MAIN,
-                    subsystem = LOG_SUBSYSTEM_STARTUP,
-                    service = "ahm",
-                    state = "stopping",
-                    "Background service shutdown started"
-                );
-                shutdown_ahm_services();
-            }
-        }
-    }
-
-    if background_steps.is_empty() {
-        info!(
-            target: "rustfs::main::handle_shutdown",
-            event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            service = "ahm",
-            state = "skipped",
-            reason = "disabled",
-            "Background service shutdown skipped"
-        );
-    }
-
-    let optional_runtime_shutdowns = prepare_optional_runtime_shutdowns(optional_runtimes);
-
-    info!(
-        target: "rustfs::main::handle_shutdown",
-        event = EVENT_EVENT_NOTIFIER_SHUTDOWN,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        state = "stopping",
-        "Event notifier shutdown started"
-    );
-    shutdown_event_notifier().await;
-
-    info!(
-        target: "rustfs::main::handle_shutdown",
-        event = EVENT_AUDIT_SYSTEM_STATE,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        state = "stopping",
-        "Audit runtime stopping"
-    );
-    match stop_audit_system().await {
-        Ok(_) => info!(
-            target: "rustfs::main::handle_shutdown",
-            event = EVENT_AUDIT_SYSTEM_STATE,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            state = "stopped",
-            "Audit runtime stopped"
-        ),
-        Err(e) => error!(
-            target: "rustfs::main::handle_shutdown",
-            event = EVENT_AUDIT_SYSTEM_STATE,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            state = "stop_failed",
-            error = %e,
-            "Audit runtime failed to stop"
-        ),
-    }
-
-    info!(
-        target: "rustfs::main::handle_shutdown",
-        event = EVENT_PROFILING_SHUTDOWN,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        state = "stopping",
-        "Profiling shutdown started"
-    );
-    crate::startup_profiling::shutdown_profiling_runtime();
-
-    info!(
-        target: "rustfs::main::handle_shutdown",
-        event = EVENT_SERVER_SHUTDOWN_STATE,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        state = "stopping",
-        "RustFS server stopping"
-    );
-    if let Some(s3_shutdown_handle) = s3_shutdown_handle {
-        s3_shutdown_handle.shutdown().await;
-    }
-    if let Some(console_shutdown_handle) = console_shutdown_handle {
-        console_shutdown_handle.shutdown().await;
-    }
-    shutdown_optional_runtime_services(optional_runtime_shutdowns).await;
-    state_manager.update(ServiceState::Stopped);
-    info!(
-        target: "rustfs::main::handle_shutdown",
-        event = EVENT_SERVER_SHUTDOWN_STATE,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        state = "stopped",
-        "RustFS server stopped"
-    );
-}
-
 pub async fn init_event_notifier_and_audit() -> AuditResult<()> {
     init_event_notifier_and_audit_with(init_event_notifier, start_audit_system).await
 }
@@ -547,9 +377,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BackgroundShutdownStep, background_shutdown_steps, init_event_notifier_and_audit_with, init_notification_system_with,
-    };
+    use super::{init_event_notifier_and_audit_with, init_notification_system_with};
     use rustfs_audit::AuditError;
     use std::sync::{Arc, Mutex};
 
@@ -601,19 +429,5 @@ mod tests {
         let result = init_notification_system_with(|| async { Err(crate::storage_compat::EcstoreError::FaultyDisk) }).await;
 
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn background_shutdown_plan_keeps_scanner_before_ahm() {
-        assert_eq!(
-            background_shutdown_steps(true, true),
-            vec![BackgroundShutdownStep::DataScanner, BackgroundShutdownStep::Ahm]
-        );
-        assert_eq!(
-            background_shutdown_steps(true, false),
-            vec![BackgroundShutdownStep::DataScanner, BackgroundShutdownStep::Ahm]
-        );
-        assert_eq!(background_shutdown_steps(false, true), vec![BackgroundShutdownStep::Ahm]);
-        assert!(background_shutdown_steps(false, false).is_empty());
     }
 }

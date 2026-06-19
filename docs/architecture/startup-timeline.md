@@ -69,11 +69,11 @@ new startup semantics.
 
 | Step | Source | Current action | Side effects | Fatal boundary | Ready stage |
 |---|---|---|---|---|---|
-| `STOP-001` | `rustfs/src/startup_services.rs` | Cancel runtime token and move service state to `Stopping`. | Notifies cancellation-aware background tasks. | Non-fatal. | Service state moves to `Stopping`; readiness stages are not cleared here |
-| `STOP-002` | `rustfs/src/startup_services.rs` | Stop scanner/background services and AHM services according to enable flags. | Calls ECStore background shutdown and heal/scanner shutdown helpers. | Non-fatal in this path. | No readiness-stage change |
+| `STOP-001` | `rustfs/src/startup_shutdown.rs` | Cancel runtime token and move service state to `Stopping`. | Notifies cancellation-aware background tasks. | Non-fatal. | Service state moves to `Stopping`; readiness stages are not cleared here |
+| `STOP-002` | `rustfs/src/startup_shutdown.rs` | Stop scanner/background services and AHM services according to enable flags. | Calls ECStore background shutdown and heal/scanner shutdown helpers. | Non-fatal in this path. | No readiness-stage change |
 | `STOP-003` | `rustfs/src/startup_optional_runtimes.rs` | Plan optional runtime shutdown and log stopping state for FTP/FTPS/WebDAV/SFTP protocol servers. | Collects protocol shutdown handles. | Non-fatal in this path. | No readiness-stage change |
-| `STOP-004` | `rustfs/src/startup_services.rs` and `rustfs/src/startup_profiling.rs` | Stop event notifier, audit system, and profiling tasks. | Stops notifier and profiling tasks; audit stop failures are logged. | Non-fatal in this path. | No readiness-stage change |
-| `STOP-005` | `rustfs/src/startup_services.rs` and `rustfs/src/startup_optional_runtimes.rs` | Stop S3 and console HTTP servers, signal and wait for optional protocol shutdowns, then mark service state `Stopped`. | HTTP shutdown happens after notifier/audit/profiling shutdown in current order. | Join failures are logged by shutdown handles; this path does not return errors. | Service state moves to `Stopped`; readiness stages are not cleared here |
+| `STOP-004` | `rustfs/src/startup_shutdown.rs` and `rustfs/src/startup_profiling.rs` | Stop event notifier, audit system, and profiling tasks. | Stops notifier and profiling tasks; audit stop failures are logged. | Non-fatal in this path. | No readiness-stage change |
+| `STOP-005` | `rustfs/src/startup_shutdown.rs` and `rustfs/src/startup_optional_runtimes.rs` | Stop S3 and console HTTP servers, signal and wait for optional protocol shutdowns, then mark service state `Stopped`. | HTTP shutdown happens after notifier/audit/profiling shutdown in current order. | Join failures are logged by shutdown handles; this path does not return errors. | Service state moves to `Stopped`; readiness stages are not cleared here |
 
 ## Migration Rules
 

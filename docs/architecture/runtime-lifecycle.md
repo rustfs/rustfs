@@ -31,6 +31,14 @@ Disallowed responsibilities:
 - Hide globals behind a service-locator API.
 - Change startup side effects while moving code.
 
+## Shutdown Lifecycle Boundary
+
+`startup_shutdown` owns the main shutdown sequence after the process receives a
+shutdown signal. Startup modules may pass handles into this boundary, but they
+must not reorder runtime-token cancellation, background service shutdown,
+optional runtime shutdown planning, notifier/audit/profiling shutdown, HTTP
+shutdown, optional runtime waits, or final service-state publication.
+
 ## Optional Runtime Boundary
 
 `startup_optional_runtimes` owns startup and shutdown handoff for optional
