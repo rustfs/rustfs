@@ -5,18 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-list-contracts-direct`
-- Baseline: stacked after `rustfs/rustfs#3613`
-  (`28fce7b377c38b286b69c62f1ab15711d0f59589`).
+- Branch: `overtrue/arch-ecstore-object-api-alias-prune`
+- Baseline: stacked after `rustfs/rustfs#3614`
+  (`3740e65246aed8c8ee9685ed0234997c7d54e1b5`).
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: migrate ECStore internal list/walk consumers to direct
-  aliases over the generic `rustfs-storage-api` list contracts, including
-  replication worker trait bounds.
-- CI/script changes: make the migration guard reject ECStore internal
-  `crate::object_api` imports of list/walk compatibility aliases, including
-  multi-line import forms.
-- Docs changes: record the API-065 ECStore list contract cleanup slice.
+- Rust code changes: remove unused public `rustfs-storage-api` passthrough
+  aliases from ECStore `object_api` and bind the ECStore contract test directly
+  to the storage-api generic list/delete/walk contracts.
+- CI/script changes: make the migration guard reject restoring ECStore
+  `object_api` storage-api passthrough aliases.
+- Docs changes: record the API-066 ECStore object API alias prune slice.
 
 ## Phase 0 Tasks
 
@@ -302,6 +301,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     compatibility.
   - Verification: focused ECStore compile checks, migration guard, formatting,
     diff hygiene, risk scan, and three-expert review.
+
+- [x] `API-066` Prune ECStore object API storage aliases.
+  - Completed slice: remove unused public storage-api passthrough aliases from
+    ECStore `object_api` for list responses, walk options, walk result items,
+    and delete-object DTOs, then bind the ECStore contract test directly to the
+    generic `rustfs-storage-api` contracts.
+  - Acceptance: ECStore `object_api` no longer exposes storage-api passthrough
+    aliases, the storage contract test still proves ECStore implements the
+    storage-api traits with the same associated concrete types, and migration
+    rules reject restoring the object_api passthrough aliases.
+  - Must preserve: ECStore-owned object metadata, object options, reader/writer
+    types, storage-api trait associated type bindings, list/delete/walk response
+    shapes, and runtime behavior.
+  - Verification: focused ECStore compile checks, storage contract test,
+    downstream compile checks, migration and layer guards, formatting, diff
+    hygiene, risk scan, full pre-commit, and three-expert review.
 
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.
   - Acceptance: `./scripts/check_architecture_migration_rules.sh` parses the
