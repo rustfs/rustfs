@@ -422,7 +422,7 @@ impl RustFSServerBuilder {
         // Buffer profiles.
         init_buffer_profile_system(&config);
 
-        if let Err(e) = crate::startup_services::init_event_notifier_and_audit().await {
+        if let Err(e) = crate::startup_service_components::init_event_notifier_and_audit().await {
             warn!(
                 component = LOG_COMPONENT_EMBEDDED,
                 subsystem = LOG_SUBSYSTEM_EMBEDDED,
@@ -465,7 +465,7 @@ impl RustFSServerBuilder {
         // Bucket notifications.
         add_bucket_notification_configuration(buckets.clone()).await;
 
-        if let Err(e) = crate::startup_services::init_notification_system(endpoint_pools.clone()).await {
+        if let Err(e) = crate::startup_service_components::init_notification_system(endpoint_pools.clone()).await {
             warn!(
                 component = LOG_COMPONENT_EMBEDDED,
                 subsystem = LOG_SUBSYSTEM_EMBEDDED,

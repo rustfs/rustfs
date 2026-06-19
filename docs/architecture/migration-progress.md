@@ -5,15 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-startup-ready-lifecycle-boundary`
-- Baseline: `origin/main` (`e9037f9eb09fcbb31d980efac8b8e6b8f12bcaef`).
+- Branch: `overtrue/arch-startup-service-components-boundary`
+- Baseline: `overtrue/arch-startup-ready-lifecycle-boundary`
+  (`a518f40489515c1ec37c3cbc5738e04955a942f2`).
+- Stacked on: rustfs/rustfs#3635.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move ready publication, scanner startup, shutdown-signal
-  wait, and stopped-state final logging from `startup_services` into a
-  dedicated startup lifecycle boundary.
+- Rust code changes: move startup service component initialization helpers from
+  `startup_services` into a dedicated startup service component boundary.
 - CI/script changes: none.
-- Docs changes: record the R-024 startup lifecycle boundary slice.
+- Docs changes: record the R-025 startup service component boundary slice.
 
 ## Phase 0 Tasks
 
@@ -2077,6 +2078,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
     freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `R-025` Extract startup service component boundary.
+  - Do: add `startup_service_components` and move audit/deadlock, bucket
+    metadata, IAM bootstrap, auth integration, notification, background service,
+    and observability component helpers out of `startup_services`.
+  - Acceptance: `startup_services` keeps the same runtime service orchestration
+    order while component helpers own the individual service startup side
+    effects.
+  - Must preserve: KMS before optional runtime startup, buffer profiling before
+    audit, event notifier before audit, bucket metadata before IAM, IAM before
+    auth and notification, notification before background services, and
+    observability startup after background service setup.
+  - Verification: focused startup service component/service/lifecycle tests,
+    RustFS lib check, migration/layer guards, formatting, diff hygiene, Rust
+    risk scan, branch freshness check, pre-commit quality gate, and
+    three-expert review.
+
 ## Next PRs
 
 1. `pure-move`: continue larger lifecycle hook slices for optional runtime
@@ -2088,9 +2105,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-024 keeps runtime service initialization in `startup_services` and moves ready/scanner/shutdown-wait orchestration into `startup_lifecycle`. |
-| Migration preservation | passed | Ready publication, global init time, scanner startup, shutdown wait/delegation, and final stopped logging remain ordered. |
-| Testing/verification | passed | Focused lifecycle, shutdown, and startup service tests plus final checks are tracked below before push. |
+| Quality/architecture | passed | R-025 keeps `startup_services` as the orchestrator and moves component helpers into `startup_service_components`. |
+| Migration preservation | passed | Runtime service startup order and embedded helper reuse remain unchanged. |
+| Testing/verification | passed | Focused component, service, lifecycle, final hygiene, and full pre-commit checks passed. |
 
 ## Verification Notes
 
@@ -2163,6 +2180,20 @@ Passed before push:
   - `cargo test -p rustfs --lib startup_lifecycle -- --nocapture`: passed.
   - `cargo test -p rustfs --lib startup_services -- --nocapture`: passed.
   - `cargo test -p rustfs --lib startup_shutdown -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 R-025 current slice:
+  - `cargo test -p rustfs --lib startup_service_components -- --nocapture`:
+    passed.
+  - `cargo test -p rustfs --lib startup_services -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_lifecycle -- --nocapture`: passed.
   - `cargo check -p rustfs --lib`: passed.
   - `./scripts/check_architecture_migration_rules.sh`: passed.
   - `./scripts/check_layer_dependencies.sh`: passed.
