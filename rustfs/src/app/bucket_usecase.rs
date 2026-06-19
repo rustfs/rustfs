@@ -1027,6 +1027,7 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket lifecycle delete hook failed");
         }
 
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(DeleteBucketLifecycleOutput::default()))
     }
 
@@ -1096,6 +1097,7 @@ impl DefaultBucketUsecase {
 
         info!(bucket = %bucket, "deleted bucket replication config");
 
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(DeleteBucketReplicationOutput::default()))
     }
 
@@ -1115,6 +1117,7 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket tagging delete hook failed");
         }
 
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(DeleteBucketTaggingOutput {}))
     }
 
@@ -1676,6 +1679,7 @@ impl DefaultBucketUsecase {
             });
         }
 
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(PutBucketLifecycleConfigurationOutput::default()))
     }
 
@@ -1889,6 +1893,7 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket replication-config hook failed");
         }
 
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(PutBucketReplicationOutput::default()))
     }
 
@@ -1951,6 +1956,7 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket tagging hook failed");
         }
 
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(PutBucketTaggingOutput::default()))
     }
 
@@ -1981,6 +1987,7 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket versioning hook failed");
         }
 
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(PutBucketVersioningOutput {}))
     }
 

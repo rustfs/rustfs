@@ -4379,6 +4379,7 @@ impl DefaultObjectUsecase {
                 )
                 .await
                 .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrCopyObject".into()), "restore object failed."))?;
+            rustfs_scanner::record_dirty_usage_bucket(&bucket);
 
             if already_restored {
                 let output = RestoreObjectOutput {
@@ -4435,6 +4436,7 @@ impl DefaultObjectUsecase {
                     err.to_string()
                 );
             } else {
+                rustfs_scanner::record_dirty_usage_bucket(&bucket_clone);
                 debug!(bucket = %bucket_clone, object = %object_clone, "Transitioned object restored");
             }
         });
