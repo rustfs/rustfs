@@ -51,7 +51,7 @@ use crate::{
     // event::name::EventName,
     event_notification::{EventArgs, send_event},
     global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id, is_dist_erasure},
-    store_api::{GetObjectReader, ListObjectsV2Info, MultipartOperations, ObjectIO, ObjectInfo, ObjectOperations, PutObjReader},
+    store_api::{GetObjectReader, ListObjectsV2Info, ObjectInfo, PutObjReader},
     store_init::load_format_erasure,
 };
 use bytes::Bytes;

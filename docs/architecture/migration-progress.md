@@ -5,17 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-operation-compat-cleanup`
-- Baseline: stacked after `rustfs/rustfs#3607`
-  (`43666b2e005b7f4ed51b41d0cda56094e40d90c1`).
+- Branch: `overtrue/arch-ecstore-direct-storage-ops`
+- Baseline: stacked after `rustfs/rustfs#3608`
+  (`d9a08f00bdc0422d519d3f3f69f75761cfa76bed`).
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: remove the remaining ECStore `store_api` compatibility
-  subtraits for heal and namespace-lock operations, and make internal coverage
-  use the shared `rustfs_storage_api` contracts directly.
-- CI/script changes: shrink migration guard coverage so it no longer requires
-  the removed operation facade bindings.
-- Docs changes: record the API-060 operation compatibility cleanup slice.
+- Rust code changes: remove the remaining public ECStore `store_api`
+  operation compatibility subtraits and move internal generic bounds to
+  crate-private shared storage-api contract constraints.
+- CI/script changes: shrink migration guard coverage so it rejects restored
+  store-api operation method signatures without requiring the removed facade
+  module, and extend direct storage-api contract coverage.
+- Docs changes: record the API-061 operation compatibility cleanup slice.
 
 ## Phase 0 Tasks
 
@@ -224,6 +225,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Must preserve: heal operation behavior, namespace-lock acquisition,
     replication resync locking, rebalance metadata locking, object I/O,
     multipart, list, and storage hot paths.
+  - Verification: focused ECStore contract tests, focused ECStore library
+    check, migration and layer guards, formatting, diff hygiene, risk scan, and
+    three-expert review.
+
+- [x] `API-061` Remove public ECStore object operation compatibility facades.
+  - Completed slice: remove the old public ECStore `store_api` object, list,
+    and multipart operation compatibility subtraits, and keep internal generic
+    bounds on crate-private storage-api contract constraints instead of public
+    downstream compatibility traits.
+  - Acceptance: `store_api` no longer exports public operation compatibility
+    traits, ECStore direct storage-api compile-time coverage includes object,
+    object-operation, list, multipart, namespace-lock, heal, and admin
+    contracts, and remaining public `store_api` exports are DTO/reader
+    compatibility paths only.
+  - Must preserve: object I/O, list/walk behavior, multipart behavior, config
+    persistence, tier config migration, rebalance metadata locking, lifecycle
+    journal handling, replication MRF/resync persistence, and downstream DTO
+    import compatibility.
   - Verification: focused ECStore contract tests, focused ECStore library
     check, migration and layer guards, formatting, diff hygiene, risk scan, and
     three-expert review.

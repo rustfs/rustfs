@@ -40,7 +40,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
-use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -48,9 +47,7 @@ pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
 
 mod readers;
-mod traits;
 mod types;
 
 pub use readers::*;
-pub use traits::*;
 pub use types::*;

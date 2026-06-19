@@ -366,8 +366,12 @@ fi
 
 (
   cd "$ROOT_DIR"
+  store_api_bucket_operation_scan_targets=(crates/ecstore/src/store_api.rs)
+  if [[ -f crates/ecstore/src/store_api/traits.rs ]]; then
+    store_api_bucket_operation_scan_targets+=(crates/ecstore/src/store_api/traits.rs)
+  fi
   rg -n --no-heading 'pub(?:\(crate\))? use rustfs_storage_api::\{[^}]*\bBucketOperations\b|pub trait BucketOperations\b' \
-    crates/ecstore/src/store_api.rs crates/ecstore/src/store_api/traits.rs || true
+    "${store_api_bucket_operation_scan_targets[@]}" || true
 ) >"$STORE_API_BUCKET_OPERATION_HITS_FILE"
 
 if [[ -s "$STORE_API_BUCKET_OPERATION_HITS_FILE" ]]; then
@@ -652,26 +656,16 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --no-heading 'async fn (get_object_reader|put_object|get_object_info|verify_object_integrity|copy_object|delete_object_version|delete_object|delete_objects|put_object_metadata|get_object_tags|put_object_tags|delete_object_tags|add_partial|transition_object|restore_transitioned_object|list_multipart_uploads|new_multipart_upload|copy_object_part|put_object_part|get_multipart_info|list_object_parts|abort_multipart_upload|complete_multipart_upload|heal_format|heal_bucket|heal_object|get_pool_and_set|check_abandoned_parts|new_ns_lock)\b' \
-    crates/ecstore/src/store_api/traits.rs || true
+  if [[ -f crates/ecstore/src/store_api/traits.rs ]]; then
+    rg -n --no-heading 'async fn (get_object_reader|put_object|get_object_info|verify_object_integrity|copy_object|delete_object_version|delete_object|delete_objects|put_object_metadata|get_object_tags|put_object_tags|delete_object_tags|add_partial|transition_object|restore_transitioned_object|list_multipart_uploads|new_multipart_upload|copy_object_part|put_object_part|get_multipart_info|list_object_parts|abort_multipart_upload|complete_multipart_upload|heal_format|heal_bucket|heal_object|get_pool_and_set|check_abandoned_parts|new_ns_lock)\b' \
+      crates/ecstore/src/store_api/traits.rs || true
+  fi
 ) >"$STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE"
 
 if [[ -s "$STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE" ]]; then
   report_failure "old ecstore operation method signatures reintroduced: $(paste -sd '; ' "$STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE")"
 fi
 
-require_source_contains \
-  "crates/ecstore/src/store_api/traits.rs" \
-  "rustfs_storage_api::ObjectIO<" \
-  "ECStore ObjectIO compatibility binding"
-require_source_contains \
-  "crates/ecstore/src/store_api/traits.rs" \
-  "rustfs_storage_api::ObjectOperations<" \
-  "ECStore ObjectOperations compatibility binding"
-require_source_contains \
-  "crates/ecstore/src/store_api/traits.rs" \
-  "rustfs_storage_api::MultipartOperations<" \
-  "ECStore MultipartOperations compatibility binding"
 require_source_contains \
   "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
   "fn ecstore_implements_storage_admin_api_contract()" \
@@ -680,6 +674,22 @@ require_source_contains \
   "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
   "fn ecstore_implements_storage_namespace_locking_contract()" \
   "ECStore storage-api NamespaceLocking compile-time coverage test"
+require_source_contains \
+  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
+  "fn ecstore_implements_storage_object_io_contract()" \
+  "ECStore storage-api ObjectIO compile-time coverage test"
+require_source_contains \
+  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
+  "fn ecstore_implements_storage_object_operations_contract()" \
+  "ECStore storage-api ObjectOperations compile-time coverage test"
+require_source_contains \
+  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
+  "fn ecstore_implements_storage_list_operations_contract()" \
+  "ECStore storage-api ListOperations compile-time coverage test"
+require_source_contains \
+  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
+  "fn ecstore_implements_storage_multipart_operations_contract()" \
+  "ECStore storage-api MultipartOperations compile-time coverage test"
 require_source_contains \
   "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
   "fn ecstore_implements_storage_heal_operations_contract()" \

@@ -33,7 +33,11 @@ use crate::global::GLOBAL_LocalNodeName;
 use crate::global::get_global_bucket_monitor;
 use crate::resolve_object_store_handle;
 use crate::set_disk::get_lock_acquire_timeout;
-use crate::store_api::{ListOperations, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, WalkOptions};
+use crate::storage_api_contracts::{EcstoreObjectIO, EcstoreObjectOperations};
+use crate::store_api::{
+    GetObjectReader, ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo, ObjectInfoOrErr, ObjectOptions, PutObjReader,
+    WalkOptions,
+};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
 use aws_sdk_s3::primitives::ByteStream;
@@ -52,13 +56,16 @@ use http_body_util::StreamBody;
 use regex::Regex;
 use rmp_serde;
 use rustfs_filemeta::{
-    MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo,
+    FileInfo, MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo,
     ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction, ReplicationState, ReplicationStatusType,
     ReplicationType, ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType,
     get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
 use rustfs_s3_types::EventName;
-use rustfs_storage_api::{DeletedObject, HTTPRangeSpec, NamespaceLocking as StorageNamespaceLocking, ObjectToDelete};
+use rustfs_storage_api::{
+    DeletedObject, HTTPRangeSpec, ListOperations, NamespaceLocking as StorageNamespaceLocking, ObjectIO, ObjectOperations,
+    ObjectToDelete,
+};
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, AMZ_TAGGING_DIRECTIVE, CONTENT_ENCODING, HeaderExt as _,
     SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
@@ -104,18 +111,58 @@ const EVENT_RESYNC_RUNTIME_CHANNEL_FAILED: &str = "replication_resync_runtime_ch
 
 /// Storage capabilities required by bucket replication workers.
 pub trait ReplicationStorage:
-    ObjectIO
-    + ObjectOperations
-    + ListOperations
-    + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
+    ObjectIO<
+        Error = Error,
+        RangeSpec = HTTPRangeSpec,
+        HeaderMap = HeaderMap,
+        ObjectOptions = ObjectOptions,
+        ObjectInfo = ObjectInfo,
+        GetObjectReader = GetObjectReader,
+        PutObjectReader = PutObjReader,
+    > + ObjectOperations<
+        Error = Error,
+        ObjectInfo = ObjectInfo,
+        ObjectOptions = ObjectOptions,
+        FileInfo = FileInfo,
+        ObjectToDelete = ObjectToDelete,
+        DeletedObject = DeletedObject,
+    > + ListOperations<
+        Error = Error,
+        ListObjectsV2Info = ListObjectsV2Info,
+        ListObjectVersionsInfo = ListObjectVersionsInfo,
+        ObjectInfoOrErr = ObjectInfoOrErr,
+        WalkOptions = WalkOptions,
+        WalkCancellation = CancellationToken,
+        WalkResultSender = tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+    > + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
 {
 }
 
 impl<T> ReplicationStorage for T where
-    T: ObjectIO
-        + ObjectOperations
-        + ListOperations
-        + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
+    T: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        > + ObjectOperations<
+            Error = Error,
+            ObjectInfo = ObjectInfo,
+            ObjectOptions = ObjectOptions,
+            FileInfo = FileInfo,
+            ObjectToDelete = ObjectToDelete,
+            DeletedObject = DeletedObject,
+        > + ListOperations<
+            Error = Error,
+            ListObjectsV2Info = ListObjectsV2Info,
+            ListObjectVersionsInfo = ListObjectVersionsInfo,
+            ObjectInfoOrErr = ObjectInfoOrErr,
+            WalkOptions = WalkOptions,
+            WalkCancellation = CancellationToken,
+            WalkResultSender = tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+        > + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
 {
 }
 
@@ -540,7 +587,18 @@ impl ReplicationResyncer {
         }
     }
 
-    pub async fn mark_status<S: ObjectIO>(&self, status: ResyncStatusType, opts: ResyncOpts, obj_layer: Arc<S>) -> Result<()> {
+    pub async fn mark_status<S>(&self, status: ResyncStatusType, opts: ResyncOpts, obj_layer: Arc<S>) -> Result<()>
+    where
+        S: ObjectIO<
+                Error = Error,
+                RangeSpec = HTTPRangeSpec,
+                HeaderMap = HeaderMap,
+                ObjectOptions = ObjectOptions,
+                ObjectInfo = ObjectInfo,
+                GetObjectReader = GetObjectReader,
+                PutObjectReader = PutObjReader,
+            >,
+    {
         let bucket_status = {
             let mut status_map = self.status_map.write().await;
             let now = OffsetDateTime::now_utc();
@@ -653,7 +711,18 @@ impl ReplicationResyncer {
         bucket_status.last_update = Some(now);
     }
 
-    pub async fn persist_to_disk<S: ObjectIO>(&self, cancel_token: CancellationToken, api: Arc<S>) {
+    pub async fn persist_to_disk<S>(&self, cancel_token: CancellationToken, api: Arc<S>)
+    where
+        S: ObjectIO<
+                Error = Error,
+                RangeSpec = HTTPRangeSpec,
+                HeaderMap = HeaderMap,
+                ObjectOptions = ObjectOptions,
+                ObjectInfo = ObjectInfo,
+                GetObjectReader = GetObjectReader,
+                PutObjectReader = PutObjReader,
+            >,
+    {
         let mut interval = tokio::time::interval(RESYNC_TIME_INTERVAL);
 
         let mut last_update_times = HashMap::new();
@@ -706,7 +775,7 @@ impl ReplicationResyncer {
         }
     }
 
-    async fn resync_bucket_mark_status<S: ObjectIO>(&self, status: ResyncStatusType, opts: ResyncOpts, storage: Arc<S>) {
+    async fn resync_bucket_mark_status<S: EcstoreObjectIO>(&self, status: ResyncStatusType, opts: ResyncOpts, storage: Arc<S>) {
         if let Err(err) = self.mark_status(status, opts.clone(), storage.clone()).await {
             error!(
                 event = EVENT_RESYNC_STATUS_UPDATE_SKIPPED,
@@ -1231,7 +1300,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
     }
 }
 
-pub(crate) async fn save_resync_status<S: ObjectIO>(
+pub(crate) async fn save_resync_status<S: EcstoreObjectIO>(
     bucket: &str,
     status: &BucketReplicationResyncStatus,
     api: Arc<S>,
@@ -2193,7 +2262,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
     }
 }
 
-async fn source_delete_marker_missing<S: ObjectOperations>(
+async fn source_delete_marker_missing<S: EcstoreObjectOperations>(
     storage: &S,
     bucket: &str,
     object_name: &str,
@@ -2885,13 +2954,13 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
 }
 
 trait ReplicateObjectInfoExt {
-    async fn replicate_object<S: ObjectIO>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo;
-    async fn replicate_all<S: ObjectIO>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo;
+    async fn replicate_object<S: EcstoreObjectIO>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo;
+    async fn replicate_all<S: EcstoreObjectIO>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo;
     fn to_object_info(&self) -> ObjectInfo;
 }
 
 impl ReplicateObjectInfoExt for ReplicateObjectInfo {
-    async fn replicate_object<S: ObjectIO>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
+    async fn replicate_object<S: EcstoreObjectIO>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
         let bucket = self.bucket.clone();
         let object = self.name.clone();
 
@@ -3186,7 +3255,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         rinfo
     }
 
-    async fn replicate_all<S: ObjectIO>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
+    async fn replicate_all<S: EcstoreObjectIO>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
         let start_time = OffsetDateTime::now_utc();
 
         let bucket = self.bucket.clone();
@@ -3908,7 +3977,7 @@ fn part_range_spec_from_actual_size(offset: i64, part_size: i64) -> std::io::Res
     ))
 }
 
-struct MultipartReplicationContext<'a, S: ObjectIO> {
+struct MultipartReplicationContext<'a, S: EcstoreObjectIO> {
     storage: Arc<S>,
     cli: Arc<TargetClient>,
     src_bucket: &'a str,
@@ -3920,7 +3989,7 @@ struct MultipartReplicationContext<'a, S: ObjectIO> {
     put_opts: PutObjectOptions,
 }
 
-async fn replicate_object_with_multipart<S: ObjectIO>(ctx: MultipartReplicationContext<'_, S>) -> std::io::Result<()> {
+async fn replicate_object_with_multipart<S: EcstoreObjectIO>(ctx: MultipartReplicationContext<'_, S>) -> std::io::Result<()> {
     let MultipartReplicationContext {
         storage,
         cli,

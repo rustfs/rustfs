@@ -38,6 +38,7 @@ pub mod rio;
 pub mod rpc;
 pub mod set_disk;
 mod sets;
+mod storage_api_contracts;
 pub mod store;
 pub mod store_api;
 mod store_init;

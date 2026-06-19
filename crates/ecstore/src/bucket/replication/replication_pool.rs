@@ -27,7 +27,8 @@ use crate::bucket::replication::replication_state::ReplicationStats;
 use crate::config::com::{read_config, save_config};
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::Error as EcstoreError;
-use crate::store_api::{ObjectIO, ObjectInfo, ObjectOptions};
+use crate::storage_api_contracts::EcstoreObjectIO;
+use crate::store_api::{ObjectInfo, ObjectOptions};
 use lazy_static::lazy_static;
 use rustfs_filemeta::MrfOpKind;
 use rustfs_filemeta::MrfReplicateEntry;
@@ -1252,7 +1253,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 /// Returns `true` on success; on failure logs the error and returns `false`.
 /// Callers must NOT clear their in-memory buffer on `false` so the next tick
 /// can retry — otherwise a transient storage error permanently drops the batch.
-async fn flush_mrf_to_disk<S: ObjectIO>(entries: &[MrfReplicateEntry], storage: &Arc<S>) -> bool {
+async fn flush_mrf_to_disk<S: EcstoreObjectIO>(entries: &[MrfReplicateEntry], storage: &Arc<S>) -> bool {
     match encode_mrf_file(entries) {
         Ok(data) => {
             if let Err(e) = save_config(storage.clone(), MRF_REPLICATION_FILE, data).await {
@@ -1281,7 +1282,7 @@ async fn flush_mrf_to_disk<S: ObjectIO>(entries: &[MrfReplicateEntry], storage: 
 }
 
 /// Load bucket resync metadata from disk
-async fn load_bucket_resync_metadata<S: ObjectIO>(
+async fn load_bucket_resync_metadata<S: EcstoreObjectIO>(
     bucket: &str,
     obj_api: Arc<S>,
 ) -> Result<BucketReplicationResyncStatus, EcstoreError> {

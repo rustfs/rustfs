@@ -1,14 +1,18 @@
-use super::*;
-use rustfs_storage_api::{
-    CompletePart, DeletedObject, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, ObjectToDelete,
-    PartInfo,
+use crate::error::Error;
+use crate::store_api::{
+    GetObjectReader, ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo, ObjectInfoOrErr, ObjectOptions, PutObjReader,
+    WalkOptions,
 };
+use rustfs_filemeta::FileInfo;
+use rustfs_storage_api::{DeletedObject, HTTPRangeSpec, ObjectToDelete};
+use std::fmt::Debug;
+use tokio_util::sync::CancellationToken;
 
-pub trait ObjectIO:
+pub(crate) trait EcstoreObjectIO:
     rustfs_storage_api::ObjectIO<
         Error = Error,
         RangeSpec = HTTPRangeSpec,
-        HeaderMap = HeaderMap,
+        HeaderMap = http::HeaderMap,
         ObjectOptions = ObjectOptions,
         ObjectInfo = ObjectInfo,
         GetObjectReader = GetObjectReader,
@@ -20,11 +24,11 @@ pub trait ObjectIO:
 {
 }
 
-impl<T> ObjectIO for T where
+impl<T> EcstoreObjectIO for T where
     T: rustfs_storage_api::ObjectIO<
             Error = Error,
             RangeSpec = HTTPRangeSpec,
-            HeaderMap = HeaderMap,
+            HeaderMap = http::HeaderMap,
             ObjectOptions = ObjectOptions,
             ObjectInfo = ObjectInfo,
             GetObjectReader = GetObjectReader,
@@ -36,8 +40,7 @@ impl<T> ObjectIO for T where
 {
 }
 
-/// Object-level storage operations (beyond basic I/O in ObjectIO).
-pub trait ObjectOperations:
+pub(crate) trait EcstoreObjectOperations:
     rustfs_storage_api::ObjectOperations<
         Error = Error,
         ObjectInfo = ObjectInfo,
@@ -51,7 +54,7 @@ pub trait ObjectOperations:
 {
 }
 
-impl<T> ObjectOperations for T where
+impl<T> EcstoreObjectOperations for T where
     T: rustfs_storage_api::ObjectOperations<
             Error = Error,
             ObjectInfo = ObjectInfo,
@@ -65,8 +68,7 @@ impl<T> ObjectOperations for T where
 {
 }
 
-/// Listing and walking operations.
-pub trait ListOperations:
+pub(crate) trait EcstoreListOperations:
     rustfs_storage_api::ListOperations<
         Error = Error,
         ListObjectsV2Info = ListObjectsV2Info,
@@ -81,7 +83,7 @@ pub trait ListOperations:
 {
 }
 
-impl<T> ListOperations for T where
+impl<T> EcstoreListOperations for T where
     T: rustfs_storage_api::ListOperations<
             Error = Error,
             ListObjectsV2Info = ListObjectsV2Info,
@@ -90,43 +92,6 @@ impl<T> ListOperations for T where
             WalkOptions = WalkOptions,
             WalkCancellation = CancellationToken,
             WalkResultSender = tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
-        > + Send
-        + Sync
-        + Debug
-{
-}
-
-/// Multipart upload operations.
-pub trait MultipartOperations:
-    rustfs_storage_api::MultipartOperations<
-        Error = Error,
-        ObjectInfo = ObjectInfo,
-        ObjectOptions = ObjectOptions,
-        PutObjectReader = PutObjReader,
-        CompletePart = CompletePart,
-        ListMultipartsInfo = ListMultipartsInfo,
-        MultipartUploadResult = MultipartUploadResult,
-        PartInfo = PartInfo,
-        MultipartInfo = MultipartInfo,
-        ListPartsInfo = ListPartsInfo,
-    > + Send
-    + Sync
-    + Debug
-{
-}
-
-impl<T> MultipartOperations for T where
-    T: rustfs_storage_api::MultipartOperations<
-            Error = Error,
-            ObjectInfo = ObjectInfo,
-            ObjectOptions = ObjectOptions,
-            PutObjectReader = PutObjReader,
-            CompletePart = CompletePart,
-            ListMultipartsInfo = ListMultipartsInfo,
-            MultipartUploadResult = MultipartUploadResult,
-            PartInfo = PartInfo,
-            MultipartInfo = MultipartInfo,
-            ListPartsInfo = ListPartsInfo,
         > + Send
         + Sync
         + Debug

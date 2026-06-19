@@ -17,11 +17,18 @@
 use crate::bucket::metadata::BUCKET_METADATA_FILE;
 use crate::bucket::replication::{decode_resync_file, encode_resync_file};
 use crate::disk::{BUCKET_META_PREFIX, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
-use crate::store_api::{ListOperations, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader};
+use crate::storage_api_contracts::{EcstoreObjectIO, EcstoreObjectOperations};
+use crate::store_api::{
+    GetObjectReader, ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo, ObjectInfoOrErr, ObjectOptions, PutObjReader,
+    WalkOptions,
+};
 use http::HeaderMap;
+use rustfs_filemeta::FileInfo;
 use rustfs_policy::auth::UserIdentity;
 use rustfs_policy::policy::PolicyDoc;
-use rustfs_storage_api::{BucketOperations, BucketOptions};
+use rustfs_storage_api::{
+    BucketOperations, BucketOptions, DeletedObject, HTTPRangeSpec, ListOperations, ObjectIO, ObjectOperations, ObjectToDelete,
+};
 use rustfs_utils::path::SLASH_SEPARATOR;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -179,7 +186,23 @@ fn normalize_bucket_meta_blob(path: &str, data: &[u8]) -> std::result::Result<Op
 /// Skips buckets that already exist in RustFS (idempotent).
 pub async fn try_migrate_bucket_metadata<S>(store: Arc<S>)
 where
-    S: BucketOperations<Error = crate::error::Error> + ObjectIO + ObjectOperations,
+    S: BucketOperations<Error = crate::error::Error>
+        + ObjectIO<
+            Error = crate::error::Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        > + ObjectOperations<
+            Error = crate::error::Error,
+            ObjectInfo = ObjectInfo,
+            ObjectOptions = ObjectOptions,
+            FileInfo = FileInfo,
+            ObjectToDelete = ObjectToDelete,
+            DeletedObject = DeletedObject,
+        >,
 {
     let buckets_list = match store
         .list_bucket(&BucketOptions {
@@ -224,7 +247,7 @@ where
 
 async fn migrate_one_if_missing<S>(store: Arc<S>, opts: &ObjectOptions, headers: &HeaderMap, path: &str, label: &str)
 where
-    S: ObjectIO + ObjectOperations,
+    S: EcstoreObjectIO + EcstoreObjectOperations,
 {
     if store
         .get_object_info(RUSTFS_META_BUCKET, path, &ObjectOptions::default())
@@ -278,7 +301,30 @@ where
 /// If list_objects_v2 on the legacy bucket fails (e.g. format differs), migration is skipped.
 pub async fn try_migrate_iam_config<S>(store: Arc<S>)
 where
-    S: ListOperations + ObjectIO + ObjectOperations,
+    S: ListOperations<
+            Error = crate::error::Error,
+            ListObjectsV2Info = ListObjectsV2Info,
+            ListObjectVersionsInfo = ListObjectVersionsInfo,
+            ObjectInfoOrErr = ObjectInfoOrErr,
+            WalkOptions = WalkOptions,
+            WalkCancellation = tokio_util::sync::CancellationToken,
+            WalkResultSender = tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+        > + ObjectIO<
+            Error = crate::error::Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        > + ObjectOperations<
+            Error = crate::error::Error,
+            ObjectInfo = ObjectInfo,
+            ObjectOptions = ObjectOptions,
+            FileInfo = FileInfo,
+            ObjectToDelete = ObjectToDelete,
+            DeletedObject = DeletedObject,
+        >,
 {
     let opts = ObjectOptions {
         max_parity: true,

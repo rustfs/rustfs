@@ -24,8 +24,9 @@ use crate::config::com::{delete_config, read_config, save_config};
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result};
 use crate::store::ECStore;
-use crate::store_api::{ObjectIO, ObjectOperations};
-use rustfs_storage_api::ListOperations as _;
+use crate::store_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
+use rustfs_filemeta::FileInfo;
+use rustfs_storage_api::{DeletedObject, HTTPRangeSpec, ListOperations as _, ObjectIO, ObjectOperations, ObjectToDelete};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
@@ -104,7 +105,15 @@ fn encode_tier_delete_journal_entry(je: &Jentry) -> Result<Vec<u8>> {
 
 pub async fn persist_tier_delete_journal_entry<S>(api: Arc<S>, je: &Jentry) -> std::io::Result<()>
 where
-    S: ObjectIO,
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = http::HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
 {
     let data = encode_tier_delete_journal_entry(je).map_err(std::io::Error::other)?;
     save_config(api, &tier_delete_journal_object_name(je), data)
@@ -114,7 +123,14 @@ where
 
 pub async fn remove_tier_delete_journal_entry<S>(api: Arc<S>, je: &Jentry) -> std::io::Result<()>
 where
-    S: ObjectOperations,
+    S: ObjectOperations<
+            Error = Error,
+            ObjectInfo = ObjectInfo,
+            ObjectOptions = ObjectOptions,
+            FileInfo = FileInfo,
+            ObjectToDelete = ObjectToDelete,
+            DeletedObject = DeletedObject,
+        >,
 {
     match delete_config(api, &tier_delete_journal_object_name(je)).await {
         Ok(()) | Err(Error::ConfigNotFound) => Ok(()),

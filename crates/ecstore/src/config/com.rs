@@ -16,7 +16,8 @@ use crate::config::{audit, notify, oidc, set_global_storage_class, storageclass}
 use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::global::is_first_cluster_node_local;
-use crate::store_api::{ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, PutObjReader};
+use crate::storage_api_contracts::EcstoreObjectIO;
+use crate::store_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use http::HeaderMap;
 use rustfs_config::audit::{
     AUDIT_AMQP_KEYS, AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS,
@@ -32,7 +33,8 @@ use rustfs_config::notify::{
 use rustfs_config::oidc::{IDENTITY_OPENID_KEYS, IDENTITY_OPENID_SUB_SYS, OIDC_REDIRECT_URI_DYNAMIC};
 use rustfs_config::server_config::{Config, KVS};
 use rustfs_config::{COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, RUSTFS_REGION};
-use rustfs_storage_api::StorageAdminApi;
+use rustfs_filemeta::FileInfo;
+use rustfs_storage_api::{DeletedObject, HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectToDelete, StorageAdminApi};
 use rustfs_utils::path::SLASH_SEPARATOR;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -182,12 +184,34 @@ fn audit_target_descriptors() -> [TargetConfigDescriptor; 9] {
 }
 
 #[instrument(skip(api))]
-pub async fn read_config<S: ObjectIO>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
+pub async fn read_config<S>(api: Arc<S>, file: &str) -> Result<Vec<u8>>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
     let (data, _obj) = read_config_with_metadata(api, file, &ObjectOptions::default()).await?;
     Ok(data)
 }
 
-pub async fn read_config_no_lock<S: ObjectIO>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
+pub async fn read_config_no_lock<S>(api: Arc<S>, file: &str) -> Result<Vec<u8>>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
     let (data, _obj) = read_config_with_metadata(
         api,
         file,
@@ -200,11 +224,18 @@ pub async fn read_config_no_lock<S: ObjectIO>(api: Arc<S>, file: &str) -> Result
     Ok(data)
 }
 
-pub async fn read_config_with_metadata<S: ObjectIO>(
-    api: Arc<S>,
-    file: &str,
-    opts: &ObjectOptions,
-) -> Result<(Vec<u8>, ObjectInfo)> {
+pub async fn read_config_with_metadata<S>(api: Arc<S>, file: &str, opts: &ObjectOptions) -> Result<(Vec<u8>, ObjectInfo)>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
     let h = HeaderMap::new();
     let mut rd = api
         .get_object_reader(RUSTFS_META_BUCKET, file, None, h, opts)
@@ -228,7 +259,18 @@ pub async fn read_config_with_metadata<S: ObjectIO>(
 }
 
 #[instrument(skip(api, data))]
-pub async fn save_config<S: ObjectIO>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()> {
+pub async fn save_config<S>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
     save_config_with_opts(
         api,
         file,
@@ -242,7 +284,17 @@ pub async fn save_config<S: ObjectIO>(api: Arc<S>, file: &str, data: Vec<u8>) ->
 }
 
 #[instrument(skip(api))]
-pub async fn delete_config<S: ObjectOperations>(api: Arc<S>, file: &str) -> Result<()> {
+pub async fn delete_config<S>(api: Arc<S>, file: &str) -> Result<()>
+where
+    S: ObjectOperations<
+            Error = Error,
+            ObjectInfo = ObjectInfo,
+            ObjectOptions = ObjectOptions,
+            FileInfo = FileInfo,
+            ObjectToDelete = ObjectToDelete,
+            DeletedObject = DeletedObject,
+        >,
+{
     match api
         .delete_object(
             RUSTFS_META_BUCKET,
@@ -266,7 +318,18 @@ pub async fn delete_config<S: ObjectOperations>(api: Arc<S>, file: &str) -> Resu
     }
 }
 
-pub async fn save_config_with_opts<S: ObjectIO>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<()> {
+pub async fn save_config_with_opts<S>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<()>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
     let mut put_data = PutObjReader::from_vec(data);
     if let Err(err) = api.put_object(RUSTFS_META_BUCKET, file, &mut put_data, opts).await {
         error!("save_config_with_opts: err: {:?}, file: {}", err, file);
@@ -281,7 +344,7 @@ fn new_server_config() -> Config {
 
 async fn new_and_save_server_config<S>(api: Arc<S>) -> Result<Config>
 where
-    S: ObjectIO + StorageAdminApi,
+    S: EcstoreObjectIO + StorageAdminApi,
 {
     let mut cfg = new_server_config();
     lookup_configs(&mut cfg, api.clone()).await;
@@ -985,7 +1048,22 @@ fn is_object_not_found(err: &Error) -> bool {
 
 pub async fn try_migrate_server_config<S>(api: Arc<S>)
 where
-    S: ObjectIO + ObjectOperations,
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        > + ObjectOperations<
+            Error = Error,
+            ObjectInfo = ObjectInfo,
+            ObjectOptions = ObjectOptions,
+            FileInfo = FileInfo,
+            ObjectToDelete = ObjectToDelete,
+            DeletedObject = DeletedObject,
+        >,
 {
     let config_file = get_config_file();
     match api
@@ -1069,7 +1147,7 @@ where
 /// Handle the situation where the configuration file does not exist, create and save a new configuration
 async fn handle_missing_config<S>(api: Arc<S>, context: &str) -> Result<Config>
 where
-    S: ObjectIO + StorageAdminApi,
+    S: EcstoreObjectIO + StorageAdminApi,
 {
     warn!("Configuration not found ({}): Start initializing new configuration", context);
     let cfg = if is_first_cluster_node_local().await {
@@ -1091,7 +1169,15 @@ fn handle_config_read_error(err: Error, file_path: &str) -> Result<Config> {
 
 pub async fn read_config_without_migrate<S>(api: Arc<S>) -> Result<Config>
 where
-    S: ObjectIO + StorageAdminApi,
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        > + StorageAdminApi,
 {
     let config_file = get_config_file();
 
@@ -1105,7 +1191,7 @@ where
 
 async fn read_server_config<S>(api: Arc<S>, data: &[u8]) -> Result<Config>
 where
-    S: ObjectIO + StorageAdminApi,
+    S: EcstoreObjectIO + StorageAdminApi,
 {
     // If the provided data is empty, try to read from the file again
     if data.is_empty() {
@@ -1129,7 +1215,18 @@ where
     Ok(cfg.merge())
 }
 
-pub async fn save_server_config<S: ObjectIO>(api: Arc<S>, cfg: &Config) -> Result<()> {
+pub async fn save_server_config<S>(api: Arc<S>, cfg: &Config) -> Result<()>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
     let config_file = get_config_file();
     let existing = match read_config(api.clone(), &config_file).await {
         Ok(v) => Some(v),
