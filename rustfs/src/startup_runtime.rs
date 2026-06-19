@@ -12,78 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{config::Config, license::license_status};
-use rustls::crypto::aws_lc_rs::default_provider;
+use crate::{
+    config::Config,
+    startup_runtime_hooks::{init_profiling_runtime, install_default_crypto_provider, log_startup_runtime_diagnostics},
+};
 use std::io::{Error, Result};
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 const LOG_COMPONENT_MAIN: &str = "main";
-const LOG_SUBSYSTEM_LICENSE: &str = "license";
 const LOG_SUBSYSTEM_STARTUP: &str = "startup";
-const EVENT_CRYPTO_PROVIDER_STATE: &str = "crypto_provider_state";
-const EVENT_DIAL9_RUNTIME_STATUS: &str = "dial9_runtime_status";
-const EVENT_RUNTIME_LICENSE_STATUS: &str = "runtime_license_status";
 const EVENT_TLS_OUTBOUND_INITIALIZED: &str = "tls_outbound_initialized";
 const EVENT_TLS_OUTBOUND_INITIALIZATION_FAILED: &str = "tls_outbound_initialization_failed";
 const TLS_STARTUP_GENERATION_CONSUMER: &str = "rustfs_server_startup";
 
 pub async fn init_startup_runtime_foundation(config: &Config) -> Result<()> {
-    log_dial9_runtime_status();
-    log_runtime_license_status();
-
-    debug!("{}", crate::server::LOGO);
-
-    crate::startup_profiling::init_profiling_runtime().await;
+    log_startup_runtime_diagnostics();
+    init_profiling_runtime().await;
     rustfs_trusted_proxies::init();
     install_default_crypto_provider();
     init_outbound_tls_material(config).await
-}
-
-fn log_dial9_runtime_status() {
-    if rustfs_obs::dial9::is_enabled() {
-        info!(
-            target: "rustfs::main",
-            event = EVENT_DIAL9_RUNTIME_STATUS,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            enabled = true,
-            "Dial9 Tokio runtime telemetry is enabled"
-        );
-    } else {
-        debug!(
-            target: "rustfs::main",
-            event = EVENT_DIAL9_RUNTIME_STATUS,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            enabled = false,
-            "Dial9 Tokio runtime telemetry is disabled"
-        );
-    }
-}
-
-fn log_runtime_license_status() {
-    info!(
-        target: "rustfs::main",
-        event = EVENT_RUNTIME_LICENSE_STATUS,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_LICENSE,
-        license_status = %license_status(),
-        "Initialized runtime license state"
-    );
-}
-
-fn install_default_crypto_provider() {
-    if default_provider().install_default().is_err() {
-        debug!(
-            target: "rustfs::main",
-            event = EVENT_CRYPTO_PROVIDER_STATE,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            provider = "aws_lc_rs",
-            state = "already_installed",
-            "Rustls crypto provider state checked"
-        );
-    }
 }
 
 async fn init_outbound_tls_material(config: &Config) -> Result<()> {
