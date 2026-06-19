@@ -5,15 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-optional-runtime-start-boundary`
-- Baseline: latest `origin/main`
-  (`74fcfddd7fd98d69358e02908617261d962725d1`).
+- Branch: `overtrue/arch-startup-shutdown-lifecycle-boundary`
+- Baseline: `origin/main`
+  (`eec1792c7bd1bf650dbb3c46d7873db6fed6150f`).
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move optional protocol startup and shutdown ownership from
-  `startup_services` into the optional runtime boundary.
+- Rust code changes: move startup shutdown sequencing from `startup_services`
+  into a dedicated shutdown lifecycle boundary.
 - CI/script changes: none.
-- Docs changes: record the R-022 optional runtime startup boundary slice.
+- Docs changes: record the R-023 startup shutdown lifecycle boundary slice.
 
 ## Phase 0 Tasks
 
@@ -2046,6 +2046,23 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     risk scan, branch freshness check, pre-commit quality gate, and
     three-expert review.
 
+- [x] `R-023` Extract startup shutdown lifecycle boundary.
+  - Do: add `startup_shutdown` and move runtime token cancellation, service
+    state transitions, background shutdown, notifier/audit/profiling shutdown,
+    HTTP shutdown, and optional runtime wait sequencing out of
+    `startup_services`.
+  - Acceptance: shutdown order stays runtime token cancellation, `Stopping`
+    state, scanner/AHM shutdown, optional runtime shutdown planning,
+    notifier/audit/profiling shutdown, S3 and console HTTP shutdown, optional
+    runtime waits, then `Stopped` state.
+  - Must preserve: service state transitions, readiness state behavior,
+    scanner/heal enable flag handling, notifier/audit/profiling shutdown logs,
+    HTTP shutdown ordering, optional protocol shutdown ordering, and fatal
+    boundaries.
+  - Verification: focused shutdown/service/optional runtime tests, RustFS lib
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
 ## Next PRs
 
 1. `pure-move`: continue larger lifecycle hook slices for optional runtime
@@ -2057,9 +2074,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-022 keeps protocol implementation details in `startup_protocols` and moves optional runtime startup ownership into `startup_optional_runtimes`. |
-| Migration preservation | passed | KMS-before-protocol ordering, protocol fatal boundary, protocol startup order, shutdown order, readiness, and HTTP shutdown behavior remain unchanged. |
-| Testing/verification | passed | Focused optional runtime, protocol, and startup service tests plus final checks are tracked below before push. |
+| Quality/architecture | passed | R-023 keeps startup orchestration in `startup_services` and moves shutdown sequencing into `startup_shutdown`. |
+| Migration preservation | passed | Runtime token cancellation, background shutdown, optional runtime planning, notifier/audit/profiling shutdown, HTTP shutdown, optional runtime waits, and service state transitions remain ordered. |
+| Testing/verification | passed | Focused shutdown, optional runtime, and startup service tests plus final checks are tracked below before push. |
 
 ## Verification Notes
 
@@ -2105,6 +2122,20 @@ Passed before push:
     passed.
   - `cargo test -p rustfs --lib startup_protocols -- --nocapture`: passed.
   - `cargo test -p rustfs --lib startup_services -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 R-023 current slice:
+  - `cargo test -p rustfs --lib startup_shutdown -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_services -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_optional_runtimes -- --nocapture`:
+    passed.
   - `cargo check -p rustfs --lib`: passed.
   - `./scripts/check_architecture_migration_rules.sh`: passed.
   - `./scripts/check_layer_dependencies.sh`: passed.
