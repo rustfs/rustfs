@@ -12,8 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{server::ShutdownHandle, startup_protocols::ProtocolShutdownSenders};
+use crate::{
+    server::ShutdownHandle,
+    startup_protocols::{ProtocolShutdownSenders, init_protocol_shutdown_senders},
+};
 use futures_util::future::join_all;
+use std::io::Result;
 use tracing::info;
 
 const LOG_COMPONENT_MAIN: &str = "main";
@@ -28,6 +32,11 @@ impl OptionalRuntimeServices {
     pub fn new(protocols: ProtocolShutdownSenders) -> Self {
         Self { protocols }
     }
+}
+
+pub async fn init_optional_runtime_services() -> Result<OptionalRuntimeServices> {
+    let protocols = init_protocol_shutdown_senders().await?;
+    Ok(OptionalRuntimeServices::new(protocols))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

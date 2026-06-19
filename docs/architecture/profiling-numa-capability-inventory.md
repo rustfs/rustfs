@@ -86,3 +86,10 @@ Future sidecars for profiling, eBPF, or NUMA must preserve these invariants:
   runtime boundary with explicit shutdown ownership.
 - Preserve current service order, KMS/audit/notification fatal boundaries, and
   scanner/heal startup semantics.
+
+`R-022`:
+
+- Keep optional runtime startup handoff in `startup_optional_runtimes` while
+  leaving concrete protocol adapters in `startup_protocols`.
+- Preserve KMS-before-protocol startup ordering and disabled protocol no-op
+  behavior.
