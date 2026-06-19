@@ -18,10 +18,10 @@ pub(super) type SwiftBucketMetadata = rustfs_ecstore::bucket::metadata::BucketMe
 pub(super) type SwiftStorageResult<T> = rustfs_ecstore::error::Result<T>;
 pub(super) type SwiftStore = rustfs_ecstore::store::ECStore;
 
-pub type SwiftGetObjectReader = rustfs_ecstore::store_api::GetObjectReader;
-pub type SwiftObjectInfo = rustfs_ecstore::store_api::ObjectInfo;
-pub type SwiftObjectOptions = rustfs_ecstore::store_api::ObjectOptions;
-pub type SwiftPutObjReader = rustfs_ecstore::store_api::PutObjReader;
+pub type SwiftGetObjectReader = rustfs_ecstore::object_api::GetObjectReader;
+pub type SwiftObjectInfo = rustfs_ecstore::object_api::ObjectInfo;
+pub type SwiftObjectOptions = rustfs_ecstore::object_api::ObjectOptions;
+pub type SwiftPutObjReader = rustfs_ecstore::object_api::PutObjReader;
 
 pub fn resolve_swift_object_store_handle() -> Option<Arc<SwiftStore>> {
     rustfs_ecstore::resolve_object_store_handle()

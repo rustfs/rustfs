@@ -17,8 +17,8 @@ use std::sync::Arc;
 pub(crate) const IAM_CONFIG_ROOT_PREFIX: &str = rustfs_ecstore::config::RUSTFS_CONFIG_PREFIX;
 
 pub(crate) type IamEcstoreError = rustfs_ecstore::error::Error;
-pub(crate) type IamConfigObjectInfo = rustfs_ecstore::store_api::ObjectInfo;
-pub(crate) type IamConfigObjectOptions = rustfs_ecstore::store_api::ObjectOptions;
+pub(crate) type IamConfigObjectInfo = rustfs_ecstore::object_api::ObjectInfo;
+pub(crate) type IamConfigObjectOptions = rustfs_ecstore::object_api::ObjectOptions;
 pub(crate) type IamStorageError = rustfs_ecstore::error::StorageError;
 pub(crate) type IamStorageResult<T> = rustfs_ecstore::error::Result<T>;
 pub(crate) type IamStore = rustfs_ecstore::store::ECStore;

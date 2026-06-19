@@ -20,15 +20,16 @@ use crate::disk::error::DiskError;
 use crate::error::{Error, Result};
 use crate::error::{is_err_object_not_found, is_err_operation_canceled, is_err_version_not_found, is_network_or_host_down};
 use crate::global::get_global_endpoints;
+use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use crate::pools::ListCallback;
 use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
+use crate::storage_api_contracts::EcstoreObjectIO;
 use crate::store::ECStore;
-use crate::store_api::{GetObjectReader, ObjectIO, ObjectInfo, ObjectOptions};
 use http::HeaderMap;
 use rand::RngExt as _;
 use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
 use rustfs_storage_api::{
-    HTTPRangeSpec, NamespaceLocking as StorageNamespaceLocking, ObjectIO as _, ObjectOperations as _, StorageAdminApi,
+    HTTPRangeSpec, NamespaceLocking as StorageNamespaceLocking, ObjectIO, ObjectOperations as _, StorageAdminApi,
 };
 use rustfs_utils::path::encode_dir_object;
 use serde::{Deserialize, Serialize};
@@ -591,11 +592,33 @@ impl RebalanceMeta {
     pub fn new() -> Self {
         Self::default()
     }
-    pub async fn load<S: ObjectIO>(&mut self, store: Arc<S>) -> Result<()> {
+    pub async fn load<S>(&mut self, store: Arc<S>) -> Result<()>
+    where
+        S: ObjectIO<
+                Error = Error,
+                RangeSpec = HTTPRangeSpec,
+                HeaderMap = HeaderMap,
+                ObjectOptions = ObjectOptions,
+                ObjectInfo = ObjectInfo,
+                GetObjectReader = GetObjectReader,
+                PutObjectReader = PutObjReader,
+            >,
+    {
         self.load_with_opts(store, ObjectOptions::default()).await
     }
 
-    pub async fn load_with_opts<S: ObjectIO>(&mut self, store: Arc<S>, opts: ObjectOptions) -> Result<()> {
+    pub async fn load_with_opts<S>(&mut self, store: Arc<S>, opts: ObjectOptions) -> Result<()>
+    where
+        S: ObjectIO<
+                Error = Error,
+                RangeSpec = HTTPRangeSpec,
+                HeaderMap = HeaderMap,
+                ObjectOptions = ObjectOptions,
+                ObjectInfo = ObjectInfo,
+                GetObjectReader = GetObjectReader,
+                PutObjectReader = PutObjReader,
+            >,
+    {
         let (data, _) = read_config_with_metadata(store, REBAL_META_NAME, &opts).await?;
         if data.is_empty() {
             debug!(
@@ -636,11 +659,33 @@ impl RebalanceMeta {
         Ok(())
     }
 
-    pub async fn save<S: ObjectIO>(&self, store: Arc<S>) -> Result<()> {
+    pub async fn save<S>(&self, store: Arc<S>) -> Result<()>
+    where
+        S: ObjectIO<
+                Error = Error,
+                RangeSpec = HTTPRangeSpec,
+                HeaderMap = HeaderMap,
+                ObjectOptions = ObjectOptions,
+                ObjectInfo = ObjectInfo,
+                GetObjectReader = GetObjectReader,
+                PutObjectReader = PutObjReader,
+            >,
+    {
         self.save_with_opts(store, ObjectOptions::default()).await
     }
 
-    pub async fn save_with_opts<S: ObjectIO>(&self, store: Arc<S>, opts: ObjectOptions) -> Result<()> {
+    pub async fn save_with_opts<S>(&self, store: Arc<S>, opts: ObjectOptions) -> Result<()>
+    where
+        S: ObjectIO<
+                Error = Error,
+                RangeSpec = HTTPRangeSpec,
+                HeaderMap = HeaderMap,
+                ObjectOptions = ObjectOptions,
+                ObjectInfo = ObjectInfo,
+                GetObjectReader = GetObjectReader,
+                PutObjectReader = PutObjReader,
+            >,
+    {
         if self.pool_stats.is_empty() {
             debug!(
                 event = EVENT_REBALANCE_STATE,
@@ -671,7 +716,7 @@ impl RebalanceMeta {
 impl ECStore {
     async fn save_rebalance_meta_with_merge<S>(&self, pool: Arc<S>, local_snapshot: &RebalanceMeta, stage: &str) -> Result<()>
     where
-        S: ObjectIO + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
+        S: EcstoreObjectIO + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
     {
         let ns_lock = pool.new_ns_lock(crate::disk::RUSTFS_META_BUCKET, REBAL_META_NAME).await?;
         let _guard = ns_lock
