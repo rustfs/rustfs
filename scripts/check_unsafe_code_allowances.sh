@@ -11,7 +11,8 @@ status=0
 while IFS=: read -r file line _; do
   start=$((line > 3 ? line - 3 : 1))
   end=$((line + 6))
-  if ! sed -n "${start},${end}p" "$file" | rg -q "SAFETY:"; then
+  window="$(sed -n "${start},${end}p" "$file")"
+  if ! rg -q "SAFETY:" <<<"$window"; then
     printf '%s:%s: unsafe_code allowance must have a nearby SAFETY comment\n' "$file" "$line" >&2
     status=1
   fi
