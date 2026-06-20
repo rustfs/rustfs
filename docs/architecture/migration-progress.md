@@ -2574,6 +2574,42 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
     pre-commit quality gate, and three-expert review.
 
+- [x] `R-063` Move startup audit runtime owner.
+  - Do: move audit/event-notifier startup wiring and its ordering tests out of
+    startup service components and into an audit startup module.
+  - Acceptance: startup services still start audit after buffer profiling, and
+    embedded optional startup still shares the same event-notifier-before-audit
+    helper.
+  - Must preserve: audit started/failed log fields, event notifier ordering,
+    audit source error propagation, and embedded audit skipped-service behavior.
+  - Verification: focused startup audit checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-064` Move startup deadlock detector owner.
+  - Do: move deadlock detector startup wiring out of startup service components
+    and into a deadlock startup module.
+  - Acceptance: startup services still initialize the detector after audit and
+    before bucket metadata setup, with enabled/disabled states unchanged.
+  - Must preserve: detector singleton lookup, enabled start behavior, disabled
+    no-op behavior, and log fields.
+  - Verification: focused startup checks, RustFS lib check, migration/layer
+    guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `R-065` Retire startup service components aggregate.
+  - Do: move embedded optional service startup wiring into an embedded optional
+    startup module and remove the now-empty startup service components module.
+  - Acceptance: startup services import focused owners directly and embedded
+    optional startup keeps KMS, buffer profile, and audit skipped-service
+    handling unchanged.
+  - Must preserve: embedded KMS skipped-service log fields, buffer profile
+    placement, audit skipped-service log fields, and no public runtime API
+    changes.
+  - Verification: focused startup checks, RustFS lib check, migration/layer
+    guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
 - [x] `E-001/E-SET-001` Add ECStore layout skeleton and set-layout boundary.
   - Do: create the ECStore internal layout ownership buckets and pin static set
     layout versus runtime `Sets`/`SetDisks` orchestration boundaries before any
@@ -2823,22 +2859,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-056 through R-062 keep startup services as orchestration while moving KMS, IAM facade, bucket metadata, notification, auth, background, and observability ownership to focused startup modules. |
-| Migration preservation | passed | KMS singleton reuse/init behavior, embedded/main IAM wiring, bucket metadata migration/resync order, notification/auth/background/observability setup, readiness stages, and log behavior stay unchanged. |
+| Quality/architecture | passed | R-056 through R-065 keep startup services as orchestration while moving KMS, IAM facade, bucket metadata, notification, auth, background, observability, audit, deadlock, and embedded optional ownership to focused startup modules. |
+| Migration preservation | passed | KMS singleton reuse/init behavior, embedded/main IAM wiring, bucket metadata migration/resync order, notification/auth/background/observability/audit/deadlock setup, readiness stages, and log behavior stay unchanged. |
 | Testing/verification | passed | Focused startup IAM/KMS/service/notification checks, RustFS lib check, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
 
-- Issue #660 R-056/R-062 current slice:
+- Issue #660 R-056/R-065 current slice:
   - `cargo test -p rustfs --lib startup_kms -- --nocapture`: passed; 2
     tests.
   - `cargo test -p rustfs --lib startup_iam -- --nocapture`: passed; 8
     tests.
   - `cargo test -p rustfs --lib startup_ -- --nocapture`: passed; 53
     tests.
-  - `cargo test -p rustfs --lib startup_service_components -- --nocapture`:
+  - `cargo test -p rustfs --lib startup_audit -- --nocapture`:
     passed; 2 tests.
   - `cargo test -p rustfs --lib startup_notification -- --nocapture`:
     passed; 1 test.
