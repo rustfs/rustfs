@@ -8,5 +8,6 @@ pub(crate) mod disks_layout;
 pub(crate) mod endpoint;
 pub(crate) mod endpoints;
 pub(crate) mod format;
+pub(crate) mod pool_space;
 pub(crate) mod set_heal;
 pub(crate) mod set_layout;
