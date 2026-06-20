@@ -5,16 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-layout-pool-space`
-- Baseline: completed `E-004/E-LAYOUT-003`.
+- Branch: `overtrue/arch-ecstore-rebalance-helper-boundary`
+- Baseline: completed `E-005/E-LAYOUT-004`.
 - Stacked on: merged ECStore layout foundation, format layout ownership, and
-  endpoint layout move slices plus the set-format heal helper layout slice.
+  endpoint layout move slices plus the set-format heal and pool-space layout
+  helper slices.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move ECStore pool-space selection helper types into the
-  internal layout bucket while preserving the old `store` export path.
+- Rust code changes: move ECStore rebalance support helper types and pure
+  result reducers into a local rebalance support boundary while preserving
+  store orchestration.
 - CI/script changes: none.
-- Docs changes: record the ECStore pool-space helper layout slice.
+- Docs changes: record the ECStore rebalance support helper boundary slice.
 
 ## Phase 0 Tasks
 
@@ -2282,10 +2284,25 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     scan, branch freshness check, pre-commit quality gate, and three-expert
     review.
 
+- [x] `E-006/E-REBALANCE-001` Move ECStore rebalance support helpers.
+  - Do: move rebalance-only helper DTOs, pool lookup error classification, and
+    delete/latest-object result reducers into `store::rebalance::support`
+    while keeping async store orchestration in the existing modules.
+  - Acceptance: rebalance callers keep the same `PoolObjInfo`/`PoolErr`
+    access inside `store`, delete aggregation and latest-object selection keep
+    the same behavior, and the moved helpers remain private to the rebalance
+    boundary.
+  - Must preserve: latest-object tie-breaks, delete result aggregation, pool
+    lookup not-found/version-not-found classification, rebalance disk-set lookup
+    error context, object delete flows, and existing rebalance control flow.
+  - Verification: focused ECStore rebalance tests, ECStore/RustFS/Heal compile
+    checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
 ## Next PRs
 
-1. `pure-move`: continue moving runtime-neutral pool/set layout helpers once
-   E-005/E-LAYOUT-004 lands.
+1. `pure-move`: continue moving ECStore rebalance/layout support helpers once
+   E-006/E-REBALANCE-001 lands.
 2. `pure-move`: continue pruning residual embedded startup-only orchestration
    once the lifecycle helpers are merged.
 
@@ -2293,9 +2310,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | E-005/E-LAYOUT-004 extracts runtime-neutral pool-space helper types into ECStore layout without moving rebalance or store orchestration. |
-| Migration preservation | passed | Pool index ordering, available-space summation, max-used-percent filtering, excluded-pool zeroing, and old `store` import compatibility remain preserved. |
-| Testing/verification | passed | Focused pool-space helper tests, compile checks, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
+| Quality/architecture | passed | E-006/E-REBALANCE-001 extracts rebalance support helpers into a local boundary without moving async store orchestration. |
+| Migration preservation | passed | Latest-object tie-breaks, delete aggregation, pool lookup error classification, and sibling `store` visibility remain preserved. |
+| Testing/verification | passed | Focused rebalance tests, compile checks, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
 
 ## Verification Notes
 
@@ -2405,6 +2422,18 @@ Passed before push:
   - Rust risk scan on changed Rust files: passed; only existing `store.rs`
     test-only `expect` calls and an existing `Result<String>` method signature
     were present outside the moved helper body.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 E-006/E-REBALANCE-001 current slice:
+  - `cargo test -p rustfs-ecstore store::rebalance -- --nocapture`: passed.
+  - `cargo check -p rustfs-ecstore -p rustfs -p rustfs-heal`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; no risky added lines were
+    introduced.
   - `make pre-commit`: passed.
   - Three-expert review: passed.
 
