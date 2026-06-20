@@ -44,10 +44,9 @@ use crate::error::{
 };
 use crate::event_notification::EventNotifier;
 use crate::global::{
-    DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME,
-    GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, TypeLocalDiskSetDrives, get_global_deployment_id, get_global_endpoints,
-    get_global_region, get_global_tier_config_mgr, init_global_bucket_monitor, is_erasure_sd, set_global_deployment_id,
-    set_object_layer,
+    DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, TypeLocalDiskSetDrives,
+    get_global_deployment_id, get_global_endpoints, get_global_region, get_global_tier_config_mgr, init_global_bucket_monitor,
+    set_global_deployment_id, set_object_layer,
 };
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
@@ -105,7 +104,7 @@ type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
-pub use crate::layout::pool_space::{PoolAvailableSpace, ServerPoolsAvailableSpace};
+pub use crate::layout::pool_space::{PoolAvailableSpace, ServerPoolsAvailableSpace, has_space_for};
 
 /// Check if a directory contains any xl.meta files (indicating actual S3 objects)
 /// This is used to determine if a bucket is empty for deletion purposes.
@@ -178,7 +177,7 @@ mod rebalance;
 use peer::init_local_peer;
 pub use peer::{
     all_local_disk, all_local_disk_path, find_local_disk, find_local_disk_by_ref, get_disk_infos, get_disk_via_endpoint,
-    has_space_for, init_local_disks, init_lock_clients, prewarm_local_disk_id_map,
+    init_local_disks, init_lock_clients, prewarm_local_disk_id_map,
 };
 
 pub struct ECStore {
