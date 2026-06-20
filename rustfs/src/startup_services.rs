@@ -17,14 +17,16 @@ use crate::{
     config::Config,
     init::{init_buffer_profile_system, init_kms_system},
     server::ServiceStateManager,
-    startup_iam::IamBootstrapDisposition,
+    startup_audit::init_audit_runtime,
+    startup_auth::init_auth_integrations,
+    startup_background::init_background_service_runtime,
+    startup_bucket_metadata::{init_bucket_metadata_runtime, init_embedded_bucket_metadata_runtime},
+    startup_deadlock::init_deadlock_detector_runtime,
+    startup_embedded_optional::init_embedded_optional_service_runtime,
+    startup_iam::{IamBootstrapDisposition, init_embedded_iam_runtime, init_iam_runtime},
+    startup_notification::{init_embedded_notification_runtime, init_notification_runtime},
+    startup_observability::init_observability_runtime,
     startup_optional_runtime_sidecars::{OptionalRuntimeServices, init_optional_runtime_services},
-    startup_service_components::{
-        init_audit_runtime, init_auth_integrations, init_background_service_runtime, init_bucket_metadata_runtime,
-        init_deadlock_detector_runtime, init_embedded_bucket_metadata_runtime, init_embedded_iam_runtime,
-        init_embedded_notification_runtime, init_embedded_optional_service_runtime, init_iam_runtime, init_notification_runtime,
-        init_observability_runtime,
-    },
 };
 use rustfs_common::GlobalReadiness;
 use std::{io::Result, sync::Arc};

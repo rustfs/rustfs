@@ -2484,6 +2484,146 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
     pre-commit quality gate, and three-expert review.
 
+- [x] `R-056` Move startup KMS runtime handle owner into app context.
+  - Do: route startup IAM KMS handle resolution through the app context startup
+    boundary while keeping startup service orchestration on the startup IAM
+    API.
+  - Acceptance: inline and deferred IAM bootstrap use the same KMS manager
+    reuse-or-init path without adding new startup service to app reverse
+    dependencies.
+  - Must preserve: KMS global singleton behavior, IAM bootstrap call order,
+    degraded recovery KMS handle reuse, readiness publication, and layer guard
+    boundaries.
+  - Verification: focused startup KMS checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-057` Move startup IAM runtime facade into startup IAM.
+  - Do: move the main and embedded IAM runtime facade helpers out of startup
+    service components and into the startup IAM module.
+  - Acceptance: startup services still call one IAM-facing API for embedded and
+    main startup, while service components no longer own IAM facade wiring.
+  - Must preserve: embedded versus main state-manager wiring, shutdown token
+    propagation, IAM bootstrap disposition handling, KMS startup handle
+    resolution, and degraded recovery behavior.
+  - Verification: focused startup IAM/KMS checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-058` Move startup bucket metadata runtime owner.
+  - Do: move embedded and main bucket metadata runtime helpers out of startup
+    service components and into a bucket metadata startup module.
+  - Acceptance: startup services still receive the same bucket list and bucket
+    metadata, replication resync, bucket metadata system, and IAM config
+    migration order stay unchanged.
+  - Must preserve: embedded list-bucket error text, main list-bucket error
+    mapping, replication resync placement, metadata migration order, and bucket
+    list cloning semantics.
+  - Verification: focused startup service checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-059` Move startup notification runtime owner.
+  - Do: move embedded and main notification runtime helpers out of startup
+    service components and into a notification startup module.
+  - Acceptance: startup services still configure bucket notification state
+    before notification system initialization and keep embedded notification
+    failures non-fatal while main startup failures remain fatal.
+  - Must preserve: notification config ordering, embedded skipped-service log
+    fields, main failure log fields, error mapping, and notification init source
+    error behavior.
+  - Verification: focused startup notification/service checks, RustFS lib
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-060` Move startup auth integration owner.
+  - Do: move Keystone and OIDC startup integration wiring out of startup service
+    components and into an auth startup module.
+  - Acceptance: startup services still initialize auth integrations after IAM
+    bootstrap and before notification setup, with Keystone failures remaining
+    non-fatal and OIDC failures still logged as warnings.
+  - Must preserve: Keystone env parsing error mapping, Keystone success/failure
+    log fields, OIDC warning fields, and startup ordering.
+  - Verification: focused startup checks, RustFS lib check, migration/layer
+    guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `R-061` Move startup background service owner.
+  - Do: move scanner/heal background runtime setup out of startup service
+    components and into a background startup module.
+  - Acceptance: startup services still receive the same scanner-enabled flag,
+    while AHM cancellation-token creation, scanner/heal env parsing, heal
+    manager initialization, and disabled-state logging stay unchanged.
+  - Must preserve: env alias behavior, heal/scanner default enablement, disabled
+    debug log fields, and heal storage ownership.
+  - Verification: focused startup checks, RustFS lib check, migration/layer
+    guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `R-062` Move startup observability runtime owner.
+  - Do: move server-info, update-check, allocator reclaim, metrics, memory
+    observability, and auto-tuner startup wiring out of startup service
+    components and into an observability startup module.
+  - Acceptance: observability side effects still run after background services,
+    metrics-gated components keep the same guard, and cancellation-token clone
+    behavior stays unchanged.
+  - Must preserve: server-info/update-check ordering, allocator reclaim
+    initialization, metrics enablement, memory observability setup, and
+    auto-tuner startup.
+  - Verification: focused startup checks, RustFS lib check, migration/layer
+    guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `R-063` Move startup audit runtime owner.
+  - Do: move audit/event-notifier startup wiring and its ordering tests out of
+    startup service components and into an audit startup module.
+  - Acceptance: startup services still start audit after buffer profiling, and
+    embedded optional startup still shares the same event-notifier-before-audit
+    helper.
+  - Must preserve: audit started/failed log fields, event notifier ordering,
+    audit source error propagation, and embedded audit skipped-service behavior.
+  - Verification: focused startup audit checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-064` Move startup deadlock detector owner.
+  - Do: move deadlock detector startup wiring out of startup service components
+    and into a deadlock startup module.
+  - Acceptance: startup services still initialize the detector after audit and
+    before bucket metadata setup, with enabled/disabled states unchanged.
+  - Must preserve: detector singleton lookup, enabled start behavior, disabled
+    no-op behavior, and log fields.
+  - Verification: focused startup checks, RustFS lib check, migration/layer
+    guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `R-065` Retire startup service components aggregate.
+  - Do: move embedded optional service startup wiring into an embedded optional
+    startup module and remove the now-empty startup service components module.
+  - Acceptance: startup services import focused owners directly and embedded
+    optional startup keeps KMS, buffer profile, and audit skipped-service
+    handling unchanged.
+  - Must preserve: embedded KMS skipped-service log fields, buffer profile
+    placement, audit skipped-service log fields, and no public runtime API
+    changes.
+  - Verification: focused startup checks, RustFS lib check, migration/layer
+    guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `R-066` Narrow internal startup owner module visibility.
+  - Do: make focused startup owner modules crate-private after their public
+    aggregate was retired.
+  - Acceptance: the binary entrypoint and embedded public API still compile
+    through the intended startup entrypoints, while audit/auth/background/bucket
+    metadata/deadlock/embedded optional/notification/observability owner
+    modules are no longer part of the public library surface.
+  - Must preserve: all startup call order, log fields, readiness behavior,
+    embedded startup behavior, optional runtime behavior, and public embedded
+    builder API.
+  - Verification: RustFS lib and bin check, focused startup checks,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
 - [x] `E-001/E-SET-001` Add ECStore layout skeleton and set-layout boundary.
   - Do: create the ECStore internal layout ownership buckets and pin static set
     layout versus runtime `Sets`/`SetDisks` orchestration boundaries before any
@@ -2733,13 +2873,36 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-054 and R-055 move AppContext bootstrap ownership into app context and shrink stale layer baseline entries without widening public API. |
-| Migration preservation | passed | IAM init order, singleton reuse, KMS handle wiring, degraded recovery, readiness stages, and log behavior stay unchanged. |
-| Testing/verification | passed | Focused startup checks, RustFS lib check, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
+| Quality/architecture | passed | R-056 through R-066 keep startup services as orchestration while moving KMS, IAM facade, bucket metadata, notification, auth, background, observability, audit, deadlock, and embedded optional ownership to focused startup modules, then narrowing those internal owner modules to crate visibility. |
+| Migration preservation | passed | KMS singleton reuse/init behavior, embedded/main IAM wiring, bucket metadata migration/resync order, notification/auth/background/observability/audit/deadlock setup, readiness stages, public embedded API, and log behavior stay unchanged. |
+| Testing/verification | passed | Focused startup IAM/KMS/service/notification/audit checks, RustFS lib/bin check, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 R-056/R-066 current slice:
+  - `cargo test -p rustfs --lib startup_kms -- --nocapture`: passed; 2
+    tests.
+  - `cargo test -p rustfs --lib startup_iam -- --nocapture`: passed; 8
+    tests.
+  - `cargo test -p rustfs --lib startup_ -- --nocapture`: passed; 53
+    tests.
+  - `cargo test -p rustfs --lib startup_audit -- --nocapture`:
+    passed; 2 tests.
+  - `cargo test -p rustfs --lib startup_notification -- --nocapture`:
+    passed; 1 test.
+  - `cargo check -p rustfs --lib --bins`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `./scripts/check_unsafe_code_allowances.sh`: passed.
+  - Rust risk scan on changed Rust files: passed; only test-only `expect`
+    calls were present.
+  - `make pre-commit`: passed; nextest ran 6341 tests with 6341 passed, 111
+    skipped, and doctests passed.
 
 - Issue #660 R-054/R-055 current slice:
   - `cargo test -p rustfs --lib startup_ -- --nocapture`: passed; 51 tests.
