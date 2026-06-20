@@ -19,6 +19,7 @@ use thiserror::Error;
 
 pub const EXTENSION_SCHEMA_VERSION: &str = "rustfs.extension-schema.v1";
 pub const OPS_DIAGNOSTICS_CAPABILITY: &str = "ops.diagnostics.v1";
+pub const OPS_PROFILER_CAPABILITY: &str = "ops.profiler.v1";
 pub const S3_POST_AUTH_HOOK_CAPABILITY: &str = "s3.hook.post_auth.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -27,6 +28,7 @@ pub enum ExtensionKind {
     TargetPlugin,
     S3Hook,
     OpsDiagnostics,
+    OpsProfiler,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -117,6 +119,95 @@ pub struct OpsDiagnosticsContract {
     pub requires_admin_action: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpsProfilerContractMode {
+    CapabilityDescription,
+    ExecutionRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OpsProfilerBackendName(String);
+
+impl OpsProfilerBackendName {
+    pub fn new(backend: impl Into<String>) -> Self {
+        Self(backend.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpsProfilerBackendStatus {
+    Enabled,
+    Disabled,
+    Unsupported,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpsProfilerRedactionField {
+    Secret,
+    Token,
+    LocalPath,
+    Host,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpsProfilerTrustLevel {
+    RuntimeTrusted,
+    AdminTrusted,
+    ExtensionProvided,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsProfilerProvenance {
+    pub source: String,
+    pub collection_boundary: String,
+    pub trust_level: OpsProfilerTrustLevel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsProfilerBackendCapability {
+    pub backend: OpsProfilerBackendName,
+    pub status: OpsProfilerBackendStatus,
+    pub supports_profile_export: bool,
+    pub redaction_required: Vec<OpsProfilerRedactionField>,
+    pub provenance: OpsProfilerProvenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsProfilerContract {
+    pub mode: OpsProfilerContractMode,
+    pub backends: Vec<OpsProfilerBackendCapability>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsProfilerRuntimeSnapshot {
+    pub boundary: ExtensionRuntimeBoundary,
+    pub disabled_by_default: bool,
+    pub startup_fatal: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsProfilerCapabilitySnapshot {
+    pub capability: ExtensionCapabilityRef,
+    pub runtime: OpsProfilerRuntimeSnapshot,
+    pub contract: OpsProfilerContract,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ExtensionSchemaError {
     #[error("extension schema at index {index} has an empty extension id")]
@@ -178,6 +269,42 @@ pub enum ExtensionContractError {
 
     #[error("ops diagnostics contract must require an admin action")]
     OpsDiagnosticsMissingAdminAction,
+
+    #[error("ops profiler contract must describe capabilities, not execution requests")]
+    OpsProfilerExecutionRequest,
+
+    #[error("ops profiler contract must declare at least one backend")]
+    EmptyOpsProfilerBackends,
+
+    #[error("ops profiler contract has an empty backend name")]
+    EmptyOpsProfilerBackend,
+
+    #[error("ops profiler contract duplicates backend {backend}")]
+    DuplicateOpsProfilerBackend { backend: String },
+
+    #[error("ops profiler backend {backend} duplicates redaction field {field:?}")]
+    DuplicateOpsProfilerRedactionField {
+        backend: String,
+        field: OpsProfilerRedactionField,
+    },
+
+    #[error("ops profiler backend {backend} exports profiles without local path redaction")]
+    OpsProfilerMissingLocalPathRedaction { backend: String },
+
+    #[error("ops profiler backend {backend} has an empty provenance source")]
+    EmptyOpsProfilerProvenanceSource { backend: String },
+
+    #[error("ops profiler backend {backend} has an empty collection boundary")]
+    EmptyOpsProfilerCollectionBoundary { backend: String },
+
+    #[error("ops profiler snapshot has unsupported capability {capability}")]
+    UnsupportedOpsProfilerCapability { capability: String },
+
+    #[error("ops profiler external runtime must be disabled by default")]
+    OpsProfilerExternalRuntimeEnabledByDefault,
+
+    #[error("ops profiler runtime snapshot cannot add a startup fatal boundary")]
+    OpsProfilerStartupFatalBoundary,
 }
 
 pub fn validate_extension_schemas(schemas: &[ExtensionSchema]) -> Result<(), ExtensionSchemaError> {
@@ -304,13 +431,88 @@ pub fn validate_ops_diagnostics_contract(contract: &OpsDiagnosticsContract) -> R
     Ok(())
 }
 
+pub fn validate_ops_profiler_contract(contract: &OpsProfilerContract) -> Result<(), ExtensionContractError> {
+    if contract.mode != OpsProfilerContractMode::CapabilityDescription {
+        return Err(ExtensionContractError::OpsProfilerExecutionRequest);
+    }
+
+    if contract.backends.is_empty() {
+        return Err(ExtensionContractError::EmptyOpsProfilerBackends);
+    }
+
+    let mut backends = BTreeSet::new();
+    for backend in &contract.backends {
+        let backend_name = backend.backend.as_str().trim();
+        if backend_name.is_empty() {
+            return Err(ExtensionContractError::EmptyOpsProfilerBackend);
+        }
+
+        if !backends.insert(backend_name) {
+            return Err(ExtensionContractError::DuplicateOpsProfilerBackend {
+                backend: backend_name.to_string(),
+            });
+        }
+
+        let mut redaction_fields = BTreeSet::new();
+        for field in &backend.redaction_required {
+            if !redaction_fields.insert(*field) {
+                return Err(ExtensionContractError::DuplicateOpsProfilerRedactionField {
+                    backend: backend_name.to_string(),
+                    field: *field,
+                });
+            }
+        }
+
+        if backend.supports_profile_export && !redaction_fields.contains(&OpsProfilerRedactionField::LocalPath) {
+            return Err(ExtensionContractError::OpsProfilerMissingLocalPathRedaction {
+                backend: backend_name.to_string(),
+            });
+        }
+
+        if backend.provenance.source.trim().is_empty() {
+            return Err(ExtensionContractError::EmptyOpsProfilerProvenanceSource {
+                backend: backend_name.to_string(),
+            });
+        }
+
+        if backend.provenance.collection_boundary.trim().is_empty() {
+            return Err(ExtensionContractError::EmptyOpsProfilerCollectionBoundary {
+                backend: backend_name.to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+pub fn validate_ops_profiler_capability_snapshot(snapshot: &OpsProfilerCapabilitySnapshot) -> Result<(), ExtensionContractError> {
+    if snapshot.capability.as_str() != OPS_PROFILER_CAPABILITY {
+        return Err(ExtensionContractError::UnsupportedOpsProfilerCapability {
+            capability: snapshot.capability.as_str().to_string(),
+        });
+    }
+
+    if snapshot.runtime.boundary.requires_disabled_by_default() && !snapshot.runtime.disabled_by_default {
+        return Err(ExtensionContractError::OpsProfilerExternalRuntimeEnabledByDefault);
+    }
+
+    if snapshot.runtime.startup_fatal {
+        return Err(ExtensionContractError::OpsProfilerStartupFatalBoundary);
+    }
+
+    validate_ops_profiler_contract(&snapshot.contract)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         EXTENSION_SCHEMA_VERSION, ExtensionCapabilityRef, ExtensionContractError, ExtensionKind, ExtensionRuntimeBoundary,
-        ExtensionRuntimeContract, ExtensionSchema, ExtensionSchemaError, OPS_DIAGNOSTICS_CAPABILITY, OpsDiagnosticSurface,
-        OpsDiagnosticsContract, S3_POST_AUTH_HOOK_CAPABILITY, S3HookContract, S3HookPoint, validate_extension_schemas,
-        validate_ops_diagnostics_contract, validate_s3_hook_contract,
+        ExtensionRuntimeContract, ExtensionSchema, ExtensionSchemaError, OPS_DIAGNOSTICS_CAPABILITY, OPS_PROFILER_CAPABILITY,
+        OpsDiagnosticSurface, OpsDiagnosticsContract, OpsProfilerBackendCapability, OpsProfilerBackendName,
+        OpsProfilerBackendStatus, OpsProfilerCapabilitySnapshot, OpsProfilerContract, OpsProfilerContractMode,
+        OpsProfilerProvenance, OpsProfilerRedactionField, OpsProfilerRuntimeSnapshot, OpsProfilerTrustLevel,
+        S3_POST_AUTH_HOOK_CAPABILITY, S3HookContract, S3HookPoint, validate_extension_schemas, validate_ops_diagnostics_contract,
+        validate_ops_profiler_capability_snapshot, validate_ops_profiler_contract, validate_s3_hook_contract,
     };
     use serde_json::json;
 
@@ -363,20 +565,36 @@ mod tests {
 
     #[test]
     fn validates_extension_schema_contracts() {
-        let schemas = [ExtensionSchema {
-            schema_version: EXTENSION_SCHEMA_VERSION.to_string(),
-            extension_id: "rustfs.ops.diagnostics".to_string(),
-            display_name: "Ops Diagnostics".to_string(),
-            provider: "rustfs".to_string(),
-            version: "1.0.0".to_string(),
-            kind: ExtensionKind::OpsDiagnostics,
-            runtime: ExtensionRuntimeContract {
-                api_version: "rustfs.extension.v1".to_string(),
-                boundary: ExtensionRuntimeBoundary::Builtin,
+        let schemas = [
+            ExtensionSchema {
+                schema_version: EXTENSION_SCHEMA_VERSION.to_string(),
+                extension_id: "rustfs.ops.diagnostics".to_string(),
+                display_name: "Ops Diagnostics".to_string(),
+                provider: "rustfs".to_string(),
+                version: "1.0.0".to_string(),
+                kind: ExtensionKind::OpsDiagnostics,
+                runtime: ExtensionRuntimeContract {
+                    api_version: "rustfs.extension.v1".to_string(),
+                    boundary: ExtensionRuntimeBoundary::Builtin,
+                },
+                capabilities: vec![ExtensionCapabilityRef::new(OPS_DIAGNOSTICS_CAPABILITY)],
+                disabled_by_default: false,
             },
-            capabilities: vec![ExtensionCapabilityRef::new(OPS_DIAGNOSTICS_CAPABILITY)],
-            disabled_by_default: false,
-        }];
+            ExtensionSchema {
+                schema_version: EXTENSION_SCHEMA_VERSION.to_string(),
+                extension_id: "rustfs.ops.profiler".to_string(),
+                display_name: "Ops Profiler".to_string(),
+                provider: "rustfs".to_string(),
+                version: "1.0.0".to_string(),
+                kind: ExtensionKind::OpsProfiler,
+                runtime: ExtensionRuntimeContract {
+                    api_version: "rustfs.extension.v1".to_string(),
+                    boundary: ExtensionRuntimeBoundary::Builtin,
+                },
+                capabilities: vec![ExtensionCapabilityRef::new(OPS_PROFILER_CAPABILITY)],
+                disabled_by_default: false,
+            },
+        ];
 
         assert!(validate_extension_schemas(&schemas).is_ok());
     }
@@ -534,6 +752,355 @@ mod tests {
 
         assert!(validate_ops_diagnostics_contract(&contract).is_ok());
         assert_eq!(OPS_DIAGNOSTICS_CAPABILITY, "ops.diagnostics.v1");
+    }
+
+    fn profiler_backend(
+        backend: &str,
+        status: OpsProfilerBackendStatus,
+        supports_profile_export: bool,
+    ) -> OpsProfilerBackendCapability {
+        OpsProfilerBackendCapability {
+            backend: OpsProfilerBackendName::new(backend),
+            status,
+            supports_profile_export,
+            redaction_required: vec![
+                OpsProfilerRedactionField::Secret,
+                OpsProfilerRedactionField::Token,
+                OpsProfilerRedactionField::LocalPath,
+                OpsProfilerRedactionField::Host,
+            ],
+            provenance: OpsProfilerProvenance {
+                source: "rustfs.profiling".to_string(),
+                collection_boundary: "rustfs-process".to_string(),
+                trust_level: OpsProfilerTrustLevel::RuntimeTrusted,
+            },
+        }
+    }
+
+    #[test]
+    fn validates_ops_profiler_contract_states_and_redaction() {
+        let contract = OpsProfilerContract {
+            mode: OpsProfilerContractMode::CapabilityDescription,
+            backends: vec![
+                profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true),
+                profiler_backend("memory_pprof", OpsProfilerBackendStatus::Disabled, false),
+                profiler_backend("ebpf", OpsProfilerBackendStatus::Unsupported, false),
+                profiler_backend("future_kernel_profiler", OpsProfilerBackendStatus::Unknown, false),
+            ],
+        };
+
+        assert!(validate_ops_profiler_contract(&contract).is_ok());
+        assert_eq!(OPS_PROFILER_CAPABILITY, "ops.profiler.v1");
+        assert!(
+            contract
+                .backends
+                .iter()
+                .all(|backend| !backend.provenance.source.contains("token"))
+        );
+    }
+
+    #[test]
+    fn ops_profiler_schema_serializes_stable_json_shape() {
+        let contract = OpsProfilerContract {
+            mode: OpsProfilerContractMode::CapabilityDescription,
+            backends: vec![profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true)],
+        };
+
+        let value = serde_json::to_value(contract).expect("ops profiler schema should serialize");
+
+        assert_eq!(
+            value,
+            json!({
+                "mode": "capability_description",
+                "backends": [{
+                    "backend": "cpu_pprof",
+                    "status": "enabled",
+                    "supports_profile_export": true,
+                    "redaction_required": ["secret", "token", "local_path", "host"],
+                    "provenance": {
+                        "source": "rustfs.profiling",
+                        "collection_boundary": "rustfs-process",
+                        "trust_level": "runtime_trusted"
+                    }
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn ops_profiler_schema_accepts_unknown_future_backend_names() {
+        let contract: OpsProfilerContract = serde_json::from_value(json!({
+            "mode": "capability_description",
+            "backends": [{
+                "backend": "vendor.future-profiler",
+                "status": "unknown",
+                "supports_profile_export": false,
+                "redaction_required": ["host"],
+                "provenance": {
+                    "source": "extension.schema",
+                    "collection_boundary": "read_only_inventory",
+                    "trust_level": "unknown"
+                }
+            }]
+        }))
+        .expect("unknown future backend names should remain representable");
+
+        assert!(validate_ops_profiler_contract(&contract).is_ok());
+    }
+
+    #[test]
+    fn ops_profiler_capability_snapshot_preserves_runtime_states() {
+        let snapshot = OpsProfilerCapabilitySnapshot {
+            capability: ExtensionCapabilityRef::new(OPS_PROFILER_CAPABILITY),
+            runtime: OpsProfilerRuntimeSnapshot {
+                boundary: ExtensionRuntimeBoundary::Sidecar,
+                disabled_by_default: true,
+                startup_fatal: false,
+            },
+            contract: OpsProfilerContract {
+                mode: OpsProfilerContractMode::CapabilityDescription,
+                backends: vec![
+                    profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true),
+                    profiler_backend("memory_pprof", OpsProfilerBackendStatus::Disabled, false),
+                    profiler_backend("ebpf", OpsProfilerBackendStatus::Unsupported, false),
+                ],
+            },
+        };
+
+        assert!(validate_ops_profiler_capability_snapshot(&snapshot).is_ok());
+
+        let encoded = serde_json::to_string(&snapshot).expect("ops profiler snapshot should serialize");
+        let decoded: OpsProfilerCapabilitySnapshot =
+            serde_json::from_str(&encoded).expect("ops profiler snapshot should deserialize");
+
+        let states: Vec<_> = decoded.contract.backends.iter().map(|backend| backend.status).collect();
+        assert_eq!(
+            states,
+            vec![
+                OpsProfilerBackendStatus::Enabled,
+                OpsProfilerBackendStatus::Disabled,
+                OpsProfilerBackendStatus::Unsupported,
+            ]
+        );
+        assert_eq!(decoded.runtime.boundary, ExtensionRuntimeBoundary::Sidecar);
+        assert!(decoded.runtime.disabled_by_default);
+        assert!(!decoded.runtime.startup_fatal);
+    }
+
+    #[test]
+    fn ops_profiler_capability_snapshot_serializes_stable_json_shape() {
+        let snapshot = OpsProfilerCapabilitySnapshot {
+            capability: ExtensionCapabilityRef::new(OPS_PROFILER_CAPABILITY),
+            runtime: OpsProfilerRuntimeSnapshot {
+                boundary: ExtensionRuntimeBoundary::Builtin,
+                disabled_by_default: false,
+                startup_fatal: false,
+            },
+            contract: OpsProfilerContract {
+                mode: OpsProfilerContractMode::CapabilityDescription,
+                backends: vec![profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true)],
+            },
+        };
+
+        let value = serde_json::to_value(snapshot).expect("ops profiler snapshot should serialize");
+
+        assert_eq!(
+            value,
+            json!({
+                "capability": "ops.profiler.v1",
+                "runtime": {
+                    "boundary": "builtin",
+                    "disabled_by_default": false,
+                    "startup_fatal": false
+                },
+                "contract": {
+                    "mode": "capability_description",
+                    "backends": [{
+                        "backend": "cpu_pprof",
+                        "status": "enabled",
+                        "supports_profile_export": true,
+                        "redaction_required": ["secret", "token", "local_path", "host"],
+                        "provenance": {
+                            "source": "rustfs.profiling",
+                            "collection_boundary": "rustfs-process",
+                            "trust_level": "runtime_trusted"
+                        }
+                    }]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_ops_profiler_snapshot_wrong_capability_or_fatal_runtime() {
+        let mut snapshot = OpsProfilerCapabilitySnapshot {
+            capability: ExtensionCapabilityRef::new("ops.not-profiler.v1"),
+            runtime: OpsProfilerRuntimeSnapshot {
+                boundary: ExtensionRuntimeBoundary::Sidecar,
+                disabled_by_default: true,
+                startup_fatal: false,
+            },
+            contract: OpsProfilerContract {
+                mode: OpsProfilerContractMode::CapabilityDescription,
+                backends: vec![profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true)],
+            },
+        };
+
+        assert_eq!(
+            validate_ops_profiler_capability_snapshot(&snapshot).expect_err("only ops.profiler.v1 snapshots are accepted"),
+            ExtensionContractError::UnsupportedOpsProfilerCapability {
+                capability: "ops.not-profiler.v1".to_string()
+            }
+        );
+
+        snapshot.capability = ExtensionCapabilityRef::new(OPS_PROFILER_CAPABILITY);
+        snapshot.runtime.disabled_by_default = false;
+
+        assert_eq!(
+            validate_ops_profiler_capability_snapshot(&snapshot)
+                .expect_err("external profiler runtimes must stay disabled by default"),
+            ExtensionContractError::OpsProfilerExternalRuntimeEnabledByDefault
+        );
+
+        snapshot.runtime.disabled_by_default = true;
+        snapshot.runtime.startup_fatal = true;
+
+        assert_eq!(
+            validate_ops_profiler_capability_snapshot(&snapshot)
+                .expect_err("optional profiler runtimes must not become startup fatal"),
+            ExtensionContractError::OpsProfilerStartupFatalBoundary
+        );
+    }
+
+    #[test]
+    fn rejects_ops_profiler_execution_requests_and_empty_backends() {
+        let mut contract = OpsProfilerContract {
+            mode: OpsProfilerContractMode::ExecutionRequest,
+            backends: vec![profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true)],
+        };
+
+        assert_eq!(
+            validate_ops_profiler_contract(&contract).expect_err("execution requests are outside schema scope"),
+            ExtensionContractError::OpsProfilerExecutionRequest
+        );
+
+        contract.mode = OpsProfilerContractMode::CapabilityDescription;
+        contract.backends.clear();
+
+        assert_eq!(
+            validate_ops_profiler_contract(&contract).expect_err("profiler capability must declare backends"),
+            ExtensionContractError::EmptyOpsProfilerBackends
+        );
+    }
+
+    #[test]
+    fn rejects_ops_profiler_missing_required_fields() {
+        let err = serde_json::from_value::<OpsProfilerContract>(json!({
+            "mode": "capability_description",
+            "backends": [{
+                "backend": "cpu_pprof",
+                "status": "enabled",
+                "supports_profile_export": true,
+                "redaction_required": ["local_path"]
+            }]
+        }))
+        .expect_err("provenance is required");
+
+        assert!(err.to_string().contains("missing field `provenance`"));
+    }
+
+    #[test]
+    fn rejects_ops_profiler_unknown_credential_fields() {
+        let err = serde_json::from_value::<OpsProfilerContract>(json!({
+            "mode": "capability_description",
+            "backends": [{
+                "backend": "cpu_pprof",
+                "status": "enabled",
+                "supports_profile_export": true,
+                "redaction_required": ["local_path"],
+                "provenance": {
+                    "source": "rustfs.profiling",
+                    "collection_boundary": "rustfs-process",
+                    "trust_level": "runtime_trusted",
+                    "credentials": "not-allowed"
+                }
+            }]
+        }))
+        .expect_err("credential-bearing fields are outside the schema");
+
+        assert!(err.to_string().contains("unknown field `credentials`"));
+    }
+
+    #[test]
+    fn rejects_ops_profiler_invalid_backend_and_redaction_shape() {
+        let mut contract = OpsProfilerContract {
+            mode: OpsProfilerContractMode::CapabilityDescription,
+            backends: vec![profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true)],
+        };
+        contract.backends[0].backend = OpsProfilerBackendName::new(" ");
+
+        assert_eq!(
+            validate_ops_profiler_contract(&contract).expect_err("backend name should be required"),
+            ExtensionContractError::EmptyOpsProfilerBackend
+        );
+
+        contract.backends[0] = profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true);
+        contract
+            .backends
+            .push(profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Disabled, false));
+
+        assert_eq!(
+            validate_ops_profiler_contract(&contract).expect_err("duplicate backends should fail validation"),
+            ExtensionContractError::DuplicateOpsProfilerBackend {
+                backend: "cpu_pprof".to_string()
+            }
+        );
+
+        contract.backends.truncate(1);
+        contract.backends[0].redaction_required.push(OpsProfilerRedactionField::Host);
+
+        assert_eq!(
+            validate_ops_profiler_contract(&contract).expect_err("duplicate redaction fields should fail validation"),
+            ExtensionContractError::DuplicateOpsProfilerRedactionField {
+                backend: "cpu_pprof".to_string(),
+                field: OpsProfilerRedactionField::Host
+            }
+        );
+
+        contract.backends[0].redaction_required = vec![OpsProfilerRedactionField::Host];
+
+        assert_eq!(
+            validate_ops_profiler_contract(&contract).expect_err("profile export requires local path redaction"),
+            ExtensionContractError::OpsProfilerMissingLocalPathRedaction {
+                backend: "cpu_pprof".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_ops_profiler_missing_provenance_boundary() {
+        let mut contract = OpsProfilerContract {
+            mode: OpsProfilerContractMode::CapabilityDescription,
+            backends: vec![profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true)],
+        };
+        contract.backends[0].provenance.source = " ".to_string();
+
+        assert_eq!(
+            validate_ops_profiler_contract(&contract).expect_err("provenance source should be required"),
+            ExtensionContractError::EmptyOpsProfilerProvenanceSource {
+                backend: "cpu_pprof".to_string()
+            }
+        );
+
+        contract.backends[0].provenance.source = "rustfs.profiling".to_string();
+        contract.backends[0].provenance.collection_boundary.clear();
+
+        assert_eq!(
+            validate_ops_profiler_contract(&contract).expect_err("collection boundary should be required"),
+            ExtensionContractError::EmptyOpsProfilerCollectionBoundary {
+                backend: "cpu_pprof".to_string()
+            }
+        );
     }
 
     #[test]

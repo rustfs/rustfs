@@ -47,30 +47,19 @@
 //! start a second server will return an error.
 
 use crate::config::Config;
-use crate::init::{add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system};
-use crate::server::{ShutdownHandle, shutdown_event_notifier, start_http_server, stop_audit_system};
-use crate::startup_fs_guard::enforce_unsupported_fs_policy;
-use crate::startup_iam::{bootstrap_or_defer_iam_init, publish_ready_for_iam_bootstrap};
-use crate::storage_compat::init_lock_clients;
-use crate::storage_compat::{
-    ECStore, EndpointServerPools, init as init_ecstore_config, init_background_replication, init_bucket_metadata_sys,
-    init_global_config_sys, init_local_disks, set_global_endpoints, set_global_rustfs_port, try_migrate_bucket_metadata,
-    try_migrate_iam_config, try_migrate_server_config, update_erasure_type,
-};
-use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
-use rustfs_credentials::init_global_action_credentials;
+use crate::server::{ShutdownHandle, start_http_server};
+use crate::startup_lifecycle::{log_embedded_server_ready, publish_embedded_startup_ready};
+use crate::startup_server::init_embedded_startup_listen_context;
+use crate::startup_services::init_embedded_startup_runtime_services;
+use crate::startup_shutdown::run_embedded_shutdown_cleanup;
+use crate::startup_storage::{init_embedded_startup_storage_foundation, init_embedded_startup_storage_runtime};
 use rustfs_obs::{init_obs, set_global_guard};
-use rustfs_storage_api::{BucketOperations, BucketOptions};
-use rustfs_utils::net::parse_and_resolve_address;
 use rustls::crypto::aws_lc_rs::default_provider;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 const LOG_COMPONENT_EMBEDDED: &str = "embedded";
 const LOG_SUBSYSTEM_EMBEDDED: &str = "embedded";
@@ -302,188 +291,56 @@ impl RustFSServerBuilder {
         // Trusted proxies.
         rustfs_trusted_proxies::init();
 
-        // Resolve listen address before endpoint/global initialization.
-        let server_addr =
-            parse_and_resolve_address(config.address.as_str()).map_err(|e| ServerError::Init(format!("address: {e}")))?;
-
-        if server_addr.port() == 0 {
-            return Err(ServerError::Init(
-                "port 0 is not supported in embedded mode because startup requires \
-                 a stable listen address and port before endpoint/global initialization. \
-                 Use `find_available_port()` to obtain a free port."
-                    .to_string(),
-            ));
-        }
-
-        // Credentials.
-        init_global_action_credentials(Some(config.access_key.clone()), Some(config.secret_key.clone()))
-            .map_err(|e| ServerError::Init(format!("credentials: {e:?}")))?;
-
-        // Region.
-        if let Some(region_str) = &config.region {
-            let region = region_str
-                .parse()
-                .map_err(|e| ServerError::Init(format!("invalid region '{region_str}': {e}")))?;
-            crate::storage_compat::set_global_region(region);
-        }
-
-        let server_port = server_addr.port();
-
-        set_global_rustfs_port(server_port);
-        set_global_addr(&config.address).await;
+        let listen_context = init_embedded_startup_listen_context(&config)
+            .await
+            .map_err(|e| ServerError::Init(e.to_string()))?;
 
         set_global_init_guard()?;
 
-        // Endpoints / erasure setup.
-        let server_addr_str = server_addr.to_string();
-        let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_addr_str.as_str(), config.volumes.clone())
+        let endpoint_pools = init_embedded_startup_storage_foundation(&listen_context.server_address, &config.volumes)
             .await
-            .map_err(|e| ServerError::Init(format!("endpoints: {e}")))?;
-        enforce_unsupported_fs_policy(&endpoint_pools).map_err(|e| ServerError::Init(format!("unsupported fs guard: {e}")))?;
-
-        set_global_endpoints(endpoint_pools.as_ref().clone());
-        update_erasure_type(setup_type).await;
-
-        // Local disks.
-        init_local_disks(endpoint_pools.clone())
-            .await
-            .map_err(|e| ServerError::Init(format!("local disks: {e}")))?;
-        init_lock_clients(endpoint_pools.clone());
-
-        // Service state.
-        let readiness = Arc::new(GlobalReadiness::new());
+            .map_err(|e| ServerError::Init(e.to_string()))?;
 
         // Start HTTP server.
         let mut s3_config = config.clone();
         s3_config.console_enable = false;
-        let (shutdown_handle, bound_addr) = start_http_server(&s3_config, readiness.clone()).await?;
+        let (shutdown_handle, bound_addr) = start_http_server(&s3_config, listen_context.readiness.clone()).await?;
         let ctx = CancellationToken::new();
         let shutdown_embedded_server = || {
             shutdown_handle.signal();
             ctx.cancel();
         };
 
-        // Storage engine.
-        let store = match ECStore::new(server_addr, endpoint_pools.clone(), ctx.clone()).await {
-            Ok(store) => store,
+        let storage_runtime = match init_embedded_startup_storage_runtime(
+            listen_context.server_addr,
+            &endpoint_pools,
+            listen_context.readiness.clone(),
+            ctx.clone(),
+        )
+        .await
+        {
+            Ok(runtime) => runtime,
             Err(e) => {
-                error!(
-                    component = LOG_COMPONENT_EMBEDDED,
-                    subsystem = LOG_SUBSYSTEM_EMBEDDED,
-                    event = "embedded_storage_init_failed",
-                    stage = "ecstore_new",
-                    error = ?e,
-                    "Embedded storage initialization failed"
-                );
                 shutdown_embedded_server();
-                return Err(ServerError::Init(format!("ECStore: {e}")));
+                return Err(ServerError::Init(e.to_string()));
             }
         };
+        let store = storage_runtime.store;
 
-        init_ecstore_config();
-        try_migrate_server_config(store.clone()).await;
+        let service_runtime =
+            init_embedded_startup_runtime_services(&config, endpoint_pools, store, ctx.clone(), listen_context.readiness.clone())
+                .await
+                .map_err(|e| {
+                    shutdown_embedded_server();
+                    ServerError::Init(e.to_string())
+                })?;
 
-        // Global config system (with retry).
-        let mut retry = 0;
-        while let Err(e) = init_global_config_sys(store.clone()).await {
-            retry += 1;
-            if retry > 15 {
-                shutdown_embedded_server();
-                return Err(ServerError::Init(format!("init_global_config_sys failed after 15 retries: {e}")));
-            }
-            debug!(
-                component = LOG_COMPONENT_EMBEDDED,
-                subsystem = LOG_SUBSYSTEM_EMBEDDED,
-                event = "embedded_storage_init_retry",
-                stage = "global_config_sys",
-                retry,
-                error = %e,
-                "Embedded storage initialization retry scheduled"
-            );
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        }
-        readiness.mark_stage(SystemStage::StorageReady);
-
-        // Replication.
-        init_background_replication(store.clone()).await;
-
-        // KMS (optional, non-fatal for embedded).
-        if let Err(e) = init_kms_system(&config).await {
-            warn!(
-                component = LOG_COMPONENT_EMBEDDED,
-                subsystem = LOG_SUBSYSTEM_EMBEDDED,
-                event = "embedded_optional_service_skipped",
-                service = "kms",
-                error = %e,
-                "Embedded optional service initialization skipped"
-            );
-        }
-
-        // Buffer profiles.
-        init_buffer_profile_system(&config);
-
-        if let Err(e) = crate::startup_services::init_event_notifier_and_audit().await {
-            warn!(
-                component = LOG_COMPONENT_EMBEDDED,
-                subsystem = LOG_SUBSYSTEM_EMBEDDED,
-                event = "embedded_optional_service_skipped",
-                service = "audit",
-                error = %e,
-                "Embedded optional service initialization skipped"
-            );
-        }
-
-        // Bucket listing for metadata + notification init.
-        let buckets: Vec<String> = store
-            .list_bucket(&BucketOptions {
-                no_metadata: true,
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| {
-                shutdown_embedded_server();
-                ServerError::Init(format!("list_bucket: {e}"))
-            })?
-            .into_iter()
-            .map(|v| v.name)
-            .collect();
-
-        try_migrate_bucket_metadata(store.clone()).await;
-        init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
-        try_migrate_iam_config(store.clone()).await;
-
-        // IAM.
-        let kms_interface =
-            rustfs_kms::get_global_kms_service_manager().unwrap_or_else(rustfs_kms::init_global_kms_service_manager);
-        let iam_bootstrap = bootstrap_or_defer_iam_init(store.clone(), kms_interface, readiness.clone(), None, Some(ctx.clone()))
-            .await
-            .map_err(|e| {
-                shutdown_embedded_server();
-                ServerError::Init(format!("IAM bootstrap setup: {e}"))
-            })?;
-
-        // Bucket notifications.
-        add_bucket_notification_configuration(buckets.clone()).await;
-
-        if let Err(e) = crate::startup_services::init_notification_system(endpoint_pools.clone()).await {
-            warn!(
-                component = LOG_COMPONENT_EMBEDDED,
-                subsystem = LOG_SUBSYSTEM_EMBEDDED,
-                event = "embedded_optional_service_skipped",
-                service = "notification",
-                error = %e,
-                "Embedded optional service initialization skipped"
-            );
-        }
-
-        publish_ready_for_iam_bootstrap(iam_bootstrap, readiness.as_ref(), None)
+        publish_embedded_startup_ready(service_runtime.iam_bootstrap, listen_context.readiness.as_ref())
             .await
             .map_err(|e| {
                 shutdown_embedded_server();
                 ServerError::Init(format!("runtime readiness: {e}"))
             })?;
-
-        rustfs_common::set_global_init_time_now().await;
 
         let server = RustFSServer {
             address: bound_addr,
@@ -495,15 +352,7 @@ impl RustFSServerBuilder {
             temp_dir: temp_dir_guard.map(|g| g.keep()),
         };
 
-        info!(
-            target: "rustfs::embedded",
-            component = LOG_COMPONENT_EMBEDDED,
-            subsystem = LOG_SUBSYSTEM_EMBEDDED,
-            event = "embedded_server_state",
-            state = "ready",
-            "RustFS embedded server ready at http://{}",
-            server.endpoint_address()
-        );
+        log_embedded_server_ready(server.endpoint_address());
 
         Ok(server)
     }
@@ -583,20 +432,7 @@ impl RustFSServer {
         // Cancel background services.
         self.cancel_token.cancel();
 
-        // Shutdown event notifier.
-        shutdown_event_notifier().await;
-
-        // Stop the audit system.
-        if let Err(e) = stop_audit_system().await {
-            warn!(
-                component = LOG_COMPONENT_EMBEDDED,
-                subsystem = LOG_SUBSYSTEM_EMBEDDED,
-                event = "embedded_shutdown_cleanup_failed",
-                service = "audit",
-                error = %e,
-                "Embedded shutdown cleanup failed"
-            );
-        }
+        run_embedded_shutdown_cleanup().await;
 
         // Signal HTTP server to stop.
         if let Some(shutdown_handle) = self.shutdown_handle.take() {

@@ -12,4 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use crate::layout::disks_layout::*;
+pub use crate::startup_optional_runtime_sidecars::{
+    OptionalRuntimeServices, init_optional_runtime_services, prepare_optional_runtime_shutdowns,
+    shutdown_optional_runtime_services,
+};

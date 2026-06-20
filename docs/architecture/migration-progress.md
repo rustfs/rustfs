@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-final-object-boundary-prune`
-- Baseline: stacked after `rustfs/rustfs#3622`
-  (`4300bf04f3a82ef4cc2605f417f89e7b4643b99e`).
-- PR type for this branch: `consumer-migration`
+- Branch: `overtrue/arch-ecstore-layout-endpoints-move`
+- Baseline: merged `E-002/E-LAYOUT-001`.
+- Stacked on: merged ECStore layout foundation and format layout ownership
+  slices.
+- PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: route heal and RustFS storage object reader, writer,
-  metadata, and options aliases through `rustfs_storage_api` associated types.
-- CI/script changes: shrink the remaining external `rustfs_ecstore::object_api`
-  compatibility alias snapshot to empty.
-- Docs changes: record the API-071 final object boundary prune slice.
+- Rust code changes: pure-move ECStore endpoint parsing and endpoint grouping
+  modules into the internal layout bucket while preserving old public paths.
+- CI/script changes: none.
+- Docs changes: record the ECStore endpoint pure move slice.
 
 ## Phase 0 Tasks
 
@@ -1985,25 +1985,494 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     checks, formatting, migration guards, Rust risk scan, branch freshness
     check, and pre-commit quality gate.
 
+- [x] `X-012` Define ops profiler extension schema contract.
+  - Do: add `ops.profiler.v1` capability DTOs for profiler backend status,
+    capability-description mode, profile export redaction requirements, and
+    provenance in the extension schema contract crate.
+  - Acceptance: disabled, unsupported, enabled, and unknown backend states are
+    representable; execution requests are rejected; profile export declarations
+    require local path redaction; provenance records source, collection
+    boundary, and trust level without credentials.
+  - Must preserve: no plugin execution, no sidecar startup, no profile route or
+    admin API behavior changes, no exporter/storage/object-path/telemetry
+    behavior changes, and no dependency edge from `extension-schema` to
+    implementation crates.
+  - Verification: extension schema check/tests, formatting, migration/layer
+    guards, diff hygiene, Rust risk scan, branch freshness check, and
+    pre-commit quality gate.
+
+- [x] `X-013` Add ops profiler capability snapshot contract.
+  - Do: add `OpsProfilerCapabilitySnapshot` and `OpsProfilerRuntimeSnapshot`
+    DTOs plus validation for the `ops.profiler.v1` capability, disabled
+    external runtimes, and non-fatal profiler startup behavior.
+  - Acceptance: disabled, unsupported, and enabled profiler backend states
+    round-trip through the snapshot contract; sidecar/Wasm profiler runtimes
+    remain disabled by default; profiler snapshots cannot declare a startup
+    fatal boundary.
+  - Must preserve: no plugin execution, no sidecar startup, no profile route,
+    no admin API behavior changes, no runtime startup/shutdown behavior
+    changes, and no dependency edge from `extension-schema` to runtime or
+    storage implementation crates.
+  - Verification: extension schema check/tests, formatting, migration/layer
+    guards, diff hygiene, Rust risk scan, branch freshness check, and
+    pre-commit quality gate.
+
+- [x] `R-021` Extract optional runtime shutdown boundary.
+  - Do: add `startup_optional_runtimes` and move optional protocol shutdown
+    ownership/logging out of `startup_services`.
+  - Acceptance: optional protocol shutdown plan order stays FTP, FTPS, WebDAV,
+    SFTP; stopping logs remain before event notifier/audit/profiling shutdown;
+    signal/wait remains after S3/console HTTP shutdown; later optional
+    sidecars have an explicit owner without startup behavior changes.
+  - Must preserve: protocol initialization, protocol shutdown signaling and
+    waiting, shutdown order, profiling/audit/event notifier shutdown, HTTP
+    shutdown, readiness state, and fatal boundaries.
+  - Verification: focused startup optional runtime/service tests, RustFS lib
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-022` Extract optional runtime startup boundary.
+  - Do: add `init_optional_runtime_services` so optional protocol startup is
+    owned by `startup_optional_runtimes`, while `startup_protocols` remains the
+    protocol implementation adapter.
+  - Acceptance: optional protocol startup order stays FTP, FTPS, WebDAV, SFTP;
+    KMS initialization still happens before optional protocol startup; buffer
+    profiling, audit, deadlock detection, metadata, IAM, notification, scanner,
+    heal, and observability startup remain after optional protocol startup.
+  - Must preserve: protocol feature gates, disabled protocol behavior,
+    protocol startup error mapping, fatal boundary on protocol startup errors,
+    startup order, shutdown order, readiness state, and runtime behavior.
+  - Verification: focused optional runtime/protocol/startup service tests,
+    RustFS lib check, migration/layer guards, formatting, diff hygiene, Rust
+    risk scan, branch freshness check, pre-commit quality gate, and
+    three-expert review.
+
+- [x] `R-023` Extract startup shutdown lifecycle boundary.
+  - Do: add `startup_shutdown` and move runtime token cancellation, service
+    state transitions, background shutdown, notifier/audit/profiling shutdown,
+    HTTP shutdown, and optional runtime wait sequencing out of
+    `startup_services`.
+  - Acceptance: shutdown order stays runtime token cancellation, `Stopping`
+    state, scanner/AHM shutdown, optional runtime shutdown planning,
+    notifier/audit/profiling shutdown, S3 and console HTTP shutdown, optional
+    runtime waits, then `Stopped` state.
+  - Must preserve: service state transitions, readiness state behavior,
+    scanner/heal enable flag handling, notifier/audit/profiling shutdown logs,
+    HTTP shutdown ordering, optional protocol shutdown ordering, and fatal
+    boundaries.
+  - Verification: focused shutdown/service/optional runtime tests, RustFS lib
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-024` Extract startup ready lifecycle boundary.
+  - Do: add `startup_lifecycle` and move ready publication, global init time,
+    scanner startup, shutdown-signal wait, shutdown delegation, and final
+    stopped-state logging out of `startup_services`.
+  - Acceptance: lifecycle order stays server-ready log, IAM readiness
+    publication, global init time, optional scanner startup, shutdown wait,
+    shutdown sequence delegation, and final stopped log.
+  - Must preserve: inline/deferred IAM readiness behavior, scanner start timing,
+    global init-time timing, shutdown signal wait semantics, shutdown ordering,
+    service state reporting, and fatal boundary on readiness publication.
+  - Verification: focused lifecycle/service/shutdown tests, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-025` Extract startup service component boundary.
+  - Do: add `startup_service_components` and move audit/deadlock, bucket
+    metadata, IAM bootstrap, auth integration, notification, background service,
+    and observability component helpers out of `startup_services`.
+  - Acceptance: `startup_services` keeps the same runtime service orchestration
+    order while component helpers own the individual service startup side
+    effects.
+  - Must preserve: KMS before optional runtime startup, buffer profiling before
+    audit, event notifier before audit, bucket metadata before IAM, IAM before
+    auth and notification, notification before background services, and
+    observability startup after background service setup.
+  - Verification: focused startup service component/service/lifecycle tests,
+    RustFS lib check, migration/layer guards, formatting, diff hygiene, Rust
+    risk scan, branch freshness check, pre-commit quality gate, and
+    three-expert review.
+
+- [x] `R-026` Extract optional runtime sidecar boundary.
+  - Do: add `startup_optional_runtime_sidecars` and move optional runtime
+    sidecar ownership, shutdown planning, shutdown execution, and protocol
+    shutdown order tests out of `startup_optional_runtimes`.
+  - Acceptance: optional protocol startup still happens after KMS and before
+    buffer profiling, while shutdown planning still records FTP, FTPS, WebDAV,
+    then SFTP handles before later shutdown signaling.
+  - Must preserve: feature-gated protocol startup behavior, disabled-protocol
+    handling, protocol shutdown ordering, HTTP shutdown before optional protocol
+    shutdown signaling, and the compatibility `startup_optional_runtimes` API.
+  - Verification: focused optional runtime sidecar/runtime/shutdown tests,
+    RustFS lib check, migration/layer guards, formatting, diff hygiene, Rust
+    risk scan, branch freshness check, pre-commit quality gate, and
+    three-expert review.
+
+- [x] `R-027` Extract startup runtime hook boundary.
+  - Do: add `startup_runtime_hooks` and move startup runtime diagnostics,
+    profiling hook dispatch, shutdown profiling dispatch, and default crypto
+    provider installation out of `startup_runtime` and `startup_profiling`.
+  - Acceptance: BOOT-006 keeps diagnostics, profiling init, trusted proxy init,
+    provider install, and outbound TLS material load in the same order, while
+    STOP-004 still stops profiling through the existing compatibility path.
+  - Must preserve: startup logo and telemetry/license log behavior, profiling
+    hook dispatch behavior, rustls provider install behavior, trusted proxy init
+    order, outbound TLS fatal boundary, and profiling shutdown call path.
+  - Verification: focused runtime hook/profiling/runtime/shutdown tests, RustFS
+    lib check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-028` Extract startup TLS material boundary.
+  - Do: add `startup_tls_material` and move outbound TLS material loading,
+    global TLS publication, generation recording, TLS metrics initialization,
+    and existing TLS path/generation tests out of `startup_runtime`.
+  - Acceptance: BOOT-006 keeps diagnostics, profiling init, trusted proxy init,
+    provider install, and outbound TLS material load in the same order.
+  - Must preserve: configured TLS material fatal behavior, TLS path trimming,
+    saturating TLS generation behavior, outbound TLS global state publication,
+    generation metric recording, and metrics initialization when observability
+    metrics are enabled.
+  - Verification: focused TLS material/runtime tests, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-029` Reuse startup phase boundaries in embedded mode.
+  - Do: move embedded listen setup, endpoint/local disk setup, ECStore/global
+    config setup, storage readiness publication, and replication startup behind
+    startup server/storage helpers.
+  - Acceptance: embedded startup keeps its stable-port requirement, global
+    startup guard placement, S3-only HTTP startup, readiness publication, and
+    storage initialization order while sharing the same startup phase owners.
+  - Must preserve: embedded port 0 rejection, credential/region publication,
+    endpoint and unsupported filesystem validation, local disk and lock client
+    initialization, ECStore fatal shutdown behavior, global config retry limit,
+    and embedded-specific non-fatal KMS/audit/notification behavior.
+  - Verification: focused embedded/startup storage checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-030` Reuse runtime service boundaries in embedded mode.
+  - Do: move embedded KMS/buffer/audit setup, bucket metadata migration, IAM
+    bootstrap, notification setup, and event/audit shutdown cleanup behind
+    startup service/shutdown helpers.
+  - Acceptance: embedded startup keeps KMS/audit/notification failures
+    non-fatal, preserves bucket metadata and IAM initialization order, and
+    keeps shutdown cleanup behavior unchanged.
+  - Must preserve: KMS warning-only behavior, buffer profile initialization,
+    audit warning-only behavior, bucket listing failure shutdown, bucket
+    metadata migration before IAM migration, IAM bootstrap fatal behavior,
+    notification warning-only behavior, readiness publication, event notifier
+    shutdown, audit stop warning behavior, and temp directory cleanup.
+  - Verification: focused embedded/service/shutdown checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-031` Reuse lifecycle publication boundaries in embedded mode.
+  - Do: move embedded IAM readiness publication, global init-time publication,
+    and ready-state logging behind startup lifecycle helpers.
+  - Acceptance: embedded startup still publishes readiness after runtime
+    service setup, preserves the `runtime readiness` error prefix on failure,
+    records global init time after successful readiness publication, and logs
+    the same ready endpoint message after the server handle is built.
+  - Must preserve: deferred IAM bootstrap readiness behavior, ready-inline
+    runtime readiness publication, startup failure shutdown signaling, global
+    init-time publication ordering, and endpoint-address normalization used by
+    the ready log.
+  - Verification: focused embedded/lifecycle checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-032` Publish ops profiler runtime contract boundaries.
+  - Do: add the builtin ops profiler extension schema/contract to the targets
+    catalog, expose it through the admin extension catalog, and add a read-only
+    registry for profiler backend capability descriptions.
+  - Acceptance: the catalog advertises `builtin:ops-profiler` with
+    `ops.profiler.v1`, backend capability descriptions validate through the
+    extension-schema contract, and registry access is admin/capability limited
+    without executing profiler collection.
+  - Must preserve: existing `/debug/pprof/*` admin behavior, profiling startup
+    and shutdown hooks, disabled external profiler runtime defaults, local path
+    redaction requirements, and no plugin execution or sidecar startup.
+  - Verification: focused targets/admin extension checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-033` Expose extension runtime capability snapshots.
+  - Do: add read-only diagnostics/profiler runtime capability snapshots to the
+    admin extension catalog response using existing schema and contract DTOs.
+  - Acceptance: `/v4/extensions/catalog` reports builtin diagnostics and
+    profiler capability contracts with their runtime boundaries, disabled
+    defaults, and non-fatal startup flags while preserving schema validation.
+  - Must preserve: existing extension catalog route/auth, plugin instance
+    listing, profiler/diagnostics execution paths, and external plugin flow
+    status semantics.
+  - Verification: focused admin catalog and targets runtime checks, RustFS lib
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `E-001/E-SET-001` Add ECStore layout skeleton and set-layout boundary.
+  - Do: create the ECStore internal layout ownership buckets and pin static set
+    layout versus runtime `Sets`/`SetDisks` orchestration boundaries before any
+    file moves.
+  - Acceptance: the skeleton documents future ownership buckets, static format
+    set distribution is preserved, and runtime flat disk plus per-set lock-host
+    mapping is described by focused tests.
+  - Must preserve: format distribution, object-to-set hashing owner, local disk
+    replacement, lock client mapping, existing public module paths, and runtime
+    `Sets`/`SetDisks` behavior.
+  - Verification: focused ECStore set layout tests, ECStore/RustFS compile
+    checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `E-002/E-LAYOUT-001` Move ECStore format and disk-layout owners.
+  - Do: pure-move persisted format ownership and disk-layout expansion into
+    the ECStore layout bucket while keeping compatibility stubs at the old
+    public paths.
+  - Acceptance: `crate::disk::format::*` and `crate::disks_layout::*` remain
+    usable, `layout::format` owns `FormatV3`, and `layout::disks_layout` owns
+    CLI volume expansion.
+  - Must preserve: format JSON wire shape, disk UUID lookup, distribution
+    algorithm, `RUSTFS_ERASURE_SET_DRIVE_COUNT` handling, endpoint expansion,
+    and old public module paths.
+  - Verification: focused ECStore format and disks-layout tests,
+    ECStore/RustFS/Heal compile checks, migration/layer guards, formatting,
+    diff hygiene, Rust risk scan, branch freshness check, pre-commit quality
+    gate, and three-expert review.
+
+- [x] `E-003/E-LAYOUT-002` Move ECStore endpoint layout owners.
+  - Do: pure-move endpoint parsing and endpoint grouping into the ECStore
+    layout bucket while keeping compatibility stubs at the old public paths.
+  - Acceptance: `crate::disk::endpoint::*` and `crate::endpoints::*` remain
+    usable, `layout::endpoint` owns `Endpoint`, and `layout::endpoints` owns
+    `EndpointServerPools` and endpoint grouping.
+  - Must preserve: endpoint string parsing, URL/path validation, local-host
+    detection, pool/set/disk indexes, endpoint grouping, disk independence
+    checks, setup type classification, and old public module paths.
+  - Verification: focused ECStore endpoint tests, ECStore/RustFS/Heal compile
+    checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
 ## Next PRs
 
-1. `pure-move`: continue larger lifecycle hook slices for optional runtime
-   sidecars while preserving startup and shutdown ordering.
-2. `consumer-migration`: continue larger cleanup slices with the
-   loss-prevention guards active for remaining ECStore compatibility contracts
-   that still have dedicated preservation coverage.
+1. `pure-move`: continue moving runtime-neutral pool/set layout helpers once
+   E-003/E-LAYOUT-002 lands.
+2. `pure-move`: continue pruning residual embedded startup-only orchestration
+   once the lifecycle helpers are merged.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-020 moves profiling init/shutdown call sites behind `startup_profiling` hook functions without moving CPU/memory profiling implementation ownership or admin pprof APIs. |
-| Migration preservation | passed | BOOT-006 still initializes profiling before trusted proxies/provider/TLS setup; STOP-004 still stops profiling after notifier/audit shutdown and before HTTP shutdown; profiling env flags, platform gates, target unsupported behavior, and cancellation-token ownership remain in `profiling.rs`. |
-| Testing/verification | passed | Focused startup profiling hook tests, RustFS library check, migration/layer guards, formatting, diff hygiene, Rust risk scan, and full `make pre-commit` validate the current R-020 slice. |
+| Quality/architecture | passed | E-003/E-LAYOUT-002 is a pure move into ECStore layout with compatibility stubs at old public paths; no new runtime owner or dependency boundary is introduced. |
+| Migration preservation | passed | Endpoint parsing, local-host detection, pool/set/disk indexes, endpoint grouping, disk independence checks, setup type classification, and old public module paths remain preserved. |
+| Testing/verification | passed | Focused endpoint/layout checks, compile checks, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 R-031 current slice:
+  - `cargo test -p rustfs --lib startup_lifecycle -- --nocapture`: passed;
+    no matching unit tests currently exist.
+  - `cargo test -p rustfs --lib embedded -- --nocapture`: passed; no
+    matching unit tests currently exist.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; only existing embedded doc
+    examples use `Box<dyn Error>` / `println!`.
+  - `make pre-commit`: passed.
+
+- Issue #660 R-032 current slice:
+  - `cargo test -p rustfs-targets ops_profiler -- --nocapture`: passed.
+  - `cargo test -p rustfs-targets builtin_ops_profiler -- --nocapture`:
+    passed.
+  - `cargo test -p rustfs --lib extension_catalog -- --nocapture`: passed.
+  - `cargo check -p rustfs-targets`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; only test-only
+    expectations/assertion paths were present.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 R-033 current slice:
+  - `cargo test -p rustfs --lib extension_catalog -- --nocapture`: passed.
+  - `cargo test -p rustfs-targets ops_diagnostics -- --nocapture`: passed.
+  - `cargo test -p rustfs-targets ops_profiler -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; only test-only
+    expectations/assertion paths were present.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 E-001/E-SET-001 current slice:
+  - `cargo test -p rustfs-ecstore test_eset -- --nocapture`: passed.
+  - `cargo check -p rustfs-ecstore -p rustfs -p rustfs-heal`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; only test-only
+    expectation paths were present.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 E-002/E-LAYOUT-001 current slice:
+  - `cargo test -p rustfs-ecstore format::test -- --nocapture`: passed.
+  - `cargo test -p rustfs-ecstore disks_layout -- --nocapture`: passed.
+  - `cargo check -p rustfs-ecstore -p rustfs -p rustfs-heal`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; only existing test-only
+    unwrap/println/panic/expect paths were present.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 E-003/E-LAYOUT-002 current slice:
+  - `cargo test -p rustfs-ecstore layout::endpoint -- --nocapture`: passed.
+  - `cargo test -p rustfs-ecstore layout::endpoints -- --nocapture`: passed.
+  - `cargo check -p rustfs-ecstore -p rustfs -p rustfs-heal`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; only existing endpoint
+    production/test unwrap and expectation paths were moved.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 X-012 current slice:
+  - `cargo test -p rustfs-extension-schema`: passed.
+  - `cargo check -p rustfs-extension-schema`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 X-013 current slice:
+  - `cargo test -p rustfs-extension-schema`: passed.
+  - `cargo check -p rustfs-extension-schema`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 R-021 current slice:
+  - `cargo test -p rustfs --lib startup_optional_runtimes -- --nocapture`:
+    passed.
+  - `cargo test -p rustfs --lib startup_services -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 R-022 current slice:
+  - `cargo test -p rustfs --lib startup_optional_runtimes -- --nocapture`:
+    passed.
+  - `cargo test -p rustfs --lib startup_protocols -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_services -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 R-023 current slice:
+  - `cargo test -p rustfs --lib startup_shutdown -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_services -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_optional_runtimes -- --nocapture`:
+    passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 R-024 current slice:
+  - `cargo test -p rustfs --lib startup_lifecycle -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_services -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_shutdown -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 R-025 current slice:
+  - `cargo test -p rustfs --lib startup_service_components -- --nocapture`:
+    passed.
+  - `cargo test -p rustfs --lib startup_services -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_lifecycle -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 R-026 current slice:
+  - `cargo test -p rustfs --lib startup_optional_runtime_sidecars -- --nocapture`:
+    passed.
+  - `cargo test -p rustfs --lib startup_optional_runtimes -- --nocapture`:
+    passed.
+  - `cargo test -p rustfs --lib startup_shutdown -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 R-027 current slice:
+  - `cargo test -p rustfs --lib startup_runtime_hooks -- --nocapture`:
+    passed.
+  - `cargo test -p rustfs --lib startup_profiling -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_runtime -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_shutdown -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
 
 - Issue #660 R-020 current slice:
   - `cargo test -p rustfs --lib startup_profiling -- --nocapture`: passed.

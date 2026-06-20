@@ -31,6 +31,79 @@ Disallowed responsibilities:
 - Hide globals behind a service-locator API.
 - Change startup side effects while moving code.
 
+## Shutdown Lifecycle Boundary
+
+`startup_shutdown` owns the main shutdown sequence after the process receives a
+shutdown signal. Startup modules may pass handles into this boundary, but they
+must not reorder runtime-token cancellation, background service shutdown,
+optional runtime shutdown planning, notifier/audit/profiling shutdown, HTTP
+shutdown, optional runtime waits, or final service-state publication.
+
+## Startup Lifecycle Boundary
+
+`startup_lifecycle` owns the ready-to-shutdown orchestration after runtime
+services initialize. Service modules may return initialized handles into this
+boundary, but they must not reorder ready publication, global init-time
+publication, scanner startup, shutdown-signal wait, shutdown delegation, or the
+final stopped-state log.
+
+## Startup Service Component Boundary
+
+`startup_service_components` owns individual runtime service startup component
+helpers while `startup_services` preserves their orchestration order. Migration
+PRs must not change KMS, optional runtime, audit, metadata, IAM, auth,
+notification, background service, or observability startup ordering while moving
+these helpers.
+
+## Optional Runtime Boundary
+
+`startup_optional_runtime_sidecars` owns startup handles, shutdown planning, and
+shutdown execution for optional runtime services that are not readiness
+boundaries. `startup_optional_runtimes` remains a compatibility handoff for the
+old module path. The current owner set is protocol servers only. Future optional
+sidecars must enter this boundary with explicit shutdown handles and status
+snapshots instead of adding ad hoc startup or shutdown work to
+`startup_services`.
+
+## Startup Runtime Hook Boundary
+
+`startup_runtime_hooks` owns runtime hook side effects that wrap the startup
+foundation but are not TLS material loading: startup diagnostics, profiling
+hook dispatch, and default crypto provider installation. `startup_runtime`
+preserves BOOT-006 orchestration and outbound TLS fatal behavior, while
+`startup_profiling` remains a compatibility handoff for the old profiling hook
+path.
+
+## Startup TLS Material Boundary
+
+`startup_tls_material` owns configured outbound TLS material loading, global
+outbound TLS publication, generation recording, and TLS metrics initialization.
+`startup_runtime` still owns BOOT-006 ordering and must preserve the fatal
+boundary when configured TLS material fails to load.
+
+## Embedded Startup Phase Reuse
+
+Embedded startup should use the same startup server and storage phase owners for
+listen context, endpoint/local disk setup, storage runtime setup, readiness
+publication, and replication startup. Embedded-specific behavior still owns its
+stable-port requirement, one-shot global initialization guard placement, S3-only
+HTTP listener, and non-fatal KMS/audit/notification policy.
+
+## Embedded Runtime Service Reuse
+
+Embedded runtime service setup should share startup service helpers for optional
+service initialization, bucket metadata/IAM setup, notification setup, and
+shutdown cleanup. Embedded-specific behavior still owns warning-only
+KMS/audit/notification failures, no binary-only background sidecars, no state
+manager, and the one-shot server handle cleanup used by embedded shutdown.
+
+## Embedded Lifecycle Publication Reuse
+
+Embedded ready publication should share startup lifecycle helpers for IAM
+readiness publication, global init-time publication, and ready-state logging.
+Embedded-specific behavior still owns server handle construction, endpoint
+address normalization, and process-local shutdown cleanup.
+
 ## AppContext Foundation
 
 Early AppContext work should split resolver files and add compatibility tests before

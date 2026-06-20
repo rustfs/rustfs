@@ -30,6 +30,7 @@ pub mod endpoints;
 pub mod erasure_coding;
 pub mod error;
 pub mod global;
+pub(crate) mod layout;
 pub mod metrics_realtime;
 pub mod notification_sys;
 pub mod object_api;
