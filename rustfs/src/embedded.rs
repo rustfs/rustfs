@@ -49,20 +49,15 @@
 use crate::config::Config;
 use crate::server::{ShutdownHandle, start_http_server};
 use crate::startup_lifecycle::{log_embedded_server_ready, publish_embedded_startup_ready};
+use crate::startup_runtime_hooks::init_embedded_runtime_hooks;
 use crate::startup_server::init_embedded_startup_listen_context;
 use crate::startup_services::init_embedded_startup_runtime_services;
-use crate::startup_shutdown::run_embedded_shutdown_cleanup;
+use crate::startup_shutdown::run_embedded_server_shutdown;
 use crate::startup_storage::{init_embedded_startup_storage_foundation, init_embedded_startup_storage_runtime};
-use rustfs_obs::{init_obs, set_global_guard};
-use rustls::crypto::aws_lc_rs::default_provider;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
-
-const LOG_COMPONENT_EMBEDDED: &str = "embedded";
-const LOG_SUBSYSTEM_EMBEDDED: &str = "embedded";
 
 /// Tracks whether a server has been started in this process.
 static SERVER_STARTED: AtomicBool = AtomicBool::new(false);
@@ -270,26 +265,9 @@ impl RustFSServerBuilder {
 
         // --- Initialization sequence (mirrors main.rs::run) ---
 
-        // Observability (minimal / no-op endpoint for embedded use).
-        let guard = init_obs(Some(config.obs_endpoint.clone()))
+        init_embedded_runtime_hooks(config.obs_endpoint.clone())
             .await
-            .map_err(|e| ServerError::Init(format!("init_obs: {e}")))?;
-        set_global_guard(guard).map_err(|e| ServerError::Init(format!("set_global_guard: {e}")))?;
-
-        // Crypto provider.
-        if let Err(err) = default_provider().install_default() {
-            debug!(
-                component = LOG_COMPONENT_EMBEDDED,
-                subsystem = LOG_SUBSYSTEM_EMBEDDED,
-                event = "crypto_provider_state",
-                state = "already_installed",
-                error = ?err,
-                "Embedded crypto provider state changed"
-            );
-        }
-
-        // Trusted proxies.
-        rustfs_trusted_proxies::init();
+            .map_err(|e| ServerError::Init(e.to_string()))?;
 
         let listen_context = init_embedded_startup_listen_context(&config)
             .await
@@ -420,48 +398,7 @@ impl RustFSServer {
     }
 
     async fn do_shutdown(&mut self) {
-        info!(
-            target: "rustfs::embedded",
-            component = LOG_COMPONENT_EMBEDDED,
-            subsystem = LOG_SUBSYSTEM_EMBEDDED,
-            event = "embedded_server_state",
-            state = "stopping",
-            "Embedded server state changed"
-        );
-
-        // Cancel background services.
-        self.cancel_token.cancel();
-
-        run_embedded_shutdown_cleanup().await;
-
-        // Signal HTTP server to stop.
-        if let Some(shutdown_handle) = self.shutdown_handle.take() {
-            shutdown_handle.shutdown().await;
-        }
-
-        // Clean up temp directory if we created it.
-        if let Some(ref dir) = self.temp_dir
-            && let Err(e) = tokio::fs::remove_dir_all(dir).await
-        {
-            warn!(
-                component = LOG_COMPONENT_EMBEDDED,
-                subsystem = LOG_SUBSYSTEM_EMBEDDED,
-                event = "embedded_shutdown_cleanup_failed",
-                service = "temp_dir",
-                path = %dir.display(),
-                error = %e,
-                "Embedded shutdown cleanup failed"
-            );
-        }
-
-        info!(
-            target: "rustfs::embedded",
-            component = LOG_COMPONENT_EMBEDDED,
-            subsystem = LOG_SUBSYSTEM_EMBEDDED,
-            event = "embedded_server_state",
-            state = "stopped",
-            "Embedded server state changed"
-        );
+        run_embedded_server_shutdown(&self.cancel_token, &mut self.shutdown_handle, self.temp_dir.as_deref()).await;
     }
 }
 

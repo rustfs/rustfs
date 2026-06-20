@@ -21,6 +21,7 @@ use crate::{
 };
 use rustfs_heal::shutdown_ahm_services;
 use rustfs_utils::get_env_bool_with_aliases;
+use std::path::Path;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -33,6 +34,7 @@ const LOG_COMPONENT_EMBEDDED: &str = "embedded";
 const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const LOG_SUBSYSTEM_EMBEDDED: &str = "embedded";
 const EVENT_AUDIT_SYSTEM_STATE: &str = "audit_system_state";
+const EVENT_EMBEDDED_SERVER_STATE: &str = "embedded_server_state";
 const EVENT_EMBEDDED_SHUTDOWN_CLEANUP_FAILED: &str = "embedded_shutdown_cleanup_failed";
 const EVENT_SHUTDOWN_SIGNAL_RECEIVED: &str = "shutdown_signal_received";
 const EVENT_BACKGROUND_SERVICE_SHUTDOWN: &str = "background_service_shutdown";
@@ -212,6 +214,52 @@ pub async fn run_embedded_shutdown_cleanup() {
             "Embedded shutdown cleanup failed"
         );
     }
+}
+
+pub async fn run_embedded_server_shutdown(
+    ctx: &CancellationToken,
+    shutdown_handle: &mut Option<ShutdownHandle>,
+    temp_dir: Option<&Path>,
+) {
+    info!(
+        target: "rustfs::embedded",
+        component = LOG_COMPONENT_EMBEDDED,
+        subsystem = LOG_SUBSYSTEM_EMBEDDED,
+        event = EVENT_EMBEDDED_SERVER_STATE,
+        state = "stopping",
+        "Embedded server state changed"
+    );
+
+    ctx.cancel();
+
+    run_embedded_shutdown_cleanup().await;
+
+    if let Some(shutdown_handle) = shutdown_handle.take() {
+        shutdown_handle.shutdown().await;
+    }
+
+    if let Some(dir) = temp_dir
+        && let Err(err) = tokio::fs::remove_dir_all(dir).await
+    {
+        warn!(
+            component = LOG_COMPONENT_EMBEDDED,
+            subsystem = LOG_SUBSYSTEM_EMBEDDED,
+            event = EVENT_EMBEDDED_SHUTDOWN_CLEANUP_FAILED,
+            service = "temp_dir",
+            path = %dir.display(),
+            error = %err,
+            "Embedded shutdown cleanup failed"
+        );
+    }
+
+    info!(
+        target: "rustfs::embedded",
+        component = LOG_COMPONENT_EMBEDDED,
+        subsystem = LOG_SUBSYSTEM_EMBEDDED,
+        event = EVENT_EMBEDDED_SERVER_STATE,
+        state = "stopped",
+        "Embedded server state changed"
+    );
 }
 
 #[cfg(test)]
