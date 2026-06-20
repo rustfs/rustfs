@@ -128,7 +128,9 @@ downstream compatibility.
 
 Outer compatibility boundary modules must use `rustfs_ecstore::api` for ECStore
 public facade surfaces such as layout, storage owner, admin, metrics,
-notification, capacity, and bucket-name helpers.
+notification, capacity, bucket/config helpers, disk/error contracts, global
+state accessors, RPC constants/clients, reader helpers, tier helpers, and
+rebalance status contracts.
 
 RustFS startup internals must stay crate-private after the startup owner split.
 Only `startup_entrypoint` remains a public startup module for the binary

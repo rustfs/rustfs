@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use rustfs_config::server_config::Config;
-use rustfs_ecstore::{config, global};
+use rustfs_ecstore::api::{config, global};
 
 #[derive(Debug)]
 pub(crate) enum NotifyConfigStoreError {

@@ -14,17 +14,17 @@
 
 use std::sync::Arc;
 
-pub(crate) const IAM_CONFIG_ROOT_PREFIX: &str = rustfs_ecstore::config::RUSTFS_CONFIG_PREFIX;
+pub(crate) const IAM_CONFIG_ROOT_PREFIX: &str = rustfs_ecstore::api::config::RUSTFS_CONFIG_PREFIX;
 
-pub(crate) type IamEcstoreError = rustfs_ecstore::error::Error;
-pub(crate) type IamStorageError = rustfs_ecstore::error::StorageError;
-pub(crate) type IamStorageResult<T> = rustfs_ecstore::error::Result<T>;
+pub(crate) type IamEcstoreError = rustfs_ecstore::api::error::Error;
+pub(crate) type IamStorageError = rustfs_ecstore::api::error::StorageError;
+pub(crate) type IamStorageResult<T> = rustfs_ecstore::api::error::Result<T>;
 pub(crate) type IamStore = rustfs_ecstore::api::storage::ECStore;
 pub(crate) type IamConfigObjectInfo = <IamStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
 pub(crate) type IamConfigObjectOptions = <IamStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
 
 pub(crate) async fn read_iam_config_no_lock(api: Arc<IamStore>, file: &str) -> IamStorageResult<Vec<u8>> {
-    rustfs_ecstore::config::com::read_config_no_lock(api, file).await
+    rustfs_ecstore::api::config::com::read_config_no_lock(api, file).await
 }
 
 pub(crate) async fn read_iam_config_with_metadata(
@@ -32,11 +32,11 @@ pub(crate) async fn read_iam_config_with_metadata(
     file: &str,
     opts: &IamConfigObjectOptions,
 ) -> IamStorageResult<(Vec<u8>, IamConfigObjectInfo)> {
-    rustfs_ecstore::config::com::read_config_with_metadata(api, file, opts).await
+    rustfs_ecstore::api::config::com::read_config_with_metadata(api, file, opts).await
 }
 
 pub(crate) async fn save_iam_config(api: Arc<IamStore>, file: &str, data: Vec<u8>) -> IamStorageResult<()> {
-    rustfs_ecstore::config::com::save_config(api, file, data).await
+    rustfs_ecstore::api::config::com::save_config(api, file, data).await
 }
 
 pub(crate) async fn save_iam_config_with_opts(
@@ -45,19 +45,19 @@ pub(crate) async fn save_iam_config_with_opts(
     data: Vec<u8>,
     opts: &IamConfigObjectOptions,
 ) -> IamStorageResult<()> {
-    rustfs_ecstore::config::com::save_config_with_opts(api, file, data, opts).await
+    rustfs_ecstore::api::config::com::save_config_with_opts(api, file, data, opts).await
 }
 
 pub(crate) async fn delete_iam_config(api: Arc<IamStore>, file: &str) -> IamStorageResult<()> {
-    rustfs_ecstore::config::com::delete_config(api, file).await
+    rustfs_ecstore::api::config::com::delete_config(api, file).await
 }
 
 pub(crate) fn classify_iam_system_path_failure_reason(err: &IamEcstoreError) -> &'static str {
-    rustfs_ecstore::error::classify_system_path_failure_reason(err)
+    rustfs_ecstore::api::error::classify_system_path_failure_reason(err)
 }
 
 pub(crate) async fn is_iam_first_cluster_node_local() -> bool {
-    rustfs_ecstore::global::is_first_cluster_node_local().await
+    rustfs_ecstore::api::global::is_first_cluster_node_local().await
 }
 
 pub(crate) struct IamNotificationPeerErr {

@@ -606,11 +606,10 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --no-heading 'rustfs_ecstore::(?:admin_server_info|endpoints|disks_layout|metrics_realtime|notification_sys|pools|store_utils|store)::' \
+  rg -n --no-heading 'rustfs_ecstore::(?:admin_server_info|bucket|cache_value|client|compress|config|data_usage|disk|disks_layout|endpoints|error|event_notification|global|metrics_realtime|notification_sys|pools|rebalance|rio|rpc|set_disk|store|store_utils|tier)::' \
     rustfs/src crates/*/src crates/*/tests fuzz/fuzz_targets \
     --glob '*storage_compat.rs' \
-    --glob '!crates/ecstore/**' \
-    --glob '!crates/e2e_test/**' || true
+    --glob '!crates/ecstore/**' || true
 ) >"$ECSTORE_PUBLIC_FACADE_BYPASS_HITS_FILE"
 
 if [[ -s "$ECSTORE_PUBLIC_FACADE_BYPASS_HITS_FILE" ]]; then
