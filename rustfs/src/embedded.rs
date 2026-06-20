@@ -48,9 +48,9 @@
 
 use crate::server::ShutdownHandle;
 use crate::startup_embedded::{EmbeddedStartupArgs, EmbeddedStartupError, run_embedded_startup};
-use crate::startup_lifecycle::log_embedded_server_ready;
-use crate::startup_shutdown::run_embedded_server_shutdown;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use crate::startup_lifecycle::{embedded_endpoint_address, log_embedded_server_ready};
+use crate::startup_shutdown::{run_embedded_server_drop_cleanup, run_embedded_server_shutdown};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
@@ -263,14 +263,7 @@ pub struct RustFSServer {
 
 impl RustFSServer {
     fn endpoint_address(&self) -> SocketAddr {
-        let ip = match self.address.ip() {
-            ip @ IpAddr::V4(v4) if !v4.is_unspecified() => ip,
-            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
-            ip @ IpAddr::V6(v6) if !v6.is_unspecified() => ip,
-            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
-        };
-
-        SocketAddr::new(ip, self.address.port())
+        embedded_endpoint_address(self.address)
     }
 
     /// The HTTP endpoint URL (e.g. `"http://127.0.0.1:54321"`).
@@ -312,14 +305,7 @@ impl RustFSServer {
 
 impl Drop for RustFSServer {
     fn drop(&mut self) {
-        // Best-effort synchronous cleanup.
-        self.cancel_token.cancel();
-        if let Some(shutdown_handle) = self.shutdown_handle.take() {
-            shutdown_handle.signal();
-        }
-        if let Some(ref dir) = self.temp_dir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        run_embedded_server_drop_cleanup(&self.cancel_token, &mut self.shutdown_handle, self.temp_dir.as_deref());
     }
 }
 

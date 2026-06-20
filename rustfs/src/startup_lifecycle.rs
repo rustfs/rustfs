@@ -23,7 +23,7 @@ use rustfs_common::GlobalReadiness;
 use rustfs_scanner::init_data_scanner;
 use std::{
     io::Result,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -157,6 +157,17 @@ pub async fn publish_embedded_startup_ready(iam_bootstrap: IamBootstrapDispositi
     Ok(())
 }
 
+pub(crate) fn embedded_endpoint_address(address: SocketAddr) -> SocketAddr {
+    let ip = match address.ip() {
+        ip @ IpAddr::V4(v4) if !v4.is_unspecified() => ip,
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        ip @ IpAddr::V6(v6) if !v6.is_unspecified() => ip,
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+    };
+
+    SocketAddr::new(ip, address.port())
+}
+
 pub fn log_embedded_server_ready(endpoint_address: SocketAddr) {
     info!(
         target: "rustfs::embedded",
@@ -171,8 +182,11 @@ pub fn log_embedded_server_ready(endpoint_address: SocketAddr) {
 
 #[cfg(test)]
 mod tests {
-    use super::mark_embedded_global_init_started;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use super::{embedded_endpoint_address, mark_embedded_global_init_started};
+    use std::{
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+        sync::atomic::{AtomicBool, Ordering},
+    };
 
     #[test]
     fn embedded_global_init_guard_allows_local_retry_before_mark() {
@@ -197,5 +211,29 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!global_init_started);
+    }
+
+    #[test]
+    fn embedded_endpoint_address_rewrites_unspecified_hosts() {
+        assert_eq!(
+            embedded_endpoint_address(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9000)),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000)
+        );
+        assert_eq!(
+            embedded_endpoint_address(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 9001)),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9001)
+        );
+    }
+
+    #[test]
+    fn embedded_endpoint_address_preserves_bound_hosts() {
+        assert_eq!(
+            embedded_endpoint_address(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 9000)),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 9000)
+        );
+        assert_eq!(
+            embedded_endpoint_address(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9001)),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9001)
+        );
     }
 }
