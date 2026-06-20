@@ -84,7 +84,6 @@ use rustfs_storage_api::{
 };
 use rustfs_utils::path::{decode_dir_object, encode_dir_object, path_join_buf};
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
-use std::cmp::Ordering;
 use std::net::SocketAddr;
 use std::process::exit;
 use std::time::SystemTime;
@@ -318,31 +317,6 @@ impl ECStore {
 //         }
 //     }
 // }
-
-// init_local_disks must succeed before the server starts
-/// create unique lock clients for the endpoints and store them globally
-#[derive(Debug, Default)]
-struct PoolErr {
-    index: Option<usize>,
-    err: Option<Error>,
-}
-
-#[derive(Debug, Default)]
-pub struct PoolObjInfo {
-    pub index: usize,
-    pub object_info: ObjectInfo,
-    pub err: Option<Error>,
-}
-
-impl Clone for PoolObjInfo {
-    fn clone(&self) -> Self {
-        Self {
-            index: self.index,
-            object_info: self.object_info.clone(),
-            err: self.err.clone(),
-        }
-    }
-}
 
 // #[derive(Debug, Default, Clone)]
 // pub struct ListPathOptions {
