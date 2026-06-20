@@ -5,17 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-layout-format-move`
-- Baseline: `overtrue/arch-ecstore-layout-foundation`
-  (`2e10661d088a665c789fdb092871c6b52675aa1e`).
-- Stacked on: local E-001/E-SET-001, which is stacked on local R-033 and
-  local R-032.
+- Branch: `overtrue/arch-ecstore-layout-endpoints-move`
+- Baseline: merged `E-002/E-LAYOUT-001`.
+- Stacked on: merged ECStore layout foundation and format layout ownership
+  slices.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: pure-move ECStore format and disk-layout expansion modules
-  into the internal layout bucket while preserving old public paths.
+- Rust code changes: pure-move ECStore endpoint parsing and endpoint grouping
+  modules into the internal layout bucket while preserving old public paths.
 - CI/script changes: none.
-- Docs changes: record the ECStore format/disk-layout pure move slice.
+- Docs changes: record the ECStore endpoint pure move slice.
 
 ## Phase 0 Tasks
 
@@ -2241,10 +2240,23 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     diff hygiene, Rust risk scan, branch freshness check, pre-commit quality
     gate, and three-expert review.
 
+- [x] `E-003/E-LAYOUT-002` Move ECStore endpoint layout owners.
+  - Do: pure-move endpoint parsing and endpoint grouping into the ECStore
+    layout bucket while keeping compatibility stubs at the old public paths.
+  - Acceptance: `crate::disk::endpoint::*` and `crate::endpoints::*` remain
+    usable, `layout::endpoint` owns `Endpoint`, and `layout::endpoints` owns
+    `EndpointServerPools` and endpoint grouping.
+  - Must preserve: endpoint string parsing, URL/path validation, local-host
+    detection, pool/set/disk indexes, endpoint grouping, disk independence
+    checks, setup type classification, and old public module paths.
+  - Verification: focused ECStore endpoint tests, ECStore/RustFS/Heal compile
+    checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
 ## Next PRs
 
-1. `pure-move`: continue moving endpoint grouping and runtime-neutral layout
-   helpers once E-002/E-LAYOUT-001 lands.
+1. `pure-move`: continue moving runtime-neutral pool/set layout helpers once
+   E-003/E-LAYOUT-002 lands.
 2. `pure-move`: continue pruning residual embedded startup-only orchestration
    once the lifecycle helpers are merged.
 
@@ -2252,9 +2264,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | E-002/E-LAYOUT-001 is a pure move into ECStore layout with compatibility stubs at old public paths; no new runtime owner or dependency boundary is introduced. |
-| Migration preservation | passed | Format JSON, disk UUID lookup, distribution algorithm, disk-layout expansion, and old public module paths remain preserved. |
-| Testing/verification | passed | Focused format/layout checks, compile checks, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
+| Quality/architecture | passed | E-003/E-LAYOUT-002 is a pure move into ECStore layout with compatibility stubs at old public paths; no new runtime owner or dependency boundary is introduced. |
+| Migration preservation | passed | Endpoint parsing, local-host detection, pool/set/disk indexes, endpoint grouping, disk independence checks, setup type classification, and old public module paths remain preserved. |
+| Testing/verification | passed | Focused endpoint/layout checks, compile checks, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
 
 ## Verification Notes
 
@@ -2326,6 +2338,19 @@ Passed before push:
   - `git diff --check`: passed.
   - Rust risk scan on changed Rust files: passed; only existing test-only
     unwrap/println/panic/expect paths were present.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 E-003/E-LAYOUT-002 current slice:
+  - `cargo test -p rustfs-ecstore layout::endpoint -- --nocapture`: passed.
+  - `cargo test -p rustfs-ecstore layout::endpoints -- --nocapture`: passed.
+  - `cargo check -p rustfs-ecstore -p rustfs -p rustfs-heal`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; only existing endpoint
+    production/test unwrap and expectation paths were moved.
   - `make pre-commit`: passed.
   - Three-expert review: passed.
 
