@@ -224,6 +224,14 @@ require_source_line \
   "pub(crate) mod startup_iam;" \
   "startup IAM shim crate-private module"
 require_source_line \
+  "crates/ecstore/src/lib.rs" \
+  "mod disks_layout;" \
+  "ECStore legacy disks-layout compatibility module crate-private visibility"
+require_source_line \
+  "crates/ecstore/src/lib.rs" \
+  "mod endpoints;" \
+  "ECStore legacy endpoint compatibility module crate-private visibility"
+require_source_line \
   "crates/storage-api/src/lib.rs" \
   "pub use bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};" \
   "storage-api public bucket contract re-export"

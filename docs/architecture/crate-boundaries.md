@@ -132,6 +132,9 @@ notification, capacity, bucket/config helpers, disk/error contracts, global
 state accessors, RPC constants/clients, reader helpers, tier helpers, and
 rebalance status contracts. Any non-ECStore `storage_compat.rs` import from
 `rustfs_ecstore` must route through the `rustfs_ecstore::api` facade.
+The legacy ECStore root `endpoints` and `disks_layout` compatibility modules
+must remain crate-private; public layout access goes through
+`rustfs_ecstore::api::layout`.
 
 RustFS startup internals must stay crate-private after the startup owner split.
 Only `startup_entrypoint` remains a public startup module for the binary

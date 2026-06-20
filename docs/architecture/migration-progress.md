@@ -439,6 +439,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     hygiene, branch freshness check, pre-commit quality gate, and three-expert
     review.
 
+- [x] `API-075` Prune ECStore legacy layout root modules.
+  - Completed slice: make the legacy ECStore root `endpoints` and
+    `disks_layout` compatibility modules crate-private now that outer
+    compatibility boundaries use `rustfs_ecstore::api::layout`.
+  - Acceptance: `rustfs_ecstore::api::layout` remains the public facade for
+    endpoint pools and disk layout helpers, while migration rules reject
+    restoring the old root layout compatibility modules as public modules.
+  - Must preserve: endpoint layout types, disk layout helper behavior, ECStore
+    internal call sites, and all outer compatibility facade paths.
+  - Verification: ECStore and affected outer package compile, migration and
+    layer guards, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, pre-commit quality gate, and three-expert review.
+
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.
   - Acceptance: `./scripts/check_architecture_migration_rules.sh` parses the
     allowed PR types from [`crate-boundaries.md`](crate-boundaries.md) and fails
@@ -2953,13 +2966,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-074 turns the ECStore facade convention into a generic guard for every non-ECStore `storage_compat.rs` boundary. |
-| Migration preservation | passed | The slice changes only guardrails and architecture docs; runtime aliases, facade exports, type ownership, and ECStore behavior are unchanged. |
-| Testing/verification | passed | Migration guard, direct old-path scan, formatting, diff hygiene, and the full pre-commit gate passed. |
+| Quality/architecture | passed | API-075 removes the legacy ECStore root layout compatibility modules from the public module surface while keeping the intended `api::layout` facade. |
+| Migration preservation | passed | Endpoint pools, endpoints, disk-layout helpers, internal ECStore call sites, and outer compatibility imports keep the same behavior and names through the facade. |
+| Testing/verification | passed | Focused affected-package compile, migration guard, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-075 current slice:
+  - `cargo check --tests -p rustfs-ecstore -p rustfs -p rustfs-scanner -p rustfs-heal -p rustfs-iam -p rustfs-notify -p rustfs-obs -p rustfs-protocols -p rustfs-s3select-api -p e2e_test`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed; nextest ran 6341 tests with 6341 passed, 111 skipped, and doctests passed.
 
 - Issue #660 API-074 current slice:
   - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
