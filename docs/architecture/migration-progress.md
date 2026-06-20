@@ -2460,6 +2460,30 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
     freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `R-054` Move startup AppContext bootstrap owner into app context.
+  - Do: move the post-IAM AppContext bootstrap helper out of IAM startup and
+    into the app context owner while keeping IAM startup on the existing
+    context boundary.
+  - Acceptance: inline startup and deferred IAM recovery still initialize or
+    reuse the global AppContext through one owner.
+  - Must preserve: global AppContext singleton behavior, IAM handle lookup,
+    KMS handle wiring, startup error mapping, and readiness ordering.
+  - Verification: focused startup checks, RustFS lib check, migration/layer
+    guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `R-055` Retire stale startup IAM layer baseline entries.
+  - Do: remove the old direct `get_global_app_context` and
+    `init_global_app_context` startup IAM baseline entries after the app
+    context owner absorbs those calls.
+  - Acceptance: layer dependency guard reports no new reverse dependencies and
+    no stale baseline entries.
+  - Must preserve: the existing accepted startup-to-AppContext boundary,
+    AppContext initialization semantics, and no new layer cycles.
+  - Verification: focused startup checks, RustFS lib check, migration/layer
+    guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
 - [x] `E-001/E-SET-001` Add ECStore layout skeleton and set-layout boundary.
   - Do: create the ECStore internal layout ownership buckets and pin static set
     layout versus runtime `Sets`/`SetDisks` orchestration boundaries before any
@@ -2702,20 +2726,33 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `pure-move`: continue the context-first runtime startup path after the
-   embedded startup ownership slices land.
+1. `pure-move`: continue the context-first runtime startup path by narrowing
+   remaining startup service ownership boundaries.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-052 and R-053 make AppContext bootstrap outcome explicit and share inline/recovery finalization without widening public API. |
-| Migration preservation | passed | IAM init order, singleton reuse, KMS/IAM handles, degraded recovery, backoff/shutdown token, readiness stages, and log behavior stay unchanged. |
-| Testing/verification | passed | Focused startup IAM checks, RustFS lib check, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
+| Quality/architecture | passed | R-054 and R-055 move AppContext bootstrap ownership into app context and shrink stale layer baseline entries without widening public API. |
+| Migration preservation | passed | IAM init order, singleton reuse, KMS handle wiring, degraded recovery, readiness stages, and log behavior stay unchanged. |
+| Testing/verification | passed | Focused startup checks, RustFS lib check, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 R-054/R-055 current slice:
+  - `cargo test -p rustfs --lib startup_ -- --nocapture`: passed; 51 tests.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `./scripts/check_unsafe_code_allowances.sh`: passed.
+  - Rust risk scan on changed Rust files: passed; only a test-only `expect`
+    call was present.
+  - `make pre-commit`: passed; nextest ran 6339 tests with 6339 passed, 111
+    skipped, and doctests passed.
 
 - Issue #660 R-052/R-053 current slice:
   - `cargo test -p rustfs --lib startup_iam -- --nocapture`: passed.
