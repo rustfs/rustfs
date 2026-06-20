@@ -6,21 +6,21 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
 - Branch: `overtrue/arch-ecstore-rebalance-entry-flow`
-- Baseline: completed `E-014/E-REBALANCE-008`.
+- Baseline: completed `E-015/E-REBALANCE-009`.
 - Stacked on: merged ECStore layout foundation, format layout ownership, and
   endpoint layout move slices plus the set-format heal, pool-space layout
   helper, rebalance support helper, pool-space builder, rebalance metadata
   helper, rebalance worker helper, rebalance migration helper, rebalance state
-  impl, rebalance control impl, rebalance runtime loop, and rebalance entry
-  flow slices.
+  impl, rebalance control impl, rebalance runtime loop, rebalance entry flow,
+  rebalance unit-test split, and rebalance type-owner slices.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move ECStore rebalance control, runtime, and entry flows
-  into dedicated rebalance submodules, then split the inline rebalance unit
-  tests out of the root module while preserving public wire structs.
+- Rust code changes: move ECStore rebalance control, runtime, entry flow,
+  inline tests, and type contracts into dedicated rebalance submodules while
+  preserving public root paths.
 - CI/script changes: none.
 - Docs changes: record the combined ECStore rebalance control/runtime/entry
-  flow and test-module split slices.
+  flow, test-module split, and type-owner split slices.
 
 ## Phase 0 Tasks
 
@@ -2443,19 +2443,31 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     formatting, diff hygiene, Rust risk scan, branch freshness check,
     pre-commit quality gate, and three-expert review.
 
+- [x] `E-016/E-REBALANCE-010` Move ECStore rebalance type contracts.
+  - Do: move rebalance stats, status, info, metadata DTOs, and internal
+    bucket/entry outcomes into `rebalance::types` while preserving root
+    re-exports.
+  - Acceptance: public `crate::rebalance::*` paths remain stable, internal
+    submodules keep `super::...` access, and `rebalance.rs` only wires shared
+    constants, modules, and re-exports.
+  - Must preserve: serde field names/defaults, rebalance metadata wire shape,
+    status/save-option defaults, cancellation/refresh metadata fields, and
+    internal bucket/entry outcome semantics.
+  - Verification: focused ECStore rebalance tests, migration/layer guards,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
 ## Next PRs
 
-1. `pure-move`: continue pruning residual ECStore rebalance root data-contract
-   ownership once E-015/E-REBALANCE-009 lands.
-2. `pure-move`: continue pruning residual embedded startup-only orchestration
+1. `pure-move`: continue pruning residual embedded startup-only orchestration
    once the lifecycle helpers are merged.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | E-012 through E-015 move control/runtime/entry flow into rebalance submodules and leave `rebalance.rs` as contracts plus wiring. |
-| Migration preservation | passed | Lifecycle filtering, delete-marker skips, deferred transient failures, source cleanup warnings, cancellation, bucket outcome precedence, and test coverage remain preserved. |
+| Quality/architecture | passed | E-012 through E-016 move control/runtime/entry flow, tests, and type contracts into rebalance submodules while preserving root exports. |
+| Migration preservation | passed | Lifecycle filtering, delete-marker skips, deferred transient failures, source cleanup warnings, cancellation, bucket outcome precedence, serde contracts, and test coverage remain preserved. |
 | Testing/verification | passed | Focused rebalance tests, compile checks, guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
@@ -2661,6 +2673,19 @@ Passed before push:
   - `git diff --check`: passed.
   - Rust risk scan on changed Rust files: passed; the runtime diff is a test
     module move plus a SAFETY-comment proximity fix required by the guard.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 E-016/E-REBALANCE-010 current slice:
+  - `cargo test -p rustfs-ecstore rebalance::rebalance_unit_tests -- --nocapture`: passed.
+  - `cargo check -p rustfs-ecstore -p rustfs -p rustfs-heal`: passed.
+  - `./scripts/check_unsafe_code_allowances.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; production changes are a
+    type-contract move and existing Windows FFI casts remain unchanged.
   - `make pre-commit`: passed.
   - Three-expert review: passed.
 
