@@ -47,21 +47,17 @@
 //! start a second server will return an error.
 
 use crate::server::ShutdownHandle;
-use crate::startup_lifecycle::{log_embedded_server_ready, publish_embedded_startup_ready};
+use crate::startup_lifecycle::{EmbeddedStartupGuard, log_embedded_server_ready, publish_embedded_startup_ready};
 use crate::startup_runtime_hooks::init_embedded_runtime_hooks;
 use crate::startup_server::{
     EmbeddedStartupConfig, init_embedded_startup_listen_context, prepare_embedded_startup_config, start_embedded_http_server,
 };
 use crate::startup_services::init_embedded_startup_runtime_services;
-use crate::startup_shutdown::run_embedded_server_shutdown;
+use crate::startup_shutdown::{run_embedded_server_shutdown, signal_embedded_startup_shutdown};
 use crate::startup_storage::{init_embedded_startup_storage_foundation, init_embedded_startup_storage_runtime};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::sync::CancellationToken;
-
-/// Tracks whether a server has been started in this process.
-static SERVER_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Error type for embedded server operations.
 #[derive(Debug)]
@@ -223,20 +219,7 @@ impl RustFSServerBuilder {
         // Build is allowed to fail before irreversible global initialization
         // (for example on temporary I/O or directory setup errors), and in that
         // case callers can retry.
-        let mut global_init_started = false;
-        let mut set_global_init_guard = || -> Result<(), ServerError> {
-            if global_init_started {
-                return Ok(());
-            }
-            if SERVER_STARTED
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-            {
-                return Err(ServerError::AlreadyStarted);
-            }
-            global_init_started = true;
-            Ok(())
-        };
+        let mut startup_guard = EmbeddedStartupGuard::new();
 
         let EmbeddedStartupConfig { config, temp_dir_guard } = prepare_embedded_startup_config(
             self.address.clone(),
@@ -258,7 +241,9 @@ impl RustFSServerBuilder {
             .await
             .map_err(|e| ServerError::Init(e.to_string()))?;
 
-        set_global_init_guard()?;
+        startup_guard
+            .mark_global_init_started()
+            .map_err(|_| ServerError::AlreadyStarted)?;
 
         let endpoint_pools = init_embedded_startup_storage_foundation(&listen_context.server_address, &config.volumes)
             .await
@@ -268,11 +253,6 @@ impl RustFSServerBuilder {
         let shutdown_handle = http_server.shutdown_handle;
         let bound_addr = http_server.bound_addr;
         let ctx = CancellationToken::new();
-        let shutdown_embedded_server = || {
-            shutdown_handle.signal();
-            ctx.cancel();
-        };
-
         let storage_runtime = match init_embedded_startup_storage_runtime(
             listen_context.server_addr,
             &endpoint_pools,
@@ -283,7 +263,7 @@ impl RustFSServerBuilder {
         {
             Ok(runtime) => runtime,
             Err(e) => {
-                shutdown_embedded_server();
+                signal_embedded_startup_shutdown(&shutdown_handle, &ctx);
                 return Err(ServerError::Init(e.to_string()));
             }
         };
@@ -293,14 +273,14 @@ impl RustFSServerBuilder {
             init_embedded_startup_runtime_services(&config, endpoint_pools, store, ctx.clone(), listen_context.readiness.clone())
                 .await
                 .map_err(|e| {
-                    shutdown_embedded_server();
+                    signal_embedded_startup_shutdown(&shutdown_handle, &ctx);
                     ServerError::Init(e.to_string())
                 })?;
 
         publish_embedded_startup_ready(service_runtime.iam_bootstrap, listen_context.readiness.as_ref())
             .await
             .map_err(|e| {
-                shutdown_embedded_server();
+                signal_embedded_startup_shutdown(&shutdown_handle, &ctx);
                 ServerError::Init(format!("runtime readiness: {e}"))
             })?;
 
