@@ -14,6 +14,7 @@
 
 pub mod adapter;
 pub mod ops_diagnostics;
+pub mod ops_profiler;
 pub mod s3_hooks;
 pub mod sidecar;
 pub mod sidecar_protocol;

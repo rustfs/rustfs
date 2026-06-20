@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-embedded-lifecycle-publication-reuse`
-- Baseline: `overtrue/arch-embedded-runtime-service-reuse`
-  (`00cf2509338ec6acdddc3b5fdf1a02dd52ed309a`).
-- Stacked on: rustfs/rustfs#3641.
-- PR type for this branch: `pure-move`
+- Branch: `overtrue/arch-ops-profiler-runtime-contract`
+- Baseline: `overtrue/arch-embedded-lifecycle-publication-reuse`
+  (`e27c079d4c2a577bd9a632a615b2f0b96b468149`).
+- Stacked on: local R-031, which is stacked on rustfs/rustfs#3641.
+- PR type for this branch: `contract`
 - Runtime behavior changes: none.
-- Rust code changes: route embedded ready publication, global init-time
-  publication, and ready logging through startup lifecycle helpers.
+- Rust code changes: publish the builtin ops profiler catalog contract through
+  targets and add a read-only profiler registry contract.
 - CI/script changes: none.
-- Docs changes: record the R-031 embedded lifecycle publication reuse slice.
+- Docs changes: record the R-032 ops profiler runtime contract slice.
 
 ## Phase 0 Tasks
 
@@ -2183,20 +2183,35 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
     freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `R-032` Publish ops profiler runtime contract boundaries.
+  - Do: add the builtin ops profiler extension schema/contract to the targets
+    catalog, expose it through the admin extension catalog, and add a read-only
+    registry for profiler backend capability descriptions.
+  - Acceptance: the catalog advertises `builtin:ops-profiler` with
+    `ops.profiler.v1`, backend capability descriptions validate through the
+    extension-schema contract, and registry access is admin/capability limited
+    without executing profiler collection.
+  - Must preserve: existing `/debug/pprof/*` admin behavior, profiling startup
+    and shutdown hooks, disabled external profiler runtime defaults, local path
+    redaction requirements, and no plugin execution or sidecar startup.
+  - Verification: focused targets/admin extension checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
 ## Next PRs
 
-1. `contract`: continue extension contract coverage for future diagnostics and
-   profiler handoff surfaces after runtime owners are stable.
-2. `pure-move`: continue pruning residual embedded startup-only orchestration
+1. `pure-move`: continue pruning residual embedded startup-only orchestration
    once the lifecycle helpers are merged.
+2. `contract`: add the next read-only extension handoff once admin/reporting
+   consumers need profiler or diagnostics snapshots.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-031 keeps embedded server-handle ownership in `embedded.rs` while moving readiness/global-init/ready-log publication into `startup_lifecycle`. |
-| Migration preservation | passed | Runtime readiness error wrapping, IAM bootstrap disposition handling, global init-time ordering, and endpoint-address normalization remain unchanged. |
-| Testing/verification | passed | Focused embedded/lifecycle checks, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
+| Quality/architecture | passed | R-032 keeps profiler execution in the existing admin/profiling paths while adding only catalog and registry contract boundaries. |
+| Migration preservation | passed | Existing profile collection routes, startup/shutdown hook behavior, redaction requirements, and disabled external-runtime defaults remain unchanged. |
+| Testing/verification | passed | Focused targets/admin extension checks, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
 
 ## Verification Notes
 
@@ -2215,6 +2230,22 @@ Passed before push:
   - Rust risk scan on changed Rust files: passed; only existing embedded doc
     examples use `Box<dyn Error>` / `println!`.
   - `make pre-commit`: passed.
+
+- Issue #660 R-032 current slice:
+  - `cargo test -p rustfs-targets ops_profiler -- --nocapture`: passed.
+  - `cargo test -p rustfs-targets builtin_ops_profiler -- --nocapture`:
+    passed.
+  - `cargo test -p rustfs --lib extension_catalog -- --nocapture`: passed.
+  - `cargo check -p rustfs-targets`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; only test-only
+    expectations/assertion paths were present.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
 
 - Issue #660 X-012 current slice:
   - `cargo test -p rustfs-extension-schema`: passed.

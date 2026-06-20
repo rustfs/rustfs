@@ -21,11 +21,14 @@ use crate::manifest::{
 };
 use rustfs_extension_schema::{
     EXTENSION_SCHEMA_VERSION, ExtensionCapabilityRef, ExtensionKind, ExtensionRuntimeBoundary, ExtensionRuntimeContract,
-    ExtensionSchema, OPS_DIAGNOSTICS_CAPABILITY, OpsDiagnosticSurface, OpsDiagnosticsContract, S3_POST_AUTH_HOOK_CAPABILITY,
-    S3HookContract, S3HookPoint,
+    ExtensionSchema, OPS_DIAGNOSTICS_CAPABILITY, OPS_PROFILER_CAPABILITY, OpsDiagnosticSurface, OpsDiagnosticsContract,
+    OpsProfilerBackendCapability, OpsProfilerBackendName, OpsProfilerBackendStatus, OpsProfilerContract, OpsProfilerContractMode,
+    OpsProfilerProvenance, OpsProfilerRedactionField, OpsProfilerTrustLevel, S3_POST_AUTH_HOOK_CAPABILITY, S3HookContract,
+    S3HookPoint,
 };
 
 pub const OPS_DIAGNOSTICS_EXTENSION_API_VERSION: &str = "rustfs.ops-diagnostics.v1";
+pub const OPS_PROFILER_EXTENSION_API_VERSION: &str = "rustfs.ops-profiler.v1";
 pub const S3_HOOK_EXTENSION_API_VERSION: &str = "rustfs.s3-hook.v1";
 pub const TARGET_AUDIT_CAPABILITY: &str = "target.audit.v1";
 pub const TARGET_NOTIFY_CAPABILITY: &str = "target.notify.v1";
@@ -34,6 +37,7 @@ pub fn builtin_extension_schemas() -> Vec<ExtensionSchema> {
     let mut schemas = builtin_target_extension_schemas();
     schemas.push(builtin_s3_hook_extension_schema());
     schemas.push(builtin_ops_diagnostics_extension_schema());
+    schemas.push(builtin_ops_profiler_extension_schema());
     schemas
 }
 
@@ -98,6 +102,57 @@ pub fn builtin_ops_diagnostics_contract() -> OpsDiagnosticsContract {
     }
 }
 
+pub fn builtin_ops_profiler_extension_schema() -> ExtensionSchema {
+    ExtensionSchema {
+        schema_version: EXTENSION_SCHEMA_VERSION.to_string(),
+        extension_id: "builtin:ops-profiler".to_string(),
+        display_name: "Ops Profiler".to_string(),
+        provider: "rustfs".to_string(),
+        version: "1.0.0".to_string(),
+        kind: ExtensionKind::OpsProfiler,
+        runtime: ExtensionRuntimeContract {
+            api_version: OPS_PROFILER_EXTENSION_API_VERSION.to_string(),
+            boundary: ExtensionRuntimeBoundary::Builtin,
+        },
+        capabilities: vec![ExtensionCapabilityRef::new(OPS_PROFILER_CAPABILITY)],
+        disabled_by_default: false,
+    }
+}
+
+pub fn builtin_ops_profiler_contract() -> OpsProfilerContract {
+    OpsProfilerContract {
+        mode: OpsProfilerContractMode::CapabilityDescription,
+        backends: vec![
+            builtin_ops_profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true),
+            builtin_ops_profiler_backend("memory_pprof", OpsProfilerBackendStatus::Disabled, true),
+            builtin_ops_profiler_backend("ebpf", OpsProfilerBackendStatus::Unsupported, false),
+        ],
+    }
+}
+
+fn builtin_ops_profiler_backend(
+    backend: &str,
+    status: OpsProfilerBackendStatus,
+    supports_profile_export: bool,
+) -> OpsProfilerBackendCapability {
+    OpsProfilerBackendCapability {
+        backend: OpsProfilerBackendName::new(backend),
+        status,
+        supports_profile_export,
+        redaction_required: vec![
+            OpsProfilerRedactionField::Secret,
+            OpsProfilerRedactionField::Token,
+            OpsProfilerRedactionField::LocalPath,
+            OpsProfilerRedactionField::Host,
+        ],
+        provenance: OpsProfilerProvenance {
+            source: "rustfs.profiling".to_string(),
+            collection_boundary: "rustfs-process".to_string(),
+            trust_level: OpsProfilerTrustLevel::RuntimeTrusted,
+        },
+    }
+}
+
 pub fn target_marketplace_extension_schema(manifest: &TargetPluginMarketplaceManifest) -> ExtensionSchema {
     let boundary = target_runtime_boundary(manifest.entrypoint_kind);
 
@@ -159,8 +214,9 @@ fn target_domain_capability(domain: TargetDomain) -> ExtensionCapabilityRef {
 #[cfg(test)]
 mod tests {
     use super::{
-        OPS_DIAGNOSTICS_EXTENSION_API_VERSION, S3_HOOK_EXTENSION_API_VERSION, TARGET_AUDIT_CAPABILITY, TARGET_NOTIFY_CAPABILITY,
-        builtin_extension_schemas, builtin_ops_diagnostics_contract, builtin_ops_diagnostics_extension_schema,
+        OPS_DIAGNOSTICS_EXTENSION_API_VERSION, OPS_PROFILER_EXTENSION_API_VERSION, S3_HOOK_EXTENSION_API_VERSION,
+        TARGET_AUDIT_CAPABILITY, TARGET_NOTIFY_CAPABILITY, builtin_extension_schemas, builtin_ops_diagnostics_contract,
+        builtin_ops_diagnostics_extension_schema, builtin_ops_profiler_contract, builtin_ops_profiler_extension_schema,
         builtin_s3_hook_contract, builtin_s3_hook_extension_schema, builtin_target_extension_schemas,
         target_marketplace_extension_schema,
     };
@@ -171,9 +227,9 @@ mod tests {
         builtin_target_marketplace_manifest,
     };
     use rustfs_extension_schema::{
-        EXTENSION_SCHEMA_VERSION, ExtensionKind, ExtensionRuntimeBoundary, OPS_DIAGNOSTICS_CAPABILITY, OpsDiagnosticSurface,
-        S3_POST_AUTH_HOOK_CAPABILITY, S3HookPoint, validate_extension_schemas, validate_ops_diagnostics_contract,
-        validate_s3_hook_contract,
+        EXTENSION_SCHEMA_VERSION, ExtensionKind, ExtensionRuntimeBoundary, OPS_DIAGNOSTICS_CAPABILITY, OPS_PROFILER_CAPABILITY,
+        OpsDiagnosticSurface, OpsProfilerBackendStatus, S3_POST_AUTH_HOOK_CAPABILITY, S3HookPoint, validate_extension_schemas,
+        validate_ops_diagnostics_contract, validate_ops_profiler_contract, validate_s3_hook_contract,
     };
 
     #[test]
@@ -254,14 +310,15 @@ mod tests {
     }
 
     #[test]
-    fn builtin_extension_catalog_includes_hooks_and_ops_diagnostics() {
+    fn builtin_extension_catalog_includes_hooks_and_ops_capabilities() {
         let schemas = builtin_extension_schemas();
         let mut extension_ids = schemas.iter().map(|schema| schema.extension_id.as_str()).collect::<Vec<_>>();
         extension_ids.sort_unstable();
 
-        assert_eq!(schemas.len(), 11);
+        assert_eq!(schemas.len(), 12);
         assert!(extension_ids.contains(&"builtin:s3-post-auth-hooks"));
         assert!(extension_ids.contains(&"builtin:ops-diagnostics"));
+        assert!(extension_ids.contains(&"builtin:ops-profiler"));
         assert!(validate_extension_schemas(&schemas).is_ok());
     }
 
@@ -313,5 +370,41 @@ mod tests {
         assert!(!contract.mutates_object_data);
         assert!(contract.requires_admin_action);
         assert!(validate_ops_diagnostics_contract(&contract).is_ok());
+    }
+
+    #[test]
+    fn builtin_ops_profiler_schema_describes_read_only_profile_capabilities() {
+        let schema = builtin_ops_profiler_extension_schema();
+        let contract = builtin_ops_profiler_contract();
+
+        assert_eq!(schema.kind, ExtensionKind::OpsProfiler);
+        assert_eq!(schema.runtime.boundary, ExtensionRuntimeBoundary::Builtin);
+        assert_eq!(schema.runtime.api_version, OPS_PROFILER_EXTENSION_API_VERSION);
+        assert_eq!(schema.capabilities[0].as_str(), OPS_PROFILER_CAPABILITY);
+        assert!(!schema.disabled_by_default);
+
+        let backends = contract
+            .backends
+            .iter()
+            .map(|backend| (backend.backend.as_str(), backend.status, backend.supports_profile_export))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            backends,
+            vec![
+                ("cpu_pprof", OpsProfilerBackendStatus::Enabled, true),
+                ("memory_pprof", OpsProfilerBackendStatus::Disabled, true),
+                ("ebpf", OpsProfilerBackendStatus::Unsupported, false),
+            ]
+        );
+        assert!(
+            contract
+                .backends
+                .iter()
+                .filter(|backend| backend.supports_profile_export)
+                .all(|backend| backend
+                    .redaction_required
+                    .contains(&rustfs_extension_schema::OpsProfilerRedactionField::LocalPath))
+        );
+        assert!(validate_ops_profiler_contract(&contract).is_ok());
     }
 }
