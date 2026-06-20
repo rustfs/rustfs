@@ -160,25 +160,25 @@ impl RustFSServerBuilder {
     /// [`build`](Self::build), but that is too late for the earlier
     /// initialization that depends on the configured address.
     pub fn address(mut self, addr: impl Into<String>) -> Self {
-        self.startup_args.address = addr.into();
+        self.startup_args.set_address(addr.into());
         self
     }
 
     /// Set the S3 access key (default: `"rustfsadmin"`).
     pub fn access_key(mut self, key: impl Into<String>) -> Self {
-        self.startup_args.access_key = key.into();
+        self.startup_args.set_access_key(key.into());
         self
     }
 
     /// Set the S3 secret key (default: `"rustfsadmin"`).
     pub fn secret_key(mut self, key: impl Into<String>) -> Self {
-        self.startup_args.secret_key = key.into();
+        self.startup_args.set_secret_key(key.into());
         self
     }
 
     /// Set the AWS region (default: `"us-east-1"`).
     pub fn region(mut self, region: impl Into<String>) -> Self {
-        self.startup_args.region = region.into();
+        self.startup_args.set_region(region.into());
         self
     }
 
@@ -187,13 +187,13 @@ impl RustFSServerBuilder {
     /// If no volumes are added, a temporary directory with a single drive is
     /// created automatically (and cleaned up on [`RustFSServer::shutdown`]).
     pub fn volume(mut self, path: impl Into<String>) -> Self {
-        self.startup_args.volumes.push(path.into());
+        self.startup_args.push_volume(path.into());
         self
     }
 
     /// Set multiple volume paths at once, replacing any previously set volumes.
     pub fn volumes(mut self, paths: Vec<String>) -> Self {
-        self.startup_args.volumes = paths;
+        self.startup_args.set_volumes(paths);
         self
     }
 
@@ -212,17 +212,13 @@ impl RustFSServerBuilder {
     }
 
     async fn do_build(&mut self) -> Result<RustFSServer, ServerError> {
-        let startup_args = self.startup_args.clone();
-        let access_key = startup_args.access_key.clone();
-        let secret_key = startup_args.secret_key.clone();
-        let region = startup_args.region.clone();
-        let started = run_embedded_startup(startup_args).await?;
+        let started = run_embedded_startup(self.startup_args.clone()).await?;
 
         let server = RustFSServer {
             address: started.bound_addr,
-            access_key,
-            secret_key,
-            region,
+            access_key: started.access_key,
+            secret_key: started.secret_key,
+            region: started.region,
             shutdown_handle: Some(started.shutdown_handle),
             cancel_token: started.cancel_token,
             temp_dir: started.temp_dir,
