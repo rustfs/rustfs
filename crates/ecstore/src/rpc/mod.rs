@@ -25,14 +25,12 @@ pub use client::{
     TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client, node_service_time_out_client_no_auth,
 };
 pub use http_auth::{TONIC_RPC_PREFIX, build_auth_headers, gen_signature_headers, verify_rpc_signature};
-pub use internode_data_transport::{
-    InternodeDataTransport, InternodeDataTransportCapabilities, ReadStreamRequest, TcpHttpInternodeDataTransport,
-    WalkDirStreamRequest, WriteStreamRequest, build_internode_data_transport, build_internode_data_transport_from_env,
-};
+#[cfg(test)]
+pub(crate) use internode_data_transport::TcpHttpInternodeDataTransport;
+pub use internode_data_transport::build_internode_data_transport_from_env;
 pub use peer_rest_client::{
-    PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, SERVICE_SIGNAL_REFRESH_CONFIG,
-    SERVICE_SIGNAL_RELOAD_DYNAMIC,
+    PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
 };
-pub use peer_s3_client::{LocalPeerS3Client, PeerS3Client, RemotePeerS3Client, S3PeerSys};
+pub use peer_s3_client::{LocalPeerS3Client, PeerS3Client, S3PeerSys};
 pub use remote_disk::RemoteDisk;
 pub use remote_locker::RemoteClient;

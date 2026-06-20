@@ -104,8 +104,6 @@ type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
-pub use crate::layout::pool_space::{PoolAvailableSpace, ServerPoolsAvailableSpace, has_space_for};
-
 /// Check if a directory contains any xl.meta files (indicating actual S3 objects)
 /// This is used to determine if a bucket is empty for deletion purposes.
 async fn has_xlmeta_files(path: &std::path::Path) -> bool {
@@ -176,8 +174,8 @@ mod rebalance;
 
 use peer::init_local_peer;
 pub use peer::{
-    all_local_disk, all_local_disk_path, find_local_disk, find_local_disk_by_ref, get_disk_infos, get_disk_via_endpoint,
-    init_local_disks, init_lock_clients, prewarm_local_disk_id_map,
+    all_local_disk, all_local_disk_path, find_local_disk_by_ref, get_disk_infos, init_local_disks, init_lock_clients,
+    prewarm_local_disk_id_map,
 };
 
 pub struct ECStore {
@@ -788,14 +786,14 @@ mod tests {
     async fn test_has_space_for() {
         let disk_infos = vec![None, None]; // No actual disk info
 
-        let result = has_space_for(&disk_infos, 1024).await;
+        let result = crate::layout::pool_space::has_space_for(&disk_infos, 1024).await;
         // Should fail due to no valid disk info
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_find_local_disk() {
-        let result = find_local_disk(&"/nonexistent/path".to_string()).await;
+        let result = peer::find_local_disk(&"/nonexistent/path".to_string()).await;
         assert!(result.is_none(), "Should return None for nonexistent path");
     }
 

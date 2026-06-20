@@ -14,7 +14,7 @@
 
 use super::*;
 use crate::config::get_global_storage_class;
-use crate::layout::pool_space::build_server_pools_available_space;
+use crate::layout::pool_space::{ServerPoolsAvailableSpace, build_server_pools_available_space};
 use rustfs_storage_api::{NamespaceLocking as _, ObjectOperations as _, StorageAdminApi};
 pub(in crate::store) mod support;
 use support::{

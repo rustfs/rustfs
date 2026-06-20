@@ -41,9 +41,7 @@ mod runtime;
 mod types;
 mod worker;
 
-pub use types::{
-    DiskStat, RStats, RebalSaveOpt, RebalStatus, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta, RebalanceStats,
-};
+pub use types::{DiskStat, RebalSaveOpt, RebalStatus, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta, RebalanceStats};
 use types::{RebalanceBucketConfigs, RebalanceBucketOutcome, RebalanceEntryOutcome};
 
 #[cfg(test)]

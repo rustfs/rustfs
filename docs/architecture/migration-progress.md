@@ -452,6 +452,21 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     layer guards, formatting, diff hygiene, Rust risk scan, branch freshness
     check, pre-commit quality gate, and three-expert review.
 
+- [x] `API-076` Prune facade-covered ECStore root modules.
+  - Completed slice: make facade-covered legacy ECStore root modules
+    crate-private after all in-repo outer compatibility boundaries route
+    through `rustfs_ecstore::api`.
+  - Acceptance: `rustfs_ecstore::api::*` remains the public facade for storage,
+    admin, config, metrics, notification, RPC, disk, error, tier, rebalance,
+    and layout helper surfaces, while migration rules reject restoring those
+    legacy root modules as public modules.
+  - Must preserve: ECStore internal module access, public `api` facade paths,
+    object API paths, bitrot and erasure coding test/bench paths, and storage
+    contract compatibility tests.
+  - Verification: ECStore and affected outer package compile, migration and
+    layer guards, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, pre-commit quality gate, and three-expert review.
+
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.
   - Acceptance: `./scripts/check_architecture_migration_rules.sh` parses the
     allowed PR types from [`crate-boundaries.md`](crate-boundaries.md) and fails
@@ -2966,13 +2981,25 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-075 removes the legacy ECStore root layout compatibility modules from the public module surface while keeping the intended `api::layout` facade. |
-| Migration preservation | passed | Endpoint pools, endpoints, disk-layout helpers, internal ECStore call sites, and outer compatibility imports keep the same behavior and names through the facade. |
-| Testing/verification | passed | Focused affected-package compile, migration guard, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
+| Quality/architecture | passed | API-076 removes facade-covered legacy ECStore root modules from the public module surface while keeping the explicit `rustfs_ecstore::api` boundary as the supported compatibility path. |
+| Migration preservation | passed | ECStore internal call sites, storage contract tests, object API, bitrot, erasure coding, and outer compatibility imports keep their behavior and names through retained facade paths. |
+| Testing/verification | passed | ECStore/outer compile checks, bench compile, migration/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-076 current slice:
+  - `cargo check --tests -p rustfs-ecstore -p rustfs -p rustfs-scanner -p rustfs-heal -p rustfs-iam -p rustfs-notify -p rustfs-obs -p rustfs-protocols -p rustfs-s3select-api -p e2e_test`: passed.
+  - `cargo check --benches -p rustfs-ecstore`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `./scripts/check_unsafe_code_allowances.sh`: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed; nextest ran 6341 tests with 6341 passed, 111 skipped, and doctests passed.
 
 - Issue #660 API-075 current slice:
   - `cargo check --tests -p rustfs-ecstore -p rustfs -p rustfs-scanner -p rustfs-heal -p rustfs-iam -p rustfs-notify -p rustfs-obs -p rustfs-protocols -p rustfs-s3select-api -p e2e_test`: passed.

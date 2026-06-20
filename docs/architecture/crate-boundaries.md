@@ -135,6 +135,9 @@ rebalance status contracts. Any non-ECStore `storage_compat.rs` import from
 The legacy ECStore root `endpoints` and `disks_layout` compatibility modules
 must remain crate-private; public layout access goes through
 `rustfs_ecstore::api::layout`.
+Facade-covered ECStore root modules must remain crate-private after this
+boundary is established; outer crates should use `rustfs_ecstore::api::*`
+instead of legacy root module paths.
 
 RustFS startup internals must stay crate-private after the startup owner split.
 Only `startup_entrypoint` remains a public startup module for the binary

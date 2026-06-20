@@ -231,6 +231,33 @@ require_source_line \
   "crates/ecstore/src/lib.rs" \
   "mod endpoints;" \
   "ECStore legacy endpoint compatibility module crate-private visibility"
+for ecstore_private_module in \
+  admin_server_info \
+  bucket \
+  cache_value \
+  client \
+  compress \
+  config \
+  data_usage \
+  disk \
+  error \
+  event_notification \
+  global \
+  metrics_realtime \
+  notification_sys \
+  pools \
+  rebalance \
+  rio \
+  rpc \
+  set_disk \
+  store \
+  store_utils \
+  tier; do
+  require_source_line \
+    "crates/ecstore/src/lib.rs" \
+    "mod ${ecstore_private_module};" \
+    "ECStore legacy ${ecstore_private_module} root module crate-private visibility"
+done
 require_source_line \
   "crates/storage-api/src/lib.rs" \
   "pub use bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};" \
