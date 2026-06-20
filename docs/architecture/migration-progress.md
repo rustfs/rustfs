@@ -2217,6 +2217,34 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
     branch freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `R-034` Extract embedded runtime hook boundary.
+  - Do: move embedded observability guard setup, default crypto provider
+    installation, and trusted proxy initialization behind startup runtime hooks.
+  - Acceptance: embedded startup keeps observability initialization before the
+    global startup guard/listen/storage phases while sharing the runtime hook
+    owner used by normal startup.
+  - Must preserve: `init_obs` and `set_global_guard` error prefixes, embedded
+    crypto provider already-installed debug fields, trusted proxy init timing,
+    and no added embedded server runtime behavior.
+  - Verification: focused embedded/runtime hook checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-035` Extract embedded shutdown glue boundary.
+  - Do: move embedded async shutdown logging, cancellation, event/audit cleanup,
+    HTTP shutdown, and temporary directory cleanup behind startup shutdown
+    helpers.
+  - Acceptance: embedded server shutdown preserves the same stopping/stopped
+    logs, cancellation timing, best-effort audit cleanup, HTTP shutdown, and
+    temp-dir cleanup behavior while leaving `Drop` as a synchronous best-effort
+    fallback.
+  - Must preserve: event notifier shutdown before audit stop, audit stop
+    warning-only behavior, HTTP shutdown after background cancellation, temp
+    directory cleanup warning fields, and final stopped log.
+  - Verification: focused embedded/shutdown checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
 - [x] `E-001/E-SET-001` Add ECStore layout skeleton and set-layout boundary.
   - Do: create the ECStore internal layout ownership buckets and pin static set
     layout versus runtime `Sets`/`SetDisks` orchestration boundaries before any
@@ -2460,19 +2488,33 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Next PRs
 
 1. `pure-move`: continue pruning residual embedded startup-only orchestration
-   once the lifecycle helpers are merged.
+   after the runtime hook and shutdown glue boundaries land.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | E-012 through E-016 move control/runtime/entry flow, tests, and type contracts into rebalance submodules while preserving root exports. |
-| Migration preservation | passed | Lifecycle filtering, delete-marker skips, deferred transient failures, source cleanup warnings, cancellation, bucket outcome precedence, serde contracts, and test coverage remain preserved. |
-| Testing/verification | passed | Focused rebalance tests, compile checks, guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
+| Quality/architecture | passed | R-034 and R-035 move embedded runtime hooks and async shutdown glue into startup owners while keeping the embedded builder focused on startup orchestration. |
+| Migration preservation | passed | Observability error prefixes, embedded crypto log fields, trusted-proxy timing, cancellation, audit cleanup, HTTP shutdown, temp-dir cleanup, and stopped logs stay in the same order. |
+| Testing/verification | passed | Focused runtime/embedded checks, RustFS lib check, architecture/layer guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 R-034/R-035 current slice:
+  - `cargo test -p rustfs --lib startup_runtime_hooks -- --nocapture`:
+    passed.
+  - `cargo test -p rustfs --lib embedded -- --nocapture`: passed; no
+    matching unit tests currently exist.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; only existing default
+    credential fields and moved temp-dir cleanup paths were present.
+  - `make pre-commit`: passed.
 
 - Issue #660 R-031 current slice:
   - `cargo test -p rustfs --lib startup_lifecycle -- --nocapture`: passed;

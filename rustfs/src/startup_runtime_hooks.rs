@@ -15,9 +15,12 @@
 use crate::license::license_status;
 use rustls::crypto::aws_lc_rs::default_provider;
 use std::future::Future;
+use std::io::{Error, Result};
 use tracing::{debug, info};
 
+const LOG_COMPONENT_EMBEDDED: &str = "embedded";
 const LOG_COMPONENT_MAIN: &str = "main";
+const LOG_SUBSYSTEM_EMBEDDED: &str = "embedded";
 const LOG_SUBSYSTEM_LICENSE: &str = "license";
 const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const EVENT_CRYPTO_PROVIDER_STATE: &str = "crypto_provider_state";
@@ -96,6 +99,31 @@ pub fn install_default_crypto_provider() {
             provider = "aws_lc_rs",
             state = "already_installed",
             "Rustls crypto provider state checked"
+        );
+    }
+}
+
+pub async fn init_embedded_runtime_hooks(obs_endpoint: String) -> Result<()> {
+    let guard = rustfs_obs::init_obs(Some(obs_endpoint))
+        .await
+        .map_err(|err| Error::other(format!("init_obs: {err}")))?;
+    rustfs_obs::set_global_guard(guard).map_err(|err| Error::other(format!("set_global_guard: {err}")))?;
+
+    install_embedded_default_crypto_provider();
+    rustfs_trusted_proxies::init();
+
+    Ok(())
+}
+
+fn install_embedded_default_crypto_provider() {
+    if let Err(err) = default_provider().install_default() {
+        debug!(
+            component = LOG_COMPONENT_EMBEDDED,
+            subsystem = LOG_SUBSYSTEM_EMBEDDED,
+            event = EVENT_CRYPTO_PROVIDER_STATE,
+            state = "already_installed",
+            error = ?err,
+            "Embedded crypto provider state changed"
         );
     }
 }
