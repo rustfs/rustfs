@@ -5,15 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-embedded-startup-config-identity`
-- Baseline: completed `R-048/R-049`.
-- Stacked on: embedded startup result shell slice.
+- Branch: `overtrue/arch-app-context-bootstrap-result`
+- Baseline: completed `R-050/R-051`.
+- Stacked on: embedded startup config identity slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: keep embedded startup identity with prepared startup
-  config and remove the residual startup-argument clone contract.
+- Rust code changes: make IAM AppContext bootstrap outcome explicit and reuse
+  it in inline and deferred IAM readiness paths.
 - CI/script changes: none.
-- Docs changes: record the embedded startup config identity slices.
+- Docs changes: record the AppContext bootstrap result slices.
 
 ## Phase 0 Tasks
 
@@ -2435,6 +2435,31 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     risk scan, branch freshness check, pre-commit quality gate, and
     three-expert review.
 
+- [x] `R-052` Make IAM AppContext bootstrap outcome explicit.
+  - Do: replace boolean-or-global probing in IAM startup with a crate-private
+    AppContext bootstrap disposition that reports already-available versus
+    initialized context.
+  - Acceptance: successful inline IAM bootstrap still initializes or reuses
+    AppContext before publishing IAM readiness, while failure still returns an
+    I/O error.
+  - Must preserve: IAM initialization order, global AppContext singleton
+    behavior, KMS/IAM handle construction, degraded-mode fallback, and
+    readiness stage updates.
+  - Verification: focused startup IAM checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-053` Reuse explicit AppContext bootstrap in IAM recovery.
+  - Do: route degraded IAM recovery finalization through the same AppContext
+    bootstrap result helper as inline startup.
+  - Acceptance: recovered IAM still marks `IamReady` and publishes runtime
+    readiness only after AppContext is available.
+  - Must preserve: recovery retry/backoff behavior, shutdown-token handling,
+    readiness publication retry behavior, and log semantics.
+  - Verification: focused startup IAM checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
 - [x] `E-001/E-SET-001` Add ECStore layout skeleton and set-layout boundary.
   - Do: create the ECStore internal layout ownership buckets and pin static set
     layout versus runtime `Sets`/`SetDisks` orchestration boundaries before any
@@ -2677,20 +2702,33 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `pure-move`: continue pruning residual embedded handle/startup-only
-   boundaries after the embedded startup result shell slice lands.
+1. `pure-move`: continue the context-first runtime startup path after the
+   embedded startup ownership slices land.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-050 and R-051 keep embedded identity with prepared startup config and remove the residual startup-argument clone contract without widening the public API. |
-| Migration preservation | passed | Builder chaining, configured identity, region setup, temporary volume ownership, startup error mapping, and shutdown ownership stay unchanged. |
-| Testing/verification | passed | Focused startup-server/startup-embedded/embedded checks, RustFS lib check, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
+| Quality/architecture | passed | R-052 and R-053 make AppContext bootstrap outcome explicit and share inline/recovery finalization without widening public API. |
+| Migration preservation | passed | IAM init order, singleton reuse, KMS/IAM handles, degraded recovery, backoff/shutdown token, readiness stages, and log behavior stay unchanged. |
+| Testing/verification | passed | Focused startup IAM checks, RustFS lib check, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 R-052/R-053 current slice:
+  - `cargo test -p rustfs --lib startup_iam -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `./scripts/check_unsafe_code_allowances.sh`: passed.
+  - Rust risk scan on changed Rust files: passed; only a test-only `expect`
+    call was present.
+  - `make pre-commit`: passed; nextest ran 6336 tests with 6336 passed and
+    111 skipped, and doctests passed.
 
 - Issue #660 R-050/R-051 current slice:
   - `cargo test -p rustfs --lib startup_server -- --nocapture`: passed.
