@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::context::{AppContext, get_global_app_context, init_global_app_context};
+use crate::app::context::AppContext;
 use crate::server::{ServiceStateManager, publish_ready_when_runtime_ready};
 use crate::storage_compat::ECStore;
 use rustfs_common::{GlobalReadiness, SystemStage};
@@ -44,12 +44,6 @@ pub enum IamBootstrapDisposition {
     Deferred,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AppContextBootstrapDisposition {
-    AlreadyAvailable,
-    Initialized,
-}
-
 pub async fn publish_ready_for_iam_bootstrap(
     disposition: IamBootstrapDisposition,
     readiness: &GlobalReadiness,
@@ -77,27 +71,13 @@ where
     Ok(false)
 }
 
-fn ensure_app_context_after_iam(
-    store: Arc<ECStore>,
-    kms_interface: Arc<KmsServiceManager>,
-) -> Result<AppContextBootstrapDisposition> {
-    if get_global_app_context().is_some() {
-        return Ok(AppContextBootstrapDisposition::AlreadyAvailable);
-    }
-
-    let iam_interface = rustfs_iam::get().map_err(|_| std::io::Error::other("IAM is initialized but unavailable"))?;
-
-    init_global_app_context(AppContext::with_default_interfaces(store, iam_interface, kms_interface));
-    Ok(AppContextBootstrapDisposition::Initialized)
-}
-
 async fn finalize_iam_recovery(
     store: Arc<ECStore>,
     kms_interface: Arc<KmsServiceManager>,
     readiness: Arc<GlobalReadiness>,
     state_manager: Option<Arc<ServiceStateManager>>,
 ) -> Result<()> {
-    ensure_app_context_after_iam(store, kms_interface)?;
+    AppContext::ensure_startup_after_iam(store, kms_interface)?;
 
     readiness.mark_stage(SystemStage::IamReady);
     publish_ready_when_runtime_ready(readiness.as_ref(), state_manager.as_deref()).await
@@ -335,7 +315,7 @@ pub async fn bootstrap_or_defer_iam_init(
 ) -> Result<IamBootstrapDisposition> {
     match attempt_init_iam_sys(store.clone()).await {
         Ok(()) => {
-            ensure_app_context_after_iam(store, kms_interface)?;
+            AppContext::ensure_startup_after_iam(store, kms_interface)?;
             readiness.mark_stage(SystemStage::IamReady);
             return Ok(IamBootstrapDisposition::ReadyInline);
         }
