@@ -89,6 +89,14 @@ publication, and replication startup. Embedded-specific behavior still owns its
 stable-port requirement, one-shot global initialization guard placement, S3-only
 HTTP listener, and non-fatal KMS/audit/notification policy.
 
+## Embedded Runtime Service Reuse
+
+Embedded runtime service setup should share startup service helpers for optional
+service initialization, bucket metadata/IAM setup, notification setup, and
+shutdown cleanup. Embedded-specific behavior still owns warning-only
+KMS/audit/notification failures, no binary-only background sidecars, no state
+manager, and the one-shot server handle cleanup used by embedded shutdown.
+
 ## AppContext Foundation
 
 Early AppContext work should split resolver files and add compatibility tests before

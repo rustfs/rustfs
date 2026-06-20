@@ -22,15 +22,18 @@ use crate::{
 use rustfs_heal::shutdown_ahm_services;
 use rustfs_utils::get_env_bool_with_aliases;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 const ENV_SCANNER_ENABLED: &str = "RUSTFS_SCANNER_ENABLED";
 const ENV_SCANNER_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_SCANNER";
 const ENV_HEAL_ENABLED: &str = "RUSTFS_HEAL_ENABLED";
 const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
 const LOG_COMPONENT_MAIN: &str = "main";
+const LOG_COMPONENT_EMBEDDED: &str = "embedded";
 const LOG_SUBSYSTEM_STARTUP: &str = "startup";
+const LOG_SUBSYSTEM_EMBEDDED: &str = "embedded";
 const EVENT_AUDIT_SYSTEM_STATE: &str = "audit_system_state";
+const EVENT_EMBEDDED_SHUTDOWN_CLEANUP_FAILED: &str = "embedded_shutdown_cleanup_failed";
 const EVENT_SHUTDOWN_SIGNAL_RECEIVED: &str = "shutdown_signal_received";
 const EVENT_BACKGROUND_SERVICE_SHUTDOWN: &str = "background_service_shutdown";
 const EVENT_EVENT_NOTIFIER_SHUTDOWN: &str = "event_notifier_shutdown";
@@ -194,6 +197,21 @@ pub async fn run_startup_shutdown_sequence(
         state = "stopped",
         "RustFS server stopped"
     );
+}
+
+pub async fn run_embedded_shutdown_cleanup() {
+    shutdown_event_notifier().await;
+
+    if let Err(err) = stop_audit_system().await {
+        warn!(
+            component = LOG_COMPONENT_EMBEDDED,
+            subsystem = LOG_SUBSYSTEM_EMBEDDED,
+            event = EVENT_EMBEDDED_SHUTDOWN_CLEANUP_FAILED,
+            service = "audit",
+            error = %err,
+            "Embedded shutdown cleanup failed"
+        );
+    }
 }
 
 #[cfg(test)]

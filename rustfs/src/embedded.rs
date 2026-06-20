@@ -47,14 +47,13 @@
 //! start a second server will return an error.
 
 use crate::config::Config;
-use crate::init::{add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system};
-use crate::server::{ShutdownHandle, shutdown_event_notifier, start_http_server, stop_audit_system};
-use crate::startup_iam::{bootstrap_or_defer_iam_init, publish_ready_for_iam_bootstrap};
+use crate::server::{ShutdownHandle, start_http_server};
+use crate::startup_iam::publish_ready_for_iam_bootstrap;
 use crate::startup_server::init_embedded_startup_listen_context;
+use crate::startup_services::init_embedded_startup_runtime_services;
+use crate::startup_shutdown::run_embedded_shutdown_cleanup;
 use crate::startup_storage::{init_embedded_startup_storage_foundation, init_embedded_startup_storage_runtime};
-use crate::storage_compat::{init_bucket_metadata_sys, try_migrate_bucket_metadata, try_migrate_iam_config};
 use rustfs_obs::{init_obs, set_global_guard};
-use rustfs_storage_api::{BucketOperations, BucketOptions};
 use rustls::crypto::aws_lc_rs::default_provider;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -328,77 +327,15 @@ impl RustFSServerBuilder {
         };
         let store = storage_runtime.store;
 
-        // KMS (optional, non-fatal for embedded).
-        if let Err(e) = init_kms_system(&config).await {
-            warn!(
-                component = LOG_COMPONENT_EMBEDDED,
-                subsystem = LOG_SUBSYSTEM_EMBEDDED,
-                event = "embedded_optional_service_skipped",
-                service = "kms",
-                error = %e,
-                "Embedded optional service initialization skipped"
-            );
-        }
-
-        // Buffer profiles.
-        init_buffer_profile_system(&config);
-
-        if let Err(e) = crate::startup_service_components::init_event_notifier_and_audit().await {
-            warn!(
-                component = LOG_COMPONENT_EMBEDDED,
-                subsystem = LOG_SUBSYSTEM_EMBEDDED,
-                event = "embedded_optional_service_skipped",
-                service = "audit",
-                error = %e,
-                "Embedded optional service initialization skipped"
-            );
-        }
-
-        // Bucket listing for metadata + notification init.
-        let buckets: Vec<String> = store
-            .list_bucket(&BucketOptions {
-                no_metadata: true,
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| {
-                shutdown_embedded_server();
-                ServerError::Init(format!("list_bucket: {e}"))
-            })?
-            .into_iter()
-            .map(|v| v.name)
-            .collect();
-
-        try_migrate_bucket_metadata(store.clone()).await;
-        init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
-        try_migrate_iam_config(store.clone()).await;
-
-        // IAM.
-        let kms_interface =
-            rustfs_kms::get_global_kms_service_manager().unwrap_or_else(rustfs_kms::init_global_kms_service_manager);
-        let iam_bootstrap =
-            bootstrap_or_defer_iam_init(store.clone(), kms_interface, listen_context.readiness.clone(), None, Some(ctx.clone()))
+        let service_runtime =
+            init_embedded_startup_runtime_services(&config, endpoint_pools, store, ctx.clone(), listen_context.readiness.clone())
                 .await
                 .map_err(|e| {
                     shutdown_embedded_server();
-                    ServerError::Init(format!("IAM bootstrap setup: {e}"))
+                    ServerError::Init(e.to_string())
                 })?;
 
-        // Bucket notifications.
-        add_bucket_notification_configuration(buckets.clone()).await;
-
-        if let Err(e) = crate::startup_service_components::init_notification_system(endpoint_pools.clone()).await {
-            warn!(
-                component = LOG_COMPONENT_EMBEDDED,
-                subsystem = LOG_SUBSYSTEM_EMBEDDED,
-                event = "embedded_optional_service_skipped",
-                service = "notification",
-                error = %e,
-                "Embedded optional service initialization skipped"
-            );
-        }
-
-        publish_ready_for_iam_bootstrap(iam_bootstrap, listen_context.readiness.as_ref(), None)
+        publish_ready_for_iam_bootstrap(service_runtime.iam_bootstrap, listen_context.readiness.as_ref(), None)
             .await
             .map_err(|e| {
                 shutdown_embedded_server();
@@ -505,20 +442,7 @@ impl RustFSServer {
         // Cancel background services.
         self.cancel_token.cancel();
 
-        // Shutdown event notifier.
-        shutdown_event_notifier().await;
-
-        // Stop the audit system.
-        if let Err(e) = stop_audit_system().await {
-            warn!(
-                component = LOG_COMPONENT_EMBEDDED,
-                subsystem = LOG_SUBSYSTEM_EMBEDDED,
-                event = "embedded_shutdown_cleanup_failed",
-                service = "audit",
-                error = %e,
-                "Embedded shutdown cleanup failed"
-            );
-        }
+        run_embedded_shutdown_cleanup().await;
 
         // Signal HTTP server to stop.
         if let Some(shutdown_handle) = self.shutdown_handle.take() {
