@@ -12,23 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_compat::{
-    ECStore, EndpointServerPools, get_global_replication_pool, init_bucket_metadata_sys, new_global_notification_sys,
-    try_migrate_bucket_metadata, try_migrate_iam_config,
-};
+use crate::storage_compat::ECStore;
 use crate::{
     config::Config,
-    init::{
-        add_bucket_notification_configuration, init_auto_tuner, init_buffer_profile_system, init_kms_system, init_update_check,
-        print_server_info,
-    },
+    init::{init_auto_tuner, init_buffer_profile_system, init_kms_system, init_update_check, print_server_info},
     server::{init_event_notifier, start_audit_system},
 };
 use rustfs_audit::AuditResult;
 use rustfs_heal::{create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager};
 use rustfs_iam::init_oidc_sys;
 use rustfs_obs::init_metrics_runtime;
-use rustfs_storage_api::{BucketOperations, BucketOptions};
 use rustfs_utils::get_env_bool_with_aliases;
 use std::{
     future::Future,
@@ -53,7 +46,6 @@ const EVENT_EMBEDDED_OPTIONAL_SERVICE_SKIPPED: &str = "embedded_optional_service
 const EVENT_KEYSTONE_AUTH_INITIALIZED: &str = "keystone_auth_initialized";
 const EVENT_KEYSTONE_AUTH_INITIALIZATION_FAILED: &str = "keystone_auth_initialization_failed";
 const EVENT_OIDC_INITIALIZATION_FAILED: &str = "oidc_initialization_failed";
-const EVENT_NOTIFICATION_SYSTEM_INITIALIZATION_FAILED: &str = "notification_system_initialization_failed";
 const EVENT_BACKGROUND_SERVICES_CONFIGURED: &str = "background_services_configured";
 
 pub(crate) async fn init_audit_runtime() {
@@ -114,55 +106,6 @@ pub(crate) fn init_deadlock_detector_runtime() {
     }
 }
 
-pub(crate) async fn init_embedded_bucket_metadata_runtime(store: Arc<ECStore>) -> Result<Vec<String>> {
-    let buckets_list = store
-        .list_bucket(&BucketOptions {
-            no_metadata: true,
-            ..Default::default()
-        })
-        .await
-        .map_err(|err| Error::other(format!("list_bucket: {err}")))?;
-
-    let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
-
-    try_migrate_bucket_metadata(store.clone()).await;
-    init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
-    try_migrate_iam_config(store).await;
-
-    Ok(buckets)
-}
-
-pub(crate) async fn init_bucket_metadata_runtime(store: Arc<ECStore>, ctx: CancellationToken) -> Result<Vec<String>> {
-    let buckets_list = store
-        .list_bucket(&BucketOptions {
-            no_metadata: true,
-            ..Default::default()
-        })
-        .await
-        .map_err(Error::other)?;
-
-    let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
-
-    try_migrate_bucket_metadata(store.clone()).await;
-
-    if let Some(pool) = get_global_replication_pool() {
-        pool.init_resync(ctx, buckets.clone()).await?;
-    }
-
-    try_migrate_iam_config(store.clone()).await;
-    init_bucket_metadata_sys(store, buckets.clone()).await;
-
-    Ok(buckets)
-}
-
-pub(crate) async fn init_embedded_notification_runtime(endpoint_pools: EndpointServerPools, buckets: Vec<String>) {
-    add_bucket_notification_configuration(buckets).await;
-
-    if let Err(err) = init_notification_system(endpoint_pools).await {
-        log_embedded_optional_service_skipped("notification", err);
-    }
-}
-
 pub(crate) async fn init_auth_integrations() -> Result<()> {
     let keystone_config = rustfs_keystone::KeystoneConfig::from_env().map_err(Error::other)?;
     if keystone_config.enable {
@@ -196,21 +139,6 @@ pub(crate) async fn init_auth_integrations() -> Result<()> {
     }
 
     Ok(())
-}
-
-pub(crate) async fn init_notification_runtime(endpoint_pools: EndpointServerPools, buckets: Vec<String>) -> Result<()> {
-    add_bucket_notification_configuration(buckets).await;
-
-    init_notification_system(endpoint_pools).await.map_err(|err| {
-        error!(
-            event = EVENT_NOTIFICATION_SYSTEM_INITIALIZATION_FAILED,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            error = ?err,
-            "Failed to initialize notification system"
-        );
-        Error::other(err)
-    })
 }
 
 pub(crate) async fn init_background_service_runtime(store: Arc<ECStore>) -> Result<bool> {
@@ -282,18 +210,6 @@ where
     start_audit().await
 }
 
-pub(crate) async fn init_notification_system(endpoint_pools: EndpointServerPools) -> crate::storage_compat::EcstoreResult<()> {
-    init_notification_system_with(|| new_global_notification_sys(endpoint_pools)).await
-}
-
-async fn init_notification_system_with<InitFn, InitFuture>(init_notification: InitFn) -> crate::storage_compat::EcstoreResult<()>
-where
-    InitFn: FnOnce() -> InitFuture,
-    InitFuture: Future<Output = crate::storage_compat::EcstoreResult<()>>,
-{
-    init_notification().await
-}
-
 fn log_embedded_optional_service_skipped(service: &str, err: impl std::fmt::Display) {
     warn!(
         component = LOG_COMPONENT_EMBEDDED,
@@ -307,7 +223,7 @@ fn log_embedded_optional_service_skipped(service: &str, err: impl std::fmt::Disp
 
 #[cfg(test)]
 mod tests {
-    use super::{init_event_notifier_and_audit_with, init_notification_system_with};
+    use super::init_event_notifier_and_audit_with;
     use rustfs_audit::AuditError;
     use std::sync::{Arc, Mutex};
 
@@ -352,12 +268,5 @@ mod tests {
         assert!(result.is_err());
         let events = events.lock().unwrap_or_else(|err| err.into_inner()).clone();
         assert_eq!(events, ["notify", "audit"]);
-    }
-
-    #[tokio::test]
-    async fn notification_system_returns_source_error() {
-        let result = init_notification_system_with(|| async { Err(crate::storage_compat::EcstoreError::FaultyDisk) }).await;
-
-        assert!(result.is_err());
     }
 }

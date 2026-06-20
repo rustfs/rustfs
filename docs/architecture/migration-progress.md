@@ -2510,6 +2510,32 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
     freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `R-058` Move startup bucket metadata runtime owner.
+  - Do: move embedded and main bucket metadata runtime helpers out of startup
+    service components and into a bucket metadata startup module.
+  - Acceptance: startup services still receive the same bucket list and bucket
+    metadata, replication resync, bucket metadata system, and IAM config
+    migration order stay unchanged.
+  - Must preserve: embedded list-bucket error text, main list-bucket error
+    mapping, replication resync placement, metadata migration order, and bucket
+    list cloning semantics.
+  - Verification: focused startup service checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-059` Move startup notification runtime owner.
+  - Do: move embedded and main notification runtime helpers out of startup
+    service components and into a notification startup module.
+  - Acceptance: startup services still configure bucket notification state
+    before notification system initialization and keep embedded notification
+    failures non-fatal while main startup failures remain fatal.
+  - Must preserve: notification config ordering, embedded skipped-service log
+    fields, main failure log fields, error mapping, and notification init source
+    error behavior.
+  - Verification: focused startup notification/service checks, RustFS lib
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
 - [x] `E-001/E-SET-001` Add ECStore layout skeleton and set-layout boundary.
   - Do: create the ECStore internal layout ownership buckets and pin static set
     layout versus runtime `Sets`/`SetDisks` orchestration boundaries before any
@@ -2759,19 +2785,23 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-056 and R-057 keep startup services on startup IAM while moving KMS ownership into app context and IAM facade wiring into startup IAM. |
-| Migration preservation | passed | KMS singleton reuse/init behavior, embedded/main IAM wiring, IAM bootstrap order, degraded recovery, readiness stages, and log behavior stay unchanged. |
-| Testing/verification | passed | Focused startup IAM/KMS checks, RustFS lib check, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
+| Quality/architecture | passed | R-056 through R-059 keep startup services as orchestration while moving KMS, IAM facade, bucket metadata, and notification ownership to focused startup modules. |
+| Migration preservation | passed | KMS singleton reuse/init behavior, embedded/main IAM wiring, bucket metadata migration/resync order, notification setup, readiness stages, and log behavior stay unchanged. |
+| Testing/verification | passed | Focused startup IAM/KMS/service/notification checks, RustFS lib check, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
 
-- Issue #660 R-056/R-057 current slice:
+- Issue #660 R-056/R-059 current slice:
   - `cargo test -p rustfs --lib startup_kms -- --nocapture`: passed; 2
     tests.
   - `cargo test -p rustfs --lib startup_iam -- --nocapture`: passed; 8
     tests.
+  - `cargo test -p rustfs --lib startup_service_components -- --nocapture`:
+    passed; 2 tests.
+  - `cargo test -p rustfs --lib startup_notification -- --nocapture`:
+    passed; 1 test.
   - `cargo check -p rustfs --lib`: passed.
   - `cargo fmt --all --check`: passed.
   - `git diff --check`: passed.
