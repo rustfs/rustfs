@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-layout-set-heal-helpers`
-- Baseline: merged `E-003/E-LAYOUT-002`.
+- Branch: `overtrue/arch-ecstore-layout-pool-space`
+- Baseline: completed `E-004/E-LAYOUT-003`.
 - Stacked on: merged ECStore layout foundation, format layout ownership, and
-  endpoint layout move slices.
+  endpoint layout move slices plus the set-format heal helper layout slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move runtime-neutral ECStore set-format heal helpers into
-  the internal layout bucket while preserving `Sets` runtime orchestration.
+- Rust code changes: move ECStore pool-space selection helper types into the
+  internal layout bucket while preserving the old `store` export path.
 - CI/script changes: none.
-- Docs changes: record the ECStore set-format heal helper layout slice.
+- Docs changes: record the ECStore pool-space helper layout slice.
 
 ## Phase 0 Tasks
 
@@ -2267,10 +2267,25 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
     branch freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `E-005/E-LAYOUT-004` Move ECStore pool-space selection helpers.
+  - Do: move runtime-neutral pool-space selection helper structs into the
+    ECStore layout bucket while keeping the old `store` export path available.
+  - Acceptance: `layout::pool_space` owns `PoolAvailableSpace` and
+    `ServerPoolsAvailableSpace`, rebalance pool selection keeps the same tuple
+    storage access inside the crate, and external `store` imports remain
+    source-compatible through re-export.
+  - Must preserve: pool index ordering, available-space summation,
+    max-used-percent filtering semantics, excluded-pool zeroing, object
+    placement pool selection, and rebalance pool-space behavior.
+  - Verification: focused ECStore pool-space tests, ECStore/RustFS/Heal
+    compile checks, migration/layer guards, formatting, diff hygiene, Rust risk
+    scan, branch freshness check, pre-commit quality gate, and three-expert
+    review.
+
 ## Next PRs
 
 1. `pure-move`: continue moving runtime-neutral pool/set layout helpers once
-   E-004/E-LAYOUT-003 lands.
+   E-005/E-LAYOUT-004 lands.
 2. `pure-move`: continue pruning residual embedded startup-only orchestration
    once the lifecycle helpers are merged.
 
@@ -2278,9 +2293,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | E-004/E-LAYOUT-003 extracts runtime-neutral set-format heal helpers into ECStore layout without moving disk init or `Sets` orchestration. |
-| Migration preservation | passed | Drive-info state mapping, unformatted format regeneration, current disk-info preservation, dry-run/save behavior, and `Sets` runtime control flow remain preserved. |
-| Testing/verification | passed | Focused set-heal helper tests, compile checks, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
+| Quality/architecture | passed | E-005/E-LAYOUT-004 extracts runtime-neutral pool-space helper types into ECStore layout without moving rebalance or store orchestration. |
+| Migration preservation | passed | Pool index ordering, available-space summation, max-used-percent filtering, excluded-pool zeroing, and old `store` import compatibility remain preserved. |
+| Testing/verification | passed | Focused pool-space helper tests, compile checks, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
 
 ## Verification Notes
 
@@ -2377,6 +2392,19 @@ Passed before push:
   - `git diff --check`: passed.
   - Rust risk scan on changed Rust files: passed; only test-only unwrap
     expectations were added around deterministic helper construction.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 E-005/E-LAYOUT-004 current slice:
+  - `cargo test -p rustfs-ecstore layout::pool_space -- --nocapture`: passed.
+  - `cargo check -p rustfs-ecstore -p rustfs -p rustfs-heal`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; only existing `store.rs`
+    test-only `expect` calls and an existing `Result<String>` method signature
+    were present outside the moved helper body.
   - `make pre-commit`: passed.
   - Three-expert review: passed.
 
