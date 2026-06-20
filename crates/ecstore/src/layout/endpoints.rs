@@ -1053,7 +1053,7 @@ mod test {
         assert!(!is_retryable_dns_error(&Error::new(ErrorKind::ConnectionRefused, "connection refused")));
         assert!(!is_retryable_dns_error(&Error::new(ErrorKind::ConnectionReset, "connection reset")));
         assert!(!is_retryable_dns_error(&Error::new(ErrorKind::UnexpectedEof, "unexpected eof")));
-        assert!(!is_retryable_dns_error(&Error::from_raw_os_error(11)));
+        assert!(!is_retryable_dns_error(&Error::new(ErrorKind::PermissionDenied, "permission denied")));
     }
 
     #[test]
