@@ -28,8 +28,9 @@ pub mod sys;
 pub mod target;
 
 pub use catalog::extension::{
-    OPS_DIAGNOSTICS_EXTENSION_API_VERSION, S3_HOOK_EXTENSION_API_VERSION, TARGET_AUDIT_CAPABILITY, TARGET_NOTIFY_CAPABILITY,
-    builtin_extension_schemas, builtin_ops_diagnostics_contract, builtin_ops_diagnostics_extension_schema,
+    OPS_DIAGNOSTICS_EXTENSION_API_VERSION, OPS_PROFILER_EXTENSION_API_VERSION, S3_HOOK_EXTENSION_API_VERSION,
+    TARGET_AUDIT_CAPABILITY, TARGET_NOTIFY_CAPABILITY, builtin_extension_schemas, builtin_ops_diagnostics_contract,
+    builtin_ops_diagnostics_extension_schema, builtin_ops_profiler_contract, builtin_ops_profiler_extension_schema,
     builtin_s3_hook_contract, builtin_s3_hook_extension_schema, builtin_target_extension_schemas,
     target_marketplace_extension_schema, target_runtime_boundary,
 };
@@ -70,6 +71,9 @@ pub use runtime::{
     ops_diagnostics::{
         OpsDiagnosticsAccessDecision, OpsDiagnosticsReadRequest, OpsDiagnosticsRegistration, OpsDiagnosticsRegistry,
         OpsDiagnosticsRegistryError,
+    },
+    ops_profiler::{
+        OpsProfilerAccessDecision, OpsProfilerReadRequest, OpsProfilerRegistration, OpsProfilerRegistry, OpsProfilerRegistryError,
     },
     s3_hooks::{S3HookContext, S3HookDecision, S3HookRegistration, S3HookRegistry, S3HookRegistryError},
     sidecar::{SidecarPluginRuntime, SidecarRuntimePolicy, SidecarRuntimePolicyError, SidecarRuntimeSafetyChecks},

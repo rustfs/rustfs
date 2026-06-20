@@ -287,6 +287,14 @@ mod tests {
         assert_eq!(diagnostics.kind, ExtensionKind::OpsDiagnostics);
         assert_eq!(diagnostics.runtime.boundary, ExtensionRuntimeBoundary::Builtin);
 
+        let profiler = response
+            .extensions
+            .iter()
+            .find(|schema| schema.extension_id == "builtin:ops-profiler")
+            .expect("builtin ops profiler extension should be present");
+        assert_eq!(profiler.kind, ExtensionKind::OpsProfiler);
+        assert_eq!(profiler.runtime.boundary, ExtensionRuntimeBoundary::Builtin);
+
         assert!(!response.external_plugin_flow.enabled);
         assert!(response.external_plugin_flow.install_requires_signature);
         assert!(response.external_plugin_flow.install_requires_provenance);
