@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::config::get_global_storage_class;
+use crate::layout::pool_space::build_server_pools_available_space;
 use rustfs_storage_api::{NamespaceLocking as _, ObjectOperations as _, StorageAdminApi};
 pub(in crate::store) mod support;
 use support::{
@@ -21,61 +22,6 @@ use support::{
     rebalance_disk_set_lookup_error, resolve_latest_object_info_candidates, resolve_rebalance_delete_from_all_pools_result,
     resolve_rebalance_delete_from_all_pools_results, resolve_store_rebalance_pool_meta_reload_result,
 };
-
-async fn build_server_pools_available_space(
-    bucket: &str,
-    size: i64,
-    n_sets: &[usize],
-    infos: &[Vec<Option<DiskInfo>>],
-) -> ServerPoolsAvailableSpace {
-    let mut server_pools = vec![PoolAvailableSpace::default(); infos.len()];
-
-    for (i, zinfo) in infos.iter().enumerate() {
-        if zinfo.is_empty() {
-            server_pools[i] = PoolAvailableSpace {
-                index: i,
-                ..Default::default()
-            };
-
-            continue;
-        }
-
-        if !is_meta_bucketname(bucket) && !has_space_for(zinfo, size).await.unwrap_or_default() {
-            server_pools[i] = PoolAvailableSpace {
-                index: i,
-                ..Default::default()
-            };
-
-            continue;
-        }
-
-        let mut available = 0;
-        let mut max_used_pct = 0;
-        for disk in zinfo.iter().flatten() {
-            if disk.total == 0 {
-                continue;
-            }
-
-            available += disk.total - disk.used;
-
-            let pct_used = disk.used * 100 / disk.total;
-
-            if pct_used > max_used_pct {
-                max_used_pct = pct_used;
-            }
-        }
-
-        available *= n_sets[i] as u64;
-
-        server_pools[i] = PoolAvailableSpace {
-            index: i,
-            available,
-            max_used_pct,
-        }
-    }
-
-    ServerPoolsAvailableSpace(server_pools)
-}
 
 impl ECStore {
     #[instrument(level = "debug", skip(self))]
@@ -700,22 +646,11 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::disk::DiskInfo;
 
     fn object_info_with_mod_time(unix_ts: i64, delete_marker: bool) -> ObjectInfo {
         ObjectInfo {
             mod_time: Some(OffsetDateTime::from_unix_timestamp(unix_ts).unwrap()),
             delete_marker,
-            ..Default::default()
-        }
-    }
-
-    fn disk_info(total: u64, used: u64, free: u64) -> DiskInfo {
-        DiskInfo {
-            total,
-            used,
-            free,
-            free_inodes: 1_024,
             ..Default::default()
         }
     }
@@ -1007,38 +942,5 @@ mod tests {
             err.to_string()
                 .contains("failed to resolve rebalance disk set: pool index 2, set index 7, pool count 3")
         );
-    }
-
-    #[tokio::test]
-    async fn build_server_pools_available_space_returns_zero_for_empty_pool_info() {
-        let spaces = build_server_pools_available_space("bucket-a", 64, &[1], &[Vec::new()]).await;
-
-        assert_eq!(spaces.0.len(), 1);
-        assert_eq!(spaces.0[0].index, 0);
-        assert_eq!(spaces.0[0].available, 0);
-        assert_eq!(spaces.0[0].max_used_pct, 0);
-    }
-
-    #[tokio::test]
-    async fn build_server_pools_available_space_computes_available_capacity_and_max_used_pct() {
-        let infos = vec![vec![Some(disk_info(1_000, 100, 900)), Some(disk_info(1_000, 200, 800))]];
-
-        let spaces = build_server_pools_available_space("bucket-a", 64, &[2], &infos).await;
-
-        assert_eq!(spaces.0.len(), 1);
-        assert_eq!(spaces.0[0].index, 0);
-        assert_eq!(spaces.0[0].available, 3_400);
-        assert_eq!(spaces.0[0].max_used_pct, 20);
-    }
-
-    #[tokio::test]
-    async fn build_server_pools_available_space_skips_capacity_guard_for_meta_bucket() {
-        let infos = vec![vec![Some(disk_info(10, 9, 1)), Some(disk_info(10, 9, 1))]];
-
-        let spaces = build_server_pools_available_space(crate::disk::RUSTFS_META_BUCKET, 1_024, &[1], &infos).await;
-
-        assert_eq!(spaces.0.len(), 1);
-        assert_eq!(spaces.0[0].available, 2);
-        assert_eq!(spaces.0[0].max_used_pct, 90);
     }
 }
