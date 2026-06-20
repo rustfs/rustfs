@@ -26,11 +26,16 @@ use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
 use matchit::Params;
-use rustfs_extension_schema::{ExtensionKind, ExtensionSchema};
+use rustfs_extension_schema::{
+    ExtensionCapabilityRef, ExtensionKind, ExtensionRuntimeContract, ExtensionSchema, OPS_DIAGNOSTICS_CAPABILITY,
+    OPS_PROFILER_CAPABILITY, OpsDiagnosticsContract, OpsProfilerContract,
+};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::{
-    TargetPluginExternalFlowGate, TargetPluginExternalFlowGateStatus, builtin_extension_schemas,
-    catalog::example_external_webhook_plugin, target_marketplace_extension_schema,
+    OpsDiagnosticsRegistry, OpsProfilerRegistry, TargetPluginExternalFlowGate, TargetPluginExternalFlowGateStatus,
+    builtin_extension_schemas, builtin_ops_diagnostics_contract, builtin_ops_diagnostics_extension_schema,
+    builtin_ops_profiler_contract, builtin_ops_profiler_extension_schema, catalog::example_external_webhook_plugin,
+    target_marketplace_extension_schema,
 };
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
@@ -55,7 +60,27 @@ pub fn register_extension_route(r: &mut S3Router<AdminOperation>) -> std::io::Re
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ExtensionCatalogResponse {
     pub extensions: Vec<ExtensionSchema>,
+    pub runtime_capabilities: ExtensionRuntimeCapabilitiesResponse,
     pub external_plugin_flow: TargetPluginExternalFlowGateStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ExtensionRuntimeCapabilitiesResponse {
+    pub ops_diagnostics: ExtensionRuntimeCapabilityResponse<OpsDiagnosticsContract>,
+    pub ops_profiler: ExtensionRuntimeCapabilityResponse<OpsProfilerContract>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ExtensionRuntimeCapabilityResponse<T>
+where
+    T: Serialize,
+{
+    pub extension_id: String,
+    pub capability: ExtensionCapabilityRef,
+    pub runtime: ExtensionRuntimeContract,
+    pub disabled_by_default: bool,
+    pub startup_fatal: bool,
+    pub contract: T,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -95,7 +120,47 @@ fn build_extension_catalog_response() -> ExtensionCatalogResponse {
 
     ExtensionCatalogResponse {
         extensions,
+        runtime_capabilities: build_extension_runtime_capabilities_response(),
         external_plugin_flow: TargetPluginExternalFlowGate::default().status(),
+    }
+}
+
+fn build_extension_runtime_capabilities_response() -> ExtensionRuntimeCapabilitiesResponse {
+    let ops_diagnostics_schema = builtin_ops_diagnostics_extension_schema();
+    let ops_diagnostics_contract = builtin_ops_diagnostics_contract();
+    let mut ops_diagnostics_registry = OpsDiagnosticsRegistry::new();
+    debug_assert!(
+        ops_diagnostics_registry
+            .register_schema(&ops_diagnostics_schema, &ops_diagnostics_contract)
+            .is_ok()
+    );
+
+    let ops_profiler_schema = builtin_ops_profiler_extension_schema();
+    let ops_profiler_contract = builtin_ops_profiler_contract();
+    let mut ops_profiler_registry = OpsProfilerRegistry::new();
+    debug_assert!(
+        ops_profiler_registry
+            .register_schema(&ops_profiler_schema, &ops_profiler_contract)
+            .is_ok()
+    );
+
+    ExtensionRuntimeCapabilitiesResponse {
+        ops_diagnostics: ExtensionRuntimeCapabilityResponse {
+            extension_id: ops_diagnostics_schema.extension_id,
+            capability: ExtensionCapabilityRef::new(OPS_DIAGNOSTICS_CAPABILITY),
+            runtime: ops_diagnostics_schema.runtime,
+            disabled_by_default: ops_diagnostics_schema.disabled_by_default,
+            startup_fatal: false,
+            contract: ops_diagnostics_contract,
+        },
+        ops_profiler: ExtensionRuntimeCapabilityResponse {
+            extension_id: ops_profiler_schema.extension_id,
+            capability: ExtensionCapabilityRef::new(OPS_PROFILER_CAPABILITY),
+            runtime: ops_profiler_schema.runtime,
+            disabled_by_default: ops_profiler_schema.disabled_by_default,
+            startup_fatal: false,
+            contract: ops_profiler_contract,
+        },
     }
 }
 
@@ -206,7 +271,10 @@ mod tests {
         PluginContractDomain, PluginEnableState, PluginInstallState, PluginInstanceEntry, PluginInstanceSource,
         PluginOperationalRuntimeState, PluginOperationalStateContract,
     };
-    use rustfs_extension_schema::{ExtensionKind, ExtensionRuntimeBoundary, validate_extension_schemas};
+    use rustfs_extension_schema::{
+        ExtensionKind, ExtensionRuntimeBoundary, OPS_DIAGNOSTICS_CAPABILITY, OPS_PROFILER_CAPABILITY, validate_extension_schemas,
+        validate_ops_diagnostics_contract, validate_ops_profiler_contract,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -303,6 +371,36 @@ mod tests {
         assert!(!response.external_plugin_flow.circuit_breaker_closed);
 
         assert!(validate_extension_schemas(&response.extensions).is_ok());
+    }
+
+    #[test]
+    fn extension_catalog_exposes_read_only_runtime_capability_snapshots() {
+        let response = build_extension_catalog_response();
+
+        assert_eq!(response.runtime_capabilities.ops_diagnostics.extension_id, "builtin:ops-diagnostics");
+        assert_eq!(
+            response.runtime_capabilities.ops_diagnostics.capability.as_str(),
+            OPS_DIAGNOSTICS_CAPABILITY
+        );
+        assert_eq!(
+            response.runtime_capabilities.ops_diagnostics.runtime.boundary,
+            ExtensionRuntimeBoundary::Builtin
+        );
+        assert!(!response.runtime_capabilities.ops_diagnostics.disabled_by_default);
+        assert!(!response.runtime_capabilities.ops_diagnostics.startup_fatal);
+        assert!(response.runtime_capabilities.ops_diagnostics.contract.requires_admin_action);
+        assert!(!response.runtime_capabilities.ops_diagnostics.contract.mutates_object_data);
+        assert!(validate_ops_diagnostics_contract(&response.runtime_capabilities.ops_diagnostics.contract).is_ok());
+
+        assert_eq!(response.runtime_capabilities.ops_profiler.extension_id, "builtin:ops-profiler");
+        assert_eq!(response.runtime_capabilities.ops_profiler.capability.as_str(), OPS_PROFILER_CAPABILITY);
+        assert_eq!(
+            response.runtime_capabilities.ops_profiler.runtime.boundary,
+            ExtensionRuntimeBoundary::Builtin
+        );
+        assert!(!response.runtime_capabilities.ops_profiler.disabled_by_default);
+        assert!(!response.runtime_capabilities.ops_profiler.startup_fatal);
+        assert!(validate_ops_profiler_contract(&response.runtime_capabilities.ops_profiler.contract).is_ok());
     }
 
     #[test]

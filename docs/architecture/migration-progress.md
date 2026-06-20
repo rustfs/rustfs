@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ops-profiler-runtime-contract`
-- Baseline: `overtrue/arch-embedded-lifecycle-publication-reuse`
-  (`e27c079d4c2a577bd9a632a615b2f0b96b468149`).
-- Stacked on: local R-031, which is stacked on rustfs/rustfs#3641.
+- Branch: `overtrue/arch-extension-runtime-snapshots`
+- Baseline: `overtrue/arch-ops-profiler-runtime-contract`
+  (`6d4ff92f398a9decdce53a7203744c7c2a70a4e9`).
+- Stacked on: local R-032, which is stacked on rustfs/rustfs#3642.
 - PR type for this branch: `contract`
 - Runtime behavior changes: none.
-- Rust code changes: publish the builtin ops profiler catalog contract through
-  targets and add a read-only profiler registry contract.
+- Rust code changes: expose builtin diagnostics/profiler runtime capability
+  snapshots through the admin extension catalog response.
 - CI/script changes: none.
-- Docs changes: record the R-032 ops profiler runtime contract slice.
+- Docs changes: record the R-033 extension runtime snapshot slice.
 
 ## Phase 0 Tasks
 
@@ -2198,20 +2198,33 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
     freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `R-033` Expose extension runtime capability snapshots.
+  - Do: add read-only diagnostics/profiler runtime capability snapshots to the
+    admin extension catalog response using existing schema and contract DTOs.
+  - Acceptance: `/v4/extensions/catalog` reports builtin diagnostics and
+    profiler capability contracts with their runtime boundaries, disabled
+    defaults, and non-fatal startup flags while preserving schema validation.
+  - Must preserve: existing extension catalog route/auth, plugin instance
+    listing, profiler/diagnostics execution paths, and external plugin flow
+    status semantics.
+  - Verification: focused admin catalog and targets runtime checks, RustFS lib
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
 ## Next PRs
 
 1. `pure-move`: continue pruning residual embedded startup-only orchestration
    once the lifecycle helpers are merged.
 2. `contract`: add the next read-only extension handoff once admin/reporting
-   consumers need profiler or diagnostics snapshots.
+   consumers need additional extension runtime snapshots.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-032 keeps profiler execution in the existing admin/profiling paths while adding only catalog and registry contract boundaries. |
-| Migration preservation | passed | Existing profile collection routes, startup/shutdown hook behavior, redaction requirements, and disabled external-runtime defaults remain unchanged. |
-| Testing/verification | passed | Focused targets/admin extension checks, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
+| Quality/architecture | passed | R-033 exposes only read-only diagnostics/profiler capability snapshots through the admin extension catalog response. |
+| Migration preservation | passed | Catalog auth, plugin instance listing, profiler/diagnostics execution paths, and external plugin flow status semantics remain unchanged. |
+| Testing/verification | passed | Focused admin catalog and targets runtime checks, lib check, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
 
 ## Verification Notes
 
@@ -2237,6 +2250,20 @@ Passed before push:
     passed.
   - `cargo test -p rustfs --lib extension_catalog -- --nocapture`: passed.
   - `cargo check -p rustfs-targets`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; only test-only
+    expectations/assertion paths were present.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 R-033 current slice:
+  - `cargo test -p rustfs --lib extension_catalog -- --nocapture`: passed.
+  - `cargo test -p rustfs-targets ops_diagnostics -- --nocapture`: passed.
+  - `cargo test -p rustfs-targets ops_profiler -- --nocapture`: passed.
   - `cargo check -p rustfs --lib`: passed.
   - `./scripts/check_architecture_migration_rules.sh`: passed.
   - `./scripts/check_layer_dependencies.sh`: passed.
