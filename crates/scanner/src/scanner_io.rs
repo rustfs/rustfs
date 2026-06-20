@@ -31,6 +31,8 @@ use rustfs_storage_api::{BucketInfo, BucketOperations, BucketOptions, DiskSetSel
 use rustfs_utils::path::path_join_buf;
 use s3s::dto::{BucketLifecycleConfiguration, ReplicationConfiguration};
 use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex as StdMutex, MutexGuard};
