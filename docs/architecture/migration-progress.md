@@ -5,17 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-embedded-builder-startup-context`
-- Baseline: completed `R-034/R-035`.
-- Stacked on: embedded runtime hook and shutdown glue extraction slices.
+- Branch: `overtrue/arch-embedded-startup-control`
+- Baseline: completed `R-036/R-037`.
+- Stacked on: embedded startup server helper extraction slices.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move embedded startup config preparation and S3-only HTTP
-  server startup into startup server helpers while preserving embedded builder
-  behavior.
+- Rust code changes: move the embedded process-global startup guard and
+  post-HTTP startup failure shutdown signal into startup lifecycle/shutdown
+  helpers while preserving embedded builder behavior.
 - CI/script changes: none.
-- Docs changes: record the embedded startup config and HTTP startup owner
-  slices.
+- Docs changes: record the embedded startup control owner slices.
 
 ## Phase 0 Tasks
 
@@ -2266,6 +2265,33 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
     freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `R-038` Extract embedded process-global startup guard boundary.
+  - Do: move the embedded process-global once guard behind a startup lifecycle
+    helper.
+  - Acceptance: embedded startup still allows retry before irreversible global
+    initialization, treats repeated marks inside the same startup as idempotent,
+    and rejects a second process-local embedded server after the first
+    irreversible mark.
+  - Must preserve: startup guard timing after runtime hooks and listen context,
+    `AlreadyStarted` error mapping, no reset-after-stop behavior, and no normal
+    startup behavior changes.
+  - Verification: focused startup lifecycle and embedded checks, RustFS lib
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-039` Extract embedded startup failure shutdown signal boundary.
+  - Do: move the post-HTTP embedded startup failure shutdown signal behind a
+    startup shutdown helper.
+  - Acceptance: embedded startup still signals the HTTP shutdown handle and
+    cancels the background token before returning initialization errors from
+    storage runtime, service runtime, or readiness publication failures.
+  - Must preserve: no shutdown signal before HTTP startup exists, signal-then-
+    cancel ordering, `Init` error mapping, and no public embedded API behavior
+    changes.
+  - Verification: focused startup shutdown and embedded checks, RustFS lib
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
 - [x] `E-001/E-SET-001` Add ECStore layout skeleton and set-layout boundary.
   - Do: create the ECStore internal layout ownership buckets and pin static set
     layout versus runtime `Sets`/`SetDisks` orchestration boundaries before any
@@ -2509,19 +2535,33 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Next PRs
 
 1. `pure-move`: continue pruning residual embedded startup-only orchestration
-   after the builder config and S3-only HTTP startup boundaries land.
+   after the startup control helpers land.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-036 and R-037 move embedded builder config preparation and S3-only HTTP startup into startup server helpers without exposing new public API. |
-| Migration preservation | passed | Temp-dir guard lifetime, volume directory creation, embedded config fields, console-disabled S3 startup, readiness sharing, shutdown handle, and bound address behavior stay unchanged. |
-| Testing/verification | passed | Focused startup server/embedded checks, RustFS lib check, architecture/layer guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
+| Quality/architecture | passed | R-038 and R-039 move embedded startup guard and startup-failure shutdown signaling into startup owner helpers with crate-only visibility. |
+| Migration preservation | passed | Retry-before-global-init, once-only process guard, `AlreadyStarted` mapping, post-HTTP signal/cancel behavior, and `Init` error mapping stay unchanged. |
+| Testing/verification | passed | Focused startup lifecycle/shutdown/embedded checks, RustFS lib check, architecture/layer guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 R-038/R-039 current slice:
+  - `cargo test -p rustfs --lib startup_lifecycle -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_shutdown -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib embedded -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: reviewed; newly added risky-token
+    matches were limited to test-only `expect` calls, and broader changed-file
+    matches were pre-existing lifecycle/doc examples plus cleanup paths.
+  - `make pre-commit`: passed.
 
 - Issue #660 R-036/R-037 current slice:
   - `cargo test -p rustfs --lib startup_server -- --nocapture`: passed.

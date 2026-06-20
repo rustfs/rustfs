@@ -216,6 +216,11 @@ pub async fn run_embedded_shutdown_cleanup() {
     }
 }
 
+pub(crate) fn signal_embedded_startup_shutdown(shutdown_handle: &ShutdownHandle, ctx: &CancellationToken) {
+    shutdown_handle.signal();
+    ctx.cancel();
+}
+
 pub async fn run_embedded_server_shutdown(
     ctx: &CancellationToken,
     shutdown_handle: &mut Option<ShutdownHandle>,
@@ -264,7 +269,11 @@ pub async fn run_embedded_server_shutdown(
 
 #[cfg(test)]
 mod tests {
-    use super::{BackgroundShutdownStep, background_shutdown_steps};
+    use super::{BackgroundShutdownStep, background_shutdown_steps, signal_embedded_startup_shutdown};
+    use crate::server::ShutdownHandle;
+    use std::time::Duration;
+    use tokio::sync::broadcast;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn background_shutdown_plan_keeps_scanner_before_ahm() {
@@ -278,5 +287,22 @@ mod tests {
         );
         assert_eq!(background_shutdown_steps(false, true), vec![BackgroundShutdownStep::Ahm]);
         assert!(background_shutdown_steps(false, false).is_empty());
+    }
+
+    #[tokio::test]
+    async fn signal_embedded_startup_shutdown_signals_handle_and_cancels_token() {
+        let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
+        let shutdown_task = tokio::spawn(async move {
+            let _ = shutdown_rx.recv().await;
+        });
+        let shutdown_handle = ShutdownHandle::new(shutdown_tx, shutdown_task);
+        let cancel_token = CancellationToken::new();
+
+        signal_embedded_startup_shutdown(&shutdown_handle, &cancel_token);
+
+        tokio::time::timeout(Duration::from_secs(1), shutdown_handle.wait())
+            .await
+            .expect("shutdown task should observe startup signal");
+        assert!(cancel_token.is_cancelled());
     }
 }
