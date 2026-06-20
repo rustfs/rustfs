@@ -54,7 +54,14 @@ pub struct EmbeddedStartupListenContext {
 
 pub(crate) struct EmbeddedStartupConfig {
     pub config: Config,
+    pub identity: EmbeddedServerIdentity,
     pub(crate) temp_dir_guard: Option<TempDir>,
+}
+
+pub(crate) struct EmbeddedServerIdentity {
+    pub access_key: String,
+    pub secret_key: String,
+    pub region: String,
 }
 
 pub(crate) struct EmbeddedHttpServer {
@@ -141,12 +148,20 @@ pub(crate) async fn prepare_embedded_startup_config(
     }
 
     let mut config = Config::new(&address, volumes);
-    config.access_key = access_key;
-    config.secret_key = secret_key;
-    config.region = Some(region);
+    config.access_key = access_key.clone();
+    config.secret_key = secret_key.clone();
+    config.region = Some(region.clone());
     config.console_enable = false;
 
-    Ok(EmbeddedStartupConfig { config, temp_dir_guard })
+    Ok(EmbeddedStartupConfig {
+        config,
+        identity: EmbeddedServerIdentity {
+            access_key,
+            secret_key,
+            region,
+        },
+        temp_dir_guard,
+    })
 }
 
 pub(crate) fn find_embedded_available_port() -> Result<u16> {
@@ -380,6 +395,9 @@ mod tests {
         assert_eq!(prepared.config.access_key, "access");
         assert_eq!(prepared.config.secret_key, "secret");
         assert_eq!(prepared.config.region.as_deref(), Some("us-west-2"));
+        assert_eq!(prepared.identity.access_key, "access");
+        assert_eq!(prepared.identity.secret_key, "secret");
+        assert_eq!(prepared.identity.region, "us-west-2");
         assert!(!prepared.config.console_enable);
         assert_eq!(prepared.config.volumes.len(), 1);
         assert!(std::path::Path::new(&prepared.config.volumes[0]).exists());
