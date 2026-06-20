@@ -221,6 +221,20 @@ pub(crate) fn signal_embedded_startup_shutdown(shutdown_handle: &ShutdownHandle,
     ctx.cancel();
 }
 
+pub(crate) fn run_embedded_server_drop_cleanup(
+    ctx: &CancellationToken,
+    shutdown_handle: &mut Option<ShutdownHandle>,
+    temp_dir: Option<&Path>,
+) {
+    ctx.cancel();
+    if let Some(shutdown_handle) = shutdown_handle.take() {
+        shutdown_handle.signal();
+    }
+    if let Some(dir) = temp_dir {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 pub async fn run_embedded_server_shutdown(
     ctx: &CancellationToken,
     shutdown_handle: &mut Option<ShutdownHandle>,
@@ -269,7 +283,9 @@ pub async fn run_embedded_server_shutdown(
 
 #[cfg(test)]
 mod tests {
-    use super::{BackgroundShutdownStep, background_shutdown_steps, signal_embedded_startup_shutdown};
+    use super::{
+        BackgroundShutdownStep, background_shutdown_steps, run_embedded_server_drop_cleanup, signal_embedded_startup_shutdown,
+    };
     use crate::server::ShutdownHandle;
     use std::time::Duration;
     use tokio::sync::broadcast;
@@ -304,5 +320,30 @@ mod tests {
             .await
             .expect("shutdown task should observe startup signal");
         assert!(cancel_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn embedded_drop_cleanup_signals_handle_cancels_token_and_removes_temp_dir() {
+        let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
+        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+        let shutdown_task = tokio::spawn(async move {
+            let _ = shutdown_rx.recv().await;
+            let _ = observed_tx.send(());
+        });
+        let shutdown_handle = ShutdownHandle::new(shutdown_tx, shutdown_task);
+        let mut shutdown_handle = Some(shutdown_handle);
+        let cancel_token = CancellationToken::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir should create");
+        let temp_path = temp_dir.path().to_path_buf();
+
+        run_embedded_server_drop_cleanup(&cancel_token, &mut shutdown_handle, Some(temp_dir.path()));
+
+        tokio::time::timeout(Duration::from_secs(1), observed_rx)
+            .await
+            .expect("drop cleanup should signal shutdown")
+            .expect("shutdown signal should be delivered");
+        assert!(cancel_token.is_cancelled());
+        assert!(shutdown_handle.is_none());
+        assert!(!temp_path.exists());
     }
 }

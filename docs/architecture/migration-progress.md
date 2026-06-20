@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-embedded-build-orchestration`
-- Baseline: completed `R-038/R-039`.
-- Stacked on: embedded startup control helper extraction slice.
+- Branch: `overtrue/arch-embedded-handle-boundaries`
+- Baseline: completed `R-040/R-041`.
+- Stacked on: embedded build orchestration owner slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move the embedded build startup sequence into a crate-only
-  startup owner while preserving the public embedded builder and server handle
-  behavior.
+- Rust code changes: move embedded endpoint normalization and synchronous drop
+  cleanup behind startup lifecycle/shutdown helpers while preserving the public
+  embedded server handle behavior.
 - CI/script changes: none.
-- Docs changes: record the embedded build orchestration owner slices.
+- Docs changes: record the embedded handle boundary slices.
 
 ## Phase 0 Tasks
 
@@ -2320,6 +2320,30 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
     pre-commit quality gate, and three-expert review.
 
+- [x] `R-042` Extract embedded endpoint normalization.
+  - Do: move unspecified-address endpoint normalization into a crate-only
+    startup lifecycle helper.
+  - Acceptance: embedded endpoint reporting still rewrites unspecified IPv4 and
+    IPv6 bind addresses to localhost while preserving concrete bound hosts.
+  - Must preserve: public endpoint URL shape, `address()` returning the bound
+    socket address, ready-log endpoint text, and no public embedded API
+    signature changes.
+  - Verification: focused startup lifecycle and embedded checks, RustFS lib
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-043` Extract embedded drop cleanup boundary.
+  - Do: move synchronous embedded server drop cleanup into a crate-only startup
+    shutdown helper.
+  - Acceptance: dropping a server still cancels the token, signals the shutdown
+    handle, and best-effort removes the temporary directory.
+  - Must preserve: explicit async shutdown behavior, shutdown handle ownership,
+    temp-dir cleanup behavior, ignored drop cleanup errors, and no public
+    embedded API signature changes.
+  - Verification: focused startup shutdown and embedded checks, RustFS lib
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
 - [x] `E-001/E-SET-001` Add ECStore layout skeleton and set-layout boundary.
   - Do: create the ECStore internal layout ownership buckets and pin static set
     layout versus runtime `Sets`/`SetDisks` orchestration boundaries before any
@@ -2562,20 +2586,35 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `pure-move`: continue pruning residual embedded shutdown/handle-only
-   boundaries after the embedded build orchestration helper lands.
+1. `pure-move`: continue pruning residual embedded public builder-only
+   boundaries after the embedded handle helper slice lands.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-040 and R-041 move embedded startup orchestration into a crate-only startup owner while keeping `embedded.rs` focused on public API and handle behavior. |
-| Migration preservation | passed | Initialization order, startup guard timing, temp-dir lifetime, post-HTTP shutdown signaling, error mapping, endpoint normalization, and shutdown/drop behavior stay unchanged. |
-| Testing/verification | passed | Focused embedded checks, RustFS lib check, architecture/layer guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
+| Quality/architecture | passed | R-042 and R-043 move endpoint normalization and synchronous drop cleanup into crate-only startup lifecycle/shutdown helpers while keeping the public embedded API surface unchanged. |
+| Migration preservation | passed | Endpoint URL normalization, bound-address accessors, ready logging, async shutdown, drop cancellation, shutdown signaling, and temp-dir cleanup behavior stay unchanged. |
+| Testing/verification | passed | Focused startup lifecycle/shutdown/embedded checks, RustFS lib check, architecture/layer guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 R-042/R-043 current slice:
+  - `cargo test -p rustfs --lib startup_lifecycle -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_shutdown -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib embedded -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; the only production risky
+    token was the intended move of embedded drop `remove_dir_all` cleanup from
+    the public embedded handle into `startup_shutdown`.
+  - `./scripts/check_unsafe_code_allowances.sh`: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 R-040/R-041 current slice:
   - `cargo test -p rustfs --lib embedded -- --nocapture`: passed.
