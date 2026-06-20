@@ -424,6 +424,21 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
     pre-commit quality gate, and three-expert review.
 
+- [x] `API-074` Enforce ECStore API facade for compatibility boundaries.
+  - Completed slice: extend the architecture migration guard so every
+    non-ECStore `storage_compat.rs` import from `rustfs_ecstore` must route
+    through `rustfs_ecstore::api`, not only the previously enumerated public
+    ECStore module paths.
+  - Acceptance: RustFS, app/admin/storage runtime, scanner, heal, IAM, notify,
+    observability, Swift, S3 Select, e2e, test, and fuzz compatibility
+    boundaries cannot reintroduce direct pre-facade ECStore paths through new
+    modules or grouped imports.
+  - Must preserve: no runtime behavior, type ownership, compatibility alias, or
+    ECStore public facade behavior changes.
+  - Verification: migration guard, direct old-path scan, formatting, diff
+    hygiene, branch freshness check, pre-commit quality gate, and three-expert
+    review.
+
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.
   - Acceptance: `./scripts/check_architecture_migration_rules.sh` parses the
     allowed PR types from [`crate-boundaries.md`](crate-boundaries.md) and fails
@@ -2938,13 +2953,21 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-073 routes outer ECStore compatibility boundaries through explicit `rustfs_ecstore::api` facade groups and extends the migration guard against direct public-module paths. |
-| Migration preservation | passed | ECStore owner types, storage initialization helpers, endpoint/layout helpers, metrics, notifications, tiering, compression, cache, and fuzz/test compatibility bindings keep the same behavior with import-path-only call-site changes. |
-| Testing/verification | passed | Focused workspace checks, fuzz target check, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
+| Quality/architecture | passed | API-074 turns the ECStore facade convention into a generic guard for every non-ECStore `storage_compat.rs` boundary. |
+| Migration preservation | passed | The slice changes only guardrails and architecture docs; runtime aliases, facade exports, type ownership, and ECStore behavior are unchanged. |
+| Testing/verification | passed | Migration guard, direct old-path scan, formatting, diff hygiene, and the full pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-074 current slice:
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Direct old ECStore path scan in non-ECStore `storage_compat.rs` boundaries: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `make pre-commit`: passed; nextest ran 6341 tests with 6341 passed, 111 skipped, and doctests passed.
 
 - Issue #660 API-073 current slice:
   - `cargo check --tests -p rustfs-ecstore -p rustfs -p rustfs-scanner -p rustfs-heal -p rustfs-iam -p rustfs-notify -p rustfs-obs -p rustfs-protocols -p rustfs-s3select-api -p e2e_test`: passed.

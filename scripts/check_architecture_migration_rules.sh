@@ -72,6 +72,7 @@ STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_list_c
 STORE_API_EXTERNAL_OPERATION_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_operation_consumer_hits.txt"
 STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE="${TMP_DIR}/store_api_object_operation_local_method_hits.txt"
 DIRECT_ECSTORE_IMPORT_HITS_FILE="${TMP_DIR}/direct_ecstore_import_hits.txt"
+ECSTORE_API_FACADE_REQUIRED_HITS_FILE="${TMP_DIR}/ecstore_api_facade_required_hits.txt"
 ECSTORE_PUBLIC_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_public_facade_bypass_hits.txt"
 TEST_HARNESS_NESTED_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/test_harness_nested_storage_compat_hits.txt"
 RUSTFS_NESTED_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/rustfs_nested_storage_compat_hits.txt"
@@ -602,6 +603,22 @@ fi
 
 if [[ -s "$DIRECT_ECSTORE_IMPORT_HITS_FILE" ]]; then
   report_failure "direct rustfs_ecstore imports outside compatibility boundaries are forbidden: $(paste -sd '; ' "$DIRECT_ECSTORE_IMPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  find rustfs/src crates fuzz/fuzz_targets -type f -name 'storage_compat.rs' \
+    ! -path '*/crates/ecstore/*' -print0 |
+    xargs -0 perl -ne '
+      if (/rustfs_ecstore::(?!api::)/) {
+        chomp;
+        print "$ARGV:$.:$_\n";
+      }
+    ' || true
+) >"$ECSTORE_API_FACADE_REQUIRED_HITS_FILE"
+
+if [[ -s "$ECSTORE_API_FACADE_REQUIRED_HITS_FILE" ]]; then
+  report_failure "outer storage compatibility boundaries must route ECStore imports through rustfs_ecstore::api: $(paste -sd '; ' "$ECSTORE_API_FACADE_REQUIRED_HITS_FILE")"
 fi
 
 (
