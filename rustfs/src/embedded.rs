@@ -46,16 +46,17 @@
 //! storage engine uses process-global singletons (`OnceLock`). Attempting to
 //! start a second server will return an error.
 
-use crate::config::Config;
-use crate::server::{ShutdownHandle, start_http_server};
+use crate::server::ShutdownHandle;
 use crate::startup_lifecycle::{log_embedded_server_ready, publish_embedded_startup_ready};
 use crate::startup_runtime_hooks::init_embedded_runtime_hooks;
-use crate::startup_server::init_embedded_startup_listen_context;
+use crate::startup_server::{
+    EmbeddedStartupConfig, init_embedded_startup_listen_context, prepare_embedded_startup_config, start_embedded_http_server,
+};
 use crate::startup_services::init_embedded_startup_runtime_services;
 use crate::startup_shutdown::run_embedded_server_shutdown;
 use crate::startup_storage::{init_embedded_startup_storage_foundation, init_embedded_startup_storage_runtime};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::sync::CancellationToken;
 
@@ -237,31 +238,15 @@ impl RustFSServerBuilder {
             Ok(())
         };
 
-        // Keep a TempDir guard alive so that if build fails the directory is
-        // cleaned up automatically. We disarm (keep) on success.
-        let mut temp_dir_guard: Option<tempfile::TempDir> = None;
-        if self.volumes.is_empty() {
-            let dir = tempfile::tempdir().map_err(|e| ServerError::Init(format!("failed to create temp dir: {e}")))?;
-            self.volumes.push(dir.path().display().to_string());
-            temp_dir_guard = Some(dir);
-        }
-
-        // Ensure volume directories exist.
-        for v in &self.volumes {
-            let p = Path::new(v);
-            if !p.exists() {
-                tokio::fs::create_dir_all(p)
-                    .await
-                    .map_err(|e| ServerError::Init(format!("failed to create volume dir {v}: {e}")))?;
-            }
-        }
-
-        // Build Config.
-        let mut config = Config::new(&self.address, self.volumes.clone());
-        config.access_key = self.access_key.clone();
-        config.secret_key = self.secret_key.clone();
-        config.region = Some(self.region.clone());
-        config.console_enable = false;
+        let EmbeddedStartupConfig { config, temp_dir_guard } = prepare_embedded_startup_config(
+            self.address.clone(),
+            self.access_key.clone(),
+            self.secret_key.clone(),
+            self.volumes.clone(),
+            self.region.clone(),
+        )
+        .await
+        .map_err(|e| ServerError::Init(e.to_string()))?;
 
         // --- Initialization sequence (mirrors main.rs::run) ---
 
@@ -279,10 +264,9 @@ impl RustFSServerBuilder {
             .await
             .map_err(|e| ServerError::Init(e.to_string()))?;
 
-        // Start HTTP server.
-        let mut s3_config = config.clone();
-        s3_config.console_enable = false;
-        let (shutdown_handle, bound_addr) = start_http_server(&s3_config, listen_context.readiness.clone()).await?;
+        let http_server = start_embedded_http_server(&config, listen_context.readiness.clone()).await?;
+        let shutdown_handle = http_server.shutdown_handle;
+        let bound_addr = http_server.bound_addr;
         let ctx = CancellationToken::new();
         let shutdown_embedded_server = || {
             shutdown_handle.signal();
