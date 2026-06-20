@@ -15,9 +15,10 @@
 
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
+use crate::layout::set_heal::{formats_to_drives_info, new_heal_format_sets};
 use crate::{
     disk::{
-        DiskAPI, DiskInfo, DiskOption, DiskStore,
+        DiskAPI, DiskOption, DiskStore,
         error::DiskError,
         format::{DistributionAlgoVersion, FormatV3},
         new_disk,
@@ -1015,74 +1016,6 @@ async fn init_storage_disks_with_errors(
     }
 
     (disks, errs)
-}
-
-fn formats_to_drives_info(endpoints: &Endpoints, formats: &[Option<FormatV3>], errs: &[Option<DiskError>]) -> Vec<HealDriveInfo> {
-    let mut before_drives = Vec::with_capacity(endpoints.as_ref().len());
-    for (index, format) in formats.iter().enumerate() {
-        let drive = endpoints.get_string(index);
-        let state = if format.is_some() {
-            DriveState::Ok.to_string()
-        } else if let Some(Some(err)) = errs.get(index) {
-            if *err == DiskError::UnformattedDisk {
-                DriveState::Missing.to_string()
-            } else if *err == DiskError::DiskNotFound {
-                DriveState::Offline.to_string()
-            } else {
-                DriveState::Corrupt.to_string()
-            }
-        } else {
-            DriveState::Corrupt.to_string()
-        };
-
-        let uuid = if let Some(format) = format {
-            format.erasure.this.to_string()
-        } else {
-            "".to_string()
-        };
-        before_drives.push(HealDriveInfo {
-            uuid,
-            endpoint: drive,
-            state: state.to_string(),
-        });
-    }
-    before_drives
-}
-
-fn new_heal_format_sets(
-    ref_format: &FormatV3,
-    set_count: usize,
-    set_drive_count: usize,
-    formats: &[Option<FormatV3>],
-    errs: &[Option<DiskError>],
-) -> (Vec<Vec<Option<FormatV3>>>, Vec<Vec<DiskInfo>>) {
-    let mut new_formats = vec![vec![None; set_drive_count]; set_count];
-    let mut current_disks_info = vec![vec![DiskInfo::default(); set_drive_count]; set_count];
-    for (i, set) in ref_format.erasure.sets.iter().enumerate() {
-        for j in 0..set.len() {
-            if let Some(Some(err)) = errs.get(i * set_drive_count + j)
-                && *err == DiskError::UnformattedDisk
-            {
-                let mut fm = FormatV3::new(set_count, set_drive_count);
-                fm.id = ref_format.id;
-                fm.format = ref_format.format.clone();
-                fm.version = ref_format.version.clone();
-                fm.erasure.this = ref_format.erasure.sets[i][j];
-                fm.erasure.sets = ref_format.erasure.sets.clone();
-                fm.erasure.version = ref_format.erasure.version.clone();
-                fm.erasure.distribution_algo = ref_format.erasure.distribution_algo.clone();
-                new_formats[i][j] = Some(fm);
-            }
-            if let (Some(format), None) = (&formats[i * set_drive_count + j], &errs[i * set_drive_count + j])
-                && let Some(info) = &format.disk_info
-                && !info.endpoint.is_empty()
-            {
-                current_disks_info[i][j] = info.clone();
-            }
-        }
-    }
-
-    (new_formats, current_disks_info)
 }
 
 #[cfg(test)]
