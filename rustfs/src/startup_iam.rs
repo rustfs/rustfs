@@ -44,6 +44,12 @@ pub enum IamBootstrapDisposition {
     Deferred,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppContextBootstrapDisposition {
+    AlreadyAvailable,
+    Initialized,
+}
+
 pub async fn publish_ready_for_iam_bootstrap(
     disposition: IamBootstrapDisposition,
     readiness: &GlobalReadiness,
@@ -71,17 +77,18 @@ where
     Ok(false)
 }
 
-fn init_app_context_if_needed(store: Arc<ECStore>, kms_interface: Arc<KmsServiceManager>) -> bool {
+fn ensure_app_context_after_iam(
+    store: Arc<ECStore>,
+    kms_interface: Arc<KmsServiceManager>,
+) -> Result<AppContextBootstrapDisposition> {
     if get_global_app_context().is_some() {
-        return false;
+        return Ok(AppContextBootstrapDisposition::AlreadyAvailable);
     }
 
-    let Ok(iam_interface) = rustfs_iam::get() else {
-        return false;
-    };
+    let iam_interface = rustfs_iam::get().map_err(|_| std::io::Error::other("IAM is initialized but unavailable"))?;
 
     init_global_app_context(AppContext::with_default_interfaces(store, iam_interface, kms_interface));
-    true
+    Ok(AppContextBootstrapDisposition::Initialized)
 }
 
 async fn finalize_iam_recovery(
@@ -90,9 +97,7 @@ async fn finalize_iam_recovery(
     readiness: Arc<GlobalReadiness>,
     state_manager: Option<Arc<ServiceStateManager>>,
 ) -> Result<()> {
-    if !init_app_context_if_needed(store, kms_interface) && get_global_app_context().is_none() {
-        return Err(std::io::Error::other("IAM recovered but app context is still unavailable"));
-    }
+    ensure_app_context_after_iam(store, kms_interface)?;
 
     readiness.mark_stage(SystemStage::IamReady);
     publish_ready_when_runtime_ready(readiness.as_ref(), state_manager.as_deref()).await
@@ -330,9 +335,7 @@ pub async fn bootstrap_or_defer_iam_init(
 ) -> Result<IamBootstrapDisposition> {
     match attempt_init_iam_sys(store.clone()).await {
         Ok(()) => {
-            if !init_app_context_if_needed(store, kms_interface) && get_global_app_context().is_none() {
-                return Err(std::io::Error::other("IAM bootstrap succeeded but app context is still unavailable"));
-            }
+            ensure_app_context_after_iam(store, kms_interface)?;
             readiness.mark_stage(SystemStage::IamReady);
             return Ok(IamBootstrapDisposition::ReadyInline);
         }
