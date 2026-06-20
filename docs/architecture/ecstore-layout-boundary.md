@@ -33,6 +33,14 @@ expansion. It may describe:
 Static layout must not own disk handles, lock clients, reconnect loops, repair
 state, or shutdown signaling.
 
+## Format And Disk Layout Ownership
+
+`layout::format` owns persisted format structures and disk UUID position lookup.
+`layout::disks_layout` owns command-line volume expansion into pool/set layout.
+
+Compatibility paths remain available through `disk::format` and `disks_layout`
+until downstream callers are moved or compatibility coverage allows removal.
+
 ## Runtime Set Orchestration
 
 Runtime orchestration remains owned by `Sets` and `SetDisks` until a later pure

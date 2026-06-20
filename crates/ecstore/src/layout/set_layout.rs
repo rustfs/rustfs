@@ -1,4 +1,4 @@
-use crate::disk::format::{DistributionAlgoVersion, FormatV3};
+use crate::layout::format::{DistributionAlgoVersion, FormatV3};
 use std::collections::HashSet;
 use std::io::{Error, Result};
 use uuid::Uuid;

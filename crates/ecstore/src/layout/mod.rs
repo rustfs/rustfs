@@ -4,4 +4,6 @@
 //! topology separate from runtime `Sets`/`SetDisks` orchestration before any
 //! file moves happen.
 
+pub(crate) mod disks_layout;
+pub(crate) mod format;
 pub(crate) mod set_layout;
