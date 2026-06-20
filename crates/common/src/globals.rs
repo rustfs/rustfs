@@ -30,6 +30,14 @@ pub static GLOBAL_OUTBOUND_TLS_GENERATION: LazyLock<AtomicU64> = LazyLock::new(|
 /// Global initialization time of the RustFS node.
 pub static GLOBAL_INIT_TIME: LazyLock<RwLock<Option<DateTime<Utc>>>> = LazyLock::new(|| RwLock::new(None));
 
+/// Log level to use when reporting cached gRPC connection eviction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionEvictionLogLevel {
+    Warn,
+    Info,
+    Debug,
+}
+
 /// Set the global local node name.
 ///
 /// # Arguments
@@ -105,12 +113,33 @@ pub fn get_global_outbound_tls_generation() -> u64 {
 /// # Arguments
 /// * `addr` - The address of the connection to evict.
 pub async fn evict_connection(addr: &str) {
+    evict_connection_with_log_level(addr, ConnectionEvictionLogLevel::Info).await;
+}
+
+/// Evict a stale/dead connection from the global connection cache with an explicit log level.
+pub async fn evict_connection_with_log_level(addr: &str, log_level: ConnectionEvictionLogLevel) {
     let removed = GLOBAL_CONN_MAP.write().await.remove(addr);
     if removed.is_some() {
-        tracing::info!(
-            addr = %addr,
-            "Removed cached gRPC connection so future RPCs will attempt to establish a fresh channel"
-        );
+        match log_level {
+            ConnectionEvictionLogLevel::Warn => {
+                tracing::warn!(
+                    addr = %addr,
+                    "Removed cached gRPC connection so future RPCs will attempt to establish a fresh channel"
+                );
+            }
+            ConnectionEvictionLogLevel::Info => {
+                tracing::info!(
+                    addr = %addr,
+                    "Removed cached gRPC connection so future RPCs will attempt to establish a fresh channel"
+                );
+            }
+            ConnectionEvictionLogLevel::Debug => {
+                tracing::debug!(
+                    addr = %addr,
+                    "Removed cached gRPC connection so future RPCs will attempt to establish a fresh channel"
+                );
+            }
+        }
     }
 }
 
