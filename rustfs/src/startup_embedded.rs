@@ -28,11 +28,11 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub(crate) struct EmbeddedStartupArgs {
-    pub address: String,
-    pub access_key: String,
-    pub secret_key: String,
-    pub volumes: Vec<String>,
-    pub region: String,
+    address: String,
+    access_key: String,
+    secret_key: String,
+    volumes: Vec<String>,
+    region: String,
 }
 
 impl EmbeddedStartupArgs {
@@ -45,10 +45,37 @@ impl EmbeddedStartupArgs {
             region: rustfs_config::RUSTFS_REGION.to_string(),
         }
     }
+
+    pub(crate) fn set_address(&mut self, address: String) {
+        self.address = address;
+    }
+
+    pub(crate) fn set_access_key(&mut self, access_key: String) {
+        self.access_key = access_key;
+    }
+
+    pub(crate) fn set_secret_key(&mut self, secret_key: String) {
+        self.secret_key = secret_key;
+    }
+
+    pub(crate) fn set_region(&mut self, region: String) {
+        self.region = region;
+    }
+
+    pub(crate) fn push_volume(&mut self, path: String) {
+        self.volumes.push(path);
+    }
+
+    pub(crate) fn set_volumes(&mut self, paths: Vec<String>) {
+        self.volumes = paths;
+    }
 }
 
 pub(crate) struct EmbeddedStartedServer {
     pub bound_addr: SocketAddr,
+    pub access_key: String,
+    pub secret_key: String,
+    pub region: String,
     pub shutdown_handle: ShutdownHandle,
     pub cancel_token: CancellationToken,
     pub temp_dir: Option<PathBuf>,
@@ -68,13 +95,24 @@ impl From<io::Error> for EmbeddedStartupError {
 }
 
 pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<EmbeddedStartedServer, EmbeddedStartupError> {
+    let EmbeddedStartupArgs {
+        address,
+        access_key,
+        secret_key,
+        volumes,
+        region,
+    } = args;
+    let server_access_key = access_key.clone();
+    let server_secret_key = secret_key.clone();
+    let server_region = region.clone();
+
     // Build is allowed to fail before irreversible global initialization
     // (for example on temporary I/O or directory setup errors), and in that
     // case callers can retry.
     let mut startup_guard = EmbeddedStartupGuard::new();
 
     let EmbeddedStartupConfig { config, temp_dir_guard } =
-        prepare_embedded_startup_config(args.address, args.access_key, args.secret_key, args.volumes, args.region)
+        prepare_embedded_startup_config(address, access_key, secret_key, volumes, region)
             .await
             .map_err(init_error)?;
 
@@ -134,6 +172,9 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
 
     Ok(EmbeddedStartedServer {
         bound_addr,
+        access_key: server_access_key,
+        secret_key: server_secret_key,
+        region: server_region,
         shutdown_handle,
         cancel_token,
         temp_dir: temp_dir_guard.map(|guard| guard.keep()),
@@ -157,5 +198,23 @@ mod tests {
         assert_eq!(args.secret_key, rustfs_credentials::DEFAULT_SECRET_KEY);
         assert_eq!(args.region, rustfs_config::RUSTFS_REGION);
         assert!(args.volumes.is_empty());
+    }
+
+    #[test]
+    fn embedded_startup_args_setters_preserve_public_builder_inputs() {
+        let mut args = EmbeddedStartupArgs::new_default();
+
+        args.set_address("127.0.0.1:9100".to_string());
+        args.set_access_key("custom-access".to_string());
+        args.set_secret_key("custom-secret".to_string());
+        args.set_region("test-region".to_string());
+        args.push_volume("/tmp/one".to_string());
+        args.set_volumes(vec!["/tmp/two".to_string(), "/tmp/three".to_string()]);
+
+        assert_eq!(args.address, "127.0.0.1:9100");
+        assert_eq!(args.access_key, "custom-access");
+        assert_eq!(args.secret_key, "custom-secret");
+        assert_eq!(args.region, "test-region");
+        assert_eq!(args.volumes, vec!["/tmp/two", "/tmp/three"]);
     }
 }

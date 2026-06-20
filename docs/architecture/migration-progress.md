@@ -5,17 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-embedded-builder-shell`
-- Baseline: completed `R-042/R-043`.
-- Stacked on: embedded handle boundary slice.
+- Branch: `overtrue/arch-embedded-startup-identity-flow`
+- Baseline: completed `R-044/R-045`.
+- Stacked on: embedded builder shell slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: keep the public embedded builder as a thin shell over
-  crate-only startup arguments and move embedded port probing behind
-  startup-server helpers.
-- CI/script changes: make the unsafe allowance checker avoid a local
-  `pipefail` false positive after `rg -q` matches nearby `SAFETY:` comments.
-- Docs changes: record the embedded builder shell slices.
+- Rust code changes: hide embedded startup argument fields behind crate-only
+  setters and return public server identity from the startup result.
+- CI/script changes: none.
+- Docs changes: record the embedded startup identity slices.
 
 ## Phase 0 Tasks
 
@@ -2367,6 +2365,29 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
     freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `R-046` Encapsulate embedded startup argument mutation.
+  - Do: hide embedded startup argument fields behind crate-only setter methods
+    used by the public builder.
+  - Acceptance: public builder fluent methods still apply the same address,
+    credential, region, and volume values in the same order.
+  - Must preserve: builder method signatures, default values, `volume` append
+    semantics, `volumes` replacement semantics, and startup input ownership.
+  - Verification: focused startup-embedded and embedded checks, RustFS lib
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-047` Return embedded server identity from startup result.
+  - Do: let the crate-only startup result carry the access key, secret key, and
+    region used by the public server handle.
+  - Acceptance: public server accessors still expose the configured values
+    without the public builder duplicating identity assembly.
+  - Must preserve: startup error mapping, readiness logging order, endpoint
+    address handling, shutdown handle ownership, and no public API signature
+    changes.
+  - Verification: focused startup-embedded and embedded checks, RustFS lib
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
 - [x] `E-001/E-SET-001` Add ECStore layout skeleton and set-layout boundary.
   - Do: create the ECStore internal layout ownership buckets and pin static set
     layout versus runtime `Sets`/`SetDisks` orchestration boundaries before any
@@ -2609,20 +2630,34 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `pure-move`: continue pruning residual embedded builder/startup-only
-   boundaries after the embedded builder shell slice lands.
+1. `pure-move`: continue pruning residual embedded handle/startup-only
+   boundaries after the embedded startup identity slice lands.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-044 and R-045 keep the public embedded builder as a thin shell over crate-only startup args and move port probing behind startup-server helpers without widening the public API. |
-| Migration preservation | passed | Builder defaults, fluent setters, volume replacement, credential/region accessors, public port helper signature, and localhost ephemeral port behavior stay unchanged. |
-| Testing/verification | passed | Focused embedded/startup-embedded/startup-server checks, RustFS lib check, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
+| Quality/architecture | passed | R-046 and R-047 hide startup argument mutation behind crate-only methods and move public server identity assembly into the startup result without widening the public API. |
+| Migration preservation | passed | Builder setter semantics, public server identity accessors, endpoint handling, startup error mapping, and shutdown ownership stay unchanged. |
+| Testing/verification | passed | Focused startup-embedded/embedded checks, RustFS lib check, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 R-046/R-047 current slice:
+  - `cargo test -p rustfs --lib startup_embedded -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib embedded -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `./scripts/check_unsafe_code_allowances.sh`: passed.
+  - Rust risk scan on changed Rust files: passed; matches were limited to
+    existing embedded doc examples.
+  - `make pre-commit`: passed; nextest ran 6324 tests with 6324 passed and
+    111 skipped, and doctests passed.
 
 - Issue #660 R-044/R-045 current slice:
   - `cargo test -p rustfs --lib embedded -- --nocapture`: passed.
