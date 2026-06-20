@@ -5,19 +5,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-rebalance-migration-helpers`
-- Baseline: completed `E-009/E-REBALANCE-003`.
+- Branch: `overtrue/arch-ecstore-rebalance-state-impls`
+- Baseline: completed `E-010/E-REBALANCE-004`.
 - Stacked on: merged ECStore layout foundation, format layout ownership, and
   endpoint layout move slices plus the set-format heal, pool-space layout
   helper, rebalance support helper, pool-space builder, rebalance metadata
-  helper, and rebalance worker helper slices.
+  helper, rebalance worker helper, and rebalance migration helper slices.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move ECStore rebalance migration backend, version-result,
-  delete-marker option, remote-tier option, and version migration retry helpers
-  into `rebalance::migration` while preserving ECStore orchestration.
+- Rust code changes: move ECStore rebalance state/metadata impls into
+  `rebalance::meta` while preserving public wire structs and ECStore
+  orchestration.
 - CI/script changes: none.
-- Docs changes: record the ECStore rebalance migration helper slice.
+- Docs changes: record the ECStore rebalance state impl slice.
 
 ## Phase 0 Tasks
 
@@ -2363,10 +2363,25 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
     branch freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `E-011/E-REBALANCE-005` Move ECStore rebalance state impls.
+  - Do: move `RebalanceStats` update helpers, `RebalStatus` conversions, and
+    `RebalanceMeta` load/save impls into `rebalance::meta` while leaving public
+    wire structs in `rebalance.rs`.
+  - Acceptance: `rebalance::meta` owns metadata/state behavior, `rebalance.rs`
+    keeps data contracts and ECStore orchestration, and focused rebalance tests
+    keep covering moved behavior.
+  - Must preserve: serialized rebalance metadata header format/version,
+    empty/short/unknown metadata handling, last refresh timestamps, save-skip
+    behavior for empty pool stats, object/version/byte accounting, batch update
+    behavior, status display labels, and legacy status byte mapping.
+  - Verification: focused ECStore rebalance tests, ECStore/RustFS/Heal compile
+    checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
 ## Next PRs
 
 1. `pure-move`: continue moving ECStore rebalance/layout support helpers once
-   E-010/E-REBALANCE-004 lands.
+   E-011/E-REBALANCE-005 lands.
 2. `pure-move`: continue pruning residual embedded startup-only orchestration
    once the lifecycle helpers are merged.
 
@@ -2374,8 +2389,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | E-010/E-REBALANCE-004 moves migration helpers into a child module while leaving ECStore orchestration in place. |
-| Migration preservation | passed | Remote-tier movement, delete-marker options, retry/backoff classification, not-found handling, stage labels, and cleanup accounting remain preserved. |
+| Quality/architecture | passed | E-011/E-REBALANCE-005 moves state/metadata impls into `rebalance::meta` while leaving ECStore orchestration in place. |
+| Migration preservation | passed | Metadata wire format/version, load/save behavior, accounting updates, batch updates, and status mapping remain preserved. |
 | Testing/verification | passed | Focused rebalance tests, compile checks, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
 
 ## Verification Notes

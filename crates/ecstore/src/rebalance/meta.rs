@@ -1,12 +1,197 @@
 use super::{
-    EVENT_REBALANCE_BUCKET, Error, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REBALANCE, REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX,
-    RebalSaveOpt, RebalStatus, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStats, Result,
+    EVENT_REBALANCE_BUCKET, EVENT_REBALANCE_STATE, Error, GetObjectReader, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REBALANCE,
+    ObjectInfo, ObjectOptions, PutObjReader, REBAL_META_FMT, REBAL_META_NAME, REBAL_META_VER,
+    REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX, RebalSaveOpt, RebalStatus, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStats,
+    Result,
 };
+use crate::config::com::{read_config_with_metadata, save_config_with_opts};
 use crate::error::is_err_operation_canceled;
-use std::collections::HashSet;
-use std::sync::Arc;
+use http::HeaderMap;
+use rustfs_filemeta::FileInfo;
+use rustfs_storage_api::{HTTPRangeSpec, ObjectIO};
+use std::{collections::HashSet, fmt, io::Cursor, sync::Arc};
 use time::OffsetDateTime;
 use tracing::{debug, info};
+
+impl RebalanceStats {
+    pub fn update(&mut self, bucket: String, fi: &FileInfo) {
+        if fi.is_latest {
+            self.num_objects += 1;
+        }
+
+        self.num_versions += 1;
+        let on_disk_size = if fi.deleted || fi.erasure.data_blocks == 0 || fi.size <= 0 {
+            0
+        } else {
+            let data_blocks = fi.erasure.data_blocks as i64;
+            let total_blocks = fi.erasure.data_blocks.saturating_add(fi.erasure.parity_blocks) as i64;
+            fi.size
+                .saturating_mul(total_blocks)
+                .checked_div(data_blocks)
+                .unwrap_or(0)
+                .max(0) as u64
+        };
+        self.bytes = self.bytes.saturating_add(on_disk_size);
+        self.bucket = bucket;
+        self.object = fi.name.clone();
+    }
+
+    pub fn update_batch(&mut self, bucket: String, versions: &[&FileInfo]) {
+        for version in versions {
+            self.update(bucket.clone(), version);
+        }
+    }
+}
+
+impl fmt::Display for RebalStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let status = match self {
+            RebalStatus::None => "None",
+            RebalStatus::Started => "Started",
+            RebalStatus::Completed => "Completed",
+            RebalStatus::Stopped => "Stopped",
+            RebalStatus::Failed => "Failed",
+        };
+        write!(f, "{status}")
+    }
+}
+
+impl From<u8> for RebalStatus {
+    fn from(value: u8) -> Self {
+        match value {
+            1 => RebalStatus::Started,
+            2 => RebalStatus::Completed,
+            3 => RebalStatus::Stopped,
+            4 => RebalStatus::Failed,
+            _ => RebalStatus::None,
+        }
+    }
+}
+
+impl RebalanceMeta {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub async fn load<S>(&mut self, store: Arc<S>) -> Result<()>
+    where
+        S: ObjectIO<
+                Error = Error,
+                RangeSpec = HTTPRangeSpec,
+                HeaderMap = HeaderMap,
+                ObjectOptions = ObjectOptions,
+                ObjectInfo = ObjectInfo,
+                GetObjectReader = GetObjectReader,
+                PutObjectReader = PutObjReader,
+            >,
+    {
+        self.load_with_opts(store, ObjectOptions::default()).await
+    }
+
+    pub async fn load_with_opts<S>(&mut self, store: Arc<S>, opts: ObjectOptions) -> Result<()>
+    where
+        S: ObjectIO<
+                Error = Error,
+                RangeSpec = HTTPRangeSpec,
+                HeaderMap = HeaderMap,
+                ObjectOptions = ObjectOptions,
+                ObjectInfo = ObjectInfo,
+                GetObjectReader = GetObjectReader,
+                PutObjectReader = PutObjReader,
+            >,
+    {
+        let (data, _) = read_config_with_metadata(store, REBAL_META_NAME, &opts).await?;
+        if data.is_empty() {
+            debug!(
+                event = EVENT_REBALANCE_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                state = "metadata_empty",
+                "Rebalance metadata is empty"
+            );
+            return Ok(());
+        }
+        if data.len() <= 4 {
+            return Err(rebalance_meta_load_no_data_error());
+        }
+
+        // Read header
+        match u16::from_le_bytes([data[0], data[1]]) {
+            REBAL_META_FMT => {}
+            fmt => return Err(rebalance_meta_load_unknown_format_error(fmt)),
+        }
+        match u16::from_le_bytes([data[2], data[3]]) {
+            REBAL_META_VER => {}
+            ver => return Err(rebalance_meta_load_unknown_version_error(ver)),
+        }
+
+        let meta: Self = rmp_serde::from_read(Cursor::new(&data[4..]))?;
+        *self = meta;
+
+        self.last_refreshed_at = Some(OffsetDateTime::now_utc());
+
+        debug!(
+            event = EVENT_REBALANCE_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            state = "metadata_loaded",
+            "Loaded rebalance metadata"
+        );
+        Ok(())
+    }
+
+    pub async fn save<S>(&self, store: Arc<S>) -> Result<()>
+    where
+        S: ObjectIO<
+                Error = Error,
+                RangeSpec = HTTPRangeSpec,
+                HeaderMap = HeaderMap,
+                ObjectOptions = ObjectOptions,
+                ObjectInfo = ObjectInfo,
+                GetObjectReader = GetObjectReader,
+                PutObjectReader = PutObjReader,
+            >,
+    {
+        self.save_with_opts(store, ObjectOptions::default()).await
+    }
+
+    pub async fn save_with_opts<S>(&self, store: Arc<S>, opts: ObjectOptions) -> Result<()>
+    where
+        S: ObjectIO<
+                Error = Error,
+                RangeSpec = HTTPRangeSpec,
+                HeaderMap = HeaderMap,
+                ObjectOptions = ObjectOptions,
+                ObjectInfo = ObjectInfo,
+                GetObjectReader = GetObjectReader,
+                PutObjectReader = PutObjReader,
+            >,
+    {
+        if self.pool_stats.is_empty() {
+            debug!(
+                event = EVENT_REBALANCE_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                state = "metadata_save_skipped",
+                reason = "no_pool_stats",
+                "Skipped rebalance metadata save"
+            );
+            return Ok(());
+        }
+
+        let mut data = Vec::new();
+
+        // Initialize the header
+        data.extend(&REBAL_META_FMT.to_le_bytes());
+        data.extend(&REBAL_META_VER.to_le_bytes());
+
+        let msg = rmp_serde::to_vec(self)?;
+        data.extend(msg);
+
+        save_config_with_opts(store, REBAL_META_NAME, data, &opts).await?;
+
+        Ok(())
+    }
+}
 
 pub(super) fn is_rebalance_pool_started(pool_stat: &RebalanceStats) -> bool {
     pool_stat.participating && pool_stat.info.status == RebalStatus::Started

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::com::{read_config_with_metadata, save_config_with_opts};
 use crate::data_movement;
 use crate::error::{Error, Result};
 use crate::global::get_global_endpoints;
@@ -21,16 +20,11 @@ use crate::pools::ListCallback;
 use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
 use crate::storage_api_contracts::EcstoreObjectIO;
 use crate::store::ECStore;
-use http::HeaderMap;
 use rustfs_filemeta::{FileInfo, MetaCacheEntry};
-use rustfs_storage_api::{
-    HTTPRangeSpec, NamespaceLocking as StorageNamespaceLocking, ObjectIO, ObjectOperations as _, StorageAdminApi,
-};
+use rustfs_storage_api::{NamespaceLocking as StorageNamespaceLocking, ObjectOperations as _, StorageAdminApi};
 use rustfs_utils::path::encode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fmt;
-use std::io::Cursor;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::time::{Duration, Instant};
@@ -64,7 +58,6 @@ use meta::{
     defer_bucket_in_rebalance_queue, ensure_valid_rebalance_pool_index, has_deferred_rebalance_error,
     invalid_rebalance_pool_index_error, is_rebalance_conflicting_with_decommission, is_rebalance_in_progress,
     mark_rebalance_bucket_done, merge_rebalance_meta, percent_free_ratio, rebalance_goal_reached,
-    rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error,
     rebalance_metadata_not_initialized_error, record_rebalance_cleanup_warning_in_meta, resolve_next_rebalance_bucket,
     resolve_rebalance_participants, should_accept_rebalance_stats_update, should_ignore_rebalance_data_usage_cache,
     should_pool_participate, should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_meta_snapshot,
@@ -110,36 +103,6 @@ pub struct RebalanceStats {
     pub cleanup_warnings: RebalanceCleanupWarnings,
 }
 
-impl RebalanceStats {
-    pub fn update(&mut self, bucket: String, fi: &FileInfo) {
-        if fi.is_latest {
-            self.num_objects += 1;
-        }
-
-        self.num_versions += 1;
-        let on_disk_size = if fi.deleted || fi.erasure.data_blocks == 0 || fi.size <= 0 {
-            0
-        } else {
-            let data_blocks = fi.erasure.data_blocks as i64;
-            let total_blocks = fi.erasure.data_blocks.saturating_add(fi.erasure.parity_blocks) as i64;
-            fi.size
-                .saturating_mul(total_blocks)
-                .checked_div(data_blocks)
-                .unwrap_or(0)
-                .max(0) as u64
-        };
-        self.bytes = self.bytes.saturating_add(on_disk_size);
-        self.bucket = bucket;
-        self.object = fi.name.clone();
-    }
-
-    pub fn update_batch(&mut self, bucket: String, versions: &[&FileInfo]) {
-        for version in versions {
-            self.update(bucket.clone(), version);
-        }
-    }
-}
-
 pub type RStats = Vec<Arc<RebalanceStats>>;
 
 #[derive(Debug, Default)]
@@ -169,31 +132,6 @@ pub enum RebalStatus {
     Completed,
     Stopped,
     Failed,
-}
-
-impl fmt::Display for RebalStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let status = match self {
-            RebalStatus::None => "None",
-            RebalStatus::Started => "Started",
-            RebalStatus::Completed => "Completed",
-            RebalStatus::Stopped => "Stopped",
-            RebalStatus::Failed => "Failed",
-        };
-        write!(f, "{status}")
-    }
-}
-
-impl From<u8> for RebalStatus {
-    fn from(value: u8) -> Self {
-        match value {
-            1 => RebalStatus::Started,
-            2 => RebalStatus::Completed,
-            3 => RebalStatus::Stopped,
-            4 => RebalStatus::Failed,
-            _ => RebalStatus::None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -250,131 +188,6 @@ pub struct RebalanceMeta {
     pub percent_free_goal: f64, // Computed from total free space and capacity at the start of rebalance
     #[serde(rename = "rss")]
     pub pool_stats: Vec<RebalanceStats>, // Per-pool rebalance stats keyed by pool index
-}
-
-impl RebalanceMeta {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    pub async fn load<S>(&mut self, store: Arc<S>) -> Result<()>
-    where
-        S: ObjectIO<
-                Error = Error,
-                RangeSpec = HTTPRangeSpec,
-                HeaderMap = HeaderMap,
-                ObjectOptions = ObjectOptions,
-                ObjectInfo = ObjectInfo,
-                GetObjectReader = GetObjectReader,
-                PutObjectReader = PutObjReader,
-            >,
-    {
-        self.load_with_opts(store, ObjectOptions::default()).await
-    }
-
-    pub async fn load_with_opts<S>(&mut self, store: Arc<S>, opts: ObjectOptions) -> Result<()>
-    where
-        S: ObjectIO<
-                Error = Error,
-                RangeSpec = HTTPRangeSpec,
-                HeaderMap = HeaderMap,
-                ObjectOptions = ObjectOptions,
-                ObjectInfo = ObjectInfo,
-                GetObjectReader = GetObjectReader,
-                PutObjectReader = PutObjReader,
-            >,
-    {
-        let (data, _) = read_config_with_metadata(store, REBAL_META_NAME, &opts).await?;
-        if data.is_empty() {
-            debug!(
-                event = EVENT_REBALANCE_STATE,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REBALANCE,
-                state = "metadata_empty",
-                "Rebalance metadata is empty"
-            );
-            return Ok(());
-        }
-        if data.len() <= 4 {
-            return Err(rebalance_meta_load_no_data_error());
-        }
-
-        // Read header
-        match u16::from_le_bytes([data[0], data[1]]) {
-            REBAL_META_FMT => {}
-            fmt => return Err(rebalance_meta_load_unknown_format_error(fmt)),
-        }
-        match u16::from_le_bytes([data[2], data[3]]) {
-            REBAL_META_VER => {}
-            ver => return Err(rebalance_meta_load_unknown_version_error(ver)),
-        }
-
-        let meta: Self = rmp_serde::from_read(Cursor::new(&data[4..]))?;
-        *self = meta;
-
-        self.last_refreshed_at = Some(OffsetDateTime::now_utc());
-
-        debug!(
-            event = EVENT_REBALANCE_STATE,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_REBALANCE,
-            state = "metadata_loaded",
-            "Loaded rebalance metadata"
-        );
-        Ok(())
-    }
-
-    pub async fn save<S>(&self, store: Arc<S>) -> Result<()>
-    where
-        S: ObjectIO<
-                Error = Error,
-                RangeSpec = HTTPRangeSpec,
-                HeaderMap = HeaderMap,
-                ObjectOptions = ObjectOptions,
-                ObjectInfo = ObjectInfo,
-                GetObjectReader = GetObjectReader,
-                PutObjectReader = PutObjReader,
-            >,
-    {
-        self.save_with_opts(store, ObjectOptions::default()).await
-    }
-
-    pub async fn save_with_opts<S>(&self, store: Arc<S>, opts: ObjectOptions) -> Result<()>
-    where
-        S: ObjectIO<
-                Error = Error,
-                RangeSpec = HTTPRangeSpec,
-                HeaderMap = HeaderMap,
-                ObjectOptions = ObjectOptions,
-                ObjectInfo = ObjectInfo,
-                GetObjectReader = GetObjectReader,
-                PutObjectReader = PutObjReader,
-            >,
-    {
-        if self.pool_stats.is_empty() {
-            debug!(
-                event = EVENT_REBALANCE_STATE,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REBALANCE,
-                state = "metadata_save_skipped",
-                reason = "no_pool_stats",
-                "Skipped rebalance metadata save"
-            );
-            return Ok(());
-        }
-
-        let mut data = Vec::new();
-
-        // Initialize the header
-        data.extend(&REBAL_META_FMT.to_le_bytes());
-        data.extend(&REBAL_META_VER.to_le_bytes());
-
-        let msg = rmp_serde::to_vec(self)?;
-        data.extend(msg);
-
-        save_config_with_opts(store, REBAL_META_NAME, data, &opts).await?;
-
-        Ok(())
-    }
 }
 
 impl ECStore {
