@@ -19,6 +19,10 @@ pub(crate) const STORAGE_FORMAT_FILE: &str = rustfs_ecstore::disk::STORAGE_FORMA
 
 pub(crate) type TransitionOptions = rustfs_ecstore::bucket::lifecycle::lifecycle::TransitionOptions;
 
+pub(crate) use rustfs_ecstore::api::capacity::path2_bucket_object_with_base_path;
+pub(crate) use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
+pub(crate) use rustfs_ecstore::api::storage::ECStore;
+pub(crate) use rustfs_ecstore::api::storage::init_local_disks;
 pub(crate) use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::{
     enqueue_transition_for_existing_objects, init_background_expiry,
 };
@@ -28,11 +32,7 @@ pub(crate) use rustfs_ecstore::bucket::metadata_sys::{
 pub(crate) use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 pub(crate) use rustfs_ecstore::client::transition_api::{ReadCloser, ReaderImpl};
 pub(crate) use rustfs_ecstore::disk::{DiskAPI, DiskOption, endpoint::Endpoint, new_disk};
-pub(crate) use rustfs_ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
 pub(crate) use rustfs_ecstore::global::GLOBAL_TierConfigMgr;
-pub(crate) use rustfs_ecstore::pools::path2_bucket_object_with_base_path;
-pub(crate) use rustfs_ecstore::store::ECStore;
-pub(crate) use rustfs_ecstore::store::init_local_disks;
 pub(crate) use rustfs_ecstore::tier::tier_config::{TierConfig, TierMinIO, TierType};
 pub(crate) use rustfs_ecstore::tier::warm_backend::WarmBackendGetOpts;
 pub(crate) use rustfs_ecstore::tier::warm_backend::{WarmBackend, build_transition_put_options};

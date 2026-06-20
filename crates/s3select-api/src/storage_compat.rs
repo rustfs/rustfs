@@ -13,7 +13,7 @@
 // limitations under the License.
 
 pub(crate) type SelectStorageError = rustfs_ecstore::error::StorageError;
-pub(crate) type SelectStore = rustfs_ecstore::store::ECStore;
+pub(crate) type SelectStore = rustfs_ecstore::api::storage::ECStore;
 pub(crate) type SelectGetObjectReader = <SelectStore as rustfs_storage_api::ObjectIO>::GetObjectReader;
 pub(crate) type SelectObjectInfo = <SelectStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
 pub(crate) type SelectObjectOptions = <SelectStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;

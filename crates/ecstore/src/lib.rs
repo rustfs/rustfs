@@ -16,6 +16,7 @@
 extern crate core;
 
 pub mod admin_server_info;
+pub mod api;
 pub mod batch_processor;
 pub mod bitrot;
 pub mod bucket;

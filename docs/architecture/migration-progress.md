@@ -389,6 +389,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: focused heal/storage compile/tests, migration and layer
     guards, formatting, diff hygiene, full pre-commit, and three-expert review.
 
+- [x] `API-072` Establish ECStore public facade for outer compatibility.
+  - Completed slice: add `rustfs_ecstore::api` facade groups for layout,
+    storage, admin, metrics, notification, and capacity helper surfaces, then
+    migrate RustFS, scanner, observability, IAM, heal, Swift, S3 Select,
+    heal-test, and scanner-test compatibility boundaries away from direct
+    ECStore module paths for those surfaces.
+  - Acceptance: selected outer `storage_compat.rs` boundaries no longer import
+    `rustfs_ecstore::{admin_server_info,endpoints,disks_layout,metrics_realtime,notification_sys,pools,store_utils,store}`
+    directly, and the migration guard rejects restoring those direct public
+    surface paths.
+  - Must preserve: endpoint and disks-layout types, ECStore owner type and
+    init helpers, admin server-info helpers, local metrics collection,
+    notification peer behavior, capacity helpers, bucket-name helpers, and all
+    runtime storage behavior.
+  - Verification: affected package test-target compile, migration and layer
+    guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.
   - Acceptance: `./scripts/check_architecture_migration_rules.sh` parses the
     allowed PR types from [`crate-boundaries.md`](crate-boundaries.md) and fails
@@ -2889,13 +2907,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-056 through R-067 keep startup services as orchestration while moving KMS, IAM facade, bucket metadata, notification, auth, background, observability, audit, deadlock, and embedded optional ownership to focused startup modules, then narrowing internal owner and orchestration modules to crate visibility. |
-| Migration preservation | passed | KMS singleton reuse/init behavior, embedded/main IAM wiring, bucket metadata migration/resync order, notification/auth/background/observability/audit/deadlock setup, readiness stages, public embedded API, startup compatibility paths, and log behavior stay unchanged. |
-| Testing/verification | passed | Focused startup IAM/KMS/service/notification/audit checks, RustFS lib/bin check, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
+| Quality/architecture | passed | API-072 adds an explicit ECStore facade for outer compatibility surfaces and routes storage, admin, scanner, observability, IAM, heal, Swift, S3 Select, and test compatibility imports through it. |
+| Migration preservation | passed | ECStore owner types, endpoint layout types, capacity helpers, local metrics collection, notification peer behavior, and storage init helpers remain re-exported without runtime behavior changes. |
+| Testing/verification | passed | ECStore and outer compatibility check suites, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and the full pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-072 current slice:
+  - `cargo check --tests -p rustfs-ecstore`: passed.
+  - `cargo check --tests -p rustfs -p rustfs-scanner -p rustfs-obs -p rustfs-iam -p rustfs-heal -p rustfs-protocols -p rustfs-s3select-api`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `./scripts/check_unsafe_code_allowances.sh`: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed; nextest ran 6341 tests with 6341 passed,
+    111 skipped, and doctests passed.
 
 - Issue #660 R-056/R-067 current slice:
   - `cargo test -p rustfs --lib startup_kms -- --nocapture`: passed; 2
