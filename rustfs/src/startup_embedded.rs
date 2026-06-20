@@ -28,7 +28,6 @@ use crate::{
 use std::{io, net::SocketAddr, path::PathBuf};
 use tokio_util::sync::CancellationToken;
 
-#[derive(Clone)]
 pub(crate) struct EmbeddedStartupArgs {
     address: String,
     access_key: String,
@@ -104,19 +103,18 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
         volumes,
         region,
     } = args;
-    let server_access_key = access_key.clone();
-    let server_secret_key = secret_key.clone();
-    let server_region = region.clone();
-
     // Build is allowed to fail before irreversible global initialization
     // (for example on temporary I/O or directory setup errors), and in that
     // case callers can retry.
     let mut startup_guard = EmbeddedStartupGuard::new();
 
-    let EmbeddedStartupConfig { config, temp_dir_guard } =
-        prepare_embedded_startup_config(address, access_key, secret_key, volumes, region)
-            .await
-            .map_err(init_error)?;
+    let EmbeddedStartupConfig {
+        config,
+        identity,
+        temp_dir_guard,
+    } = prepare_embedded_startup_config(address, access_key, secret_key, volumes, region)
+        .await
+        .map_err(init_error)?;
 
     init_embedded_runtime_hooks(config.obs_endpoint.clone())
         .await
@@ -176,9 +174,9 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
 
     Ok(EmbeddedStartedServer {
         bound_addr,
-        access_key: server_access_key,
-        secret_key: server_secret_key,
-        region: server_region,
+        access_key: identity.access_key,
+        secret_key: identity.secret_key,
+        region: identity.region,
         shutdown_handle,
         cancel_token,
         temp_dir: temp_dir_guard.map(|guard| guard.keep()),
