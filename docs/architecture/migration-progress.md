@@ -5,16 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-embedded-handle-boundaries`
-- Baseline: completed `R-040/R-041`.
-- Stacked on: embedded build orchestration owner slice.
+- Branch: `overtrue/arch-embedded-builder-shell`
+- Baseline: completed `R-042/R-043`.
+- Stacked on: embedded handle boundary slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move embedded endpoint normalization and synchronous drop
-  cleanup behind startup lifecycle/shutdown helpers while preserving the public
-  embedded server handle behavior.
-- CI/script changes: none.
-- Docs changes: record the embedded handle boundary slices.
+- Rust code changes: keep the public embedded builder as a thin shell over
+  crate-only startup arguments and move embedded port probing behind
+  startup-server helpers.
+- CI/script changes: make the unsafe allowance checker avoid a local
+  `pipefail` false positive after `rg -q` matches nearby `SAFETY:` comments.
+- Docs changes: record the embedded builder shell slices.
 
 ## Phase 0 Tasks
 
@@ -2344,6 +2345,28 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
     branch freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `R-044` Keep embedded builder state in startup args.
+  - Do: replace duplicated public builder private fields with crate-only
+    embedded startup arguments while preserving the fluent builder API.
+  - Acceptance: builder defaults, fluent setters, server credential accessors,
+    region accessors, and startup arguments remain behaviorally unchanged.
+  - Must preserve: public builder signatures, default address and credentials,
+    volume replacement semantics, region publication, and error mapping.
+  - Verification: focused embedded/startup-embedded checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-045` Move embedded port probing behind startup server.
+  - Do: delegate public embedded available-port probing to a crate-only startup
+    server helper.
+  - Acceptance: `find_available_port` still returns a bindable localhost TCP
+    port and preserves the same public result type.
+  - Must preserve: public helper signature, localhost bind target, ephemeral
+    port behavior, and no embedded startup side effects.
+  - Verification: focused startup-server and embedded checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
 - [x] `E-001/E-SET-001` Add ECStore layout skeleton and set-layout boundary.
   - Do: create the ECStore internal layout ownership buckets and pin static set
     layout versus runtime `Sets`/`SetDisks` orchestration boundaries before any
@@ -2586,20 +2609,35 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `pure-move`: continue pruning residual embedded public builder-only
-   boundaries after the embedded handle helper slice lands.
+1. `pure-move`: continue pruning residual embedded builder/startup-only
+   boundaries after the embedded builder shell slice lands.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-042 and R-043 move endpoint normalization and synchronous drop cleanup into crate-only startup lifecycle/shutdown helpers while keeping the public embedded API surface unchanged. |
-| Migration preservation | passed | Endpoint URL normalization, bound-address accessors, ready logging, async shutdown, drop cancellation, shutdown signaling, and temp-dir cleanup behavior stay unchanged. |
-| Testing/verification | passed | Focused startup lifecycle/shutdown/embedded checks, RustFS lib check, architecture/layer guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
+| Quality/architecture | passed | R-044 and R-045 keep the public embedded builder as a thin shell over crate-only startup args and move port probing behind startup-server helpers without widening the public API. |
+| Migration preservation | passed | Builder defaults, fluent setters, volume replacement, credential/region accessors, public port helper signature, and localhost ephemeral port behavior stay unchanged. |
+| Testing/verification | passed | Focused embedded/startup-embedded/startup-server checks, RustFS lib check, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 R-044/R-045 current slice:
+  - `cargo test -p rustfs --lib embedded -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_embedded -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_server -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Rust risk scan on changed Rust files: passed; matches were limited to
+    existing doc examples and test-only `expect` calls.
+  - `./scripts/check_unsafe_code_allowances.sh`: passed after avoiding a local
+    `pipefail` false positive when `rg -q` finds nearby `SAFETY:` comments.
+  - `make pre-commit`: passed.
 
 - Issue #660 R-042/R-043 current slice:
   - `cargo test -p rustfs --lib startup_lifecycle -- --nocapture`: passed.

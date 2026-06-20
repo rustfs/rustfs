@@ -149,6 +149,13 @@ pub(crate) async fn prepare_embedded_startup_config(
     Ok(EmbeddedStartupConfig { config, temp_dir_guard })
 }
 
+pub(crate) fn find_embedded_available_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
+}
+
 pub async fn init_embedded_startup_listen_context(config: &Config) -> Result<EmbeddedStartupListenContext> {
     let readiness = Arc::new(GlobalReadiness::new());
 
@@ -279,7 +286,8 @@ fn console_http_server_config(config: &Config) -> Option<Config> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CREDENTIALS_WARNING_MESSAGE, console_http_server_config, prepare_embedded_startup_config, s3_http_server_config,
+        DEFAULT_CREDENTIALS_WARNING_MESSAGE, console_http_server_config, find_embedded_available_port,
+        prepare_embedded_startup_config, s3_http_server_config,
     };
     use crate::config::Config;
 
@@ -347,6 +355,13 @@ mod tests {
         assert!(DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_config::ENV_RUSTFS_SECRET_KEY));
         assert!(!DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_credentials::DEFAULT_ACCESS_KEY));
         assert!(!DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_credentials::DEFAULT_SECRET_KEY));
+    }
+
+    #[test]
+    fn find_embedded_available_port_returns_tcp_port() {
+        let port = find_embedded_available_port().expect("available port should be found");
+
+        assert_ne!(port, 0);
     }
 
     #[tokio::test]

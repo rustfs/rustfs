@@ -26,12 +26,25 @@ use crate::{
 use std::{io, net::SocketAddr, path::PathBuf};
 use tokio_util::sync::CancellationToken;
 
+#[derive(Clone)]
 pub(crate) struct EmbeddedStartupArgs {
     pub address: String,
     pub access_key: String,
     pub secret_key: String,
     pub volumes: Vec<String>,
     pub region: String,
+}
+
+impl EmbeddedStartupArgs {
+    pub(crate) fn new_default() -> Self {
+        Self {
+            address: "127.0.0.1:9000".to_string(),
+            access_key: rustfs_credentials::DEFAULT_ACCESS_KEY.to_string(),
+            secret_key: rustfs_credentials::DEFAULT_SECRET_KEY.to_string(),
+            volumes: Vec::new(),
+            region: rustfs_config::RUSTFS_REGION.to_string(),
+        }
+    }
 }
 
 pub(crate) struct EmbeddedStartedServer {
@@ -129,4 +142,20 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
 
 fn init_error(err: impl std::fmt::Display) -> EmbeddedStartupError {
     EmbeddedStartupError::Init(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EmbeddedStartupArgs;
+
+    #[test]
+    fn embedded_startup_args_default_matches_public_builder_defaults() {
+        let args = EmbeddedStartupArgs::new_default();
+
+        assert_eq!(args.address, "127.0.0.1:9000");
+        assert_eq!(args.access_key, rustfs_credentials::DEFAULT_ACCESS_KEY);
+        assert_eq!(args.secret_key, rustfs_credentials::DEFAULT_SECRET_KEY);
+        assert_eq!(args.region, rustfs_config::RUSTFS_REGION);
+        assert!(args.volumes.is_empty());
+    }
 }

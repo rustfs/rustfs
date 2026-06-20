@@ -49,6 +49,7 @@
 use crate::server::ShutdownHandle;
 use crate::startup_embedded::{EmbeddedStartupArgs, EmbeddedStartupError, run_embedded_startup};
 use crate::startup_lifecycle::{embedded_endpoint_address, log_embedded_server_ready};
+use crate::startup_server::find_embedded_available_port;
 use crate::startup_shutdown::{run_embedded_server_drop_cleanup, run_embedded_server_shutdown};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -123,11 +124,7 @@ impl From<EmbeddedStartupError> for ServerError {
 /// # }
 /// ```
 pub struct RustFSServerBuilder {
-    address: String,
-    access_key: String,
-    secret_key: String,
-    volumes: Vec<String>,
-    region: String,
+    startup_args: EmbeddedStartupArgs,
 }
 
 impl Default for RustFSServerBuilder {
@@ -149,11 +146,7 @@ impl RustFSServerBuilder {
     /// not suitable.
     pub fn new() -> Self {
         Self {
-            address: "127.0.0.1:9000".to_string(),
-            access_key: rustfs_credentials::DEFAULT_ACCESS_KEY.to_string(),
-            secret_key: rustfs_credentials::DEFAULT_SECRET_KEY.to_string(),
-            volumes: Vec::new(),
-            region: rustfs_config::RUSTFS_REGION.to_string(),
+            startup_args: EmbeddedStartupArgs::new_default(),
         }
     }
 
@@ -167,25 +160,25 @@ impl RustFSServerBuilder {
     /// [`build`](Self::build), but that is too late for the earlier
     /// initialization that depends on the configured address.
     pub fn address(mut self, addr: impl Into<String>) -> Self {
-        self.address = addr.into();
+        self.startup_args.address = addr.into();
         self
     }
 
     /// Set the S3 access key (default: `"rustfsadmin"`).
     pub fn access_key(mut self, key: impl Into<String>) -> Self {
-        self.access_key = key.into();
+        self.startup_args.access_key = key.into();
         self
     }
 
     /// Set the S3 secret key (default: `"rustfsadmin"`).
     pub fn secret_key(mut self, key: impl Into<String>) -> Self {
-        self.secret_key = key.into();
+        self.startup_args.secret_key = key.into();
         self
     }
 
     /// Set the AWS region (default: `"us-east-1"`).
     pub fn region(mut self, region: impl Into<String>) -> Self {
-        self.region = region.into();
+        self.startup_args.region = region.into();
         self
     }
 
@@ -194,13 +187,13 @@ impl RustFSServerBuilder {
     /// If no volumes are added, a temporary directory with a single drive is
     /// created automatically (and cleaned up on [`RustFSServer::shutdown`]).
     pub fn volume(mut self, path: impl Into<String>) -> Self {
-        self.volumes.push(path.into());
+        self.startup_args.volumes.push(path.into());
         self
     }
 
     /// Set multiple volume paths at once, replacing any previously set volumes.
     pub fn volumes(mut self, paths: Vec<String>) -> Self {
-        self.volumes = paths;
+        self.startup_args.volumes = paths;
         self
     }
 
@@ -219,20 +212,17 @@ impl RustFSServerBuilder {
     }
 
     async fn do_build(&mut self) -> Result<RustFSServer, ServerError> {
-        let started = run_embedded_startup(EmbeddedStartupArgs {
-            address: self.address.clone(),
-            access_key: self.access_key.clone(),
-            secret_key: self.secret_key.clone(),
-            volumes: self.volumes.clone(),
-            region: self.region.clone(),
-        })
-        .await?;
+        let startup_args = self.startup_args.clone();
+        let access_key = startup_args.access_key.clone();
+        let secret_key = startup_args.secret_key.clone();
+        let region = startup_args.region.clone();
+        let started = run_embedded_startup(startup_args).await?;
 
         let server = RustFSServer {
             address: started.bound_addr,
-            access_key: self.access_key.clone(),
-            secret_key: self.secret_key.clone(),
-            region: self.region.clone(),
+            access_key,
+            secret_key,
+            region,
             shutdown_handle: Some(started.shutdown_handle),
             cancel_token: started.cancel_token,
             temp_dir: started.temp_dir,
@@ -331,8 +321,5 @@ impl Drop for RustFSServer {
 ///  }
 /// ```
 pub fn find_available_port() -> Result<u16, std::io::Error> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    Ok(port)
+    find_embedded_available_port()
 }
