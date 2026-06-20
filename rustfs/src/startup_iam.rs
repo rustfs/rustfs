@@ -348,6 +348,16 @@ pub async fn bootstrap_or_defer_iam_init(
     Ok(IamBootstrapDisposition::Deferred)
 }
 
+pub async fn bootstrap_or_defer_iam_init_with_startup_kms(
+    store: Arc<ECStore>,
+    readiness: Arc<GlobalReadiness>,
+    state_manager: Option<Arc<ServiceStateManager>>,
+    shutdown_token: Option<tokio_util::sync::CancellationToken>,
+) -> Result<IamBootstrapDisposition> {
+    let kms_interface = AppContext::ensure_startup_kms_interface();
+    bootstrap_or_defer_iam_init(store, kms_interface, readiness, state_manager, shutdown_token).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

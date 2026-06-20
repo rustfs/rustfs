@@ -2484,6 +2484,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
     pre-commit quality gate, and three-expert review.
 
+- [x] `R-056` Move startup KMS runtime handle owner into app context.
+  - Do: route startup IAM KMS handle resolution through the app context startup
+    boundary while keeping startup service orchestration on the startup IAM
+    API.
+  - Acceptance: inline and deferred IAM bootstrap use the same KMS manager
+    reuse-or-init path without adding new startup service to app reverse
+    dependencies.
+  - Must preserve: KMS global singleton behavior, IAM bootstrap call order,
+    degraded recovery KMS handle reuse, readiness publication, and layer guard
+    boundaries.
+  - Verification: focused startup KMS checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
 - [x] `E-001/E-SET-001` Add ECStore layout skeleton and set-layout boundary.
   - Do: create the ECStore internal layout ownership buckets and pin static set
     layout versus runtime `Sets`/`SetDisks` orchestration boundaries before any
@@ -2733,13 +2747,27 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-054 and R-055 move AppContext bootstrap ownership into app context and shrink stale layer baseline entries without widening public API. |
-| Migration preservation | passed | IAM init order, singleton reuse, KMS handle wiring, degraded recovery, readiness stages, and log behavior stay unchanged. |
-| Testing/verification | passed | Focused startup checks, RustFS lib check, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
+| Quality/architecture | passed | R-056 keeps startup services on startup IAM while moving KMS runtime handle ownership into the app context startup boundary. |
+| Migration preservation | passed | KMS singleton reuse/init behavior, IAM bootstrap order, degraded recovery, readiness stages, and log behavior stay unchanged. |
+| Testing/verification | passed | Focused startup KMS checks, RustFS lib check, architecture/layer/unsafe guards, formatting, diff hygiene, and Rust risk scan passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 R-056 current slice:
+  - `cargo test -p rustfs --lib startup_kms -- --nocapture`: passed; 2
+    tests.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `./scripts/check_unsafe_code_allowances.sh`: passed.
+  - Rust risk scan on changed Rust files: passed; only test-only `expect`
+    calls were present.
+  - `make pre-commit`: passed; nextest ran 6341 tests with 6341 passed, 111
+    skipped, and doctests passed.
 
 - Issue #660 R-054/R-055 current slice:
   - `cargo test -p rustfs --lib startup_ -- --nocapture`: passed; 51 tests.

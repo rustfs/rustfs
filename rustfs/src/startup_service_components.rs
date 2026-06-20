@@ -23,7 +23,7 @@ use crate::{
         print_server_info,
     },
     server::{ServiceStateManager, init_event_notifier, start_audit_system},
-    startup_iam::{IamBootstrapDisposition, bootstrap_or_defer_iam_init},
+    startup_iam::{IamBootstrapDisposition, bootstrap_or_defer_iam_init_with_startup_kms},
 };
 use rustfs_audit::AuditResult;
 use rustfs_common::GlobalReadiness;
@@ -162,8 +162,7 @@ pub(crate) async fn init_embedded_iam_runtime(
     ctx: CancellationToken,
     readiness: Arc<GlobalReadiness>,
 ) -> Result<IamBootstrapDisposition> {
-    let kms_interface = rustfs_kms::get_global_kms_service_manager().unwrap_or_else(rustfs_kms::init_global_kms_service_manager);
-    bootstrap_or_defer_iam_init(store, kms_interface, readiness, None, Some(ctx)).await
+    bootstrap_or_defer_iam_init_with_startup_kms(store, readiness, None, Some(ctx)).await
 }
 
 pub(crate) async fn init_iam_runtime(
@@ -172,8 +171,7 @@ pub(crate) async fn init_iam_runtime(
     readiness: Arc<GlobalReadiness>,
     state_manager: Arc<ServiceStateManager>,
 ) -> Result<IamBootstrapDisposition> {
-    let kms_interface = rustfs_kms::get_global_kms_service_manager().unwrap_or_else(rustfs_kms::init_global_kms_service_manager);
-    bootstrap_or_defer_iam_init(store, kms_interface, readiness, Some(state_manager), Some(ctx)).await
+    bootstrap_or_defer_iam_init_with_startup_kms(store, readiness, Some(state_manager), Some(ctx)).await
 }
 
 pub(crate) async fn init_embedded_notification_runtime(endpoint_pools: EndpointServerPools, buckets: Vec<String>) {
