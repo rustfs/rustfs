@@ -17,11 +17,10 @@ use crate::error::{Error, Result};
 use crate::global::get_global_endpoints;
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use crate::pools::ListCallback;
-use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
-use crate::storage_api_contracts::EcstoreObjectIO;
+use crate::set_disk::SetDisks;
 use crate::store::ECStore;
-use rustfs_filemeta::{FileInfo, MetaCacheEntry};
-use rustfs_storage_api::{NamespaceLocking as StorageNamespaceLocking, ObjectOperations as _, StorageAdminApi};
+use rustfs_filemeta::MetaCacheEntry;
+use rustfs_storage_api::ObjectOperations as _;
 use rustfs_utils::path::encode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -37,7 +36,6 @@ const EVENT_REBALANCE_STATE: &str = "rebalance_state";
 const EVENT_REBALANCE_BUCKET: &str = "rebalance_bucket";
 const EVENT_REBALANCE_ENTRY: &str = "rebalance_entry";
 const EVENT_REBALANCE_LISTING: &str = "rebalance_listing";
-use uuid::Uuid;
 
 const REBAL_META_FMT: u16 = 1; // Replace with actual format value
 const REBAL_META_VER: u16 = 1; // Replace with actual version value
@@ -49,30 +47,27 @@ const REBALANCE_MIGRATION_RETRY_BASE_DELAY: Duration = Duration::from_millis(250
 const REBALANCE_MIGRATION_LOCK_RETRY_CAP: Duration = Duration::from_secs(10);
 const REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX: &str = "deferred transient rebalance entry failure:";
 
+mod control;
 mod meta;
 mod migration;
 mod worker;
 use meta::{
     apply_rebalance_save_option, apply_rebalance_terminal_event, classify_rebalance_terminal_event, clone_arc_by_index,
-    clone_first_arc, clone_rebalance_pool_stats, complete_rebalance_pools_at_goal, complete_rebalance_pools_with_empty_queue,
-    defer_bucket_in_rebalance_queue, ensure_valid_rebalance_pool_index, has_deferred_rebalance_error,
-    invalid_rebalance_pool_index_error, is_rebalance_conflicting_with_decommission, is_rebalance_in_progress,
-    mark_rebalance_bucket_done, merge_rebalance_meta, percent_free_ratio, rebalance_goal_reached,
-    rebalance_metadata_not_initialized_error, record_rebalance_cleanup_warning_in_meta, resolve_next_rebalance_bucket,
-    resolve_rebalance_participants, should_accept_rebalance_stats_update, should_ignore_rebalance_data_usage_cache,
-    should_pool_participate, should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_meta_snapshot,
+    clone_first_arc, complete_rebalance_pools_at_goal, complete_rebalance_pools_with_empty_queue,
+    ensure_valid_rebalance_pool_index, has_deferred_rebalance_error, invalid_rebalance_pool_index_error,
+    is_rebalance_in_progress, rebalance_goal_reached, rebalance_metadata_not_initialized_error, resolve_rebalance_participants,
+    should_ignore_rebalance_data_usage_cache, should_preserve_rebalance_stopped_state, should_skip_start_rebalance,
     validate_start_rebalance_state,
 };
 use migration::migrate_entry_version;
 use worker::{
-    RebalanceEntryTask, load_rebalance_bucket_configs, rebalance_max_attempts, rebalance_meta_lock_error,
-    resolve_load_rebalance_stats_update_result, resolve_rebalance_bucket_error, resolve_rebalance_bucket_result,
-    resolve_rebalance_entry_cleanup_delete_result, resolve_rebalance_file_info_versions_result,
-    resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result, resolve_rebalance_migrate_result_error,
-    resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error,
-    resolve_rebalance_worker_result, run_rebalance_listing_with_retry, send_rebalance_done_signal,
-    should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete, should_defer_rebalance_entry_failure,
-    should_skip_rebalance_delete_marker, wait_rebalance_entry_tasks, with_rebalance_entry_context,
+    RebalanceEntryTask, load_rebalance_bucket_configs, rebalance_max_attempts, resolve_rebalance_bucket_error,
+    resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result, resolve_rebalance_file_info_versions_result,
+    resolve_rebalance_meta_save_result, resolve_rebalance_migrate_result_error, resolve_rebalance_save_task_result,
+    resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error, resolve_rebalance_worker_result,
+    run_rebalance_listing_with_retry, send_rebalance_done_signal, should_cleanup_rebalance_source_entry,
+    should_count_rebalance_version_complete, should_defer_rebalance_entry_failure, should_skip_rebalance_delete_marker,
+    wait_rebalance_entry_tasks, with_rebalance_entry_context,
 };
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -191,392 +186,6 @@ pub struct RebalanceMeta {
 }
 
 impl ECStore {
-    async fn save_rebalance_meta_with_merge<S>(&self, pool: Arc<S>, local_snapshot: &RebalanceMeta, stage: &str) -> Result<()>
-    where
-        S: EcstoreObjectIO + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
-    {
-        let ns_lock = pool.new_ns_lock(crate::disk::RUSTFS_META_BUCKET, REBAL_META_NAME).await?;
-        let _guard = ns_lock
-            .get_write_lock(get_lock_acquire_timeout())
-            .await
-            .map_err(rebalance_meta_lock_error)?;
-
-        let opts = ObjectOptions {
-            no_lock: true,
-            ..Default::default()
-        };
-        let mut merged = RebalanceMeta::new();
-        match merged.load_with_opts(pool.clone(), opts.clone()).await {
-            Ok(()) => {
-                merge_rebalance_meta(&mut merged, local_snapshot);
-            }
-            Err(Error::ConfigNotFound) => {
-                merged = local_snapshot.clone();
-            }
-            Err(err) => return Err(Error::other(format!("rebalance meta load before save failed during {stage}: {err}"))),
-        }
-
-        merged.save_with_opts(pool, opts).await
-    }
-
-    #[tracing::instrument(skip_all)]
-    pub async fn load_rebalance_meta(&self) -> Result<()> {
-        let mut meta = RebalanceMeta::new();
-        debug!(
-            event = EVENT_REBALANCE_STATE,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_REBALANCE,
-            state = "metadata_loading",
-            "Loading rebalance metadata"
-        );
-        let pool = clone_first_arc(&self.pools, "rebalanceMeta: no pools available")?;
-        if resolve_rebalance_meta_load_result(meta.load(pool).await)? {
-            {
-                let mut rebalance_meta = self.rebalance_meta.write().await;
-
-                *rebalance_meta = Some(meta);
-
-                drop(rebalance_meta);
-            }
-
-            resolve_load_rebalance_stats_update_result(self.update_rebalance_stats().await)?;
-            debug!(
-                event = EVENT_REBALANCE_STATE,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REBALANCE,
-                state = "metadata_loaded",
-                "Loaded rebalance metadata"
-            );
-        } else {
-            debug!(
-                event = EVENT_REBALANCE_STATE,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REBALANCE,
-                state = "metadata_missing",
-                reason = "rebalance_not_started",
-                "Rebalance metadata not found"
-            );
-        }
-
-        Ok(())
-    }
-
-    #[tracing::instrument(skip_all)]
-    pub async fn update_rebalance_stats(&self) -> Result<()> {
-        let mut ok = false;
-
-        let pool_stats = {
-            let rebalance_meta = self.rebalance_meta.read().await;
-            clone_rebalance_pool_stats(rebalance_meta.as_ref())?
-        };
-
-        debug!(
-            event = EVENT_REBALANCE_STATE,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_REBALANCE,
-            pool_count = pool_stats.len(),
-            "Refreshing rebalance stats snapshot"
-        );
-
-        for i in 0..self.pools.len() {
-            if pool_stats.get(i).is_none() {
-                let mut rebalance_meta = self.rebalance_meta.write().await;
-                debug!(
-                    event = EVENT_REBALANCE_STATE,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REBALANCE,
-                    pool_index = i,
-                    state = "pool_stat_missing",
-                    "Adding missing rebalance pool stats entry"
-                );
-                if let Some(meta) = rebalance_meta.as_mut() {
-                    meta.pool_stats.push(RebalanceStats::default());
-                }
-                ok = true;
-                drop(rebalance_meta);
-            }
-        }
-
-        if ok {
-            debug!(
-                event = EVENT_REBALANCE_STATE,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REBALANCE,
-                state = "metadata_saving",
-                "Saving rebalance metadata after stats refresh"
-            );
-
-            let rebalance_meta = self.rebalance_meta.read().await;
-            if let Some(meta) = rebalance_meta.as_ref() {
-                let pool = clone_first_arc(&self.pools, "update_rebalance_stats: no pools available")?;
-                resolve_rebalance_meta_save_result(
-                    self.save_rebalance_meta_with_merge(pool, meta, "update_rebalance_stats")
-                        .await,
-                    "update_rebalance_stats",
-                )?;
-            }
-        }
-
-        Ok(())
-    }
-
-    // async fn find_index(&self, index: usize) -> Option<usize> {
-    //     if let Some(meta) = self.rebalance_meta.read().await.as_ref() {
-    //         return meta.pool_stats.get(index).map(|_v| index);
-    //     }
-
-    //     None
-    // }
-
-    #[tracing::instrument(skip(self))]
-    pub async fn init_rebalance_meta(&self, bucktes: Vec<String>) -> Result<String> {
-        info!(
-            event = EVENT_REBALANCE_STATE,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_REBALANCE,
-            state = "initializing",
-            bucket_count = bucktes.len(),
-            "Initializing rebalance metadata"
-        );
-        let si = StorageAdminApi::storage_info(self).await;
-
-        let mut disk_stats = vec![DiskStat::default(); self.pools.len()];
-
-        let mut total_cap = 0;
-        let mut total_free = 0;
-        for disk in si.disks.iter() {
-            if disk.pool_index < 0 || disk_stats.len() <= disk.pool_index as usize {
-                continue;
-            }
-
-            total_cap += disk.total_space;
-            total_free += disk.available_space;
-
-            disk_stats[disk.pool_index as usize].total_space += disk.total_space;
-            disk_stats[disk.pool_index as usize].available_space += disk.available_space;
-        }
-
-        let percent_free_goal = percent_free_ratio(total_free, total_cap);
-
-        let mut pool_stats = Vec::with_capacity(self.pools.len());
-
-        let now = OffsetDateTime::now_utc();
-
-        for disk_stat in disk_stats.iter() {
-            let mut pool_stat = RebalanceStats {
-                init_free_space: disk_stat.available_space,
-                init_capacity: disk_stat.total_space,
-                buckets: bucktes.clone(),
-                rebalanced_buckets: Vec::with_capacity(bucktes.len()),
-                ..Default::default()
-            };
-
-            if should_pool_participate(disk_stat.available_space, disk_stat.total_space, percent_free_goal) {
-                pool_stat.participating = true;
-                pool_stat.info = RebalanceInfo {
-                    start_time: Some(now),
-                    status: RebalStatus::Started,
-                    ..Default::default()
-                };
-            }
-
-            pool_stats.push(pool_stat);
-        }
-
-        let meta = RebalanceMeta {
-            id: Uuid::new_v4().to_string(),
-            percent_free_goal,
-            pool_stats,
-            ..Default::default()
-        };
-
-        let pool = clone_first_arc(&self.pools, "init_rebalance_meta: no pools available")?;
-        resolve_rebalance_meta_save_result(
-            self.save_rebalance_meta_with_merge(pool, &meta, "init_rebalance_meta").await,
-            "init_rebalance_meta",
-        )?;
-
-        info!(
-            event = EVENT_REBALANCE_STATE,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_REBALANCE,
-            state = "metadata_initialized",
-            bucket_count = bucktes.len(),
-            "Rebalance metadata initialized"
-        );
-
-        let id = meta.id.clone();
-
-        {
-            let mut rebalance_meta = self.rebalance_meta.write().await;
-            *rebalance_meta = Some(meta);
-            drop(rebalance_meta);
-        }
-
-        Ok(id)
-    }
-
-    #[tracing::instrument(skip(self, fi))]
-    pub async fn update_pool_stats(&self, pool_index: usize, bucket: String, fi: &FileInfo) -> Result<()> {
-        self.update_pool_stats_batch(pool_index, bucket, &[fi]).await
-    }
-
-    #[tracing::instrument(skip(self, versions))]
-    pub async fn update_pool_stats_batch(&self, pool_index: usize, bucket: String, versions: &[&FileInfo]) -> Result<()> {
-        if versions.is_empty() {
-            return Ok(());
-        }
-
-        let mut rebalance_meta = self.rebalance_meta.write().await;
-        if let Some(meta) = rebalance_meta.as_mut() {
-            if !should_accept_rebalance_stats_update(meta, pool_index) {
-                return Ok(());
-            }
-
-            if let Some(pool_stat) = meta.pool_stats.get_mut(pool_index) {
-                pool_stat.update_batch(bucket, versions);
-            }
-        }
-
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub async fn next_rebal_bucket(&self, pool_index: usize) -> Result<Option<String>> {
-        let rebalance_meta = self.rebalance_meta.read().await;
-        debug!(
-            event = EVENT_REBALANCE_BUCKET,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_REBALANCE,
-            pool_index,
-            has_meta = rebalance_meta.is_some(),
-            state = "next_bucket_lookup",
-            "Rebalance next bucket lookup"
-        );
-        resolve_next_rebalance_bucket(rebalance_meta.as_ref(), pool_index)
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub async fn bucket_rebalance_done(&self, pool_index: usize, bucket: String) -> Result<()> {
-        let mut rebalance_meta = self.rebalance_meta.write().await;
-        mark_rebalance_bucket_done(rebalance_meta.as_mut(), pool_index, &bucket)
-    }
-
-    async fn record_rebalance_cleanup_warning(
-        &self,
-        pool_index: usize,
-        bucket: &str,
-        object: &str,
-        message: String,
-    ) -> Result<()> {
-        let mut rebalance_meta = self.rebalance_meta.write().await;
-        record_rebalance_cleanup_warning_in_meta(
-            rebalance_meta.as_mut(),
-            pool_index,
-            bucket,
-            object,
-            message,
-            OffsetDateTime::now_utc(),
-        )
-    }
-
-    async fn defer_rebalance_bucket(&self, pool_index: usize, bucket: String, last_error: String) -> Result<()> {
-        let mut rebalance_meta = self.rebalance_meta.write().await;
-        let Some(meta) = rebalance_meta.as_mut() else {
-            return Err(rebalance_metadata_not_initialized_error("defer rebalance bucket"));
-        };
-        let pool_count = meta.pool_stats.len();
-        ensure_valid_rebalance_pool_index(pool_count, pool_index)?;
-        let Some(pool_stat) = meta.pool_stats.get_mut(pool_index) else {
-            return Err(invalid_rebalance_pool_index_error(pool_index, pool_count));
-        };
-
-        defer_bucket_in_rebalance_queue(pool_stat, &bucket)?;
-        pool_stat.info.last_error = Some(last_error);
-        meta.last_refreshed_at = Some(OffsetDateTime::now_utc());
-        Ok(())
-    }
-
-    pub async fn is_rebalance_started(&self) -> bool {
-        let rebalance_meta = self.rebalance_meta.read().await;
-        if let Some(meta) = rebalance_meta.as_ref() {
-            meta.pool_stats.iter().enumerate().for_each(|(i, v)| {
-                debug!(
-                    event = EVENT_REBALANCE_STATE,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REBALANCE,
-                    pool_index = i,
-                    participating = v.participating,
-                    status = ?v.info.status,
-                    state = "status_inspected",
-                    "Rebalance status inspected"
-                );
-            });
-
-            let started = is_rebalance_conflicting_with_decommission(meta);
-            if started {
-                debug!(
-                    event = EVENT_REBALANCE_STATE,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REBALANCE,
-                    state = "running",
-                    "Rebalance is running"
-                );
-                return true;
-            }
-        }
-
-        debug!(
-            event = EVENT_REBALANCE_STATE,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_REBALANCE,
-            state = "not_running",
-            "Rebalance is not running"
-        );
-        false
-    }
-
-    pub async fn is_rebalance_conflicting_with_decommission(&self) -> bool {
-        let rebalance_meta = self.rebalance_meta.read().await;
-        rebalance_meta
-            .as_ref()
-            .is_some_and(is_rebalance_conflicting_with_decommission)
-    }
-
-    pub async fn is_pool_rebalancing(&self, pool_index: usize) -> bool {
-        let rebalance_meta = self.rebalance_meta.read().await;
-        if let Some(ref meta) = *rebalance_meta {
-            if meta.stopped_at.is_some() {
-                return false;
-            }
-
-            if let Some(pool_stat) = meta.pool_stats.get(pool_index) {
-                return pool_stat.participating && pool_stat.info.status == RebalStatus::Started;
-            }
-        }
-
-        false
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub async fn stop_rebalance(self: &Arc<Self>) -> Result<()> {
-        let meta_to_save = {
-            let mut rebalance_meta = self.rebalance_meta.write().await;
-            stop_rebalance_meta_snapshot(rebalance_meta.as_mut(), OffsetDateTime::now_utc())
-        };
-
-        if let Some(meta_to_save) = meta_to_save {
-            let pool = clone_first_arc(self.pools.as_slice(), "stop_rebalance: no pools available")?;
-            resolve_rebalance_meta_save_result(
-                self.save_rebalance_meta_with_merge(pool, &meta_to_save, "stop_rebalance")
-                    .await,
-                "stop_rebalance",
-            )?;
-        }
-
-        Ok(())
-    }
-
     #[tracing::instrument(skip_all)]
     pub async fn start_rebalance(self: &Arc<Self>) -> Result<()> {
         info!(

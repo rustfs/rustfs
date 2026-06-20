@@ -5,19 +5,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-rebalance-state-impls`
-- Baseline: completed `E-010/E-REBALANCE-004`.
+- Branch: `overtrue/arch-ecstore-rebalance-control-impls`
+- Baseline: completed `E-011/E-REBALANCE-005`.
 - Stacked on: merged ECStore layout foundation, format layout ownership, and
   endpoint layout move slices plus the set-format heal, pool-space layout
   helper, rebalance support helper, pool-space builder, rebalance metadata
-  helper, rebalance worker helper, and rebalance migration helper slices.
+  helper, rebalance worker helper, rebalance migration helper, and rebalance
+  state impl slices.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move ECStore rebalance state/metadata impls into
-  `rebalance::meta` while preserving public wire structs and ECStore
+- Rust code changes: move ECStore rebalance metadata/control impls into
+  `rebalance::control` while preserving public wire structs and worker
   orchestration.
 - CI/script changes: none.
-- Docs changes: record the ECStore rebalance state impl slice.
+- Docs changes: record the ECStore rebalance control impl slice.
 
 ## Phase 0 Tasks
 
@@ -2378,10 +2379,25 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
     branch freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `E-012/E-REBALANCE-006` Move ECStore rebalance control impls.
+  - Do: move ECStore rebalance metadata save/load/update/init/status/stop
+    control methods into `rebalance::control` while leaving the worker loop and
+    entry migration orchestration in `rebalance.rs`.
+  - Acceptance: `rebalance::control` owns metadata/control methods,
+    `rebalance.rs` keeps public data contracts and worker orchestration, and
+    focused rebalance tests keep covering moved behavior.
+  - Must preserve: metadata merge locking, load/save error wrapping, pool stats
+    refresh and extension, init free-space goal, pool stat update behavior,
+    bucket queue done/defer behavior, cleanup warning recording, start/stop
+    status checks, decommission conflict checks, and stop snapshot persistence.
+  - Verification: focused ECStore rebalance tests, ECStore/RustFS/Heal compile
+    checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
 ## Next PRs
 
 1. `pure-move`: continue moving ECStore rebalance/layout support helpers once
-   E-011/E-REBALANCE-005 lands.
+   E-012/E-REBALANCE-006 lands.
 2. `pure-move`: continue pruning residual embedded startup-only orchestration
    once the lifecycle helpers are merged.
 
@@ -2389,8 +2405,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | E-011/E-REBALANCE-005 moves state/metadata impls into `rebalance::meta` while leaving ECStore orchestration in place. |
-| Migration preservation | passed | Metadata wire format/version, load/save behavior, accounting updates, batch updates, and status mapping remain preserved. |
+| Quality/architecture | passed | E-012/E-REBALANCE-006 moves metadata/control impls into `rebalance::control` while leaving worker orchestration in place. |
+| Migration preservation | passed | Metadata merge locking, status checks, pool stat refresh/update, bucket queue transitions, cleanup warnings, and stop persistence remain preserved. |
 | Testing/verification | passed | Focused rebalance tests, compile checks, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
 
 ## Verification Notes
@@ -2548,6 +2564,18 @@ Passed before push:
   - `cargo fmt --all --check`: passed.
   - `git diff --check`: passed.
   - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 E-012/E-REBALANCE-006 current slice:
+  - `cargo test -p rustfs-ecstore rebalance::rebalance_unit_tests -- --nocapture`: passed.
+  - `cargo check -p rustfs-ecstore -p rustfs -p rustfs-heal`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; added casts are moved
+    pool-index accounting from the existing implementation and remain guarded.
   - `make pre-commit`: passed.
   - Three-expert review: passed.
 
