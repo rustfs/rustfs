@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-layout-endpoints-move`
-- Baseline: merged `E-002/E-LAYOUT-001`.
-- Stacked on: merged ECStore layout foundation and format layout ownership
-  slices.
+- Branch: `overtrue/arch-ecstore-layout-set-heal-helpers`
+- Baseline: merged `E-003/E-LAYOUT-002`.
+- Stacked on: merged ECStore layout foundation, format layout ownership, and
+  endpoint layout move slices.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: pure-move ECStore endpoint parsing and endpoint grouping
-  modules into the internal layout bucket while preserving old public paths.
+- Rust code changes: move runtime-neutral ECStore set-format heal helpers into
+  the internal layout bucket while preserving `Sets` runtime orchestration.
 - CI/script changes: none.
-- Docs changes: record the ECStore endpoint pure move slice.
+- Docs changes: record the ECStore set-format heal helper layout slice.
 
 ## Phase 0 Tasks
 
@@ -2253,10 +2253,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
     branch freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `E-004/E-LAYOUT-003` Move ECStore set-format heal helpers.
+  - Do: move runtime-neutral set-format heal helper logic into the ECStore
+    layout bucket while keeping disk initialization and `Sets` orchestration in
+    `sets.rs`.
+  - Acceptance: `layout::set_heal` owns drive-info mapping and unformatted
+    format regeneration helpers, `Sets` keeps the same heal orchestration, and
+    focused tests cover the extracted helper behavior.
+  - Must preserve: disk format heal state mapping, unformatted disk format
+    regeneration, current disk-info preservation, dry-run behavior, save-format
+    behavior, and all `Sets` runtime control flow.
+  - Verification: focused ECStore set-heal tests, ECStore/RustFS/Heal compile
+    checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
 ## Next PRs
 
 1. `pure-move`: continue moving runtime-neutral pool/set layout helpers once
-   E-003/E-LAYOUT-002 lands.
+   E-004/E-LAYOUT-003 lands.
 2. `pure-move`: continue pruning residual embedded startup-only orchestration
    once the lifecycle helpers are merged.
 
@@ -2264,9 +2278,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | E-003/E-LAYOUT-002 is a pure move into ECStore layout with compatibility stubs at old public paths; no new runtime owner or dependency boundary is introduced. |
-| Migration preservation | passed | Endpoint parsing, local-host detection, pool/set/disk indexes, endpoint grouping, disk independence checks, setup type classification, and old public module paths remain preserved. |
-| Testing/verification | passed | Focused endpoint/layout checks, compile checks, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
+| Quality/architecture | passed | E-004/E-LAYOUT-003 extracts runtime-neutral set-format heal helpers into ECStore layout without moving disk init or `Sets` orchestration. |
+| Migration preservation | passed | Drive-info state mapping, unformatted format regeneration, current disk-info preservation, dry-run/save behavior, and `Sets` runtime control flow remain preserved. |
+| Testing/verification | passed | Focused set-heal helper tests, compile checks, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
 
 ## Verification Notes
 
@@ -2351,6 +2365,18 @@ Passed before push:
   - `git diff --check`: passed.
   - Rust risk scan on changed Rust files: passed; only existing endpoint
     production/test unwrap and expectation paths were moved.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 E-004/E-LAYOUT-003 current slice:
+  - `cargo test -p rustfs-ecstore layout::set_heal -- --nocapture`: passed.
+  - `cargo check -p rustfs-ecstore -p rustfs -p rustfs-heal`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; only test-only unwrap
+    expectations were added around deterministic helper construction.
   - `make pre-commit`: passed.
   - Three-expert review: passed.
 
