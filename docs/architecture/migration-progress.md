@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-extension-runtime-snapshots`
-- Baseline: `overtrue/arch-ops-profiler-runtime-contract`
-  (`6d4ff92f398a9decdce53a7203744c7c2a70a4e9`).
-- Stacked on: local R-032, which is stacked on rustfs/rustfs#3642.
-- PR type for this branch: `contract`
+- Branch: `overtrue/arch-ecstore-layout-foundation`
+- Baseline: `overtrue/arch-extension-runtime-snapshots`
+  (`6ee557f63c4f8eb45334af23a6b3a32e0ee009e9`).
+- Stacked on: local R-033, which is stacked on local R-032 and rustfs/rustfs#3642.
+- PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: expose builtin diagnostics/profiler runtime capability
-  snapshots through the admin extension catalog response.
+- Rust code changes: add the ECStore internal layout skeleton and read-only set
+  layout boundary tests.
 - CI/script changes: none.
-- Docs changes: record the R-033 extension runtime snapshot slice.
+- Docs changes: record the ECStore layout boundary and E-001/E-SET-001 slice.
 
 ## Phase 0 Tasks
 
@@ -2211,20 +2211,34 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
     branch freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `E-001/E-SET-001` Add ECStore layout skeleton and set-layout boundary.
+  - Do: create the ECStore internal layout ownership buckets and pin static set
+    layout versus runtime `Sets`/`SetDisks` orchestration boundaries before any
+    file moves.
+  - Acceptance: the skeleton documents future ownership buckets, static format
+    set distribution is preserved, and runtime flat disk plus per-set lock-host
+    mapping is described by focused tests.
+  - Must preserve: format distribution, object-to-set hashing owner, local disk
+    replacement, lock client mapping, existing public module paths, and runtime
+    `Sets`/`SetDisks` behavior.
+  - Verification: focused ECStore set layout tests, ECStore/RustFS compile
+    checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
 ## Next PRs
 
-1. `pure-move`: continue pruning residual embedded startup-only orchestration
+1. `pure-move`: move ECStore layout files into the new layout bucket with
+   compatibility coverage after E-001/E-SET-001 lands.
+2. `pure-move`: continue pruning residual embedded startup-only orchestration
    once the lifecycle helpers are merged.
-2. `contract`: add the next read-only extension handoff once admin/reporting
-   consumers need additional extension runtime snapshots.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-033 exposes only read-only diagnostics/profiler capability snapshots through the admin extension catalog response. |
-| Migration preservation | passed | Catalog auth, plugin instance listing, profiler/diagnostics execution paths, and external plugin flow status semantics remain unchanged. |
-| Testing/verification | passed | Focused admin catalog and targets runtime checks, lib check, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
+| Quality/architecture | passed | E-001/E-SET-001 adds only ECStore layout skeleton boundaries and read-only set-layout contracts before file moves. |
+| Migration preservation | passed | Format distribution, local disk replacement, lock client mapping, public module paths, and runtime set behavior remain unchanged. |
+| Testing/verification | passed | Focused ECStore set-layout checks, compile checks, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
 
 ## Verification Notes
 
@@ -2271,6 +2285,18 @@ Passed before push:
   - `git diff --check`: passed.
   - Rust risk scan on changed Rust files: passed; only test-only
     expectations/assertion paths were present.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 E-001/E-SET-001 current slice:
+  - `cargo test -p rustfs-ecstore test_eset -- --nocapture`: passed.
+  - `cargo check -p rustfs-ecstore -p rustfs -p rustfs-heal`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; only test-only
+    expectation paths were present.
   - `make pre-commit`: passed.
   - Three-expert review: passed.
 
