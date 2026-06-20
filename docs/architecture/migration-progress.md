@@ -5,20 +5,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-rebalance-worker-helpers`
-- Baseline: completed `E-008/E-REBALANCE-002`.
+- Branch: `overtrue/arch-ecstore-rebalance-migration-helpers`
+- Baseline: completed `E-009/E-REBALANCE-003`.
 - Stacked on: merged ECStore layout foundation, format layout ownership, and
   endpoint layout move slices plus the set-format heal, pool-space layout
-  helper, rebalance support helper, pool-space builder, and rebalance metadata
-  helper slices.
+  helper, rebalance support helper, pool-space builder, rebalance metadata
+  helper, and rebalance worker helper slices.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move ECStore rebalance worker result handling, retry,
-  listing, bucket config, and source cleanup helper boundaries into
-  `rebalance::worker` while preserving the `RebalanceMeta`/`RebalanceStats`
-  wire structs and ECStore orchestration.
+- Rust code changes: move ECStore rebalance migration backend, version-result,
+  delete-marker option, remote-tier option, and version migration retry helpers
+  into `rebalance::migration` while preserving ECStore orchestration.
 - CI/script changes: none.
-- Docs changes: record the ECStore rebalance worker helper slice.
+- Docs changes: record the ECStore rebalance migration helper slice.
 
 ## Phase 0 Tasks
 
@@ -2348,10 +2347,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
     branch freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `E-010/E-REBALANCE-004` Move ECStore rebalance migration helpers.
+  - Do: move migration backend abstraction, migration version result,
+    delete-marker/remote-tier option builders, and version migration retry flow
+    into `rebalance::migration` while keeping high-level rebalance orchestration
+    in `rebalance.rs`.
+  - Acceptance: `rebalance::migration` owns migration helper functions and
+    result types, `rebalance.rs` keeps orchestration and wire structs, and
+    focused rebalance tests keep covering moved behavior.
+  - Must preserve: remote-tier object movement, delete-marker replication
+    state, data-usage cache skip behavior, source read/write retry semantics,
+    transient/non-transient classification, retry backoff, not-found handling,
+    migration stage labels, and cleanup accounting.
+  - Verification: focused ECStore rebalance tests, ECStore/RustFS/Heal compile
+    checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
 ## Next PRs
 
 1. `pure-move`: continue moving ECStore rebalance/layout support helpers once
-   E-009/E-REBALANCE-003 lands.
+   E-010/E-REBALANCE-004 lands.
 2. `pure-move`: continue pruning residual embedded startup-only orchestration
    once the lifecycle helpers are merged.
 
@@ -2359,8 +2374,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | E-009/E-REBALANCE-003 moves rebalance worker helpers into a child module while leaving ECStore orchestration in place. |
-| Migration preservation | passed | Worker join error context, retry/backoff classification, listing retry cancellation, bucket config handling, and cleanup decisions remain preserved. |
+| Quality/architecture | passed | E-010/E-REBALANCE-004 moves migration helpers into a child module while leaving ECStore orchestration in place. |
+| Migration preservation | passed | Remote-tier movement, delete-marker options, retry/backoff classification, not-found handling, stage labels, and cleanup accounting remain preserved. |
 | Testing/verification | passed | Focused rebalance tests, compile checks, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
 
 ## Verification Notes
