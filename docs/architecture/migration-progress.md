@@ -2610,6 +2610,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
     pre-commit quality gate, and three-expert review.
 
+- [x] `R-066` Narrow internal startup owner module visibility.
+  - Do: make focused startup owner modules crate-private after their public
+    aggregate was retired.
+  - Acceptance: the binary entrypoint and embedded public API still compile
+    through the intended startup entrypoints, while audit/auth/background/bucket
+    metadata/deadlock/embedded optional/notification/observability owner
+    modules are no longer part of the public library surface.
+  - Must preserve: all startup call order, log fields, readiness behavior,
+    embedded startup behavior, optional runtime behavior, and public embedded
+    builder API.
+  - Verification: RustFS lib and bin check, focused startup checks,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
 - [x] `E-001/E-SET-001` Add ECStore layout skeleton and set-layout boundary.
   - Do: create the ECStore internal layout ownership buckets and pin static set
     layout versus runtime `Sets`/`SetDisks` orchestration boundaries before any
@@ -2859,15 +2873,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-056 through R-065 keep startup services as orchestration while moving KMS, IAM facade, bucket metadata, notification, auth, background, observability, audit, deadlock, and embedded optional ownership to focused startup modules. |
-| Migration preservation | passed | KMS singleton reuse/init behavior, embedded/main IAM wiring, bucket metadata migration/resync order, notification/auth/background/observability/audit/deadlock setup, readiness stages, and log behavior stay unchanged. |
-| Testing/verification | passed | Focused startup IAM/KMS/service/notification checks, RustFS lib check, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
+| Quality/architecture | passed | R-056 through R-066 keep startup services as orchestration while moving KMS, IAM facade, bucket metadata, notification, auth, background, observability, audit, deadlock, and embedded optional ownership to focused startup modules, then narrowing those internal owner modules to crate visibility. |
+| Migration preservation | passed | KMS singleton reuse/init behavior, embedded/main IAM wiring, bucket metadata migration/resync order, notification/auth/background/observability/audit/deadlock setup, readiness stages, public embedded API, and log behavior stay unchanged. |
+| Testing/verification | passed | Focused startup IAM/KMS/service/notification/audit checks, RustFS lib/bin check, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
 
-- Issue #660 R-056/R-065 current slice:
+- Issue #660 R-056/R-066 current slice:
   - `cargo test -p rustfs --lib startup_kms -- --nocapture`: passed; 2
     tests.
   - `cargo test -p rustfs --lib startup_iam -- --nocapture`: passed; 8
@@ -2878,6 +2892,7 @@ Passed before push:
     passed; 2 tests.
   - `cargo test -p rustfs --lib startup_notification -- --nocapture`:
     passed; 1 test.
+  - `cargo check -p rustfs --lib --bins`: passed.
   - `cargo check -p rustfs --lib`: passed.
   - `cargo fmt --all --check`: passed.
   - `git diff --check`: passed.
