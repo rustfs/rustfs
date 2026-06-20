@@ -130,6 +130,11 @@ Outer compatibility boundary modules must use `rustfs_ecstore::api` for ECStore
 public facade surfaces such as layout, storage owner, admin, metrics,
 notification, capacity, and bucket-name helpers.
 
+RustFS startup internals must stay crate-private after the startup owner split.
+Only `startup_entrypoint` remains a public startup module for the binary
+entrypoint; IAM bootstrap, optional runtime, and profiling startup shims must
+not be re-exported as public library modules.
+
 ECStore internal consumers must use `rustfs-storage-api` lifecycle helper DTOs
 directly for `ExpirationOptions` and `TransitionedObject`; ECStore keeps the
 old lifecycle paths only as downstream compatibility re-exports.

@@ -63,6 +63,7 @@ ECSTORE_OBJECT_API_EXTERNAL_ALIAS_EXPECTED_FILE="${TMP_DIR}/ecstore_object_api_e
 ECSTORE_OBJECT_API_EXTERNAL_ALIAS_ACTUAL_FILE="${TMP_DIR}/ecstore_object_api_external_alias_actual.txt"
 ECSTORE_OBJECT_API_EXTERNAL_ALIAS_DIFF_FILE="${TMP_DIR}/ecstore_object_api_external_alias_diff.txt"
 ECSTORE_OBJECT_API_UNAPPROVED_NAME_HITS_FILE="${TMP_DIR}/ecstore_object_api_unapproved_name_hits.txt"
+STARTUP_PUBLIC_SHIM_HITS_FILE="${TMP_DIR}/startup_public_shim_hits.txt"
 STORE_API_DELETE_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_delete_dto_reexports.txt"
 STORE_API_DELETE_DTO_INTERNAL_HITS_FILE="${TMP_DIR}/store_api_delete_dto_internal_hits.txt"
 STORE_API_LIFECYCLE_HELPER_DEFINITION_HITS_FILE="${TMP_DIR}/store_api_lifecycle_helper_definition_hits.txt"
@@ -213,6 +214,14 @@ require_source_line \
   "crates/storage-api/src/lib.rs" \
   "pub use admin::{DiskSetSelector, StorageAdminApi};" \
   "storage-api public admin contract re-export"
+require_source_line \
+  "rustfs/src/lib.rs" \
+  "pub mod startup_entrypoint;" \
+  "startup process entrypoint public module"
+require_source_line \
+  "rustfs/src/lib.rs" \
+  "pub(crate) mod startup_iam;" \
+  "startup IAM shim crate-private module"
 require_source_line \
   "crates/storage-api/src/lib.rs" \
   "pub use bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};" \
@@ -561,6 +570,15 @@ fi
 
 if [[ -s "$ECSTORE_OBJECT_API_UNAPPROVED_NAME_HITS_FILE" ]]; then
   report_failure "external storage compatibility boundaries must not expose new ECStore object_api names: $(paste -sd '; ' "$ECSTORE_OBJECT_API_UNAPPROVED_NAME_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading '^pub mod startup_(iam|optional_runtimes|profiling);' rustfs/src/lib.rs || true
+) >"$STARTUP_PUBLIC_SHIM_HITS_FILE"
+
+if [[ -s "$STARTUP_PUBLIC_SHIM_HITS_FILE" ]]; then
+  report_failure "startup compatibility shims must not be public library modules: $(paste -sd '; ' "$STARTUP_PUBLIC_SHIM_HITS_FILE")"
 fi
 
 (
