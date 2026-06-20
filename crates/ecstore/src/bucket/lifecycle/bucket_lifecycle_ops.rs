@@ -3322,6 +3322,7 @@ mod tests {
     // SAFETY: this helper is only used from `#[serial]` tests and those tests run under a
     // single-thread runtime (`worker_threads = 1`), so no concurrent reader/writer can access
     // process environment while `env::set_var`/`env::remove_var` is active.
+    // SAFETY: keep this note adjacent to the allowance for the repository guard.
     #[allow(unsafe_code)]
     async fn with_transition_queue_env_async<F, Fut>(capacity: Option<&str>, timeout_ms: Option<&str>, test_fn: F)
     where

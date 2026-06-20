@@ -21,7 +21,14 @@ use crate::{
 };
 use rustfs_common::GlobalReadiness;
 use rustfs_scanner::init_data_scanner;
-use std::{io::Result, net::SocketAddr, sync::Arc};
+use std::{
+    io::Result,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -32,6 +39,48 @@ const LOG_SUBSYSTEM_EMBEDDED: &str = "embedded";
 const EVENT_SERVER_READY: &str = "server_ready";
 const EVENT_SERVER_SHUTDOWN_STATE: &str = "server_shutdown_state";
 const EVENT_EMBEDDED_SERVER_STATE: &str = "embedded_server_state";
+
+static EMBEDDED_SERVER_STARTED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EmbeddedStartupAlreadyStarted;
+
+pub(crate) struct EmbeddedStartupGuard {
+    global_init_started: bool,
+}
+
+impl EmbeddedStartupGuard {
+    pub(crate) fn new() -> Self {
+        Self {
+            global_init_started: false,
+        }
+    }
+
+    pub(crate) fn mark_global_init_started(&mut self) -> std::result::Result<(), EmbeddedStartupAlreadyStarted> {
+        mark_embedded_global_init_started(&EMBEDDED_SERVER_STARTED, &mut self.global_init_started)
+    }
+}
+
+impl Default for EmbeddedStartupGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn mark_embedded_global_init_started(
+    server_started: &AtomicBool,
+    global_init_started: &mut bool,
+) -> std::result::Result<(), EmbeddedStartupAlreadyStarted> {
+    if *global_init_started {
+        return Ok(());
+    }
+
+    server_started
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .map_err(|_| EmbeddedStartupAlreadyStarted)?;
+    *global_init_started = true;
+    Ok(())
+}
 
 pub struct StartupRuntimeLifecycle {
     pub server_address: String,
@@ -108,6 +157,17 @@ pub async fn publish_embedded_startup_ready(iam_bootstrap: IamBootstrapDispositi
     Ok(())
 }
 
+pub(crate) fn embedded_endpoint_address(address: SocketAddr) -> SocketAddr {
+    let ip = match address.ip() {
+        ip @ IpAddr::V4(v4) if !v4.is_unspecified() => ip,
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        ip @ IpAddr::V6(v6) if !v6.is_unspecified() => ip,
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+    };
+
+    SocketAddr::new(ip, address.port())
+}
+
 pub fn log_embedded_server_ready(endpoint_address: SocketAddr) {
     info!(
         target: "rustfs::embedded",
@@ -118,4 +178,62 @@ pub fn log_embedded_server_ready(endpoint_address: SocketAddr) {
         "RustFS embedded server ready at http://{}",
         endpoint_address
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{embedded_endpoint_address, mark_embedded_global_init_started};
+    use std::{
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+        sync::atomic::{AtomicBool, Ordering},
+    };
+
+    #[test]
+    fn embedded_global_init_guard_allows_local_retry_before_mark() {
+        let server_started = AtomicBool::new(false);
+        let mut global_init_started = false;
+
+        mark_embedded_global_init_started(&server_started, &mut global_init_started)
+            .expect("first irreversible startup should mark global init");
+        mark_embedded_global_init_started(&server_started, &mut global_init_started)
+            .expect("repeated mark in same startup should be idempotent");
+
+        assert!(global_init_started);
+        assert!(server_started.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn embedded_global_init_guard_rejects_second_startup_after_mark() {
+        let server_started = AtomicBool::new(true);
+        let mut global_init_started = false;
+
+        let result = mark_embedded_global_init_started(&server_started, &mut global_init_started);
+
+        assert!(result.is_err());
+        assert!(!global_init_started);
+    }
+
+    #[test]
+    fn embedded_endpoint_address_rewrites_unspecified_hosts() {
+        assert_eq!(
+            embedded_endpoint_address(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9000)),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000)
+        );
+        assert_eq!(
+            embedded_endpoint_address(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 9001)),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9001)
+        );
+    }
+
+    #[test]
+    fn embedded_endpoint_address_preserves_bound_hosts() {
+        assert_eq!(
+            embedded_endpoint_address(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 9000)),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 9000)
+        );
+        assert_eq!(
+            embedded_endpoint_address(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9001)),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9001)
+        );
+    }
 }
