@@ -16,11 +16,9 @@ use crate::scanner_budget::ScannerCycleBudget;
 use crate::scanner_folder::{ScannerItem, scan_data_folder};
 use crate::sleeper::SCANNER_SLEEPER;
 use crate::{
-    DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, DataUsageCache, DataUsageCacheInfo, DataUsageEntryInfo, DataUsageInfo,
-    ScannerError, ScannerObjectIO, SizeSummary, TierStats,
+    DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, DataUsageCache, DataUsageCacheInfo, DataUsageEntry, DataUsageEntryInfo,
+    DataUsageInfo, ScannerError, ScannerObjectIO, SizeSummary, TierStats,
 };
-#[cfg(test)]
-use crate::DataUsageEntry;
 use futures::future::join_all;
 use metrics::counter;
 use rand::seq::SliceRandom as _;
@@ -32,7 +30,7 @@ use rustfs_filemeta::FileMeta;
 use rustfs_storage_api::{BucketInfo, BucketOperations, BucketOptions, DiskSetSelector, StorageAdminApi};
 use rustfs_utils::path::path_join_buf;
 use s3s::dto::{BucketLifecycleConfiguration, ReplicationConfiguration};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex as StdMutex, MutexGuard};
