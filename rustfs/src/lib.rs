@@ -68,6 +68,7 @@ pub mod profiling;
 pub mod protocols;
 pub mod runtime_capabilities;
 pub mod server;
+pub(crate) mod startup_embedded;
 pub mod startup_entrypoint;
 pub mod startup_fs_guard;
 pub mod startup_iam;

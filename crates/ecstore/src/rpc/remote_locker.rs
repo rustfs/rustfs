@@ -21,7 +21,8 @@ use rustfs_lock::{
 };
 use rustfs_protos::proto_gen::node_service::{BatchGenerallyLockRequest, GenerallyLockRequest, PingRequest};
 use rustfs_protos::{
-    evict_failed_connection, models::PingBodyBuilder, proto_gen::node_service::node_service_client::NodeServiceClient,
+    ConnectionEvictionLogLevel, evict_failed_connection_with_log_level, models::PingBodyBuilder,
+    proto_gen::node_service::node_service_client::NodeServiceClient,
 };
 use std::time::Duration;
 use tokio::time::timeout;
@@ -86,7 +87,7 @@ impl RemoteClient {
     }
 
     async fn evict_connection(&self, op: &'static str, reason: &str, resource_summary: &str) {
-        if Self::is_scanner_leader_lock(resource_summary) {
+        let log_level = if Self::is_scanner_leader_lock(resource_summary) {
             debug!(
                 addr = %self.addr,
                 op,
@@ -94,6 +95,7 @@ impl RemoteClient {
                 resource_summary,
                 "Evicting cached remote lock connection for scanner leader-lock RPC failure"
             );
+            ConnectionEvictionLogLevel::Debug
         } else {
             warn!(
                 addr = %self.addr,
@@ -102,8 +104,9 @@ impl RemoteClient {
                 resource_summary,
                 "Evicting cached remote lock connection after RPC failure"
             );
-        }
-        evict_failed_connection(&self.addr).await;
+            ConnectionEvictionLogLevel::Warn
+        };
+        evict_failed_connection_with_log_level(&self.addr, log_level).await;
     }
 
     fn summarize_resources(requests: &[LockRequest]) -> String {

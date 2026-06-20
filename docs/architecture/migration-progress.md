@@ -5,18 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-rebalance-helper-boundary`
-- Baseline: completed `E-005/E-LAYOUT-004`.
-- Stacked on: merged ECStore layout foundation, format layout ownership, and
-  endpoint layout move slices plus the set-format heal and pool-space layout
-  helper slices.
+- Branch: `overtrue/arch-embedded-startup-identity-flow`
+- Baseline: completed `R-044/R-045`.
+- Stacked on: embedded builder shell slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move ECStore rebalance support helper types and pure
-  result reducers into a local rebalance support boundary while preserving
-  store orchestration.
+- Rust code changes: hide embedded startup argument fields behind crate-only
+  setters and return public server identity from the startup result.
 - CI/script changes: none.
-- Docs changes: record the ECStore rebalance support helper boundary slice.
+- Docs changes: record the embedded startup identity slices.
 
 ## Phase 0 Tasks
 
@@ -2213,6 +2210,184 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
     branch freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `R-034` Extract embedded runtime hook boundary.
+  - Do: move embedded observability guard setup, default crypto provider
+    installation, and trusted proxy initialization behind startup runtime hooks.
+  - Acceptance: embedded startup keeps observability initialization before the
+    global startup guard/listen/storage phases while sharing the runtime hook
+    owner used by normal startup.
+  - Must preserve: `init_obs` and `set_global_guard` error prefixes, embedded
+    crypto provider already-installed debug fields, trusted proxy init timing,
+    and no added embedded server runtime behavior.
+  - Verification: focused embedded/runtime hook checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-035` Extract embedded shutdown glue boundary.
+  - Do: move embedded async shutdown logging, cancellation, event/audit cleanup,
+    HTTP shutdown, and temporary directory cleanup behind startup shutdown
+    helpers.
+  - Acceptance: embedded server shutdown preserves the same stopping/stopped
+    logs, cancellation timing, best-effort audit cleanup, HTTP shutdown, and
+    temp-dir cleanup behavior while leaving `Drop` as a synchronous best-effort
+    fallback.
+  - Must preserve: event notifier shutdown before audit stop, audit stop
+    warning-only behavior, HTTP shutdown after background cancellation, temp
+    directory cleanup warning fields, and final stopped log.
+  - Verification: focused embedded/shutdown checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-036` Extract embedded startup config preparation boundary.
+  - Do: move embedded temporary volume allocation, custom volume directory
+    creation, and embedded `Config` construction behind startup server helpers.
+  - Acceptance: embedded builder still creates a temporary volume when none is
+    provided, creates missing custom volume directories, disables console for
+    embedded S3 startup, and keeps the temp-dir guard alive until success.
+  - Must preserve: temp-dir cleanup-on-failure behavior, configured address,
+    access key, secret key, region, volume ordering, directory creation error
+    text, and no new normal startup behavior.
+  - Verification: focused startup server and embedded checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-037` Extract embedded S3-only HTTP startup boundary.
+  - Do: move embedded S3-only HTTP server startup behind a startup server
+    helper that returns the bound address and shutdown handle.
+  - Acceptance: embedded startup keeps console disabled for the HTTP server,
+    keeps using the same readiness object, and preserves the shutdown handle
+    and bound address used by `RustFSServer`.
+  - Must preserve: S3-only embedded HTTP config, readiness sharing, startup
+    error propagation, shutdown signaling, bound endpoint reporting, and no
+    public embedded API behavior changes.
+  - Verification: focused startup server and embedded checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-038` Extract embedded process-global startup guard boundary.
+  - Do: move the embedded process-global once guard behind a startup lifecycle
+    helper.
+  - Acceptance: embedded startup still allows retry before irreversible global
+    initialization, treats repeated marks inside the same startup as idempotent,
+    and rejects a second process-local embedded server after the first
+    irreversible mark.
+  - Must preserve: startup guard timing after runtime hooks and listen context,
+    `AlreadyStarted` error mapping, no reset-after-stop behavior, and no normal
+    startup behavior changes.
+  - Verification: focused startup lifecycle and embedded checks, RustFS lib
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-039` Extract embedded startup failure shutdown signal boundary.
+  - Do: move the post-HTTP embedded startup failure shutdown signal behind a
+    startup shutdown helper.
+  - Acceptance: embedded startup still signals the HTTP shutdown handle and
+    cancels the background token before returning initialization errors from
+    storage runtime, service runtime, or readiness publication failures.
+  - Must preserve: no shutdown signal before HTTP startup exists, signal-then-
+    cancel ordering, `Init` error mapping, and no public embedded API behavior
+    changes.
+  - Verification: focused startup shutdown and embedded checks, RustFS lib
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-040` Extract embedded build orchestration owner.
+  - Do: move the embedded build sequence behind a crate-only startup embedded
+    helper.
+  - Acceptance: embedded startup still runs config preparation, runtime hooks,
+    listen context, process-global guard, storage foundation, HTTP startup,
+    storage runtime, runtime services, and readiness publication in the same
+    order.
+  - Must preserve: retry-before-global-init behavior, temp-dir guard lifetime,
+    post-HTTP startup failure shutdown signaling, readiness publication error
+    text, and no public embedded API behavior changes.
+  - Verification: focused embedded checks, RustFS lib check, migration/layer
+    guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `R-041` Keep embedded public API as handle assembly.
+  - Do: keep `embedded.rs` focused on public builder inputs, `RustFSServer`
+    handle construction, endpoint reporting, shutdown, and drop cleanup.
+  - Acceptance: builder defaults and fluent setters still feed the same startup
+    fields, server accessors still return the configured credentials and
+    region, endpoint normalization stays in the public handle, and shutdown/drop
+    cleanup remains unchanged.
+  - Must preserve: `ServerError` variants and messages, `Io` versus `Init`
+    error mapping, endpoint URL shape, shutdown handle ownership, cancellation
+    token ownership, and temp-dir cleanup path.
+  - Verification: focused embedded checks, RustFS lib check, migration/layer
+    guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `R-042` Extract embedded endpoint normalization.
+  - Do: move unspecified-address endpoint normalization into a crate-only
+    startup lifecycle helper.
+  - Acceptance: embedded endpoint reporting still rewrites unspecified IPv4 and
+    IPv6 bind addresses to localhost while preserving concrete bound hosts.
+  - Must preserve: public endpoint URL shape, `address()` returning the bound
+    socket address, ready-log endpoint text, and no public embedded API
+    signature changes.
+  - Verification: focused startup lifecycle and embedded checks, RustFS lib
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-043` Extract embedded drop cleanup boundary.
+  - Do: move synchronous embedded server drop cleanup into a crate-only startup
+    shutdown helper.
+  - Acceptance: dropping a server still cancels the token, signals the shutdown
+    handle, and best-effort removes the temporary directory.
+  - Must preserve: explicit async shutdown behavior, shutdown handle ownership,
+    temp-dir cleanup behavior, ignored drop cleanup errors, and no public
+    embedded API signature changes.
+  - Verification: focused startup shutdown and embedded checks, RustFS lib
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-044` Keep embedded builder state in startup args.
+  - Do: replace duplicated public builder private fields with crate-only
+    embedded startup arguments while preserving the fluent builder API.
+  - Acceptance: builder defaults, fluent setters, server credential accessors,
+    region accessors, and startup arguments remain behaviorally unchanged.
+  - Must preserve: public builder signatures, default address and credentials,
+    volume replacement semantics, region publication, and error mapping.
+  - Verification: focused embedded/startup-embedded checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-045` Move embedded port probing behind startup server.
+  - Do: delegate public embedded available-port probing to a crate-only startup
+    server helper.
+  - Acceptance: `find_available_port` still returns a bindable localhost TCP
+    port and preserves the same public result type.
+  - Must preserve: public helper signature, localhost bind target, ephemeral
+    port behavior, and no embedded startup side effects.
+  - Verification: focused startup-server and embedded checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-046` Encapsulate embedded startup argument mutation.
+  - Do: hide embedded startup argument fields behind crate-only setter methods
+    used by the public builder.
+  - Acceptance: public builder fluent methods still apply the same address,
+    credential, region, and volume values in the same order.
+  - Must preserve: builder method signatures, default values, `volume` append
+    semantics, `volumes` replacement semantics, and startup input ownership.
+  - Verification: focused startup-embedded and embedded checks, RustFS lib
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-047` Return embedded server identity from startup result.
+  - Do: let the crate-only startup result carry the access key, secret key, and
+    region used by the public server handle.
+  - Acceptance: public server accessors still expose the configured values
+    without the public builder duplicating identity assembly.
+  - Must preserve: startup error mapping, readiness logging order, endpoint
+    address handling, shutdown handle ownership, and no public API signature
+    changes.
+  - Verification: focused startup-embedded and embedded checks, RustFS lib
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
 - [x] `E-001/E-SET-001` Add ECStore layout skeleton and set-layout boundary.
   - Do: create the ECStore internal layout ownership buckets and pin static set
     layout versus runtime `Sets`/`SetDisks` orchestration boundaries before any
@@ -2299,24 +2474,273 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
     branch freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `E-007/E-LAYOUT-005` Move ECStore pool-space builder helpers.
+  - Do: move `has_space_for` and server-pool available-space construction into
+    the ECStore layout pool-space owner while keeping `store::has_space_for`
+    source-compatible through re-export.
+  - Acceptance: `layout::pool_space` owns capacity checks, pool availability
+    construction, filter helpers, and focused tests; rebalance only gathers
+    runtime disk snapshots and calls the layout owner.
+  - Must preserve: unknown-size handling, erasure fill-fraction math,
+    inode/free-space guard behavior, meta-bucket capacity bypass, pool index
+    ordering, available-space summation, and rebalance pool selection.
+  - Verification: focused ECStore pool-space and rebalance tests,
+    ECStore/RustFS/Heal compile checks, migration/layer guards, formatting,
+    diff hygiene, Rust risk scan, branch freshness check, pre-commit quality
+    gate, and three-expert review.
+
+- [x] `E-008/E-REBALANCE-002` Move ECStore rebalance metadata helpers.
+  - Do: move rebalance metadata status, bucket queue, terminal event,
+    participant, cleanup-warning, metadata merge, and stop-state helpers into
+    `rebalance::meta` while keeping wire structs and ECStore orchestration in
+    `rebalance.rs`.
+  - Acceptance: `rebalance::meta` owns the helper functions, `rebalance.rs`
+    keeps save/load and object-flow orchestration, and focused rebalance tests
+    keep covering the moved behavior.
+  - Must preserve: metadata wire shape, stopped/completed/failed precedence,
+    bucket queue ordering, cleanup-warning merge semantics, participant
+    resolution, data-usage cache filtering, start/stop validation, and
+    percent-free goal math.
+  - Verification: focused ECStore rebalance tests, ECStore/RustFS/Heal compile
+    checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `E-009/E-REBALANCE-003` Move ECStore rebalance worker helpers.
+  - Do: move rebalance worker task/result handling, transient retry
+    classification, retry timing, bucket config loading, source cleanup
+    decisions, and listing retry wrappers into `rebalance::worker` while keeping
+    high-level rebalance orchestration in `rebalance.rs`.
+  - Acceptance: `rebalance::worker` owns worker helper functions,
+    `rebalance.rs` keeps orchestration and wire structs, and focused rebalance
+    tests keep covering the moved behavior.
+  - Must preserve: worker join error context, transient/terminal error
+    classification, retry backoff, missing bucket config handling, delete-marker
+    skip and cleanup decisions, listing retry cancellation behavior, and
+    migration result accounting.
+  - Verification: focused ECStore rebalance tests, ECStore/RustFS/Heal compile
+    checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `E-010/E-REBALANCE-004` Move ECStore rebalance migration helpers.
+  - Do: move migration backend abstraction, migration version result,
+    delete-marker/remote-tier option builders, and version migration retry flow
+    into `rebalance::migration` while keeping high-level rebalance orchestration
+    in `rebalance.rs`.
+  - Acceptance: `rebalance::migration` owns migration helper functions and
+    result types, `rebalance.rs` keeps orchestration and wire structs, and
+    focused rebalance tests keep covering moved behavior.
+  - Must preserve: remote-tier object movement, delete-marker replication
+    state, data-usage cache skip behavior, source read/write retry semantics,
+    transient/non-transient classification, retry backoff, not-found handling,
+    migration stage labels, and cleanup accounting.
+  - Verification: focused ECStore rebalance tests, ECStore/RustFS/Heal compile
+    checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `E-011/E-REBALANCE-005` Move ECStore rebalance state impls.
+  - Do: move `RebalanceStats` update helpers, `RebalStatus` conversions, and
+    `RebalanceMeta` load/save impls into `rebalance::meta` while leaving public
+    wire structs in `rebalance.rs`.
+  - Acceptance: `rebalance::meta` owns metadata/state behavior, `rebalance.rs`
+    keeps data contracts and ECStore orchestration, and focused rebalance tests
+    keep covering moved behavior.
+  - Must preserve: serialized rebalance metadata header format/version,
+    empty/short/unknown metadata handling, last refresh timestamps, save-skip
+    behavior for empty pool stats, object/version/byte accounting, batch update
+    behavior, status display labels, and legacy status byte mapping.
+  - Verification: focused ECStore rebalance tests, ECStore/RustFS/Heal compile
+    checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `E-012/E-REBALANCE-006` Move ECStore rebalance control impls.
+  - Do: move ECStore rebalance metadata save/load/update/init/status/stop
+    control methods into `rebalance::control` while leaving the worker loop and
+    entry migration orchestration in `rebalance.rs`.
+  - Acceptance: `rebalance::control` owns metadata/control methods,
+    `rebalance.rs` keeps public data contracts and worker orchestration, and
+    focused rebalance tests keep covering moved behavior.
+  - Must preserve: metadata merge locking, load/save error wrapping, pool stats
+    refresh and extension, init free-space goal, pool stat update behavior,
+    bucket queue done/defer behavior, cleanup warning recording, start/stop
+    status checks, decommission conflict checks, and stop snapshot persistence.
+  - Verification: focused ECStore rebalance tests, ECStore/RustFS/Heal compile
+    checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `E-013/E-REBALANCE-007` Move ECStore rebalance runtime loop.
+  - Do: move `start_rebalance`, the pool rebalance worker loop, completion
+    check, and periodic stats save loop into `rebalance::runtime` while leaving
+    entry/object/bucket migration orchestration in `rebalance.rs`.
+  - Acceptance: `rebalance::runtime` owns start and pool runtime orchestration,
+    `rebalance.rs` keeps public data contracts and entry/object/bucket
+    migration flow, and focused rebalance tests keep covering moved behavior.
+  - Must preserve: decommission/start validation, duplicate-start skipping,
+    pool-at-goal and empty-queue completion persistence, participant/local
+    endpoint filtering, cancellation handling, deferred-bucket repeated failure
+    guard, bucket done/defer behavior, terminal event application, save-task
+    error precedence, goal completion math, and save option persistence.
+  - Verification: focused ECStore rebalance tests, ECStore/RustFS/Heal compile
+    checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `E-014/E-REBALANCE-008` Move ECStore rebalance entry flow.
+  - Do: move the remaining entry, object-transfer, deferred-error, and bucket
+    entry-scan migration flow into `rebalance::entry` while leaving public data
+    contracts in `rebalance.rs`.
+  - Acceptance: `rebalance::entry` owns bucket/entry migration flow,
+    `rebalance::runtime` keeps pool-level orchestration, and focused rebalance
+    tests keep covering moved behavior.
+  - Must preserve: directory and completed-pool skips, lifecycle-expired
+    filtering, delete-marker skip semantics, data-movement retry flow, deferred
+    transient failure recording, batch stats updates, source cleanup warning
+    recording, entry worker semaphore limits, cancellation handling, listing
+    retry flow, and bucket outcome precedence.
+  - Verification: focused ECStore rebalance tests, ECStore/RustFS/Heal compile
+    checks, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `E-015/E-REBALANCE-009` Split ECStore rebalance unit tests.
+  - Do: move the large inline `rebalance_unit_tests` module out of
+    `rebalance.rs` into `rebalance/rebalance_unit_tests.rs` while preserving
+    the module name and test filter path.
+  - Acceptance: `rebalance.rs` is reduced to public rebalance data contracts
+    plus submodule wiring, rebalance unit tests remain under
+    `rebalance::rebalance_unit_tests`, and focused rebalance tests keep covering
+    moved behavior.
+  - Must preserve: test coverage, helper visibility, legacy metadata
+    serialization coverage, migration backend spies, panic-context tests, and
+    every existing rebalance unit-test filter path.
+  - Verification: focused ECStore rebalance tests, migration/layer guards,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `E-016/E-REBALANCE-010` Move ECStore rebalance type contracts.
+  - Do: move rebalance stats, status, info, metadata DTOs, and internal
+    bucket/entry outcomes into `rebalance::types` while preserving root
+    re-exports.
+  - Acceptance: public `crate::rebalance::*` paths remain stable, internal
+    submodules keep `super::...` access, and `rebalance.rs` only wires shared
+    constants, modules, and re-exports.
+  - Must preserve: serde field names/defaults, rebalance metadata wire shape,
+    status/save-option defaults, cancellation/refresh metadata fields, and
+    internal bucket/entry outcome semantics.
+  - Verification: focused ECStore rebalance tests, migration/layer guards,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
 ## Next PRs
 
-1. `pure-move`: continue moving ECStore rebalance/layout support helpers once
-   E-006/E-REBALANCE-001 lands.
-2. `pure-move`: continue pruning residual embedded startup-only orchestration
-   once the lifecycle helpers are merged.
+1. `pure-move`: continue pruning residual embedded handle/startup-only
+   boundaries after the embedded startup identity slice lands.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | E-006/E-REBALANCE-001 extracts rebalance support helpers into a local boundary without moving async store orchestration. |
-| Migration preservation | passed | Latest-object tie-breaks, delete aggregation, pool lookup error classification, and sibling `store` visibility remain preserved. |
-| Testing/verification | passed | Focused rebalance tests, compile checks, guards, formatting, diff hygiene, Rust risk scan, and full pre-commit passed. |
+| Quality/architecture | passed | R-046 and R-047 hide startup argument mutation behind crate-only methods and move public server identity assembly into the startup result without widening the public API. |
+| Migration preservation | passed | Builder setter semantics, public server identity accessors, endpoint handling, startup error mapping, and shutdown ownership stay unchanged. |
+| Testing/verification | passed | Focused startup-embedded/embedded checks, RustFS lib check, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 R-046/R-047 current slice:
+  - `cargo test -p rustfs --lib startup_embedded -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib embedded -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `./scripts/check_unsafe_code_allowances.sh`: passed.
+  - Rust risk scan on changed Rust files: passed; matches were limited to
+    existing embedded doc examples.
+  - `make pre-commit`: passed; nextest ran 6324 tests with 6324 passed and
+    111 skipped, and doctests passed.
+
+- Issue #660 R-044/R-045 current slice:
+  - `cargo test -p rustfs --lib embedded -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_embedded -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_server -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Rust risk scan on changed Rust files: passed; matches were limited to
+    existing doc examples and test-only `expect` calls.
+  - `./scripts/check_unsafe_code_allowances.sh`: passed after avoiding a local
+    `pipefail` false positive when `rg -q` finds nearby `SAFETY:` comments.
+  - `make pre-commit`: passed.
+
+- Issue #660 R-042/R-043 current slice:
+  - `cargo test -p rustfs --lib startup_lifecycle -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_shutdown -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib embedded -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; the only production risky
+    token was the intended move of embedded drop `remove_dir_all` cleanup from
+    the public embedded handle into `startup_shutdown`.
+  - `./scripts/check_unsafe_code_allowances.sh`: passed.
+  - `make pre-commit`: passed.
+
+- Issue #660 R-040/R-041 current slice:
+  - `cargo test -p rustfs --lib embedded -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; newly added risky-token
+    matches were empty, and the changed-file scan only matched the existing
+    embedded `Drop` cleanup path.
+  - `make pre-commit`: passed.
+
+- Issue #660 R-038/R-039 current slice:
+  - `cargo test -p rustfs --lib startup_lifecycle -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib startup_shutdown -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib embedded -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: reviewed; newly added risky-token
+    matches were limited to test-only `expect` calls, and broader changed-file
+    matches were pre-existing lifecycle/doc examples plus cleanup paths.
+  - `make pre-commit`: passed.
+
+- Issue #660 R-036/R-037 current slice:
+  - `cargo test -p rustfs --lib startup_server -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib embedded -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; only test-only
+    `expect` calls and the existing embedded temp-dir cleanup path were
+    present.
+  - `make pre-commit`: passed.
+
+- Issue #660 R-034/R-035 current slice:
+  - `cargo test -p rustfs --lib startup_runtime_hooks -- --nocapture`:
+    passed.
+  - `cargo test -p rustfs --lib embedded -- --nocapture`: passed; no
+    matching unit tests currently exist.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; only existing default
+    credential fields and moved temp-dir cleanup paths were present.
+  - `make pre-commit`: passed.
 
 - Issue #660 R-031 current slice:
   - `cargo test -p rustfs --lib startup_lifecycle -- --nocapture`: passed;
@@ -2434,6 +2858,102 @@ Passed before push:
   - `git diff --check`: passed.
   - Rust risk scan on changed Rust files: passed; no risky added lines were
     introduced.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 E-007/E-LAYOUT-005 current slice:
+  - `cargo test -p rustfs-ecstore layout::pool_space -- --nocapture`: passed.
+  - `cargo test -p rustfs-ecstore store::rebalance -- --nocapture`: passed.
+  - `cargo check -p rustfs-ecstore -p rustfs -p rustfs-heal`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; added cast lines are moved
+    capacity math from the existing implementation.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 E-008/E-REBALANCE-002 current slice:
+  - `cargo test -p rustfs-ecstore rebalance::rebalance_unit_tests -- --nocapture`: passed.
+  - `cargo check -p rustfs-ecstore -p rustfs -p rustfs-heal`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 E-009/E-REBALANCE-003 current slice:
+  - `cargo test -p rustfs-ecstore rebalance::rebalance_unit_tests -- --nocapture`: passed.
+  - `cargo check -p rustfs-ecstore -p rustfs -p rustfs-heal`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 E-012/E-REBALANCE-006 current slice:
+  - `cargo test -p rustfs-ecstore rebalance::rebalance_unit_tests -- --nocapture`: passed.
+  - `cargo check -p rustfs-ecstore -p rustfs -p rustfs-heal`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; added casts are moved
+    pool-index accounting from the existing implementation and remain guarded.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 E-013/E-REBALANCE-007 current slice:
+  - `cargo test -p rustfs-ecstore rebalance::rebalance_unit_tests -- --nocapture`: passed.
+  - `cargo check -p rustfs-ecstore -p rustfs -p rustfs-heal`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; moved casts are existing
+    pool completion math and remain guarded.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 E-014/E-REBALANCE-008 current slice:
+  - `cargo test -p rustfs-ecstore rebalance::rebalance_unit_tests -- --nocapture`: passed.
+  - `cargo check -p rustfs-ecstore -p rustfs -p rustfs-heal`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; moved casts and unwraps are
+    existing test or migration-flow code and remain guarded.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 E-015/E-REBALANCE-009 current slice:
+  - `cargo test -p rustfs-ecstore rebalance::rebalance_unit_tests -- --nocapture`: passed.
+  - `./scripts/check_unsafe_code_allowances.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; the runtime diff is a test
+    module move plus a SAFETY-comment proximity fix required by the guard.
+  - `make pre-commit`: passed.
+  - Three-expert review: passed.
+
+- Issue #660 E-016/E-REBALANCE-010 current slice:
+  - `cargo test -p rustfs-ecstore rebalance::rebalance_unit_tests -- --nocapture`: passed.
+  - `cargo check -p rustfs-ecstore -p rustfs -p rustfs-heal`: passed.
+  - `./scripts/check_unsafe_code_allowances.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; production changes are a
+    type-contract move and existing Windows FFI casts remain unchanged.
   - `make pre-commit`: passed.
   - Three-expert review: passed.
 

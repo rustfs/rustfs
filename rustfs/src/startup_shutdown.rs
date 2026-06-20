@@ -21,6 +21,7 @@ use crate::{
 };
 use rustfs_heal::shutdown_ahm_services;
 use rustfs_utils::get_env_bool_with_aliases;
+use std::path::Path;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -33,6 +34,7 @@ const LOG_COMPONENT_EMBEDDED: &str = "embedded";
 const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const LOG_SUBSYSTEM_EMBEDDED: &str = "embedded";
 const EVENT_AUDIT_SYSTEM_STATE: &str = "audit_system_state";
+const EVENT_EMBEDDED_SERVER_STATE: &str = "embedded_server_state";
 const EVENT_EMBEDDED_SHUTDOWN_CLEANUP_FAILED: &str = "embedded_shutdown_cleanup_failed";
 const EVENT_SHUTDOWN_SIGNAL_RECEIVED: &str = "shutdown_signal_received";
 const EVENT_BACKGROUND_SERVICE_SHUTDOWN: &str = "background_service_shutdown";
@@ -214,9 +216,80 @@ pub async fn run_embedded_shutdown_cleanup() {
     }
 }
 
+pub(crate) fn signal_embedded_startup_shutdown(shutdown_handle: &ShutdownHandle, ctx: &CancellationToken) {
+    shutdown_handle.signal();
+    ctx.cancel();
+}
+
+pub(crate) fn run_embedded_server_drop_cleanup(
+    ctx: &CancellationToken,
+    shutdown_handle: &mut Option<ShutdownHandle>,
+    temp_dir: Option<&Path>,
+) {
+    ctx.cancel();
+    if let Some(shutdown_handle) = shutdown_handle.take() {
+        shutdown_handle.signal();
+    }
+    if let Some(dir) = temp_dir {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+pub async fn run_embedded_server_shutdown(
+    ctx: &CancellationToken,
+    shutdown_handle: &mut Option<ShutdownHandle>,
+    temp_dir: Option<&Path>,
+) {
+    info!(
+        target: "rustfs::embedded",
+        component = LOG_COMPONENT_EMBEDDED,
+        subsystem = LOG_SUBSYSTEM_EMBEDDED,
+        event = EVENT_EMBEDDED_SERVER_STATE,
+        state = "stopping",
+        "Embedded server state changed"
+    );
+
+    ctx.cancel();
+
+    run_embedded_shutdown_cleanup().await;
+
+    if let Some(shutdown_handle) = shutdown_handle.take() {
+        shutdown_handle.shutdown().await;
+    }
+
+    if let Some(dir) = temp_dir
+        && let Err(err) = tokio::fs::remove_dir_all(dir).await
+    {
+        warn!(
+            component = LOG_COMPONENT_EMBEDDED,
+            subsystem = LOG_SUBSYSTEM_EMBEDDED,
+            event = EVENT_EMBEDDED_SHUTDOWN_CLEANUP_FAILED,
+            service = "temp_dir",
+            path = %dir.display(),
+            error = %err,
+            "Embedded shutdown cleanup failed"
+        );
+    }
+
+    info!(
+        target: "rustfs::embedded",
+        component = LOG_COMPONENT_EMBEDDED,
+        subsystem = LOG_SUBSYSTEM_EMBEDDED,
+        event = EVENT_EMBEDDED_SERVER_STATE,
+        state = "stopped",
+        "Embedded server state changed"
+    );
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BackgroundShutdownStep, background_shutdown_steps};
+    use super::{
+        BackgroundShutdownStep, background_shutdown_steps, run_embedded_server_drop_cleanup, signal_embedded_startup_shutdown,
+    };
+    use crate::server::ShutdownHandle;
+    use std::time::Duration;
+    use tokio::sync::broadcast;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn background_shutdown_plan_keeps_scanner_before_ahm() {
@@ -230,5 +303,47 @@ mod tests {
         );
         assert_eq!(background_shutdown_steps(false, true), vec![BackgroundShutdownStep::Ahm]);
         assert!(background_shutdown_steps(false, false).is_empty());
+    }
+
+    #[tokio::test]
+    async fn signal_embedded_startup_shutdown_signals_handle_and_cancels_token() {
+        let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
+        let shutdown_task = tokio::spawn(async move {
+            let _ = shutdown_rx.recv().await;
+        });
+        let shutdown_handle = ShutdownHandle::new(shutdown_tx, shutdown_task);
+        let cancel_token = CancellationToken::new();
+
+        signal_embedded_startup_shutdown(&shutdown_handle, &cancel_token);
+
+        tokio::time::timeout(Duration::from_secs(1), shutdown_handle.wait())
+            .await
+            .expect("shutdown task should observe startup signal");
+        assert!(cancel_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn embedded_drop_cleanup_signals_handle_cancels_token_and_removes_temp_dir() {
+        let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
+        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+        let shutdown_task = tokio::spawn(async move {
+            let _ = shutdown_rx.recv().await;
+            let _ = observed_tx.send(());
+        });
+        let shutdown_handle = ShutdownHandle::new(shutdown_tx, shutdown_task);
+        let mut shutdown_handle = Some(shutdown_handle);
+        let cancel_token = CancellationToken::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir should create");
+        let temp_path = temp_dir.path().to_path_buf();
+
+        run_embedded_server_drop_cleanup(&cancel_token, &mut shutdown_handle, Some(temp_dir.path()));
+
+        tokio::time::timeout(Duration::from_secs(1), observed_rx)
+            .await
+            .expect("drop cleanup should signal shutdown")
+            .expect("shutdown signal should be delivered");
+        assert!(cancel_token.is_cancelled());
+        assert!(shutdown_handle.is_none());
+        assert!(!temp_path.exists());
     }
 }
