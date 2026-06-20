@@ -47,8 +47,8 @@
 //! start a second server will return an error.
 
 use crate::server::ShutdownHandle;
-use crate::startup_embedded::{EmbeddedStartupArgs, EmbeddedStartupError, run_embedded_startup};
-use crate::startup_lifecycle::{embedded_endpoint_address, log_embedded_server_ready};
+use crate::startup_embedded::{EmbeddedStartedServer, EmbeddedStartupArgs, EmbeddedStartupError, run_embedded_startup};
+use crate::startup_lifecycle::embedded_endpoint_address;
 use crate::startup_server::find_embedded_available_port;
 use crate::startup_shutdown::{run_embedded_server_drop_cleanup, run_embedded_server_shutdown};
 use std::net::SocketAddr;
@@ -207,14 +207,20 @@ impl RustFSServerBuilder {
     /// Returns [`ServerError::AlreadyStarted`] if another server is already
     /// running in this process, or if another startup attempt has already
     /// entered irreversible global initialization.
-    pub async fn build(mut self) -> Result<RustFSServer, ServerError> {
+    pub async fn build(self) -> Result<RustFSServer, ServerError> {
         self.do_build().await
     }
 
-    async fn do_build(&mut self) -> Result<RustFSServer, ServerError> {
-        let started = run_embedded_startup(self.startup_args.clone()).await?;
+    async fn do_build(self) -> Result<RustFSServer, ServerError> {
+        let started = run_embedded_startup(self.startup_args).await?;
 
-        let server = RustFSServer {
+        Ok(started.into())
+    }
+}
+
+impl From<EmbeddedStartedServer> for RustFSServer {
+    fn from(started: EmbeddedStartedServer) -> Self {
+        Self {
             address: started.bound_addr,
             access_key: started.access_key,
             secret_key: started.secret_key,
@@ -222,11 +228,7 @@ impl RustFSServerBuilder {
             shutdown_handle: Some(started.shutdown_handle),
             cancel_token: started.cancel_token,
             temp_dir: started.temp_dir,
-        };
-
-        log_embedded_server_ready(server.endpoint_address());
-
-        Ok(server)
+        }
     }
 }
 

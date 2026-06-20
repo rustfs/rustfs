@@ -5,15 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-embedded-startup-identity-flow`
-- Baseline: completed `R-044/R-045`.
-- Stacked on: embedded builder shell slice.
+- Branch: `overtrue/arch-embedded-startup-result-shell`
+- Baseline: completed `R-046/R-047`.
+- Stacked on: embedded startup identity slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: hide embedded startup argument fields behind crate-only
-  setters and return public server identity from the startup result.
+- Rust code changes: consume embedded builder startup arguments directly and
+  keep startup-result-to-public-handle mapping plus ready logging at clear
+  ownership boundaries.
 - CI/script changes: none.
-- Docs changes: record the embedded startup identity slices.
+- Docs changes: record the embedded startup result shell slices.
 
 ## Phase 0 Tasks
 
@@ -2388,6 +2389,28 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
     branch freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `R-048` Consume embedded builder startup arguments directly.
+  - Do: make public embedded build consume the builder state and pass startup
+    arguments directly into the crate-only startup owner.
+  - Acceptance: fluent builder behavior, defaults, configured credentials,
+    region, volume ordering, and public build signature remain unchanged.
+  - Must preserve: startup argument ownership, public builder method chaining,
+    startup error mapping, and no public API signature changes.
+  - Verification: focused startup-embedded and embedded checks, RustFS lib
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-049` Keep embedded ready logging with startup completion.
+  - Do: move embedded ready logging to the startup owner once readiness has
+    been published and before the startup result is returned.
+  - Acceptance: ready log endpoint text and endpoint normalization remain the
+    same while the public builder only converts the startup result to a handle.
+  - Must preserve: readiness publication order, endpoint address normalization,
+    shutdown handle ownership, and no public API signature changes.
+  - Verification: focused startup-embedded and embedded checks, RustFS lib
+    check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
 - [x] `E-001/E-SET-001` Add ECStore layout skeleton and set-layout boundary.
   - Do: create the ECStore internal layout ownership buckets and pin static set
     layout versus runtime `Sets`/`SetDisks` orchestration boundaries before any
@@ -2631,19 +2654,33 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Next PRs
 
 1. `pure-move`: continue pruning residual embedded handle/startup-only
-   boundaries after the embedded startup identity slice lands.
+   boundaries after the embedded startup result shell slice lands.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-046 and R-047 hide startup argument mutation behind crate-only methods and move public server identity assembly into the startup result without widening the public API. |
-| Migration preservation | passed | Builder setter semantics, public server identity accessors, endpoint handling, startup error mapping, and shutdown ownership stay unchanged. |
+| Quality/architecture | passed | R-048 and R-049 keep the public embedded builder as a shell over the startup owner and localize ready logging with startup completion. |
+| Migration preservation | passed | Builder chaining, defaults, configured identity, endpoint normalization, readiness publication order, and shutdown ownership stay unchanged. |
 | Testing/verification | passed | Focused startup-embedded/embedded checks, RustFS lib check, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 R-048/R-049 current slice:
+  - `cargo test -p rustfs --lib startup_embedded -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib embedded -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `./scripts/check_unsafe_code_allowances.sh`: passed.
+  - Rust risk scan on changed Rust files: passed; no risky-token matches were
+    present in changed Rust files.
+  - `make pre-commit`: passed; nextest ran 6329 tests with 6329 passed and
+    111 skipped, and doctests passed.
 
 - Issue #660 R-046/R-047 current slice:
   - `cargo test -p rustfs --lib startup_embedded -- --nocapture`: passed.

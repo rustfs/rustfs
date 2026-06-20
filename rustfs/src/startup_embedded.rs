@@ -14,7 +14,9 @@
 
 use crate::{
     server::ShutdownHandle,
-    startup_lifecycle::{EmbeddedStartupGuard, publish_embedded_startup_ready},
+    startup_lifecycle::{
+        EmbeddedStartupGuard, embedded_endpoint_address, log_embedded_server_ready, publish_embedded_startup_ready,
+    },
     startup_runtime_hooks::init_embedded_runtime_hooks,
     startup_server::{
         EmbeddedStartupConfig, init_embedded_startup_listen_context, prepare_embedded_startup_config, start_embedded_http_server,
@@ -169,6 +171,8 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
             signal_embedded_startup_shutdown(&shutdown_handle, &cancel_token);
             EmbeddedStartupError::Init(format!("runtime readiness: {err}"))
         })?;
+
+    log_embedded_server_ready(embedded_endpoint_address(bound_addr));
 
     Ok(EmbeddedStartedServer {
         bound_addr,
