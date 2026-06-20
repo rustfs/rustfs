@@ -47,14 +47,9 @@
 //! start a second server will return an error.
 
 use crate::server::ShutdownHandle;
-use crate::startup_lifecycle::{EmbeddedStartupGuard, log_embedded_server_ready, publish_embedded_startup_ready};
-use crate::startup_runtime_hooks::init_embedded_runtime_hooks;
-use crate::startup_server::{
-    EmbeddedStartupConfig, init_embedded_startup_listen_context, prepare_embedded_startup_config, start_embedded_http_server,
-};
-use crate::startup_services::init_embedded_startup_runtime_services;
-use crate::startup_shutdown::{run_embedded_server_shutdown, signal_embedded_startup_shutdown};
-use crate::startup_storage::{init_embedded_startup_storage_foundation, init_embedded_startup_storage_runtime};
+use crate::startup_embedded::{EmbeddedStartupArgs, EmbeddedStartupError, run_embedded_startup};
+use crate::startup_lifecycle::log_embedded_server_ready;
+use crate::startup_shutdown::run_embedded_server_shutdown;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
@@ -96,6 +91,16 @@ impl std::error::Error for ServerError {
 impl From<std::io::Error> for ServerError {
     fn from(e: std::io::Error) -> Self {
         ServerError::Io(e)
+    }
+}
+
+impl From<EmbeddedStartupError> for ServerError {
+    fn from(err: EmbeddedStartupError) -> Self {
+        match err {
+            EmbeddedStartupError::AlreadyStarted => ServerError::AlreadyStarted,
+            EmbeddedStartupError::Init(message) => ServerError::Init(message),
+            EmbeddedStartupError::Io(err) => ServerError::Io(err),
+        }
     }
 }
 
@@ -213,85 +218,24 @@ impl RustFSServerBuilder {
         self.do_build().await
     }
 
-    /// Inner build implementation. Separated from [`build`] so the outer
-    /// method can enforce the one-shot process-global startup guard.
     async fn do_build(&mut self) -> Result<RustFSServer, ServerError> {
-        // Build is allowed to fail before irreversible global initialization
-        // (for example on temporary I/O or directory setup errors), and in that
-        // case callers can retry.
-        let mut startup_guard = EmbeddedStartupGuard::new();
-
-        let EmbeddedStartupConfig { config, temp_dir_guard } = prepare_embedded_startup_config(
-            self.address.clone(),
-            self.access_key.clone(),
-            self.secret_key.clone(),
-            self.volumes.clone(),
-            self.region.clone(),
-        )
-        .await
-        .map_err(|e| ServerError::Init(e.to_string()))?;
-
-        // --- Initialization sequence (mirrors main.rs::run) ---
-
-        init_embedded_runtime_hooks(config.obs_endpoint.clone())
-            .await
-            .map_err(|e| ServerError::Init(e.to_string()))?;
-
-        let listen_context = init_embedded_startup_listen_context(&config)
-            .await
-            .map_err(|e| ServerError::Init(e.to_string()))?;
-
-        startup_guard
-            .mark_global_init_started()
-            .map_err(|_| ServerError::AlreadyStarted)?;
-
-        let endpoint_pools = init_embedded_startup_storage_foundation(&listen_context.server_address, &config.volumes)
-            .await
-            .map_err(|e| ServerError::Init(e.to_string()))?;
-
-        let http_server = start_embedded_http_server(&config, listen_context.readiness.clone()).await?;
-        let shutdown_handle = http_server.shutdown_handle;
-        let bound_addr = http_server.bound_addr;
-        let ctx = CancellationToken::new();
-        let storage_runtime = match init_embedded_startup_storage_runtime(
-            listen_context.server_addr,
-            &endpoint_pools,
-            listen_context.readiness.clone(),
-            ctx.clone(),
-        )
-        .await
-        {
-            Ok(runtime) => runtime,
-            Err(e) => {
-                signal_embedded_startup_shutdown(&shutdown_handle, &ctx);
-                return Err(ServerError::Init(e.to_string()));
-            }
-        };
-        let store = storage_runtime.store;
-
-        let service_runtime =
-            init_embedded_startup_runtime_services(&config, endpoint_pools, store, ctx.clone(), listen_context.readiness.clone())
-                .await
-                .map_err(|e| {
-                    signal_embedded_startup_shutdown(&shutdown_handle, &ctx);
-                    ServerError::Init(e.to_string())
-                })?;
-
-        publish_embedded_startup_ready(service_runtime.iam_bootstrap, listen_context.readiness.as_ref())
-            .await
-            .map_err(|e| {
-                signal_embedded_startup_shutdown(&shutdown_handle, &ctx);
-                ServerError::Init(format!("runtime readiness: {e}"))
-            })?;
+        let started = run_embedded_startup(EmbeddedStartupArgs {
+            address: self.address.clone(),
+            access_key: self.access_key.clone(),
+            secret_key: self.secret_key.clone(),
+            volumes: self.volumes.clone(),
+            region: self.region.clone(),
+        })
+        .await?;
 
         let server = RustFSServer {
-            address: bound_addr,
+            address: started.bound_addr,
             access_key: self.access_key.clone(),
             secret_key: self.secret_key.clone(),
             region: self.region.clone(),
-            shutdown_handle: Some(shutdown_handle),
-            cancel_token: ctx,
-            temp_dir: temp_dir_guard.map(|g| g.keep()),
+            shutdown_handle: Some(started.shutdown_handle),
+            cancel_token: started.cancel_token,
+            temp_dir: started.temp_dir,
         };
 
         log_embedded_server_ready(server.endpoint_address());
