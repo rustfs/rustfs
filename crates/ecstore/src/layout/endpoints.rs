@@ -549,10 +549,7 @@ fn dns_retry_delay(attempt: u32) -> Duration {
 }
 
 fn apply_jitter(delay: Duration) -> Duration {
-    let delay_ms = match u64::try_from(delay.as_millis()) {
-        Ok(delay_ms) => delay_ms,
-        Err(_) => u64::MAX,
-    };
+    let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
     if delay_ms == 0 {
         return delay;
     }
