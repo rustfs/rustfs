@@ -18,7 +18,7 @@ pub(crate) const RUSTFS_META_BUCKET: &str = rustfs_ecstore::disk::RUSTFS_META_BU
 
 pub(crate) type DiskError = rustfs_ecstore::disk::error::DiskError;
 pub(crate) type DiskStore = rustfs_ecstore::disk::DiskStore;
-pub(crate) type ECStore = rustfs_ecstore::store::ECStore;
+pub(crate) type ECStore = rustfs_ecstore::api::storage::ECStore;
 pub(crate) type EcstoreError = rustfs_ecstore::error::Error;
 pub(crate) type Endpoint = rustfs_ecstore::disk::endpoint::Endpoint;
 pub(crate) type StorageError = rustfs_ecstore::error::StorageError;

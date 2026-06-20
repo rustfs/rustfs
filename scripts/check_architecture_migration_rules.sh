@@ -71,6 +71,7 @@ STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_list_c
 STORE_API_EXTERNAL_OPERATION_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_operation_consumer_hits.txt"
 STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE="${TMP_DIR}/store_api_object_operation_local_method_hits.txt"
 DIRECT_ECSTORE_IMPORT_HITS_FILE="${TMP_DIR}/direct_ecstore_import_hits.txt"
+ECSTORE_PUBLIC_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_public_facade_bypass_hits.txt"
 TEST_HARNESS_NESTED_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/test_harness_nested_storage_compat_hits.txt"
 RUSTFS_NESTED_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/rustfs_nested_storage_compat_hits.txt"
 RUSTFS_RUNTIME_SCALAR_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/rustfs_runtime_scalar_storage_compat_hits.txt"
@@ -583,6 +584,19 @@ fi
 
 if [[ -s "$DIRECT_ECSTORE_IMPORT_HITS_FILE" ]]; then
   report_failure "direct rustfs_ecstore imports outside compatibility boundaries are forbidden: $(paste -sd '; ' "$DIRECT_ECSTORE_IMPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'rustfs_ecstore::(?:admin_server_info|endpoints|disks_layout|metrics_realtime|notification_sys|pools|store_utils|store)::' \
+    rustfs/src crates/*/src crates/*/tests fuzz/fuzz_targets \
+    --glob '*storage_compat.rs' \
+    --glob '!crates/ecstore/**' \
+    --glob '!crates/e2e_test/**' || true
+) >"$ECSTORE_PUBLIC_FACADE_BYPASS_HITS_FILE"
+
+if [[ -s "$ECSTORE_PUBLIC_FACADE_BYPASS_HITS_FILE" ]]; then
+  report_failure "outer storage compatibility boundaries must use rustfs_ecstore::api facade for ECStore public surfaces: $(paste -sd '; ' "$ECSTORE_PUBLIC_FACADE_BYPASS_HITS_FILE")"
 fi
 
 (

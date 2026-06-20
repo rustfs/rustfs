@@ -24,7 +24,7 @@ pub(crate) const TRANSITION_COMPLETE: &str = rustfs_ecstore::bucket::lifecycle::
 
 pub(crate) type Disk = rustfs_ecstore::disk::Disk;
 pub(crate) type DiskError = rustfs_ecstore::disk::error::DiskError;
-pub(crate) type ECStore = rustfs_ecstore::store::ECStore;
+pub(crate) type ECStore = rustfs_ecstore::api::storage::ECStore;
 pub(crate) type EcstoreError = rustfs_ecstore::error::Error;
 pub(crate) type EcstoreResult<T> = rustfs_ecstore::error::Result<T>;
 pub(crate) type ListPathRawOptions = rustfs_ecstore::cache_value::metacache_set::ListPathRawOptions;
@@ -69,15 +69,15 @@ pub(crate) fn resolve_scanner_object_store_handle() -> Option<Arc<ECStore>> {
 }
 
 pub(crate) fn is_reserved_or_invalid_bucket(bucket: &str, strict: bool) -> bool {
-    rustfs_ecstore::store_utils::is_reserved_or_invalid_bucket(bucket, strict)
+    rustfs_ecstore::api::capacity::is_reserved_or_invalid_bucket(bucket, strict)
 }
 
 pub(crate) fn path2_bucket_object(name: &str) -> (String, String) {
-    rustfs_ecstore::pools::path2_bucket_object(name)
+    rustfs_ecstore::api::capacity::path2_bucket_object(name)
 }
 
 pub(crate) fn path2_bucket_object_with_base_path(base_path: &str, path: &str) -> (String, String) {
-    rustfs_ecstore::pools::path2_bucket_object_with_base_path(base_path, path)
+    rustfs_ecstore::api::capacity::path2_bucket_object_with_base_path(base_path, path)
 }
 
 pub(crate) async fn is_erasure() -> bool {

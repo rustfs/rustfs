@@ -126,6 +126,10 @@ directly for `ObjectIO`, `ObjectOperations`, `ListOperations`,
 the concrete compatibility traits only for internal implementation and
 downstream compatibility.
 
+Outer compatibility boundary modules must use `rustfs_ecstore::api` for ECStore
+public facade surfaces such as layout, storage owner, admin, metrics,
+notification, capacity, and bucket-name helpers.
+
 ECStore internal consumers must use `rustfs-storage-api` lifecycle helper DTOs
 directly for `ExpirationOptions` and `TransitionedObject`; ECStore keeps the
 old lifecycle paths only as downstream compatibility re-exports.

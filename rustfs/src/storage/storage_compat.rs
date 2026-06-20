@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use rustfs_ecstore::admin_server_info::get_local_server_property;
+pub(crate) use rustfs_ecstore::api::admin::get_local_server_property;
+pub(crate) use rustfs_ecstore::api::metrics::{CollectMetricsOpts, MetricType, collect_local_metrics};
+pub(crate) use rustfs_ecstore::api::storage::{ECStore, all_local_disk_path, find_local_disk_by_ref};
 pub(crate) use rustfs_ecstore::bucket::{
     metadata, metadata_sys, object_lock, policy_sys, replication, tagging, utils, versioning, versioning_sys,
 };
@@ -30,14 +32,12 @@ pub(crate) use rustfs_ecstore::error::{
 pub(crate) use rustfs_ecstore::global::{
     GLOBAL_TierConfigMgr, get_global_lock_client, get_global_region, resolve_object_store_handle,
 };
-pub(crate) use rustfs_ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
 pub(crate) use rustfs_ecstore::rio::WriteEncryption;
 pub(crate) use rustfs_ecstore::rpc::{
     LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG,
     SERVICE_SIGNAL_RELOAD_DYNAMIC, verify_rpc_signature,
 };
 pub(crate) use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
-pub(crate) use rustfs_ecstore::store::{ECStore, all_local_disk_path, find_local_disk_by_ref};
 
 pub(crate) type GetObjectReader = <ECStore as rustfs_storage_api::ObjectIO>::GetObjectReader;
 pub(crate) type ObjectInfo = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;

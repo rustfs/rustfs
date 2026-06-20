@@ -12,7 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use rustfs_ecstore::admin_server_info::get_server_info;
+pub(crate) use rustfs_ecstore::api::admin::get_server_info;
+pub(crate) use rustfs_ecstore::api::capacity::{
+    PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free,
+};
+pub(crate) use rustfs_ecstore::api::layout::EndpointServerPools;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::layout::{Endpoints, PoolEndpoints};
+pub(crate) use rustfs_ecstore::api::notification::get_global_notification_sys;
+pub(crate) use rustfs_ecstore::api::storage::ECStore;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::storage::init_local_disks;
 pub(crate) use rustfs_ecstore::bucket::{
     bucket_target_sys, lifecycle, metadata, metadata_sys, object_lock, policy_sys, quota, replication, tagging, target, utils,
     versioning, versioning_sys,
@@ -30,9 +40,6 @@ pub(crate) use rustfs_ecstore::data_usage::{
 pub(crate) use rustfs_ecstore::disk::endpoint::Endpoint;
 pub(crate) use rustfs_ecstore::disk::error::DiskError;
 pub(crate) use rustfs_ecstore::disk::error_reduce::is_all_buckets_not_found;
-pub(crate) use rustfs_ecstore::endpoints::EndpointServerPools;
-#[cfg(test)]
-pub(crate) use rustfs_ecstore::endpoints::{Endpoints, PoolEndpoints};
 pub(crate) use rustfs_ecstore::error::{
     Error, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
 };
@@ -41,19 +48,12 @@ pub(crate) use rustfs_ecstore::global::GLOBAL_TierConfigMgr;
 pub(crate) use rustfs_ecstore::global::{
     get_global_endpoints_opt, get_global_region, get_global_tier_config_mgr, new_object_layer_fn, set_object_store_resolver,
 };
-pub(crate) use rustfs_ecstore::notification_sys::get_global_notification_sys;
-pub(crate) use rustfs_ecstore::pools::{
-    PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free,
-};
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::rio::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader};
 pub(crate) use rustfs_ecstore::rio::{
     DynReader, HashReader, WriteEncryption, WritePlan, compression_metadata_value, wrap_reader,
 };
 pub(crate) use rustfs_ecstore::set_disk::{get_lock_acquire_timeout, is_valid_storage_class};
-pub(crate) use rustfs_ecstore::store::ECStore;
-#[cfg(test)]
-pub(crate) use rustfs_ecstore::store::init_local_disks;
 pub(crate) use rustfs_ecstore::tier::tier::TierConfigMgr;
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::tier::tier_config::{TierConfig, TierType};

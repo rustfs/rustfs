@@ -14,8 +14,8 @@
 
 #![allow(unused_imports)]
 
+pub(crate) use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
+pub(crate) use rustfs_ecstore::api::storage::ECStore;
+pub(crate) use rustfs_ecstore::api::storage::init_local_disks;
 pub(crate) use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
 pub(crate) use rustfs_ecstore::disk::{DiskStore, endpoint::Endpoint};
-pub(crate) use rustfs_ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
-pub(crate) use rustfs_ecstore::store::ECStore;
-pub(crate) use rustfs_ecstore::store::init_local_disks;

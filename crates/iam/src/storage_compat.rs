@@ -19,7 +19,7 @@ pub(crate) const IAM_CONFIG_ROOT_PREFIX: &str = rustfs_ecstore::config::RUSTFS_C
 pub(crate) type IamEcstoreError = rustfs_ecstore::error::Error;
 pub(crate) type IamStorageError = rustfs_ecstore::error::StorageError;
 pub(crate) type IamStorageResult<T> = rustfs_ecstore::error::Result<T>;
-pub(crate) type IamStore = rustfs_ecstore::store::ECStore;
+pub(crate) type IamStore = rustfs_ecstore::api::storage::ECStore;
 pub(crate) type IamConfigObjectInfo = <IamStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
 pub(crate) type IamConfigObjectOptions = <IamStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
 
@@ -64,14 +64,14 @@ pub(crate) struct IamNotificationPeerErr {
     pub(crate) err: Option<IamEcstoreError>,
 }
 
-impl From<rustfs_ecstore::notification_sys::NotificationPeerErr> for IamNotificationPeerErr {
-    fn from(value: rustfs_ecstore::notification_sys::NotificationPeerErr) -> Self {
+impl From<rustfs_ecstore::api::notification::NotificationPeerErr> for IamNotificationPeerErr {
+    fn from(value: rustfs_ecstore::api::notification::NotificationPeerErr) -> Self {
         Self { err: value.err }
     }
 }
 
 pub(crate) async fn notify_iam_delete_policy(policy_name: &str) -> Vec<IamNotificationPeerErr> {
-    match rustfs_ecstore::notification_sys::get_global_notification_sys() {
+    match rustfs_ecstore::api::notification::get_global_notification_sys() {
         Some(notification_sys) => notification_sys
             .delete_policy(policy_name)
             .await
@@ -83,7 +83,7 @@ pub(crate) async fn notify_iam_delete_policy(policy_name: &str) -> Vec<IamNotifi
 }
 
 pub(crate) async fn notify_iam_load_policy(policy_name: &str) -> Vec<IamNotificationPeerErr> {
-    match rustfs_ecstore::notification_sys::get_global_notification_sys() {
+    match rustfs_ecstore::api::notification::get_global_notification_sys() {
         Some(notification_sys) => notification_sys
             .load_policy(policy_name)
             .await
@@ -95,7 +95,7 @@ pub(crate) async fn notify_iam_load_policy(policy_name: &str) -> Vec<IamNotifica
 }
 
 pub(crate) async fn notify_iam_delete_user(access_key: &str) -> Vec<IamNotificationPeerErr> {
-    match rustfs_ecstore::notification_sys::get_global_notification_sys() {
+    match rustfs_ecstore::api::notification::get_global_notification_sys() {
         Some(notification_sys) => notification_sys
             .delete_user(access_key)
             .await
@@ -107,7 +107,7 @@ pub(crate) async fn notify_iam_delete_user(access_key: &str) -> Vec<IamNotificat
 }
 
 pub(crate) async fn notify_iam_load_user(access_key: &str, temp: bool) -> Vec<IamNotificationPeerErr> {
-    match rustfs_ecstore::notification_sys::get_global_notification_sys() {
+    match rustfs_ecstore::api::notification::get_global_notification_sys() {
         Some(notification_sys) => notification_sys
             .load_user(access_key, temp)
             .await
@@ -119,7 +119,7 @@ pub(crate) async fn notify_iam_load_user(access_key: &str, temp: bool) -> Vec<Ia
 }
 
 pub(crate) async fn notify_iam_load_service_account(access_key: &str) -> Vec<IamNotificationPeerErr> {
-    match rustfs_ecstore::notification_sys::get_global_notification_sys() {
+    match rustfs_ecstore::api::notification::get_global_notification_sys() {
         Some(notification_sys) => notification_sys
             .load_service_account(access_key)
             .await
@@ -131,7 +131,7 @@ pub(crate) async fn notify_iam_load_service_account(access_key: &str) -> Vec<Iam
 }
 
 pub(crate) async fn notify_iam_delete_service_account(access_key: &str) -> Vec<IamNotificationPeerErr> {
-    match rustfs_ecstore::notification_sys::get_global_notification_sys() {
+    match rustfs_ecstore::api::notification::get_global_notification_sys() {
         Some(notification_sys) => notification_sys
             .delete_service_account(access_key)
             .await
@@ -143,7 +143,7 @@ pub(crate) async fn notify_iam_delete_service_account(access_key: &str) -> Vec<I
 }
 
 pub(crate) async fn notify_iam_load_group(group: &str) -> Vec<IamNotificationPeerErr> {
-    match rustfs_ecstore::notification_sys::get_global_notification_sys() {
+    match rustfs_ecstore::api::notification::get_global_notification_sys() {
         Some(notification_sys) => notification_sys.load_group(group).await.into_iter().map(Into::into).collect(),
         None => Vec::new(),
     }
@@ -154,7 +154,7 @@ pub(crate) async fn notify_iam_load_policy_mapping(
     user_type: u64,
     is_group: bool,
 ) -> Vec<IamNotificationPeerErr> {
-    match rustfs_ecstore::notification_sys::get_global_notification_sys() {
+    match rustfs_ecstore::api::notification::get_global_notification_sys() {
         Some(notification_sys) => notification_sys
             .load_policy_mapping(user_or_group, user_type, is_group)
             .await

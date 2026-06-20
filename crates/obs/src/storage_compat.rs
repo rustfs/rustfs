@@ -22,7 +22,7 @@ use std::time::Duration;
 
 pub(crate) use rustfs_ecstore::data_usage::load_data_usage_from_backend as load_obs_data_usage_from_backend;
 
-pub(crate) type ObsStore = rustfs_ecstore::store::ECStore;
+pub(crate) type ObsStore = rustfs_ecstore::api::storage::ECStore;
 type ObsStorageInfo = <ObsStore as StorageAdminApi>::StorageInfo;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,11 +50,17 @@ pub(crate) fn resolve_obs_object_store_handle() -> Option<Arc<ObsStore>> {
 }
 
 pub(crate) fn obs_total_usable_capacity_bytes(storage_info: &ObsStorageInfo) -> u64 {
-    usize_to_u64_saturating(rustfs_ecstore::pools::get_total_usable_capacity(&storage_info.disks, storage_info))
+    usize_to_u64_saturating(rustfs_ecstore::api::capacity::get_total_usable_capacity(
+        &storage_info.disks,
+        storage_info,
+    ))
 }
 
 pub(crate) fn obs_total_usable_capacity_free_bytes(storage_info: &ObsStorageInfo) -> u64 {
-    usize_to_u64_saturating(rustfs_ecstore::pools::get_total_usable_capacity_free(&storage_info.disks, storage_info))
+    usize_to_u64_saturating(rustfs_ecstore::api::capacity::get_total_usable_capacity_free(
+        &storage_info.disks,
+        storage_info,
+    ))
 }
 
 pub(crate) async fn obs_bucket_quota_limit_bytes(bucket: &str) -> u64 {
