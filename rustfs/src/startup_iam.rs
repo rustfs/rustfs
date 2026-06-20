@@ -358,6 +358,23 @@ pub async fn bootstrap_or_defer_iam_init_with_startup_kms(
     bootstrap_or_defer_iam_init(store, kms_interface, readiness, state_manager, shutdown_token).await
 }
 
+pub(crate) async fn init_embedded_iam_runtime(
+    store: Arc<ECStore>,
+    ctx: tokio_util::sync::CancellationToken,
+    readiness: Arc<GlobalReadiness>,
+) -> Result<IamBootstrapDisposition> {
+    bootstrap_or_defer_iam_init_with_startup_kms(store, readiness, None, Some(ctx)).await
+}
+
+pub(crate) async fn init_iam_runtime(
+    store: Arc<ECStore>,
+    ctx: tokio_util::sync::CancellationToken,
+    readiness: Arc<GlobalReadiness>,
+    state_manager: Arc<ServiceStateManager>,
+) -> Result<IamBootstrapDisposition> {
+    bootstrap_or_defer_iam_init_with_startup_kms(store, readiness, Some(state_manager), Some(ctx)).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

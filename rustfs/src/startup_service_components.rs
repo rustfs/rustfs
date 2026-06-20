@@ -22,11 +22,9 @@ use crate::{
         add_bucket_notification_configuration, init_auto_tuner, init_buffer_profile_system, init_kms_system, init_update_check,
         print_server_info,
     },
-    server::{ServiceStateManager, init_event_notifier, start_audit_system},
-    startup_iam::{IamBootstrapDisposition, bootstrap_or_defer_iam_init_with_startup_kms},
+    server::{init_event_notifier, start_audit_system},
 };
 use rustfs_audit::AuditResult;
-use rustfs_common::GlobalReadiness;
 use rustfs_heal::{create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager};
 use rustfs_iam::init_oidc_sys;
 use rustfs_obs::init_metrics_runtime;
@@ -155,23 +153,6 @@ pub(crate) async fn init_bucket_metadata_runtime(store: Arc<ECStore>, ctx: Cance
     init_bucket_metadata_sys(store, buckets.clone()).await;
 
     Ok(buckets)
-}
-
-pub(crate) async fn init_embedded_iam_runtime(
-    store: Arc<ECStore>,
-    ctx: CancellationToken,
-    readiness: Arc<GlobalReadiness>,
-) -> Result<IamBootstrapDisposition> {
-    bootstrap_or_defer_iam_init_with_startup_kms(store, readiness, None, Some(ctx)).await
-}
-
-pub(crate) async fn init_iam_runtime(
-    store: Arc<ECStore>,
-    ctx: CancellationToken,
-    readiness: Arc<GlobalReadiness>,
-    state_manager: Arc<ServiceStateManager>,
-) -> Result<IamBootstrapDisposition> {
-    bootstrap_or_defer_iam_init_with_startup_kms(store, readiness, Some(state_manager), Some(ctx)).await
 }
 
 pub(crate) async fn init_embedded_notification_runtime(endpoint_pools: EndpointServerPools, buckets: Vec<String>) {

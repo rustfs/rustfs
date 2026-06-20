@@ -2498,6 +2498,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
     freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `R-057` Move startup IAM runtime facade into startup IAM.
+  - Do: move the main and embedded IAM runtime facade helpers out of startup
+    service components and into the startup IAM module.
+  - Acceptance: startup services still call one IAM-facing API for embedded and
+    main startup, while service components no longer own IAM facade wiring.
+  - Must preserve: embedded versus main state-manager wiring, shutdown token
+    propagation, IAM bootstrap disposition handling, KMS startup handle
+    resolution, and degraded recovery behavior.
+  - Verification: focused startup IAM/KMS checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
 - [x] `E-001/E-SET-001` Add ECStore layout skeleton and set-layout boundary.
   - Do: create the ECStore internal layout ownership buckets and pin static set
     layout versus runtime `Sets`/`SetDisks` orchestration boundaries before any
@@ -2747,16 +2759,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-056 keeps startup services on startup IAM while moving KMS runtime handle ownership into the app context startup boundary. |
-| Migration preservation | passed | KMS singleton reuse/init behavior, IAM bootstrap order, degraded recovery, readiness stages, and log behavior stay unchanged. |
-| Testing/verification | passed | Focused startup KMS checks, RustFS lib check, architecture/layer/unsafe guards, formatting, diff hygiene, and Rust risk scan passed. |
+| Quality/architecture | passed | R-056 and R-057 keep startup services on startup IAM while moving KMS ownership into app context and IAM facade wiring into startup IAM. |
+| Migration preservation | passed | KMS singleton reuse/init behavior, embedded/main IAM wiring, IAM bootstrap order, degraded recovery, readiness stages, and log behavior stay unchanged. |
+| Testing/verification | passed | Focused startup IAM/KMS checks, RustFS lib check, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
 
-- Issue #660 R-056 current slice:
+- Issue #660 R-056/R-057 current slice:
   - `cargo test -p rustfs --lib startup_kms -- --nocapture`: passed; 2
+    tests.
+  - `cargo test -p rustfs --lib startup_iam -- --nocapture`: passed; 8
     tests.
   - `cargo check -p rustfs --lib`: passed.
   - `cargo fmt --all --check`: passed.

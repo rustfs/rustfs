@@ -17,13 +17,12 @@ use crate::{
     config::Config,
     init::{init_buffer_profile_system, init_kms_system},
     server::ServiceStateManager,
-    startup_iam::IamBootstrapDisposition,
+    startup_iam::{IamBootstrapDisposition, init_embedded_iam_runtime, init_iam_runtime},
     startup_optional_runtime_sidecars::{OptionalRuntimeServices, init_optional_runtime_services},
     startup_service_components::{
         init_audit_runtime, init_auth_integrations, init_background_service_runtime, init_bucket_metadata_runtime,
-        init_deadlock_detector_runtime, init_embedded_bucket_metadata_runtime, init_embedded_iam_runtime,
-        init_embedded_notification_runtime, init_embedded_optional_service_runtime, init_iam_runtime, init_notification_runtime,
-        init_observability_runtime,
+        init_deadlock_detector_runtime, init_embedded_bucket_metadata_runtime, init_embedded_notification_runtime,
+        init_embedded_optional_service_runtime, init_notification_runtime, init_observability_runtime,
     },
 };
 use rustfs_common::GlobalReadiness;
