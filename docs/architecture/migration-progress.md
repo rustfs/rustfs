@@ -2536,6 +2536,44 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     check, migration/layer guards, formatting, diff hygiene, Rust risk scan,
     branch freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `R-060` Move startup auth integration owner.
+  - Do: move Keystone and OIDC startup integration wiring out of startup service
+    components and into an auth startup module.
+  - Acceptance: startup services still initialize auth integrations after IAM
+    bootstrap and before notification setup, with Keystone failures remaining
+    non-fatal and OIDC failures still logged as warnings.
+  - Must preserve: Keystone env parsing error mapping, Keystone success/failure
+    log fields, OIDC warning fields, and startup ordering.
+  - Verification: focused startup checks, RustFS lib check, migration/layer
+    guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `R-061` Move startup background service owner.
+  - Do: move scanner/heal background runtime setup out of startup service
+    components and into a background startup module.
+  - Acceptance: startup services still receive the same scanner-enabled flag,
+    while AHM cancellation-token creation, scanner/heal env parsing, heal
+    manager initialization, and disabled-state logging stay unchanged.
+  - Must preserve: env alias behavior, heal/scanner default enablement, disabled
+    debug log fields, and heal storage ownership.
+  - Verification: focused startup checks, RustFS lib check, migration/layer
+    guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `R-062` Move startup observability runtime owner.
+  - Do: move server-info, update-check, allocator reclaim, metrics, memory
+    observability, and auto-tuner startup wiring out of startup service
+    components and into an observability startup module.
+  - Acceptance: observability side effects still run after background services,
+    metrics-gated components keep the same guard, and cancellation-token clone
+    behavior stays unchanged.
+  - Must preserve: server-info/update-check ordering, allocator reclaim
+    initialization, metrics enablement, memory observability setup, and
+    auto-tuner startup.
+  - Verification: focused startup checks, RustFS lib check, migration/layer
+    guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
 - [x] `E-001/E-SET-001` Add ECStore layout skeleton and set-layout boundary.
   - Do: create the ECStore internal layout ownership buckets and pin static set
     layout versus runtime `Sets`/`SetDisks` orchestration boundaries before any
@@ -2785,18 +2823,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-056 through R-059 keep startup services as orchestration while moving KMS, IAM facade, bucket metadata, and notification ownership to focused startup modules. |
-| Migration preservation | passed | KMS singleton reuse/init behavior, embedded/main IAM wiring, bucket metadata migration/resync order, notification setup, readiness stages, and log behavior stay unchanged. |
+| Quality/architecture | passed | R-056 through R-062 keep startup services as orchestration while moving KMS, IAM facade, bucket metadata, notification, auth, background, and observability ownership to focused startup modules. |
+| Migration preservation | passed | KMS singleton reuse/init behavior, embedded/main IAM wiring, bucket metadata migration/resync order, notification/auth/background/observability setup, readiness stages, and log behavior stay unchanged. |
 | Testing/verification | passed | Focused startup IAM/KMS/service/notification checks, RustFS lib check, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
 
-- Issue #660 R-056/R-059 current slice:
+- Issue #660 R-056/R-062 current slice:
   - `cargo test -p rustfs --lib startup_kms -- --nocapture`: passed; 2
     tests.
   - `cargo test -p rustfs --lib startup_iam -- --nocapture`: passed; 8
+    tests.
+  - `cargo test -p rustfs --lib startup_ -- --nocapture`: passed; 53
     tests.
   - `cargo test -p rustfs --lib startup_service_components -- --nocapture`:
     passed; 2 tests.

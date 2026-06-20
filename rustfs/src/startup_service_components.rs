@@ -12,41 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_compat::ECStore;
 use crate::{
     config::Config,
-    init::{init_auto_tuner, init_buffer_profile_system, init_kms_system, init_update_check, print_server_info},
+    init::{init_buffer_profile_system, init_kms_system},
     server::{init_event_notifier, start_audit_system},
 };
 use rustfs_audit::AuditResult;
-use rustfs_heal::{create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager};
-use rustfs_iam::init_oidc_sys;
-use rustfs_obs::init_metrics_runtime;
-use rustfs_utils::get_env_bool_with_aliases;
-use std::{
-    future::Future,
-    io::{Error, Result},
-    sync::Arc,
-};
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use std::future::Future;
+use tracing::{error, info, warn};
 
-const ENV_SCANNER_ENABLED: &str = "RUSTFS_SCANNER_ENABLED";
-const ENV_SCANNER_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_SCANNER";
-const ENV_HEAL_ENABLED: &str = "RUSTFS_HEAL_ENABLED";
-const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
 const LOG_COMPONENT_MAIN: &str = "main";
 const LOG_COMPONENT_EMBEDDED: &str = "embedded";
 const LOG_SUBSYSTEM_STARTUP: &str = "startup";
-const LOG_SUBSYSTEM_AUTH: &str = "auth";
 const LOG_SUBSYSTEM_EMBEDDED: &str = "embedded";
 const EVENT_AUDIT_SYSTEM_STATE: &str = "audit_system_state";
 const EVENT_DEADLOCK_DETECTOR_STATE: &str = "deadlock_detector_state";
 const EVENT_EMBEDDED_OPTIONAL_SERVICE_SKIPPED: &str = "embedded_optional_service_skipped";
-const EVENT_KEYSTONE_AUTH_INITIALIZED: &str = "keystone_auth_initialized";
-const EVENT_KEYSTONE_AUTH_INITIALIZATION_FAILED: &str = "keystone_auth_initialization_failed";
-const EVENT_OIDC_INITIALIZATION_FAILED: &str = "oidc_initialization_failed";
-const EVENT_BACKGROUND_SERVICES_CONFIGURED: &str = "background_services_configured";
 
 pub(crate) async fn init_audit_runtime() {
     match init_event_notifier_and_audit().await {
@@ -103,92 +84,6 @@ pub(crate) fn init_deadlock_detector_runtime() {
             state = "disabled",
             "Deadlock detector disabled"
         );
-    }
-}
-
-pub(crate) async fn init_auth_integrations() -> Result<()> {
-    let keystone_config = rustfs_keystone::KeystoneConfig::from_env().map_err(Error::other)?;
-    if keystone_config.enable {
-        match crate::auth_keystone::init_keystone_auth(keystone_config).await {
-            Ok(_) => info!(
-                event = EVENT_KEYSTONE_AUTH_INITIALIZED,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_AUTH,
-                "Initialized Keystone authentication"
-            ),
-            Err(e) => {
-                error!(
-                    event = EVENT_KEYSTONE_AUTH_INITIALIZATION_FAILED,
-                    component = LOG_COMPONENT_MAIN,
-                    subsystem = LOG_SUBSYSTEM_AUTH,
-                    error = %e,
-                    "Failed to initialize Keystone authentication"
-                );
-            }
-        }
-    }
-
-    if let Err(e) = init_oidc_sys().await {
-        warn!(
-            event = EVENT_OIDC_INITIALIZATION_FAILED,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_AUTH,
-            error = %e,
-            "OIDC initialization failed; continuing without OIDC providers"
-        );
-    }
-
-    Ok(())
-}
-
-pub(crate) async fn init_background_service_runtime(store: Arc<ECStore>) -> Result<bool> {
-    let _ = create_ahm_services_cancel_token();
-
-    let enable_scanner = get_env_bool_with_aliases(ENV_SCANNER_ENABLED, &[ENV_SCANNER_ENABLED_DEPRECATED], true);
-    let enable_heal = get_env_bool_with_aliases(ENV_HEAL_ENABLED, &[ENV_HEAL_ENABLED_DEPRECATED], true);
-
-    info!(
-        target: "rustfs::main::run",
-        event = EVENT_BACKGROUND_SERVICES_CONFIGURED,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        enable_scanner = enable_scanner,
-        enable_heal = enable_heal,
-        "Background services configured"
-    );
-
-    if enable_heal || enable_scanner {
-        let heal_storage = Arc::new(ECStoreHealStorage::new(store));
-        init_heal_manager(heal_storage, None).await?;
-    }
-
-    if !enable_heal && !enable_scanner {
-        debug!(
-            target: "rustfs::main::run",
-            event = EVENT_BACKGROUND_SERVICES_CONFIGURED,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            enable_scanner = false,
-            enable_heal = false,
-            ahm_state = "skipped",
-            reason = "disabled",
-            "Background services disabled"
-        );
-    }
-
-    Ok(enable_scanner)
-}
-
-pub(crate) async fn init_observability_runtime(ctx: CancellationToken) {
-    print_server_info();
-    init_update_check();
-    crate::allocator_reclaim::init_allocator_reclaim(ctx.clone());
-
-    if rustfs_obs::observability_metric_enabled() {
-        rustfs_io_metrics::set_put_stage_metrics_enabled(true);
-        init_metrics_runtime(ctx.clone());
-        crate::memory_observability::init_memory_observability(ctx.clone());
-        init_auto_tuner(ctx).await;
     }
 }
 
