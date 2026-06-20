@@ -5,22 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-rebalance-entry-flow`
-- Baseline: completed `E-015/E-REBALANCE-009`.
-- Stacked on: merged ECStore layout foundation, format layout ownership, and
-  endpoint layout move slices plus the set-format heal, pool-space layout
-  helper, rebalance support helper, pool-space builder, rebalance metadata
-  helper, rebalance worker helper, rebalance migration helper, rebalance state
-  impl, rebalance control impl, rebalance runtime loop, rebalance entry flow,
-  rebalance unit-test split, and rebalance type-owner slices.
+- Branch: `overtrue/arch-embedded-builder-startup-context`
+- Baseline: completed `R-034/R-035`.
+- Stacked on: embedded runtime hook and shutdown glue extraction slices.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move ECStore rebalance control, runtime, entry flow,
-  inline tests, and type contracts into dedicated rebalance submodules while
-  preserving public root paths.
+- Rust code changes: move embedded startup config preparation and S3-only HTTP
+  server startup into startup server helpers while preserving embedded builder
+  behavior.
 - CI/script changes: none.
-- Docs changes: record the combined ECStore rebalance control/runtime/entry
-  flow, test-module split, and type-owner split slices.
+- Docs changes: record the embedded startup config and HTTP startup owner
+  slices.
 
 ## Phase 0 Tasks
 
@@ -2245,6 +2240,32 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
     freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `R-036` Extract embedded startup config preparation boundary.
+  - Do: move embedded temporary volume allocation, custom volume directory
+    creation, and embedded `Config` construction behind startup server helpers.
+  - Acceptance: embedded builder still creates a temporary volume when none is
+    provided, creates missing custom volume directories, disables console for
+    embedded S3 startup, and keeps the temp-dir guard alive until success.
+  - Must preserve: temp-dir cleanup-on-failure behavior, configured address,
+    access key, secret key, region, volume ordering, directory creation error
+    text, and no new normal startup behavior.
+  - Verification: focused startup server and embedded checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `R-037` Extract embedded S3-only HTTP startup boundary.
+  - Do: move embedded S3-only HTTP server startup behind a startup server
+    helper that returns the bound address and shutdown handle.
+  - Acceptance: embedded startup keeps console disabled for the HTTP server,
+    keeps using the same readiness object, and preserves the shutdown handle
+    and bound address used by `RustFSServer`.
+  - Must preserve: S3-only embedded HTTP config, readiness sharing, startup
+    error propagation, shutdown signaling, bound endpoint reporting, and no
+    public embedded API behavior changes.
+  - Verification: focused startup server and embedded checks, RustFS lib check,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
 - [x] `E-001/E-SET-001` Add ECStore layout skeleton and set-layout boundary.
   - Do: create the ECStore internal layout ownership buckets and pin static set
     layout versus runtime `Sets`/`SetDisks` orchestration boundaries before any
@@ -2488,19 +2509,32 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Next PRs
 
 1. `pure-move`: continue pruning residual embedded startup-only orchestration
-   after the runtime hook and shutdown glue boundaries land.
+   after the builder config and S3-only HTTP startup boundaries land.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-034 and R-035 move embedded runtime hooks and async shutdown glue into startup owners while keeping the embedded builder focused on startup orchestration. |
-| Migration preservation | passed | Observability error prefixes, embedded crypto log fields, trusted-proxy timing, cancellation, audit cleanup, HTTP shutdown, temp-dir cleanup, and stopped logs stay in the same order. |
-| Testing/verification | passed | Focused runtime/embedded checks, RustFS lib check, architecture/layer guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
+| Quality/architecture | passed | R-036 and R-037 move embedded builder config preparation and S3-only HTTP startup into startup server helpers without exposing new public API. |
+| Migration preservation | passed | Temp-dir guard lifetime, volume directory creation, embedded config fields, console-disabled S3 startup, readiness sharing, shutdown handle, and bound address behavior stay unchanged. |
+| Testing/verification | passed | Focused startup server/embedded checks, RustFS lib check, architecture/layer guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 R-036/R-037 current slice:
+  - `cargo test -p rustfs --lib startup_server -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib embedded -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan on changed Rust files: passed; only test-only
+    `expect` calls and the existing embedded temp-dir cleanup path were
+    present.
+  - `make pre-commit`: passed.
 
 - Issue #660 R-034/R-035 current slice:
   - `cargo test -p rustfs --lib startup_runtime_hooks -- --nocapture`:
