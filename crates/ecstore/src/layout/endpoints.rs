@@ -25,8 +25,11 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry},
     io::{Error, ErrorKind, Result},
     net::IpAddr,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use tokio::time::sleep as async_sleep;
 use tracing::{error, info, instrument, warn};
+use url::Host;
 
 /// enum for setup type.
 #[derive(PartialEq, Eq, Debug, Clone)]
@@ -264,18 +267,17 @@ impl PoolEndpointList {
             setup_type: SetupType::Unknown,
         };
 
-        pool_endpoint_list.update_is_local(server_addr.port())?;
+        pool_endpoint_list.update_is_local(server_addr.port()).await?;
 
         for endpoints in pool_endpoint_list.inner.iter_mut() {
             // Check whether same path is not used in endpoints of a host on different port.
             let mut path_ip_map: HashMap<String, HashSet<IpAddr>> = HashMap::new();
-            let mut host_ip_cache = HashMap::new();
+            let mut host_ip_cache: HashMap<Host<&str>, HashSet<IpAddr>> = HashMap::new();
             for ep in endpoints.as_ref() {
-                if !ep.url.has_host() {
+                let Some(host) = ep.url.host() else {
                     continue;
-                }
+                };
 
-                let host = ep.url.host().unwrap();
                 let host_ip_set = if let Some(set) = host_ip_cache.get(&host) {
                     info!(
                         target: "rustfs::ecstore::endpoints",
@@ -284,13 +286,13 @@ impl PoolEndpointList {
                         from = "cache",
                         "Create pool endpoints host '{}' found in cache for endpoint '{}'", host, ep.to_string()
                     );
-                    set
+                    set.clone()
                 } else {
-                    let ips = match get_host_ip(host.clone()).await {
+                    let ips = match resolve_host_ips_with_retry(host.clone(), &ep.to_string()).await {
                         Ok(ips) => ips,
                         Err(e) => {
                             error!("Create pool endpoints host {} not found, error:{}", host, e);
-                            return Err(Error::other(format!("host '{host}' cannot resolve: {e}")));
+                            return Err(e);
                         }
                     };
                     info!(
@@ -303,14 +305,14 @@ impl PoolEndpointList {
                         ips,
                         ep.to_string()
                     );
-                    host_ip_cache.insert(host.clone(), ips);
-                    host_ip_cache.get(&host).unwrap()
+                    host_ip_cache.insert(host.clone(), ips.clone());
+                    ips
                 };
 
                 let path = ep.get_file_path();
                 match path_ip_map.entry(path) {
                     Entry::Occupied(mut e) => {
-                        if e.get().intersection(host_ip_set).count() > 0 {
+                        if e.get().intersection(&host_ip_set).count() > 0 {
                             let path_key = e.key().clone();
                             return Err(Error::other(format!(
                                 "same path '{path_key}' can not be served by different port on same address"
@@ -401,7 +403,12 @@ impl PoolEndpointList {
     }
 
     /// resolves all hosts and discovers which are local
-    fn update_is_local(&mut self, local_port: u16) -> Result<()> {
+    async fn update_is_local(&mut self, local_port: u16) -> Result<()> {
+        self._update_is_local(local_port).await
+    }
+
+    /// resolves all hosts and discovers which are local
+    async fn _update_is_local(&mut self, local_port: u16) -> Result<()> {
         for endpoints in self.inner.iter_mut() {
             for ep in endpoints.as_mut() {
                 match ep.url.host() {
@@ -409,7 +416,9 @@ impl PoolEndpointList {
                         ep.is_local = true;
                     }
                     Some(host) => {
-                        ep.is_local = is_local_host(host, ep.url.port().unwrap_or_default(), local_port)?;
+                        ep.is_local =
+                            resolve_local_host_with_retry(host, ep.url.port().unwrap_or_default(), local_port, &ep.to_string())
+                                .await?;
                     }
                 }
             }
@@ -417,58 +426,148 @@ impl PoolEndpointList {
 
         Ok(())
     }
+}
 
-    /// resolves all hosts and discovers which are local
-    fn _update_is_local(&mut self, local_port: u16) -> Result<()> {
-        let mut eps_resolved = 0;
-        let mut found_local = false;
-        let mut resolved_set: HashSet<(usize, usize)> = HashSet::new();
-        let ep_count: usize = self.inner.iter().map(|v| v.as_ref().len()).sum();
+const DNS_RETRY_TOTAL_TIMEOUT: Duration = Duration::from_secs(90);
+const DNS_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+const DNS_RETRY_MAX_DELAY: Duration = Duration::from_secs(8);
+const DNS_RETRY_JITTER_PERCENT: u64 = 20;
 
-        loop {
-            // Break if the local endpoint is found already Or all the endpoints are resolved.
-            if found_local || eps_resolved == ep_count {
-                break;
-            }
+async fn resolve_local_host_with_retry(host: Host<&str>, port: u16, local_port: u16, context: &str) -> Result<bool> {
+    let started = Instant::now();
+    let mut attempts: u32 = 0;
 
-            for (i, endpoints) in self.inner.iter_mut().enumerate() {
-                for (j, ep) in endpoints.as_mut().iter_mut().enumerate() {
-                    if resolved_set.contains(&(i, j)) {
-                        // Continue if host is already resolved.
-                        continue;
-                    }
-
-                    match ep.url.host() {
-                        None => {
-                            if !found_local {
-                                found_local = true;
-                            }
-                            ep.is_local = true;
-                            eps_resolved += 1;
-                            resolved_set.insert((i, j));
-                            continue;
-                        }
-                        Some(host) => match is_local_host(host, ep.url.port().unwrap_or_default(), local_port) {
-                            Ok(is_local) => {
-                                if !found_local {
-                                    found_local = is_local;
-                                }
-                                ep.is_local = is_local;
-                                eps_resolved += 1;
-                                resolved_set.insert((i, j));
-                            }
-                            Err(err) => {
-                                // TODO Retry infinitely on Kubernetes and Docker swarm?
-                                return Err(err);
-                            }
-                        },
-                    }
+    loop {
+        match is_local_host(host.clone(), port, local_port) {
+            Ok(is_local) => return Ok(is_local),
+            Err(err) => {
+                if !is_retryable_dns_error(&err) {
+                    return Err(Error::other(format!(
+                        "endpoint '{context}' local-host detection failed for host '{host}': {err}"
+                    )));
                 }
+
+                attempts += 1;
+                if started.elapsed() >= DNS_RETRY_TOTAL_TIMEOUT {
+                    return Err(Error::other(format!(
+                        "endpoint '{context}' local-host detection timed out after {attempts} attempts and {:?}: {err}",
+                        DNS_RETRY_TOTAL_TIMEOUT
+                    )));
+                }
+
+                let delay = dns_retry_delay(attempts);
+                warn!(
+                    target = "rustfs::ecstore::endpoints",
+                    context = %context,
+                    host = %host,
+                    endpoint = %context,
+                    attempt = attempts,
+                    delay_ms = delay.as_millis(),
+                    error = %err,
+                    "retrying endpoint local-host detection after temporary DNS error"
+                );
+                async_sleep(delay).await;
             }
         }
-
-        Ok(())
     }
+}
+
+async fn resolve_host_ips_with_retry(host: Host<&str>, context: &str) -> Result<HashSet<IpAddr>> {
+    let started = Instant::now();
+    let mut attempts: u32 = 0;
+
+    loop {
+        match get_host_ip(host.clone()).await {
+            Ok(ips) => return Ok(ips),
+            Err(err) => {
+                if !is_retryable_dns_error(&err) {
+                    return Err(Error::other(format!("endpoint '{context}' host '{host}' cannot resolve: {err}")));
+                }
+
+                attempts += 1;
+                if started.elapsed() >= DNS_RETRY_TOTAL_TIMEOUT {
+                    return Err(Error::other(format!(
+                        "endpoint '{context}' host '{host}' DNS resolution timed out after {attempts} attempts and {:?}: {err}",
+                        DNS_RETRY_TOTAL_TIMEOUT
+                    )));
+                }
+
+                let delay = dns_retry_delay(attempts);
+                warn!(
+                    target = "rustfs::ecstore::endpoints",
+                    context = %context,
+                    host = %host,
+                    attempt = attempts,
+                    delay_ms = delay.as_millis(),
+                    error = %err,
+                    "retrying endpoint DNS resolution after temporary error"
+                );
+                async_sleep(delay).await;
+            }
+        }
+    }
+}
+
+fn is_retryable_dns_error(err: &Error) -> bool {
+    if matches!(
+        err.kind(),
+        ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+            | ErrorKind::TimedOut
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::NotConnected
+            | ErrorKind::UnexpectedEof
+    ) {
+        return true;
+    }
+
+    if matches!(err.raw_os_error(), Some(-3) | Some(-2) | Some(2) | Some(8) | Some(11)) {
+        return true;
+    }
+
+    let message = err.to_string().to_ascii_lowercase();
+    // Kubernetes and Docker DNS records can be observed as negative lookups
+    // while headless service records are still propagating during startup.
+    message.contains("temporary failure in name resolution")
+        || message.contains("try again")
+        || message.contains("name or service not known")
+        || message.contains("no such host")
+        || message.contains("nodename nor servname provided")
+}
+
+fn dns_retry_delay(attempt: u32) -> Duration {
+    let capped_attempt = attempt.min(10);
+    let raw_delay = DNS_RETRY_BASE_DELAY.saturating_mul(1_u32 << capped_attempt);
+    let bounded_delay = if raw_delay > DNS_RETRY_MAX_DELAY {
+        DNS_RETRY_MAX_DELAY
+    } else {
+        raw_delay
+    };
+    apply_jitter(bounded_delay)
+}
+
+fn apply_jitter(delay: Duration) -> Duration {
+    let delay_ms = match u64::try_from(delay.as_millis()) {
+        Ok(delay_ms) => delay_ms,
+        Err(_) => u64::MAX,
+    };
+    if delay_ms == 0 {
+        return delay;
+    }
+
+    let jitter_window_ms = delay_ms.saturating_mul(DNS_RETRY_JITTER_PERCENT) / 100;
+    if jitter_window_ms == 0 {
+        return delay;
+    }
+
+    let jitter_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map_or(0, |ts| u64::from(ts.subsec_nanos()) % (2 * jitter_window_ms + 1));
+
+    delay + Duration::from_millis(jitter_ms)
 }
 
 /// represent endpoints in a given pool
@@ -593,6 +692,10 @@ impl EndpointServerPools {
 
         for pool in self.0.iter() {
             for ep in pool.endpoints.as_ref() {
+                let Ok(pool_idx) = usize::try_from(ep.pool_idx) else {
+                    continue;
+                };
+
                 let n = node_map.entry(ep.host_port()).or_insert_with(|| Node {
                     url: ep.url.clone(),
                     pools: vec![],
@@ -600,8 +703,8 @@ impl EndpointServerPools {
                     grid_host: ep.grid_host(),
                 });
 
-                if !n.pools.contains(&(ep.pool_idx as usize)) {
-                    n.pools.push(ep.pool_idx as usize);
+                if !n.pools.contains(&pool_idx) {
+                    n.pools.push(pool_idx);
                 }
             }
         }
@@ -865,6 +968,25 @@ mod test {
     use temp_env::async_with_vars;
     #[cfg(target_os = "linux")]
     use tempfile::tempdir;
+
+    #[test]
+    fn retryable_dns_error_accepts_startup_dns_transients() {
+        assert!(is_retryable_dns_error(&Error::new(ErrorKind::TimedOut, "resolver timeout")));
+        assert!(is_retryable_dns_error(&Error::other(
+            "failed to lookup address information: Name or service not known"
+        )));
+        assert!(is_retryable_dns_error(&Error::other("no such host")));
+        assert!(is_retryable_dns_error(&Error::other("nodename nor servname provided, or not known")));
+    }
+
+    #[test]
+    fn retryable_dns_error_rejects_configuration_errors() {
+        assert!(!is_retryable_dns_error(&Error::new(
+            ErrorKind::InvalidInput,
+            "invalid URL endpoint format"
+        )));
+        assert!(!is_retryable_dns_error(&Error::other("mixed scheme is not supported")));
+    }
 
     #[test]
     fn test_new_endpoints() {
