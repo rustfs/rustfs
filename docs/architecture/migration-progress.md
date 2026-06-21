@@ -5,15 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-app-context-bootstrap-result`
-- Baseline: completed `R-050/R-051`.
-- Stacked on: embedded startup config identity slice.
-- PR type for this branch: `pure-move`
+- Branch: `overtrue/arch-cluster-control-plane-read-models`
+- Baseline: completed `API-078`.
+- Stacked on: ECStore root global facade prune.
+- PR type for this branch: `api-extraction`
 - Runtime behavior changes: none.
-- Rust code changes: make IAM AppContext bootstrap outcome explicit and reuse
-  it in inline and deferred IAM readiness paths.
-- CI/script changes: none.
-- Docs changes: record the AppContext bootstrap result slices.
+- Rust code changes: add ECStore ClusterControlPlane read models and route
+  RustFS runtime endpoint topology snapshots through the ECStore owner facade.
+- CI/script changes: extend architecture rules for the cluster facade boundary.
+- Docs changes: record the C-001/C-002/C-003 read-model slice.
 
 ## Phase 0 Tasks
 
@@ -497,6 +497,47 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: migration guard, ECStore and RustFS compile coverage,
     formatting, diff hygiene, Rust risk scan, branch freshness check,
     pre-commit quality gate, and three-expert review.
+
+## Phase 5 Cluster Control Plane Tasks
+
+- [x] `C-001` Add topology model.
+  - Completed slice: move endpoint-pool topology mapping behind ECStore's
+    crate-private `cluster` owner module and expose it through
+    `rustfs_ecstore::api::cluster`.
+  - Acceptance: pool, set, and disk topology snapshots are built from existing
+    endpoint assignments without exposing local disk paths or changing
+    placement, readiness, or endpoint construction.
+  - Must preserve: endpoint pool/set/disk indexes, local path privacy,
+    storage-api topology contract shape, runtime capability reasons, and
+    existing RustFS topology provider behavior.
+  - Verification: ECStore topology tests, RustFS runtime topology tests,
+    migration guard, compile coverage, formatting, diff hygiene, risk scan,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `C-002` Add membership model.
+  - Completed slice: add a static membership snapshot that groups endpoint
+    drives by node identity and records drive placement without dynamic
+    membership, health checks, control RPC, or hot-path changes.
+  - Acceptance: URL endpoints group by host:port, path endpoints group under a
+    local node identity, and drive membership carries pool/set/disk placement
+    plus endpoint type/local flags.
+  - Must preserve: no Raft, no Kubernetes watcher, no peer-health behavior, no
+    dynamic membership, and no object I/O or lock-quorum behavior changes.
+  - Verification: ECStore membership tests, compile coverage, migration guard,
+    formatting, diff hygiene, risk scan, pre-commit quality gate, and
+    three-expert review.
+
+- [x] `C-003` Add read-only control plane facade.
+  - Completed slice: add `ClusterControlPlane` as a read-only facade that
+    combines topology and membership snapshots from existing endpoint pools.
+  - Acceptance: outer crates use `rustfs_ecstore::api::cluster` for the facade,
+    while ECStore root `cluster` remains crate-private and migration rules
+    reject restoring it as a public root module.
+  - Must preserve: no worker start/stop, health impact, lock registry mutation,
+    pool state mutation, endpoint publication, or readiness behavior changes.
+  - Verification: control-plane read-snapshot test, migration guard, compile
+    coverage, formatting, diff hygiene, risk scan, pre-commit quality gate, and
+    three-expert review.
 
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.
   - Acceptance: `./scripts/check_architecture_migration_rules.sh` parses the
@@ -3026,13 +3067,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-078 removes remaining ECStore global root re-exports without runtime logic changes. |
-| Migration preservation | passed | Outer access remains through `rustfs_ecstore::api::global`; internal ECStore users route directly to `crate::global`. |
-| Testing/verification | passed | ECStore all-target and RustFS lib/bin compile coverage, migration guards, formatting, diff hygiene, added-line risk scan, and pre-commit gate passed. |
+| Quality/architecture | passed | C-001/C-002/C-003 keeps ClusterControlPlane read models in ECStore with public access only through `api::cluster`. |
+| Migration preservation | passed | Topology and static membership are read-only snapshots from existing endpoint pools; no placement, readiness, health, or lock behavior changes. |
+| Testing/verification | passed | ECStore cluster tests, RustFS runtime capability tests, compile coverage, migration guard, formatting, diff hygiene, risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 C-001/C-002/C-003 current slice:
+  - `cargo check -p rustfs-ecstore --all-targets`: passed.
+  - `cargo check -p rustfs --lib --bins`: passed.
+  - `cargo test -p rustfs-ecstore cluster -- --nocapture`: passed; 4 tests.
+  - `cargo test -p rustfs --lib runtime_capabilities -- --nocapture`: passed; 3 tests.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Rust added-line risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-078 current slice:
   - `cargo check -p rustfs-ecstore --all-targets`: passed.

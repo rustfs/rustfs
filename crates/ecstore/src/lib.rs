@@ -21,6 +21,7 @@ mod batch_processor;
 mod bitrot;
 mod bucket;
 mod cache_value;
+mod cluster;
 mod compress;
 mod config;
 mod data_movement;

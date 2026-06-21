@@ -143,6 +143,10 @@ batch processor root modules once their facade groups exist.
 ECStore root `global` re-exports must also stay removed once consumers use
 `rustfs_ecstore::api::global` or crate-internal `crate::global` paths.
 
+ECStore ClusterControlPlane read models must stay owned by the crate-private
+`cluster` module. Public access goes through `rustfs_ecstore::api::cluster` so
+outer crates cannot depend on ECStore root control-plane internals.
+
 RustFS startup internals must stay crate-private after the startup owner split.
 Only `startup_entrypoint` remains a public startup module for the binary
 entrypoint; IAM bootstrap, optional runtime, and profiling startup shims must

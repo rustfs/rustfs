@@ -233,6 +233,14 @@ require_source_line \
   "crates/ecstore/src/lib.rs" \
   "mod endpoints;" \
   "ECStore legacy endpoint compatibility module crate-private visibility"
+require_source_line \
+  "crates/ecstore/src/lib.rs" \
+  "mod cluster;" \
+  "ECStore cluster control-plane owner module crate-private visibility"
+require_source_line \
+  "crates/ecstore/src/api/mod.rs" \
+  "pub mod cluster {" \
+  "ECStore cluster control-plane public facade"
 for ecstore_private_module in \
   admin_server_info \
   bucket \
@@ -798,7 +806,7 @@ if rg -n --no-heading '^\s*pub\s+mod\s+store_api\s*;' "$ROOT_DIR/crates/ecstore/
   report_failure "ECStore store_api must remain private; expose ECStore-owned object DTO and reader aliases through rustfs_ecstore::object_api"
 fi
 
-if rg -n --no-heading '^\s*pub\s+mod\s+(batch_processor|bitrot|erasure_coding|event|object_api|store_list_objects)\s*;' "$ROOT_DIR/crates/ecstore/src/lib.rs" >"$ECSTORE_PUBLIC_ROOT_MODULE_HITS_FILE"; then
+if rg -n --no-heading '^\s*pub\s+mod\s+(batch_processor|bitrot|cluster|erasure_coding|event|object_api|store_list_objects)\s*;' "$ROOT_DIR/crates/ecstore/src/lib.rs" >"$ECSTORE_PUBLIC_ROOT_MODULE_HITS_FILE"; then
   report_failure "facade-covered ECStore root modules must remain private; expose compatibility through rustfs_ecstore::api: $(paste -sd '; ' "$ECSTORE_PUBLIC_ROOT_MODULE_HITS_FILE")"
 fi
 
