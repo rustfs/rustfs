@@ -5,16 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-outer-consumer-compat-raw-facade-prune`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093`.
-- Stacked on: `overtrue/arch-outer-compat-raw-facade-prune` pending API-093 merge.
+- Branch: `overtrue/arch-root-e2e-compat-raw-facade-prune`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094`.
+- Stacked on: `overtrue/arch-outer-consumer-compat-raw-facade-prune` pending API-094 merge.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: centralize peripheral consumer storage compatibility raw
-  ECStore facade paths behind local `ecstore_*` module aliases.
-- CI/script changes: guard peripheral consumer storage compatibility boundaries
-  against restoring scattered raw ECStore facade paths.
-- Docs changes: record the API-094 consumer facade path cleanup.
+- Rust code changes: centralize RustFS root runtime and e2e storage
+  compatibility raw ECStore facade paths behind local `ecstore_*` module
+  aliases.
+- CI/script changes: guard RustFS root runtime and e2e storage compatibility
+  boundaries against restoring scattered raw ECStore facade paths.
+- Docs changes: record the API-095 root/e2e facade path cleanup.
 
 ## Phase 0 Tasks
 
@@ -346,6 +347,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     metrics, Swift metadata wrappers, S3 Select error checks, and test/fuzz
     harness wrappers.
   - Verification: RustFS compile coverage, consumer raw facade path residual
+    scan, migration guard, formatting, diff hygiene, Rust risk scan,
+    pre-commit quality gate, and three-expert review.
+- [x] `API-095` Prune root/e2e raw facade paths.
+  - Completed slice: replace scattered raw `rustfs_ecstore::api::...` paths in
+    the RustFS root runtime and e2e storage compatibility boundaries with local
+    `ecstore_*` module aliases.
+  - Acceptance: `rustfs/src/storage_compat.rs` and
+    `crates/e2e_test/src/storage_compat.rs` no longer contain raw
+    `rustfs_ecstore::api::...` facade paths outside centralized local alias
+    imports.
+  - Must preserve: root runtime metadata/config/global/storage/RPC wrappers and
+    e2e RPC harness aliases.
+  - Verification: RustFS compile coverage, root/e2e raw facade path residual
     scan, migration guard, formatting, diff hygiene, Rust risk scan,
     pre-commit quality gate, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
@@ -3381,13 +3395,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-094 centralizes peripheral consumer ECStore facade paths behind local `ecstore_*` module aliases without adding nested compatibility modules. |
-| Migration preservation | passed | IAM config and notifications, heal disk lookup, scanner lifecycle and tier helpers, notify server config IO, observability runtime metrics, Swift metadata wrappers, S3 Select error checks, and test/fuzz harness wrappers keep the same ECStore contracts. |
-| Testing/verification | passed | RustFS compile coverage, consumer raw facade path residual scan, migration and layer guards, formatting, diff hygiene, Rust risk scan, full pre-commit, and three-expert review passed. |
+| Quality/architecture | passed | API-095 centralizes RustFS root runtime and e2e ECStore facade paths behind local `ecstore_*` module aliases without adding nested compatibility modules. |
+| Migration preservation | passed | Root runtime metadata/config/global/storage/RPC wrappers and e2e RPC harness aliases keep the same ECStore contracts. |
+| Testing/verification | passed | RustFS compile coverage, root/e2e raw facade path residual scan, migration and layer guards, formatting, diff hygiene, Rust risk scan, full pre-commit, and three-expert review passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-095 current slice:
+  - `cargo check -p rustfs`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - RustFS root/e2e raw facade path residual scan: passed.
+  - Rust risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed; nextest run
+    `a1771057-5015-4861-9a38-b856c8abb6f6`, 6354 passed, 111 skipped; doctests
+    passed.
 
 - Issue #660 API-094 current slice:
   - `cargo check -p rustfs`: passed.

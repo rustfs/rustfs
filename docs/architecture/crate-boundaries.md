@@ -194,6 +194,9 @@ Peripheral consumer storage compatibility boundaries must follow the same
 pattern. IAM, heal, scanner, notify, observability, Swift, S3 Select, test, and
 fuzz storage compatibility modules keep raw ECStore facade access centralized
 behind local `ecstore_*` module aliases.
+RustFS root runtime and e2e storage compatibility boundaries must follow the
+same pattern, keeping raw ECStore facade access centralized behind local
+`ecstore_*` module aliases.
 Scanner, notify, observability, and e2e `storage_compat.rs` boundaries must
 also stay narrow. Scanner must not restore grouped bucket compatibility exports
 for target, lifecycle, metadata, replication, or versioning modules. Notify
