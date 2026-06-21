@@ -18,7 +18,9 @@ use rustfs_concurrency::{
 };
 
 use crate::storage::concurrency::get_concurrency_manager;
-use crate::storage_compat::{get_global_bucket_metadata_sys, get_global_replication_pool, replication_queue_current_count};
+use crate::workload_admission_storage_compat::{
+    get_global_bucket_metadata_sys, get_global_replication_pool, replication_queue_current_count,
+};
 
 const BUCKET_METADATA_RUNTIME_NOT_INITIALIZED: &str = "bucket metadata runtime not initialized";
 const HEAL_MANAGER_NOT_INITIALIZED: &str = "heal manager not initialized";

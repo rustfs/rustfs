@@ -27,11 +27,10 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 
-use crate::storage_compat::RUSTFS_META_BUCKET;
-use crate::storage_compat::get_lock_acquire_timeout;
-use crate::storage_compat::{
+use crate::table_catalog_storage_compat::{
     BUCKET_TABLE_CATALOG_META_PREFIX, BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG,
-    BUCKET_TABLE_RESERVED_PREFIX, EcstoreError, StorageError, get_bucket_metadata, table_catalog_path_hash,
+    BUCKET_TABLE_RESERVED_PREFIX, EcstoreError, RUSTFS_META_BUCKET, StorageError, get_bucket_metadata, get_lock_acquire_timeout,
+    table_catalog_path_hash,
 };
 use bytes::Bytes;
 use datafusion::{
@@ -7886,7 +7885,7 @@ mod tests {
             .map(|(bucket, _)| bucket.as_str())
             .collect::<BTreeSet<_>>();
 
-        assert_eq!(object_buckets, BTreeSet::from([crate::storage_compat::RUSTFS_META_BUCKET]));
+        assert_eq!(object_buckets, BTreeSet::from([RUSTFS_META_BUCKET]));
     }
 
     #[tokio::test]
@@ -10931,9 +10930,7 @@ mod tests {
             .await
             .unwrap();
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
-        backend
-            .fail_put_attempt(crate::storage_compat::RUSTFS_META_BUCKET, &idempotency_path, 1)
-            .await;
+        backend.fail_put_attempt(RUSTFS_META_BUCKET, &idempotency_path, 1).await;
 
         let err = store
             .commit_table(TableCommitRequest {
@@ -10981,9 +10978,7 @@ mod tests {
             .await
             .unwrap();
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
-        backend
-            .fail_put_attempt(crate::storage_compat::RUSTFS_META_BUCKET, &commit_path, 2)
-            .await;
+        backend.fail_put_attempt(RUSTFS_META_BUCKET, &commit_path, 2).await;
 
         let request = TableCommitRequest {
             table_bucket: bucket.to_string(),
@@ -11036,9 +11031,7 @@ mod tests {
             .await
             .unwrap();
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
-        backend
-            .fail_put_attempt(crate::storage_compat::RUSTFS_META_BUCKET, &commit_path, 2)
-            .await;
+        backend.fail_put_attempt(RUSTFS_META_BUCKET, &commit_path, 2).await;
 
         let result = store
             .commit_table(TableCommitRequest {
@@ -11090,9 +11083,7 @@ mod tests {
             .await
             .unwrap();
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
-        backend
-            .fail_put_attempt(crate::storage_compat::RUSTFS_META_BUCKET, &commit_path, 2)
-            .await;
+        backend.fail_put_attempt(RUSTFS_META_BUCKET, &commit_path, 2).await;
 
         store
             .commit_table(TableCommitRequest {
@@ -11144,9 +11135,7 @@ mod tests {
             .await
             .unwrap();
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
-        backend
-            .fail_put_attempt(crate::storage_compat::RUSTFS_META_BUCKET, &commit_path, 2)
-            .await;
+        backend.fail_put_attempt(RUSTFS_META_BUCKET, &commit_path, 2).await;
 
         store
             .commit_table(TableCommitRequest {
@@ -11195,9 +11184,7 @@ mod tests {
             .unwrap();
         backend.seed_object(bucket, &current_metadata, b"{}".to_vec()).await;
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
-        backend
-            .fail_put_attempt(crate::storage_compat::RUSTFS_META_BUCKET, &table_path, 2)
-            .await;
+        backend.fail_put_attempt(RUSTFS_META_BUCKET, &table_path, 2).await;
 
         let err = store
             .commit_table(TableCommitRequest {
@@ -11252,9 +11239,7 @@ mod tests {
             .await
             .unwrap();
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
-        backend
-            .fail_put_attempt(crate::storage_compat::RUSTFS_META_BUCKET, &idempotency_path, 2)
-            .await;
+        backend.fail_put_attempt(RUSTFS_META_BUCKET, &idempotency_path, 2).await;
 
         let result = store
             .commit_table(TableCommitRequest {
