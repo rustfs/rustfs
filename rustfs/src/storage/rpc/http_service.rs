@@ -15,6 +15,7 @@
 use crate::server::RPC_PREFIX;
 use crate::storage::request_context::spawn_traced;
 use crate::storage::storage_compat::DEFAULT_READ_BUFFER_SIZE;
+use crate::storage::storage_compat::StorageDiskRpcExt as _;
 use crate::storage::storage_compat::WalkDirOptions;
 use crate::storage::storage_compat::find_local_disk_by_ref;
 use crate::storage::storage_compat::verify_rpc_signature;
@@ -24,7 +25,6 @@ use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_ecstore::api::disk::DiskAPI as _;
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
     INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,

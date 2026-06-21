@@ -200,9 +200,10 @@ same pattern, keeping raw ECStore facade access centralized behind local
 Outer bucket lifecycle, replication, versioning, object-lock, and
 restore-request trait method access must stay behind local compatibility traits
 or wrapper functions. Non-compat sources must not import those ECStore bucket
-API traits directly after the wrapper boundary is established. Remaining
-temporary direct ECStore method-resolution imports are limited to disk, RPC peer
-client, and warm-backend traits until their hot-path wrappers are isolated.
+API traits directly after the wrapper boundary is established. Disk, RPC peer
+client, and warm-backend method-resolution access must follow the same pattern:
+non-compat sources use owner-local compatibility traits or test aliases instead
+of importing ECStore traits directly.
 Scanner, notify, observability, and e2e `storage_compat.rs` boundaries must
 also stay narrow. Scanner must not restore grouped bucket compatibility exports
 for target, lifecycle, metadata, replication, or versioning modules. Notify

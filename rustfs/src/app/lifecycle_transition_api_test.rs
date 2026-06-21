@@ -15,7 +15,7 @@
 use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};
 use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::app::storage_compat::{
-    ECStore, Endpoint, EndpointServerPools, Endpoints, GLOBAL_TierConfigMgr, PoolEndpoints, TierConfig, TierType,
+    AppWarmBackend, ECStore, Endpoint, EndpointServerPools, Endpoints, GLOBAL_TierConfigMgr, PoolEndpoints, TierConfig, TierType,
     WarmBackendGetOpts,
     metadata::{BUCKET_LIFECYCLE_CONFIG, OBJECT_LOCK_CONFIG},
     metadata_sys,
@@ -31,7 +31,6 @@ use futures::FutureExt;
 use futures::stream;
 use http::{Extensions, HeaderMap, HeaderValue, Method, Uri, header::IF_NONE_MATCH};
 use rustfs_config::{ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT};
-use rustfs_ecstore::api::tier::warm_backend::WarmBackend;
 use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
 use rustfs_storage_api::{
     BucketOperations, BucketOptions, ListOperations as _, MakeBucketOptions, MultipartOperations as _, ObjectIO as _,
@@ -295,7 +294,7 @@ impl MockWarmBackend {
 }
 
 #[async_trait::async_trait]
-impl WarmBackend for MockWarmBackend {
+impl AppWarmBackend for MockWarmBackend {
     async fn put(&self, object: &str, r: ReaderImpl, _length: i64) -> Result<String, std::io::Error> {
         let bytes = self.read_bytes(r).await?;
         Ok(self.put_bytes(object, bytes).await)

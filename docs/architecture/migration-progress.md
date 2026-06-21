@@ -5,17 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-compat-trait-method-wrappers`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095`.
-- Stacked on: `overtrue/arch-root-e2e-compat-raw-facade-prune` pending API-095 merge.
+- Branch: `overtrue/arch-disk-rpc-method-wrappers`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096`.
+- Stacked on: `overtrue/arch-compat-trait-method-wrappers` pending API-096 merge.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move remaining outer bucket lifecycle, replication,
-  versioning, object-lock, and restore-request trait method access behind
-  local compatibility traits and wrapper functions.
-- CI/script changes: stop allowing those bucket trait imports as direct ECStore
+- Rust code changes: move remaining disk RPC, peer S3 RPC, heal/scanner disk,
+  and warm-backend test method access behind local compatibility traits or
+  aliases.
+- CI/script changes: remove the final direct ECStore method-resolution import
   exceptions outside compatibility boundaries.
-- Docs changes: record the API-096 trait-method wrapper cleanup.
+- Docs changes: record the API-097 disk/RPC/warm-backend wrapper cleanup.
 
 ## Phase 0 Tasks
 
@@ -376,6 +376,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: RustFS/scanner/heal compile coverage, direct bucket trait
     import residual scan, migration guard, formatting, diff hygiene, Rust risk
     scan, pre-commit quality gate, and three-expert review.
+- [x] `API-097` Prune disk/RPC/warm-backend method imports.
+  - Current slice: move disk RPC, peer S3 RPC, heal/scanner disk, and
+    warm-backend test method access behind local compatibility traits or
+    aliases in the owning boundaries.
+  - Acceptance: non-compat RustFS, scanner, heal, and test sources no longer
+    import ECStore `DiskAPI`, `PeerS3Client`, or `WarmBackend` traits directly;
+    the migration guard no longer allowlists those direct imports.
+  - Must preserve: disk RPC request/response behavior, internode HTTP file and
+    walk streams, heal resume and auto-scan disk handling, scanner disk scan
+    behavior, and transition warm-backend test harness behavior.
+  - Verification: RustFS/scanner/heal/e2e compile coverage, direct
+    disk/RPC/warm-backend trait import residual scan, migration guard,
+    formatting, diff hygiene, Rust risk scan, pre-commit quality gate, and
+    three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3409,13 +3423,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-096 localizes bucket trait method access behind owner-local compatibility traits/wrappers without re-exporting ECStore traits or widening the facade. |
-| Migration preservation | pass | App/admin/storage/scanner call sites keep the same method names or direct wrapper calls; disk/RPC/warm-backend exceptions are unchanged. |
-| Testing/verification | pass | Focused compile, residual scan, migration guard, formatting, diff hygiene, added-line risk scan, and full pre-commit passed. |
+| Quality/architecture | pass | API-097 localizes disk/RPC/warm-backend method access behind owner-local compatibility traits and aliases without widening non-compat imports. |
+| Migration preservation | pass | RPC, heal, scanner, and transition-test call sites keep existing behavior while losing direct ECStore trait imports. |
+| Testing/verification | pass | Focused compile, residual scan, migration guard, layer guard, formatting, diff hygiene, risk scan, and full pre-commit passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-097 current slice:
+  - `cargo check -p rustfs -p rustfs-scanner -p rustfs-heal -p e2e_test --tests`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Direct non-compat disk/RPC/warm-backend trait import residual scan: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-096 current slice:
   - `cargo check -p rustfs -p rustfs-scanner -p rustfs-heal`: passed.

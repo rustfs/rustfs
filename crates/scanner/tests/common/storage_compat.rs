@@ -41,7 +41,21 @@ pub(crate) type TierConfigMgr = ecstore_tier::tier::TierConfigMgr;
 pub(crate) type TierMinIO = ecstore_tier::tier_config::TierMinIO;
 pub(crate) type TierType = ecstore_tier::tier_config::TierType;
 pub(crate) type TransitionOptions = ecstore_bucket::lifecycle::lifecycle::TransitionOptions;
+pub(crate) use ecstore_tier::warm_backend::WarmBackend as ScannerWarmBackend;
 pub(crate) type WarmBackendGetOpts = ecstore_tier::warm_backend::WarmBackendGetOpts;
+
+pub(crate) trait ScannerTestDiskExt {
+    async fn read_metadata(&self, volume: &str, path: &str) -> ecstore_disk::error::Result<ecstore_disk::Bytes>;
+}
+
+impl<T> ScannerTestDiskExt for T
+where
+    T: ecstore_disk::DiskAPI,
+{
+    async fn read_metadata(&self, volume: &str, path: &str) -> ecstore_disk::error::Result<ecstore_disk::Bytes> {
+        ecstore_disk::DiskAPI::read_metadata(self, volume, path).await
+    }
+}
 
 #[allow(non_snake_case)]
 pub(crate) fn EndpointServerPools(pools: Vec<PoolEndpoints>) -> EndpointServerPools {

@@ -691,12 +691,7 @@ fi
     --glob '!**/storage_compat.rs' \
     --glob '!target/**' || true
 ) |
-  perl -ne '
-    next if /\buse rustfs_ecstore::api::disk::DiskAPI(?:\s+as\s+_)?;/;
-    next if /\buse rustfs_ecstore::api::rpc::PeerS3Client(?:\s+as\s+_)?;/;
-    next if /\buse rustfs_ecstore::api::tier::warm_backend::WarmBackend(?:\s+as\s+_)?;/;
-    print;
-  ' >"$DIRECT_ECSTORE_IMPORT_HITS_FILE"
+  cat >"$DIRECT_ECSTORE_IMPORT_HITS_FILE"
 
 if [[ -s "$DIRECT_ECSTORE_IMPORT_HITS_FILE" ]]; then
   report_failure "direct rustfs_ecstore imports outside compatibility boundaries are forbidden: $(paste -sd '; ' "$DIRECT_ECSTORE_IMPORT_HITS_FILE")"

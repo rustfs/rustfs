@@ -57,6 +57,8 @@ pub(crate) type TierConfig = crate::app::storage_compat::ecstore_tier::tier_conf
 #[cfg(test)]
 pub(crate) type TierType = crate::app::storage_compat::ecstore_tier::tier_config::TierType;
 #[cfg(test)]
+pub(crate) use crate::app::storage_compat::ecstore_tier::warm_backend::WarmBackend as AppWarmBackend;
+#[cfg(test)]
 pub(crate) type WarmBackendGetOpts = crate::app::storage_compat::ecstore_tier::warm_backend::WarmBackendGetOpts;
 
 #[cfg(test)]

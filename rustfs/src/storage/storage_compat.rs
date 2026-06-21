@@ -40,29 +40,323 @@ pub(crate) type BucketMetadata = ecstore_bucket::metadata::BucketMetadata;
 #[cfg(test)]
 pub(crate) type BucketMetadataSys = ecstore_bucket::metadata_sys::BucketMetadataSys;
 pub(crate) type BucketVersioningSys = ecstore_bucket::versioning_sys::BucketVersioningSys;
+pub(crate) type CheckPartsResp = ecstore_disk::CheckPartsResp;
 pub(crate) type CollectMetricsOpts = ecstore_metrics::CollectMetricsOpts;
 pub(crate) type DeleteOptions = ecstore_disk::DeleteOptions;
 pub(crate) type DiskError = ecstore_disk::error::DiskError;
+pub(crate) type DiskInfo = ecstore_disk::DiskInfo;
 pub(crate) type DiskInfoOptions = ecstore_disk::DiskInfoOptions;
+pub(crate) type DiskResult<T> = ecstore_disk::error::Result<T>;
 pub(crate) type DiskStore = ecstore_disk::DiskStore;
 pub(crate) type ECStore = ecstore_storage::ECStore;
 pub(crate) type FileInfoVersions = ecstore_disk::FileInfoVersions;
+pub(crate) type FileReader = ecstore_disk::FileReader;
+pub(crate) type FileWriter = ecstore_disk::FileWriter;
 pub(crate) type LocalPeerS3Client = ecstore_rpc::LocalPeerS3Client;
 pub(crate) type MetricType = ecstore_metrics::MetricType;
+pub(crate) type ObjectPartInfo = rustfs_filemeta::ObjectPartInfo;
 pub(crate) type ObjectLockBlockReason = ecstore_bucket::object_lock::objectlock_sys::ObjectLockBlockReason;
 pub(crate) type PolicySys = ecstore_bucket::policy_sys::PolicySys;
+pub(crate) type RawFileInfo = rustfs_filemeta::RawFileInfo;
 pub(crate) type ReadMultipleReq = ecstore_disk::ReadMultipleReq;
 pub(crate) type ReadMultipleResp = ecstore_disk::ReadMultipleResp;
 pub(crate) type ReadOptions = ecstore_disk::ReadOptions;
+pub(crate) type RenameDataResp = ecstore_disk::RenameDataResp;
 pub(crate) type StorageError = ecstore_error::StorageError;
 pub(crate) type Error = StorageError;
 pub(crate) type Result<T> = core::result::Result<T, Error>;
 pub(crate) type UpdateMetadataOpts = ecstore_disk::UpdateMetadataOpts;
+pub(crate) type VolumeInfo = ecstore_disk::VolumeInfo;
 pub(crate) type WalkDirOptions = ecstore_disk::WalkDirOptions;
 pub(crate) type WriteEncryption = ecstore_rio::WriteEncryption;
 
 pub(crate) async fn get_local_server_property() -> rustfs_madmin::ServerProperties {
     ecstore_admin::get_local_server_property().await
+}
+
+pub(crate) trait StorageDiskRpcExt {
+    async fn disk_info(&self, opts: &DiskInfoOptions) -> DiskResult<DiskInfo>;
+    async fn delete_volume(&self, volume: &str) -> DiskResult<()>;
+    async fn read_multiple(&self, req: ReadMultipleReq) -> DiskResult<Vec<ReadMultipleResp>>;
+    async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions)
+    -> Vec<Option<DiskError>>;
+    async fn delete_version(
+        &self,
+        volume: &str,
+        path: &str,
+        file_info: rustfs_filemeta::FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+    ) -> DiskResult<()>;
+    async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> DiskResult<RawFileInfo>;
+    async fn read_version(
+        &self,
+        org_volume: &str,
+        volume: &str,
+        path: &str,
+        version_id: &str,
+        opts: &ReadOptions,
+    ) -> DiskResult<rustfs_filemeta::FileInfo>;
+    async fn write_metadata(
+        &self,
+        org_volume: &str,
+        volume: &str,
+        path: &str,
+        file_info: rustfs_filemeta::FileInfo,
+    ) -> DiskResult<()>;
+    async fn update_metadata(
+        &self,
+        volume: &str,
+        path: &str,
+        file_info: rustfs_filemeta::FileInfo,
+        opts: &UpdateMetadataOpts,
+    ) -> DiskResult<()>;
+    async fn read_metadata(&self, volume: &str, path: &str) -> DiskResult<bytes::Bytes>;
+    async fn delete_paths(&self, volume: &str, paths: &[String]) -> DiskResult<()>;
+    async fn stat_volume(&self, volume: &str) -> DiskResult<VolumeInfo>;
+    async fn list_volumes(&self) -> DiskResult<Vec<VolumeInfo>>;
+    async fn make_volume(&self, volume: &str) -> DiskResult<()>;
+    async fn make_volumes(&self, volume: Vec<&str>) -> DiskResult<()>;
+    async fn rename_data(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        file_info: rustfs_filemeta::FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+    ) -> DiskResult<RenameDataResp>;
+    async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> DiskResult<Vec<String>>;
+    async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> DiskResult<FileReader>;
+    async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> DiskResult<()>;
+    async fn rename_part(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        dst_volume: &str,
+        dst_path: &str,
+        meta: bytes::Bytes,
+    ) -> DiskResult<()>;
+    async fn delete(&self, volume: &str, path: &str, options: DeleteOptions) -> DiskResult<()>;
+    async fn verify_file(&self, volume: &str, path: &str, file_info: &rustfs_filemeta::FileInfo) -> DiskResult<CheckPartsResp>;
+    async fn check_parts(&self, volume: &str, path: &str, file_info: &rustfs_filemeta::FileInfo) -> DiskResult<CheckPartsResp>;
+    async fn read_parts(&self, bucket: &str, paths: &[String]) -> DiskResult<Vec<ObjectPartInfo>>;
+    async fn walk_dir<W: tokio::io::AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> DiskResult<()>;
+    async fn write_all(&self, volume: &str, path: &str, data: bytes::Bytes) -> DiskResult<()>;
+    async fn read_all(&self, volume: &str, path: &str) -> DiskResult<bytes::Bytes>;
+    async fn append_file(&self, volume: &str, path: &str) -> DiskResult<FileWriter>;
+    async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: i64) -> DiskResult<FileWriter>;
+}
+
+impl<T> StorageDiskRpcExt for T
+where
+    T: ecstore_disk::DiskAPI,
+{
+    async fn disk_info(&self, opts: &DiskInfoOptions) -> DiskResult<DiskInfo> {
+        ecstore_disk::DiskAPI::disk_info(self, opts).await
+    }
+
+    async fn delete_volume(&self, volume: &str) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::delete_volume(self, volume).await
+    }
+
+    async fn read_multiple(&self, req: ReadMultipleReq) -> DiskResult<Vec<ReadMultipleResp>> {
+        ecstore_disk::DiskAPI::read_multiple(self, req).await
+    }
+
+    async fn delete_versions(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        ecstore_disk::DiskAPI::delete_versions(self, volume, versions, opts).await
+    }
+
+    async fn delete_version(
+        &self,
+        volume: &str,
+        path: &str,
+        file_info: rustfs_filemeta::FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+    ) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::delete_version(self, volume, path, file_info, force_del_marker, opts).await
+    }
+
+    async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> DiskResult<RawFileInfo> {
+        ecstore_disk::DiskAPI::read_xl(self, volume, path, read_data).await
+    }
+
+    async fn read_version(
+        &self,
+        org_volume: &str,
+        volume: &str,
+        path: &str,
+        version_id: &str,
+        opts: &ReadOptions,
+    ) -> DiskResult<rustfs_filemeta::FileInfo> {
+        ecstore_disk::DiskAPI::read_version(self, org_volume, volume, path, version_id, opts).await
+    }
+
+    async fn write_metadata(
+        &self,
+        org_volume: &str,
+        volume: &str,
+        path: &str,
+        file_info: rustfs_filemeta::FileInfo,
+    ) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::write_metadata(self, org_volume, volume, path, file_info).await
+    }
+
+    async fn update_metadata(
+        &self,
+        volume: &str,
+        path: &str,
+        file_info: rustfs_filemeta::FileInfo,
+        opts: &UpdateMetadataOpts,
+    ) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::update_metadata(self, volume, path, file_info, opts).await
+    }
+
+    async fn read_metadata(&self, volume: &str, path: &str) -> DiskResult<bytes::Bytes> {
+        ecstore_disk::DiskAPI::read_metadata(self, volume, path).await
+    }
+
+    async fn delete_paths(&self, volume: &str, paths: &[String]) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::delete_paths(self, volume, paths).await
+    }
+
+    async fn stat_volume(&self, volume: &str) -> DiskResult<VolumeInfo> {
+        ecstore_disk::DiskAPI::stat_volume(self, volume).await
+    }
+
+    async fn list_volumes(&self) -> DiskResult<Vec<VolumeInfo>> {
+        ecstore_disk::DiskAPI::list_volumes(self).await
+    }
+
+    async fn make_volume(&self, volume: &str) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::make_volume(self, volume).await
+    }
+
+    async fn make_volumes(&self, volume: Vec<&str>) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::make_volumes(self, volume).await
+    }
+
+    async fn rename_data(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        file_info: rustfs_filemeta::FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+    ) -> DiskResult<RenameDataResp> {
+        ecstore_disk::DiskAPI::rename_data(self, src_volume, src_path, file_info, dst_volume, dst_path).await
+    }
+
+    async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> DiskResult<Vec<String>> {
+        ecstore_disk::DiskAPI::list_dir(self, origvolume, volume, dir_path, count).await
+    }
+
+    async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> DiskResult<FileReader> {
+        ecstore_disk::DiskAPI::read_file_stream(self, volume, path, offset, length).await
+    }
+
+    async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::rename_file(self, src_volume, src_path, dst_volume, dst_path).await
+    }
+
+    async fn rename_part(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        dst_volume: &str,
+        dst_path: &str,
+        meta: bytes::Bytes,
+    ) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::rename_part(self, src_volume, src_path, dst_volume, dst_path, meta).await
+    }
+
+    async fn delete(&self, volume: &str, path: &str, options: DeleteOptions) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::delete(self, volume, path, options).await
+    }
+
+    async fn verify_file(&self, volume: &str, path: &str, file_info: &rustfs_filemeta::FileInfo) -> DiskResult<CheckPartsResp> {
+        ecstore_disk::DiskAPI::verify_file(self, volume, path, file_info).await
+    }
+
+    async fn check_parts(&self, volume: &str, path: &str, file_info: &rustfs_filemeta::FileInfo) -> DiskResult<CheckPartsResp> {
+        ecstore_disk::DiskAPI::check_parts(self, volume, path, file_info).await
+    }
+
+    async fn read_parts(&self, bucket: &str, paths: &[String]) -> DiskResult<Vec<ObjectPartInfo>> {
+        ecstore_disk::DiskAPI::read_parts(self, bucket, paths).await
+    }
+
+    async fn walk_dir<W: tokio::io::AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::walk_dir(self, opts, wr).await
+    }
+
+    async fn write_all(&self, volume: &str, path: &str, data: bytes::Bytes) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::write_all(self, volume, path, data).await
+    }
+
+    async fn read_all(&self, volume: &str, path: &str) -> DiskResult<bytes::Bytes> {
+        ecstore_disk::DiskAPI::read_all(self, volume, path).await
+    }
+
+    async fn append_file(&self, volume: &str, path: &str) -> DiskResult<FileWriter> {
+        ecstore_disk::DiskAPI::append_file(self, volume, path).await
+    }
+
+    async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: i64) -> DiskResult<FileWriter> {
+        ecstore_disk::DiskAPI::create_file(self, origvolume, volume, path, file_size).await
+    }
+}
+
+pub(crate) trait StoragePeerS3ClientExt {
+    async fn heal_bucket(
+        &self,
+        bucket: &str,
+        opts: &rustfs_common::heal_channel::HealOpts,
+    ) -> DiskResult<rustfs_madmin::heal_commands::HealResultItem>;
+    async fn make_bucket(&self, bucket: &str, opts: &rustfs_storage_api::MakeBucketOptions) -> DiskResult<()>;
+    async fn list_bucket(&self, opts: &rustfs_storage_api::BucketOptions) -> DiskResult<Vec<rustfs_storage_api::BucketInfo>>;
+    async fn delete_bucket(&self, bucket: &str, opts: &rustfs_storage_api::DeleteBucketOptions) -> DiskResult<()>;
+    async fn get_bucket_info(
+        &self,
+        bucket: &str,
+        opts: &rustfs_storage_api::BucketOptions,
+    ) -> DiskResult<rustfs_storage_api::BucketInfo>;
+}
+
+impl StoragePeerS3ClientExt for LocalPeerS3Client {
+    async fn heal_bucket(
+        &self,
+        bucket: &str,
+        opts: &rustfs_common::heal_channel::HealOpts,
+    ) -> DiskResult<rustfs_madmin::heal_commands::HealResultItem> {
+        ecstore_rpc::PeerS3Client::heal_bucket(self, bucket, opts).await
+    }
+
+    async fn make_bucket(&self, bucket: &str, opts: &rustfs_storage_api::MakeBucketOptions) -> DiskResult<()> {
+        ecstore_rpc::PeerS3Client::make_bucket(self, bucket, opts).await
+    }
+
+    async fn list_bucket(&self, opts: &rustfs_storage_api::BucketOptions) -> DiskResult<Vec<rustfs_storage_api::BucketInfo>> {
+        ecstore_rpc::PeerS3Client::list_bucket(self, opts).await
+    }
+
+    async fn delete_bucket(&self, bucket: &str, opts: &rustfs_storage_api::DeleteBucketOptions) -> DiskResult<()> {
+        ecstore_rpc::PeerS3Client::delete_bucket(self, bucket, opts).await
+    }
+
+    async fn get_bucket_info(
+        &self,
+        bucket: &str,
+        opts: &rustfs_storage_api::BucketOptions,
+    ) -> DiskResult<rustfs_storage_api::BucketInfo> {
+        ecstore_rpc::PeerS3Client::get_bucket_info(self, bucket, opts).await
+    }
 }
 
 pub(crate) async fn load_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Result<BucketMetadata> {
