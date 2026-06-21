@@ -38,7 +38,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::client::admin_handler_utils::AdminError;
 use crate::error::{Error, Result, StorageError};
-use crate::resolve_object_store_handle;
+use crate::global::resolve_object_store_handle;
 use crate::tier::{
     tier_admin::TierCreds,
     tier_config::{TierConfig, TierType},

@@ -21,7 +21,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use super::storage_compat::{BUCKET_META_PREFIX, DiskAPI, DiskError, DiskStore, RUSTFS_META_BUCKET};
+use super::storage_compat::{BUCKET_META_PREFIX, DiskError, DiskStore, HealDiskExt as _, RUSTFS_META_BUCKET};
 
 const LOG_COMPONENT_HEAL: &str = "heal";
 const LOG_SUBSYSTEM_RESUME: &str = "resume";

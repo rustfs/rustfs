@@ -47,8 +47,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::storage_compat::{
-    ECStore, EcstoreError, Lifecycle as _, RUSTFS_META_BUCKET, ReplicationConfigurationExt as _, get_lifecycle_config,
-    get_replication_config, is_erasure_sd, read_config, replace_bucket_usage_memory_from_info, save_config,
+    ECStore, EcstoreError, RUSTFS_META_BUCKET, ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _,
+    get_lifecycle_config, get_replication_config, is_erasure_sd, read_config, replace_bucket_usage_memory_from_info, save_config,
 };
 
 const LOG_COMPONENT_SCANNER: &str = "scanner";

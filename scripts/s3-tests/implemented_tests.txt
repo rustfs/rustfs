@@ -371,6 +371,7 @@ test_list_buckets_invalid_auth
 test_atomic_read_1mb
 test_atomic_read_4mb
 test_atomic_read_8mb
+test_atomic_conditional_write_1mb
 test_atomic_write_1mb
 test_atomic_write_4mb
 test_atomic_write_8mb

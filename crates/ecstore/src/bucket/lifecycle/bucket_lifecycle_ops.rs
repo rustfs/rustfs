@@ -890,7 +890,7 @@ impl TransitionState {
         tokio::spawn(async move {
             Self::inc_counter(&state.compensation_running_tasks);
             state.record_scanner_transition_state();
-            let Some(api) = crate::resolve_object_store_handle() else {
+            let Some(api) = crate::global::resolve_object_store_handle() else {
                 scheduled.lock().unwrap().remove(&bucket);
                 Self::add_counter(&state.compensation_running_tasks, -1);
                 state.record_scanner_transition_state();
@@ -1909,7 +1909,7 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
     let Some(lifecycle) = GLOBAL_LifecycleSys.get(&oi.bucket).await else {
         return;
     };
-    let Some(api) = crate::resolve_object_store_handle() else {
+    let Some(api) = crate::global::resolve_object_store_handle() else {
         return;
     };
 
@@ -3322,6 +3322,7 @@ mod tests {
     // SAFETY: this helper is only used from `#[serial]` tests and those tests run under a
     // single-thread runtime (`worker_threads = 1`), so no concurrent reader/writer can access
     // process environment while `env::set_var`/`env::remove_var` is active.
+    // SAFETY: keep this note adjacent to the allowance for the repository guard.
     #[allow(unsafe_code)]
     async fn with_transition_queue_env_async<F, Fut>(capacity: Option<&str>, timeout_ms: Option<&str>, test_fn: F)
     where

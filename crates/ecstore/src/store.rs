@@ -44,10 +44,9 @@ use crate::error::{
 };
 use crate::event_notification::EventNotifier;
 use crate::global::{
-    DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME,
-    GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, TypeLocalDiskSetDrives, get_global_deployment_id, get_global_endpoints,
-    get_global_region, get_global_tier_config_mgr, init_global_bucket_monitor, is_erasure_sd, set_global_deployment_id,
-    set_object_layer,
+    DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, TypeLocalDiskSetDrives,
+    get_global_deployment_id, get_global_endpoints, get_global_region, get_global_tier_config_mgr, init_global_bucket_monitor,
+    set_global_deployment_id, set_object_layer,
 };
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
@@ -84,10 +83,8 @@ use rustfs_storage_api::{
 };
 use rustfs_utils::path::{decode_dir_object, encode_dir_object, path_join_buf};
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
-use std::cmp::Ordering;
 use std::net::SocketAddr;
 use std::process::exit;
-use std::slice::Iter;
 use std::time::SystemTime;
 use std::{
     collections::HashMap,
@@ -177,8 +174,8 @@ mod rebalance;
 
 use peer::init_local_peer;
 pub use peer::{
-    all_local_disk, all_local_disk_path, find_local_disk, find_local_disk_by_ref, get_disk_infos, get_disk_via_endpoint,
-    has_space_for, init_local_disks, init_lock_clients, prewarm_local_disk_id_map,
+    all_local_disk, all_local_disk_path, find_local_disk_by_ref, get_disk_infos, init_local_disks, init_lock_clients,
+    prewarm_local_disk_id_map,
 };
 
 pub struct ECStore {
@@ -317,31 +314,6 @@ impl ECStore {
 //         }
 //     }
 // }
-
-// init_local_disks must succeed before the server starts
-/// create unique lock clients for the endpoints and store them globally
-#[derive(Debug, Default)]
-struct PoolErr {
-    index: Option<usize>,
-    err: Option<Error>,
-}
-
-#[derive(Debug, Default)]
-pub struct PoolObjInfo {
-    pub index: usize,
-    pub object_info: ObjectInfo,
-    pub err: Option<Error>,
-}
-
-impl Clone for PoolObjInfo {
-    fn clone(&self) -> Self {
-        Self {
-            index: self.index,
-            object_info: self.object_info.clone(),
-            err: self.err.clone(),
-        }
-    }
-}
 
 // #[derive(Debug, Default, Clone)]
 // pub struct ListPathOptions {
@@ -791,59 +763,6 @@ impl rustfs_storage_api::StorageAdminApi for ECStore {
     }
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct PoolAvailableSpace {
-    pub index: usize,
-    pub available: u64,    // in bytes
-    pub max_used_pct: u64, // Used disk percentage of most filled disk, rounded down.
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct ServerPoolsAvailableSpace(Vec<PoolAvailableSpace>);
-
-impl ServerPoolsAvailableSpace {
-    pub fn iter(&self) -> Iter<'_, PoolAvailableSpace> {
-        self.0.iter()
-    }
-    // TotalAvailable - total available space
-    pub fn total_available(&self) -> u64 {
-        let mut total = 0;
-        for pool in &self.0 {
-            total += pool.available;
-        }
-        total
-    }
-
-    // FilterMaxUsed will filter out any pools that has used percent bigger than max,
-    // unless all have that, in which case all are preserved.
-    pub fn filter_max_used(&mut self, max: u64) {
-        if self.0.len() <= 1 {
-            // Nothing to do.
-            return;
-        }
-        let mut ok = false;
-        for pool in &self.0 {
-            if pool.available > 0 && pool.max_used_pct < max {
-                ok = true;
-                break;
-            }
-        }
-        if !ok {
-            // All above limit.
-            // Do not modify
-            return;
-        }
-
-        // Remove entries that are above.
-        for pool in self.0.iter_mut() {
-            if pool.available > 0 && pool.max_used_pct < max {
-                continue;
-            }
-            pool.available = 0
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -867,40 +786,14 @@ mod tests {
     async fn test_has_space_for() {
         let disk_infos = vec![None, None]; // No actual disk info
 
-        let result = has_space_for(&disk_infos, 1024).await;
+        let result = crate::layout::pool_space::has_space_for(&disk_infos, 1024).await;
         // Should fail due to no valid disk info
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_server_pools_available_space() {
-        let mut spaces = ServerPoolsAvailableSpace(vec![
-            PoolAvailableSpace {
-                index: 0,
-                available: 1000,
-                max_used_pct: 50,
-            },
-            PoolAvailableSpace {
-                index: 1,
-                available: 2000,
-                max_used_pct: 80,
-            },
-        ]);
-
-        assert_eq!(spaces.total_available(), 3000);
-
-        spaces.filter_max_used(60);
-        // filter_max_used sets available to 0 for filtered pools, doesn't remove them
-        assert_eq!(spaces.0.len(), 2); // Length remains the same
-        assert_eq!(spaces.0[0].index, 0);
-        assert_eq!(spaces.0[0].available, 1000); // First pool should still be available
-        assert_eq!(spaces.0[1].available, 0); // Second pool should be filtered (available = 0)
-        assert_eq!(spaces.total_available(), 1000); // Only first pool contributes to total
-    }
-
     #[tokio::test]
     async fn test_find_local_disk() {
-        let result = find_local_disk(&"/nonexistent/path".to_string()).await;
+        let result = peer::find_local_disk(&"/nonexistent/path".to_string()).await;
         assert!(result.is_none(), "Should return None for nonexistent path");
     }
 
@@ -994,34 +887,5 @@ mod tests {
         };
 
         assert!(!should_enqueue_transition_immediately(&oi));
-    }
-
-    // Test that we can create the basic structures without global state
-    #[test]
-    fn test_pool_available_space_creation() {
-        let space = PoolAvailableSpace {
-            index: 0,
-            available: 1000,
-            max_used_pct: 50,
-        };
-        assert_eq!(space.index, 0);
-        assert_eq!(space.available, 1000);
-        assert_eq!(space.max_used_pct, 50);
-    }
-
-    #[test]
-    fn test_server_pools_available_space_iter() {
-        let spaces = ServerPoolsAvailableSpace(vec![PoolAvailableSpace {
-            index: 0,
-            available: 1000,
-            max_used_pct: 50,
-        }]);
-
-        let mut count = 0;
-        for space in spaces.iter() {
-            assert_eq!(space.index, 0);
-            count += 1;
-        }
-        assert_eq!(count, 1);
     }
 }

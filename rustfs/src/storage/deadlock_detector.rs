@@ -66,6 +66,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, warn};
 
 use metrics::counter;
+use rustfs_concurrency::DeadlockMonitorPolicy;
 use rustfs_io_core::DeadlockDetectorConfig as CoreDeadlockConfig;
 
 /// Request identifier type.
@@ -124,10 +125,15 @@ impl RequestHangDetectionPolicy {
 
     /// Convert the request-level policy into the shared io-core deadlock config.
     pub fn to_core_config(&self) -> CoreDeadlockConfig {
-        CoreDeadlockConfig {
+        self.to_concurrency_policy().to_core_config()
+    }
+
+    /// Convert the request-level policy into the shared concurrency facade policy.
+    pub fn to_concurrency_policy(&self) -> DeadlockMonitorPolicy {
+        DeadlockMonitorPolicy {
             enabled: self.enabled,
-            detection_interval: self.check_interval,
-            max_hold_time: self.hang_threshold,
+            check_interval: self.check_interval,
+            hang_threshold: self.hang_threshold,
         }
     }
 }
@@ -258,6 +264,8 @@ pub struct ResourceUsage {
 pub struct DeadlockDetector {
     /// Configuration.
     config: RequestHangDetectionPolicy,
+    /// Shared concurrency facade policy.
+    policy: DeadlockMonitorPolicy,
     /// Active request trackers.
     requests: Arc<RwLock<HashMap<RequestId, RequestResourceTracker>>>,
     /// Detection task handle.
@@ -274,9 +282,11 @@ impl DeadlockDetector {
     /// Create a new deadlock detector.
     pub fn new(config: RequestHangDetectionPolicy) -> Self {
         let (shutdown_tx, _) = broadcast::channel(1);
+        let policy = config.to_concurrency_policy();
 
         Self {
             config,
+            policy,
             requests: Arc::new(RwLock::new(HashMap::new())),
             detector_task: Arc::new(Mutex::new(None)),
             shutdown_tx,
@@ -287,12 +297,12 @@ impl DeadlockDetector {
 
     /// Check if detection is enabled.
     pub fn is_enabled(&self) -> bool {
-        self.config.enabled
+        self.policy.enabled
     }
 
     /// Start the detection task.
     pub fn start(&self) {
-        if !self.config.enabled {
+        if !self.policy.enabled {
             debug!("Deadlock detection is disabled");
             return;
         }
@@ -303,22 +313,22 @@ impl DeadlockDetector {
         }
 
         let requests = self.requests.clone();
-        let config = self.config.clone();
+        let policy = self.policy;
         let deadlocks_detected = self.deadlocks_detected.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let running = self.running.clone();
 
         let handle = tokio::spawn(async move {
             debug!(
-                check_interval_secs = config.check_interval.as_secs(),
-                hang_threshold_secs = config.hang_threshold.as_secs(),
+                check_interval_secs = policy.check_interval.as_secs(),
+                hang_threshold_secs = policy.hang_threshold.as_secs(),
                 "Deadlock detector started"
             );
 
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(config.check_interval) => {
-                        Self::detect_cycle(&requests, &config, &deadlocks_detected);
+                    _ = tokio::time::sleep(policy.check_interval) => {
+                        Self::detect_cycle(&requests, &policy, &deadlocks_detected);
                     }
                     _ = shutdown_rx.recv() => {
                         debug!("Deadlock detector shutting down");
@@ -345,7 +355,7 @@ impl DeadlockDetector {
 
     /// Register a new request for tracking.
     pub fn register_request(&self, request_id: impl Into<String>, description: impl Into<String>) {
-        if !self.config.enabled {
+        if !self.policy.enabled {
             return;
         }
 
@@ -359,7 +369,7 @@ impl DeadlockDetector {
 
     /// Unregister a request (it completed or was cancelled).
     pub fn unregister_request(&self, request_id: &str) {
-        if !self.config.enabled {
+        if !self.policy.enabled {
             return;
         }
 
@@ -370,7 +380,7 @@ impl DeadlockDetector {
 
     /// Record a lock acquisition.
     pub fn record_lock_acquire(&self, request_id: &str, lock: LockInfo) {
-        if !self.config.enabled {
+        if !self.policy.enabled {
             return;
         }
 
@@ -381,7 +391,7 @@ impl DeadlockDetector {
 
     /// Record a lock release.
     pub fn record_lock_release(&self, request_id: &str, lock_id: &LockId) {
-        if !self.config.enabled {
+        if !self.policy.enabled {
             return;
         }
 
@@ -392,7 +402,7 @@ impl DeadlockDetector {
 
     /// Record that a request is waiting for a lock.
     pub fn record_lock_wait(&self, request_id: &str, lock: LockInfo) {
-        if !self.config.enabled {
+        if !self.policy.enabled {
             return;
         }
 
@@ -403,7 +413,7 @@ impl DeadlockDetector {
 
     /// Clear the waiting lock (acquired or gave up).
     pub fn clear_lock_wait(&self, request_id: &str) {
-        if !self.config.enabled {
+        if !self.policy.enabled {
             return;
         }
 
@@ -414,7 +424,7 @@ impl DeadlockDetector {
 
     /// Record resource usage.
     pub fn record_resource(&self, request_id: &str, resource_type: ResourceType, amount: usize) {
-        if !self.config.enabled {
+        if !self.policy.enabled {
             return;
         }
 
@@ -436,13 +446,13 @@ impl DeadlockDetector {
     /// Detect deadlock cycles in the lock wait graph.
     fn detect_cycle(
         requests: &Arc<RwLock<HashMap<RequestId, RequestResourceTracker>>>,
-        config: &RequestHangDetectionPolicy,
+        policy: &DeadlockMonitorPolicy,
         deadlocks_detected: &Arc<AtomicU64>,
     ) {
         let requests_guard = requests.read().unwrap();
 
         // Find hung requests
-        let hung_requests: Vec<_> = requests_guard.values().filter(|r| r.is_hung(config.hang_threshold)).collect();
+        let hung_requests: Vec<_> = requests_guard.values().filter(|r| r.is_hung(policy.hang_threshold)).collect();
 
         if hung_requests.is_empty() {
             return;
@@ -610,6 +620,43 @@ mod tests {
         assert!(!config.enabled);
         assert_eq!(config.check_interval, Duration::from_secs(5));
         assert_eq!(config.hang_threshold, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_request_hang_policy_projects_to_concurrency_and_core_config() {
+        let config = RequestHangDetectionPolicy {
+            enabled: true,
+            check_interval: Duration::from_secs(7),
+            hang_threshold: Duration::from_secs(11),
+            capture_backtrace: true,
+        };
+        let concurrency = config.to_concurrency_policy();
+        let core = config.to_core_config();
+
+        assert!(concurrency.enabled);
+        assert_eq!(concurrency.check_interval, config.check_interval);
+        assert_eq!(concurrency.hang_threshold, config.hang_threshold);
+        assert!(core.enabled);
+        assert_eq!(core.detection_interval, config.check_interval);
+        assert_eq!(core.max_hold_time, config.hang_threshold);
+        assert!(config.capture_backtrace);
+    }
+
+    #[test]
+    fn test_deadlock_detector_consumes_concurrency_policy() {
+        let config = RequestHangDetectionPolicy {
+            enabled: true,
+            check_interval: Duration::from_secs(7),
+            hang_threshold: Duration::from_secs(11),
+            capture_backtrace: true,
+        };
+        let concurrency = config.to_concurrency_policy();
+        let detector = DeadlockDetector::new(config);
+
+        assert!(detector.is_enabled());
+        assert_eq!(detector.policy.check_interval, concurrency.check_interval);
+        assert_eq!(detector.policy.hang_threshold, concurrency.hang_threshold);
+        assert!(detector.config.capture_backtrace);
     }
 
     #[test]

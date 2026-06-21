@@ -16,12 +16,11 @@ use crate::config::{RustFSBufferConfig, WorkloadProfile, get_global_buffer_confi
 use crate::error::ApiError;
 use crate::server::cors;
 use crate::storage::ecfs::ListObjectUnorderedQuery;
-use crate::storage::storage_compat::StorageError;
-use crate::storage::storage_compat::metadata_sys;
-use crate::storage::storage_compat::metadata_sys::get_replication_config;
-use crate::storage::storage_compat::object_lock::objectlock_sys;
-use crate::storage::storage_compat::replication::ReplicationConfigurationExt;
-use crate::storage::storage_compat::resolve_object_store_handle;
+use crate::storage::storage_compat::StorageReplicationConfigExt as _;
+use crate::storage::storage_compat::{
+    StorageError, add_object_lock_years, get_bucket_cors_config, get_bucket_object_lock_config, get_bucket_replication_config,
+    resolve_object_store_handle,
+};
 use http::header::{IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::counter;
@@ -106,7 +105,7 @@ pub(crate) fn apply_lock_retention(object_lock_config: Option<ObjectLockConfigur
     let now = OffsetDateTime::now_utc();
     let retain_until = match (default_retention.days, default_retention.years) {
         (Some(days), _) => now.saturating_add(time::Duration::days(days as i64)),
-        (None, Some(years)) => objectlock_sys::add_years(now, years),
+        (None, Some(years)) => add_object_lock_years(now, years),
         _ => return,
     };
 
@@ -148,7 +147,7 @@ pub(crate) async fn apply_bucket_default_lock_retention(
         return Ok(());
     }
 
-    let object_lock_configuration = match metadata_sys::get_object_lock_config(bucket).await {
+    let object_lock_configuration = match get_bucket_object_lock_config(bucket).await {
         Ok((cfg, _created)) => Some(cfg),
         Err(err) => {
             if err == StorageError::ConfigNotFound {
@@ -426,7 +425,7 @@ pub(crate) fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHol
 }
 
 pub(crate) async fn validate_bucket_object_lock_enabled(bucket: &str) -> S3Result<()> {
-    match metadata_sys::get_object_lock_config(bucket).await {
+    match get_bucket_object_lock_config(bucket).await {
         Ok((cfg, _created)) => {
             if cfg.object_lock_enabled != Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)) {
                 return Err(S3Error::with_message(
@@ -723,7 +722,7 @@ where
 }
 
 pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelete]) -> bool {
-    let (cfg, _created) = match get_replication_config(bucket).await {
+    let (cfg, _created) = match get_bucket_replication_config(bucket).await {
         Ok(replication_config) => replication_config,
         Err(_err) => {
             return false;
@@ -788,7 +787,7 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
     let origin = headers.get(cors::standard::ORIGIN)?.to_str().ok()?;
 
     // Get CORS configuration for the bucket
-    let cors_config = match metadata_sys::get_cors_config(bucket).await {
+    let cors_config = match get_bucket_cors_config(bucket).await {
         Ok((config, _)) => config,
         Err(_) => return None, // No CORS config, no headers to add
     };

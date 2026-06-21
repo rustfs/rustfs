@@ -12,6 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use rustfs_ecstore::bucket::utils::{
-    check_object_name_for_length_and_slash, has_bad_path_component, is_valid_object_prefix,
-};
+use rustfs_ecstore::api::{bucket as ecstore_bucket, error as ecstore_error};
+
+pub(crate) fn check_object_name_for_length_and_slash(
+    bucket: &str,
+    object: &str,
+) -> ecstore_error::Result<()> {
+    ecstore_bucket::utils::check_object_name_for_length_and_slash(bucket, object)
+}
+
+pub(crate) fn has_bad_path_component(path: &str) -> bool {
+    ecstore_bucket::utils::has_bad_path_component(path)
+}
+
+pub(crate) fn is_valid_object_prefix(object: &str) -> bool {
+    ecstore_bucket::utils::is_valid_object_prefix(object)
+}

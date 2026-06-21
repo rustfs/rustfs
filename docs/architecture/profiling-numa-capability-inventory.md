@@ -66,19 +66,30 @@ Future sidecars for profiling, eBPF, or NUMA must preserve these invariants:
 
 `X-012`:
 
-- Add an optional profiling/eBPF extension point that can observe capability
-  status.
-- Keep unsupported targets and disabled sidecars as no-op.
+- Define the `ops.profiler.v1` extension schema for profiling capability
+  reporting, backend status, redaction requirements, and provenance.
+- Keep the schema capability-only; it must not request profiler execution,
+  start sidecars, or change profile export behavior.
+- Keep unsupported targets, disabled sidecars, and unknown future backends
+  representable as no-op capability states.
 
 `X-013`:
 
-- Add extension tests for disabled, unsupported, and enabled capability
-  snapshots.
-- Verify no startup fatal boundary is added for optional profiling sidecars.
+- Add the extension capability snapshot contract for disabled, unsupported, and
+  enabled profiler backends.
+- Verify optional profiler sidecar and Wasm runtimes stay disabled by default
+  and cannot declare a startup fatal boundary.
 
-`R-017`:
+`R-021`:
 
-- If a runtime service sidecar is added later, start it from the startup service
-  boundary with explicit shutdown ownership.
+- If a runtime service sidecar is added later, enter it through the optional
+  runtime boundary with explicit shutdown ownership.
 - Preserve current service order, KMS/audit/notification fatal boundaries, and
   scanner/heal startup semantics.
+
+`R-022`:
+
+- Keep optional runtime startup handoff in `startup_optional_runtimes` while
+  leaving concrete protocol adapters in `startup_protocols`.
+- Preserve KMS-before-protocol startup ordering and disabled protocol no-op
+  behavior.

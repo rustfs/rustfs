@@ -20,17 +20,16 @@ use crate::admin::storage_compat::bandwidth::monitor::BandwidthDetails;
 use crate::admin::storage_compat::bucket_target_sys::{
     BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, TargetClient,
 };
-use crate::admin::storage_compat::com::read_config_without_migrate;
 use crate::admin::storage_compat::get_global_notification_sys;
 use crate::admin::storage_compat::metadata::BUCKET_TARGETS_FILE;
 use crate::admin::storage_compat::metadata_sys;
+use crate::admin::storage_compat::read_admin_config_without_migrate;
 use crate::admin::storage_compat::replication::{
-    BucketReplicationResyncStatus, BucketStats, GLOBAL_REPLICATION_STATS, ObjectOpts, ReplicationConfigurationExt, ResyncOpts,
-    get_global_replication_pool,
+    BucketReplicationResyncStatus, BucketStats, GLOBAL_REPLICATION_STATS, ObjectOpts, ResyncOpts, get_global_replication_pool,
 };
 use crate::admin::storage_compat::target::{BucketTarget, BucketTargetType, BucketTargets};
-use crate::admin::storage_compat::versioning::VersioningApi;
 use crate::admin::storage_compat::versioning_sys::BucketVersioningSys;
+use crate::admin::storage_compat::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
 use crate::admin::storage_compat::{get_global_bucket_monitor, get_global_deployment_id, get_global_region};
 use crate::app::context::resolve_object_store_handle;
 use crate::app::object_usecase::DefaultObjectUsecase;
@@ -636,7 +635,7 @@ async fn load_current_server_config() -> S3Result<Config> {
     }
 
     if let Some(store) = resolve_object_store_handle() {
-        match read_config_without_migrate(store).await {
+        match read_admin_config_without_migrate(store).await {
             Ok(config) => return Ok(config),
             Err(err) => {
                 warn!(

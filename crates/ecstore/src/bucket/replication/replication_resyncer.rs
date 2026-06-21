@@ -31,8 +31,8 @@ use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_fo
 use crate::event_notification::{EventArgs, send_event};
 use crate::global::GLOBAL_LocalNodeName;
 use crate::global::get_global_bucket_monitor;
+use crate::global::resolve_object_store_handle;
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
-use crate::resolve_object_store_handle;
 use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::{EcstoreObjectIO, EcstoreObjectOperations};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};

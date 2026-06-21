@@ -14,185 +14,14 @@
 
 use super::*;
 use crate::config::get_global_storage_class;
+use crate::layout::pool_space::{ServerPoolsAvailableSpace, build_server_pools_available_space};
 use rustfs_storage_api::{NamespaceLocking as _, ObjectOperations as _, StorageAdminApi};
-
-struct LatestObjectInfoCandidate {
-    info: Option<ObjectInfo>,
-    idx: usize,
-    err: Option<Error>,
-}
-
-struct RebalanceDeletePoolResult {
-    pool_idx: usize,
-    result: Result<ObjectInfo>,
-}
-
-fn pool_lookup_not_found_error(bucket: &str, object: &str, opts: &ObjectOptions) -> Error {
-    let object = decode_dir_object(object);
-
-    if let Some(version_id) = &opts.version_id {
-        StorageError::VersionNotFound(bucket.to_owned(), object, version_id.clone())
-    } else {
-        StorageError::ObjectNotFound(bucket.to_owned(), object)
-    }
-}
-
-fn resolve_store_rebalance_pool_meta_reload_result(result: Result<()>, stage: &str) -> Result<()> {
-    result.map_err(|err| Error::other(format!("store rebalance pool meta reload failed during {stage}: {err}")))
-}
-
-fn resolve_rebalance_delete_from_all_pools_result(result: Result<ObjectInfo>, bucket: &str, object: &str) -> Result<ObjectInfo> {
-    result.map_err(|err| Error::other(format!("failed to delete rebalance source object {bucket}/{object}: {err}")))
-}
-
-fn is_ignorable_rebalance_delete_error(err: &Error) -> bool {
-    is_err_object_not_found(err) || is_err_version_not_found(err)
-}
-
-fn rebalance_delete_pool_error(pool_idx: usize, bucket: &str, object: &str, err: Error) -> Error {
-    Error::other(format!("pool {pool_idx} delete failed for {bucket}/{object}: {err}"))
-}
-
-fn resolve_rebalance_delete_from_all_pools_results(
-    results: Vec<RebalanceDeletePoolResult>,
-    bucket: &str,
-    object: &str,
-) -> Result<ObjectInfo> {
-    let mut deleted = None;
-    let mut ignored_error = None;
-
-    for pool_result in results {
-        let pool_idx = pool_result.pool_idx;
-        match pool_result.result {
-            Ok(info) => {
-                if deleted.is_none() {
-                    deleted = Some(info);
-                }
-            }
-            Err(err) if is_ignorable_rebalance_delete_error(&err) => {
-                ignored_error = Some((pool_idx, err));
-            }
-            Err(err) => {
-                return Err(rebalance_delete_pool_error(pool_idx, bucket, object, err));
-            }
-        }
-    }
-
-    if let Some(info) = deleted {
-        return Ok(info);
-    }
-
-    if let Some((pool_idx, err)) = ignored_error {
-        return Err(rebalance_delete_pool_error(pool_idx, bucket, object, err));
-    }
-
-    Err(Error::other(format!(
-        "failed to delete rebalance source object {bucket}/{object}: no pools were attempted"
-    )))
-}
-
-fn rebalance_disk_set_lookup_error(pool_idx: usize, set_idx: usize, pool_count: usize) -> Error {
-    Error::other(format!(
-        "failed to resolve rebalance disk set: pool index {pool_idx}, set index {set_idx}, pool count {pool_count}",
-    ))
-}
-
-fn resolve_latest_object_info_candidates(
-    mut candidates: Vec<LatestObjectInfoCandidate>,
-    bucket: &str,
-    object: &str,
-    opts: &ObjectOptions,
-) -> Result<(ObjectInfo, usize)> {
-    candidates.sort_by(|a, b| {
-        let a_mod = if let Some(info) = &a.info {
-            info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
-        } else {
-            OffsetDateTime::UNIX_EPOCH
-        };
-
-        let b_mod = if let Some(info) = &b.info {
-            info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
-        } else {
-            OffsetDateTime::UNIX_EPOCH
-        };
-
-        if a_mod == b_mod {
-            return if a.idx < b.idx { Ordering::Greater } else { Ordering::Less };
-        }
-
-        b_mod.cmp(&a_mod)
-    });
-
-    for candidate in candidates {
-        if let Some(info) = candidate.info {
-            return Ok((info, candidate.idx));
-        }
-
-        if let Some(err) = candidate.err
-            && !is_err_object_not_found(&err)
-            && !is_err_version_not_found(&err)
-        {
-            return Err(err);
-        }
-    }
-
-    Err(pool_lookup_not_found_error(bucket, object, opts))
-}
-
-async fn build_server_pools_available_space(
-    bucket: &str,
-    size: i64,
-    n_sets: &[usize],
-    infos: &[Vec<Option<DiskInfo>>],
-) -> ServerPoolsAvailableSpace {
-    let mut server_pools = vec![PoolAvailableSpace::default(); infos.len()];
-
-    for (i, zinfo) in infos.iter().enumerate() {
-        if zinfo.is_empty() {
-            server_pools[i] = PoolAvailableSpace {
-                index: i,
-                ..Default::default()
-            };
-
-            continue;
-        }
-
-        if !is_meta_bucketname(bucket) && !has_space_for(zinfo, size).await.unwrap_or_default() {
-            server_pools[i] = PoolAvailableSpace {
-                index: i,
-                ..Default::default()
-            };
-
-            continue;
-        }
-
-        let mut available = 0;
-        let mut max_used_pct = 0;
-        for disk in zinfo.iter().flatten() {
-            if disk.total == 0 {
-                continue;
-            }
-
-            available += disk.total - disk.used;
-
-            let pct_used = disk.used * 100 / disk.total;
-
-            if pct_used > max_used_pct {
-                max_used_pct = pct_used;
-            }
-        }
-
-        available *= n_sets[i] as u64;
-
-        server_pools[i] = PoolAvailableSpace {
-            index: i,
-            available,
-            max_used_pct,
-        }
-    }
-
-    ServerPoolsAvailableSpace(server_pools)
-}
+pub(in crate::store) mod support;
+use support::{
+    LatestObjectInfoCandidate, PoolErr, PoolObjInfo, RebalanceDeletePoolResult, pool_lookup_not_found_error,
+    rebalance_disk_set_lookup_error, resolve_latest_object_info_candidates, resolve_rebalance_delete_from_all_pools_result,
+    resolve_rebalance_delete_from_all_pools_results, resolve_store_rebalance_pool_meta_reload_result,
+};
 
 impl ECStore {
     #[instrument(level = "debug", skip(self))]
@@ -817,22 +646,11 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::disk::DiskInfo;
 
     fn object_info_with_mod_time(unix_ts: i64, delete_marker: bool) -> ObjectInfo {
         ObjectInfo {
             mod_time: Some(OffsetDateTime::from_unix_timestamp(unix_ts).unwrap()),
             delete_marker,
-            ..Default::default()
-        }
-    }
-
-    fn disk_info(total: u64, used: u64, free: u64) -> DiskInfo {
-        DiskInfo {
-            total,
-            used,
-            free,
-            free_inodes: 1_024,
             ..Default::default()
         }
     }
@@ -1124,38 +942,5 @@ mod tests {
             err.to_string()
                 .contains("failed to resolve rebalance disk set: pool index 2, set index 7, pool count 3")
         );
-    }
-
-    #[tokio::test]
-    async fn build_server_pools_available_space_returns_zero_for_empty_pool_info() {
-        let spaces = build_server_pools_available_space("bucket-a", 64, &[1], &[Vec::new()]).await;
-
-        assert_eq!(spaces.0.len(), 1);
-        assert_eq!(spaces.0[0].index, 0);
-        assert_eq!(spaces.0[0].available, 0);
-        assert_eq!(spaces.0[0].max_used_pct, 0);
-    }
-
-    #[tokio::test]
-    async fn build_server_pools_available_space_computes_available_capacity_and_max_used_pct() {
-        let infos = vec![vec![Some(disk_info(1_000, 100, 900)), Some(disk_info(1_000, 200, 800))]];
-
-        let spaces = build_server_pools_available_space("bucket-a", 64, &[2], &infos).await;
-
-        assert_eq!(spaces.0.len(), 1);
-        assert_eq!(spaces.0[0].index, 0);
-        assert_eq!(spaces.0[0].available, 3_400);
-        assert_eq!(spaces.0[0].max_used_pct, 20);
-    }
-
-    #[tokio::test]
-    async fn build_server_pools_available_space_skips_capacity_guard_for_meta_bucket() {
-        let infos = vec![vec![Some(disk_info(10, 9, 1)), Some(disk_info(10, 9, 1))]];
-
-        let spaces = build_server_pools_available_space(crate::disk::RUSTFS_META_BUCKET, 1_024, &[1], &infos).await;
-
-        assert_eq!(spaces.0.len(), 1);
-        assert_eq!(spaces.0[0].available, 2);
-        assert_eq!(spaces.0[0].max_used_pct, 90);
     }
 }

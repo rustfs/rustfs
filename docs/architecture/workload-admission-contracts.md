@@ -112,3 +112,19 @@ additional read-only owner mappings:
 This is an observation surface only. Disk-read permit acquisition, scanner
 cycle scheduling, bucket metadata loading, metadata locks, object write paths,
 and queue behavior are unchanged.
+
+## Provider Composition Boundary
+
+`WorkloadAdmissionRegistrySnapshot::overlay` composes provider-owned registry
+snapshots without mutating runtime owners:
+
+- The storage concurrency provider remains the source of truth for
+  `ForegroundRead`.
+- The RustFS runtime owner provider overlays metadata, scanner, repair,
+  replication, and foreground-write status on top of the storage registry.
+- Matching workload classes are replaced by the later provider snapshot; new
+  classes are appended without reordering existing unrelated entries.
+
+This keeps the later controller/status layer consuming a single read-only
+registry while preserving the existing storage, scanner, heal, replication, and
+metadata ownership boundaries.

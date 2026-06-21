@@ -14,11 +14,36 @@
 
 #![allow(dead_code, unused_imports)]
 
-pub(crate) type BucketTargetSys = rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
-pub(crate) type TonicInterceptor = rustfs_ecstore::rpc::TonicInterceptor;
-pub(crate) type VolumeInfo = rustfs_ecstore::disk::VolumeInfo;
-pub(crate) type WalkDirOptions = rustfs_ecstore::disk::WalkDirOptions;
+use rustfs_ecstore::api::{bucket as ecstore_bucket, disk as ecstore_disk, rpc as ecstore_rpc};
 
-pub(crate) use rustfs_ecstore::rpc::{
-    gen_tonic_signature_interceptor, node_service_time_out_client, node_service_time_out_client_no_auth,
-};
+pub(crate) type BucketTargetSys = ecstore_bucket::bucket_target_sys::BucketTargetSys;
+pub(crate) type TonicInterceptor = ecstore_rpc::TonicInterceptor;
+pub(crate) type VolumeInfo = ecstore_disk::VolumeInfo;
+pub(crate) type WalkDirOptions = ecstore_disk::WalkDirOptions;
+
+pub(crate) fn gen_tonic_signature_interceptor() -> TonicInterceptor {
+    TonicInterceptor::Signature(ecstore_rpc::gen_tonic_signature_interceptor())
+}
+
+pub(crate) async fn node_service_time_out_client(
+    addr: &String,
+    interceptor: TonicInterceptor,
+) -> Result<
+    rustfs_protos::proto_gen::node_service::node_service_client::NodeServiceClient<
+        tonic::service::interceptor::InterceptedService<tonic::transport::Channel, TonicInterceptor>,
+    >,
+    Box<dyn std::error::Error>,
+> {
+    ecstore_rpc::node_service_time_out_client(addr, interceptor).await
+}
+
+pub(crate) async fn node_service_time_out_client_no_auth(
+    addr: &String,
+) -> Result<
+    rustfs_protos::proto_gen::node_service::node_service_client::NodeServiceClient<
+        tonic::service::interceptor::InterceptedService<tonic::transport::Channel, TonicInterceptor>,
+    >,
+    Box<dyn std::error::Error>,
+> {
+    ecstore_rpc::node_service_time_out_client_no_auth(addr).await
+}

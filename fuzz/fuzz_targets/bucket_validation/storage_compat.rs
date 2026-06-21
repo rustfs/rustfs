@@ -12,6 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use rustfs_ecstore::bucket::utils::{
-    check_bucket_and_object_names, check_list_objs_args, check_valid_bucket_name_strict, is_meta_bucketname,
-};
+use rustfs_ecstore::api::{bucket as ecstore_bucket, error as ecstore_error};
+
+pub(crate) fn check_bucket_and_object_names(bucket: &str, object: &str) -> ecstore_error::Result<()> {
+    ecstore_bucket::utils::check_bucket_and_object_names(bucket, object)
+}
+
+pub(crate) fn check_list_objs_args(
+    bucket: &str,
+    prefix: &str,
+    marker: &Option<String>,
+) -> ecstore_error::Result<()> {
+    ecstore_bucket::utils::check_list_objs_args(bucket, prefix, marker)
+}
+
+pub(crate) fn check_valid_bucket_name_strict(bucket_name: &str) -> ecstore_error::Result<()> {
+    ecstore_bucket::utils::check_valid_bucket_name_strict(bucket_name)
+}
+
+pub(crate) fn is_meta_bucketname(name: &str) -> bool {
+    ecstore_bucket::utils::is_meta_bucketname(name)
+}

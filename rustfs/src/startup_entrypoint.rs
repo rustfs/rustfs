@@ -14,9 +14,10 @@
 
 use crate::{
     config::{CommandResult, Config, Opt},
+    startup_lifecycle::{StartupRuntimeLifecycle, run_startup_runtime_lifecycle},
     startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight},
     startup_server::{StartupHttpServers, StartupListenContext, init_startup_http_servers, init_startup_listen_context},
-    startup_services::{StartupRuntimeLifecycle, init_startup_runtime_services, run_startup_runtime_lifecycle},
+    startup_services::init_startup_runtime_services,
     startup_storage::{StartupStorageRuntime, init_startup_storage_foundation, init_startup_storage_runtime},
 };
 use std::io::{Error, Result};

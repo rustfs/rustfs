@@ -24,10 +24,12 @@ use crate::app::storage_compat::ECStore;
 use crate::app::storage_compat::StorageError;
 use crate::app::storage_compat::get_global_notification_sys;
 use crate::app::storage_compat::object_api_utils::to_s3s_etag;
+use crate::app::storage_compat::{AppObjectLockConfigExt as _, AppVersioningConfigExt as _};
 use crate::app::storage_compat::{
     bucket_target_sys::BucketTargetSys,
     lifecycle::bucket_lifecycle_ops::{
-        enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects, validate_transition_tier,
+        enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects, validate_lifecycle_config,
+        validate_transition_tier,
     },
     metadata::{
         BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG,
@@ -35,11 +37,9 @@ use crate::app::storage_compat::{
         BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG,
     },
     metadata_sys,
-    object_lock::ObjectLockApi,
     policy_sys::PolicySys,
     target::{BucketTargetType, BucketTargets},
     utils::serialize,
-    versioning::VersioningApi,
     versioning_sys::BucketVersioningSys,
 };
 use crate::auth::get_condition_values_with_client_info;
@@ -1631,7 +1631,7 @@ impl DefaultBucketUsecase {
             }
         };
 
-        if let Err(err) = crate::app::storage_compat::lifecycle::lifecycle::Lifecycle::validate(&input_cfg, &rcfg).await {
+        if let Err(err) = validate_lifecycle_config(&input_cfg, &rcfg).await {
             return Err(s3_error!(InvalidArgument, "{err}"));
         }
 

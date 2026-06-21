@@ -52,6 +52,9 @@ use crate::app::storage_compat::ECStore;
 use crate::app::storage_compat::object_api_utils::to_s3s_etag;
 use crate::app::storage_compat::quota::checker::QuotaChecker;
 use crate::app::storage_compat::storageclass;
+use crate::app::storage_compat::{
+    AppReplicationConfigExt as _, AppVersioningConfigExt as _, predict_lifecycle_expiration, validate_restore_request,
+};
 use crate::app::storage_compat::{DiskError, is_all_buckets_not_found};
 use crate::app::storage_compat::{DynReader, HashReader, WritePlan, wrap_reader};
 use crate::app::storage_compat::{
@@ -62,8 +65,8 @@ use crate::app::storage_compat::{get_lock_acquire_timeout, is_valid_storage_clas
 use crate::app::storage_compat::{
     lifecycle::{
         bucket_lifecycle_audit::LcEventSrc,
-        bucket_lifecycle_ops::{RestoreRequestOps, enqueue_transition_immediate, post_restore_opts},
-        lifecycle::{self, Lifecycle, TransitionOptions},
+        bucket_lifecycle_ops::{enqueue_transition_immediate, post_restore_opts},
+        lifecycle::{self, TransitionOptions},
     },
     metadata_sys,
     object_lock::{
@@ -72,11 +75,10 @@ use crate::app::storage_compat::{
     },
     quota::QuotaOperation,
     replication::{
-        DeletedObjectReplicationInfo, ObjectOpts as ReplicationObjectOpts, ReplicationConfigurationExt, check_replicate_delete,
-        get_must_replicate_options, must_replicate, schedule_replication, schedule_replication_delete,
+        DeletedObjectReplicationInfo, ObjectOpts as ReplicationObjectOpts, check_replicate_delete, get_must_replicate_options,
+        must_replicate, schedule_replication, schedule_replication_delete,
     },
     tagging::decode_tags,
-    versioning::VersioningApi,
     versioning_sys::BucketVersioningSys,
 };
 use crate::server::convert_ecstore_object_info;
@@ -1278,7 +1280,7 @@ async fn resolve_put_object_expiration(bucket: &str, obj_info: &ObjectInfo) -> O
     };
 
     let obj_opts = lifecycle::ObjectOpts::from_object_info(obj_info);
-    let event = lifecycle_config.predict_expiration(&obj_opts).await;
+    let event = predict_lifecycle_expiration(&lifecycle_config, &obj_opts).await;
     debug!(
         bucket,
         action = ?event.action,
@@ -4302,7 +4304,7 @@ impl DefaultObjectUsecase {
         }
 
         // Validate restore request
-        if let Err(e) = rreq.validate(store.clone()) {
+        if let Err(e) = validate_restore_request(&rreq, store.clone()) {
             return Err(S3Error::with_message(
                 S3ErrorCode::Custom("ErrValidRestoreObject".into()),
                 format!("Restore object validation failed: {}", e),

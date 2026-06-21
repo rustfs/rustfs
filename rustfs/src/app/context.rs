@@ -20,6 +20,7 @@ mod compat;
 mod global;
 mod handles;
 mod interfaces;
+mod startup;
 
 pub use compat::*;
 pub use global::*;

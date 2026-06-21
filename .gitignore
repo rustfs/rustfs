@@ -68,3 +68,4 @@ benchmarks.logs
 tmp/
 crates/*/docs
 fuzz/target
+outputs

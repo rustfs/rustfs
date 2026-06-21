@@ -52,7 +52,7 @@ jobs:
       NIX_CURL_FLAGS: -A cargo/stable
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3.21.0

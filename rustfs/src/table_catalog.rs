@@ -29,13 +29,9 @@ use std::{
 
 use crate::storage_compat::RUSTFS_META_BUCKET;
 use crate::storage_compat::get_lock_acquire_timeout;
-use crate::storage_compat::{EcstoreError, StorageError};
 use crate::storage_compat::{
-    metadata::{
-        BUCKET_TABLE_CATALOG_META_PREFIX, BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG,
-        BUCKET_TABLE_RESERVED_PREFIX, table_catalog_path_hash,
-    },
-    metadata_sys,
+    BUCKET_TABLE_CATALOG_META_PREFIX, BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG,
+    BUCKET_TABLE_RESERVED_PREFIX, EcstoreError, StorageError, get_bucket_metadata, table_catalog_path_hash,
 };
 use bytes::Bytes;
 use datafusion::{
@@ -108,6 +104,7 @@ const TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS: i64 = 15 * 60;
 const TABLE_MAINTENANCE_RETRY_BACKOFF_MAX_SECONDS: u64 = 24 * 60 * 60;
 const TABLE_MAINTENANCE_WORKER_LEASE_TIMEOUT_DEFAULT_SECONDS: u64 = 15 * 60;
 const TABLE_MAINTENANCE_WORKER_LEASE_TIMEOUT_MAX_SECONDS: u64 = 24 * 60 * 60;
+const TABLE_MAINTENANCE_DELETE_DISABLED_REASON: &str = "metadata delete is disabled by maintenance config";
 const TABLE_COMMIT_SLOW_LOG_THRESHOLD: StdDuration = StdDuration::from_secs(2);
 const ICEBERG_MAIN_REF: &str = "main";
 const ICEBERG_MIN_SNAPSHOTS_TO_KEEP_PROPERTY: &str = "history.expire.min-snapshots-to-keep";
@@ -490,6 +487,8 @@ pub(crate) struct TableMetadataMaintenanceJob {
     pub status: TableMetadataMaintenanceJobStatus,
     #[serde(default)]
     pub failure_reason: Option<String>,
+    #[serde(default, rename = "recommended-actions")]
+    pub recommended_actions: Vec<TableMaintenanceRecommendedAction>,
     #[serde(default)]
     pub config_source: TableMaintenanceConfigSource,
     #[serde(default)]
@@ -753,6 +752,19 @@ pub(crate) enum TableMetadataMaintenanceJobStatus {
     Failed,
     Disabled,
     Paused,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableMaintenanceRecommendedAction {
+    NoActionRequired,
+    ReviewAndRunDelete,
+    EnableDelete,
+    EnableBackgroundMaintenance,
+    ResumeMaintenanceWorker,
+    WaitForRetryBackoff,
+    WaitForActiveWorker,
+    InvestigateFailure,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2153,6 +2165,7 @@ where
         &self,
         report: &TableMetadataMaintenanceReport,
     ) -> TableCatalogStoreResult<()> {
+        let report = table_maintenance_report_with_recommended_actions(report.clone());
         let namespace = parse_namespace_for_store(&report.job.namespace)?;
         let table = parse_table_for_store(&report.job.table)?;
         let job_path = self.paths.table_maintenance_job_path(
@@ -2168,11 +2181,11 @@ where
         let current_job_path =
             self.paths
                 .table_maintenance_current_job_path(&report.job.table_bucket, &namespace, &table, &report.job.table_id);
-        self.write_entry(self.catalog_bucket(), &job_path, report, TableCatalogPutPrecondition::Any)
+        self.write_entry(self.catalog_bucket(), &job_path, &report, TableCatalogPutPrecondition::Any)
             .await?;
-        self.write_entry(self.catalog_bucket(), &latest_job_path, report, TableCatalogPutPrecondition::Any)
+        self.write_entry(self.catalog_bucket(), &latest_job_path, &report, TableCatalogPutPrecondition::Any)
             .await?;
-        self.write_entry(self.catalog_bucket(), &current_job_path, report, TableCatalogPutPrecondition::Any)
+        self.write_entry(self.catalog_bucket(), &current_job_path, &report, TableCatalogPutPrecondition::Any)
             .await
     }
 
@@ -2209,7 +2222,7 @@ where
         };
         self.read_entry::<TableMetadataMaintenanceReport>(self.catalog_bucket(), &job_path)
             .await
-            .map(|entry| entry.map(|(report, _)| report))
+            .map(|entry| entry.map(|(report, _)| table_maintenance_report_with_recommended_actions(report)))
     }
 
     pub(crate) async fn run_table_metadata_maintenance_worker_once(
@@ -2388,6 +2401,7 @@ where
                 operation: TableMetadataMaintenanceOperation::DryRun,
                 status: control.status,
                 failure_reason: Some(control.reason.to_string()),
+                recommended_actions: Vec::new(),
                 config_source: control.effective.source,
                 worker_id: Some(control.worker_id),
                 lease_id: String::new(),
@@ -2428,6 +2442,7 @@ where
             snapshot_expiration: None,
             compaction: None,
         };
+        let report = table_maintenance_report_with_recommended_actions(report);
         self.put_table_metadata_maintenance_report(&report).await?;
         Ok(report)
     }
@@ -2994,7 +3009,7 @@ where
             )
             .await?;
 
-        Ok(TableMetadataMaintenanceReport {
+        Ok(table_maintenance_report_with_recommended_actions(TableMetadataMaintenanceReport {
             job: TableMetadataMaintenanceJob {
                 job_id: Uuid::new_v4().to_string(),
                 table_bucket: table_bucket.to_string(),
@@ -3004,6 +3019,7 @@ where
                 operation: TableMetadataMaintenanceOperation::DryRun,
                 status: TableMetadataMaintenanceJobStatus::Successful,
                 failure_reason: None,
+                recommended_actions: Vec::new(),
                 config_source: TableMaintenanceConfigSource::Default,
                 worker_id: None,
                 lease_id: String::new(),
@@ -3044,7 +3060,7 @@ where
             reachability_graph,
             snapshot_expiration: None,
             compaction: None,
-        })
+        }))
     }
 
     pub(crate) async fn delete_table_metadata_maintenance_candidates(
@@ -3125,14 +3141,16 @@ where
         report.job.heartbeat_at = Some(started_at.clone());
         report.job.started_at = Some(started_at);
         report.job.finished_at = None;
+        refresh_table_maintenance_report_recommended_actions(&mut report);
         self.put_table_metadata_maintenance_report(&report).await?;
 
         if delete && !effective.config.delete_enabled {
             let mut failed = report;
             failed.job.status = TableMetadataMaintenanceJobStatus::Failed;
-            failed.job.failure_reason = Some("metadata delete is disabled by maintenance config".to_string());
+            failed.job.failure_reason = Some(TABLE_MAINTENANCE_DELETE_DISABLED_REASON.to_string());
             apply_maintenance_retry_after(&mut failed.job, &effective.config, OffsetDateTime::now_utc());
             failed.job.finished_at = Some(maintenance_timestamp(OffsetDateTime::now_utc()));
+            refresh_table_maintenance_report_recommended_actions(&mut failed);
             self.put_table_metadata_maintenance_report(&failed).await?;
             return Ok(failed);
         }
@@ -3150,17 +3168,20 @@ where
                     failed.job.failure_reason = Some(err.to_string());
                     apply_maintenance_retry_after(&mut failed.job, &effective.config, OffsetDateTime::now_utc());
                     failed.job.finished_at = Some(maintenance_timestamp(OffsetDateTime::now_utc()));
+                    refresh_table_maintenance_report_recommended_actions(&mut failed);
                     self.put_table_metadata_maintenance_report(&failed).await?;
                     return Err(err);
                 }
             };
             deleted.job.finished_at = Some(maintenance_timestamp(OffsetDateTime::now_utc()));
+            refresh_table_maintenance_report_recommended_actions(&mut deleted);
             self.put_table_metadata_maintenance_report(&deleted).await?;
             return Ok(deleted);
         }
 
         report.job.status = TableMetadataMaintenanceJobStatus::Successful;
         report.job.finished_at = Some(maintenance_timestamp(OffsetDateTime::now_utc()));
+        refresh_table_maintenance_report_recommended_actions(&mut report);
         self.put_table_metadata_maintenance_report(&report).await?;
         Ok(report)
     }
@@ -3337,7 +3358,7 @@ where
         let mut object_cleanup_reports = report.object_cleanup_reports;
         mark_deleted_object_cleanup_reports(&mut object_cleanup_reports, &deleted_object_locations);
 
-        Ok(TableMetadataMaintenanceReport {
+        Ok(table_maintenance_report_with_recommended_actions(TableMetadataMaintenanceReport {
             job,
             current_metadata_location: entry.metadata_location,
             retained_metadata_locations,
@@ -3351,7 +3372,7 @@ where
             reachability_graph: report.reachability_graph,
             snapshot_expiration: report.snapshot_expiration,
             compaction: report.compaction,
-        })
+        }))
     }
 }
 
@@ -6123,6 +6144,58 @@ fn parse_maintenance_timestamp(timestamp: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(timestamp, &time::format_description::well_known::Rfc3339).ok()
 }
 
+fn table_maintenance_recommended_actions(job: &TableMetadataMaintenanceJob) -> Vec<TableMaintenanceRecommendedAction> {
+    let mut actions = Vec::new();
+    match job.status {
+        TableMetadataMaintenanceJobStatus::NotYetRun => {}
+        TableMetadataMaintenanceJobStatus::Running => {
+            actions.push(TableMaintenanceRecommendedAction::WaitForActiveWorker);
+        }
+        TableMetadataMaintenanceJobStatus::Successful => {
+            if matches!(job.operation, TableMetadataMaintenanceOperation::DryRun)
+                && (job.deletable_metadata_file_count > 0 || job.deletable_object_count > 0)
+            {
+                actions.push(TableMaintenanceRecommendedAction::ReviewAndRunDelete);
+            } else {
+                actions.push(TableMaintenanceRecommendedAction::NoActionRequired);
+            }
+        }
+        TableMetadataMaintenanceJobStatus::Failed => {
+            if job
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason == TABLE_MAINTENANCE_DELETE_DISABLED_REASON)
+            {
+                actions.push(TableMaintenanceRecommendedAction::EnableDelete);
+            }
+            if job.next_retry_after.is_some() {
+                actions.push(TableMaintenanceRecommendedAction::WaitForRetryBackoff);
+            }
+            if actions.is_empty() {
+                actions.push(TableMaintenanceRecommendedAction::InvestigateFailure);
+            }
+        }
+        TableMetadataMaintenanceJobStatus::Disabled => {
+            actions.push(TableMaintenanceRecommendedAction::EnableBackgroundMaintenance);
+        }
+        TableMetadataMaintenanceJobStatus::Paused => {
+            actions.push(TableMaintenanceRecommendedAction::ResumeMaintenanceWorker);
+        }
+    }
+    actions
+}
+
+fn refresh_table_maintenance_report_recommended_actions(report: &mut TableMetadataMaintenanceReport) {
+    report.job.recommended_actions = table_maintenance_recommended_actions(&report.job);
+}
+
+fn table_maintenance_report_with_recommended_actions(
+    mut report: TableMetadataMaintenanceReport,
+) -> TableMetadataMaintenanceReport {
+    refresh_table_maintenance_report_recommended_actions(&mut report);
+    report
+}
+
 fn table_maintenance_job_lease_is_active(
     job: &TableMetadataMaintenanceJob,
     worker_lease_timeout_seconds: u64,
@@ -6930,7 +7003,7 @@ pub fn validate_object_mutation(table_bucket_enabled: bool, object_key: &str) ->
 }
 
 pub(crate) async fn validate_bucket_object_mutation(bucket: &str, object_key: &str) -> Result<(), TableObjectMutationError> {
-    let table_bucket_enabled = metadata_sys::get(bucket)
+    let table_bucket_enabled = get_bucket_metadata(bucket)
         .await
         .is_ok_and(|metadata| metadata.table_bucket_enabled());
 
@@ -8107,6 +8180,10 @@ mod tests {
         assert_eq!(report.job.retained_metadata_file_count, 3);
         assert_eq!(report.job.cleanup_candidate_count, 2);
         assert_eq!(report.job.deletable_metadata_file_count, 1);
+        assert_eq!(
+            report.job.recommended_actions,
+            vec![TableMaintenanceRecommendedAction::ReviewAndRunDelete]
+        );
 
         let current_report = maintenance_object_report(&report, &current);
         assert_eq!(current_report.state, TableMetadataMaintenanceObjectState::Retained);
@@ -8138,6 +8215,54 @@ mod tests {
                 TableMetadataMaintenanceReason::NoCurrentReachability,
                 TableMetadataMaintenanceReason::SafetyWindowPending,
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_report_read_back_derives_actions_for_legacy_records() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+        let mut report = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .expect("maintenance report should be planned");
+        report.job.status = TableMetadataMaintenanceJobStatus::Running;
+        report.job.worker_id = Some("worker-a".to_string());
+        report.job.lease_id = "lease-a".to_string();
+        report.job.heartbeat_at = Some(maintenance_timestamp(OffsetDateTime::UNIX_EPOCH + Duration::seconds(10)));
+
+        let job_path = store
+            .paths
+            .table_maintenance_job_path(bucket, &namespace, &table, "table-id", &report.job.job_id);
+        let mut legacy_report = serde_json::to_value(&report).expect("legacy report should serialize");
+        legacy_report
+            .get_mut("job")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("legacy report job should be an object")
+            .remove("recommended-actions");
+        store
+            .write_entry(store.catalog_bucket(), &job_path, &legacy_report, TableCatalogPutPrecondition::Any)
+            .await
+            .expect("legacy maintenance report should be seeded");
+
+        let loaded = store
+            .get_table_metadata_maintenance_report(bucket, "sales", "orders", &report.job.job_id)
+            .await
+            .expect("legacy maintenance report lookup should succeed")
+            .expect("legacy maintenance report should be returned");
+
+        assert_eq!(
+            loaded.job.recommended_actions,
+            vec![TableMaintenanceRecommendedAction::WaitForActiveWorker]
         );
     }
 
@@ -8598,6 +8723,13 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("disabled"))
         );
+        assert_eq!(
+            report.job.recommended_actions,
+            vec![
+                TableMaintenanceRecommendedAction::EnableDelete,
+                TableMaintenanceRecommendedAction::WaitForRetryBackoff,
+            ]
+        );
         assert!(backend.object_exists(bucket, &old).await.unwrap());
 
         let latest = store
@@ -8607,6 +8739,7 @@ mod tests {
             .expect("failed maintenance job should be stored");
         assert_eq!(latest.job.job_id, report.job.job_id);
         assert_eq!(latest.job.status, TableMetadataMaintenanceJobStatus::Failed);
+        assert_eq!(latest.job.recommended_actions, report.job.recommended_actions);
     }
 
     #[tokio::test]
@@ -8632,6 +8765,10 @@ mod tests {
 
         assert_eq!(report.job.status, TableMetadataMaintenanceJobStatus::Disabled);
         assert_eq!(report.job.worker_id.as_deref(), Some("worker-a"));
+        assert_eq!(
+            report.job.recommended_actions,
+            vec![TableMaintenanceRecommendedAction::EnableBackgroundMaintenance]
+        );
         assert_eq!(report.job.deleted_metadata_file_count, 0);
         assert!(backend.object_exists(bucket, &old).await.unwrap());
     }
@@ -8675,6 +8812,10 @@ mod tests {
 
         assert_eq!(report.job.status, TableMetadataMaintenanceJobStatus::Paused);
         assert_eq!(report.job.operation, TableMetadataMaintenanceOperation::DryRun);
+        assert_eq!(
+            report.job.recommended_actions,
+            vec![TableMaintenanceRecommendedAction::ResumeMaintenanceWorker]
+        );
         assert_eq!(report.job.deleted_metadata_file_count, 0);
         assert!(backend.object_exists(bucket, &old).await.unwrap());
     }
@@ -8731,6 +8872,12 @@ mod tests {
         assert_eq!(deferred.job.job_id, failed.job.job_id);
         assert_eq!(deferred.job.status, TableMetadataMaintenanceJobStatus::Failed);
         assert_eq!(deferred.job.worker_id.as_deref(), Some("worker-a"));
+        assert!(
+            deferred
+                .job
+                .recommended_actions
+                .contains(&TableMaintenanceRecommendedAction::WaitForRetryBackoff)
+        );
         assert!(backend.object_exists(bucket, &old).await.unwrap());
     }
 
@@ -8785,6 +8932,10 @@ mod tests {
         assert_eq!(report.job.job_id, running.job.job_id);
         assert_eq!(report.job.status, TableMetadataMaintenanceJobStatus::Running);
         assert_eq!(report.job.worker_id.as_deref(), Some("worker-a"));
+        assert_eq!(
+            report.job.recommended_actions,
+            vec![TableMaintenanceRecommendedAction::WaitForActiveWorker]
+        );
     }
 
     #[tokio::test]
@@ -8854,6 +9005,10 @@ mod tests {
                 .failure_reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("lease expired"))
+        );
+        assert_eq!(
+            expired.job.recommended_actions,
+            vec![TableMaintenanceRecommendedAction::InvestigateFailure]
         );
     }
 

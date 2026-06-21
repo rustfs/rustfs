@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::storage_compat::com::{STORAGE_CLASS_SUB_SYS, read_config_without_migrate};
 use crate::admin::storage_compat::get_global_notification_sys;
 use crate::admin::storage_compat::set_global_storage_class;
 use crate::admin::storage_compat::storageclass;
+use crate::admin::storage_compat::{STORAGE_CLASS_SUB_SYS, read_admin_config_without_migrate};
 use crate::app::context::resolve_object_store_handle;
 use rustfs_audit::reload_audit_config;
 use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_WEBHOOK_SUB_SYS};
@@ -301,7 +301,7 @@ pub async fn reload_dynamic_config_runtime_state(sub_system: &str) -> S3Result<(
         return Err(internal_error("storage layer not initialized"));
     };
 
-    let config = read_config_without_migrate(store).await.map_err(|err| {
+    let config = read_admin_config_without_migrate(store).await.map_err(|err| {
         warn!("peer reload_dynamic_config: failed to load server config for {sub_system}: {err}");
         internal_error(format!("failed to load server config: {err}"))
     })?;
@@ -317,7 +317,7 @@ pub async fn reload_runtime_config_snapshot() -> S3Result<()> {
         return Err(internal_error("storage layer not initialized"));
     };
 
-    let config = read_config_without_migrate(store).await.map_err(|err| {
+    let config = read_admin_config_without_migrate(store).await.map_err(|err| {
         warn!("peer reload_runtime_config_snapshot: failed to load server config: {err}");
         internal_error(format!("failed to load server config: {err}"))
     })?;
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn validate_notify_subsystem_config_rejects_invalid_webhook_endpoint() {
-        crate::admin::storage_compat::init();
+        crate::admin::storage_compat::init_admin_config_defaults();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(NOTIFY_WEBHOOK_SUB_SYS).expect("notify webhook defaults");
         let kvs = targets.get_mut(DEFAULT_DELIMITER).expect("default target");
@@ -441,7 +441,7 @@ mod tests {
 
     #[test]
     fn validate_audit_subsystem_config_rejects_relative_queue_dir() {
-        crate::admin::storage_compat::init();
+        crate::admin::storage_compat::init_admin_config_defaults();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(AUDIT_MQTT_SUB_SYS).expect("audit mqtt defaults");
         let kvs = targets.get_mut(DEFAULT_DELIMITER).expect("default target");
@@ -456,7 +456,7 @@ mod tests {
 
     #[test]
     fn validate_identity_openid_config_rejects_missing_openid_scope() {
-        crate::admin::storage_compat::init();
+        crate::admin::storage_compat::init_admin_config_defaults();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(IDENTITY_OPENID_SUB_SYS).expect("openid defaults");
         let kvs = targets.get_mut(DEFAULT_DELIMITER).expect("default target");
@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn validate_identity_openid_config_rejects_invalid_named_provider_id() {
-        crate::admin::storage_compat::init();
+        crate::admin::storage_compat::init_admin_config_defaults();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(IDENTITY_OPENID_SUB_SYS).expect("openid defaults");
         let default_kvs = targets.get(DEFAULT_DELIMITER).cloned().expect("default target");

@@ -135,7 +135,7 @@ const OBJECT_KEY_DERIVATION_CONTEXT: &[u8] = b"object-encryption-key generation"
 
 use crate::error::ApiError;
 use crate::storage::storage_compat::Error;
-use crate::storage::storage_compat::metadata_sys;
+use crate::storage::storage_compat::get_bucket_sse_config;
 use rustfs_utils::http::headers::{
     AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
     AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5, AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT,
@@ -219,7 +219,7 @@ async fn prepare_sse_configuration(
     }
 
     // Get bucket default encryption configuration.
-    let bucket_sse_config_result = metadata_sys::get_sse_config(bucket).await;
+    let bucket_sse_config_result = get_bucket_sse_config(bucket).await;
     debug!(
         component = LOG_COMPONENT_STORAGE,
         subsystem = LOG_SUBSYSTEM_SSE,

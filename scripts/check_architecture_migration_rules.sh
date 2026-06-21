@@ -63,6 +63,7 @@ ECSTORE_OBJECT_API_EXTERNAL_ALIAS_EXPECTED_FILE="${TMP_DIR}/ecstore_object_api_e
 ECSTORE_OBJECT_API_EXTERNAL_ALIAS_ACTUAL_FILE="${TMP_DIR}/ecstore_object_api_external_alias_actual.txt"
 ECSTORE_OBJECT_API_EXTERNAL_ALIAS_DIFF_FILE="${TMP_DIR}/ecstore_object_api_external_alias_diff.txt"
 ECSTORE_OBJECT_API_UNAPPROVED_NAME_HITS_FILE="${TMP_DIR}/ecstore_object_api_unapproved_name_hits.txt"
+STARTUP_PUBLIC_SHIM_HITS_FILE="${TMP_DIR}/startup_public_shim_hits.txt"
 STORE_API_DELETE_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_delete_dto_reexports.txt"
 STORE_API_DELETE_DTO_INTERNAL_HITS_FILE="${TMP_DIR}/store_api_delete_dto_internal_hits.txt"
 STORE_API_LIFECYCLE_HELPER_DEFINITION_HITS_FILE="${TMP_DIR}/store_api_lifecycle_helper_definition_hits.txt"
@@ -71,19 +72,43 @@ STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_list_c
 STORE_API_EXTERNAL_OPERATION_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_operation_consumer_hits.txt"
 STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE="${TMP_DIR}/store_api_object_operation_local_method_hits.txt"
 DIRECT_ECSTORE_IMPORT_HITS_FILE="${TMP_DIR}/direct_ecstore_import_hits.txt"
+ECSTORE_API_FACADE_REQUIRED_HITS_FILE="${TMP_DIR}/ecstore_api_facade_required_hits.txt"
+ECSTORE_PUBLIC_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_public_facade_bypass_hits.txt"
 TEST_HARNESS_NESTED_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/test_harness_nested_storage_compat_hits.txt"
 RUSTFS_NESTED_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/rustfs_nested_storage_compat_hits.txt"
 RUSTFS_RUNTIME_SCALAR_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/rustfs_runtime_scalar_storage_compat_hits.txt"
 RUSTFS_RUNTIME_SECONDARY_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/rustfs_runtime_secondary_storage_compat_hits.txt"
+RUSTFS_ROOT_STORAGE_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_root_storage_compat_reexport_hits.txt"
+RUSTFS_ROOT_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_root_bucket_storage_compat_module_hits.txt"
+RUSTFS_ROOT_RUNTIME_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_root_runtime_storage_compat_module_hits.txt"
+RUSTFS_ADMIN_CONFIG_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_admin_config_storage_compat_module_hits.txt"
+RUSTFS_STORAGE_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_storage_bucket_storage_compat_module_hits.txt"
+RUSTFS_STORAGE_OWNER_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_compat_reexport_hits.txt"
+RUSTFS_ADMIN_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_admin_bucket_storage_compat_module_hits.txt"
+RUSTFS_APP_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_app_bucket_storage_compat_module_hits.txt"
+RUSTFS_OUTER_COMPAT_FACADE_ALIAS_HITS_FILE="${TMP_DIR}/rustfs_outer_compat_facade_alias_hits.txt"
+RUSTFS_OUTER_COMPAT_SIGNATURE_ALIAS_HITS_FILE="${TMP_DIR}/rustfs_outer_compat_signature_alias_hits.txt"
+RUSTFS_STORAGE_COMPAT_RAW_FACADE_PATH_HITS_FILE="${TMP_DIR}/rustfs_storage_compat_raw_facade_path_hits.txt"
+RUSTFS_APP_ADMIN_COMPAT_RAW_FACADE_PATH_HITS_FILE="${TMP_DIR}/rustfs_app_admin_compat_raw_facade_path_hits.txt"
+OUTER_CONSUMER_COMPAT_RAW_FACADE_PATH_HITS_FILE="${TMP_DIR}/outer_consumer_compat_raw_facade_path_hits.txt"
+RUSTFS_ROOT_E2E_COMPAT_RAW_FACADE_PATH_HITS_FILE="${TMP_DIR}/rustfs_root_e2e_compat_raw_facade_path_hits.txt"
+SCANNER_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/scanner_bucket_storage_compat_module_hits.txt"
+NOTIFY_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/notify_storage_compat_module_hits.txt"
+OBS_STORAGE_COMPAT_PASSTHROUGH_HITS_FILE="${TMP_DIR}/obs_storage_compat_passthrough_hits.txt"
+E2E_STORAGE_COMPAT_RPC_PASSTHROUGH_HITS_FILE="${TMP_DIR}/e2e_storage_compat_rpc_passthrough_hits.txt"
+TEST_STORAGE_COMPAT_PASSTHROUGH_HITS_FILE="${TMP_DIR}/test_storage_compat_passthrough_hits.txt"
 PRODUCTION_UNUSED_COMPAT_ALLOW_HITS_FILE="${TMP_DIR}/production_unused_compat_allow_hits.txt"
 BROAD_STORE_API_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/broad_store_api_compat_reexport_hits.txt"
 NESTED_STORE_API_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/nested_store_api_compat_module_hits.txt"
 UNAPPROVED_STORE_API_COMPAT_ALIAS_HITS_FILE="${TMP_DIR}/unapproved_store_api_compat_alias_hits.txt"
 PUBLIC_STORE_API_MODULE_HITS_FILE="${TMP_DIR}/public_store_api_module_hits.txt"
+ECSTORE_PUBLIC_ROOT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_public_root_module_hits.txt"
+ECSTORE_PUBLIC_GLOBAL_REEXPORT_HITS_FILE="${TMP_DIR}/ecstore_public_global_reexport_hits.txt"
 STORE_API_MODULE_PATH_HITS_FILE="${TMP_DIR}/store_api_module_path_hits.txt"
 ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE="${TMP_DIR}/ecstore_compat_passthrough_expected.txt"
 ECSTORE_COMPAT_PASSTHROUGH_ACTUAL_FILE="${TMP_DIR}/ecstore_compat_passthrough_actual.txt"
 ECSTORE_COMPAT_PASSTHROUGH_DIFF_FILE="${TMP_DIR}/ecstore_compat_passthrough_diff.txt"
+RUSTFS_WORKLOAD_DIRECT_FOREGROUND_MAPPING_HITS_FILE="${TMP_DIR}/rustfs_workload_direct_foreground_mapping_hits.txt"
 
 awk '
   /^## PR Types$/ {
@@ -213,6 +238,57 @@ require_source_line \
   "pub use admin::{DiskSetSelector, StorageAdminApi};" \
   "storage-api public admin contract re-export"
 require_source_line \
+  "rustfs/src/lib.rs" \
+  "pub mod startup_entrypoint;" \
+  "startup process entrypoint public module"
+require_source_line \
+  "rustfs/src/lib.rs" \
+  "pub(crate) mod startup_iam;" \
+  "startup IAM shim crate-private module"
+require_source_line \
+  "crates/ecstore/src/lib.rs" \
+  "mod disks_layout;" \
+  "ECStore legacy disks-layout compatibility module crate-private visibility"
+require_source_line \
+  "crates/ecstore/src/lib.rs" \
+  "mod endpoints;" \
+  "ECStore legacy endpoint compatibility module crate-private visibility"
+require_source_line \
+  "crates/ecstore/src/lib.rs" \
+  "mod cluster;" \
+  "ECStore cluster control-plane owner module crate-private visibility"
+require_source_line \
+  "crates/ecstore/src/api/mod.rs" \
+  "pub mod cluster {" \
+  "ECStore cluster control-plane public facade"
+for ecstore_private_module in \
+  admin_server_info \
+  bucket \
+  cache_value \
+  client \
+  compress \
+  config \
+  data_usage \
+  disk \
+  error \
+  event_notification \
+  global \
+  metrics_realtime \
+  notification_sys \
+  pools \
+  rebalance \
+  rio \
+  rpc \
+  set_disk \
+  store \
+  store_utils \
+  tier; do
+  require_source_line \
+    "crates/ecstore/src/lib.rs" \
+    "mod ${ecstore_private_module};" \
+    "ECStore legacy ${ecstore_private_module} root module crate-private visibility"
+done
+require_source_line \
   "crates/storage-api/src/lib.rs" \
   "pub use bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};" \
   "storage-api public bucket contract re-export"
@@ -314,19 +390,23 @@ require_source_contains \
   "RustFS workload admission snapshot provider implementation"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
-  "pub fn foreground_read_workload_admission_snapshot() -> WorkloadAdmissionSnapshot" \
-  "RustFS foreground-read workload admission snapshot helper"
+  "storage_concurrency_workload_admission_snapshot().overlay(runtime_owner_workload_admission_registry_snapshot())" \
+  "RustFS workload admission provider composition"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
-  "WorkloadClass::ForegroundRead => foreground_read_workload_admission_snapshot()" \
-  "RustFS foreground-read workload admission class mapping"
+  "let storage_provider: &dyn WorkloadAdmissionSnapshotProvider = get_concurrency_manager();" \
+  "RustFS workload admission storage provider boundary"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "pub fn foreground_read_workload_admission_snapshot() -> WorkloadAdmissionSnapshot" \
+  "RustFS foreground-read workload admission snapshot helper"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
   "pub fn metadata_workload_admission_snapshot() -> WorkloadAdmissionSnapshot" \
   "RustFS metadata workload admission snapshot helper"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
-  "WorkloadClass::Metadata => metadata_workload_admission_snapshot()" \
+  "WorkloadClass::Metadata => Some(metadata_workload_admission_snapshot())" \
   "RustFS metadata workload admission class mapping"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
@@ -334,7 +414,7 @@ require_source_contains \
   "RustFS scanner workload admission snapshot helper"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
-  "WorkloadClass::Scanner => scanner_workload_admission_snapshot()" \
+  "WorkloadClass::Scanner => Some(scanner_workload_admission_snapshot())" \
   "RustFS scanner workload admission class mapping"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
@@ -342,7 +422,7 @@ require_source_contains \
   "RustFS repair workload admission snapshot helper"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
-  "WorkloadClass::Repair => repair_workload_admission_snapshot()" \
+  "WorkloadClass::Repair => Some(repair_workload_admission_snapshot())" \
   "RustFS repair workload admission class mapping"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
@@ -350,8 +430,18 @@ require_source_contains \
   "RustFS replication workload admission snapshot helper"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
-  "WorkloadClass::Replication => replication_workload_admission_snapshot()" \
+  "WorkloadClass::Replication => Some(replication_workload_admission_snapshot())" \
   "RustFS replication workload admission class mapping"
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'WorkloadClass::ForegroundRead => foreground_read_workload_admission_snapshot\(\)' \
+    rustfs/src/workload_admission.rs || true
+) >"$RUSTFS_WORKLOAD_DIRECT_FOREGROUND_MAPPING_HITS_FILE"
+
+if [[ -s "$RUSTFS_WORKLOAD_DIRECT_FOREGROUND_MAPPING_HITS_FILE" ]]; then
+  report_failure "RustFS workload admission foreground reads must be composed through the storage provider registry: $(paste -sd '; ' "$RUSTFS_WORKLOAD_DIRECT_FOREGROUND_MAPPING_HITS_FILE")"
+fi
 
 (
   cd "$ROOT_DIR"
@@ -564,6 +654,27 @@ fi
 
 (
   cd "$ROOT_DIR"
+  {
+    perl -ne '
+      if (/^\s*pub\s+mod\s+(startup_[A-Za-z0-9_]+);/ && $1 ne "startup_entrypoint") {
+        print "$ARGV:$.:$_";
+      }
+    ' rustfs/src/lib.rs
+    find rustfs/src -maxdepth 1 -type f -name 'startup_*.rs' ! -name 'startup_entrypoint.rs' -print0 |
+      xargs -0 perl -ne '
+        if (/^\s*pub\s+(?!\()/) {
+          print "$ARGV:$.:$_";
+        }
+      '
+  } || true
+) >"$STARTUP_PUBLIC_SHIM_HITS_FILE"
+
+if [[ -s "$STARTUP_PUBLIC_SHIM_HITS_FILE" ]]; then
+  report_failure "startup owner boundaries must stay crate-private except startup_entrypoint: $(paste -sd '; ' "$STARTUP_PUBLIC_SHIM_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
   rg -n --no-heading 'rustfs_ecstore::store_api(?:::\{[^}]*\b(?:ObjectIO|ObjectOperations|ListOperations|MultipartOperations|HealOperations|NamespaceLocking)\b|::(?:ObjectIO|ObjectOperations|ListOperations|MultipartOperations|HealOperations|NamespaceLocking)\b)' \
     rustfs/src crates --glob '!crates/ecstore/**' || true
 ) >"$STORE_API_EXTERNAL_OPERATION_CONSUMER_HITS_FILE"
@@ -579,10 +690,39 @@ fi
     --glob '!crates/ecstore/**' \
     --glob '!**/storage_compat.rs' \
     --glob '!target/**' || true
-) >"$DIRECT_ECSTORE_IMPORT_HITS_FILE"
+) |
+  cat >"$DIRECT_ECSTORE_IMPORT_HITS_FILE"
 
 if [[ -s "$DIRECT_ECSTORE_IMPORT_HITS_FILE" ]]; then
   report_failure "direct rustfs_ecstore imports outside compatibility boundaries are forbidden: $(paste -sd '; ' "$DIRECT_ECSTORE_IMPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  find rustfs/src crates fuzz/fuzz_targets -type f -name 'storage_compat.rs' \
+    ! -path '*/crates/ecstore/*' -print0 |
+    xargs -0 perl -ne '
+      if (/rustfs_ecstore::(?!api::)/) {
+        chomp;
+        print "$ARGV:$.:$_\n";
+      }
+    ' || true
+) >"$ECSTORE_API_FACADE_REQUIRED_HITS_FILE"
+
+if [[ -s "$ECSTORE_API_FACADE_REQUIRED_HITS_FILE" ]]; then
+  report_failure "outer storage compatibility boundaries must route ECStore imports through rustfs_ecstore::api: $(paste -sd '; ' "$ECSTORE_API_FACADE_REQUIRED_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'rustfs_ecstore::(?:admin_server_info|bucket|cache_value|client|compress|config|data_usage|disk|disks_layout|endpoints|error|event_notification|global|metrics_realtime|notification_sys|pools|rebalance|rio|rpc|set_disk|store|store_utils|tier)::' \
+    rustfs/src crates/*/src crates/*/tests fuzz/fuzz_targets \
+    --glob '*storage_compat.rs' \
+    --glob '!crates/ecstore/**' || true
+) >"$ECSTORE_PUBLIC_FACADE_BYPASS_HITS_FILE"
+
+if [[ -s "$ECSTORE_PUBLIC_FACADE_BYPASS_HITS_FILE" ]]; then
+  report_failure "outer storage compatibility boundaries must use rustfs_ecstore::api facade for ECStore public surfaces: $(paste -sd '; ' "$ECSTORE_PUBLIC_FACADE_BYPASS_HITS_FILE")"
 fi
 
 (
@@ -647,6 +787,222 @@ fi
 
 (
   cd "$ROOT_DIR"
+  rg -n --no-heading 'pub\(crate\)\s+use\s+rustfs_ecstore::api::' \
+    rustfs/src/storage_compat.rs || true
+) >"$RUSTFS_ROOT_STORAGE_COMPAT_REEXPORT_HITS_FILE"
+
+if [[ -s "$RUSTFS_ROOT_STORAGE_COMPAT_REEXPORT_HITS_FILE" ]]; then
+  report_failure "RustFS root storage compatibility must use local aliases or wrappers instead of re-exporting ECStore API symbols: $(paste -sd '; ' "$RUSTFS_ROOT_STORAGE_COMPAT_REEXPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub\(crate\)\s+use rustfs_ecstore::api::bucket::\{[^}]*\b(?:metadata|metadata_sys|quota)\b[^}]*\}\s*;|pub\(crate\)\s+use rustfs_ecstore::api::bucket::(?:metadata|metadata_sys|quota)\s*;' \
+    rustfs/src/storage_compat.rs || true
+) >"$RUSTFS_ROOT_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE"
+
+if [[ -s "$RUSTFS_ROOT_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE" ]]; then
+  report_failure "RustFS root storage compatibility must expose bucket metadata/quota contracts as explicit aliases: $(paste -sd '; ' "$RUSTFS_ROOT_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub\(crate\)\s+use rustfs_ecstore::api::config::\{[^}]*\bcom\b[^}]*\}\s*;|pub\(crate\)\s+use rustfs_ecstore::api::config::\{[^}]*\binit\s*(?:,|})[^}]*\}\s*;|pub\(crate\)\s+use rustfs_ecstore::api::disk::\{[^}]*\bendpoint::Endpoint\b[^}]*\}\s*;' \
+    rustfs/src/storage_compat.rs || true
+) >"$RUSTFS_ROOT_RUNTIME_STORAGE_COMPAT_MODULE_HITS_FILE"
+
+if [[ -s "$RUSTFS_ROOT_RUNTIME_STORAGE_COMPAT_MODULE_HITS_FILE" ]]; then
+  report_failure "RustFS root storage compatibility must expose config init and disk endpoint contracts as explicit aliases: $(paste -sd '; ' "$RUSTFS_ROOT_RUNTIME_STORAGE_COMPAT_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub\(crate\)\s+use rustfs_ecstore::api::config::\{[^}]*\bcom\b[^}]*\}\s*;|pub\(crate\)\s+use rustfs_ecstore::api::config::\{[^}]*\binit\s*(?:,|})[^}]*\}\s*;' \
+    rustfs/src/admin/storage_compat.rs || true
+) >"$RUSTFS_ADMIN_CONFIG_STORAGE_COMPAT_MODULE_HITS_FILE"
+
+if [[ -s "$RUSTFS_ADMIN_CONFIG_STORAGE_COMPAT_MODULE_HITS_FILE" ]]; then
+  report_failure "RustFS admin storage compatibility must expose config IO and default initialization as explicit aliases: $(paste -sd '; ' "$RUSTFS_ADMIN_CONFIG_STORAGE_COMPAT_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub\(crate\)\s+use rustfs_ecstore::api::bucket::\{[^}]*\b(?:metadata|metadata_sys|object_lock|policy_sys|replication|tagging|utils|versioning|versioning_sys)\b[^}]*\}\s*;|pub\(crate\)\s+use rustfs_ecstore::api::bucket::(?:metadata|metadata_sys|object_lock|policy_sys|replication|tagging|utils|versioning|versioning_sys)\s*;|pub\(crate\)\s+use rustfs_ecstore::api::client::object_api_utils\s*;|pub\(crate\)\s+use rustfs_ecstore::api::config::com\s*;' \
+    rustfs/src/storage/storage_compat.rs || true
+) >"$RUSTFS_STORAGE_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE" ]]; then
+  report_failure "RustFS storage compatibility must expose bucket/object-api/config contracts as explicit aliases: $(paste -sd '; ' "$RUSTFS_STORAGE_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  perl -0ne '
+    while (/pub\(crate\)\s+use\s+rustfs_ecstore::api::([^;]+);/g) {
+      my $path = $1;
+      $path =~ s/\s+/ /g;
+      $path =~ s/^\s+|\s+$//g;
+      next if $path eq "bucket::replication::ReplicationConfigurationExt";
+      next if $path eq "bucket::versioning::VersioningApi";
+      next if $path eq "disk::DiskAPI";
+      next if $path eq "rpc::PeerS3Client";
+      print "$ARGV:pub(crate) use rustfs_ecstore::api::$path;\n";
+    }
+  ' rustfs/src/storage/storage_compat.rs || true
+) >"$RUSTFS_STORAGE_OWNER_COMPAT_REEXPORT_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_OWNER_COMPAT_REEXPORT_HITS_FILE" ]]; then
+  report_failure "RustFS storage owner compatibility must use local aliases or wrappers instead of re-exporting ECStore API symbols except temporary traits: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_COMPAT_REEXPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub\(crate\)\s+use rustfs_ecstore::api::bucket::\{[^}]*\b(?:bandwidth|bucket_target_sys|lifecycle|metadata|metadata_sys|quota|replication|target|utils|versioning|versioning_sys)\b[^}]*\}\s*;|pub\(crate\)\s+use rustfs_ecstore::api::bucket::(?:bandwidth|bucket_target_sys|lifecycle|metadata|metadata_sys|quota|replication|target|utils|versioning|versioning_sys)\s*;|pub\(crate\)\s+use rustfs_ecstore::api::config::\{[^}]*\bstorageclass\b[^}]*\}\s*;|pub\(crate\)\s+use rustfs_ecstore::api::config::storageclass\s*;' \
+    rustfs/src/admin/storage_compat.rs || true
+) >"$RUSTFS_ADMIN_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE"
+
+if [[ -s "$RUSTFS_ADMIN_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE" ]]; then
+  report_failure "RustFS admin storage compatibility must expose bucket/storageclass contracts as explicit aliases: $(paste -sd '; ' "$RUSTFS_ADMIN_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub\(crate\)\s+use rustfs_ecstore::api::bucket::\{[^}]*\b(?:bucket_target_sys|lifecycle|metadata|metadata_sys|object_lock|policy_sys|quota|replication|tagging|target|utils|versioning|versioning_sys)\b[^}]*\}\s*;|pub\(crate\)\s+use rustfs_ecstore::api::bucket::(?:bucket_target_sys|lifecycle|metadata|metadata_sys|object_lock|policy_sys|quota|replication|tagging|target|utils|versioning|versioning_sys)\s*;|pub\(crate\)\s+use rustfs_ecstore::api::client::(?:object_api_utils|transition_api)\s*;|pub\(crate\)\s+use rustfs_ecstore::api::config::storageclass\s*;' \
+    rustfs/src/app/storage_compat.rs || true
+) >"$RUSTFS_APP_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE" ]]; then
+  report_failure "RustFS app storage compatibility must expose bucket/client/storageclass contracts as explicit aliases: $(paste -sd '; ' "$RUSTFS_APP_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'rustfs_ecstore::api::(object::(ObjectInfo|ObjectOptions)|error::(Error|Result))' \
+    rustfs/src/app/storage_compat.rs \
+    rustfs/src/admin/storage_compat.rs \
+    rustfs/src/storage/storage_compat.rs || true
+) >"$RUSTFS_OUTER_COMPAT_FACADE_ALIAS_HITS_FILE"
+
+if [[ -s "$RUSTFS_OUTER_COMPAT_FACADE_ALIAS_HITS_FILE" ]]; then
+  report_failure "RustFS outer storage compatibility must use storage-api object aliases and local StorageError aliases instead of raw ECStore object/error facade aliases: $(paste -sd '; ' "$RUSTFS_OUTER_COMPAT_FACADE_ALIAS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading '(fn .*rustfs_ecstore::api::(bucket::metadata_sys::BucketMetadataSys|bucket::object_lock::objectlock_sys::ObjectLockBlockReason|bucket::lifecycle::tier_sweeper::Jentry|bucket::bandwidth::monitor::Monitor|notification::NotificationSys)|-> .*rustfs_ecstore::api::(bucket::metadata_sys::BucketMetadataSys|bucket::object_lock::objectlock_sys::ObjectLockBlockReason|bucket::lifecycle::tier_sweeper::Jentry|bucket::bandwidth::monitor::Monitor|notification::NotificationSys)|: &?rustfs_ecstore::api::(bucket::metadata_sys::BucketMetadataSys|bucket::object_lock::objectlock_sys::ObjectLockBlockReason|bucket::lifecycle::tier_sweeper::Jentry|bucket::bandwidth::monitor::Monitor|notification::NotificationSys))' \
+    rustfs/src/app/storage_compat.rs \
+    rustfs/src/admin/storage_compat.rs \
+    rustfs/src/storage/storage_compat.rs || true
+) >"$RUSTFS_OUTER_COMPAT_SIGNATURE_ALIAS_HITS_FILE"
+
+if [[ -s "$RUSTFS_OUTER_COMPAT_SIGNATURE_ALIAS_HITS_FILE" ]]; then
+  report_failure "RustFS outer storage compatibility signatures must use local aliases for metadata, object-lock, lifecycle, monitor, and notification facade types: $(paste -sd '; ' "$RUSTFS_OUTER_COMPAT_SIGNATURE_ALIAS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'rustfs_ecstore::api::' rustfs/src/storage/storage_compat.rs \
+    | rg -v '^[0-9]+:use rustfs_ecstore::api::\{|^[0-9]+:use rustfs_ecstore::api::config as ecstore_config;' || true
+) >"$RUSTFS_STORAGE_COMPAT_RAW_FACADE_PATH_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_COMPAT_RAW_FACADE_PATH_HITS_FILE" ]]; then
+  report_failure "RustFS storage owner compatibility must use local ecstore_* module aliases instead of scattered raw ECStore facade paths: $(paste -sd '; ' "$RUSTFS_STORAGE_COMPAT_RAW_FACADE_PATH_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'rustfs_ecstore::api::' rustfs/src/app/storage_compat.rs rustfs/src/admin/storage_compat.rs \
+    | rg -v '^[^:]+:[0-9]+:use rustfs_ecstore::api::\{' || true
+) >"$RUSTFS_APP_ADMIN_COMPAT_RAW_FACADE_PATH_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_ADMIN_COMPAT_RAW_FACADE_PATH_HITS_FILE" ]]; then
+  report_failure "RustFS app/admin storage compatibility must use local ecstore_* module aliases instead of scattered raw ECStore facade paths: $(paste -sd '; ' "$RUSTFS_APP_ADMIN_COMPAT_RAW_FACADE_PATH_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'rustfs_ecstore::api::' \
+    crates/iam/src/storage_compat.rs \
+    crates/heal/src/heal/storage_compat.rs \
+    crates/obs/src/storage_compat.rs \
+    crates/notify/src/storage_compat.rs \
+    crates/protocols/src/swift/storage_compat.rs \
+    crates/s3select-api/src/storage_compat.rs \
+    crates/scanner/src/storage_compat.rs \
+    crates/heal/tests/common/storage_compat.rs \
+    crates/scanner/tests/common/storage_compat.rs \
+    fuzz/fuzz_targets/path_containment/storage_compat.rs \
+    fuzz/fuzz_targets/bucket_validation/storage_compat.rs \
+    | rg -v '^[^:]+:[0-9]+:use rustfs_ecstore::api::\{' || true
+) >"$OUTER_CONSUMER_COMPAT_RAW_FACADE_PATH_HITS_FILE"
+
+if [[ -s "$OUTER_CONSUMER_COMPAT_RAW_FACADE_PATH_HITS_FILE" ]]; then
+  report_failure "outer consumer storage compatibility must use local ecstore_* module aliases instead of scattered raw ECStore facade paths: $(paste -sd '; ' "$OUTER_CONSUMER_COMPAT_RAW_FACADE_PATH_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'rustfs_ecstore::api::' rustfs/src/storage_compat.rs crates/e2e_test/src/storage_compat.rs \
+    | rg -v '^[^:]+:[0-9]+:use rustfs_ecstore::api::\{' || true
+) >"$RUSTFS_ROOT_E2E_COMPAT_RAW_FACADE_PATH_HITS_FILE"
+
+if [[ -s "$RUSTFS_ROOT_E2E_COMPAT_RAW_FACADE_PATH_HITS_FILE" ]]; then
+  report_failure "RustFS root/e2e storage compatibility must use local ecstore_* module aliases instead of scattered raw ECStore facade paths: $(paste -sd '; ' "$RUSTFS_ROOT_E2E_COMPAT_RAW_FACADE_PATH_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub\(crate\)\s+use rustfs_ecstore::api::bucket::\{[^}]*\b(?:bucket_target_sys|lifecycle|metadata_sys|replication|versioning|versioning_sys)\b[^}]*\}\s*;' \
+    crates/scanner/src/storage_compat.rs || true
+) >"$SCANNER_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE"
+
+if [[ -s "$SCANNER_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE" ]]; then
+  report_failure "scanner storage compatibility must expose bucket contracts as explicit aliases: $(paste -sd '; ' "$SCANNER_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'use rustfs_ecstore::api::\{[^}]*\b(?:config|global)\b[^}]*\}\s*;' \
+    crates/notify/src/storage_compat.rs || true
+) >"$NOTIFY_STORAGE_COMPAT_MODULE_HITS_FILE"
+
+if [[ -s "$NOTIFY_STORAGE_COMPAT_MODULE_HITS_FILE" ]]; then
+  report_failure "notify storage compatibility must not import broad config/global modules: $(paste -sd '; ' "$NOTIFY_STORAGE_COMPAT_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub\(crate\)\s+use rustfs_ecstore::api::data_usage::load_data_usage_from_backend' \
+    crates/obs/src/storage_compat.rs || true
+) >"$OBS_STORAGE_COMPAT_PASSTHROUGH_HITS_FILE"
+
+if [[ -s "$OBS_STORAGE_COMPAT_PASSTHROUGH_HITS_FILE" ]]; then
+  report_failure "OBS storage compatibility must wrap data-usage access instead of re-exporting ECStore functions: $(paste -sd '; ' "$OBS_STORAGE_COMPAT_PASSTHROUGH_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub\(crate\)\s+use rustfs_ecstore::api::rpc::\{[^}]*\b(?:gen_tonic_signature_interceptor|node_service_time_out_client|node_service_time_out_client_no_auth)\b[^}]*\}\s*;' \
+    crates/e2e_test/src/storage_compat.rs || true
+) >"$E2E_STORAGE_COMPAT_RPC_PASSTHROUGH_HITS_FILE"
+
+if [[ -s "$E2E_STORAGE_COMPAT_RPC_PASSTHROUGH_HITS_FILE" ]]; then
+  report_failure "e2e storage compatibility must wrap RPC helpers instead of re-exporting broad ECStore functions: $(paste -sd '; ' "$E2E_STORAGE_COMPAT_RPC_PASSTHROUGH_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub\(crate\)\s+use rustfs_ecstore::api::(?:bucket::(?:lifecycle|metadata_sys|utils)|capacity|client|disk|layout|storage|tier)::[^;]*\{[^}]*\}\s*;|pub\(crate\)\s+use rustfs_ecstore::api::bucket::metadata_sys::init_bucket_metadata_sys|pub\(crate\)\s+use rustfs_ecstore::api::storage::init_local_disks' \
+    crates/heal/tests crates/scanner/tests fuzz/fuzz_targets \
+    --glob '*storage_compat.rs' || true
+) >"$TEST_STORAGE_COMPAT_PASSTHROUGH_HITS_FILE"
+
+if [[ -s "$TEST_STORAGE_COMPAT_PASSTHROUGH_HITS_FILE" ]]; then
+  report_failure "test and fuzz storage compatibility boundaries must use explicit aliases or wrappers instead of grouped ECStore passthroughs: $(paste -sd '; ' "$TEST_STORAGE_COMPAT_PASSTHROUGH_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
   rg -n --no-heading '#!\[allow\(unused_imports\)\]' \
     rustfs/src crates/*/src fuzz/fuzz_targets \
     --glob '*storage_compat.rs' \
@@ -699,6 +1055,14 @@ fi
 
 if rg -n --no-heading '^\s*pub\s+mod\s+store_api\s*;' "$ROOT_DIR/crates/ecstore/src/lib.rs" >"$PUBLIC_STORE_API_MODULE_HITS_FILE"; then
   report_failure "ECStore store_api must remain private; expose ECStore-owned object DTO and reader aliases through rustfs_ecstore::object_api"
+fi
+
+if rg -n --no-heading '^\s*pub\s+mod\s+(batch_processor|bitrot|cluster|erasure_coding|event|object_api|store_list_objects)\s*;' "$ROOT_DIR/crates/ecstore/src/lib.rs" >"$ECSTORE_PUBLIC_ROOT_MODULE_HITS_FILE"; then
+  report_failure "facade-covered ECStore root modules must remain private; expose compatibility through rustfs_ecstore::api: $(paste -sd '; ' "$ECSTORE_PUBLIC_ROOT_MODULE_HITS_FILE")"
+fi
+
+if rg -n --no-heading '^\s*pub\s+use\s+global::' "$ROOT_DIR/crates/ecstore/src/lib.rs" >"$ECSTORE_PUBLIC_GLOBAL_REEXPORT_HITS_FILE"; then
+  report_failure "ECStore global root re-exports must remain private; expose compatibility through rustfs_ecstore::api::global: $(paste -sd '; ' "$ECSTORE_PUBLIC_GLOBAL_REEXPORT_HITS_FILE")"
 fi
 
 (

@@ -15,11 +15,11 @@
 mod common;
 
 use crate::common::storage_compat::{
-    BUCKET_LIFECYCLE_CONFIG, BucketVersioningSys, DiskAPI, DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints,
-    GLOBAL_TierConfigMgr, PoolEndpoints, ReadCloser, ReaderImpl, STORAGE_FORMAT_FILE, TierConfig, TierMinIO, TierType,
-    TransitionOptions, WarmBackend, WarmBackendGetOpts, build_transition_put_options, enqueue_transition_for_existing_objects,
-    get_bucket_metadata, init_background_expiry, init_bucket_metadata_sys, init_local_disks, new_disk,
-    path2_bucket_object_with_base_path, update_bucket_metadata,
+    BUCKET_LIFECYCLE_CONFIG, BucketVersioningSys, DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints,
+    GLOBAL_TierConfigMgr, PoolEndpoints, ReadCloser, ReaderImpl, STORAGE_FORMAT_FILE, ScannerTestDiskExt as _,
+    ScannerWarmBackend, TierConfig, TierMinIO, TierType, TransitionOptions, WarmBackendGetOpts, build_transition_put_options,
+    enqueue_transition_for_existing_objects, get_bucket_metadata, init_background_expiry, init_bucket_metadata_sys,
+    init_local_disks, new_disk, path2_bucket_object_with_base_path, update_bucket_metadata,
 };
 use futures::FutureExt;
 use rustfs_config::ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT;
@@ -685,7 +685,7 @@ impl MockWarmBackend {
 }
 
 #[async_trait::async_trait]
-impl WarmBackend for MockWarmBackend {
+impl ScannerWarmBackend for MockWarmBackend {
     async fn put(&self, object: &str, r: ReaderImpl, _length: i64) -> Result<String, std::io::Error> {
         let bytes = self.read_bytes(r).await?;
         Ok(self.put_bytes(object, bytes, HashMap::new()).await)

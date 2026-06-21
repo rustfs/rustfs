@@ -72,7 +72,7 @@ fn collect_local_paths(endpoint_pools: &EndpointServerPools) -> Vec<String> {
     local_paths.into_iter().collect()
 }
 
-pub fn enforce_unsupported_fs_policy(endpoint_pools: &EndpointServerPools) -> Result<()> {
+pub(crate) fn enforce_unsupported_fs_policy(endpoint_pools: &EndpointServerPools) -> Result<()> {
     let local_paths = collect_local_paths(endpoint_pools);
     if local_paths.is_empty() {
         return Ok(());

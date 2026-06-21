@@ -15,7 +15,7 @@
 use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};
 use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::app::storage_compat::{
-    ECStore, Endpoint, EndpointServerPools, Endpoints, GLOBAL_TierConfigMgr, PoolEndpoints, TierConfig, TierType, WarmBackend,
+    AppWarmBackend, ECStore, Endpoint, EndpointServerPools, Endpoints, GLOBAL_TierConfigMgr, PoolEndpoints, TierConfig, TierType,
     WarmBackendGetOpts,
     metadata::{BUCKET_LIFECYCLE_CONFIG, OBJECT_LOCK_CONFIG},
     metadata_sys,
@@ -294,7 +294,7 @@ impl MockWarmBackend {
 }
 
 #[async_trait::async_trait]
-impl WarmBackend for MockWarmBackend {
+impl AppWarmBackend for MockWarmBackend {
     async fn put(&self, object: &str, r: ReaderImpl, _length: i64) -> Result<String, std::io::Error> {
         let bytes = self.read_bytes(r).await?;
         Ok(self.put_bytes(object, bytes).await)

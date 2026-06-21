@@ -33,7 +33,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use super::storage_compat::{DiskAPI, DiskError, GLOBAL_LOCAL_DISK_MAP};
+use super::storage_compat::{DiskError, GLOBAL_LOCAL_DISK_MAP, HealDiskExt as _};
 
 const KEEP_HEAL_TASK_STATUS_DURATION: Duration = Duration::from_secs(10 * 60);
 const LOG_COMPONENT_HEAL: &str = "heal";

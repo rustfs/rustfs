@@ -18,7 +18,7 @@
 mod generated;
 
 use proto_gen::node_service::node_service_client::NodeServiceClient;
-use rustfs_common::{GLOBAL_CONN_MAP, evict_connection};
+use rustfs_common::{GLOBAL_CONN_MAP, evict_connection_with_log_level};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_tls_runtime::{load_global_outbound_tls_state, record_tls_consumer_stale_generation};
 use std::{
@@ -33,7 +33,7 @@ use tonic::{
     service::interceptor::InterceptedService,
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 // Type alias for the complex client type
 pub type NodeServiceClientType = NodeServiceClient<
@@ -41,6 +41,7 @@ pub type NodeServiceClientType = NodeServiceClient<
 >;
 
 pub use generated::*;
+pub use rustfs_common::ConnectionEvictionLogLevel;
 
 // Default 100 MB
 pub const DEFAULT_GRPC_SERVER_MESSAGE_LEN: usize = 100 * 1024 * 1024;
@@ -208,11 +209,37 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
 /// Evict a connection from the cache after a failure.
 /// This should be called when an RPC fails to ensure fresh connections are tried.
 pub async fn evict_failed_connection(addr: &str) {
-    warn!(
-        addr = %addr,
-        "Evicting cached gRPC connection after RPC failure; the next request will attempt to reconnect automatically"
-    );
-    evict_connection(addr).await;
+    evict_failed_connection_with_log_level(addr, ConnectionEvictionLogLevel::Warn).await;
+}
+
+/// Evict a connection from the cache after a failure with an explicit log level.
+pub async fn evict_failed_connection_with_log_level(addr: &str, log_level: ConnectionEvictionLogLevel) {
+    match log_level {
+        ConnectionEvictionLogLevel::Warn => {
+            warn!(
+                addr = %addr,
+                "Evicting cached gRPC connection after RPC failure; the next request will attempt to reconnect automatically"
+            );
+        }
+        ConnectionEvictionLogLevel::Info => {
+            info!(
+                addr = %addr,
+                "Evicting cached gRPC connection after RPC failure; the next request will attempt to reconnect automatically"
+            );
+        }
+        ConnectionEvictionLogLevel::Debug => {
+            debug!(
+                addr = %addr,
+                "Evicting cached gRPC connection after RPC failure; the next request will attempt to reconnect automatically"
+            );
+        }
+    }
+
+    let cache_log_level = match log_level {
+        ConnectionEvictionLogLevel::Warn => ConnectionEvictionLogLevel::Info,
+        level => level,
+    };
+    evict_connection_with_log_level(addr, cache_log_level).await;
     TLS_GENERATION_CACHE.lock().await.remove(addr);
 }
 
@@ -229,5 +256,16 @@ mod tests {
 
         enforce_tls_generation_cache_bound(&mut cache, 42, "new-node");
         assert_eq!(cache.len(), TLS_GENERATION_CACHE_MAX_SIZE - 1);
+    }
+
+    #[tokio::test]
+    async fn evict_failed_connection_with_log_level_removes_cached_connection() {
+        let addr = "http://evict-failed-connection-debug-test";
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        GLOBAL_CONN_MAP.write().await.insert(addr.to_string(), channel);
+
+        evict_failed_connection_with_log_level(addr, ConnectionEvictionLogLevel::Debug).await;
+
+        assert!(!GLOBAL_CONN_MAP.read().await.contains_key(addr));
     }
 }

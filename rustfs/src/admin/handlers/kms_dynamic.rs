@@ -16,7 +16,7 @@
 
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::storage_compat::com::{read_config, save_config};
+use crate::admin::storage_compat::{read_admin_config, save_admin_config};
 use crate::app::context::{resolve_kms_runtime_service_manager, resolve_object_store_handle};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
@@ -109,7 +109,7 @@ async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
 
     let data = serde_json::to_vec(config).map_err(|e| format!("Failed to serialize KMS config: {e}"))?;
 
-    save_config(store, KMS_CONFIG_PATH, data)
+    save_admin_config(store, KMS_CONFIG_PATH, data)
         .await
         .map_err(|e| format!("Failed to save KMS config to storage: {e}"))?;
 
@@ -139,7 +139,7 @@ pub async fn load_kms_config() -> Option<KmsConfig> {
         return None;
     };
 
-    match read_config(store, KMS_CONFIG_PATH).await {
+    match read_admin_config(store, KMS_CONFIG_PATH).await {
         Ok(data) => match serde_json::from_slice::<KmsConfig>(&data) {
             Ok(config) => {
                 info!(

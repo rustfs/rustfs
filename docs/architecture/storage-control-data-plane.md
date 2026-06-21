@@ -37,6 +37,15 @@ Initial scope:
 - Peer health snapshot.
 - Pool state snapshot.
 
+The first read-only implementation lives behind `rustfs_ecstore::api::cluster`.
+It maps existing endpoint pools into the shared storage-api topology contract and
+an ECStore-owned static membership snapshot. It must not expose local disk paths,
+start health checks, mutate endpoint ownership, or change placement/readiness.
+The same facade also owns static pool-state, local-node storage, and peer-health
+status projections. Peer health remains explicitly unknown until a later slice
+wires real health signals; this document does not authorize background probes or
+RPC-based health checks.
+
 Risk controls:
 
 - Distributed lock quorum remains per set.

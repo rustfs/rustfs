@@ -46,37 +46,14 @@
 //! storage engine uses process-global singletons (`OnceLock`). Attempting to
 //! start a second server will return an error.
 
-use crate::config::Config;
-use crate::init::{add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system};
-use crate::server::{ShutdownHandle, shutdown_event_notifier, start_http_server, stop_audit_system};
-use crate::startup_fs_guard::enforce_unsupported_fs_policy;
-use crate::startup_iam::{bootstrap_or_defer_iam_init, publish_ready_for_iam_bootstrap};
-use crate::storage_compat::init_lock_clients;
-use crate::storage_compat::{
-    ECStore, EndpointServerPools, init as init_ecstore_config, init_background_replication, init_bucket_metadata_sys,
-    init_global_config_sys, init_local_disks, set_global_endpoints, set_global_rustfs_port, try_migrate_bucket_metadata,
-    try_migrate_iam_config, try_migrate_server_config, update_erasure_type,
-};
-use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
-use rustfs_credentials::init_global_action_credentials;
-use rustfs_obs::{init_obs, set_global_guard};
-use rustfs_storage_api::{BucketOperations, BucketOptions};
-use rustfs_utils::net::parse_and_resolve_address;
-use rustls::crypto::aws_lc_rs::default_provider;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use crate::server::ShutdownHandle;
+use crate::startup_embedded::{EmbeddedStartedServer, EmbeddedStartupArgs, EmbeddedStartupError, run_embedded_startup};
+use crate::startup_lifecycle::embedded_endpoint_address;
+use crate::startup_server::find_embedded_available_port;
+use crate::startup_shutdown::{run_embedded_server_drop_cleanup, run_embedded_server_shutdown};
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
-
-const LOG_COMPONENT_EMBEDDED: &str = "embedded";
-const LOG_SUBSYSTEM_EMBEDDED: &str = "embedded";
-
-/// Tracks whether a server has been started in this process.
-static SERVER_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Error type for embedded server operations.
 #[derive(Debug)]
@@ -118,6 +95,16 @@ impl From<std::io::Error> for ServerError {
     }
 }
 
+impl From<EmbeddedStartupError> for ServerError {
+    fn from(err: EmbeddedStartupError) -> Self {
+        match err {
+            EmbeddedStartupError::AlreadyStarted => ServerError::AlreadyStarted,
+            EmbeddedStartupError::Init(message) => ServerError::Init(message),
+            EmbeddedStartupError::Io(err) => ServerError::Io(err),
+        }
+    }
+}
+
 /// Builder for configuring and starting an embedded RustFS server.
 ///
 /// # Examples
@@ -137,11 +124,7 @@ impl From<std::io::Error> for ServerError {
 /// # }
 /// ```
 pub struct RustFSServerBuilder {
-    address: String,
-    access_key: String,
-    secret_key: String,
-    volumes: Vec<String>,
-    region: String,
+    startup_args: EmbeddedStartupArgs,
 }
 
 impl Default for RustFSServerBuilder {
@@ -163,11 +146,7 @@ impl RustFSServerBuilder {
     /// not suitable.
     pub fn new() -> Self {
         Self {
-            address: "127.0.0.1:9000".to_string(),
-            access_key: rustfs_credentials::DEFAULT_ACCESS_KEY.to_string(),
-            secret_key: rustfs_credentials::DEFAULT_SECRET_KEY.to_string(),
-            volumes: Vec::new(),
-            region: rustfs_config::RUSTFS_REGION.to_string(),
+            startup_args: EmbeddedStartupArgs::new_default(),
         }
     }
 
@@ -181,25 +160,25 @@ impl RustFSServerBuilder {
     /// [`build`](Self::build), but that is too late for the earlier
     /// initialization that depends on the configured address.
     pub fn address(mut self, addr: impl Into<String>) -> Self {
-        self.address = addr.into();
+        self.startup_args.set_address(addr.into());
         self
     }
 
     /// Set the S3 access key (default: `"rustfsadmin"`).
     pub fn access_key(mut self, key: impl Into<String>) -> Self {
-        self.access_key = key.into();
+        self.startup_args.set_access_key(key.into());
         self
     }
 
     /// Set the S3 secret key (default: `"rustfsadmin"`).
     pub fn secret_key(mut self, key: impl Into<String>) -> Self {
-        self.secret_key = key.into();
+        self.startup_args.set_secret_key(key.into());
         self
     }
 
     /// Set the AWS region (default: `"us-east-1"`).
     pub fn region(mut self, region: impl Into<String>) -> Self {
-        self.region = region.into();
+        self.startup_args.set_region(region.into());
         self
     }
 
@@ -208,13 +187,13 @@ impl RustFSServerBuilder {
     /// If no volumes are added, a temporary directory with a single drive is
     /// created automatically (and cleaned up on [`RustFSServer::shutdown`]).
     pub fn volume(mut self, path: impl Into<String>) -> Self {
-        self.volumes.push(path.into());
+        self.startup_args.push_volume(path.into());
         self
     }
 
     /// Set multiple volume paths at once, replacing any previously set volumes.
     pub fn volumes(mut self, paths: Vec<String>) -> Self {
-        self.volumes = paths;
+        self.startup_args.set_volumes(paths);
         self
     }
 
@@ -228,284 +207,28 @@ impl RustFSServerBuilder {
     /// Returns [`ServerError::AlreadyStarted`] if another server is already
     /// running in this process, or if another startup attempt has already
     /// entered irreversible global initialization.
-    pub async fn build(mut self) -> Result<RustFSServer, ServerError> {
+    pub async fn build(self) -> Result<RustFSServer, ServerError> {
         self.do_build().await
     }
 
-    /// Inner build implementation. Separated from [`build`] so the outer
-    /// method can enforce the one-shot process-global startup guard.
-    async fn do_build(&mut self) -> Result<RustFSServer, ServerError> {
-        // Build is allowed to fail before irreversible global initialization
-        // (for example on temporary I/O or directory setup errors), and in that
-        // case callers can retry.
-        let mut global_init_started = false;
-        let mut set_global_init_guard = || -> Result<(), ServerError> {
-            if global_init_started {
-                return Ok(());
-            }
-            if SERVER_STARTED
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-            {
-                return Err(ServerError::AlreadyStarted);
-            }
-            global_init_started = true;
-            Ok(())
-        };
+    async fn do_build(self) -> Result<RustFSServer, ServerError> {
+        let started = run_embedded_startup(self.startup_args).await?;
 
-        // Keep a TempDir guard alive so that if build fails the directory is
-        // cleaned up automatically. We disarm (keep) on success.
-        let mut temp_dir_guard: Option<tempfile::TempDir> = None;
-        if self.volumes.is_empty() {
-            let dir = tempfile::tempdir().map_err(|e| ServerError::Init(format!("failed to create temp dir: {e}")))?;
-            self.volumes.push(dir.path().display().to_string());
-            temp_dir_guard = Some(dir);
+        Ok(started.into())
+    }
+}
+
+impl From<EmbeddedStartedServer> for RustFSServer {
+    fn from(started: EmbeddedStartedServer) -> Self {
+        Self {
+            address: started.bound_addr,
+            access_key: started.access_key,
+            secret_key: started.secret_key,
+            region: started.region,
+            shutdown_handle: Some(started.shutdown_handle),
+            cancel_token: started.cancel_token,
+            temp_dir: started.temp_dir,
         }
-
-        // Ensure volume directories exist.
-        for v in &self.volumes {
-            let p = Path::new(v);
-            if !p.exists() {
-                tokio::fs::create_dir_all(p)
-                    .await
-                    .map_err(|e| ServerError::Init(format!("failed to create volume dir {v}: {e}")))?;
-            }
-        }
-
-        // Build Config.
-        let mut config = Config::new(&self.address, self.volumes.clone());
-        config.access_key = self.access_key.clone();
-        config.secret_key = self.secret_key.clone();
-        config.region = Some(self.region.clone());
-        config.console_enable = false;
-
-        // --- Initialization sequence (mirrors main.rs::run) ---
-
-        // Observability (minimal / no-op endpoint for embedded use).
-        let guard = init_obs(Some(config.obs_endpoint.clone()))
-            .await
-            .map_err(|e| ServerError::Init(format!("init_obs: {e}")))?;
-        set_global_guard(guard).map_err(|e| ServerError::Init(format!("set_global_guard: {e}")))?;
-
-        // Crypto provider.
-        if let Err(err) = default_provider().install_default() {
-            debug!(
-                component = LOG_COMPONENT_EMBEDDED,
-                subsystem = LOG_SUBSYSTEM_EMBEDDED,
-                event = "crypto_provider_state",
-                state = "already_installed",
-                error = ?err,
-                "Embedded crypto provider state changed"
-            );
-        }
-
-        // Trusted proxies.
-        rustfs_trusted_proxies::init();
-
-        // Resolve listen address before endpoint/global initialization.
-        let server_addr =
-            parse_and_resolve_address(config.address.as_str()).map_err(|e| ServerError::Init(format!("address: {e}")))?;
-
-        if server_addr.port() == 0 {
-            return Err(ServerError::Init(
-                "port 0 is not supported in embedded mode because startup requires \
-                 a stable listen address and port before endpoint/global initialization. \
-                 Use `find_available_port()` to obtain a free port."
-                    .to_string(),
-            ));
-        }
-
-        // Credentials.
-        init_global_action_credentials(Some(config.access_key.clone()), Some(config.secret_key.clone()))
-            .map_err(|e| ServerError::Init(format!("credentials: {e:?}")))?;
-
-        // Region.
-        if let Some(region_str) = &config.region {
-            let region = region_str
-                .parse()
-                .map_err(|e| ServerError::Init(format!("invalid region '{region_str}': {e}")))?;
-            crate::storage_compat::set_global_region(region);
-        }
-
-        let server_port = server_addr.port();
-
-        set_global_rustfs_port(server_port);
-        set_global_addr(&config.address).await;
-
-        set_global_init_guard()?;
-
-        // Endpoints / erasure setup.
-        let server_addr_str = server_addr.to_string();
-        let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_addr_str.as_str(), config.volumes.clone())
-            .await
-            .map_err(|e| ServerError::Init(format!("endpoints: {e}")))?;
-        enforce_unsupported_fs_policy(&endpoint_pools).map_err(|e| ServerError::Init(format!("unsupported fs guard: {e}")))?;
-
-        set_global_endpoints(endpoint_pools.as_ref().clone());
-        update_erasure_type(setup_type).await;
-
-        // Local disks.
-        init_local_disks(endpoint_pools.clone())
-            .await
-            .map_err(|e| ServerError::Init(format!("local disks: {e}")))?;
-        init_lock_clients(endpoint_pools.clone());
-
-        // Service state.
-        let readiness = Arc::new(GlobalReadiness::new());
-
-        // Start HTTP server.
-        let mut s3_config = config.clone();
-        s3_config.console_enable = false;
-        let (shutdown_handle, bound_addr) = start_http_server(&s3_config, readiness.clone()).await?;
-        let ctx = CancellationToken::new();
-        let shutdown_embedded_server = || {
-            shutdown_handle.signal();
-            ctx.cancel();
-        };
-
-        // Storage engine.
-        let store = match ECStore::new(server_addr, endpoint_pools.clone(), ctx.clone()).await {
-            Ok(store) => store,
-            Err(e) => {
-                error!(
-                    component = LOG_COMPONENT_EMBEDDED,
-                    subsystem = LOG_SUBSYSTEM_EMBEDDED,
-                    event = "embedded_storage_init_failed",
-                    stage = "ecstore_new",
-                    error = ?e,
-                    "Embedded storage initialization failed"
-                );
-                shutdown_embedded_server();
-                return Err(ServerError::Init(format!("ECStore: {e}")));
-            }
-        };
-
-        init_ecstore_config();
-        try_migrate_server_config(store.clone()).await;
-
-        // Global config system (with retry).
-        let mut retry = 0;
-        while let Err(e) = init_global_config_sys(store.clone()).await {
-            retry += 1;
-            if retry > 15 {
-                shutdown_embedded_server();
-                return Err(ServerError::Init(format!("init_global_config_sys failed after 15 retries: {e}")));
-            }
-            debug!(
-                component = LOG_COMPONENT_EMBEDDED,
-                subsystem = LOG_SUBSYSTEM_EMBEDDED,
-                event = "embedded_storage_init_retry",
-                stage = "global_config_sys",
-                retry,
-                error = %e,
-                "Embedded storage initialization retry scheduled"
-            );
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        }
-        readiness.mark_stage(SystemStage::StorageReady);
-
-        // Replication.
-        init_background_replication(store.clone()).await;
-
-        // KMS (optional, non-fatal for embedded).
-        if let Err(e) = init_kms_system(&config).await {
-            warn!(
-                component = LOG_COMPONENT_EMBEDDED,
-                subsystem = LOG_SUBSYSTEM_EMBEDDED,
-                event = "embedded_optional_service_skipped",
-                service = "kms",
-                error = %e,
-                "Embedded optional service initialization skipped"
-            );
-        }
-
-        // Buffer profiles.
-        init_buffer_profile_system(&config);
-
-        if let Err(e) = crate::startup_services::init_event_notifier_and_audit().await {
-            warn!(
-                component = LOG_COMPONENT_EMBEDDED,
-                subsystem = LOG_SUBSYSTEM_EMBEDDED,
-                event = "embedded_optional_service_skipped",
-                service = "audit",
-                error = %e,
-                "Embedded optional service initialization skipped"
-            );
-        }
-
-        // Bucket listing for metadata + notification init.
-        let buckets: Vec<String> = store
-            .list_bucket(&BucketOptions {
-                no_metadata: true,
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| {
-                shutdown_embedded_server();
-                ServerError::Init(format!("list_bucket: {e}"))
-            })?
-            .into_iter()
-            .map(|v| v.name)
-            .collect();
-
-        try_migrate_bucket_metadata(store.clone()).await;
-        init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
-        try_migrate_iam_config(store.clone()).await;
-
-        // IAM.
-        let kms_interface =
-            rustfs_kms::get_global_kms_service_manager().unwrap_or_else(rustfs_kms::init_global_kms_service_manager);
-        let iam_bootstrap = bootstrap_or_defer_iam_init(store.clone(), kms_interface, readiness.clone(), None, Some(ctx.clone()))
-            .await
-            .map_err(|e| {
-                shutdown_embedded_server();
-                ServerError::Init(format!("IAM bootstrap setup: {e}"))
-            })?;
-
-        // Bucket notifications.
-        add_bucket_notification_configuration(buckets.clone()).await;
-
-        if let Err(e) = crate::startup_services::init_notification_system(endpoint_pools.clone()).await {
-            warn!(
-                component = LOG_COMPONENT_EMBEDDED,
-                subsystem = LOG_SUBSYSTEM_EMBEDDED,
-                event = "embedded_optional_service_skipped",
-                service = "notification",
-                error = %e,
-                "Embedded optional service initialization skipped"
-            );
-        }
-
-        publish_ready_for_iam_bootstrap(iam_bootstrap, readiness.as_ref(), None)
-            .await
-            .map_err(|e| {
-                shutdown_embedded_server();
-                ServerError::Init(format!("runtime readiness: {e}"))
-            })?;
-
-        rustfs_common::set_global_init_time_now().await;
-
-        let server = RustFSServer {
-            address: bound_addr,
-            access_key: self.access_key.clone(),
-            secret_key: self.secret_key.clone(),
-            region: self.region.clone(),
-            shutdown_handle: Some(shutdown_handle),
-            cancel_token: ctx,
-            temp_dir: temp_dir_guard.map(|g| g.keep()),
-        };
-
-        info!(
-            target: "rustfs::embedded",
-            component = LOG_COMPONENT_EMBEDDED,
-            subsystem = LOG_SUBSYSTEM_EMBEDDED,
-            event = "embedded_server_state",
-            state = "ready",
-            "RustFS embedded server ready at http://{}",
-            server.endpoint_address()
-        );
-
-        Ok(server)
     }
 }
 
@@ -528,14 +251,7 @@ pub struct RustFSServer {
 
 impl RustFSServer {
     fn endpoint_address(&self) -> SocketAddr {
-        let ip = match self.address.ip() {
-            ip @ IpAddr::V4(v4) if !v4.is_unspecified() => ip,
-            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
-            ip @ IpAddr::V6(v6) if !v6.is_unspecified() => ip,
-            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
-        };
-
-        SocketAddr::new(ip, self.address.port())
+        embedded_endpoint_address(self.address)
     }
 
     /// The HTTP endpoint URL (e.g. `"http://127.0.0.1:54321"`).
@@ -571,74 +287,13 @@ impl RustFSServer {
     }
 
     async fn do_shutdown(&mut self) {
-        info!(
-            target: "rustfs::embedded",
-            component = LOG_COMPONENT_EMBEDDED,
-            subsystem = LOG_SUBSYSTEM_EMBEDDED,
-            event = "embedded_server_state",
-            state = "stopping",
-            "Embedded server state changed"
-        );
-
-        // Cancel background services.
-        self.cancel_token.cancel();
-
-        // Shutdown event notifier.
-        shutdown_event_notifier().await;
-
-        // Stop the audit system.
-        if let Err(e) = stop_audit_system().await {
-            warn!(
-                component = LOG_COMPONENT_EMBEDDED,
-                subsystem = LOG_SUBSYSTEM_EMBEDDED,
-                event = "embedded_shutdown_cleanup_failed",
-                service = "audit",
-                error = %e,
-                "Embedded shutdown cleanup failed"
-            );
-        }
-
-        // Signal HTTP server to stop.
-        if let Some(shutdown_handle) = self.shutdown_handle.take() {
-            shutdown_handle.shutdown().await;
-        }
-
-        // Clean up temp directory if we created it.
-        if let Some(ref dir) = self.temp_dir
-            && let Err(e) = tokio::fs::remove_dir_all(dir).await
-        {
-            warn!(
-                component = LOG_COMPONENT_EMBEDDED,
-                subsystem = LOG_SUBSYSTEM_EMBEDDED,
-                event = "embedded_shutdown_cleanup_failed",
-                service = "temp_dir",
-                path = %dir.display(),
-                error = %e,
-                "Embedded shutdown cleanup failed"
-            );
-        }
-
-        info!(
-            target: "rustfs::embedded",
-            component = LOG_COMPONENT_EMBEDDED,
-            subsystem = LOG_SUBSYSTEM_EMBEDDED,
-            event = "embedded_server_state",
-            state = "stopped",
-            "Embedded server state changed"
-        );
+        run_embedded_server_shutdown(&self.cancel_token, &mut self.shutdown_handle, self.temp_dir.as_deref()).await;
     }
 }
 
 impl Drop for RustFSServer {
     fn drop(&mut self) {
-        // Best-effort synchronous cleanup.
-        self.cancel_token.cancel();
-        if let Some(shutdown_handle) = self.shutdown_handle.take() {
-            shutdown_handle.signal();
-        }
-        if let Some(ref dir) = self.temp_dir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        run_embedded_server_drop_cleanup(&self.cancel_token, &mut self.shutdown_handle, self.temp_dir.as_deref());
     }
 }
 
@@ -664,8 +319,5 @@ impl Drop for RustFSServer {
 ///  }
 /// ```
 pub fn find_available_port() -> Result<u16, std::io::Error> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    Ok(port)
+    find_embedded_available_port()
 }

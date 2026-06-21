@@ -59,6 +59,7 @@ const CREDENTIAL_EXPIRATION_CONFIG_KEY: &str = "rustfs.credential-expiration-uni
 const CREDENTIAL_VENDING_UNSUPPORTED: &str = "unsupported";
 const CREDENTIAL_VENDING_SUPPORTED: &str = "supported";
 const CREDENTIAL_VENDING_UNSUPPORTED_REASON: &str = "temporary-credentials-not-implemented";
+const CREDENTIAL_VENDING_DISABLED_REASON: &str = "credential-vending-disabled";
 const CREDENTIAL_SCOPE_WAREHOUSE_PREFIX: &str = "warehouse-prefix";
 const CREDENTIAL_SCOPE_TABLE_PREFIX: &str = "table-prefix";
 const CREDENTIAL_MODE_CLIENT_PROVIDED: &str = "client-provided-s3-credentials-required";
@@ -731,6 +732,7 @@ struct RestLoadTableResponse {
 
 #[derive(Debug, Serialize)]
 struct RestLoadCredentialsResponse {
+    config: BTreeMap<String, String>,
     #[serde(rename = "storage-credentials")]
     storage_credentials: Vec<RestStorageCredential>,
 }
@@ -1568,6 +1570,21 @@ fn load_view_response_from_entry(entry: crate::table_catalog::ViewEntry, metadat
     }
 }
 
+fn load_credentials_response_config(vending: &str, mode: &str, reason: Option<&str>) -> BTreeMap<String, String> {
+    let mut config = BTreeMap::new();
+    config.insert(CREDENTIAL_VENDING_CONFIG_KEY.to_string(), vending.to_string());
+    config.insert(CREDENTIAL_MODE_CONFIG_KEY.to_string(), mode.to_string());
+    if let Some(reason) = reason {
+        config.insert(CREDENTIAL_VENDING_REASON_CONFIG_KEY.to_string(), reason.to_string());
+    }
+    config
+}
+
+fn add_table_credential_scope_config(config: &mut BTreeMap<String, String>, scope_prefix: &str) {
+    config.insert(CREDENTIAL_SCOPE_CONFIG_KEY.to_string(), CREDENTIAL_SCOPE_TABLE_PREFIX.to_string());
+    config.insert(CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY.to_string(), scope_prefix.to_string());
+}
+
 async fn load_credentials_response_from_entry(
     entry: &crate::table_catalog::TableEntry,
     issuer: &dyn TableCredentialIssuer,
@@ -1575,6 +1592,11 @@ async fn load_credentials_response_from_entry(
 ) -> S3Result<RestLoadCredentialsResponse> {
     if !issuer.enabled() {
         return Ok(RestLoadCredentialsResponse {
+            config: load_credentials_response_config(
+                CREDENTIAL_VENDING_UNSUPPORTED,
+                CREDENTIAL_MODE_CLIENT_PROVIDED,
+                Some(CREDENTIAL_VENDING_DISABLED_REASON),
+            ),
             storage_credentials: Vec::new(),
         });
     }
@@ -1585,11 +1607,28 @@ async fn load_credentials_response_from_entry(
         scope_prefix: scope.scope_prefix.clone(),
         object_prefix: scope.object_prefix.clone(),
     };
+    let scope_prefix = scope.scope_prefix.clone();
     let storage_credentials = match issuer.issue_table_credentials(request).await? {
         Some(issued) => vec![storage_credential_from_issued(scope, issued)],
-        None => Vec::new(),
+        None => {
+            let mut config = load_credentials_response_config(
+                CREDENTIAL_VENDING_UNSUPPORTED,
+                CREDENTIAL_MODE_CLIENT_PROVIDED,
+                Some(CREDENTIAL_VENDING_UNSUPPORTED_REASON),
+            );
+            add_table_credential_scope_config(&mut config, &scope_prefix);
+            return Ok(RestLoadCredentialsResponse {
+                config,
+                storage_credentials: Vec::new(),
+            });
+        }
     };
-    Ok(RestLoadCredentialsResponse { storage_credentials })
+    let mut config = load_credentials_response_config(CREDENTIAL_VENDING_SUPPORTED, CREDENTIAL_MODE_CATALOG_VENDED, None);
+    add_table_credential_scope_config(&mut config, &scope_prefix);
+    Ok(RestLoadCredentialsResponse {
+        config,
+        storage_credentials,
+    })
 }
 
 fn commit_table_response_from_result(
@@ -8540,6 +8579,18 @@ mod tests {
             .expect("disabled issuer should build an empty response");
 
         assert!(response.storage_credentials.is_empty());
+        assert_eq!(
+            response.config.get(CREDENTIAL_VENDING_CONFIG_KEY),
+            Some(&CREDENTIAL_VENDING_UNSUPPORTED.to_string())
+        );
+        assert_eq!(
+            response.config.get(CREDENTIAL_MODE_CONFIG_KEY),
+            Some(&CREDENTIAL_MODE_CLIENT_PROVIDED.to_string())
+        );
+        assert_eq!(
+            response.config.get(CREDENTIAL_VENDING_REASON_CONFIG_KEY),
+            Some(&"credential-vending-disabled".to_string())
+        );
     }
 
     #[tokio::test]
@@ -8553,6 +8604,54 @@ mod tests {
             .expect("disabled issuer should not validate credential scopes");
 
         assert!(response.storage_credentials.is_empty());
+        assert_eq!(
+            response.config.get(CREDENTIAL_VENDING_CONFIG_KEY),
+            Some(&CREDENTIAL_VENDING_UNSUPPORTED.to_string())
+        );
+        assert!(!response.config.contains_key(CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY));
+    }
+
+    struct UnavailableTableCredentialIssuer;
+
+    #[async_trait::async_trait]
+    impl TableCredentialIssuer for UnavailableTableCredentialIssuer {
+        async fn issue_table_credentials(
+            &self,
+            request: TableCredentialIssueRequest<'_>,
+        ) -> S3Result<Option<IssuedTableCredentials>> {
+            assert_eq!(request.scope_prefix, "s3://warehouse/tables/table-id/");
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_table_credential_issuer_reports_fallback_scope() {
+        let issuer = UnavailableTableCredentialIssuer;
+        let response = load_credentials_response_from_entry(&table_entry_for_credentials(), &issuer, None)
+            .await
+            .expect("unavailable issuer should build a fallback response");
+
+        assert!(response.storage_credentials.is_empty());
+        assert_eq!(
+            response.config.get(CREDENTIAL_VENDING_CONFIG_KEY),
+            Some(&CREDENTIAL_VENDING_UNSUPPORTED.to_string())
+        );
+        assert_eq!(
+            response.config.get(CREDENTIAL_MODE_CONFIG_KEY),
+            Some(&CREDENTIAL_MODE_CLIENT_PROVIDED.to_string())
+        );
+        assert_eq!(
+            response.config.get(CREDENTIAL_VENDING_REASON_CONFIG_KEY),
+            Some(&CREDENTIAL_VENDING_UNSUPPORTED_REASON.to_string())
+        );
+        assert_eq!(
+            response.config.get(CREDENTIAL_SCOPE_CONFIG_KEY),
+            Some(&CREDENTIAL_SCOPE_TABLE_PREFIX.to_string())
+        );
+        assert_eq!(
+            response.config.get(CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY),
+            Some(&"s3://warehouse/tables/table-id/".to_string())
+        );
     }
 
     struct TestTableCredentialIssuer;
@@ -8588,6 +8687,17 @@ mod tests {
             .await
             .expect("issuer should build a scoped credential response");
 
+        assert_eq!(
+            response.config.get(CREDENTIAL_VENDING_CONFIG_KEY),
+            Some(&CREDENTIAL_VENDING_SUPPORTED.to_string())
+        );
+        assert_eq!(
+            response.config.get(CREDENTIAL_MODE_CONFIG_KEY),
+            Some(&CREDENTIAL_MODE_CATALOG_VENDED.to_string())
+        );
+        assert!(!response.config.contains_key(S3_ACCESS_KEY_ID_CONFIG_KEY));
+        assert!(!response.config.contains_key(S3_SECRET_ACCESS_KEY_CONFIG_KEY));
+        assert!(!response.config.contains_key(S3_SESSION_TOKEN_CONFIG_KEY));
         assert_eq!(response.storage_credentials.len(), 1);
         let credential = &response.storage_credentials[0];
         assert_eq!(credential.prefix, "s3://warehouse/tables/table-id/");
@@ -8607,6 +8717,28 @@ mod tests {
             Some(&"1800000000".to_string())
         );
         assert!(!credential.config.contains_key("rustfs.credential-vending-reason"));
+    }
+
+    #[tokio::test]
+    async fn credential_response_serializes_sensitive_config_only_inside_storage_credentials() {
+        let issuer = TestTableCredentialIssuer;
+        let response = load_credentials_response_from_entry(&table_entry_for_credentials(), &issuer, None)
+            .await
+            .expect("issuer should build a scoped credential response");
+
+        let value = serde_json::to_value(&response).expect("credential response should serialize");
+
+        assert_eq!(
+            value["config"][CREDENTIAL_VENDING_CONFIG_KEY],
+            serde_json::Value::String(CREDENTIAL_VENDING_SUPPORTED.to_string())
+        );
+        assert!(value["config"].get(S3_ACCESS_KEY_ID_CONFIG_KEY).is_none());
+        assert!(value["config"].get(S3_SECRET_ACCESS_KEY_CONFIG_KEY).is_none());
+        assert!(value["config"].get(S3_SESSION_TOKEN_CONFIG_KEY).is_none());
+        assert_eq!(
+            value["storage-credentials"][0]["config"][S3_ACCESS_KEY_ID_CONFIG_KEY],
+            serde_json::Value::String("temporary-access-key".to_string())
+        );
     }
 
     #[test]
