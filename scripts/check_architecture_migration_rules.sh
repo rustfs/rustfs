@@ -83,6 +83,7 @@ BROAD_STORE_API_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/broad_store_api_compat_ree
 NESTED_STORE_API_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/nested_store_api_compat_module_hits.txt"
 UNAPPROVED_STORE_API_COMPAT_ALIAS_HITS_FILE="${TMP_DIR}/unapproved_store_api_compat_alias_hits.txt"
 PUBLIC_STORE_API_MODULE_HITS_FILE="${TMP_DIR}/public_store_api_module_hits.txt"
+ECSTORE_PUBLIC_ROOT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_public_root_module_hits.txt"
 STORE_API_MODULE_PATH_HITS_FILE="${TMP_DIR}/store_api_module_path_hits.txt"
 ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE="${TMP_DIR}/ecstore_compat_passthrough_expected.txt"
 ECSTORE_COMPAT_PASSTHROUGH_ACTUAL_FILE="${TMP_DIR}/ecstore_compat_passthrough_actual.txt"
@@ -794,6 +795,10 @@ fi
 
 if rg -n --no-heading '^\s*pub\s+mod\s+store_api\s*;' "$ROOT_DIR/crates/ecstore/src/lib.rs" >"$PUBLIC_STORE_API_MODULE_HITS_FILE"; then
   report_failure "ECStore store_api must remain private; expose ECStore-owned object DTO and reader aliases through rustfs_ecstore::object_api"
+fi
+
+if rg -n --no-heading '^\s*pub\s+mod\s+(batch_processor|bitrot|erasure_coding|event|object_api|store_list_objects)\s*;' "$ROOT_DIR/crates/ecstore/src/lib.rs" >"$ECSTORE_PUBLIC_ROOT_MODULE_HITS_FILE"; then
+  report_failure "facade-covered ECStore root modules must remain private; expose compatibility through rustfs_ecstore::api: $(paste -sd '; ' "$ECSTORE_PUBLIC_ROOT_MODULE_HITS_FILE")"
 fi
 
 (

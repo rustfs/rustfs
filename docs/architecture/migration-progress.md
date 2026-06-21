@@ -467,6 +467,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     layer guards, formatting, diff hygiene, Rust risk scan, branch freshness
     check, pre-commit quality gate, and three-expert review.
 
+- [x] `API-077` Prune remaining ECStore root compatibility modules.
+  - Completed slice: add explicit `rustfs_ecstore::api` facade groups for
+    bitrot, erasure coding, object DTO/reader, event name, and store-list
+    helper surfaces, then migrate ECStore tests and benches away from the
+    legacy root module paths.
+  - Acceptance: `batch_processor`, `bitrot`, `erasure_coding`, `event`,
+    `object_api`, and `store_list_objects` are no longer public ECStore root
+    modules, and the migration guard rejects restoring them as public modules.
+  - Must preserve: ECStore internal module access, public facade access for
+    compatibility tests/benches, bitrot reader/writer behavior, erasure coding
+    constructors/helpers, object reader/DTO wire shape, and list option
+    semantics.
+  - Verification: migration guard, ECStore compatibility tests/benches compile
+    coverage, formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.
   - Acceptance: `./scripts/check_architecture_migration_rules.sh` parses the
     allowed PR types from [`crate-boundaries.md`](crate-boundaries.md) and fails
@@ -2995,9 +3011,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-069 narrows startup owner item visibility without changing module ownership, startup flow, or public binary/embedded entrypoints. |
-| Migration preservation | passed | `startup_entrypoint` remains the only public startup module; the migration guard now rejects new public startup modules and bare public items in crate-private startup files. |
-| Testing/verification | passed | RustFS lib/bin checks, focused startup tests, migration/layer/unsafe guards, formatting, diff hygiene, added-line risk scan, and pre-commit gate passed. |
+| Quality/architecture | passed | R-069 narrows startup owner item visibility and API-077 removes remaining facade-covered ECStore root modules without runtime logic changes. |
+| Migration preservation | passed | `startup_entrypoint` remains the only public startup module; ECStore bitrot, erasure, object, event, list, and batch surfaces now route through `rustfs_ecstore::api`. |
+| Testing/verification | passed | ECStore all-target compile, migration/layer/unsafe guards, formatting, diff hygiene, added-line risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
@@ -3018,6 +3034,14 @@ Passed before push:
     remains public.
   - Rust added-line risk scan on changed Rust files and guard script: passed.
   - `make pre-commit`: passed.
+
+- Issue #660 API-077 current slice:
+  - `cargo check -p rustfs-ecstore --all-targets`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Rust added-line risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed; nextest ran 6340 tests with 6340 passed, 111 skipped, and doctests passed.
 
 - Issue #660 API-076 current slice:
   - `cargo check --tests -p rustfs-ecstore -p rustfs -p rustfs-scanner -p rustfs-heal -p rustfs-iam -p rustfs-notify -p rustfs-obs -p rustfs-protocols -p rustfs-s3select-api -p e2e_test`: passed.

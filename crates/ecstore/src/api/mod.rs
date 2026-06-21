@@ -18,6 +18,10 @@ pub mod admin {
     pub use crate::admin_server_info::{get_local_server_property, get_server_info};
 }
 
+pub mod bitrot {
+    pub use crate::bitrot::{create_bitrot_reader, create_bitrot_writer};
+}
+
 pub mod bucket {
     pub use crate::bucket::{
         bandwidth, bucket_target_sys, lifecycle, metadata, metadata_sys, migration, object_lock, policy_sys, quota, replication,
@@ -78,7 +82,15 @@ pub mod error {
     };
 }
 
+pub mod erasure {
+    pub use crate::erasure_coding::{
+        BitrotReader, BitrotWriter, BitrotWriterWrapper, CustomWriter, Erasure, ReedSolomonEncoder, calc_shard_size,
+        calc_shard_size_legacy,
+    };
+}
+
 pub mod event {
+    pub use crate::event::name::EventName;
     pub use crate::event_notification::{EventArgs, register_event_dispatch_hook};
 }
 
@@ -107,6 +119,13 @@ pub mod notification {
     };
 }
 
+pub mod object {
+    pub use crate::object_api::{
+        BLOCK_SIZE_V2, ERASURE_ALGORITHM, GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader, RangedDecompressReader,
+        StreamConsumer,
+    };
+}
+
 pub mod rebalance {
     pub use crate::rebalance::{
         DiskStat, RebalSaveOpt, RebalStatus, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta, RebalanceStats,
@@ -130,6 +149,10 @@ pub mod rpc {
 
 pub mod set_disk {
     pub use crate::set_disk::{DEFAULT_READ_BUFFER_SIZE, SetDisks, get_lock_acquire_timeout, is_valid_storage_class};
+}
+
+pub mod store_list {
+    pub use crate::store_list_objects::{ListPathOptions, max_keys_plus_one};
 }
 
 pub mod storage {

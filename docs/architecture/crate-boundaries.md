@@ -137,7 +137,9 @@ must remain crate-private; public layout access goes through
 `rustfs_ecstore::api::layout`.
 Facade-covered ECStore root modules must remain crate-private after this
 boundary is established; outer crates should use `rustfs_ecstore::api::*`
-instead of legacy root module paths.
+instead of legacy root module paths. This includes storage/layout surfaces as
+well as remaining bitrot, erasure coding, object DTO/reader, event, list, and
+batch processor root modules once their facade groups exist.
 
 RustFS startup internals must stay crate-private after the startup owner split.
 Only `startup_entrypoint` remains a public startup module for the binary
