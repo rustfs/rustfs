@@ -282,7 +282,8 @@ fn should_fail_test_init_attempt() -> bool {
 /// call re-reads the environment variable by restoring the sentinel value.
 /// Intended for use in integration tests that share a process.
 #[doc(hidden)]
-pub fn reset_test_failure_counter() {
+#[allow(dead_code)]
+pub(crate) fn reset_test_failure_counter() {
     use std::sync::atomic::Ordering;
     TEST_REMAINING_FAILURES.store(u64::MAX, Ordering::SeqCst);
 }

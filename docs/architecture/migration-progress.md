@@ -2658,6 +2658,21 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
     freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `R-068` Narrow remaining startup compatibility shim visibility.
+  - Do: make the IAM bootstrap startup shim crate-private, remove the unused
+    optional-runtime and profiling forwarding shims, and keep the binary
+    entrypoint public.
+  - Acceptance: `startup_entrypoint` remains public for `rustfs/src/main.rs`,
+    while `startup_iam`, `startup_optional_runtimes`, and `startup_profiling`
+    no longer appear as public library modules; migration rules reject
+    restoring those public shim paths.
+  - Must preserve: binary startup entrypoint access, IAM readiness bootstrap
+    flow, embedded readiness publication, optional runtime shutdown wiring,
+    profiling shutdown behavior, and test-only IAM retry hook behavior.
+  - Verification: RustFS lib and bin check, focused startup checks,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
 - [x] `E-001/E-SET-001` Add ECStore layout skeleton and set-layout boundary.
   - Do: create the ECStore internal layout ownership buckets and pin static set
     layout versus runtime `Sets`/`SetDisks` orchestration boundaries before any
@@ -2900,20 +2915,30 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `pure-move`: continue the context-first runtime startup path by narrowing
-   remaining startup service ownership boundaries.
+1. `pure-move`: continue pruning startup public surface and owner boundaries.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-072 adds an explicit ECStore facade for outer compatibility surfaces and routes storage, admin, scanner, observability, IAM, heal, Swift, S3 Select, and test compatibility imports through it. |
-| Migration preservation | passed | ECStore owner types, endpoint layout types, capacity helpers, local metrics collection, notification peer behavior, and storage init helpers remain re-exported without runtime behavior changes. |
-| Testing/verification | passed | ECStore and outer compatibility check suites, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and the full pre-commit gate passed. |
+| Quality/architecture | passed | R-068 keeps the binary startup entrypoint public while making remaining startup compatibility shims crate-private and guarding that surface. |
+| Migration preservation | passed | IAM readiness bootstrap, embedded readiness publication, optional runtime shutdown wiring, profiling shutdown behavior, and test-only IAM retry hook behavior stay in the same owner modules. |
+| Testing/verification | passed | RustFS lib/bin check, focused startup checks, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 R-068 current slice:
+  - `cargo check -p rustfs --lib --bins`: passed.
+  - `cargo test -p rustfs --lib startup_ -- --nocapture`: passed; 53 tests.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `./scripts/check_unsafe_code_allowances.sh`: passed.
+  - Rust risk scan on changed Rust files and guard script: passed; only existing test-only `expect` calls were present.
+  - `make pre-commit`: passed; nextest ran 6341 tests with 6341 passed, 111 skipped, and doctests passed.
 
 - Issue #660 API-072 current slice:
   - `cargo check --tests -p rustfs-ecstore`: passed.
