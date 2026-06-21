@@ -21,6 +21,7 @@ pub(crate) type DynReader = rustfs_ecstore::api::rio::DynReader;
 pub(crate) type ECStore = rustfs_ecstore::api::storage::ECStore;
 pub(crate) type EndpointServerPools = rustfs_ecstore::api::layout::EndpointServerPools;
 pub(crate) type HashReader = rustfs_ecstore::api::rio::HashReader;
+pub(crate) type NotificationSys = rustfs_ecstore::api::notification::NotificationSys;
 pub(crate) type ObjectStoreResolver = dyn Fn() -> Option<Arc<ECStore>> + Send + Sync + 'static;
 pub(crate) type ObjectInfo = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
 pub(crate) type ObjectOptions = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
@@ -162,7 +163,7 @@ pub(crate) mod lifecycle {
 
         pub(crate) async fn persist_tier_delete_journal_entry(
             api: Arc<ECStore>,
-            je: &rustfs_ecstore::api::bucket::lifecycle::tier_sweeper::Jentry,
+            je: &super::tier_sweeper::Jentry,
         ) -> std::io::Result<()> {
             rustfs_ecstore::api::bucket::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry(api, je).await
         }
@@ -515,7 +516,7 @@ pub(crate) fn set_object_store_resolver(resolver: Arc<ObjectStoreResolver>) -> b
     rustfs_ecstore::api::global::set_object_store_resolver(resolver)
 }
 
-pub(crate) fn get_global_notification_sys() -> Option<&'static rustfs_ecstore::api::notification::NotificationSys> {
+pub(crate) fn get_global_notification_sys() -> Option<&'static NotificationSys> {
     rustfs_ecstore::api::notification::get_global_notification_sys()
 }
 

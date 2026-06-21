@@ -180,6 +180,10 @@ facade aliases must stay anchored on storage-api associated object types and
 local `StorageError` aliases. They must not reintroduce raw
 `rustfs_ecstore::api::object::{ObjectInfo,ObjectOptions}` or
 `rustfs_ecstore::api::error::{Error,Result}` references.
+Outer compatibility function signatures must also use local aliases for ECStore
+metadata, object-lock, lifecycle journal, monitor, and notification facade
+types. The boundary may define the local alias, but call signatures must not
+expose the raw ECStore facade path once narrowed.
 Scanner, notify, observability, and e2e `storage_compat.rs` boundaries must
 also stay narrow. Scanner must not restore grouped bucket compatibility exports
 for target, lifecycle, metadata, replication, or versioning modules. Notify

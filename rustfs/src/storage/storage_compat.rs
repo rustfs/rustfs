@@ -29,6 +29,8 @@ pub(crate) const SERVICE_SIGNAL_RELOAD_DYNAMIC: u64 = rustfs_ecstore::api::rpc::
 pub(crate) const STORAGE_CLASS_SUB_SYS: &str = rustfs_ecstore::api::config::com::STORAGE_CLASS_SUB_SYS;
 
 pub(crate) type BucketMetadata = rustfs_ecstore::api::bucket::metadata::BucketMetadata;
+#[cfg(test)]
+pub(crate) type BucketMetadataSys = rustfs_ecstore::api::bucket::metadata_sys::BucketMetadataSys;
 pub(crate) type BucketVersioningSys = rustfs_ecstore::api::bucket::versioning_sys::BucketVersioningSys;
 pub(crate) type CollectMetricsOpts = rustfs_ecstore::api::metrics::CollectMetricsOpts;
 pub(crate) type DeleteOptions = rustfs_ecstore::api::disk::DeleteOptions;
@@ -39,6 +41,7 @@ pub(crate) type ECStore = rustfs_ecstore::api::storage::ECStore;
 pub(crate) type FileInfoVersions = rustfs_ecstore::api::disk::FileInfoVersions;
 pub(crate) type LocalPeerS3Client = rustfs_ecstore::api::rpc::LocalPeerS3Client;
 pub(crate) type MetricType = rustfs_ecstore::api::metrics::MetricType;
+pub(crate) type ObjectLockBlockReason = rustfs_ecstore::api::bucket::object_lock::objectlock_sys::ObjectLockBlockReason;
 pub(crate) type PolicySys = rustfs_ecstore::api::bucket::policy_sys::PolicySys;
 pub(crate) type ReadMultipleReq = rustfs_ecstore::api::disk::ReadMultipleReq;
 pub(crate) type ReadMultipleResp = rustfs_ecstore::api::disk::ReadMultipleResp;
@@ -66,8 +69,7 @@ pub(crate) fn bucket_metadata_sys_initialized() -> bool {
 }
 
 #[cfg(test)]
-pub(crate) fn get_global_bucket_metadata_sys()
--> Option<Arc<tokio::sync::RwLock<rustfs_ecstore::api::bucket::metadata_sys::BucketMetadataSys>>> {
+pub(crate) fn get_global_bucket_metadata_sys() -> Option<Arc<tokio::sync::RwLock<BucketMetadataSys>>> {
     rustfs_ecstore::api::bucket::metadata_sys::get_global_bucket_metadata_sys()
 }
 
@@ -152,7 +154,7 @@ pub(crate) fn check_retention_for_modification(
     new_mode: Option<&str>,
     new_retain_until: Option<time::OffsetDateTime>,
     bypass_governance: bool,
-) -> Option<rustfs_ecstore::api::bucket::object_lock::objectlock_sys::ObjectLockBlockReason> {
+) -> Option<ObjectLockBlockReason> {
     rustfs_ecstore::api::bucket::object_lock::objectlock_sys::check_retention_for_modification(
         user_defined,
         new_mode,
