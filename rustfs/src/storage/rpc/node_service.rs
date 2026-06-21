@@ -17,11 +17,11 @@ use crate::admin::service::{
     site_replication::reload_site_replication_runtime_state,
 };
 use crate::storage::storage_compat::{
-    CollectMetricsOpts, DeleteOptions, DiskAPI, DiskError, DiskInfoOptions, DiskStore, FileInfoVersions, GLOBAL_TierConfigMgr,
-    LocalPeerS3Client, MetricType, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerS3Client, ReadMultipleReq, ReadMultipleResp,
-    ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, UpdateMetadataOpts, all_local_disk_path,
-    collect_local_metrics, find_local_disk_by_ref, get_global_lock_client, get_local_server_property, load_bucket_metadata,
-    resolve_object_store_handle, set_bucket_metadata,
+    CollectMetricsOpts, DeleteOptions, DiskAPI, DiskError, DiskInfoOptions, DiskStore, FileInfoVersions, LocalPeerS3Client,
+    MetricType, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerS3Client, ReadMultipleReq, ReadMultipleResp, ReadOptions,
+    SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, UpdateMetadataOpts, all_local_disk_path, collect_local_metrics,
+    find_local_disk_by_ref, get_global_lock_client, get_local_server_property, load_bucket_metadata,
+    reload_transition_tier_config, resolve_object_store_handle, set_bucket_metadata,
 };
 use bytes::Bytes;
 use futures::Stream;
@@ -1046,7 +1046,7 @@ impl Node for NodeService {
             }));
         };
 
-        match GLOBAL_TierConfigMgr.write().await.reload(store).await {
+        match reload_transition_tier_config(store).await {
             Ok(_) => Ok(Response::new(LoadTransitionTierConfigResponse {
                 success: true,
                 error_info: None,

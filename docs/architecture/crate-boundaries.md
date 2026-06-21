@@ -149,6 +149,10 @@ boundaries that still need module-local owner cleanup.
 Root runtime storage config initialization and disk endpoint contracts must also
 stay explicit aliases. The root compatibility boundary must not restore `com`,
 bare `init`, or grouped `endpoint::Endpoint` passthroughs.
+RustFS root `storage_compat.rs` must not re-export ECStore API symbols directly;
+remaining root runtime compatibility symbols must be local type aliases,
+constants, traits, or wrapper functions so ownership stays visible at the
+boundary.
 RustFS admin `storage_compat.rs` must expose config IO and default
 initialization through explicit aliases. The admin compatibility boundary must
 not restore broad `com` or bare `init` passthroughs.
@@ -162,6 +166,22 @@ storage-class config contracts through explicit aliases. The storage
 compatibility boundary must not restore broad `metadata`, `metadata_sys`,
 `object_lock`, `policy_sys`, `replication`, `tagging`, `utils`, `versioning`,
 `versioning_sys`, `object_api_utils`, or `com` passthroughs.
+RustFS storage owner `storage_compat.rs` must not re-export ECStore API symbols
+directly except temporary trait imports needed for method resolution. Remaining
+storage-owner compatibility symbols must be local constants, type aliases, or
+wrapper functions so storage-owned global state and helper access stays visible
+at the boundary.
+Scanner, notify, observability, and e2e `storage_compat.rs` boundaries must
+also stay narrow. Scanner must not restore grouped bucket compatibility exports
+for target, lifecycle, metadata, replication, or versioning modules. Notify
+must not restore broad `config`/`global` module imports. Observability must
+consume data usage through a local DTO projection instead of re-exporting the
+ECStore data-usage loader. The e2e harness must not restore grouped RPC
+passthroughs.
+Test and fuzz `storage_compat.rs` harnesses must also stay narrow. Heal and
+scanner test harnesses must expose ECStore contracts through direct aliases or
+local wrappers, and fuzz harnesses must wrap bucket utility entrypoints instead
+of restoring grouped ECStore passthrough exports.
 
 ECStore ClusterControlPlane read models must stay owned by the crate-private
 `cluster` module. Public access goes through `rustfs_ecstore::api::cluster` so

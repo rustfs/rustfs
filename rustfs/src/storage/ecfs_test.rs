@@ -941,12 +941,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_bucket_object_lock_enabled() {
-        use crate::storage::storage_compat::GLOBAL_BUCKET_METADATA_SYS;
+        use crate::storage::storage_compat::bucket_metadata_sys_initialized;
         use crate::storage::storage_compat::set_bucket_metadata;
         use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
         use time::OffsetDateTime;
 
-        if GLOBAL_BUCKET_METADATA_SYS.get().is_none() {
+        if !bucket_metadata_sys_initialized() {
             eprintln!("Skipping test: GLOBAL_BucketMetadataSys not initialized");
             return;
         }

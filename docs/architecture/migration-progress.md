@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-admin-app-compat-aliases`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082`.
-- Stacked on: API-082 storage compatibility alias pruning.
+- Branch: `overtrue/arch-storage-owner-compat-wrappers-main`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086`.
+- Stacked on: `origin/main` after API-086 merged.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: prune admin/app bucket-facing compatibility passthroughs
-  into explicit local compatibility modules and aliases.
-- CI/script changes: guard against restoring broad admin/app bucket, client,
-  and storage-class compatibility passthroughs.
-- Docs changes: record the API-083 admin/app compatibility alias boundary.
+- Rust code changes: prune storage-owner compatibility re-exports into local
+  constants, type aliases, trait imports, and wrapper functions.
+- CI/script changes: guard against restoring storage-owner ECStore API
+  re-exports except temporary trait imports.
+- Docs changes: record the API-087 storage-owner compatibility boundary.
 
 ## Phase 0 Tasks
 
@@ -187,6 +187,65 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: RustFS compile coverage, admin/app compatibility residual
     scans, formatting, diff hygiene, risk scan, architecture guard, pre-commit
     quality gate, and three-expert review.
+- [x] `API-084` Prune edge compatibility passthrough aliases.
+  - Completed slice: replace scanner grouped bucket compatibility exports,
+    notify broad config/global imports, observability data-usage passthroughs,
+    and e2e grouped RPC passthroughs with explicit edge-local aliases,
+    wrappers, and DTO projections.
+  - Acceptance: scanner bucket contracts stay explicitly named, notify config
+    persistence routes through local wrappers, observability metrics consume a
+    local data-usage DTO, and e2e RPC helper access stays narrow.
+  - Must preserve: scanner lifecycle and replication behavior, notification
+    server-config update semantics, observability cluster/bucket usage metrics,
+    and e2e RPC client/interceptor call sites.
+  - Verification: focused edge crate compile coverage, edge compatibility
+    residual scans, formatting, diff hygiene, risk scan, architecture guard,
+    pre-commit quality gate, and three-expert review.
+- [x] `API-085` Prune test and fuzz compatibility passthrough aliases.
+  - Completed slice: replace heal/scanner test and fuzz grouped ECStore
+    compatibility passthroughs with direct type aliases and local wrapper
+    functions.
+  - Acceptance: test harnesses keep their existing ECStore setup and lifecycle
+    helper call sites while exposing only narrow compatibility symbols, and
+    fuzz targets exercise bucket utility contracts through local wrappers.
+  - Must preserve: heal test ECStore setup, scanner lifecycle integration setup,
+    local disk initialization, bucket metadata updates, transition enqueue
+    behavior, and fuzz validation semantics.
+  - Verification: focused heal/scanner compile coverage, test/fuzz
+    compatibility residual scans, formatting, diff hygiene, architecture guard,
+    pre-commit quality gate, and three-expert review.
+- [x] `API-086` Prune root runtime compatibility re-exports.
+  - Completed slice: replace root RustFS runtime `storage_compat.rs` ECStore API
+    re-exports with local constants, type aliases, a minimal disk trait, and
+    wrapper functions.
+  - Acceptance: root runtime startup, metadata, replication admission,
+    topology, notification, RPC, capacity, table-catalog, and shutdown call
+    sites keep their existing local compatibility names while the root boundary
+    no longer re-exports ECStore API symbols directly.
+  - Must preserve: startup storage initialization order, bucket metadata
+    migration/init, replication runtime startup and admission counts,
+    notification init, RPC signature checks, capacity disk references,
+    topology snapshots, table-catalog metadata access, and shutdown behavior.
+  - Verification: RustFS compile coverage, root compatibility re-export
+    residual scan, formatting, diff hygiene, architecture guard, pre-commit
+    quality gate, and three-expert review.
+- [x] `API-087` Prune storage owner compatibility re-exports.
+  - Completed slice: replace RustFS storage-owner `storage_compat.rs` ECStore
+    API re-exports for metadata, object-lock, replication stats, tags, XML
+    helpers, RPC globals, metrics, global accessors, tier reloads, and local
+    disk helpers with local aliases and wrappers; keep only temporary trait
+    imports required for method resolution.
+  - Acceptance: storage S3 handlers, ECFS replication metrics, RPC node service,
+    and storage tests keep their existing compatibility names while the storage
+    owner boundary no longer exposes direct ECStore API symbol re-exports for
+    functions, constants, globals, or DTO aliases.
+  - Must preserve: bucket metadata read/write/delete semantics, object-lock
+    retention checks, replication proxy metrics, object tag encoding/decoding,
+    XML serialization behavior, RPC signature checks, transition-tier reloads,
+    global object-store/lock/region access, and local disk lookup behavior.
+  - Verification: RustFS compile coverage, storage-owner re-export residual
+    scan, migration guard, formatting, diff hygiene, Rust risk scan,
+    pre-commit quality gate, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3220,13 +3279,53 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-083 narrows admin/app bucket-facing compatibility passthroughs into explicit local aliases without adding new ECStore ownership cycles. |
-| Migration preservation | passed | Admin replication, site-replication metadata, bucket targets, quota, tier stats, app bucket/object/multipart/lifecycle, ETag conversion, and storage-class behavior remain preserved. |
-| Testing/verification | passed | RustFS compile coverage, admin/app compatibility residual scans, migration guard, formatting, diff hygiene, added-line risk scan, full pre-commit, and three-expert review passed. |
+| Quality/architecture | passed | API-087 narrows storage-owner compatibility with local aliases/wrappers and an ECStore API re-export guard while leaving only method-resolution trait imports. |
+| Migration preservation | passed | Metadata, object-lock, replication proxy metrics, tag/XML helpers, RPC signature checks, tier reload, global accessors, and local disk lookup remain behind existing storage compatibility names. |
+| Testing/verification | passed | RustFS compile coverage, storage-owner re-export residual scan, migration guard, formatting, diff hygiene, Rust risk scan, full pre-commit, and three-expert review passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-087 current slice:
+  - `cargo check -p rustfs`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Storage-owner ECStore API re-export residual scan: passed.
+  - Rust added-line risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-086 current slice:
+  - `cargo check -p rustfs`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Root runtime ECStore API re-export residual scan: passed.
+  - Rust added-line risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-085 current slice:
+  - `cargo check --tests -p rustfs-heal -p rustfs-scanner`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Test/fuzz grouped compatibility passthrough residual scans: passed.
+  - Rust added-line risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-084 current slice:
+  - `cargo check --tests -p rustfs-scanner -p rustfs-notify -p rustfs-obs -p e2e_test`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Scanner/notify/obs/e2e broad compatibility residual scans: passed.
+  - Rust added-line risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-083 current slice:
   - `cargo check -p rustfs --lib`: passed.

@@ -116,7 +116,7 @@ pub mod global {
 
 pub mod layout {
     pub use crate::disks_layout::DisksLayout;
-    pub use crate::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+    pub use crate::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints, SetupType};
 }
 
 pub mod metrics {
