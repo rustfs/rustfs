@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_compat::ECStore;
+use crate::startup_storage_compat::ECStore;
 use rustfs_heal::{create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager};
 use rustfs_utils::get_env_bool_with_aliases;
 use std::{io::Result, sync::Arc};

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_compat::set_global_rustfs_port;
+use crate::startup_storage_compat::{set_global_region, set_global_rustfs_port};
 use crate::{
     capacity::capacity_integration::init_capacity_management,
     config::Config,
@@ -82,7 +82,7 @@ pub(crate) async fn init_startup_listen_context(config: &Config) -> Result<Start
     if let Some(region_str) = &config.region {
         region_str
             .parse::<s3s::region::Region>()
-            .map(crate::storage_compat::set_global_region)
+            .map(set_global_region)
             .map_err(|err| Error::other(format!("invalid region '{}': {}", region_str, err)))?;
     }
 
@@ -190,7 +190,7 @@ pub(crate) async fn init_embedded_startup_listen_context(config: &Config) -> Res
     if let Some(region_str) = &config.region {
         region_str
             .parse::<s3s::region::Region>()
-            .map(crate::storage_compat::set_global_region)
+            .map(set_global_region)
             .map_err(|err| Error::other(format!("invalid region '{region_str}': {err}")))?;
     }
 

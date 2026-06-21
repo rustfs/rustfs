@@ -13,6 +13,7 @@
 // limitations under the License.
 
 // Import HTTP server components and compression configuration
+use super::storage_compat::{TONIC_RPC_PREFIX, verify_rpc_signature};
 use crate::admin;
 use crate::auth::IAMAuth;
 use crate::auth_keystone;
@@ -33,7 +34,6 @@ use crate::server::{
 use crate::storage;
 use crate::storage::rpc::InternodeRpcService;
 use crate::storage::tonic_service::make_server;
-use crate::storage_compat::{TONIC_RPC_PREFIX, verify_rpc_signature};
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request as HttpRequest, Response};
 use hyper_util::{

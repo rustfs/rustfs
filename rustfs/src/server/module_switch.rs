@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_compat::{
+use super::storage_compat::{
     EcstoreError as StorageError, read_ecstore_config, resolve_object_store_handle, save_ecstore_config,
 };
 use serde::{Deserialize, Serialize};

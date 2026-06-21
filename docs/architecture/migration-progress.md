@@ -5,17 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-disk-rpc-method-wrappers`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096`.
-- Stacked on: `overtrue/arch-compat-trait-method-wrappers` pending API-096 merge.
+- Branch: `overtrue/arch-runtime-compat-consumer-batch`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100`.
+- Stacked on: `overtrue/arch-disk-rpc-method-wrappers` pending API-097 merge.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move remaining disk RPC, peer S3 RPC, heal/scanner disk,
-  and warm-backend test method access behind local compatibility traits or
-  aliases.
-- CI/script changes: remove the final direct ECStore method-resolution import
-  exceptions outside compatibility boundaries.
-- Docs changes: record the API-097 disk/RPC/warm-backend wrapper cleanup.
+- Rust code changes: move capacity, server, startup, table catalog,
+  runtime-capability, workload-admission, error, and config-test ECStore
+  compatibility consumers from the root runtime facade into local boundaries.
+- CI/script changes: guard against restoring consumer wrappers in the root
+  runtime compatibility facade and tolerate retiring the empty root facade.
+- Docs changes: record the API-098/API-099/API-100 runtime consumer boundary cleanup.
 
 ## Phase 0 Tasks
 
@@ -377,7 +377,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     import residual scan, migration guard, formatting, diff hygiene, Rust risk
     scan, pre-commit quality gate, and three-expert review.
 - [x] `API-097` Prune disk/RPC/warm-backend method imports.
-  - Current slice: move disk RPC, peer S3 RPC, heal/scanner disk, and
+  - Completed slice: move disk RPC, peer S3 RPC, heal/scanner disk, and
     warm-backend test method access behind local compatibility traits or
     aliases in the owning boundaries.
   - Acceptance: non-compat RustFS, scanner, heal, and test sources no longer
@@ -390,6 +390,51 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     disk/RPC/warm-backend trait import residual scan, migration guard,
     formatting, diff hygiene, Rust risk scan, pre-commit quality gate, and
     three-expert review.
+- [x] `API-098` Prune root runtime capacity/server compat consumers.
+  - Completed slice: move capacity disk access, HTTP RPC signature verification,
+    event dispatch bridging, module-switch config persistence, and readiness
+    storage/lock quorum lookups into local `capacity` and `server`
+    compatibility boundaries.
+  - Acceptance: root runtime `storage_compat.rs` no longer owns
+    capacity/server-only ECStore wrapper functions, trait shims, or constants;
+    migration rules reject restoring those wrappers to the root facade.
+  - Must preserve: capacity background refresh disk discovery, internode RPC
+    signature verification, live event dispatch, module-switch persistence,
+    storage readiness, and distributed lock quorum behavior.
+  - Verification: RustFS test-target compile coverage, capacity/server residual
+    scan, migration and layer guards, formatting, diff hygiene, Rust risk scan,
+    pre-commit quality gate, and three-expert review.
+- [x] `API-099` Prune root runtime startup compat consumers.
+  - Completed slice: move startup storage bootstrap, bucket metadata migration,
+    notification initialization, global region/port setup, background shutdown,
+    and startup service ECStore aliases into a dedicated startup compatibility
+    boundary.
+  - Acceptance: startup and init modules no longer consume root
+    `storage_compat.rs`; root runtime `storage_compat.rs` no longer owns
+    startup-only ECStore wrapper functions or aliases; migration rules reject
+    restoring those wrappers to the root facade.
+  - Must preserve: endpoint parsing, unsupported filesystem policy,
+    local-disk and lock-client initialization, global config migration,
+    bucket metadata migration, IAM migration, notification registration,
+    default-region fallback, background replication, and shutdown behavior.
+  - Verification: RustFS test-target compile coverage, startup residual scan,
+    migration and layer guards, formatting, diff hygiene, Rust risk scan,
+    pre-commit quality gate, and three-expert review.
+- [x] `API-100` Retire root runtime storage compatibility consumers.
+  - Completed slice: move table catalog metadata constants and bucket metadata
+    reads, runtime topology capability mapping, workload admission runtime
+    state probes, S3 error mapping aliases, and config test disk-layout aliases
+    into local compatibility boundaries, then remove the root
+    `storage_compat.rs` module.
+  - Acceptance: no RustFS source consumes `crate::storage_compat`; root
+    runtime compatibility file is removed; migration rules still reject direct
+    ECStore imports outside `*storage_compat.rs` boundaries.
+  - Must preserve: table catalog internal metadata paths, lock timeout lookup,
+    runtime topology snapshots, workload admission status reporting, quota and
+    storage error mapping, and config disk-layout parsing tests.
+  - Verification: RustFS test-target compile coverage, direct root compatibility
+    consumer residual scan, migration and layer guards, formatting, diff
+    hygiene, Rust risk scan, pre-commit quality gate, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3430,6 +3475,43 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-098 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Direct root capacity/server compatibility consumer residual scan: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-099 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Startup/init root compatibility consumer residual scan: passed.
+  - Root startup consumer wrapper residual scan: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-100 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Direct root compatibility consumer residual scan: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-097 current slice:
   - `cargo check -p rustfs -p rustfs-scanner -p rustfs-heal -p e2e_test --tests`: passed.

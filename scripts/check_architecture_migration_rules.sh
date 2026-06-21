@@ -81,6 +81,7 @@ RUSTFS_RUNTIME_SECONDARY_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/rustfs_runtime_sec
 RUSTFS_ROOT_STORAGE_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_root_storage_compat_reexport_hits.txt"
 RUSTFS_ROOT_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_root_bucket_storage_compat_module_hits.txt"
 RUSTFS_ROOT_RUNTIME_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_root_runtime_storage_compat_module_hits.txt"
+RUSTFS_ROOT_CONSUMER_COMPAT_HITS_FILE="${TMP_DIR}/rustfs_root_consumer_compat_hits.txt"
 RUSTFS_ADMIN_CONFIG_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_admin_config_storage_compat_module_hits.txt"
 RUSTFS_STORAGE_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_storage_bucket_storage_compat_module_hits.txt"
 RUSTFS_STORAGE_OWNER_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_compat_reexport_hits.txt"
@@ -689,6 +690,7 @@ fi
     rustfs/src crates fuzz/fuzz_targets \
     --glob '!crates/ecstore/**' \
     --glob '!**/storage_compat.rs' \
+    --glob '!**/*storage_compat.rs' \
     --glob '!target/**' || true
 ) |
   cat >"$DIRECT_ECSTORE_IMPORT_HITS_FILE"
@@ -788,7 +790,7 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --no-heading 'pub\(crate\)\s+use\s+rustfs_ecstore::api::' \
-    rustfs/src/storage_compat.rs || true
+    rustfs/src/storage_compat.rs 2>/dev/null || true
 ) >"$RUSTFS_ROOT_STORAGE_COMPAT_REEXPORT_HITS_FILE"
 
 if [[ -s "$RUSTFS_ROOT_STORAGE_COMPAT_REEXPORT_HITS_FILE" ]]; then
@@ -798,7 +800,7 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --no-heading 'pub\(crate\)\s+use rustfs_ecstore::api::bucket::\{[^}]*\b(?:metadata|metadata_sys|quota)\b[^}]*\}\s*;|pub\(crate\)\s+use rustfs_ecstore::api::bucket::(?:metadata|metadata_sys|quota)\s*;' \
-    rustfs/src/storage_compat.rs || true
+    rustfs/src/storage_compat.rs 2>/dev/null || true
 ) >"$RUSTFS_ROOT_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE"
 
 if [[ -s "$RUSTFS_ROOT_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE" ]]; then
@@ -808,11 +810,21 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --no-heading 'pub\(crate\)\s+use rustfs_ecstore::api::config::\{[^}]*\bcom\b[^}]*\}\s*;|pub\(crate\)\s+use rustfs_ecstore::api::config::\{[^}]*\binit\s*(?:,|})[^}]*\}\s*;|pub\(crate\)\s+use rustfs_ecstore::api::disk::\{[^}]*\bendpoint::Endpoint\b[^}]*\}\s*;' \
-    rustfs/src/storage_compat.rs || true
+    rustfs/src/storage_compat.rs 2>/dev/null || true
 ) >"$RUSTFS_ROOT_RUNTIME_STORAGE_COMPAT_MODULE_HITS_FILE"
 
 if [[ -s "$RUSTFS_ROOT_RUNTIME_STORAGE_COMPAT_MODULE_HITS_FILE" ]]; then
   report_failure "RustFS root storage compatibility must expose config init and disk endpoint contracts as explicit aliases: $(paste -sd '; ' "$RUSTFS_ROOT_RUNTIME_STORAGE_COMPAT_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub\(crate\)\s+(?:async\s+)?fn\s+(?:all_local_disk|read_ecstore_config|save_ecstore_config|get_global_endpoints_opt|get_global_lock_clients|is_dist_erasure|resolve_object_store_handle|register_event_dispatch_hook|verify_rpc_signature|get_notification_config|init_bucket_metadata_sys|try_migrate_bucket_metadata|try_migrate_iam_config|init_background_replication|init_ecstore_config|init_global_config_sys|try_migrate_server_config|get_global_region|set_global_endpoints|set_global_region|set_global_rustfs_port|shutdown_background_services|update_erasure_type|new_global_notification_sys|init_local_disks|init_lock_clients|prewarm_local_disk_id_map)\b|pub\(crate\)\s+(?:const|type)\s+(?:TONIC_RPC_PREFIX|EcstoreEventArgs|ECStore|EcstoreResult)\b|pub\(crate\)\s+trait\s+DiskAPI\b' \
+    rustfs/src/storage_compat.rs 2>/dev/null || true
+) >"$RUSTFS_ROOT_CONSUMER_COMPAT_HITS_FILE"
+
+if [[ -s "$RUSTFS_ROOT_CONSUMER_COMPAT_HITS_FILE" ]]; then
+  report_failure "RustFS root storage compatibility must not own capacity/server/startup consumer wrappers: $(paste -sd '; ' "$RUSTFS_ROOT_CONSUMER_COMPAT_HITS_FILE")"
 fi
 
 (
@@ -942,7 +954,7 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --no-heading 'rustfs_ecstore::api::' rustfs/src/storage_compat.rs crates/e2e_test/src/storage_compat.rs \
+  rg -n --with-filename --no-heading 'rustfs_ecstore::api::' crates/e2e_test/src/storage_compat.rs \
     | rg -v '^[^:]+:[0-9]+:use rustfs_ecstore::api::\{' || true
 ) >"$RUSTFS_ROOT_E2E_COMPAT_RAW_FACADE_PATH_HITS_FILE"
 
