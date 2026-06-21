@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-test-protocol-compat-prune`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084`.
-- Stacked on: API-084 edge compatibility alias pruning.
+- Branch: `overtrue/arch-root-runtime-compat-wrappers`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085`.
+- Stacked on: API-085 test and fuzz compatibility alias pruning.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: prune heal/scanner test and fuzz compatibility
-  passthroughs into explicit aliases and local wrappers.
-- CI/script changes: guard against restoring grouped test and fuzz
-  compatibility passthroughs.
-- Docs changes: record the API-085 test/fuzz compatibility boundary.
+- Rust code changes: prune root RustFS runtime compatibility re-exports into
+  local aliases, traits, and wrapper functions.
+- CI/script changes: guard against restoring root RustFS runtime ECStore API
+  re-exports.
+- Docs changes: record the API-086 root runtime compatibility boundary.
 
 ## Phase 0 Tasks
 
@@ -214,6 +214,21 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: focused heal/scanner compile coverage, test/fuzz
     compatibility residual scans, formatting, diff hygiene, architecture guard,
     pre-commit quality gate, and three-expert review.
+- [x] `API-086` Prune root runtime compatibility re-exports.
+  - Completed slice: replace root RustFS runtime `storage_compat.rs` ECStore API
+    re-exports with local constants, type aliases, a minimal disk trait, and
+    wrapper functions.
+  - Acceptance: root runtime startup, metadata, replication admission,
+    topology, notification, RPC, capacity, table-catalog, and shutdown call
+    sites keep their existing local compatibility names while the root boundary
+    no longer re-exports ECStore API symbols directly.
+  - Must preserve: startup storage initialization order, bucket metadata
+    migration/init, replication runtime startup and admission counts,
+    notification init, RPC signature checks, capacity disk references,
+    topology snapshots, table-catalog metadata access, and shutdown behavior.
+  - Verification: RustFS compile coverage, root compatibility re-export
+    residual scan, formatting, diff hygiene, architecture guard, pre-commit
+    quality gate, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3247,13 +3262,23 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-085 narrows heal/scanner test and fuzz compatibility passthroughs without adding ECStore ownership cycles or runtime dependencies. |
-| Migration preservation | passed | Heal test setup, scanner lifecycle integration helpers, local disk initialization, bucket metadata updates, transition enqueue behavior, and fuzz validation semantics remain preserved behind aliases/wrappers. |
-| Testing/verification | passed | Focused heal/scanner compile coverage, test/fuzz compatibility residual scans, migration guard, formatting, diff hygiene, added-line risk scan, full pre-commit, and three-expert review passed. |
+| Quality/architecture | passed | API-086 narrows root RustFS runtime compatibility with local aliases/wrappers and adds an ECStore API re-export guard without adding runtime ownership cycles. |
+| Migration preservation | passed | Startup storage, bucket metadata migration/init, replication admission counts, notification init, RPC signature checks, capacity disk references, topology snapshots, table-catalog metadata access, and shutdown behavior remain behind existing local compatibility names. |
+| Testing/verification | passed | RustFS compile coverage, root re-export residual scan, migration guard, formatting, diff hygiene, added-line risk scan, full pre-commit, and three-expert review passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-086 current slice:
+  - `cargo check -p rustfs`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Root runtime ECStore API re-export residual scan: passed.
+  - Rust added-line risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-085 current slice:
   - `cargo check --tests -p rustfs-heal -p rustfs-scanner`: passed.

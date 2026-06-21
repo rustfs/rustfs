@@ -18,7 +18,7 @@ use rustfs_concurrency::{
 };
 
 use crate::storage::concurrency::get_concurrency_manager;
-use crate::storage_compat::{GLOBAL_REPLICATION_STATS, get_global_bucket_metadata_sys, get_global_replication_pool};
+use crate::storage_compat::{get_global_bucket_metadata_sys, get_global_replication_pool, replication_queue_current_count};
 
 const BUCKET_METADATA_RUNTIME_NOT_INITIALIZED: &str = "bucket metadata runtime not initialized";
 const HEAL_MANAGER_NOT_INITIALIZED: &str = "heal manager not initialized";
@@ -159,13 +159,7 @@ pub fn replication_workload_admission_snapshot() -> WorkloadAdmissionSnapshot {
         .active_workers()
         .saturating_add(pool.active_lrg_workers())
         .saturating_add(pool.active_mrf_workers());
-    let queued = GLOBAL_REPLICATION_STATS.get().and_then(|stats| {
-        stats
-            .q_cache
-            .try_lock()
-            .ok()
-            .map(|cache| i64_to_usize_saturated(cache.sr_queue_stats.curr.get_current_count()))
-    });
+    let queued = replication_queue_current_count().map(i64_to_usize_saturated);
 
     replication_workload_admission_snapshot_from_counts(true, Some(i32_to_usize_saturated(active)), queued)
 }
