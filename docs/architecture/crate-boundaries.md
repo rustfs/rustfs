@@ -162,6 +162,13 @@ storage-class config contracts through explicit aliases. The storage
 compatibility boundary must not restore broad `metadata`, `metadata_sys`,
 `object_lock`, `policy_sys`, `replication`, `tagging`, `utils`, `versioning`,
 `versioning_sys`, `object_api_utils`, or `com` passthroughs.
+Scanner, notify, observability, and e2e `storage_compat.rs` boundaries must
+also stay narrow. Scanner must not restore grouped bucket compatibility exports
+for target, lifecycle, metadata, replication, or versioning modules. Notify
+must not restore broad `config`/`global` module imports. Observability must
+consume data usage through a local DTO projection instead of re-exporting the
+ECStore data-usage loader. The e2e harness must not restore grouped RPC
+passthroughs.
 
 ECStore ClusterControlPlane read models must stay owned by the crate-private
 `cluster` module. Public access goes through `rustfs_ecstore::api::cluster` so

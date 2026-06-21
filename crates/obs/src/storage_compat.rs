@@ -17,13 +17,61 @@ use crate::metrics::collectors::{
     ReplicationStats as MetricReplicationStats,
 };
 use rustfs_storage_api::StorageAdminApi;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub(crate) use rustfs_ecstore::api::data_usage::load_data_usage_from_backend as load_obs_data_usage_from_backend;
-
 pub(crate) type ObsStore = rustfs_ecstore::api::storage::ECStore;
 type ObsStorageInfo = <ObsStore as StorageAdminApi>::StorageInfo;
+
+pub(crate) struct ObsDataUsageInfo {
+    pub(crate) buckets_count: u64,
+    pub(crate) objects_total_count: u64,
+    pub(crate) versions_total_count: u64,
+    pub(crate) delete_markers_total_count: u64,
+    pub(crate) objects_total_size: u64,
+    pub(crate) buckets_usage: HashMap<String, ObsBucketUsageInfo>,
+}
+
+pub(crate) struct ObsBucketUsageInfo {
+    pub(crate) size: u64,
+    pub(crate) objects_count: u64,
+    pub(crate) object_size_histogram: HashMap<String, u64>,
+    pub(crate) object_versions_histogram: HashMap<String, u64>,
+    pub(crate) versions_count: u64,
+    pub(crate) delete_markers_count: u64,
+}
+
+pub(crate) async fn load_obs_data_usage_from_backend(
+    store: Arc<ObsStore>,
+) -> rustfs_ecstore::api::error::Result<ObsDataUsageInfo> {
+    let data_usage = rustfs_ecstore::api::data_usage::load_data_usage_from_backend(store).await?;
+
+    Ok(ObsDataUsageInfo {
+        buckets_count: data_usage.buckets_count,
+        objects_total_count: data_usage.objects_total_count,
+        versions_total_count: data_usage.versions_total_count,
+        delete_markers_total_count: data_usage.delete_markers_total_count,
+        objects_total_size: data_usage.objects_total_size,
+        buckets_usage: data_usage
+            .buckets_usage
+            .into_iter()
+            .map(|(bucket, usage)| {
+                (
+                    bucket,
+                    ObsBucketUsageInfo {
+                        size: usage.size,
+                        objects_count: usage.objects_count,
+                        object_size_histogram: usage.object_size_histogram,
+                        object_versions_histogram: usage.object_versions_histogram,
+                        versions_count: usage.versions_count,
+                        delete_markers_count: usage.delete_markers_count,
+                    },
+                )
+            })
+            .collect(),
+    })
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ObsBucketReplicationBandwidthStats {

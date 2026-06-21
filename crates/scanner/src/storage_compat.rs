@@ -31,19 +31,21 @@ pub(crate) type ListPathRawOptions = rustfs_ecstore::api::cache::ListPathRawOpti
 pub(crate) type SetDisks = rustfs_ecstore::api::set_disk::SetDisks;
 pub(crate) type StorageError = rustfs_ecstore::api::error::StorageError;
 
-pub(crate) use rustfs_ecstore::api::bucket::{
-    bucket_target_sys::BucketTargetSys,
-    lifecycle::{
-        bucket_lifecycle_audit::LcEventSrc,
-        bucket_lifecycle_ops::{GLOBAL_ExpiryState, apply_expiry_rule, apply_transition_rule},
-        evaluator::Evaluator,
-        lifecycle::{Event, Lifecycle, ObjectOpts},
-    },
-    metadata_sys::{get_lifecycle_config, get_object_lock_config, get_replication_config},
-    replication::{ReplicationConfig, ReplicationConfigurationExt, ReplicationQueueAdmission, queue_replication_heal_internal},
-    versioning::VersioningApi,
-    versioning_sys::BucketVersioningSys,
+pub(crate) use rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys;
+pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
+pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::{
+    GLOBAL_ExpiryState, apply_expiry_rule, apply_transition_rule,
 };
+pub(crate) use rustfs_ecstore::api::bucket::lifecycle::evaluator::Evaluator;
+pub(crate) use rustfs_ecstore::api::bucket::lifecycle::lifecycle::{Event, Lifecycle, ObjectOpts};
+pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::{
+    get_lifecycle_config, get_object_lock_config, get_replication_config,
+};
+pub(crate) use rustfs_ecstore::api::bucket::replication::{
+    ReplicationConfig, ReplicationConfigurationExt, ReplicationQueueAdmission, queue_replication_heal_internal,
+};
+pub(crate) use rustfs_ecstore::api::bucket::versioning::VersioningApi;
+pub(crate) use rustfs_ecstore::api::bucket::versioning_sys::BucketVersioningSys;
 pub(crate) use rustfs_ecstore::api::disk::{DiskAPI, DiskInfoOptions};
 pub(crate) use rustfs_ecstore::api::global::GLOBAL_TierConfigMgr;
 
