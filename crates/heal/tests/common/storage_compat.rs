@@ -12,10 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_imports)]
+#![allow(dead_code, unused_imports)]
 
-pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::init_bucket_metadata_sys;
-pub(crate) use rustfs_ecstore::api::disk::{DiskStore, endpoint::Endpoint};
-pub(crate) use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
-pub(crate) use rustfs_ecstore::api::storage::ECStore;
-pub(crate) use rustfs_ecstore::api::storage::init_local_disks;
+use std::sync::Arc;
+
+pub(crate) type DiskStore = rustfs_ecstore::api::disk::DiskStore;
+pub(crate) type ECStore = rustfs_ecstore::api::storage::ECStore;
+pub(crate) type Endpoint = rustfs_ecstore::api::disk::endpoint::Endpoint;
+pub(crate) type Endpoints = rustfs_ecstore::api::layout::Endpoints;
+pub(crate) type PoolEndpoints = rustfs_ecstore::api::layout::PoolEndpoints;
+
+pub(crate) use rustfs_ecstore::api::layout::EndpointServerPools;
+
+pub(crate) async fn init_bucket_metadata_sys(api: Arc<ECStore>, buckets: Vec<String>) {
+    rustfs_ecstore::api::bucket::metadata_sys::init_bucket_metadata_sys(api, buckets).await;
+}
+
+pub(crate) async fn init_local_disks(endpoint_pools: EndpointServerPools) -> rustfs_ecstore::api::error::Result<()> {
+    rustfs_ecstore::api::storage::init_local_disks(endpoint_pools).await
+}

@@ -88,6 +88,7 @@ SCANNER_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/scanner_bucket_storag
 NOTIFY_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/notify_storage_compat_module_hits.txt"
 OBS_STORAGE_COMPAT_PASSTHROUGH_HITS_FILE="${TMP_DIR}/obs_storage_compat_passthrough_hits.txt"
 E2E_STORAGE_COMPAT_RPC_PASSTHROUGH_HITS_FILE="${TMP_DIR}/e2e_storage_compat_rpc_passthrough_hits.txt"
+TEST_STORAGE_COMPAT_PASSTHROUGH_HITS_FILE="${TMP_DIR}/test_storage_compat_passthrough_hits.txt"
 PRODUCTION_UNUSED_COMPAT_ALLOW_HITS_FILE="${TMP_DIR}/production_unused_compat_allow_hits.txt"
 BROAD_STORE_API_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/broad_store_api_compat_reexport_hits.txt"
 NESTED_STORE_API_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/nested_store_api_compat_module_hits.txt"
@@ -873,6 +874,17 @@ fi
 
 if [[ -s "$E2E_STORAGE_COMPAT_RPC_PASSTHROUGH_HITS_FILE" ]]; then
   report_failure "e2e storage compatibility must wrap RPC helpers instead of re-exporting broad ECStore functions: $(paste -sd '; ' "$E2E_STORAGE_COMPAT_RPC_PASSTHROUGH_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub\(crate\)\s+use rustfs_ecstore::api::(?:bucket::(?:lifecycle|metadata_sys|utils)|capacity|client|disk|layout|storage|tier)::[^;]*\{[^}]*\}\s*;|pub\(crate\)\s+use rustfs_ecstore::api::bucket::metadata_sys::init_bucket_metadata_sys|pub\(crate\)\s+use rustfs_ecstore::api::storage::init_local_disks' \
+    crates/heal/tests crates/scanner/tests fuzz/fuzz_targets \
+    --glob '*storage_compat.rs' || true
+) >"$TEST_STORAGE_COMPAT_PASSTHROUGH_HITS_FILE"
+
+if [[ -s "$TEST_STORAGE_COMPAT_PASSTHROUGH_HITS_FILE" ]]; then
+  report_failure "test and fuzz storage compatibility boundaries must use explicit aliases or wrappers instead of grouped ECStore passthroughs: $(paste -sd '; ' "$TEST_STORAGE_COMPAT_PASSTHROUGH_HITS_FILE")"
 fi
 
 (

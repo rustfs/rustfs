@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-edge-compat-alias-prune`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083`.
-- Stacked on: API-083 admin/app compatibility alias pruning.
+- Branch: `overtrue/arch-test-protocol-compat-prune`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084`.
+- Stacked on: API-084 edge compatibility alias pruning.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: prune scanner, notify, observability, and e2e edge
-  compatibility passthroughs into explicit aliases, wrappers, and local DTOs.
-- CI/script changes: guard against restoring broad edge compatibility
-  passthroughs.
-- Docs changes: record the API-084 edge compatibility alias boundary.
+- Rust code changes: prune heal/scanner test and fuzz compatibility
+  passthroughs into explicit aliases and local wrappers.
+- CI/script changes: guard against restoring grouped test and fuzz
+  compatibility passthroughs.
+- Docs changes: record the API-085 test/fuzz compatibility boundary.
 
 ## Phase 0 Tasks
 
@@ -200,6 +200,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     and e2e RPC client/interceptor call sites.
   - Verification: focused edge crate compile coverage, edge compatibility
     residual scans, formatting, diff hygiene, risk scan, architecture guard,
+    pre-commit quality gate, and three-expert review.
+- [x] `API-085` Prune test and fuzz compatibility passthrough aliases.
+  - Completed slice: replace heal/scanner test and fuzz grouped ECStore
+    compatibility passthroughs with direct type aliases and local wrapper
+    functions.
+  - Acceptance: test harnesses keep their existing ECStore setup and lifecycle
+    helper call sites while exposing only narrow compatibility symbols, and
+    fuzz targets exercise bucket utility contracts through local wrappers.
+  - Must preserve: heal test ECStore setup, scanner lifecycle integration setup,
+    local disk initialization, bucket metadata updates, transition enqueue
+    behavior, and fuzz validation semantics.
+  - Verification: focused heal/scanner compile coverage, test/fuzz
+    compatibility residual scans, formatting, diff hygiene, architecture guard,
     pre-commit quality gate, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
@@ -3234,13 +3247,23 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-084 narrows scanner/notify/obs/e2e edge compatibility passthroughs without adding ECStore ownership cycles or new runtime dependencies. |
-| Migration preservation | passed | Scanner lifecycle/replication helpers, notify config persistence, obs usage metrics, and e2e RPC helper behavior remain preserved behind local aliases/wrappers. |
-| Testing/verification | passed | Focused edge compile coverage, compatibility residual scans, migration guard, formatting, diff hygiene, added-line risk scan, full pre-commit, and three-expert review passed. |
+| Quality/architecture | passed | API-085 narrows heal/scanner test and fuzz compatibility passthroughs without adding ECStore ownership cycles or runtime dependencies. |
+| Migration preservation | passed | Heal test setup, scanner lifecycle integration helpers, local disk initialization, bucket metadata updates, transition enqueue behavior, and fuzz validation semantics remain preserved behind aliases/wrappers. |
+| Testing/verification | passed | Focused heal/scanner compile coverage, test/fuzz compatibility residual scans, migration guard, formatting, diff hygiene, added-line risk scan, full pre-commit, and three-expert review passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-085 current slice:
+  - `cargo check --tests -p rustfs-heal -p rustfs-scanner`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Test/fuzz grouped compatibility passthrough residual scans: passed.
+  - Rust added-line risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-084 current slice:
   - `cargo check --tests -p rustfs-scanner -p rustfs-notify -p rustfs-obs -p e2e_test`: passed.

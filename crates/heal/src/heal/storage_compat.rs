@@ -27,7 +27,12 @@ pub(crate) use rustfs_ecstore::api::disk::DiskAPI;
 pub(crate) use rustfs_ecstore::api::global::GLOBAL_LOCAL_DISK_MAP;
 
 #[cfg(test)]
-pub(crate) use rustfs_ecstore::api::disk::{DiskOption, new_disk};
+pub(crate) type DiskOption = rustfs_ecstore::api::disk::DiskOption;
+
+#[cfg(test)]
+pub(crate) async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> rustfs_ecstore::api::disk::error::Result<DiskStore> {
+    rustfs_ecstore::api::disk::new_disk(ep, opt).await
+}
 
 pub type HealObjectInfo = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
 pub type HealObjectOptions = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
