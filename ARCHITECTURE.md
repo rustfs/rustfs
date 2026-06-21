@@ -249,9 +249,9 @@ Depth 8 — TOP:
   not regain upward dependencies.
 
 - **Three-layer BackpressureConfig/DeadlockConfig duplication** across io-core,
-  concurrency, and rustfs/storage. Storage policies now expose explicit
-  projections into the concurrency/io-core policy shapes; later work should use
-  those bridges before deleting compatibility wrappers.
+  concurrency, and rustfs/storage. Storage policies now expose and consume
+  explicit projections into the concurrency/io-core policy shapes; later work
+  should use those bridges before deleting compatibility wrappers.
 
 ### Medium
 
