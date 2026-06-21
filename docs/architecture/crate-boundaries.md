@@ -142,6 +142,10 @@ well as remaining bitrot, erasure coding, object DTO/reader, event, list, and
 batch processor root modules once their facade groups exist.
 ECStore root `global` re-exports must also stay removed once consumers use
 `rustfs_ecstore::api::global` or crate-internal `crate::global` paths.
+RustFS root `storage_compat.rs` must expose bucket metadata and quota contracts
+as explicit aliases only. Broad `metadata`, `metadata_sys`, and `quota` module
+passthroughs are reserved to narrower app/admin/storage compatibility
+boundaries that still need module-local owner cleanup.
 
 ECStore ClusterControlPlane read models must stay owned by the crate-private
 `cluster` module. Public access goes through `rustfs_ecstore::api::cluster` so
