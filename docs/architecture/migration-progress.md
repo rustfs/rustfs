@@ -5,17 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-owner-compat-consumer-batch`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101`.
-- Based on: `origin/main` after API-098/API-099/API-100 merge (#3708).
+- Branch: `overtrue/arch-storage-core-compat-consumer-batch`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102`.
+- Based on: latest `main` after the API-101 merge.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move admin handler/service/router, app usecase/context,
-  and storage RPC/S3 API ECStore compatibility consumers behind owner-local
-  compatibility boundaries.
-- CI/script changes: guard against restoring direct owner compatibility
-  consumers outside local compatibility boundary modules.
-- Docs changes: record the API-101 owner compatibility consumer cleanup.
+- Rust code changes: move storage core ECStore compatibility consumers behind
+  the `core_storage_compat` boundary.
+- CI/script changes: extend owner compatibility consumer guard coverage across
+  `rustfs/src/storage`.
+- Docs changes: record the API-102 storage core compatibility consumer cleanup.
 
 ## Phase 0 Tasks
 
@@ -447,6 +446,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     heal status mapping, app runtime context wiring, RPC verification and disk
     lookup behavior, and S3 API ETag conversion.
   - Verification: RustFS test-target compile coverage, owner compatibility
+    consumer residual scan, migration and layer guards, formatting, diff
+    hygiene, Rust risk scan, pre-commit quality gate, and three-expert review.
+- [x] `API-102` Localize storage core compatibility consumers.
+  - Completed slice: route storage access, ECFS, ECFS extension, head-prefix,
+    options, SSE, storage module aliases, and storage tests through
+    `core_storage_compat` instead of the storage owner `storage_compat.rs`
+    facade.
+  - Acceptance: no non-compat RustFS storage source imports
+    `crate::storage::storage_compat` directly; migration rules reject
+    regressions across `rustfs/src/storage`.
+  - Must preserve: bucket access validation, ECFS object operations, SSE
+    encryption/decryption setup, storage option mapping, storage object aliases,
+    and storage compatibility tests.
+  - Verification: RustFS test-target compile coverage, storage compatibility
     consumer residual scan, migration and layer guards, formatting, diff
     hygiene, Rust risk scan, pre-commit quality gate, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
@@ -3489,6 +3502,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-102 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Storage compatibility consumer residual scan: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-101 current slice:
   - `cargo check -p rustfs --tests`: passed.

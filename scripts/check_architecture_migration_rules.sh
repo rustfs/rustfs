@@ -838,7 +838,7 @@ fi
       rustfs/src/app \
       --glob '!**/*storage_compat.rs' || true
     rg -n --no-heading 'crate::storage::storage_compat' \
-      rustfs/src/storage/rpc rustfs/src/storage/s3_api \
+      rustfs/src/storage \
       --glob '!**/*storage_compat.rs' || true
   }
 ) >"$RUSTFS_OWNER_COMPAT_CONSUMER_HITS_FILE"
