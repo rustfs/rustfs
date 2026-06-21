@@ -17,9 +17,8 @@ use std::sync::Arc;
 #[cfg(test)]
 use rustfs_ecstore::api::config as ecstore_config;
 use rustfs_ecstore::api::{
-    admin as ecstore_admin, bucket as ecstore_bucket, client as ecstore_client, disk as ecstore_disk, error as ecstore_error,
-    global as ecstore_global, metrics as ecstore_metrics, rio as ecstore_rio, rpc as ecstore_rpc, set_disk as ecstore_set_disk,
-    storage as ecstore_storage,
+    admin as ecstore_admin, bucket as ecstore_bucket, disk as ecstore_disk, error as ecstore_error, global as ecstore_global,
+    metrics as ecstore_metrics, rio as ecstore_rio, rpc as ecstore_rpc, set_disk as ecstore_set_disk, storage as ecstore_storage,
 };
 
 pub(crate) const BUCKET_ACCELERATE_CONFIG: &str = ecstore_bucket::metadata::BUCKET_ACCELERATE_CONFIG;
@@ -483,10 +482,6 @@ pub(crate) fn encode_tags(tags: Vec<s3s::dto::Tag>) -> String {
 
 pub(crate) fn serialize<T: s3s::xml::Serialize>(val: &T) -> s3s::xml::SerResult<Vec<u8>> {
     ecstore_bucket::utils::serialize(val)
-}
-
-pub(crate) fn to_s3s_etag(etag: &str) -> s3s::dto::ETag {
-    ecstore_client::object_api_utils::to_s3s_etag(etag)
 }
 
 pub(crate) fn is_err_bucket_not_found(err: &Error) -> bool {

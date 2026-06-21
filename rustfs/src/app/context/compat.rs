@@ -17,11 +17,11 @@ use super::handles::{
     default_bucket_metadata_interface, default_endpoints_interface, default_kms_runtime_interface,
     default_server_config_interface, default_tier_config_interface,
 };
-use crate::app::storage_compat::ECStore;
-use crate::app::storage_compat::EndpointServerPools;
-use crate::app::storage_compat::TierConfigMgr;
-use crate::app::storage_compat::metadata_sys::BucketMetadataSys;
-use crate::app::storage_compat::new_object_layer_fn;
+use crate::app::context::storage_compat::ECStore;
+use crate::app::context::storage_compat::EndpointServerPools;
+use crate::app::context::storage_compat::TierConfigMgr;
+use crate::app::context::storage_compat::metadata_sys::BucketMetadataSys;
+use crate::app::context::storage_compat::new_object_layer_fn;
 #[cfg(test)]
 use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
@@ -126,10 +126,10 @@ mod tests {
         BucketMetadataInterface, BufferConfigInterface, EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface,
         ServerConfigInterface, TierConfigInterface,
     };
-    use crate::app::storage_compat::Endpoint;
-    use crate::app::storage_compat::init_local_disks;
-    use crate::app::storage_compat::new_object_layer_fn;
-    use crate::app::storage_compat::{Endpoints, PoolEndpoints};
+    use crate::app::context::storage_compat::Endpoint;
+    use crate::app::context::storage_compat::init_local_disks;
+    use crate::app::context::storage_compat::new_object_layer_fn;
+    use crate::app::context::storage_compat::{Endpoints, PoolEndpoints};
     use crate::config::{RustFSBufferConfig, WorkloadProfile};
     use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
     use std::path::PathBuf;

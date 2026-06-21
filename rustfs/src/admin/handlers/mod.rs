@@ -45,6 +45,7 @@ pub mod replication;
 pub mod scanner;
 pub mod service_account;
 pub mod site_replication;
+pub(crate) mod storage_compat;
 pub mod sts;
 pub mod system;
 pub mod table_catalog;

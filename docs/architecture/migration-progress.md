@@ -5,17 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-runtime-compat-consumer-batch`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100`.
-- Stacked on: `overtrue/arch-disk-rpc-method-wrappers` pending API-097 merge.
+- Branch: `overtrue/arch-owner-compat-consumer-batch`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101`.
+- Based on: `origin/main` after API-098/API-099/API-100 merge (#3708).
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move capacity, server, startup, table catalog,
-  runtime-capability, workload-admission, error, and config-test ECStore
-  compatibility consumers from the root runtime facade into local boundaries.
-- CI/script changes: guard against restoring consumer wrappers in the root
-  runtime compatibility facade and tolerate retiring the empty root facade.
-- Docs changes: record the API-098/API-099/API-100 runtime consumer boundary cleanup.
+- Rust code changes: move admin handler/service/router, app usecase/context,
+  and storage RPC/S3 API ECStore compatibility consumers behind owner-local
+  compatibility boundaries.
+- CI/script changes: guard against restoring direct owner compatibility
+  consumers outside local compatibility boundary modules.
+- Docs changes: record the API-101 owner compatibility consumer cleanup.
 
 ## Phase 0 Tasks
 
@@ -433,6 +433,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     runtime topology snapshots, workload admission status reporting, quota and
     storage error mapping, and config disk-layout parsing tests.
   - Verification: RustFS test-target compile coverage, direct root compatibility
+    consumer residual scan, migration and layer guards, formatting, diff
+    hygiene, Rust risk scan, pre-commit quality gate, and three-expert review.
+- [x] `API-101` Localize owner compatibility consumers.
+  - Completed slice: route admin handler/service/router, app usecase/context,
+    and storage RPC/S3 API compatibility consumers through local owner
+    boundary modules instead of their root owner `storage_compat.rs` facades.
+  - Acceptance: selected admin, app, and storage owner consumers no longer
+    import `crate::admin::storage_compat`, `crate::app::storage_compat`, or
+    `crate::storage::storage_compat` directly outside local compatibility
+    boundary modules; migration rules reject regressions.
+  - Must preserve: admin config and bucket metadata behavior, replication and
+    heal status mapping, app runtime context wiring, RPC verification and disk
+    lookup behavior, and S3 API ETag conversion.
+  - Verification: RustFS test-target compile coverage, owner compatibility
     consumer residual scan, migration and layer guards, formatting, diff
     hygiene, Rust risk scan, pre-commit quality gate, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
@@ -3475,6 +3489,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-101 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Owner compatibility consumer residual scan: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-098 current slice:
   - `cargo check -p rustfs --tests`: passed.

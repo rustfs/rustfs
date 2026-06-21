@@ -12,6 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod config;
-pub mod site_replication;
-pub(crate) mod storage_compat;
+pub(crate) fn to_s3s_etag(etag: &str) -> s3s::dto::ETag {
+    rustfs_ecstore::api::client::object_api_utils::to_s3s_etag(etag)
+}

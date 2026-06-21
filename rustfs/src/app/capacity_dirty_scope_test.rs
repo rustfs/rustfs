@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::storage_compat::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, metadata_sys};
+use crate::app::usecase_storage_compat::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, metadata_sys};
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
 use rustfs_storage_api::{BucketOperations, BucketOptions, HealOperations as _, MakeBucketOptions, ObjectIO as _};
@@ -77,7 +77,7 @@ async fn setup_capacity_dirty_scope_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     };
 
     let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
-    crate::app::storage_compat::init_local_disks(endpoint_pools.clone())
+    crate::app::usecase_storage_compat::init_local_disks(endpoint_pools.clone())
         .await
         .unwrap();
 
