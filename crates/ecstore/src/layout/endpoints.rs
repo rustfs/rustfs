@@ -1040,6 +1040,12 @@ mod test {
     }
 
     #[test]
+    fn retryable_dns_error_accepts_resolver_raw_os_codes() {
+        assert!(is_retryable_dns_error(&Error::from_raw_os_error(-3)));
+        assert!(is_retryable_dns_error(&Error::from_raw_os_error(-2)));
+    }
+
+    #[test]
     fn retryable_dns_error_rejects_configuration_errors() {
         assert!(!is_retryable_dns_error(&Error::new(
             ErrorKind::InvalidInput,
