@@ -166,6 +166,11 @@ storage-class config contracts through explicit aliases. The storage
 compatibility boundary must not restore broad `metadata`, `metadata_sys`,
 `object_lock`, `policy_sys`, `replication`, `tagging`, `utils`, `versioning`,
 `versioning_sys`, `object_api_utils`, or `com` passthroughs.
+RustFS storage owner `storage_compat.rs` must not re-export ECStore API symbols
+directly except temporary trait imports needed for method resolution. Remaining
+storage-owner compatibility symbols must be local constants, type aliases, or
+wrapper functions so storage-owned global state and helper access stays visible
+at the boundary.
 Scanner, notify, observability, and e2e `storage_compat.rs` boundaries must
 also stay narrow. Scanner must not restore grouped bucket compatibility exports
 for target, lifecycle, metadata, replication, or versioning modules. Notify

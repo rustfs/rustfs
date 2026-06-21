@@ -23,11 +23,11 @@ use crate::storage::options::get_opts;
 use crate::storage::s3_api::acl;
 use crate::storage::storage_compat::{
     BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_VERSIONING_CONFIG,
-    BUCKET_WEBSITE_CONFIG, BucketVersioningSys, GLOBAL_REPLICATION_STATS, OBJECT_LOCK_CONFIG, ReplicationConfigurationExt,
-    StorageError, VersioningApi, check_retention_for_modification, decode_tags, decode_tags_to_map,
-    delete_bucket_metadata_config, encode_tags, get_bucket_accelerate_config, get_bucket_logging_config,
-    get_bucket_object_lock_config, get_bucket_replication_config, get_bucket_request_payment_config, get_bucket_website_config,
-    is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found, serialize, update_bucket_metadata_config,
+    BUCKET_WEBSITE_CONFIG, BucketVersioningSys, OBJECT_LOCK_CONFIG, ReplicationConfigurationExt, StorageError, VersioningApi,
+    check_retention_for_modification, decode_tags, decode_tags_to_map, delete_bucket_metadata_config, encode_tags,
+    get_bucket_accelerate_config, get_bucket_logging_config, get_bucket_object_lock_config, get_bucket_replication_config,
+    get_bucket_request_payment_config, get_bucket_website_config, is_err_bucket_not_found, is_err_object_not_found,
+    is_err_version_not_found, record_replication_proxy, serialize, update_bucket_metadata_config,
 };
 use crate::storage::{parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled};
 use crate::table_catalog;
@@ -87,9 +87,7 @@ impl FS {
         if !Self::replication_tagging_enabled(bucket, object).await {
             return;
         }
-        if let Some(stats) = GLOBAL_REPLICATION_STATS.get() {
-            stats.inc_proxy(bucket, api, is_err).await;
-        }
+        record_replication_proxy(bucket, api, is_err).await;
     }
 
     pub async fn get_object_tag_conditions_for_policy(
