@@ -142,7 +142,9 @@ instead of legacy root module paths.
 RustFS startup internals must stay crate-private after the startup owner split.
 Only `startup_entrypoint` remains a public startup module for the binary
 entrypoint; IAM bootstrap, optional runtime, and profiling startup shims must
-not be re-exported as public library modules.
+not be re-exported as public library modules. Items inside crate-private
+startup modules must also use crate visibility rather than bare public
+visibility.
 
 ECStore internal consumers must use `rustfs-storage-api` lifecycle helper DTOs
 directly for `ExpirationOptions` and `TransitionedObject`; ECStore keeps the

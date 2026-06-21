@@ -39,12 +39,12 @@ const IAM_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(30);
 const IAM_RETRY_ESCALATION_THRESHOLD: u64 = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IamBootstrapDisposition {
+pub(crate) enum IamBootstrapDisposition {
     ReadyInline,
     Deferred,
 }
 
-pub async fn publish_ready_for_iam_bootstrap(
+pub(crate) async fn publish_ready_for_iam_bootstrap(
     disposition: IamBootstrapDisposition,
     readiness: &GlobalReadiness,
     state_manager: Option<&ServiceStateManager>,
@@ -307,7 +307,7 @@ async fn attempt_init_iam_sys(store: Arc<ECStore>) -> std::result::Result<(), st
 /// Returns `Ok(ReadyInline)` if IAM initialized immediately, `Ok(Deferred)` if
 /// recovery is happening in the background, or `Err` if IAM succeeded but
 /// app context initialization failed (unexpected, indicates a bug).
-pub async fn bootstrap_or_defer_iam_init(
+pub(crate) async fn bootstrap_or_defer_iam_init(
     store: Arc<ECStore>,
     kms_interface: Arc<KmsServiceManager>,
     readiness: Arc<GlobalReadiness>,
@@ -349,7 +349,7 @@ pub async fn bootstrap_or_defer_iam_init(
     Ok(IamBootstrapDisposition::Deferred)
 }
 
-pub async fn bootstrap_or_defer_iam_init_with_startup_kms(
+pub(crate) async fn bootstrap_or_defer_iam_init_with_startup_kms(
     store: Arc<ECStore>,
     readiness: Arc<GlobalReadiness>,
     state_manager: Option<Arc<ServiceStateManager>>,

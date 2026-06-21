@@ -40,42 +40,42 @@ const EVENT_ACTION_CREDENTIALS_INITIALIZED: &str = "action_credentials_initializ
 const EVENT_ACTION_CREDENTIALS_INITIALIZATION_FAILED: &str = "action_credentials_initialization_failed";
 const DEFAULT_CREDENTIALS_WARNING_MESSAGE: &str = "Detected default root credentials; set RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY to non-default values for production deployments";
 
-pub struct StartupListenContext {
-    pub readiness: Arc<GlobalReadiness>,
-    pub server_addr: SocketAddr,
-    pub server_address: String,
+pub(crate) struct StartupListenContext {
+    pub(crate) readiness: Arc<GlobalReadiness>,
+    pub(crate) server_addr: SocketAddr,
+    pub(crate) server_address: String,
 }
 
-pub struct EmbeddedStartupListenContext {
-    pub readiness: Arc<GlobalReadiness>,
-    pub server_addr: SocketAddr,
-    pub server_address: String,
+pub(crate) struct EmbeddedStartupListenContext {
+    pub(crate) readiness: Arc<GlobalReadiness>,
+    pub(crate) server_addr: SocketAddr,
+    pub(crate) server_address: String,
 }
 
 pub(crate) struct EmbeddedStartupConfig {
-    pub config: Config,
-    pub identity: EmbeddedServerIdentity,
+    pub(crate) config: Config,
+    pub(crate) identity: EmbeddedServerIdentity,
     pub(crate) temp_dir_guard: Option<TempDir>,
 }
 
 pub(crate) struct EmbeddedServerIdentity {
-    pub access_key: String,
-    pub secret_key: String,
-    pub region: String,
+    pub(crate) access_key: String,
+    pub(crate) secret_key: String,
+    pub(crate) region: String,
 }
 
 pub(crate) struct EmbeddedHttpServer {
-    pub shutdown_handle: ShutdownHandle,
-    pub bound_addr: SocketAddr,
+    pub(crate) shutdown_handle: ShutdownHandle,
+    pub(crate) bound_addr: SocketAddr,
 }
 
-pub struct StartupHttpServers {
-    pub state_manager: Arc<ServiceStateManager>,
-    pub s3_shutdown_tx: Option<ShutdownHandle>,
-    pub console_shutdown_tx: Option<ShutdownHandle>,
+pub(crate) struct StartupHttpServers {
+    pub(crate) state_manager: Arc<ServiceStateManager>,
+    pub(crate) s3_shutdown_tx: Option<ShutdownHandle>,
+    pub(crate) console_shutdown_tx: Option<ShutdownHandle>,
 }
 
-pub async fn init_startup_listen_context(config: &Config) -> Result<StartupListenContext> {
+pub(crate) async fn init_startup_listen_context(config: &Config) -> Result<StartupListenContext> {
     log_sanitized_server_config(config);
     let readiness = Arc::new(GlobalReadiness::new());
 
@@ -171,7 +171,7 @@ pub(crate) fn find_embedded_available_port() -> Result<u16> {
     Ok(port)
 }
 
-pub async fn init_embedded_startup_listen_context(config: &Config) -> Result<EmbeddedStartupListenContext> {
+pub(crate) async fn init_embedded_startup_listen_context(config: &Config) -> Result<EmbeddedStartupListenContext> {
     let readiness = Arc::new(GlobalReadiness::new());
 
     let server_addr =
@@ -214,7 +214,7 @@ pub(crate) async fn start_embedded_http_server(config: &Config, readiness: Arc<G
     })
 }
 
-pub async fn init_startup_http_servers(config: &Config, readiness: Arc<GlobalReadiness>) -> Result<StartupHttpServers> {
+pub(crate) async fn init_startup_http_servers(config: &Config, readiness: Arc<GlobalReadiness>) -> Result<StartupHttpServers> {
     init_capacity_management().await;
     let state_manager = Arc::new(ServiceStateManager::new());
     state_manager.update(ServiceState::Starting);

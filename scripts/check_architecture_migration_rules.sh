@@ -610,11 +610,23 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --no-heading '^pub mod startup_(iam|optional_runtimes|profiling);' rustfs/src/lib.rs || true
+  {
+    perl -ne '
+      if (/^\s*pub\s+mod\s+(startup_[A-Za-z0-9_]+);/ && $1 ne "startup_entrypoint") {
+        print "$ARGV:$.:$_";
+      }
+    ' rustfs/src/lib.rs
+    find rustfs/src -maxdepth 1 -type f -name 'startup_*.rs' ! -name 'startup_entrypoint.rs' -print0 |
+      xargs -0 perl -ne '
+        if (/^\s*pub\s+(?!\()/) {
+          print "$ARGV:$.:$_";
+        }
+      '
+  } || true
 ) >"$STARTUP_PUBLIC_SHIM_HITS_FILE"
 
 if [[ -s "$STARTUP_PUBLIC_SHIM_HITS_FILE" ]]; then
-  report_failure "startup compatibility shims must not be public library modules: $(paste -sd '; ' "$STARTUP_PUBLIC_SHIM_HITS_FILE")"
+  report_failure "startup owner boundaries must stay crate-private except startup_entrypoint: $(paste -sd '; ' "$STARTUP_PUBLIC_SHIM_HITS_FILE")"
 fi
 
 (

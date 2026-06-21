@@ -19,7 +19,7 @@ use crate::{
 };
 use std::io::Result;
 
-pub async fn init_startup_runtime_foundation(config: &Config) -> Result<()> {
+pub(crate) async fn init_startup_runtime_foundation(config: &Config) -> Result<()> {
     log_startup_runtime_diagnostics();
     init_profiling_runtime().await;
     rustfs_trusted_proxies::init();

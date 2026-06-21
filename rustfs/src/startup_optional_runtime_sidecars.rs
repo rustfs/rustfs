@@ -24,17 +24,17 @@ const LOG_COMPONENT_MAIN: &str = "main";
 const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const EVENT_PROTOCOL_SYSTEM_STATE: &str = "protocol_system_state";
 
-pub struct OptionalRuntimeServices {
-    pub protocols: ProtocolShutdownSenders,
+pub(crate) struct OptionalRuntimeServices {
+    pub(crate) protocols: ProtocolShutdownSenders,
 }
 
 impl OptionalRuntimeServices {
-    pub fn new(protocols: ProtocolShutdownSenders) -> Self {
+    pub(crate) fn new(protocols: ProtocolShutdownSenders) -> Self {
         Self { protocols }
     }
 }
 
-pub async fn init_optional_runtime_services() -> Result<OptionalRuntimeServices> {
+pub(crate) async fn init_optional_runtime_services() -> Result<OptionalRuntimeServices> {
     let protocols = init_protocol_shutdown_senders().await?;
     Ok(OptionalRuntimeServices::new(protocols))
 }
@@ -76,7 +76,7 @@ fn optional_runtime_shutdown_steps(protocols: &ProtocolShutdownSenders) -> Vec<O
     steps
 }
 
-pub fn prepare_optional_runtime_shutdowns(optional_runtimes: OptionalRuntimeServices) -> Vec<ShutdownHandle> {
+pub(crate) fn prepare_optional_runtime_shutdowns(optional_runtimes: OptionalRuntimeServices) -> Vec<ShutdownHandle> {
     let ProtocolShutdownSenders { ftp, ftps, webdav, sftp } = optional_runtimes.protocols;
 
     let mut protocol_shutdowns = Vec::new();
@@ -100,7 +100,7 @@ pub fn prepare_optional_runtime_shutdowns(optional_runtimes: OptionalRuntimeServ
     protocol_shutdowns
 }
 
-pub async fn shutdown_optional_runtime_services(protocol_shutdowns: Vec<ShutdownHandle>) {
+pub(crate) async fn shutdown_optional_runtime_services(protocol_shutdowns: Vec<ShutdownHandle>) {
     join_all(protocol_shutdowns.into_iter().map(ShutdownHandle::shutdown)).await;
 }
 

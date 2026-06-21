@@ -73,13 +73,13 @@ impl EmbeddedStartupArgs {
 }
 
 pub(crate) struct EmbeddedStartedServer {
-    pub bound_addr: SocketAddr,
-    pub access_key: String,
-    pub secret_key: String,
-    pub region: String,
-    pub shutdown_handle: ShutdownHandle,
-    pub cancel_token: CancellationToken,
-    pub temp_dir: Option<PathBuf>,
+    pub(crate) bound_addr: SocketAddr,
+    pub(crate) access_key: String,
+    pub(crate) secret_key: String,
+    pub(crate) region: String,
+    pub(crate) shutdown_handle: ShutdownHandle,
+    pub(crate) cancel_token: CancellationToken,
+    pub(crate) temp_dir: Option<PathBuf>,
 }
 
 #[derive(Debug)]

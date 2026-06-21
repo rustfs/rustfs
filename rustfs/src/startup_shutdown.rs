@@ -59,7 +59,7 @@ fn background_shutdown_steps(enable_scanner: bool, enable_heal: bool) -> Vec<Bac
     steps
 }
 
-pub async fn run_startup_shutdown_sequence(
+pub(crate) async fn run_startup_shutdown_sequence(
     state_manager: &ServiceStateManager,
     shutdown_signal: ShutdownSignal,
     s3_shutdown_handle: Option<ShutdownHandle>,
@@ -201,7 +201,7 @@ pub async fn run_startup_shutdown_sequence(
     );
 }
 
-pub async fn run_embedded_shutdown_cleanup() {
+pub(crate) async fn run_embedded_shutdown_cleanup() {
     shutdown_event_notifier().await;
 
     if let Err(err) = stop_audit_system().await {
@@ -235,7 +235,7 @@ pub(crate) fn run_embedded_server_drop_cleanup(
     }
 }
 
-pub async fn run_embedded_server_shutdown(
+pub(crate) async fn run_embedded_server_shutdown(
     ctx: &CancellationToken,
     shutdown_handle: &mut Option<ShutdownHandle>,
     temp_dir: Option<&Path>,

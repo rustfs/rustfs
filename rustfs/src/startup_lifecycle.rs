@@ -82,18 +82,18 @@ fn mark_embedded_global_init_started(
     Ok(())
 }
 
-pub struct StartupRuntimeLifecycle {
-    pub server_address: String,
-    pub state_manager: Arc<ServiceStateManager>,
-    pub s3_shutdown_tx: Option<ShutdownHandle>,
-    pub console_shutdown_tx: Option<ShutdownHandle>,
-    pub service_runtime: StartupServiceRuntime,
-    pub store: Arc<ECStore>,
-    pub shutdown_token: CancellationToken,
-    pub readiness: Arc<GlobalReadiness>,
+pub(crate) struct StartupRuntimeLifecycle {
+    pub(crate) server_address: String,
+    pub(crate) state_manager: Arc<ServiceStateManager>,
+    pub(crate) s3_shutdown_tx: Option<ShutdownHandle>,
+    pub(crate) console_shutdown_tx: Option<ShutdownHandle>,
+    pub(crate) service_runtime: StartupServiceRuntime,
+    pub(crate) store: Arc<ECStore>,
+    pub(crate) shutdown_token: CancellationToken,
+    pub(crate) readiness: Arc<GlobalReadiness>,
 }
 
-pub async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifecycle) -> Result<()> {
+pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifecycle) -> Result<()> {
     let StartupRuntimeLifecycle {
         server_address,
         state_manager,
@@ -151,7 +151,10 @@ pub async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifecycle) -
     Ok(())
 }
 
-pub async fn publish_embedded_startup_ready(iam_bootstrap: IamBootstrapDisposition, readiness: &GlobalReadiness) -> Result<()> {
+pub(crate) async fn publish_embedded_startup_ready(
+    iam_bootstrap: IamBootstrapDisposition,
+    readiness: &GlobalReadiness,
+) -> Result<()> {
     publish_ready_for_iam_bootstrap(iam_bootstrap, readiness, None).await?;
     rustfs_common::set_global_init_time_now().await;
     Ok(())
@@ -168,7 +171,7 @@ pub(crate) fn embedded_endpoint_address(address: SocketAddr) -> SocketAddr {
     SocketAddr::new(ip, address.port())
 }
 
-pub fn log_embedded_server_ready(endpoint_address: SocketAddr) {
+pub(crate) fn log_embedded_server_ready(endpoint_address: SocketAddr) {
     info!(
         target: "rustfs::embedded",
         component = LOG_COMPONENT_EMBEDDED,
