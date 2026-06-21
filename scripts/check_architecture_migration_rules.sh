@@ -72,6 +72,7 @@ STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_list_c
 STORE_API_EXTERNAL_OPERATION_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_operation_consumer_hits.txt"
 STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE="${TMP_DIR}/store_api_object_operation_local_method_hits.txt"
 DIRECT_ECSTORE_IMPORT_HITS_FILE="${TMP_DIR}/direct_ecstore_import_hits.txt"
+ECSTORE_API_FACADE_REQUIRED_HITS_FILE="${TMP_DIR}/ecstore_api_facade_required_hits.txt"
 ECSTORE_PUBLIC_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_public_facade_bypass_hits.txt"
 TEST_HARNESS_NESTED_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/test_harness_nested_storage_compat_hits.txt"
 RUSTFS_NESTED_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/rustfs_nested_storage_compat_hits.txt"
@@ -222,6 +223,41 @@ require_source_line \
   "rustfs/src/lib.rs" \
   "pub(crate) mod startup_iam;" \
   "startup IAM shim crate-private module"
+require_source_line \
+  "crates/ecstore/src/lib.rs" \
+  "mod disks_layout;" \
+  "ECStore legacy disks-layout compatibility module crate-private visibility"
+require_source_line \
+  "crates/ecstore/src/lib.rs" \
+  "mod endpoints;" \
+  "ECStore legacy endpoint compatibility module crate-private visibility"
+for ecstore_private_module in \
+  admin_server_info \
+  bucket \
+  cache_value \
+  client \
+  compress \
+  config \
+  data_usage \
+  disk \
+  error \
+  event_notification \
+  global \
+  metrics_realtime \
+  notification_sys \
+  pools \
+  rebalance \
+  rio \
+  rpc \
+  set_disk \
+  store \
+  store_utils \
+  tier; do
+  require_source_line \
+    "crates/ecstore/src/lib.rs" \
+    "mod ${ecstore_private_module};" \
+    "ECStore legacy ${ecstore_private_module} root module crate-private visibility"
+done
 require_source_line \
   "crates/storage-api/src/lib.rs" \
   "pub use bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};" \
@@ -606,11 +642,26 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --no-heading 'rustfs_ecstore::(?:admin_server_info|endpoints|disks_layout|metrics_realtime|notification_sys|pools|store_utils|store)::' \
+  find rustfs/src crates fuzz/fuzz_targets -type f -name 'storage_compat.rs' \
+    ! -path '*/crates/ecstore/*' -print0 |
+    xargs -0 perl -ne '
+      if (/rustfs_ecstore::(?!api::)/) {
+        chomp;
+        print "$ARGV:$.:$_\n";
+      }
+    ' || true
+) >"$ECSTORE_API_FACADE_REQUIRED_HITS_FILE"
+
+if [[ -s "$ECSTORE_API_FACADE_REQUIRED_HITS_FILE" ]]; then
+  report_failure "outer storage compatibility boundaries must route ECStore imports through rustfs_ecstore::api: $(paste -sd '; ' "$ECSTORE_API_FACADE_REQUIRED_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'rustfs_ecstore::(?:admin_server_info|bucket|cache_value|client|compress|config|data_usage|disk|disks_layout|endpoints|error|event_notification|global|metrics_realtime|notification_sys|pools|rebalance|rio|rpc|set_disk|store|store_utils|tier)::' \
     rustfs/src crates/*/src crates/*/tests fuzz/fuzz_targets \
     --glob '*storage_compat.rs' \
-    --glob '!crates/ecstore/**' \
-    --glob '!crates/e2e_test/**' || true
+    --glob '!crates/ecstore/**' || true
 ) >"$ECSTORE_PUBLIC_FACADE_BYPASS_HITS_FILE"
 
 if [[ -s "$ECSTORE_PUBLIC_FACADE_BYPASS_HITS_FILE" ]]; then

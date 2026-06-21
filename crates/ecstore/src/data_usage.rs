@@ -21,11 +21,7 @@ use crate::{
     error::{Error, classify_system_path_failure_reason},
     store::ECStore,
 };
-pub use local_snapshot::{
-    DATA_USAGE_DIR, DATA_USAGE_STATE_DIR, LOCAL_USAGE_SNAPSHOT_VERSION, LocalUsageSnapshot, LocalUsageSnapshotMeta,
-    data_usage_dir, data_usage_state_dir, ensure_data_usage_layout, read_snapshot as read_local_snapshot, snapshot_file_name,
-    snapshot_object_path, snapshot_path, write_snapshot as write_local_snapshot,
-};
+pub use local_snapshot::{LocalUsageSnapshot, read_snapshot as read_local_snapshot, snapshot_path};
 use rustfs_data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus, SizeSummary,
 };
@@ -870,7 +866,7 @@ mod tests {
 
     #[test]
     fn aggregate_skips_corrupted_snapshot_and_preserves_other_disks() {
-        let mut good_snapshot = LocalUsageSnapshot::new(LocalUsageSnapshotMeta {
+        let mut good_snapshot = LocalUsageSnapshot::new(local_snapshot::LocalUsageSnapshotMeta {
             disk_id: "good-disk".to_string(),
             pool_index: Some(0),
             set_index: Some(0),

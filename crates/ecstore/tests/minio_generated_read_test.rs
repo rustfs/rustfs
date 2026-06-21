@@ -4,9 +4,9 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
+use rustfs_ecstore::api::disk::endpoint::Endpoint;
+use rustfs_ecstore::api::disk::{DiskAPI as _, DiskOption, new_disk};
 use rustfs_ecstore::bitrot::create_bitrot_reader;
-use rustfs_ecstore::disk::endpoint::Endpoint;
-use rustfs_ecstore::disk::{DiskAPI as _, DiskOption, new_disk};
 use rustfs_ecstore::erasure_coding::Erasure;
 use rustfs_ecstore::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
 use rustfs_filemeta::{FileInfo, FileInfoOpts, get_file_info};

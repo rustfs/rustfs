@@ -407,6 +407,66 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
     pre-commit quality gate, and three-expert review.
 
+- [x] `API-073` Expand ECStore public facade coverage.
+  - Completed slice: add `rustfs_ecstore::api` facade groups for bucket,
+    config, disk, error, event, global, RPC, set-disk, reader, client, tier,
+    data-usage, cache, compression, and rebalance compatibility surfaces, then
+    migrate all outer `storage_compat.rs` boundaries to those facade paths.
+  - Acceptance: RustFS, app/admin/storage runtime, scanner, heal, IAM, notify,
+    observability, Swift, S3 Select, e2e, test, and fuzz compatibility
+    boundaries no longer import those ECStore public surfaces through direct
+    pre-facade module paths, and the migration guard rejects restoring them.
+  - Must preserve: storage owner types, config IO, bucket metadata/lifecycle
+    helpers, disk/RPC/error contracts, global state accessors, reader wrappers,
+    tier helpers, rebalance status DTOs, test/fuzz harness behavior, and all
+    existing runtime behavior.
+  - Verification: affected package test-target compile, migration and layer
+    guards, formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `API-074` Enforce ECStore API facade for compatibility boundaries.
+  - Completed slice: extend the architecture migration guard so every
+    non-ECStore `storage_compat.rs` import from `rustfs_ecstore` must route
+    through `rustfs_ecstore::api`, not only the previously enumerated public
+    ECStore module paths.
+  - Acceptance: RustFS, app/admin/storage runtime, scanner, heal, IAM, notify,
+    observability, Swift, S3 Select, e2e, test, and fuzz compatibility
+    boundaries cannot reintroduce direct pre-facade ECStore paths through new
+    modules or grouped imports.
+  - Must preserve: no runtime behavior, type ownership, compatibility alias, or
+    ECStore public facade behavior changes.
+  - Verification: migration guard, direct old-path scan, formatting, diff
+    hygiene, branch freshness check, pre-commit quality gate, and three-expert
+    review.
+
+- [x] `API-075` Prune ECStore legacy layout root modules.
+  - Completed slice: make the legacy ECStore root `endpoints` and
+    `disks_layout` compatibility modules crate-private now that outer
+    compatibility boundaries use `rustfs_ecstore::api::layout`.
+  - Acceptance: `rustfs_ecstore::api::layout` remains the public facade for
+    endpoint pools and disk layout helpers, while migration rules reject
+    restoring the old root layout compatibility modules as public modules.
+  - Must preserve: endpoint layout types, disk layout helper behavior, ECStore
+    internal call sites, and all outer compatibility facade paths.
+  - Verification: ECStore and affected outer package compile, migration and
+    layer guards, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, pre-commit quality gate, and three-expert review.
+
+- [x] `API-076` Prune facade-covered ECStore root modules.
+  - Completed slice: make facade-covered legacy ECStore root modules
+    crate-private after all in-repo outer compatibility boundaries route
+    through `rustfs_ecstore::api`.
+  - Acceptance: `rustfs_ecstore::api::*` remains the public facade for storage,
+    admin, config, metrics, notification, RPC, disk, error, tier, rebalance,
+    and layout helper surfaces, while migration rules reject restoring those
+    legacy root modules as public modules.
+  - Must preserve: ECStore internal module access, public `api` facade paths,
+    object API paths, bitrot and erasure coding test/bench paths, and storage
+    contract compatibility tests.
+  - Verification: ECStore and affected outer package compile, migration and
+    layer guards, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, pre-commit quality gate, and three-expert review.
+
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.
   - Acceptance: `./scripts/check_architecture_migration_rules.sh` parses the
     allowed PR types from [`crate-boundaries.md`](crate-boundaries.md) and fails
@@ -2921,13 +2981,55 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-068 keeps the binary startup entrypoint public while making remaining startup compatibility shims crate-private and guarding that surface. |
-| Migration preservation | passed | IAM readiness bootstrap, embedded readiness publication, optional runtime shutdown wiring, profiling shutdown behavior, and test-only IAM retry hook behavior stay in the same owner modules. |
-| Testing/verification | passed | RustFS lib/bin check, focused startup checks, architecture/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
+| Quality/architecture | passed | API-076 removes facade-covered legacy ECStore root modules from the public module surface while keeping the explicit `rustfs_ecstore::api` boundary as the supported compatibility path. |
+| Migration preservation | passed | ECStore internal call sites, storage contract tests, object API, bitrot, erasure coding, and outer compatibility imports keep their behavior and names through retained facade paths. |
+| Testing/verification | passed | ECStore/outer compile checks, bench compile, migration/layer/unsafe guards, formatting, diff hygiene, Rust risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-076 current slice:
+  - `cargo check --tests -p rustfs-ecstore -p rustfs -p rustfs-scanner -p rustfs-heal -p rustfs-iam -p rustfs-notify -p rustfs-obs -p rustfs-protocols -p rustfs-s3select-api -p e2e_test`: passed.
+  - `cargo check --benches -p rustfs-ecstore`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `./scripts/check_unsafe_code_allowances.sh`: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed; nextest ran 6341 tests with 6341 passed, 111 skipped, and doctests passed.
+
+- Issue #660 API-075 current slice:
+  - `cargo check --tests -p rustfs-ecstore -p rustfs -p rustfs-scanner -p rustfs-heal -p rustfs-iam -p rustfs-notify -p rustfs-obs -p rustfs-protocols -p rustfs-s3select-api -p e2e_test`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed; nextest ran 6341 tests with 6341 passed, 111 skipped, and doctests passed.
+
+- Issue #660 API-074 current slice:
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Direct old ECStore path scan in non-ECStore `storage_compat.rs` boundaries: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `make pre-commit`: passed; nextest ran 6341 tests with 6341 passed, 111 skipped, and doctests passed.
+
+- Issue #660 API-073 current slice:
+  - `cargo check --tests -p rustfs-ecstore -p rustfs -p rustfs-scanner -p rustfs-heal -p rustfs-iam -p rustfs-notify -p rustfs-obs -p rustfs-protocols -p rustfs-s3select-api -p e2e_test`: passed.
+  - `cargo check --manifest-path fuzz/Cargo.toml --all-targets`: passed; Cargo refreshed the fuzz lockfile during verification and the generated lockfile change was not retained.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Direct old ECStore facade path scan in outer storage compatibility boundaries: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `./scripts/check_unsafe_code_allowances.sh`: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed; nextest ran 6341 tests with 6341 passed, 111 skipped, and doctests passed.
 
 - Issue #660 R-068 current slice:
   - `cargo check -p rustfs --lib --bins`: passed.

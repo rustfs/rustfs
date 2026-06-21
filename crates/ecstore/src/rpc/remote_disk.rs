@@ -2263,7 +2263,7 @@ impl DiskAPI for RemoteDisk {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::{InternodeDataTransportCapabilities, TcpHttpInternodeDataTransport};
+    use crate::rpc::internode_data_transport::{InternodeDataTransportCapabilities, TcpHttpInternodeDataTransport};
     use rustfs_common::GLOBAL_CONN_MAP;
     use serde_json::Value;
     use std::io::{self as std_io, Write};

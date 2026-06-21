@@ -17,21 +17,21 @@ use rustfs_storage_api::{HTTPRangeSpec, ObjectIO, ObjectToDelete};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-pub(crate) const BUCKET_META_PREFIX: &str = rustfs_ecstore::disk::BUCKET_META_PREFIX;
-pub(crate) const RUSTFS_META_BUCKET: &str = rustfs_ecstore::disk::RUSTFS_META_BUCKET;
-pub(crate) const STORAGE_FORMAT_FILE: &str = rustfs_ecstore::disk::STORAGE_FORMAT_FILE;
-pub(crate) const TRANSITION_COMPLETE: &str = rustfs_ecstore::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
+pub(crate) const BUCKET_META_PREFIX: &str = rustfs_ecstore::api::disk::BUCKET_META_PREFIX;
+pub(crate) const RUSTFS_META_BUCKET: &str = rustfs_ecstore::api::disk::RUSTFS_META_BUCKET;
+pub(crate) const STORAGE_FORMAT_FILE: &str = rustfs_ecstore::api::disk::STORAGE_FORMAT_FILE;
+pub(crate) const TRANSITION_COMPLETE: &str = rustfs_ecstore::api::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 
-pub(crate) type Disk = rustfs_ecstore::disk::Disk;
-pub(crate) type DiskError = rustfs_ecstore::disk::error::DiskError;
+pub(crate) type Disk = rustfs_ecstore::api::disk::Disk;
+pub(crate) type DiskError = rustfs_ecstore::api::disk::error::DiskError;
 pub(crate) type ECStore = rustfs_ecstore::api::storage::ECStore;
-pub(crate) type EcstoreError = rustfs_ecstore::error::Error;
-pub(crate) type EcstoreResult<T> = rustfs_ecstore::error::Result<T>;
-pub(crate) type ListPathRawOptions = rustfs_ecstore::cache_value::metacache_set::ListPathRawOptions;
-pub(crate) type SetDisks = rustfs_ecstore::set_disk::SetDisks;
-pub(crate) type StorageError = rustfs_ecstore::error::StorageError;
+pub(crate) type EcstoreError = rustfs_ecstore::api::error::Error;
+pub(crate) type EcstoreResult<T> = rustfs_ecstore::api::error::Result<T>;
+pub(crate) type ListPathRawOptions = rustfs_ecstore::api::cache::ListPathRawOptions;
+pub(crate) type SetDisks = rustfs_ecstore::api::set_disk::SetDisks;
+pub(crate) type StorageError = rustfs_ecstore::api::error::StorageError;
 
-pub(crate) use rustfs_ecstore::bucket::{
+pub(crate) use rustfs_ecstore::api::bucket::{
     bucket_target_sys::BucketTargetSys,
     lifecycle::{
         bucket_lifecycle_audit::LcEventSrc,
@@ -44,8 +44,8 @@ pub(crate) use rustfs_ecstore::bucket::{
     versioning::VersioningApi,
     versioning_sys::BucketVersioningSys,
 };
-pub(crate) use rustfs_ecstore::disk::{DiskAPI, DiskInfoOptions};
-pub(crate) use rustfs_ecstore::global::GLOBAL_TierConfigMgr;
+pub(crate) use rustfs_ecstore::api::disk::{DiskAPI, DiskInfoOptions};
+pub(crate) use rustfs_ecstore::api::global::GLOBAL_TierConfigMgr;
 
 pub type ScannerGetObjectReader = <ECStore as ObjectIO>::GetObjectReader;
 pub type ScannerObjectInfo = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
@@ -54,18 +54,18 @@ pub type ScannerObjectToDelete = ObjectToDelete;
 pub type ScannerPutObjReader = <ECStore as ObjectIO>::PutObjectReader;
 
 pub(crate) mod storageclass {
-    pub(crate) const RRS: &str = rustfs_ecstore::config::storageclass::RRS;
-    pub(crate) const STANDARD: &str = rustfs_ecstore::config::storageclass::STANDARD;
+    pub(crate) const RRS: &str = rustfs_ecstore::api::config::storageclass::RRS;
+    pub(crate) const STANDARD: &str = rustfs_ecstore::api::config::storageclass::STANDARD;
 }
 
 #[cfg(test)]
-pub(crate) use rustfs_ecstore::config::init as init_ecstore_config_for_scanner_tests;
+pub(crate) use rustfs_ecstore::api::config::init as init_ecstore_config_for_scanner_tests;
 
 #[cfg(test)]
-pub(crate) use rustfs_ecstore::disk::{DiskOption, endpoint::Endpoint, new_disk};
+pub(crate) use rustfs_ecstore::api::disk::{DiskOption, endpoint::Endpoint, new_disk};
 
 pub(crate) fn resolve_scanner_object_store_handle() -> Option<Arc<ECStore>> {
-    rustfs_ecstore::resolve_object_store_handle()
+    rustfs_ecstore::api::global::resolve_object_store_handle()
 }
 
 pub(crate) fn is_reserved_or_invalid_bucket(bucket: &str, strict: bool) -> bool {
@@ -81,33 +81,33 @@ pub(crate) fn path2_bucket_object_with_base_path(base_path: &str, path: &str) ->
 }
 
 pub(crate) async fn is_erasure() -> bool {
-    rustfs_ecstore::global::is_erasure().await
+    rustfs_ecstore::api::global::is_erasure().await
 }
 
 pub(crate) async fn is_erasure_sd() -> bool {
-    rustfs_ecstore::global::is_erasure_sd().await
+    rustfs_ecstore::api::global::is_erasure_sd().await
 }
 
 pub(crate) async fn read_config<S>(api: Arc<S>, file: &str) -> EcstoreResult<Vec<u8>>
 where
     S: ScannerObjectIO,
 {
-    rustfs_ecstore::config::com::read_config(api, file).await
+    rustfs_ecstore::api::config::com::read_config(api, file).await
 }
 
 pub(crate) async fn save_config<S>(api: Arc<S>, file: &str, data: Vec<u8>) -> EcstoreResult<()>
 where
     S: ScannerObjectIO,
 {
-    rustfs_ecstore::config::com::save_config(api, file, data).await
+    rustfs_ecstore::api::config::com::save_config(api, file, data).await
 }
 
 pub(crate) async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> std::result::Result<(), DiskError> {
-    rustfs_ecstore::cache_value::metacache_set::list_path_raw(rx, opts).await
+    rustfs_ecstore::api::cache::list_path_raw(rx, opts).await
 }
 
 pub(crate) async fn replace_bucket_usage_memory_from_info(data_usage_info: &rustfs_data_usage::DataUsageInfo) {
-    rustfs_ecstore::data_usage::replace_bucket_usage_memory_from_info(data_usage_info).await;
+    rustfs_ecstore::api::data_usage::replace_bucket_usage_memory_from_info(data_usage_info).await;
 }
 
 pub trait ScannerObjectIO:

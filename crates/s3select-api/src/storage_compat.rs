@@ -12,30 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) type SelectStorageError = rustfs_ecstore::error::StorageError;
+pub(crate) type SelectStorageError = rustfs_ecstore::api::error::StorageError;
 pub(crate) type SelectStore = rustfs_ecstore::api::storage::ECStore;
 pub(crate) type SelectGetObjectReader = <SelectStore as rustfs_storage_api::ObjectIO>::GetObjectReader;
 pub(crate) type SelectObjectInfo = <SelectStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
 pub(crate) type SelectObjectOptions = <SelectStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
 
-pub(crate) const SELECT_DEFAULT_READ_BUFFER_SIZE: usize = rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
+pub(crate) const SELECT_DEFAULT_READ_BUFFER_SIZE: usize = rustfs_ecstore::api::set_disk::DEFAULT_READ_BUFFER_SIZE;
 
 pub(crate) fn select_default_read_buffer_size_u64() -> u64 {
     u64::try_from(SELECT_DEFAULT_READ_BUFFER_SIZE).unwrap_or(u64::MAX)
 }
 
 pub(crate) fn resolve_select_object_store_handle() -> Option<std::sync::Arc<SelectStore>> {
-    rustfs_ecstore::resolve_object_store_handle()
+    rustfs_ecstore::api::global::resolve_object_store_handle()
 }
 
 pub(crate) fn select_is_err_bucket_not_found(err: &SelectStorageError) -> bool {
-    rustfs_ecstore::error::is_err_bucket_not_found(err)
+    rustfs_ecstore::api::error::is_err_bucket_not_found(err)
 }
 
 pub(crate) fn select_is_err_object_not_found(err: &SelectStorageError) -> bool {
-    rustfs_ecstore::error::is_err_object_not_found(err)
+    rustfs_ecstore::api::error::is_err_object_not_found(err)
 }
 
 pub(crate) fn select_is_err_version_not_found(err: &SelectStorageError) -> bool {
-    rustfs_ecstore::error::is_err_version_not_found(err)
+    rustfs_ecstore::api::error::is_err_version_not_found(err)
 }

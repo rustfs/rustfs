@@ -14,8 +14,8 @@
 
 use std::sync::Arc;
 
-pub(super) type SwiftBucketMetadata = rustfs_ecstore::bucket::metadata::BucketMetadata;
-pub(super) type SwiftStorageResult<T> = rustfs_ecstore::error::Result<T>;
+pub(super) type SwiftBucketMetadata = rustfs_ecstore::api::bucket::metadata::BucketMetadata;
+pub(super) type SwiftStorageResult<T> = rustfs_ecstore::api::error::Result<T>;
 pub(super) type SwiftStore = rustfs_ecstore::api::storage::ECStore;
 pub type SwiftGetObjectReader = <SwiftStore as rustfs_storage_api::ObjectIO>::GetObjectReader;
 pub type SwiftObjectInfo = <SwiftStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
@@ -23,13 +23,13 @@ pub type SwiftObjectOptions = <SwiftStore as rustfs_storage_api::ObjectOperation
 pub type SwiftPutObjReader = <SwiftStore as rustfs_storage_api::ObjectIO>::PutObjectReader;
 
 pub fn resolve_swift_object_store_handle() -> Option<Arc<SwiftStore>> {
-    rustfs_ecstore::resolve_object_store_handle()
+    rustfs_ecstore::api::global::resolve_object_store_handle()
 }
 
 pub async fn get_swift_bucket_metadata(bucket: &str) -> SwiftStorageResult<Arc<SwiftBucketMetadata>> {
-    rustfs_ecstore::bucket::metadata_sys::get(bucket).await
+    rustfs_ecstore::api::bucket::metadata_sys::get(bucket).await
 }
 
 pub async fn set_swift_bucket_metadata(bucket: String, metadata: SwiftBucketMetadata) -> SwiftStorageResult<()> {
-    rustfs_ecstore::bucket::metadata_sys::set_bucket_metadata(bucket, metadata).await
+    rustfs_ecstore::api::bucket::metadata_sys::set_bucket_metadata(bucket, metadata).await
 }

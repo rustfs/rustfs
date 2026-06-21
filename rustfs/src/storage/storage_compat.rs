@@ -13,31 +13,31 @@
 // limitations under the License.
 
 pub(crate) use rustfs_ecstore::api::admin::get_local_server_property;
-pub(crate) use rustfs_ecstore::api::metrics::{CollectMetricsOpts, MetricType, collect_local_metrics};
-pub(crate) use rustfs_ecstore::api::storage::{ECStore, all_local_disk_path, find_local_disk_by_ref};
-pub(crate) use rustfs_ecstore::bucket::{
+pub(crate) use rustfs_ecstore::api::bucket::{
     metadata, metadata_sys, object_lock, policy_sys, replication, tagging, utils, versioning, versioning_sys,
 };
-pub(crate) use rustfs_ecstore::client::object_api_utils;
+pub(crate) use rustfs_ecstore::api::client::object_api_utils;
 #[cfg(test)]
-pub(crate) use rustfs_ecstore::config::com;
-pub(crate) use rustfs_ecstore::disk::error::DiskError;
-pub(crate) use rustfs_ecstore::disk::{
+pub(crate) use rustfs_ecstore::api::config::com;
+pub(crate) use rustfs_ecstore::api::disk::error::DiskError;
+pub(crate) use rustfs_ecstore::api::disk::{
     DeleteOptions, DiskAPI, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadMultipleResp, ReadOptions,
     UpdateMetadataOpts, WalkDirOptions,
 };
-pub(crate) use rustfs_ecstore::error::{
+pub(crate) use rustfs_ecstore::api::error::{
     Error, Result, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
 };
-pub(crate) use rustfs_ecstore::global::{
+pub(crate) use rustfs_ecstore::api::global::{
     GLOBAL_TierConfigMgr, get_global_lock_client, get_global_region, resolve_object_store_handle,
 };
-pub(crate) use rustfs_ecstore::rio::WriteEncryption;
-pub(crate) use rustfs_ecstore::rpc::{
+pub(crate) use rustfs_ecstore::api::metrics::{CollectMetricsOpts, MetricType, collect_local_metrics};
+pub(crate) use rustfs_ecstore::api::rio::WriteEncryption;
+pub(crate) use rustfs_ecstore::api::rpc::{
     LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG,
     SERVICE_SIGNAL_RELOAD_DYNAMIC, verify_rpc_signature,
 };
-pub(crate) use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
+pub(crate) use rustfs_ecstore::api::set_disk::DEFAULT_READ_BUFFER_SIZE;
+pub(crate) use rustfs_ecstore::api::storage::{ECStore, all_local_disk_path, find_local_disk_by_ref};
 
 pub(crate) type GetObjectReader = <ECStore as rustfs_storage_api::ObjectIO>::GetObjectReader;
 pub(crate) type ObjectInfo = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;

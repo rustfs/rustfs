@@ -15,47 +15,47 @@
 
 extern crate core;
 
-pub mod admin_server_info;
+mod admin_server_info;
 pub mod api;
 pub mod batch_processor;
 pub mod bitrot;
-pub mod bucket;
-pub mod cache_value;
-pub mod compress;
-pub mod config;
+mod bucket;
+mod cache_value;
+mod compress;
+mod config;
 mod data_movement;
-pub mod data_usage;
-pub mod disk;
-pub mod disks_layout;
-pub mod endpoints;
+mod data_usage;
+mod disk;
+mod disks_layout;
+mod endpoints;
 pub mod erasure_coding;
-pub mod error;
-pub mod global;
+mod error;
+mod global;
 pub(crate) mod layout;
-pub mod metrics_realtime;
-pub mod notification_sys;
+mod metrics_realtime;
+mod notification_sys;
 pub mod object_api;
-pub mod pools;
-pub mod rebalance;
-pub mod rio;
-pub mod rpc;
-pub mod set_disk;
+mod pools;
+mod rebalance;
+mod rio;
+mod rpc;
+mod set_disk;
 mod sets;
 mod storage_api_contracts;
-pub mod store;
+mod store;
 mod store_init;
 pub mod store_list_objects;
-pub mod store_utils;
+mod store_utils;
 
 // pub mod checksum;
-pub mod client;
+mod client;
 pub mod event;
-pub mod event_notification;
+mod event_notification;
 #[cfg(test)]
 mod pools_test;
 #[cfg(test)]
 mod store_test;
-pub mod tier;
+mod tier;
 
 pub use global::set_global_endpoints;
 pub use global::update_erasure_type;

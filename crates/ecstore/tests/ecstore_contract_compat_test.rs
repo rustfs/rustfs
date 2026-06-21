@@ -13,12 +13,8 @@
 // limitations under the License.
 
 use rustfs_common::heal_channel::HealOpts;
-use rustfs_ecstore::{
-    disk::DiskStore,
-    error::Error,
-    object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
-    store::ECStore,
-};
+use rustfs_ecstore::api::{disk::DiskStore, error::Error, storage::ECStore};
+use rustfs_ecstore::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::NamespaceLockWrapper;
 use rustfs_madmin::heal_commands::HealResultItem;
