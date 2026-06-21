@@ -66,6 +66,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, warn};
 
 use metrics::counter;
+use rustfs_concurrency::DeadlockMonitorPolicy;
 use rustfs_io_core::DeadlockDetectorConfig as CoreDeadlockConfig;
 
 /// Request identifier type.
@@ -124,10 +125,15 @@ impl RequestHangDetectionPolicy {
 
     /// Convert the request-level policy into the shared io-core deadlock config.
     pub fn to_core_config(&self) -> CoreDeadlockConfig {
-        CoreDeadlockConfig {
+        self.to_concurrency_policy().to_core_config()
+    }
+
+    /// Convert the request-level policy into the shared concurrency facade policy.
+    pub fn to_concurrency_policy(&self) -> DeadlockMonitorPolicy {
+        DeadlockMonitorPolicy {
             enabled: self.enabled,
-            detection_interval: self.check_interval,
-            max_hold_time: self.hang_threshold,
+            check_interval: self.check_interval,
+            hang_threshold: self.hang_threshold,
         }
     }
 }
@@ -610,6 +616,26 @@ mod tests {
         assert!(!config.enabled);
         assert_eq!(config.check_interval, Duration::from_secs(5));
         assert_eq!(config.hang_threshold, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_request_hang_policy_projects_to_concurrency_and_core_config() {
+        let config = RequestHangDetectionPolicy {
+            enabled: true,
+            check_interval: Duration::from_secs(7),
+            hang_threshold: Duration::from_secs(11),
+            capture_backtrace: true,
+        };
+        let concurrency = config.to_concurrency_policy();
+        let core = config.to_core_config();
+
+        assert!(concurrency.enabled);
+        assert_eq!(concurrency.check_interval, config.check_interval);
+        assert_eq!(concurrency.hang_threshold, config.hang_threshold);
+        assert!(core.enabled);
+        assert_eq!(core.detection_interval, config.check_interval);
+        assert_eq!(core.max_hold_time, config.hang_threshold);
+        assert!(config.capture_backtrace);
     }
 
     #[test]

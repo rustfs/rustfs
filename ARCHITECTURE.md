@@ -244,11 +244,14 @@ Depth 8 — TOP:
 
 ### High
 
-- **Dependency inversions.** `utils → config` and `common → filemeta/madmin` break
-  the layering model. These need to be untangled.
+- **Dependency inversions.** Historical `utils → config` and
+  `common → filemeta/madmin` edges must stay removed so leaf/helper crates do
+  not regain upward dependencies.
 
 - **Three-layer BackpressureConfig/DeadlockConfig duplication** across io-core,
-  concurrency, and rustfs/storage. Should be defined once with builder/composition.
+  concurrency, and rustfs/storage. Storage policies now expose explicit
+  projections into the concurrency/io-core policy shapes; later work should use
+  those bridges before deleting compatibility wrappers.
 
 ### Medium
 
