@@ -54,6 +54,17 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 use tracing::{Instrument, warn};
 
+macro_rules! check_rpc_response {
+    ($resp:expr) => {
+        if !$resp.success {
+            if let Some(msg) = $resp.error_info {
+                return Err(Error::other(msg));
+            }
+            return Err(Error::other(""));
+        }
+    };
+}
+
 pub const PEER_RESTSIGNAL: &str = "signal";
 pub const PEER_RESTSUB_SYS: &str = "sub-sys";
 pub const PEER_RESTDRY_RUN: &str = "dry-run";
@@ -263,12 +274,7 @@ impl PeerRestClient {
         let request = Request::new(LocalStorageInfoRequest { metrics: true });
 
         let response = client.local_storage_info(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
-            }
-            return Err(Error::other(""));
-        }
+        check_rpc_response!(response);
         let data = response.storage_info;
 
         let mut buf = Deserializer::new(Cursor::new(data));
@@ -286,12 +292,7 @@ impl PeerRestClient {
         let request = Request::new(ServerInfoRequest { metrics: true });
 
         let response = client.server_info(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
-            }
-            return Err(Error::other(""));
-        }
+        check_rpc_response!(response);
         let data = response.server_properties;
 
         let mut buf = Deserializer::new(Cursor::new(data));
@@ -309,12 +310,7 @@ impl PeerRestClient {
         let request = Request::new(GetCpusRequest {});
 
         let response = client.get_cpus(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
-            }
-            return Err(Error::other(""));
-        }
+        check_rpc_response!(response);
         let data = response.cpus;
 
         let mut buf = Deserializer::new(Cursor::new(data));
@@ -332,12 +328,7 @@ impl PeerRestClient {
         let request = Request::new(GetNetInfoRequest {});
 
         let response = client.get_net_info(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
-            }
-            return Err(Error::other(""));
-        }
+        check_rpc_response!(response);
         let data = response.net_info;
 
         let mut buf = Deserializer::new(Cursor::new(data));
@@ -355,12 +346,7 @@ impl PeerRestClient {
         let request = Request::new(GetPartitionsRequest {});
 
         let response = client.get_partitions(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
-            }
-            return Err(Error::other(""));
-        }
+        check_rpc_response!(response);
         let data = response.partitions;
 
         let mut buf = Deserializer::new(Cursor::new(data));
@@ -378,12 +364,7 @@ impl PeerRestClient {
         let request = Request::new(GetOsInfoRequest {});
 
         let response = client.get_os_info(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
-            }
-            return Err(Error::other(""));
-        }
+        check_rpc_response!(response);
         let data = response.os_info;
 
         let mut buf = Deserializer::new(Cursor::new(data));
@@ -399,12 +380,7 @@ impl PeerRestClient {
                 let request = Request::new(GetSeLinuxInfoRequest {});
 
                 let response = client.get_se_linux_info(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
                 let data = response.sys_services;
 
                 let mut buf = Deserializer::new(Cursor::new(data));
@@ -424,12 +400,7 @@ impl PeerRestClient {
                 let request = Request::new(GetSysConfigRequest {});
 
                 let response = client.get_sys_config(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
                 let data = response.sys_config;
 
                 let mut buf = Deserializer::new(Cursor::new(data));
@@ -449,12 +420,7 @@ impl PeerRestClient {
                 let request = Request::new(GetSysErrorsRequest {});
 
                 let response = client.get_sys_errors(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
                 let data = response.sys_errors;
 
                 let mut buf = Deserializer::new(Cursor::new(data));
@@ -474,12 +440,7 @@ impl PeerRestClient {
                 let request = Request::new(GetMemInfoRequest {});
 
                 let response = client.get_mem_info(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
                 let data = response.mem_info;
 
                 let mut buf = Deserializer::new(Cursor::new(data));
@@ -506,12 +467,7 @@ impl PeerRestClient {
                 });
 
                 let response = client.get_metrics(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
                 let data = response.realtime_metrics;
 
                 let mut buf = Deserializer::new(Cursor::new(data));
@@ -531,12 +487,7 @@ impl PeerRestClient {
                 let request = Request::new(GetLiveEventsRequest { after_sequence, limit });
 
                 let response = client.get_live_events(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
 
                 Ok(PeerLiveEventsBatch {
                     events: response.events.to_vec(),
@@ -556,12 +507,7 @@ impl PeerRestClient {
                 let request = Request::new(GetProcInfoRequest {});
 
                 let response = client.get_proc_info(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
                 let data = response.proc_info;
 
                 let mut buf = Deserializer::new(Cursor::new(data));
@@ -583,12 +529,7 @@ impl PeerRestClient {
                 });
 
                 let response = client.start_profiling(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
                 Ok(())
             }
             .await,
@@ -625,12 +566,7 @@ impl PeerRestClient {
                 });
 
                 let response = client.load_bucket_metadata(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
                 Ok(())
             }
             .await,
@@ -647,12 +583,7 @@ impl PeerRestClient {
                 });
 
                 let response = client.delete_bucket_metadata(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
                 Ok(())
             }
             .await,
@@ -669,12 +600,7 @@ impl PeerRestClient {
                 });
 
                 let response = client.delete_policy(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
                 Ok(())
             }
             .await,
@@ -691,12 +617,7 @@ impl PeerRestClient {
                 });
 
                 let response = client.load_policy(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
                 Ok(())
             }
             .await,
@@ -715,12 +636,7 @@ impl PeerRestClient {
                 });
 
                 let response = client.load_policy_mapping(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
                 Ok(())
             }
             .await,
@@ -737,12 +653,7 @@ impl PeerRestClient {
                 });
 
                 let response = client.delete_user(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
                 Ok(())
             }
             .await,
@@ -759,12 +670,7 @@ impl PeerRestClient {
                 });
 
                 let response = client.delete_service_account(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
                 Ok(())
             }
             .await,
@@ -782,12 +688,7 @@ impl PeerRestClient {
                 });
 
                 let response = client.load_user(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
                 Ok(())
             }
             .await,
@@ -804,12 +705,7 @@ impl PeerRestClient {
                 });
 
                 let response = client.load_service_account(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
                 Ok(())
             }
             .await,
@@ -826,12 +722,7 @@ impl PeerRestClient {
                 });
 
                 let response = client.load_group(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
                 Ok(())
             }
             .await,
@@ -846,12 +737,7 @@ impl PeerRestClient {
                 let request = Request::new(ReloadSiteReplicationConfigRequest {});
 
                 let response = client.reload_site_replication_config(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
                 Ok(())
             }
             .await,
@@ -872,12 +758,7 @@ impl PeerRestClient {
                 });
 
                 let response = client.signal_service(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
                 Ok(())
             }
             .await,
@@ -902,12 +783,7 @@ impl PeerRestClient {
                 let request = Request::new(ReloadPoolMetaRequest {});
 
                 let response = client.reload_pool_meta(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
 
                 Ok(())
             }
@@ -923,12 +799,7 @@ impl PeerRestClient {
                 let request = Request::new(StopRebalanceRequest {});
 
                 let response = client.stop_rebalance(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
 
                 Ok(())
             }
@@ -946,12 +817,7 @@ impl PeerRestClient {
                 let response = client.load_rebalance_meta(request).await?.into_inner();
 
                 warn!("load_rebalance_meta response {:?}, grid_host: {:?}", response, &self.grid_host);
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
 
                 Ok(())
             }
@@ -967,12 +833,7 @@ impl PeerRestClient {
                 let request = Request::new(LoadTransitionTierConfigRequest {});
 
                 let response = client.load_transition_tier_config(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+                check_rpc_response!(response);
 
                 Ok(())
             }
