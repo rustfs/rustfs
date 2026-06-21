@@ -5,17 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-admin-config-compat-aliases`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080`.
-- Stacked on: API-080 root runtime compatibility alias pruning.
+- Branch: `overtrue/arch-storage-runtime-compat-aliases`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081`.
+- Stacked on: API-081 admin config compatibility alias pruning.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: prune admin config read/write/delete, server-config read,
-  server-config save, and config-default initialization passthroughs into
-  explicit aliases for admin handlers and services.
-- CI/script changes: guard against restoring broad admin config compatibility
-  module passthroughs.
-- Docs changes: record the API-081 admin config compatibility alias boundary.
+- Rust code changes: prune storage bucket metadata, object-lock, policy,
+  replication, tagging, versioning, object API, and test-only config
+  passthroughs into explicit aliases for storage runtime modules and tests.
+- CI/script changes: guard against restoring broad storage bucket/object-api
+  compatibility module passthroughs.
+- Docs changes: record the API-082 storage compatibility alias boundary.
 
 ## Phase 0 Tasks
 
@@ -157,6 +157,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: RustFS compile coverage, admin focused compile coverage,
     formatting, diff hygiene, risk scan, architecture guard, pre-commit quality
     gate, and three-expert review.
+- [x] `API-082` Prune storage bucket compatibility aliases.
+  - Completed slice: replace storage `metadata`, `metadata_sys`,
+    `object_lock`, `policy_sys`, `replication`, `tagging`, `utils`,
+    `versioning`, `versioning_sys`, `object_api_utils`, and test-only `com`
+    passthroughs with explicit storage compatibility aliases.
+  - Acceptance: storage S3 handlers, access checks, SSE resolution, RPC
+    metadata loading, CORS/object-lock helpers, list-output ETag helpers, and
+    storage tests use direct compatibility aliases while preserving the same
+    bucket metadata keys and ECStore facade APIs.
+  - Must preserve: bucket metadata update/delete/read semantics, object-lock
+    retention/default behavior, bucket policy/public-access checks, SSE bucket
+    defaults, replication stats lookups, object tag encoding/decoding, S3 list
+    ETag formatting, and test-only storage-class signal constants.
+  - Verification: RustFS compile coverage, storage compatibility residual
+    scan, formatting, diff hygiene, risk scan, architecture guard, pre-commit
+    quality gate, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3190,13 +3206,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-081 narrows admin config compatibility to explicit aliases without adding new ECStore ownership cycles. |
-| Migration preservation | passed | Admin config history, dynamic KMS/OIDC/audit config, site-replication state, router notification reads, storage-class defaults, and route contracts remain preserved. |
-| Testing/verification | passed | RustFS compile coverage, migration guard, formatting, diff hygiene, added-line risk scan, full pre-commit, and three-expert review passed. |
+| Quality/architecture | passed | API-082 narrows RustFS storage bucket, object API, and config compatibility to explicit aliases without adding new ECStore ownership cycles. |
+| Migration preservation | passed | Bucket metadata read/update/delete, object-lock checks, policy/public-access reads, SSE defaults, replication/tagging/versioning access, S3 ETag conversion, RPC metadata load, and test-only storage-class access remain preserved. |
+| Testing/verification | passed | RustFS compile coverage, storage compatibility residual scans, migration guard, formatting, diff hygiene, added-line risk scan, full pre-commit, and three-expert review passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-082 current slice:
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Storage compatibility residual scan excluding `storage_compat.rs`: passed.
+  - Broad storage compatibility export scan: passed.
+  - Rust added-line risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-081 current slice:
   - `cargo check -p rustfs --lib`: passed.
