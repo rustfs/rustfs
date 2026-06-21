@@ -24,6 +24,7 @@ pub(crate) type DiskStat = rustfs_ecstore::api::rebalance::DiskStat;
 pub(crate) type ECStore = rustfs_ecstore::api::storage::ECStore;
 pub(crate) type EndpointServerPools = rustfs_ecstore::api::layout::EndpointServerPools;
 pub(crate) type MetricType = rustfs_ecstore::api::metrics::MetricType;
+pub(crate) type NotificationSys = rustfs_ecstore::api::notification::NotificationSys;
 pub(crate) type PeerRestClient = rustfs_ecstore::api::rpc::PeerRestClient;
 pub(crate) type RebalSaveOpt = rustfs_ecstore::api::rebalance::RebalSaveOpt;
 pub(crate) type RebalanceCleanupWarnings = rustfs_ecstore::api::rebalance::RebalanceCleanupWarnings;
@@ -50,6 +51,7 @@ pub(crate) type RebalanceInfo = rustfs_ecstore::api::rebalance::RebalanceInfo;
 pub(crate) mod bandwidth {
     pub(crate) mod monitor {
         pub(crate) type BandwidthDetails = rustfs_ecstore::api::bucket::bandwidth::monitor::BandwidthDetails;
+        pub(crate) type Monitor = rustfs_ecstore::api::bucket::bandwidth::monitor::Monitor;
     }
 }
 
@@ -309,7 +311,7 @@ pub(crate) async fn load_data_usage_from_backend(
     rustfs_ecstore::api::data_usage::load_data_usage_from_backend(store).await
 }
 
-pub(crate) fn get_global_bucket_monitor() -> Option<Arc<rustfs_ecstore::api::bucket::bandwidth::monitor::Monitor>> {
+pub(crate) fn get_global_bucket_monitor() -> Option<Arc<bandwidth::monitor::Monitor>> {
     rustfs_ecstore::api::global::get_global_bucket_monitor()
 }
 
@@ -336,7 +338,7 @@ pub(crate) async fn collect_local_metrics(
     rustfs_ecstore::api::metrics::collect_local_metrics(types, opts).await
 }
 
-pub(crate) fn get_global_notification_sys() -> Option<&'static rustfs_ecstore::api::notification::NotificationSys> {
+pub(crate) fn get_global_notification_sys() -> Option<&'static NotificationSys> {
     rustfs_ecstore::api::notification::get_global_notification_sys()
 }
 

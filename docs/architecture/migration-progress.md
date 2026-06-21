@@ -5,16 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-outer-compat-surface-prune`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089`.
-- Stacked on: `origin/main` after API-089 merged.
+- Branch: `overtrue/arch-outer-compat-common-facade-prune`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090`.
+- Stacked on: `origin/main` after API-090 merged.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: prune raw ECStore object/error facade aliases from outer
-  app/admin/storage compatibility boundaries.
-- CI/script changes: guard app/admin/storage compatibility boundaries against
-  restoring raw ECStore object/error facade aliases.
-- Docs changes: record the API-090 outer compatibility facade alias cleanup.
+- Rust code changes: prune raw ECStore metadata/object-lock/lifecycle/monitor/
+  notification facade paths from outer app/admin/storage compatibility
+  signatures.
+- CI/script changes: guard app/admin/storage compatibility signatures against
+  restoring raw ECStore facade paths for those narrowed types.
+- Docs changes: record the API-091 outer compatibility signature alias cleanup.
 
 ## Phase 0 Tasks
 
@@ -292,6 +293,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: RustFS compile coverage, residual scan, migration guard,
     formatting, diff hygiene, Rust risk scan, pre-commit quality gate, and
     three-expert review.
+- [x] `API-091` Prune outer compat signature facade paths.
+  - Completed slice: replace app/admin/storage raw ECStore metadata,
+    object-lock, lifecycle journal, monitor, and notification facade paths in
+    compatibility function signatures with local aliases.
+  - Acceptance: app/admin/storage compatibility function signatures no longer
+    expose raw ECStore facade paths for `BucketMetadataSys`,
+    `ObjectLockBlockReason`, lifecycle `Jentry`, bandwidth `Monitor`, or
+    `NotificationSys`.
+  - Must preserve: test metadata-system access, object-lock retention checks,
+    lifecycle tier-delete journal persistence, admin bandwidth monitor access,
+    and notification-system access.
+  - Verification: RustFS compile coverage, signature residual scan, migration
+    guard, formatting, diff hygiene, Rust risk scan, pre-commit quality gate,
+    and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3325,13 +3340,23 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-090 replaces raw ECStore object/error facade aliases in outer app/admin/storage compatibility boundaries with storage-api object aliases and local StorageError aliases. |
-| Migration preservation | passed | Lifecycle, object-lock, replication, admin config, and storage S3 error paths keep the same concrete ECStore contracts through narrower local names. |
-| Testing/verification | passed | RustFS compile coverage, outer facade alias residual scan, migration guard, formatting, diff hygiene, Rust risk scan, full pre-commit, and three-expert review passed. |
+| Quality/architecture | passed | API-091 replaces raw ECStore facade paths in outer app/admin/storage compatibility signatures with local aliases. |
+| Migration preservation | passed | Metadata-system, object-lock, lifecycle journal, bandwidth monitor, and notification-system access keep the same ECStore contracts through narrower local names. |
+| Testing/verification | passed | RustFS compile coverage, signature residual scan, migration guard, formatting, diff hygiene, Rust risk scan, full pre-commit, and three-expert review passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-091 current slice:
+  - `cargo check -p rustfs`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Outer app/admin/storage raw signature facade path residual scan: passed.
+  - Rust added-line risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-090 current slice:
   - `cargo check -p rustfs`: passed.
