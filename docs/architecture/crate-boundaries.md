@@ -187,6 +187,9 @@ expose the raw ECStore facade path once narrowed.
 The RustFS storage owner compatibility boundary must keep raw ECStore facade
 paths centralized behind local `ecstore_*` module aliases rather than scattering
 `rustfs_ecstore::api::...` references through its aliases and wrappers.
+The RustFS app/admin storage compatibility boundaries must likewise route raw
+ECStore facade access through their local `ecstore_*` module aliases instead of
+scattering `rustfs_ecstore::api::...` paths through compatibility wrappers.
 Scanner, notify, observability, and e2e `storage_compat.rs` boundaries must
 also stay narrow. Scanner must not restore grouped bucket compatibility exports
 for target, lifecycle, metadata, replication, or versioning modules. Notify
