@@ -13,35 +13,40 @@
 // limitations under the License.
 
 use http::HeaderMap;
+use rustfs_ecstore::api::{
+    bucket as ecstore_bucket, cache as ecstore_cache, capacity as ecstore_capacity, config as ecstore_config,
+    data_usage as ecstore_data_usage, disk as ecstore_disk, error as ecstore_error, global as ecstore_global,
+    set_disk as ecstore_set_disk, storage as ecstore_storage, tier as ecstore_tier,
+};
 use rustfs_storage_api::{HTTPRangeSpec, ObjectIO, ObjectToDelete};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-pub(crate) const BUCKET_META_PREFIX: &str = rustfs_ecstore::api::disk::BUCKET_META_PREFIX;
-pub(crate) const RUSTFS_META_BUCKET: &str = rustfs_ecstore::api::disk::RUSTFS_META_BUCKET;
-pub(crate) const STORAGE_FORMAT_FILE: &str = rustfs_ecstore::api::disk::STORAGE_FORMAT_FILE;
-pub(crate) const TRANSITION_COMPLETE: &str = rustfs_ecstore::api::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
+pub(crate) const BUCKET_META_PREFIX: &str = ecstore_disk::BUCKET_META_PREFIX;
+pub(crate) const RUSTFS_META_BUCKET: &str = ecstore_disk::RUSTFS_META_BUCKET;
+pub(crate) const STORAGE_FORMAT_FILE: &str = ecstore_disk::STORAGE_FORMAT_FILE;
+pub(crate) const TRANSITION_COMPLETE: &str = ecstore_bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 
-pub(crate) type Disk = rustfs_ecstore::api::disk::Disk;
+pub(crate) type Disk = ecstore_disk::Disk;
 #[cfg(test)]
-pub(crate) type DiskStore = rustfs_ecstore::api::disk::DiskStore;
-pub(crate) type DiskError = rustfs_ecstore::api::disk::error::DiskError;
-pub(crate) type ECStore = rustfs_ecstore::api::storage::ECStore;
-pub(crate) type EcstoreError = rustfs_ecstore::api::error::Error;
-pub(crate) type EcstoreResult<T> = rustfs_ecstore::api::error::Result<T>;
-pub(crate) type ListPathRawOptions = rustfs_ecstore::api::cache::ListPathRawOptions;
-pub(crate) type BucketTargetSys = rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys;
-pub(crate) type BucketVersioningSys = rustfs_ecstore::api::bucket::versioning_sys::BucketVersioningSys;
-pub(crate) type DiskInfoOptions = rustfs_ecstore::api::disk::DiskInfoOptions;
-pub(crate) type Evaluator = rustfs_ecstore::api::bucket::lifecycle::evaluator::Evaluator;
-pub(crate) type Event = rustfs_ecstore::api::bucket::lifecycle::lifecycle::Event;
-pub(crate) type LcEventSrc = rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
-pub(crate) type ObjectOpts = rustfs_ecstore::api::bucket::lifecycle::lifecycle::ObjectOpts;
-pub(crate) type ReplicationConfig = rustfs_ecstore::api::bucket::replication::ReplicationConfig;
-pub(crate) type ReplicationHealQueueResult = rustfs_ecstore::api::bucket::replication::ReplicationHealQueueResult;
-pub(crate) type ReplicationQueueAdmission = rustfs_ecstore::api::bucket::replication::ReplicationQueueAdmission;
-pub(crate) type SetDisks = rustfs_ecstore::api::set_disk::SetDisks;
-pub(crate) type StorageError = rustfs_ecstore::api::error::StorageError;
+pub(crate) type DiskStore = ecstore_disk::DiskStore;
+pub(crate) type DiskError = ecstore_disk::error::DiskError;
+pub(crate) type ECStore = ecstore_storage::ECStore;
+pub(crate) type EcstoreError = ecstore_error::Error;
+pub(crate) type EcstoreResult<T> = ecstore_error::Result<T>;
+pub(crate) type ListPathRawOptions = ecstore_cache::ListPathRawOptions;
+pub(crate) type BucketTargetSys = ecstore_bucket::bucket_target_sys::BucketTargetSys;
+pub(crate) type BucketVersioningSys = ecstore_bucket::versioning_sys::BucketVersioningSys;
+pub(crate) type DiskInfoOptions = ecstore_disk::DiskInfoOptions;
+pub(crate) type Evaluator = ecstore_bucket::lifecycle::evaluator::Evaluator;
+pub(crate) type Event = ecstore_bucket::lifecycle::lifecycle::Event;
+pub(crate) type LcEventSrc = ecstore_bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
+pub(crate) type ObjectOpts = ecstore_bucket::lifecycle::lifecycle::ObjectOpts;
+pub(crate) type ReplicationConfig = ecstore_bucket::replication::ReplicationConfig;
+pub(crate) type ReplicationHealQueueResult = ecstore_bucket::replication::ReplicationHealQueueResult;
+pub(crate) type ReplicationQueueAdmission = ecstore_bucket::replication::ReplicationQueueAdmission;
+pub(crate) type SetDisks = ecstore_set_disk::SetDisks;
+pub(crate) type StorageError = ecstore_error::StorageError;
 
 pub type ScannerGetObjectReader = <ECStore as ObjectIO>::GetObjectReader;
 pub type ScannerObjectInfo = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
@@ -50,57 +55,59 @@ pub type ScannerObjectToDelete = ObjectToDelete;
 pub type ScannerPutObjReader = <ECStore as ObjectIO>::PutObjectReader;
 
 pub(crate) mod storageclass {
-    pub(crate) const RRS: &str = rustfs_ecstore::api::config::storageclass::RRS;
-    pub(crate) const STANDARD: &str = rustfs_ecstore::api::config::storageclass::STANDARD;
+    use super::ecstore_config;
+
+    pub(crate) const RRS: &str = ecstore_config::storageclass::RRS;
+    pub(crate) const STANDARD: &str = ecstore_config::storageclass::STANDARD;
 }
 
 #[cfg(test)]
 pub(crate) fn init_ecstore_config_for_scanner_tests() {
-    rustfs_ecstore::api::config::init();
+    ecstore_config::init();
 }
 
 #[cfg(test)]
-pub(crate) type DiskOption = rustfs_ecstore::api::disk::DiskOption;
+pub(crate) type DiskOption = ecstore_disk::DiskOption;
 #[cfg(test)]
-pub(crate) type Endpoint = rustfs_ecstore::api::disk::endpoint::Endpoint;
+pub(crate) type Endpoint = ecstore_disk::endpoint::Endpoint;
 
 #[cfg(test)]
-pub(crate) async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> rustfs_ecstore::api::disk::error::Result<DiskStore> {
-    rustfs_ecstore::api::disk::new_disk(ep, opt).await
+pub(crate) async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> ecstore_disk::error::Result<DiskStore> {
+    ecstore_disk::new_disk(ep, opt).await
 }
 
 pub(crate) async fn get_lifecycle_config(
     bucket: &str,
 ) -> EcstoreResult<(s3s::dto::BucketLifecycleConfiguration, time::OffsetDateTime)> {
-    rustfs_ecstore::api::bucket::metadata_sys::get_lifecycle_config(bucket).await
+    ecstore_bucket::metadata_sys::get_lifecycle_config(bucket).await
 }
 
 pub(crate) async fn get_object_lock_config(
     bucket: &str,
 ) -> EcstoreResult<(s3s::dto::ObjectLockConfiguration, time::OffsetDateTime)> {
-    rustfs_ecstore::api::bucket::metadata_sys::get_object_lock_config(bucket).await
+    ecstore_bucket::metadata_sys::get_object_lock_config(bucket).await
 }
 
 pub(crate) async fn get_replication_config(
     bucket: &str,
 ) -> EcstoreResult<(s3s::dto::ReplicationConfiguration, time::OffsetDateTime)> {
-    rustfs_ecstore::api::bucket::metadata_sys::get_replication_config(bucket).await
+    ecstore_bucket::metadata_sys::get_replication_config(bucket).await
 }
 
 pub(crate) async fn apply_transition_rule(event: &Event, src: &LcEventSrc, oi: &ScannerObjectInfo) -> bool {
-    rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::apply_transition_rule(event, src, oi).await
+    ecstore_bucket::lifecycle::bucket_lifecycle_ops::apply_transition_rule(event, src, oi).await
 }
 
 pub(crate) async fn apply_expiry_rule(event: &Event, src: &LcEventSrc, oi: &ScannerObjectInfo) -> bool {
-    rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_rule(event, src, oi).await
+    ecstore_bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_rule(event, src, oi).await
 }
 
-pub(crate) async fn list_global_tiers() -> Vec<rustfs_ecstore::api::tier::tier_config::TierConfig> {
-    rustfs_ecstore::api::global::GLOBAL_TierConfigMgr.read().await.list_tiers()
+pub(crate) async fn list_global_tiers() -> Vec<ecstore_tier::tier_config::TierConfig> {
+    ecstore_global::GLOBAL_TierConfigMgr.read().await.list_tiers()
 }
 
 pub(crate) async fn enqueue_global_free_version(oi: ScannerObjectInfo) {
-    rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState
+    ecstore_bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState
         .write()
         .await
         .enqueue_free_version(oi)
@@ -113,7 +120,7 @@ pub(crate) async fn enqueue_global_newer_noncurrent(
     event: Event,
     src: &LcEventSrc,
 ) -> bool {
-    rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState
+    ecstore_bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState
         .write()
         .await
         .enqueue_by_newer_noncurrent(bucket, to_delete_objs, event, src)
@@ -126,53 +133,53 @@ pub(crate) async fn queue_replication_heal_internal(
     rcfg: ReplicationConfig,
     retry_count: u32,
 ) -> ReplicationHealQueueResult {
-    rustfs_ecstore::api::bucket::replication::queue_replication_heal_internal(bucket, oi, rcfg, retry_count).await
+    ecstore_bucket::replication::queue_replication_heal_internal(bucket, oi, rcfg, retry_count).await
 }
 
 pub(crate) fn resolve_scanner_object_store_handle() -> Option<Arc<ECStore>> {
-    rustfs_ecstore::api::global::resolve_object_store_handle()
+    ecstore_global::resolve_object_store_handle()
 }
 
 pub(crate) fn is_reserved_or_invalid_bucket(bucket: &str, strict: bool) -> bool {
-    rustfs_ecstore::api::capacity::is_reserved_or_invalid_bucket(bucket, strict)
+    ecstore_capacity::is_reserved_or_invalid_bucket(bucket, strict)
 }
 
 pub(crate) fn path2_bucket_object(name: &str) -> (String, String) {
-    rustfs_ecstore::api::capacity::path2_bucket_object(name)
+    ecstore_capacity::path2_bucket_object(name)
 }
 
 pub(crate) fn path2_bucket_object_with_base_path(base_path: &str, path: &str) -> (String, String) {
-    rustfs_ecstore::api::capacity::path2_bucket_object_with_base_path(base_path, path)
+    ecstore_capacity::path2_bucket_object_with_base_path(base_path, path)
 }
 
 pub(crate) async fn is_erasure() -> bool {
-    rustfs_ecstore::api::global::is_erasure().await
+    ecstore_global::is_erasure().await
 }
 
 pub(crate) async fn is_erasure_sd() -> bool {
-    rustfs_ecstore::api::global::is_erasure_sd().await
+    ecstore_global::is_erasure_sd().await
 }
 
 pub(crate) async fn read_config<S>(api: Arc<S>, file: &str) -> EcstoreResult<Vec<u8>>
 where
     S: ScannerObjectIO,
 {
-    rustfs_ecstore::api::config::com::read_config(api, file).await
+    ecstore_config::com::read_config(api, file).await
 }
 
 pub(crate) async fn save_config<S>(api: Arc<S>, file: &str, data: Vec<u8>) -> EcstoreResult<()>
 where
     S: ScannerObjectIO,
 {
-    rustfs_ecstore::api::config::com::save_config(api, file, data).await
+    ecstore_config::com::save_config(api, file, data).await
 }
 
 pub(crate) async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> std::result::Result<(), DiskError> {
-    rustfs_ecstore::api::cache::list_path_raw(rx, opts).await
+    ecstore_cache::list_path_raw(rx, opts).await
 }
 
 pub(crate) async fn replace_bucket_usage_memory_from_info(data_usage_info: &rustfs_data_usage::DataUsageInfo) {
-    rustfs_ecstore::api::data_usage::replace_bucket_usage_memory_from_info(data_usage_info).await;
+    ecstore_data_usage::replace_bucket_usage_memory_from_info(data_usage_info).await;
 }
 
 pub trait ScannerObjectIO:

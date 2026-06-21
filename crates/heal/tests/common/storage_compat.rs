@@ -16,22 +16,26 @@
 
 use std::sync::Arc;
 
-pub(crate) type DiskStore = rustfs_ecstore::api::disk::DiskStore;
-pub(crate) type ECStore = rustfs_ecstore::api::storage::ECStore;
-pub(crate) type Endpoint = rustfs_ecstore::api::disk::endpoint::Endpoint;
-pub(crate) type EndpointServerPools = rustfs_ecstore::api::layout::EndpointServerPools;
-pub(crate) type Endpoints = rustfs_ecstore::api::layout::Endpoints;
-pub(crate) type PoolEndpoints = rustfs_ecstore::api::layout::PoolEndpoints;
+use rustfs_ecstore::api::{
+    bucket as ecstore_bucket, disk as ecstore_disk, error as ecstore_error, layout as ecstore_layout, storage as ecstore_storage,
+};
+
+pub(crate) type DiskStore = ecstore_disk::DiskStore;
+pub(crate) type ECStore = ecstore_storage::ECStore;
+pub(crate) type Endpoint = ecstore_disk::endpoint::Endpoint;
+pub(crate) type EndpointServerPools = ecstore_layout::EndpointServerPools;
+pub(crate) type Endpoints = ecstore_layout::Endpoints;
+pub(crate) type PoolEndpoints = ecstore_layout::PoolEndpoints;
 
 #[allow(non_snake_case)]
 pub(crate) fn EndpointServerPools(pools: Vec<PoolEndpoints>) -> EndpointServerPools {
-    rustfs_ecstore::api::layout::EndpointServerPools::from(pools)
+    ecstore_layout::EndpointServerPools::from(pools)
 }
 
 pub(crate) async fn init_bucket_metadata_sys(api: Arc<ECStore>, buckets: Vec<String>) {
-    rustfs_ecstore::api::bucket::metadata_sys::init_bucket_metadata_sys(api, buckets).await;
+    ecstore_bucket::metadata_sys::init_bucket_metadata_sys(api, buckets).await;
 }
 
-pub(crate) async fn init_local_disks(endpoint_pools: EndpointServerPools) -> rustfs_ecstore::api::error::Result<()> {
-    rustfs_ecstore::api::storage::init_local_disks(endpoint_pools).await
+pub(crate) async fn init_local_disks(endpoint_pools: EndpointServerPools) -> ecstore_error::Result<()> {
+    ecstore_storage::init_local_disks(endpoint_pools).await
 }

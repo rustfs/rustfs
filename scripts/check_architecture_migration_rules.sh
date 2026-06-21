@@ -90,6 +90,7 @@ RUSTFS_OUTER_COMPAT_FACADE_ALIAS_HITS_FILE="${TMP_DIR}/rustfs_outer_compat_facad
 RUSTFS_OUTER_COMPAT_SIGNATURE_ALIAS_HITS_FILE="${TMP_DIR}/rustfs_outer_compat_signature_alias_hits.txt"
 RUSTFS_STORAGE_COMPAT_RAW_FACADE_PATH_HITS_FILE="${TMP_DIR}/rustfs_storage_compat_raw_facade_path_hits.txt"
 RUSTFS_APP_ADMIN_COMPAT_RAW_FACADE_PATH_HITS_FILE="${TMP_DIR}/rustfs_app_admin_compat_raw_facade_path_hits.txt"
+OUTER_CONSUMER_COMPAT_RAW_FACADE_PATH_HITS_FILE="${TMP_DIR}/outer_consumer_compat_raw_facade_path_hits.txt"
 SCANNER_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/scanner_bucket_storage_compat_module_hits.txt"
 NOTIFY_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/notify_storage_compat_module_hits.txt"
 OBS_STORAGE_COMPAT_PASSTHROUGH_HITS_FILE="${TMP_DIR}/obs_storage_compat_passthrough_hits.txt"
@@ -925,6 +926,27 @@ fi
 
 if [[ -s "$RUSTFS_APP_ADMIN_COMPAT_RAW_FACADE_PATH_HITS_FILE" ]]; then
   report_failure "RustFS app/admin storage compatibility must use local ecstore_* module aliases instead of scattered raw ECStore facade paths: $(paste -sd '; ' "$RUSTFS_APP_ADMIN_COMPAT_RAW_FACADE_PATH_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'rustfs_ecstore::api::' \
+    crates/iam/src/storage_compat.rs \
+    crates/heal/src/heal/storage_compat.rs \
+    crates/obs/src/storage_compat.rs \
+    crates/notify/src/storage_compat.rs \
+    crates/protocols/src/swift/storage_compat.rs \
+    crates/s3select-api/src/storage_compat.rs \
+    crates/scanner/src/storage_compat.rs \
+    crates/heal/tests/common/storage_compat.rs \
+    crates/scanner/tests/common/storage_compat.rs \
+    fuzz/fuzz_targets/path_containment/storage_compat.rs \
+    fuzz/fuzz_targets/bucket_validation/storage_compat.rs \
+    | rg -v '^[^:]+:[0-9]+:use rustfs_ecstore::api::\{' || true
+) >"$OUTER_CONSUMER_COMPAT_RAW_FACADE_PATH_HITS_FILE"
+
+if [[ -s "$OUTER_CONSUMER_COMPAT_RAW_FACADE_PATH_HITS_FILE" ]]; then
+  report_failure "outer consumer storage compatibility must use local ecstore_* module aliases instead of scattered raw ECStore facade paths: $(paste -sd '; ' "$OUTER_CONSUMER_COMPAT_RAW_FACADE_PATH_HITS_FILE")"
 fi
 
 (
