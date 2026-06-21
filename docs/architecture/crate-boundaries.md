@@ -146,6 +146,9 @@ RustFS root `storage_compat.rs` must expose bucket metadata and quota contracts
 as explicit aliases only. Broad `metadata`, `metadata_sys`, and `quota` module
 passthroughs are reserved to narrower app/admin/storage compatibility
 boundaries that still need module-local owner cleanup.
+Root runtime storage config initialization and disk endpoint contracts must also
+stay explicit aliases. The root compatibility boundary must not restore `com`,
+bare `init`, or grouped `endpoint::Endpoint` passthroughs.
 
 ECStore ClusterControlPlane read models must stay owned by the crate-private
 `cluster` module. Public access goes through `rustfs_ecstore::api::cluster` so
