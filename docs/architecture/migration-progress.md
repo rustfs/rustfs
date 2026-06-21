@@ -5,17 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-runtime-compat-aliases`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081`.
-- Stacked on: API-081 admin config compatibility alias pruning.
+- Branch: `overtrue/arch-admin-app-compat-aliases`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082`.
+- Stacked on: API-082 storage compatibility alias pruning.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: prune storage bucket metadata, object-lock, policy,
-  replication, tagging, versioning, object API, and test-only config
-  passthroughs into explicit aliases for storage runtime modules and tests.
-- CI/script changes: guard against restoring broad storage bucket/object-api
-  compatibility module passthroughs.
-- Docs changes: record the API-082 storage compatibility alias boundary.
+- Rust code changes: prune admin/app bucket-facing compatibility passthroughs
+  into explicit local compatibility modules and aliases.
+- CI/script changes: guard against restoring broad admin/app bucket, client,
+  and storage-class compatibility passthroughs.
+- Docs changes: record the API-083 admin/app compatibility alias boundary.
 
 ## Phase 0 Tasks
 
@@ -172,6 +171,21 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     ETag formatting, and test-only storage-class signal constants.
   - Verification: RustFS compile coverage, storage compatibility residual
     scan, formatting, diff hygiene, risk scan, architecture guard, pre-commit
+    quality gate, and three-expert review.
+- [x] `API-083` Prune admin/app bucket compatibility aliases.
+  - Completed slice: replace admin and app broad bucket/client/storage-class
+    compatibility passthroughs with explicit local compatibility modules and
+    symbol whitelists.
+  - Acceptance: admin replication, bucket metadata, quota, tier, site
+    replication, router, and app bucket/object/multipart/lifecycle consumers
+    keep their existing call paths while `storage_compat.rs` no longer exposes
+    broad upstream modules.
+  - Must preserve: admin bucket target updates, replication status and resync
+    DTOs, site-replication metadata serialization, quota checks, lifecycle
+    transition hooks, bucket metadata IO, object ETag conversion, object-lock
+    checks, and app storage-class behavior.
+  - Verification: RustFS compile coverage, admin/app compatibility residual
+    scans, formatting, diff hygiene, risk scan, architecture guard, pre-commit
     quality gate, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
@@ -3206,13 +3220,23 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-082 narrows RustFS storage bucket, object API, and config compatibility to explicit aliases without adding new ECStore ownership cycles. |
-| Migration preservation | passed | Bucket metadata read/update/delete, object-lock checks, policy/public-access reads, SSE defaults, replication/tagging/versioning access, S3 ETag conversion, RPC metadata load, and test-only storage-class access remain preserved. |
-| Testing/verification | passed | RustFS compile coverage, storage compatibility residual scans, migration guard, formatting, diff hygiene, added-line risk scan, full pre-commit, and three-expert review passed. |
+| Quality/architecture | passed | API-083 narrows admin/app bucket-facing compatibility passthroughs into explicit local aliases without adding new ECStore ownership cycles. |
+| Migration preservation | passed | Admin replication, site-replication metadata, bucket targets, quota, tier stats, app bucket/object/multipart/lifecycle, ETag conversion, and storage-class behavior remain preserved. |
+| Testing/verification | passed | RustFS compile coverage, admin/app compatibility residual scans, migration guard, formatting, diff hygiene, added-line risk scan, full pre-commit, and three-expert review passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-083 current slice:
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Admin/app broad compatibility export scans: passed.
+  - Rust added-line risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-082 current slice:
   - `cargo check -p rustfs --lib`: passed.

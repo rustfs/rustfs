@@ -82,6 +82,8 @@ RUSTFS_ROOT_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_root_bucke
 RUSTFS_ROOT_RUNTIME_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_root_runtime_storage_compat_module_hits.txt"
 RUSTFS_ADMIN_CONFIG_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_admin_config_storage_compat_module_hits.txt"
 RUSTFS_STORAGE_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_storage_bucket_storage_compat_module_hits.txt"
+RUSTFS_ADMIN_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_admin_bucket_storage_compat_module_hits.txt"
+RUSTFS_APP_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_app_bucket_storage_compat_module_hits.txt"
 PRODUCTION_UNUSED_COMPAT_ALLOW_HITS_FILE="${TMP_DIR}/production_unused_compat_allow_hits.txt"
 BROAD_STORE_API_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/broad_store_api_compat_reexport_hits.txt"
 NESTED_STORE_API_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/nested_store_api_compat_module_hits.txt"
@@ -807,6 +809,26 @@ fi
 
 if [[ -s "$RUSTFS_STORAGE_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE" ]]; then
   report_failure "RustFS storage compatibility must expose bucket/object-api/config contracts as explicit aliases: $(paste -sd '; ' "$RUSTFS_STORAGE_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub\(crate\)\s+use rustfs_ecstore::api::bucket::\{[^}]*\b(?:bandwidth|bucket_target_sys|lifecycle|metadata|metadata_sys|quota|replication|target|utils|versioning|versioning_sys)\b[^}]*\}\s*;|pub\(crate\)\s+use rustfs_ecstore::api::bucket::(?:bandwidth|bucket_target_sys|lifecycle|metadata|metadata_sys|quota|replication|target|utils|versioning|versioning_sys)\s*;|pub\(crate\)\s+use rustfs_ecstore::api::config::\{[^}]*\bstorageclass\b[^}]*\}\s*;|pub\(crate\)\s+use rustfs_ecstore::api::config::storageclass\s*;' \
+    rustfs/src/admin/storage_compat.rs || true
+) >"$RUSTFS_ADMIN_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE"
+
+if [[ -s "$RUSTFS_ADMIN_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE" ]]; then
+  report_failure "RustFS admin storage compatibility must expose bucket/storageclass contracts as explicit aliases: $(paste -sd '; ' "$RUSTFS_ADMIN_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub\(crate\)\s+use rustfs_ecstore::api::bucket::\{[^}]*\b(?:bucket_target_sys|lifecycle|metadata|metadata_sys|object_lock|policy_sys|quota|replication|tagging|target|utils|versioning|versioning_sys)\b[^}]*\}\s*;|pub\(crate\)\s+use rustfs_ecstore::api::bucket::(?:bucket_target_sys|lifecycle|metadata|metadata_sys|object_lock|policy_sys|quota|replication|tagging|target|utils|versioning|versioning_sys)\s*;|pub\(crate\)\s+use rustfs_ecstore::api::client::(?:object_api_utils|transition_api)\s*;|pub\(crate\)\s+use rustfs_ecstore::api::config::storageclass\s*;' \
+    rustfs/src/app/storage_compat.rs || true
+) >"$RUSTFS_APP_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE" ]]; then
+  report_failure "RustFS app storage compatibility must expose bucket/client/storageclass contracts as explicit aliases: $(paste -sd '; ' "$RUSTFS_APP_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE")"
 fi
 
 (
