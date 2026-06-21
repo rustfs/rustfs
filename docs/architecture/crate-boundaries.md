@@ -125,6 +125,10 @@ directly for `ObjectIO`, `ObjectOperations`, `ListOperations`,
 `MultipartOperations`, `HealOperations`, and `NamespaceLocking`; ECStore keeps
 the concrete compatibility traits only for internal implementation and
 downstream compatibility.
+Outer consumers must not import ECStore directly outside compatibility
+boundaries except for temporary trait imports needed for method resolution or
+local test trait implementations. Non-trait ECStore surfaces must stay behind
+local aliases, constants, or wrapper functions.
 
 Outer compatibility boundary modules must use `rustfs_ecstore::api` for ECStore
 public facade surfaces such as layout, storage owner, admin, metrics,

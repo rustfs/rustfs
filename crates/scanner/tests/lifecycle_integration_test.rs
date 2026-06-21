@@ -15,14 +15,16 @@
 mod common;
 
 use crate::common::storage_compat::{
-    BUCKET_LIFECYCLE_CONFIG, BucketVersioningSys, DiskAPI, DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints,
+    BUCKET_LIFECYCLE_CONFIG, BucketVersioningSys, DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints,
     GLOBAL_TierConfigMgr, PoolEndpoints, ReadCloser, ReaderImpl, STORAGE_FORMAT_FILE, TierConfig, TierMinIO, TierType,
-    TransitionOptions, WarmBackend, WarmBackendGetOpts, build_transition_put_options, enqueue_transition_for_existing_objects,
+    TransitionOptions, WarmBackendGetOpts, build_transition_put_options, enqueue_transition_for_existing_objects,
     get_bucket_metadata, init_background_expiry, init_bucket_metadata_sys, init_local_disks, new_disk,
     path2_bucket_object_with_base_path, update_bucket_metadata,
 };
 use futures::FutureExt;
 use rustfs_config::ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT;
+use rustfs_ecstore::api::disk::DiskAPI as _;
+use rustfs_ecstore::api::tier::warm_backend::WarmBackend;
 use rustfs_filemeta::FileMeta;
 use rustfs_scanner::scanner_folder::ScannerItem;
 use rustfs_scanner::scanner_io::ScannerIODisk;

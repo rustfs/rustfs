@@ -19,10 +19,14 @@ use std::sync::Arc;
 pub(crate) type DiskStore = rustfs_ecstore::api::disk::DiskStore;
 pub(crate) type ECStore = rustfs_ecstore::api::storage::ECStore;
 pub(crate) type Endpoint = rustfs_ecstore::api::disk::endpoint::Endpoint;
+pub(crate) type EndpointServerPools = rustfs_ecstore::api::layout::EndpointServerPools;
 pub(crate) type Endpoints = rustfs_ecstore::api::layout::Endpoints;
 pub(crate) type PoolEndpoints = rustfs_ecstore::api::layout::PoolEndpoints;
 
-pub(crate) use rustfs_ecstore::api::layout::EndpointServerPools;
+#[allow(non_snake_case)]
+pub(crate) fn EndpointServerPools(pools: Vec<PoolEndpoints>) -> EndpointServerPools {
+    rustfs_ecstore::api::layout::EndpointServerPools::from(pools)
+}
 
 pub(crate) async fn init_bucket_metadata_sys(api: Arc<ECStore>, buckets: Vec<String>) {
     rustfs_ecstore::api::bucket::metadata_sys::init_bucket_metadata_sys(api, buckets).await;

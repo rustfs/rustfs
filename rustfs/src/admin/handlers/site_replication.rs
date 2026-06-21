@@ -26,10 +26,9 @@ use crate::admin::storage_compat::metadata::{
 };
 use crate::admin::storage_compat::metadata_sys;
 use crate::admin::storage_compat::replication::GLOBAL_REPLICATION_STATS;
-use crate::admin::storage_compat::replication::{ReplicationConfigurationExt, ResyncOpts, get_global_replication_pool};
+use crate::admin::storage_compat::replication::{ResyncOpts, get_global_replication_pool};
 use crate::admin::storage_compat::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
 use crate::admin::storage_compat::utils::{deserialize, serialize};
-use crate::admin::storage_compat::versioning::VersioningApi;
 use crate::admin::storage_compat::{delete_admin_config, read_admin_config, save_admin_config};
 use crate::admin::storage_compat::{get_global_deployment_id, get_global_endpoints_opt, get_global_region, global_rustfs_port};
 use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
@@ -50,6 +49,8 @@ use rustfs_config::{
     DEFAULT_CONSOLE_ADDRESS, DEFAULT_DELIMITER, DEFAULT_RUSTFS_TLS_PATH, ENV_RUSTFS_CONSOLE_ADDRESS, ENV_RUSTFS_TLS_PATH,
     MAX_ADMIN_REQUEST_BODY_SIZE,
 };
+use rustfs_ecstore::api::bucket::replication::ReplicationConfigurationExt as _;
+use rustfs_ecstore::api::bucket::versioning::VersioningApi as _;
 use rustfs_iam::error::is_err_no_such_service_account;
 use rustfs_iam::store::{MappedPolicy, UserType};
 use rustfs_iam::sys::{

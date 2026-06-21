@@ -14,6 +14,7 @@
 
 #![allow(dead_code, unused_imports)]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
 
@@ -25,21 +26,42 @@ pub(crate) type BucketVersioningSys = rustfs_ecstore::api::bucket::versioning_sy
 pub(crate) type DiskOption = rustfs_ecstore::api::disk::DiskOption;
 pub(crate) type ECStore = rustfs_ecstore::api::storage::ECStore;
 pub(crate) type Endpoint = rustfs_ecstore::api::disk::endpoint::Endpoint;
+pub(crate) type EndpointServerPools = rustfs_ecstore::api::layout::EndpointServerPools;
 pub(crate) type Endpoints = rustfs_ecstore::api::layout::Endpoints;
 pub(crate) type PoolEndpoints = rustfs_ecstore::api::layout::PoolEndpoints;
 pub(crate) type ReadCloser = rustfs_ecstore::api::client::transition_api::ReadCloser;
 pub(crate) type ReaderImpl = rustfs_ecstore::api::client::transition_api::ReaderImpl;
 pub(crate) type TierConfig = rustfs_ecstore::api::tier::tier_config::TierConfig;
+pub(crate) type TierConfigMgr = rustfs_ecstore::api::tier::tier::TierConfigMgr;
 pub(crate) type TierMinIO = rustfs_ecstore::api::tier::tier_config::TierMinIO;
 pub(crate) type TierType = rustfs_ecstore::api::tier::tier_config::TierType;
 pub(crate) type TransitionOptions = rustfs_ecstore::api::bucket::lifecycle::lifecycle::TransitionOptions;
 pub(crate) type WarmBackendGetOpts = rustfs_ecstore::api::tier::warm_backend::WarmBackendGetOpts;
 
-pub(crate) use rustfs_ecstore::api::disk::DiskAPI;
-pub(crate) use rustfs_ecstore::api::global::GLOBAL_TierConfigMgr;
-pub(crate) use rustfs_ecstore::api::layout::EndpointServerPools;
-pub(crate) use rustfs_ecstore::api::tier::warm_backend::WarmBackend;
-pub(crate) use rustfs_ecstore::api::tier::warm_backend::build_transition_put_options;
+#[allow(non_snake_case)]
+pub(crate) fn EndpointServerPools(pools: Vec<PoolEndpoints>) -> EndpointServerPools {
+    rustfs_ecstore::api::layout::EndpointServerPools::from(pools)
+}
+
+pub(crate) struct GlobalTierConfigMgrCompat;
+
+#[allow(non_upper_case_globals)]
+pub(crate) static GLOBAL_TierConfigMgr: GlobalTierConfigMgrCompat = GlobalTierConfigMgrCompat;
+
+impl std::ops::Deref for GlobalTierConfigMgrCompat {
+    type Target = Arc<tokio::sync::RwLock<TierConfigMgr>>;
+
+    fn deref(&self) -> &Self::Target {
+        &rustfs_ecstore::api::global::GLOBAL_TierConfigMgr
+    }
+}
+
+pub(crate) fn build_transition_put_options(
+    storage_class: String,
+    metadata: HashMap<String, String>,
+) -> rustfs_ecstore::api::client::api_put_object::PutObjectOptions {
+    rustfs_ecstore::api::tier::warm_backend::build_transition_put_options(storage_class, metadata)
+}
 
 pub(crate) async fn enqueue_transition_for_existing_objects(
     api: Arc<ECStore>,

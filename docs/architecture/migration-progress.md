@@ -5,16 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-owner-compat-wrappers-main`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086`.
-- Stacked on: `origin/main` after API-086 merged.
+- Branch: `overtrue/arch-trait-import-compat-cleanup`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088`.
+- Stacked on: `origin/main` after API-088 merged.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: prune storage-owner compatibility re-exports into local
-  constants, type aliases, trait imports, and wrapper functions.
-- CI/script changes: guard against restoring storage-owner ECStore API
-  re-exports except temporary trait imports.
-- Docs changes: record the API-087 storage-owner compatibility boundary.
+- Rust code changes: move remaining ECStore method-resolution trait imports
+  from compatibility boundaries into direct call sites, and narrow scanner,
+  heal, and e2e compatibility helpers to local aliases and wrappers.
+- CI/script changes: tighten the compatibility re-export guard while allowing
+  temporary ECStore method-resolution trait imports at call sites.
+- Docs changes: record the API-089 trait import compatibility cleanup.
 
 ## Phase 0 Tasks
 
@@ -262,6 +263,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: RustFS compile coverage, admin/app re-export residual scan,
     migration guard, formatting, diff hygiene, Rust risk scan, pre-commit
     quality gate, and three-expert review.
+- [x] `API-089` Prune trait import compatibility re-exports.
+  - Completed slice: remove the remaining direct ECStore API `pub use`
+    compatibility exports from RustFS admin/app/storage and scanner/heal/e2e
+    boundaries, replacing non-trait access with local wrappers and moving
+    method-resolution trait imports into the files that call those methods.
+  - Acceptance: compatibility boundary files no longer expose
+    `pub(crate) use rustfs_ecstore::api` symbols, while scanner, heal, e2e,
+    admin, app, and storage call sites keep their existing behavior through
+    direct trait imports or local wrappers.
+  - Must preserve: scanner lifecycle and replication evaluation, heal local
+    disk scanning, e2e RPC signature setup, app restore/lifecycle/object-lock
+    checks, admin site-replication behavior, storage RPC disk access, and S3
+    versioning/replication behavior.
+  - Verification: RustFS and edge crate compile coverage, compatibility
+    re-export residual scan, migration guard, formatting, diff hygiene, Rust
+    risk scan, pre-commit quality gate, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3295,13 +3312,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-087 narrows storage-owner compatibility with local aliases/wrappers and an ECStore API re-export guard while leaving only method-resolution trait imports. |
-| Migration preservation | passed | Metadata, object-lock, replication proxy metrics, tag/XML helpers, RPC signature checks, tier reload, global accessors, and local disk lookup remain behind existing storage compatibility names. |
-| Testing/verification | passed | RustFS compile coverage, storage-owner re-export residual scan, migration guard, formatting, diff hygiene, Rust risk scan, full pre-commit, and three-expert review passed. |
+| Quality/architecture | passed | API-089 removes ECStore API re-export compatibility from the remaining app/admin/storage/scanner/heal/e2e boundaries while limiting direct imports to method-resolution traits. |
+| Migration preservation | passed | Scanner, heal, e2e, app, admin, and storage consumers keep non-trait ECStore access behind local aliases, wrappers, or proxy statics with existing behavior preserved. |
+| Testing/verification | passed | Targeted compile coverage, ECStore API re-export residual scan, migration guard, formatting, diff hygiene, Rust risk scan, full pre-commit, and three-expert review passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-089 current slice:
+  - `cargo check -p rustfs -p rustfs-scanner -p rustfs-heal -p e2e_test`:
+    passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - ECStore API re-export residual scan for compatibility boundaries: passed.
+  - Rust added-line risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-087 current slice:
   - `cargo check -p rustfs`: passed.

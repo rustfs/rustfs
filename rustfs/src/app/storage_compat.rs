@@ -47,8 +47,6 @@ pub(crate) type TierConfig = rustfs_ecstore::api::tier::tier_config::TierConfig;
 #[cfg(test)]
 pub(crate) type TierType = rustfs_ecstore::api::tier::tier_config::TierType;
 #[cfg(test)]
-pub(crate) use rustfs_ecstore::api::tier::warm_backend::WarmBackend;
-#[cfg(test)]
 pub(crate) type WarmBackendGetOpts = rustfs_ecstore::api::tier::warm_backend::WarmBackendGetOpts;
 
 #[cfg(test)]
@@ -78,8 +76,6 @@ pub(crate) mod lifecycle {
 
         use super::ECStore;
         use super::bucket_lifecycle_audit::LcEventSrc;
-
-        pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::RestoreRequestOps;
 
         pub(crate) type ExpiryState = rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::ExpiryState;
 
@@ -131,11 +127,18 @@ pub(crate) mod lifecycle {
         pub(crate) async fn validate_transition_tier(lc: &s3s::dto::BucketLifecycleConfiguration) -> Result<(), std::io::Error> {
             rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::validate_transition_tier(lc).await
         }
+
+        pub(crate) async fn validate_lifecycle_config(
+            lc: &s3s::dto::BucketLifecycleConfiguration,
+            lock_config: &s3s::dto::ObjectLockConfiguration,
+        ) -> Result<(), std::io::Error> {
+            use rustfs_ecstore::api::bucket::lifecycle::lifecycle::Lifecycle as _;
+
+            lc.validate(lock_config).await
+        }
     }
 
     pub(crate) mod lifecycle_contract {
-        pub(crate) use rustfs_ecstore::api::bucket::lifecycle::lifecycle::Lifecycle;
-
         #[cfg(test)]
         pub(crate) type IlmAction = rustfs_ecstore::api::bucket::lifecycle::lifecycle::IlmAction;
         pub(crate) type Event = rustfs_ecstore::api::bucket::lifecycle::lifecycle::Event;
@@ -330,8 +333,6 @@ pub(crate) mod object_lock {
             rustfs_ecstore::api::bucket::object_lock::objectlock_sys::is_retention_active(mode, retain_until_date)
         }
     }
-
-    pub(crate) use rustfs_ecstore::api::bucket::object_lock::ObjectLockApi;
 }
 
 pub(crate) mod policy_sys {
@@ -349,8 +350,6 @@ pub(crate) mod quota {
 pub(crate) mod replication {
     use std::collections::HashMap;
     use std::sync::Arc;
-
-    pub(crate) use rustfs_ecstore::api::bucket::replication::ReplicationConfigurationExt;
 
     pub(crate) type DeletedObjectReplicationInfo = rustfs_ecstore::api::bucket::replication::DeletedObjectReplicationInfo;
     pub(crate) type MustReplicateOptions = rustfs_ecstore::api::bucket::replication::MustReplicateOptions;
@@ -414,9 +413,7 @@ pub(crate) mod utils {
     }
 }
 
-pub(crate) mod versioning {
-    pub(crate) use rustfs_ecstore::api::bucket::versioning::VersioningApi;
-}
+pub(crate) mod versioning {}
 
 pub(crate) mod versioning_sys {
     pub(crate) type BucketVersioningSys = rustfs_ecstore::api::bucket::versioning_sys::BucketVersioningSys;

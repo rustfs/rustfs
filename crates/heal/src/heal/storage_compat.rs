@@ -22,9 +22,17 @@ pub(crate) type ECStore = rustfs_ecstore::api::storage::ECStore;
 pub(crate) type EcstoreError = rustfs_ecstore::api::error::Error;
 pub(crate) type Endpoint = rustfs_ecstore::api::disk::endpoint::Endpoint;
 pub(crate) type StorageError = rustfs_ecstore::api::error::StorageError;
+pub(crate) type LocalDiskMap = std::collections::HashMap<String, Option<DiskStore>>;
 
-pub(crate) use rustfs_ecstore::api::disk::DiskAPI;
-pub(crate) use rustfs_ecstore::api::global::GLOBAL_LOCAL_DISK_MAP;
+pub(crate) struct GlobalLocalDiskMap;
+
+pub(crate) static GLOBAL_LOCAL_DISK_MAP: GlobalLocalDiskMap = GlobalLocalDiskMap;
+
+impl GlobalLocalDiskMap {
+    pub(crate) async fn read(&self) -> tokio::sync::RwLockReadGuard<'static, LocalDiskMap> {
+        rustfs_ecstore::api::global::GLOBAL_LOCAL_DISK_MAP.read().await
+    }
+}
 
 #[cfg(test)]
 pub(crate) type DiskOption = rustfs_ecstore::api::disk::DiskOption;
