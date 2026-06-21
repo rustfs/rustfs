@@ -45,6 +45,14 @@ pub mod client {
     pub use crate::client::{admin_handler_utils, object_api_utils, transition_api};
 }
 
+pub mod cluster {
+    pub use crate::cluster::{
+        ClusterControlPlane, ClusterControlPlaneSnapshot, ClusterDriveMembership, ClusterEndpointType, ClusterMembershipSnapshot,
+        ClusterNodeMembership, membership_snapshot_from_endpoint_pools, topology_snapshot_from_endpoint_pools,
+        topology_snapshot_from_endpoint_pools_with_capabilities,
+    };
+}
+
 pub mod compression {
     pub use crate::compress::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
 }

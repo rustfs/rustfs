@@ -12,15 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeMap;
-
 use rustfs_storage_api::{
     CapabilitySnapshotError, CapabilityStatus, DiskCapabilities, MemorySamplingState, ObservabilitySnapshot,
-    ObservabilitySnapshotProvider, PlatformSupport, TopologyCapabilities, TopologyDisk, TopologyLabels, TopologyPool,
-    TopologySet, TopologySnapshot, TopologySnapshotProvider, UserspaceProfilingCapability,
+    ObservabilitySnapshotProvider, PlatformSupport, TopologyCapabilities, TopologySnapshot, TopologySnapshotProvider,
+    UserspaceProfilingCapability,
 };
 
-use crate::storage_compat::{Endpoint, EndpointServerPools};
+use crate::storage_compat::EndpointServerPools;
 
 const NOT_WIRED_INTO_RUNTIME: &str = "not wired into runtime";
 const STORAGE_MEDIA_NOT_REPORTED: &str = "storage media not reported by endpoints";
@@ -82,94 +80,21 @@ impl TopologySnapshotProvider for EndpointTopologySnapshotProvider {
 }
 
 pub fn topology_snapshot_from_endpoint_pools(endpoint_pools: &EndpointServerPools) -> TopologySnapshot {
-    TopologySnapshot {
-        pools: endpoint_pools
-            .as_ref()
-            .iter()
-            .enumerate()
-            .map(|(pool_index, pool)| {
-                let sets = topology_sets_from_endpoints(pool_index, pool.drives_per_set, pool.endpoints.as_ref());
-                TopologyPool {
-                    pool_index,
-                    pool_id: None,
-                    labels: TopologyLabels::default(),
-                    sets,
-                }
-            })
-            .collect(),
-        capabilities: TopologyCapabilities {
+    crate::storage_compat::topology_snapshot_from_endpoint_pools_with_capabilities(
+        endpoint_pools,
+        TopologyCapabilities {
             profiling: cpu_profiling_status(),
             numa: CapabilityStatus::unsupported().with_reason(NUMA_NOT_WIRED),
             failure_domain_labels: CapabilityStatus::unknown().with_reason(FAILURE_DOMAIN_NOT_REPORTED),
             media_labels: CapabilityStatus::unknown().with_reason(STORAGE_MEDIA_NOT_REPORTED),
         },
-    }
-}
-
-fn topology_sets_from_endpoints(pool_index: usize, drives_per_set: usize, endpoints: &[Endpoint]) -> Vec<TopologySet> {
-    let safe_drives_per_set = drives_per_set.max(1);
-    let mut sets = BTreeMap::<usize, Vec<TopologyDisk>>::new();
-
-    for (endpoint_index, endpoint) in endpoints.iter().enumerate() {
-        let set_index = non_negative_index(endpoint.set_idx).unwrap_or(endpoint_index / safe_drives_per_set);
-        let disk_index = non_negative_index(endpoint.disk_idx).unwrap_or(endpoint_index % safe_drives_per_set);
-
-        sets.entry(set_index)
-            .or_default()
-            .push(topology_disk_from_endpoint(pool_index, set_index, disk_index, endpoint));
-    }
-
-    sets.into_iter()
-        .map(|(set_index, mut disks)| {
-            disks.sort_by_key(|disk| disk.disk_index);
-            TopologySet {
-                pool_index,
-                set_index,
-                set_id: None,
-                labels: TopologyLabels::default(),
-                disks,
-            }
-        })
-        .collect()
-}
-
-fn topology_disk_from_endpoint(pool_index: usize, set_index: usize, disk_index: usize, endpoint: &Endpoint) -> TopologyDisk {
-    TopologyDisk {
-        pool_index,
-        set_index,
-        disk_index,
-        disk_id: endpoint_disk_id(endpoint),
-        labels: endpoint_labels(endpoint),
-        capabilities: DiskCapabilities {
+        DiskCapabilities {
             media_type: CapabilityStatus::unknown().with_reason(STORAGE_MEDIA_NOT_REPORTED),
             failure_domain: CapabilityStatus::unknown().with_reason(FAILURE_DOMAIN_NOT_REPORTED),
             numa: CapabilityStatus::unsupported().with_reason(NUMA_NOT_WIRED),
             profiling: cpu_profiling_status(),
         },
-    }
-}
-
-fn endpoint_disk_id(endpoint: &Endpoint) -> Option<String> {
-    let host_port = endpoint.host_port();
-    if host_port.is_empty() { None } else { Some(host_port) }
-}
-
-fn endpoint_labels(endpoint: &Endpoint) -> TopologyLabels {
-    let mut additional = BTreeMap::new();
-    additional.insert(
-        "endpoint_type".to_owned(),
-        if endpoint.url.scheme() == "file" { "path" } else { "url" }.to_owned(),
-    );
-    additional.insert("local".to_owned(), endpoint.is_local.to_string());
-
-    TopologyLabels {
-        additional,
-        ..TopologyLabels::default()
-    }
-}
-
-fn non_negative_index(index: i32) -> Option<usize> {
-    usize::try_from(index).ok()
+    )
 }
 
 fn runtime_telemetry_status() -> CapabilityStatus {
@@ -207,7 +132,7 @@ fn cgroup_memory_status() -> CapabilityStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_compat::{Endpoints, PoolEndpoints};
+    use crate::storage_compat::{Endpoint, Endpoints, PoolEndpoints};
     use rustfs_storage_api::{CapabilityState, ObservabilitySnapshotProvider, TopologySnapshotProvider};
 
     #[tokio::test]
