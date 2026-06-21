@@ -25,8 +25,10 @@ pub(crate) use rustfs_ecstore::api::bucket::replication::{
     GLOBAL_REPLICATION_STATS, get_global_replication_pool, init_background_replication,
 };
 pub(crate) use rustfs_ecstore::api::cluster::topology_snapshot_from_endpoint_pools_with_capabilities;
-pub(crate) use rustfs_ecstore::api::config::{com, init, init_global_config_sys, try_migrate_server_config};
-pub(crate) use rustfs_ecstore::api::disk::{DiskAPI, RUSTFS_META_BUCKET, endpoint::Endpoint};
+pub(crate) use rustfs_ecstore::api::config::com::{read_config as read_ecstore_config, save_config as save_ecstore_config};
+pub(crate) use rustfs_ecstore::api::config::{init as init_ecstore_config, init_global_config_sys, try_migrate_server_config};
+pub(crate) use rustfs_ecstore::api::disk::endpoint::Endpoint;
+pub(crate) use rustfs_ecstore::api::disk::{DiskAPI, RUSTFS_META_BUCKET};
 pub(crate) use rustfs_ecstore::api::error::{Error as EcstoreError, Result as EcstoreResult, StorageError};
 pub(crate) use rustfs_ecstore::api::event::{EventArgs as EcstoreEventArgs, register_event_dispatch_hook};
 pub(crate) use rustfs_ecstore::api::global::{
