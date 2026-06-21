@@ -39,9 +39,6 @@ use rustfs_common::metrics::{
     IlmAction, Metric, Metrics, ScannerReplicationRepairKind, ScannerSourceWorkUpdate, ScannerWorkSource, UpdateCurrentPathFn,
     current_path_updater, global_metrics,
 };
-use rustfs_ecstore::api::bucket::lifecycle::lifecycle::Lifecycle as _;
-use rustfs_ecstore::api::bucket::replication::ReplicationConfigurationExt as _;
-use rustfs_ecstore::api::bucket::versioning::VersioningApi as _;
 use rustfs_ecstore::api::disk::DiskAPI as _;
 use rustfs_filemeta::{
     MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ReplicateObjectInfo, ReplicationStatusType, ReplicationType,
@@ -56,9 +53,10 @@ use tracing::{debug, error, warn};
 
 use crate::storage_compat::{
     BucketVersioningSys, Disk, DiskError, DiskInfoOptions, Evaluator, Event, LcEventSrc, ListPathRawOptions, ObjectOpts,
-    ReplicationConfig, ReplicationQueueAdmission, StorageError, apply_expiry_rule, apply_transition_rule,
-    enqueue_global_newer_noncurrent, is_erasure, is_reserved_or_invalid_bucket, list_path_raw, path2_bucket_object,
-    path2_bucket_object_with_base_path, queue_replication_heal_internal,
+    ReplicationConfig, ReplicationQueueAdmission, ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _,
+    ScannerVersioningConfigExt as _, StorageError, apply_expiry_rule, apply_transition_rule, enqueue_global_newer_noncurrent,
+    is_erasure, is_reserved_or_invalid_bucket, list_path_raw, path2_bucket_object, path2_bucket_object_with_base_path,
+    queue_replication_heal_internal,
 };
 use crate::{ScannerObjectInfo as ObjectInfo, ScannerObjectToDelete as ObjectToDelete};
 

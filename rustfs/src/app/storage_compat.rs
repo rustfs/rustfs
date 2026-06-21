@@ -65,6 +65,59 @@ pub(crate) fn EndpointServerPools(pools: Vec<PoolEndpoints>) -> EndpointServerPo
     crate::app::storage_compat::ecstore_layout::EndpointServerPools::from(pools)
 }
 
+pub(crate) trait AppObjectLockConfigExt {
+    fn enabled(&self) -> bool;
+}
+
+impl AppObjectLockConfigExt for s3s::dto::ObjectLockConfiguration {
+    fn enabled(&self) -> bool {
+        <s3s::dto::ObjectLockConfiguration as ecstore_bucket::object_lock::ObjectLockApi>::enabled(self)
+    }
+}
+
+pub(crate) trait AppReplicationConfigExt {
+    fn filter_target_arns(&self, obj: &replication::ObjectOpts) -> Vec<String>;
+    fn replicate(&self, opts: &replication::ObjectOpts) -> bool;
+}
+
+impl AppReplicationConfigExt for s3s::dto::ReplicationConfiguration {
+    fn filter_target_arns(&self, obj: &replication::ObjectOpts) -> Vec<String> {
+        <s3s::dto::ReplicationConfiguration as ecstore_bucket::replication::ReplicationConfigurationExt>::filter_target_arns(
+            self, obj,
+        )
+    }
+
+    fn replicate(&self, opts: &replication::ObjectOpts) -> bool {
+        <s3s::dto::ReplicationConfiguration as ecstore_bucket::replication::ReplicationConfigurationExt>::replicate(self, opts)
+    }
+}
+
+pub(crate) trait AppVersioningConfigExt {
+    fn prefix_enabled(&self, prefix: &str) -> bool;
+    fn suspended(&self) -> bool;
+}
+
+impl AppVersioningConfigExt for s3s::dto::VersioningConfiguration {
+    fn prefix_enabled(&self, prefix: &str) -> bool {
+        <s3s::dto::VersioningConfiguration as ecstore_bucket::versioning::VersioningApi>::prefix_enabled(self, prefix)
+    }
+
+    fn suspended(&self) -> bool {
+        <s3s::dto::VersioningConfiguration as ecstore_bucket::versioning::VersioningApi>::suspended(self)
+    }
+}
+
+pub(crate) async fn predict_lifecycle_expiration(
+    lifecycle: &s3s::dto::BucketLifecycleConfiguration,
+    obj: &lifecycle::lifecycle::ObjectOpts,
+) -> lifecycle::lifecycle::Event {
+    ecstore_bucket::lifecycle::lifecycle::Lifecycle::predict_expiration(lifecycle, obj).await
+}
+
+pub(crate) fn validate_restore_request(request: &s3s::dto::RestoreRequest, api: Arc<ECStore>) -> std::io::Result<()> {
+    <s3s::dto::RestoreRequest as ecstore_bucket::lifecycle::bucket_lifecycle_ops::RestoreRequestOps>::validate(request, api)
+}
+
 pub(crate) async fn get_server_info(get_pools: bool) -> rustfs_madmin::InfoMessage {
     crate::app::storage_compat::ecstore_admin::get_server_info(get_pools).await
 }

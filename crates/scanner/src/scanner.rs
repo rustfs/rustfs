@@ -39,8 +39,6 @@ use rustfs_config::{
     ENV_SCANNER_CYCLE_MAX_OBJECTS,
 };
 use rustfs_config::{ENV_SCANNER_CYCLE, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS};
-use rustfs_ecstore::api::bucket::lifecycle::lifecycle::Lifecycle as _;
-use rustfs_ecstore::api::bucket::replication::ReplicationConfigurationExt as _;
 use rustfs_storage_api::{BucketOperations, BucketOptions, NamespaceLocking as _};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -49,8 +47,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::storage_compat::{
-    ECStore, EcstoreError, RUSTFS_META_BUCKET, get_lifecycle_config, get_replication_config, is_erasure_sd, read_config,
-    replace_bucket_usage_memory_from_info, save_config,
+    ECStore, EcstoreError, RUSTFS_META_BUCKET, ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _,
+    get_lifecycle_config, get_replication_config, is_erasure_sd, read_config, replace_bucket_usage_memory_from_info, save_config,
 };
 
 const LOG_COMPONENT_SCANNER: &str = "scanner";

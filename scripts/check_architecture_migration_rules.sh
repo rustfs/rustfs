@@ -692,11 +692,6 @@ fi
     --glob '!target/**' || true
 ) |
   perl -ne '
-    next if /\buse rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::RestoreRequestOps(?:\s+as\s+_)?;/;
-    next if /\buse rustfs_ecstore::api::bucket::lifecycle::lifecycle::Lifecycle(?:\s+as\s+_)?;/;
-    next if /\buse rustfs_ecstore::api::bucket::object_lock::ObjectLockApi(?:\s+as\s+_)?;/;
-    next if /\buse rustfs_ecstore::api::bucket::replication::ReplicationConfigurationExt(?:\s+as\s+_)?;/;
-    next if /\buse rustfs_ecstore::api::bucket::versioning::VersioningApi(?:\s+as\s+_)?;/;
     next if /\buse rustfs_ecstore::api::disk::DiskAPI(?:\s+as\s+_)?;/;
     next if /\buse rustfs_ecstore::api::rpc::PeerS3Client(?:\s+as\s+_)?;/;
     next if /\buse rustfs_ecstore::api::tier::warm_backend::WarmBackend(?:\s+as\s+_)?;/;

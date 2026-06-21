@@ -197,6 +197,12 @@ behind local `ecstore_*` module aliases.
 RustFS root runtime and e2e storage compatibility boundaries must follow the
 same pattern, keeping raw ECStore facade access centralized behind local
 `ecstore_*` module aliases.
+Outer bucket lifecycle, replication, versioning, object-lock, and
+restore-request trait method access must stay behind local compatibility traits
+or wrapper functions. Non-compat sources must not import those ECStore bucket
+API traits directly after the wrapper boundary is established. Remaining
+temporary direct ECStore method-resolution imports are limited to disk, RPC peer
+client, and warm-backend traits until their hot-path wrappers are isolated.
 Scanner, notify, observability, and e2e `storage_compat.rs` boundaries must
 also stay narrow. Scanner must not restore grouped bucket compatibility exports
 for target, lifecycle, metadata, replication, or versioning modules. Notify

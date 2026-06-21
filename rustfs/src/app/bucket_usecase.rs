@@ -24,6 +24,7 @@ use crate::app::storage_compat::ECStore;
 use crate::app::storage_compat::StorageError;
 use crate::app::storage_compat::get_global_notification_sys;
 use crate::app::storage_compat::object_api_utils::to_s3s_etag;
+use crate::app::storage_compat::{AppObjectLockConfigExt as _, AppVersioningConfigExt as _};
 use crate::app::storage_compat::{
     bucket_target_sys::BucketTargetSys,
     lifecycle::bucket_lifecycle_ops::{
@@ -57,8 +58,6 @@ use futures::StreamExt;
 use http::StatusCode;
 use metrics::counter;
 use rustfs_config::RUSTFS_REGION;
-use rustfs_ecstore::api::bucket::object_lock::ObjectLockApi as _;
-use rustfs_ecstore::api::bucket::versioning::VersioningApi as _;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::{
     action::{Action, S3Action},

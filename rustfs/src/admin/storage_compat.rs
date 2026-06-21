@@ -55,6 +55,35 @@ pub(crate) type RebalStatus = crate::admin::storage_compat::ecstore_rebalance::R
 #[cfg(test)]
 pub(crate) type RebalanceInfo = crate::admin::storage_compat::ecstore_rebalance::RebalanceInfo;
 
+pub(crate) trait AdminReplicationConfigExt {
+    fn filter_target_arns(&self, obj: &replication::ObjectOpts) -> Vec<String>;
+    fn has_existing_object_replication(&self, arn: &str) -> (bool, bool);
+}
+
+impl AdminReplicationConfigExt for s3s::dto::ReplicationConfiguration {
+    fn filter_target_arns(&self, obj: &replication::ObjectOpts) -> Vec<String> {
+        <s3s::dto::ReplicationConfiguration as ecstore_bucket::replication::ReplicationConfigurationExt>::filter_target_arns(
+            self, obj,
+        )
+    }
+
+    fn has_existing_object_replication(&self, arn: &str) -> (bool, bool) {
+        <s3s::dto::ReplicationConfiguration as ecstore_bucket::replication::ReplicationConfigurationExt>::has_existing_object_replication(
+            self, arn,
+        )
+    }
+}
+
+pub(crate) trait AdminVersioningConfigExt {
+    fn enabled(&self) -> bool;
+}
+
+impl AdminVersioningConfigExt for s3s::dto::VersioningConfiguration {
+    fn enabled(&self) -> bool {
+        <s3s::dto::VersioningConfiguration as ecstore_bucket::versioning::VersioningApi>::enabled(self)
+    }
+}
+
 pub(crate) mod bandwidth {
     pub(crate) mod monitor {
         pub(crate) type BandwidthDetails = crate::admin::storage_compat::ecstore_bucket::bandwidth::monitor::BandwidthDetails;
