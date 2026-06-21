@@ -26,9 +26,6 @@ use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{Metric, Metrics, emit_scan_bucket_drive_complete, emit_scan_bucket_drive_partial, global_metrics};
 #[cfg(test)]
 use rustfs_config::{ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS};
-use rustfs_ecstore::api::bucket::lifecycle::lifecycle::Lifecycle as _;
-use rustfs_ecstore::api::bucket::replication::ReplicationConfigurationExt as _;
-use rustfs_ecstore::api::bucket::versioning::VersioningApi as _;
 use rustfs_ecstore::api::disk::DiskAPI as _;
 use rustfs_filemeta::FileMeta;
 use rustfs_storage_api::{BucketInfo, BucketOperations, BucketOptions, DiskSetSelector, StorageAdminApi};
@@ -49,7 +46,8 @@ use tracing::{debug, error, warn};
 use crate::ScannerObjectInfo as ObjectInfo;
 use crate::storage_compat::{
     BucketTargetSys, BucketVersioningSys, Disk, DiskError, ECStore, EcstoreError as Error, EcstoreResult as Result,
-    ReplicationConfig, STORAGE_FORMAT_FILE, SetDisks, StorageError, enqueue_global_free_version, get_lifecycle_config,
+    ReplicationConfig, STORAGE_FORMAT_FILE, ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _,
+    ScannerVersioningConfigExt as _, SetDisks, StorageError, enqueue_global_free_version, get_lifecycle_config,
     get_object_lock_config, get_replication_config, list_global_tiers, resolve_scanner_object_store_handle, storageclass,
 };
 

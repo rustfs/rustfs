@@ -5,17 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-root-e2e-compat-raw-facade-prune`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094`.
-- Stacked on: `overtrue/arch-outer-consumer-compat-raw-facade-prune` pending API-094 merge.
+- Branch: `overtrue/arch-compat-trait-method-wrappers`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095`.
+- Stacked on: `overtrue/arch-root-e2e-compat-raw-facade-prune` pending API-095 merge.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: centralize RustFS root runtime and e2e storage
-  compatibility raw ECStore facade paths behind local `ecstore_*` module
-  aliases.
-- CI/script changes: guard RustFS root runtime and e2e storage compatibility
-  boundaries against restoring scattered raw ECStore facade paths.
-- Docs changes: record the API-095 root/e2e facade path cleanup.
+- Rust code changes: move remaining outer bucket lifecycle, replication,
+  versioning, object-lock, and restore-request trait method access behind
+  local compatibility traits and wrapper functions.
+- CI/script changes: stop allowing those bucket trait imports as direct ECStore
+  exceptions outside compatibility boundaries.
+- Docs changes: record the API-096 trait-method wrapper cleanup.
 
 ## Phase 0 Tasks
 
@@ -362,6 +362,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: RustFS compile coverage, root/e2e raw facade path residual
     scan, migration guard, formatting, diff hygiene, Rust risk scan,
     pre-commit quality gate, and three-expert review.
+- [x] `API-096` Prune bucket trait method imports.
+  - Completed slice: move outer bucket lifecycle, replication, versioning,
+    object-lock, and restore-request method access behind local compatibility
+    traits and wrapper functions in app, admin, storage, and scanner
+    boundaries.
+  - Acceptance: non-compat RustFS, scanner, and heal sources no longer import
+    ECStore bucket API traits directly; the migration guard only keeps the
+    remaining disk/RPC/warm-backend method-resolution exceptions.
+  - Must preserve: app replication scheduling and restore validation, admin site
+    replication checks, storage object/versioning behavior, scanner lifecycle
+    and replication scans, and existing disk/RPC method-resolution behavior.
+  - Verification: RustFS/scanner/heal compile coverage, direct bucket trait
+    import residual scan, migration guard, formatting, diff hygiene, Rust risk
+    scan, pre-commit quality gate, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3395,13 +3409,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-095 centralizes RustFS root runtime and e2e ECStore facade paths behind local `ecstore_*` module aliases without adding nested compatibility modules. |
-| Migration preservation | passed | Root runtime metadata/config/global/storage/RPC wrappers and e2e RPC harness aliases keep the same ECStore contracts. |
-| Testing/verification | passed | RustFS compile coverage, root/e2e raw facade path residual scan, migration and layer guards, formatting, diff hygiene, Rust risk scan, full pre-commit, and three-expert review passed. |
+| Quality/architecture | pass | API-096 localizes bucket trait method access behind owner-local compatibility traits/wrappers without re-exporting ECStore traits or widening the facade. |
+| Migration preservation | pass | App/admin/storage/scanner call sites keep the same method names or direct wrapper calls; disk/RPC/warm-backend exceptions are unchanged. |
+| Testing/verification | pass | Focused compile, residual scan, migration guard, formatting, diff hygiene, added-line risk scan, and full pre-commit passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-096 current slice:
+  - `cargo check -p rustfs -p rustfs-scanner -p rustfs-heal`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Direct non-compat bucket trait import residual scan: passed.
+  - Added-line Rust risk scan: passed.
+  - `make pre-commit`: passed; nextest run
+    `a18de942-8181-48fa-adf0-e01c2a5d37c3`, 6354 passed, 111 skipped;
+    doctests passed.
 
 - Issue #660 API-095 current slice:
   - `cargo check -p rustfs`: passed.

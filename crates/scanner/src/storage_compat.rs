@@ -94,6 +94,45 @@ pub(crate) async fn get_replication_config(
     ecstore_bucket::metadata_sys::get_replication_config(bucket).await
 }
 
+pub(crate) trait ScannerLifecycleConfigExt {
+    fn has_active_rules(&self, prefix: &str) -> bool;
+}
+
+impl ScannerLifecycleConfigExt for s3s::dto::BucketLifecycleConfiguration {
+    fn has_active_rules(&self, prefix: &str) -> bool {
+        <s3s::dto::BucketLifecycleConfiguration as ecstore_bucket::lifecycle::lifecycle::Lifecycle>::has_active_rules(
+            self, prefix,
+        )
+    }
+}
+
+pub(crate) trait ScannerReplicationConfigExt {
+    fn has_active_rules(&self, prefix: &str, recursive: bool) -> bool;
+}
+
+impl ScannerReplicationConfigExt for s3s::dto::ReplicationConfiguration {
+    fn has_active_rules(&self, prefix: &str, recursive: bool) -> bool {
+        <s3s::dto::ReplicationConfiguration as ecstore_bucket::replication::ReplicationConfigurationExt>::has_active_rules(
+            self, prefix, recursive,
+        )
+    }
+}
+
+pub(crate) trait ScannerVersioningConfigExt {
+    fn prefix_enabled(&self, prefix: &str) -> bool;
+    fn versioned(&self, prefix: &str) -> bool;
+}
+
+impl ScannerVersioningConfigExt for s3s::dto::VersioningConfiguration {
+    fn prefix_enabled(&self, prefix: &str) -> bool {
+        <s3s::dto::VersioningConfiguration as ecstore_bucket::versioning::VersioningApi>::prefix_enabled(self, prefix)
+    }
+
+    fn versioned(&self, prefix: &str) -> bool {
+        <s3s::dto::VersioningConfiguration as ecstore_bucket::versioning::VersioningApi>::versioned(self, prefix)
+    }
+}
+
 pub(crate) async fn apply_transition_rule(event: &Event, src: &LcEventSrc, oi: &ScannerObjectInfo) -> bool {
     ecstore_bucket::lifecycle::bucket_lifecycle_ops::apply_transition_rule(event, src, oi).await
 }

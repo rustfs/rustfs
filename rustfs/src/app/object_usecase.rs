@@ -52,6 +52,9 @@ use crate::app::storage_compat::ECStore;
 use crate::app::storage_compat::object_api_utils::to_s3s_etag;
 use crate::app::storage_compat::quota::checker::QuotaChecker;
 use crate::app::storage_compat::storageclass;
+use crate::app::storage_compat::{
+    AppReplicationConfigExt as _, AppVersioningConfigExt as _, predict_lifecycle_expiration, validate_restore_request,
+};
 use crate::app::storage_compat::{DiskError, is_all_buckets_not_found};
 use crate::app::storage_compat::{DynReader, HashReader, WritePlan, wrap_reader};
 use crate::app::storage_compat::{
@@ -80,10 +83,6 @@ use crate::app::storage_compat::{
 };
 use crate::server::convert_ecstore_object_info;
 use rustfs_concurrency::GetObjectQueueSnapshot;
-use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::RestoreRequestOps as _;
-use rustfs_ecstore::api::bucket::lifecycle::lifecycle::Lifecycle as _;
-use rustfs_ecstore::api::bucket::replication::ReplicationConfigurationExt as _;
-use rustfs_ecstore::api::bucket::versioning::VersioningApi as _;
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateTargetDecision, ReplicationState, ReplicationStatusType,
     ReplicationType, RestoreStatusOps, VersionPurgeStatusType, parse_restore_obj_status, replication_statuses_map,
@@ -1281,7 +1280,7 @@ async fn resolve_put_object_expiration(bucket: &str, obj_info: &ObjectInfo) -> O
     };
 
     let obj_opts = lifecycle::ObjectOpts::from_object_info(obj_info);
-    let event = lifecycle_config.predict_expiration(&obj_opts).await;
+    let event = predict_lifecycle_expiration(&lifecycle_config, &obj_opts).await;
     debug!(
         bucket,
         action = ?event.action,
@@ -4305,7 +4304,7 @@ impl DefaultObjectUsecase {
         }
 
         // Validate restore request
-        if let Err(e) = rreq.validate(store.clone()) {
+        if let Err(e) = validate_restore_request(&rreq, store.clone()) {
             return Err(S3Error::with_message(
                 S3ErrorCode::Custom("ErrValidRestoreObject".into()),
                 format!("Restore object validation failed: {}", e),

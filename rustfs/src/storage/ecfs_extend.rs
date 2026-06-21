@@ -16,6 +16,7 @@ use crate::config::{RustFSBufferConfig, WorkloadProfile, get_global_buffer_confi
 use crate::error::ApiError;
 use crate::server::cors;
 use crate::storage::ecfs::ListObjectUnorderedQuery;
+use crate::storage::storage_compat::StorageReplicationConfigExt as _;
 use crate::storage::storage_compat::{
     StorageError, add_object_lock_years, get_bucket_cors_config, get_bucket_object_lock_config, get_bucket_replication_config,
     resolve_object_store_handle,
@@ -23,7 +24,6 @@ use crate::storage::storage_compat::{
 use http::header::{IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::counter;
-use rustfs_ecstore::api::bucket::replication::ReplicationConfigurationExt as _;
 use rustfs_storage_api::{BucketOperations, BucketOptions};
 use rustfs_targets::EventName;
 use rustfs_targets::arn::{TargetID, TargetIDError};

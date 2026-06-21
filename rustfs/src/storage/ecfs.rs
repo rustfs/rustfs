@@ -29,12 +29,11 @@ use crate::storage::storage_compat::{
     is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found, record_replication_proxy, serialize,
     update_bucket_metadata_config,
 };
+use crate::storage::storage_compat::{StorageReplicationConfigExt as _, StorageVersioningConfigExt as _};
 use crate::storage::{parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled};
 use crate::table_catalog;
 use http::StatusCode;
 use metrics::{counter, histogram};
-use rustfs_ecstore::api::bucket::replication::ReplicationConfigurationExt as _;
-use rustfs_ecstore::api::bucket::versioning::VersioningApi as _;
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use rustfs_storage_api::{BucketOperations, BucketOptions, ObjectLockRetentionOptions, ObjectOperations as _};

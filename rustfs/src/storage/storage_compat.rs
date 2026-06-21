@@ -242,6 +242,28 @@ pub(crate) async fn find_local_disk_by_ref(disk_ref: &str) -> Option<DiskStore> 
     ecstore_storage::find_local_disk_by_ref(disk_ref).await
 }
 
+pub(crate) trait StorageReplicationConfigExt {
+    fn has_active_rules(&self, prefix: &str, recursive: bool) -> bool;
+}
+
+impl StorageReplicationConfigExt for s3s::dto::ReplicationConfiguration {
+    fn has_active_rules(&self, prefix: &str, recursive: bool) -> bool {
+        <s3s::dto::ReplicationConfiguration as ecstore_bucket::replication::ReplicationConfigurationExt>::has_active_rules(
+            self, prefix, recursive,
+        )
+    }
+}
+
+pub(crate) trait StorageVersioningConfigExt {
+    fn enabled(&self) -> bool;
+}
+
+impl StorageVersioningConfigExt for s3s::dto::VersioningConfiguration {
+    fn enabled(&self) -> bool {
+        <s3s::dto::VersioningConfiguration as ecstore_bucket::versioning::VersioningApi>::enabled(self)
+    }
+}
+
 pub(crate) type GetObjectReader = <ECStore as rustfs_storage_api::ObjectIO>::GetObjectReader;
 pub(crate) type ObjectInfo = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
 pub(crate) type ObjectOptions = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
