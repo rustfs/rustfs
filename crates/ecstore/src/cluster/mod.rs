@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rustfs_storage_api::{
     CapabilityStatus, DiskCapabilities, TopologyCapabilities, TopologyDisk, TopologyLabels, TopologyPool, TopologySet,
@@ -31,6 +31,7 @@ const STORAGE_MEDIA_NOT_REPORTED: &str = "storage media not reported by endpoint
 const FAILURE_DOMAIN_NOT_REPORTED: &str = "failure domain labels not reported by endpoints";
 const NUMA_NOT_WIRED: &str = "NUMA topology not wired into runtime";
 const PROFILING_NOT_WIRED: &str = "profiling capability not wired into ECStore";
+const PEER_HEALTH_NOT_REPORTED: &str = "peer health not reported by endpoints";
 
 #[derive(Debug, Clone)]
 pub struct ClusterControlPlane {
@@ -50,10 +51,29 @@ impl ClusterControlPlane {
         membership_snapshot_from_endpoint_pools(&self.endpoint_pools)
     }
 
+    pub fn pool_state_snapshot(&self) -> ClusterPoolStateSnapshot {
+        pool_state_snapshot_from_endpoint_pools(&self.endpoint_pools)
+    }
+
+    pub fn local_node_storage_snapshot(&self) -> ClusterLocalNodeStorageSnapshot {
+        let membership = self.membership_snapshot();
+        local_node_storage_snapshot_from_membership(&membership)
+    }
+
+    pub fn peer_health_snapshot(&self) -> ClusterPeerHealthSnapshot {
+        let membership = self.membership_snapshot();
+        peer_health_snapshot_from_membership(&membership)
+    }
+
     pub fn read_snapshot(&self) -> ClusterControlPlaneSnapshot {
+        let membership = self.membership_snapshot();
+
         ClusterControlPlaneSnapshot {
             topology: self.topology_snapshot(),
-            membership: self.membership_snapshot(),
+            pool_state: self.pool_state_snapshot(),
+            local_storage: local_node_storage_snapshot_from_membership(&membership),
+            peer_health: peer_health_snapshot_from_membership(&membership),
+            membership,
         }
     }
 }
@@ -61,6 +81,9 @@ impl ClusterControlPlane {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterControlPlaneSnapshot {
     pub topology: TopologySnapshot,
+    pub pool_state: ClusterPoolStateSnapshot,
+    pub local_storage: ClusterLocalNodeStorageSnapshot,
+    pub peer_health: ClusterPeerHealthSnapshot,
     pub membership: ClusterMembershipSnapshot,
 }
 
@@ -88,7 +111,50 @@ pub struct ClusterDriveMembership {
     pub endpoint_type: ClusterEndpointType,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClusterPoolStateSnapshot {
+    pub pools: Vec<ClusterPoolState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterPoolState {
+    pub pool_index: usize,
+    pub set_count: usize,
+    pub drives_per_set: usize,
+    pub endpoint_count: usize,
+    pub local_drive_count: usize,
+    pub remote_drive_count: usize,
+    pub legacy: bool,
+    pub endpoint_types: Vec<ClusterEndpointType>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClusterLocalNodeStorageSnapshot {
+    pub nodes: Vec<ClusterLocalNodeStorage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterLocalNodeStorage {
+    pub node_id: String,
+    pub pools: Vec<usize>,
+    pub drive_count: usize,
+    pub path_drive_count: usize,
+    pub url_drive_count: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClusterPeerHealthSnapshot {
+    pub peers: Vec<ClusterPeerHealth>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterPeerHealth {
+    pub node_id: String,
+    pub is_local: bool,
+    pub status: CapabilityStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ClusterEndpointType {
     Path,
     Url,
@@ -168,6 +234,82 @@ pub fn membership_snapshot_from_endpoint_pools(endpoint_pools: &EndpointServerPo
     ClusterMembershipSnapshot {
         nodes: nodes.into_values().collect(),
         drives,
+    }
+}
+
+pub fn pool_state_snapshot_from_endpoint_pools(endpoint_pools: &EndpointServerPools) -> ClusterPoolStateSnapshot {
+    ClusterPoolStateSnapshot {
+        pools: endpoint_pools
+            .as_ref()
+            .iter()
+            .enumerate()
+            .map(|(pool_index, pool)| {
+                let mut endpoint_types = BTreeSet::new();
+                let mut local_drive_count = 0;
+
+                for endpoint in pool.endpoints.as_ref() {
+                    endpoint_types.insert(endpoint_type(endpoint));
+                    if endpoint.is_local {
+                        local_drive_count += 1;
+                    }
+                }
+
+                let endpoint_count = pool.endpoints.as_ref().len();
+                ClusterPoolState {
+                    pool_index,
+                    set_count: pool.set_count,
+                    drives_per_set: pool.drives_per_set,
+                    endpoint_count,
+                    local_drive_count,
+                    remote_drive_count: endpoint_count.saturating_sub(local_drive_count),
+                    legacy: pool.legacy,
+                    endpoint_types: endpoint_types.into_iter().collect(),
+                }
+            })
+            .collect(),
+    }
+}
+
+pub fn local_node_storage_snapshot_from_membership(membership: &ClusterMembershipSnapshot) -> ClusterLocalNodeStorageSnapshot {
+    ClusterLocalNodeStorageSnapshot {
+        nodes: membership
+            .nodes
+            .iter()
+            .filter(|node| node.is_local)
+            .map(|node| {
+                let mut path_drive_count = 0;
+                let mut url_drive_count = 0;
+
+                for drive in membership.drives.iter().filter(|drive| drive.node_id == node.node_id) {
+                    match drive.endpoint_type {
+                        ClusterEndpointType::Path => path_drive_count += 1,
+                        ClusterEndpointType::Url => url_drive_count += 1,
+                    }
+                }
+
+                ClusterLocalNodeStorage {
+                    node_id: node.node_id.clone(),
+                    pools: node.pools.clone(),
+                    drive_count: path_drive_count + url_drive_count,
+                    path_drive_count,
+                    url_drive_count,
+                }
+            })
+            .collect(),
+    }
+}
+
+pub fn peer_health_snapshot_from_membership(membership: &ClusterMembershipSnapshot) -> ClusterPeerHealthSnapshot {
+    ClusterPeerHealthSnapshot {
+        peers: membership
+            .nodes
+            .iter()
+            .map(|node| ClusterPeerHealth {
+                node_id: node.node_id.clone(),
+                is_local: node.is_local,
+                status: CapabilityStatus::unknown().with_reason(PEER_HEALTH_NOT_REPORTED),
+            })
+            .collect(),
     }
 }
 
@@ -347,8 +489,54 @@ mod tests {
     }
 
     #[test]
+    fn pool_state_snapshot_counts_local_remote_drives_and_endpoint_types() {
+        let endpoint_pools = sample_mixed_endpoint_pools();
+        let snapshot = pool_state_snapshot_from_endpoint_pools(&endpoint_pools);
+
+        assert_eq!(snapshot.pools.len(), 1);
+        assert_eq!(snapshot.pools[0].set_count, 2);
+        assert_eq!(snapshot.pools[0].drives_per_set, 2);
+        assert_eq!(snapshot.pools[0].endpoint_count, 4);
+        assert_eq!(snapshot.pools[0].local_drive_count, 3);
+        assert_eq!(snapshot.pools[0].remote_drive_count, 1);
+        assert_eq!(
+            snapshot.pools[0].endpoint_types,
+            vec![ClusterEndpointType::Path, ClusterEndpointType::Url]
+        );
+    }
+
+    #[test]
+    fn local_node_storage_snapshot_keeps_only_local_drive_counts() {
+        let membership = membership_snapshot_from_endpoint_pools(&sample_mixed_endpoint_pools());
+        let snapshot = local_node_storage_snapshot_from_membership(&membership);
+
+        assert_eq!(snapshot.nodes.len(), 2);
+        assert_eq!(snapshot.nodes[0].node_id, LOCAL_NODE_ID);
+        assert_eq!(snapshot.nodes[0].drive_count, 2);
+        assert_eq!(snapshot.nodes[0].path_drive_count, 2);
+        assert_eq!(snapshot.nodes[0].url_drive_count, 0);
+        assert_eq!(snapshot.nodes[1].node_id, "node1.example:9000");
+        assert_eq!(snapshot.nodes[1].drive_count, 1);
+        assert_eq!(snapshot.nodes[1].path_drive_count, 0);
+        assert_eq!(snapshot.nodes[1].url_drive_count, 1);
+    }
+
+    #[test]
+    fn peer_health_snapshot_reports_static_unknown_status() {
+        let membership = membership_snapshot_from_endpoint_pools(&sample_url_endpoint_pools());
+        let snapshot = peer_health_snapshot_from_membership(&membership);
+
+        assert_eq!(snapshot.peers.len(), 2);
+        assert_eq!(snapshot.peers[0].node_id, "node1.example:9000");
+        assert!(snapshot.peers[0].is_local);
+        assert_eq!(snapshot.peers[0].status.reason.as_deref(), Some(PEER_HEALTH_NOT_REPORTED));
+        assert_eq!(snapshot.peers[1].node_id, "node2.example:9000");
+        assert!(!snapshot.peers[1].is_local);
+    }
+
+    #[test]
     fn control_plane_read_snapshot_combines_topology_and_membership() {
-        let control_plane = ClusterControlPlane::new(sample_path_endpoint_pools());
+        let control_plane = ClusterControlPlane::new(sample_mixed_endpoint_pools());
         let snapshot = control_plane.read_snapshot();
         let node_ids = snapshot
             .membership
@@ -358,7 +546,10 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         assert_eq!(snapshot.topology.pools[0].sets.len(), 2);
-        assert_eq!(node_ids, BTreeSet::from([LOCAL_NODE_ID]));
+        assert_eq!(snapshot.pool_state.pools[0].endpoint_count, 4);
+        assert_eq!(snapshot.local_storage.nodes.len(), 2);
+        assert_eq!(snapshot.peer_health.peers.len(), 3);
+        assert_eq!(node_ids, BTreeSet::from([LOCAL_NODE_ID, "node1.example:9000", "node2.example:9000"]));
     }
 
     fn sample_path_endpoint_pools() -> EndpointServerPools {
@@ -403,6 +594,38 @@ mod tests {
             drives_per_set: 2,
             endpoints: Endpoints::from(endpoints),
             cmd_line: "http://node{1...2}.example:9000/export{0...3}".to_owned(),
+            platform: "OS: test | Arch: test".to_owned(),
+        }])
+    }
+
+    fn sample_mixed_endpoint_pools() -> EndpointServerPools {
+        let mut endpoints = Vec::new();
+
+        for index in 0..2 {
+            let mut endpoint =
+                Endpoint::try_from(format!("/tmp/rustfs-cluster-control-plane-{index}").as_str()).expect("local endpoint");
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(index);
+            endpoints.push(endpoint);
+        }
+
+        for index in 2..4 {
+            let host = if index == 2 { "node1.example" } else { "node2.example" };
+            let mut endpoint = Endpoint::try_from(format!("http://{host}:9000/export{index}").as_str()).expect("url endpoint");
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(1);
+            endpoint.set_disk_index(index - 2);
+            endpoint.is_local = index == 2;
+            endpoints.push(endpoint);
+        }
+
+        EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 2,
+            drives_per_set: 2,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: "mixed-test-endpoints".to_owned(),
             platform: "OS: test | Arch: test".to_owned(),
         }])
     }

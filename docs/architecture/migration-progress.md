@@ -5,15 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-cluster-control-plane-read-models`
-- Baseline: completed `API-078`.
-- Stacked on: ECStore root global facade prune.
+- Branch: `overtrue/arch-cluster-control-plane-status-snapshots`
+- Baseline: completed `C-001/C-002/C-003`.
+- Stacked on: ECStore cluster control-plane read models.
 - PR type for this branch: `api-extraction`
 - Runtime behavior changes: none.
-- Rust code changes: add ECStore ClusterControlPlane read models and route
-  RustFS runtime endpoint topology snapshots through the ECStore owner facade.
-- CI/script changes: extend architecture rules for the cluster facade boundary.
-- Docs changes: record the C-001/C-002/C-003 read-model slice.
+- Rust code changes: add pool-state, local-node storage, and peer-health status
+  read models to the ECStore ClusterControlPlane snapshot.
+- CI/script changes: none.
+- Docs changes: record the C-004/C-005/C-006 status snapshot slice.
 
 ## Phase 0 Tasks
 
@@ -538,6 +538,40 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: control-plane read-snapshot test, migration guard, compile
     coverage, formatting, diff hygiene, risk scan, pre-commit quality gate, and
     three-expert review.
+
+- [x] `C-004` Add pool state snapshot.
+  - Completed slice: add a static pool-state snapshot derived from existing
+    endpoint pools and expose it through `rustfs_ecstore::api::cluster`.
+  - Acceptance: pool state records pool index, set count, drives per set,
+    endpoint counts, local/remote drive counts, legacy flag, and endpoint type
+    coverage without reading disks or changing pool ownership.
+  - Must preserve: no placement change, no pool mutation, no command-line path
+    exposure, and no endpoint publication changes.
+  - Verification: ECStore pool-state tests, compile coverage, formatting, diff
+    hygiene, risk scan, pre-commit quality gate, and three-expert review.
+
+- [x] `C-005` Add local-node storage snapshot.
+  - Completed slice: add a read-only local-node storage projection from static
+    endpoint membership.
+  - Acceptance: local nodes include only local membership entries and report
+    aggregate path/url drive counts and pool coverage without exposing local
+    disk paths.
+  - Must preserve: no storage readiness, disk health, lock quorum, or object I/O
+    behavior changes.
+  - Verification: ECStore local-node storage tests, compile coverage,
+    formatting, diff hygiene, risk scan, pre-commit quality gate, and
+    three-expert review.
+
+- [x] `C-006` Add peer health snapshot.
+  - Completed slice: add a static peer-health read model that reports peer
+    identities from membership with unknown health status until real peer health
+    wiring lands.
+  - Acceptance: peer health is explicitly unknown and read-only; no background
+    health checks, RPC calls, timers, or failure-state mutation are introduced.
+  - Must preserve: no dynamic membership, no peer health loop, no control RPC,
+    no readiness impact, and no lock/object behavior changes.
+  - Verification: ECStore peer-health tests, compile coverage, formatting, diff
+    hygiene, risk scan, pre-commit quality gate, and three-expert review.
 
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.
   - Acceptance: `./scripts/check_architecture_migration_rules.sh` parses the
@@ -3067,13 +3101,23 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | C-001/C-002/C-003 keeps ClusterControlPlane read models in ECStore with public access only through `api::cluster`. |
-| Migration preservation | passed | Topology and static membership are read-only snapshots from existing endpoint pools; no placement, readiness, health, or lock behavior changes. |
-| Testing/verification | passed | ECStore cluster tests, RustFS runtime capability tests, compile coverage, migration guard, formatting, diff hygiene, risk scan, and pre-commit gate passed. |
+| Quality/architecture | passed | C-004/C-005/C-006 extends ClusterControlPlane with pool-state, local-node storage, and peer-health status read models behind `api::cluster`. |
+| Migration preservation | passed | New status surfaces remain static read-only projections; no placement, readiness, health loop, lock, or object I/O behavior changes. |
+| Testing/verification | passed | ECStore cluster tests, ECStore/RustFS compile coverage, migration guard, formatting, diff hygiene, risk scan, full pre-commit, and three-expert review passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 C-004/C-005/C-006 current slice:
+  - `cargo test -p rustfs-ecstore cluster -- --nocapture`: passed, 7 tests.
+  - `cargo check -p rustfs-ecstore --all-targets`: passed.
+  - `cargo check -p rustfs --lib --bins`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Rust added-line risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 C-001/C-002/C-003 current slice:
   - `cargo check -p rustfs-ecstore --all-targets`: passed.
