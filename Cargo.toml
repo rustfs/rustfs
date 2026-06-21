@@ -157,11 +157,11 @@ tonic = { version = "0.14.6", features = ["gzip", "deflate"] }
 tonic-prost = { version = "0.14.6" }
 tonic-prost-build = { version = "0.14.6" }
 tower = { version = "0.5.3", features = ["timeout"] }
-tower-http = { version = "0.6.11", features = ["cors"] }
+tower-http = { version = "0.7.0", features = ["cors"] }
 
 # Serialization and Data Formats
 apache-avro = "0.21.0"
-bytes = { version = "1.11.1", features = ["serde"] }
+bytes = { version = "1.12.0", features = ["serde"] }
 bytesize = "2.4.0"
 byteorder = "1.5.0"
 flatbuffers = "25.12.19"
@@ -196,7 +196,7 @@ zeroize = { version = "1.9.0", features = ["derive"] }
 # Time and Date
 chrono = { version = "0.4.45", features = ["serde"] }
 humantime = "2.3.0"
-jiff = { version = "0.2.28", features = ["serde"] }
+jiff = { version = "0.2.29", features = ["serde"] }
 time = { version = "0.3.49", features = ["std", "parsing", "formatting", "macros", "serde"] }
 
 # Database
@@ -212,7 +212,7 @@ atoi = "3.0.0"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.8.18" }
 aws-credential-types = { version = "1.2.14" }
-aws-sdk-s3 = { version = "1.136.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "1.137.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-smithy-http-client = { version = "1.1.13", default-features = false, features = ["default-client", "rustls-aws-lc"] }
 aws-smithy-types = { version = "1.5.0" }
 base64 = "0.22.1"
@@ -268,7 +268,7 @@ reed-solomon-erasure = { package = "rustfs-erasure-codec", version = "7.0.0", fe
 reed-solomon-simd = "3.1.0"
 regex = { version = "1.12.4" }
 rumqttc = { package = "rumqttc-next", version = "0.33.2", features = ["websocket"] }
-redis = { version = "1.2.3", features = ["connection-manager", "tokio-rustls-comp", "tls-rustls-insecure"] }
+redis = { version = "1.2.4", features = ["connection-manager", "tokio-rustls-comp", "tls-rustls-insecure"] }
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.2" }
@@ -318,7 +318,7 @@ pyroscope = { version = "=2.0.5", features = ["backend-pprof-rs", "backend-jemal
 # FTP and SFTP
 libunftp = { version = "0.23.0", features = ["experimental"] }
 unftp-core = "0.1.0"
-suppaftp = { version = "8.0.4", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
+suppaftp = { version = "9.0.0", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
 rcgen = "0.14.8"
 russh = { version = "0.61.2", features = ["serde"] }
 russh-sftp = "2.3.0"
