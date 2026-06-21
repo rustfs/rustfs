@@ -32,6 +32,9 @@ lazy_static::lazy_static! {
 pub fn check_bucket_name_common(bucket_name: &str, strict: bool) -> Result<()> {
     let bucket_name_trimmed = bucket_name.trim();
 
+    if bucket_name_trimmed != bucket_name {
+        return Err(Error::other("Bucket name cannot contain leading or trailing whitespace"));
+    }
     if bucket_name_trimmed.is_empty() {
         return Err(Error::other("Bucket name cannot be empty"));
     }
@@ -450,6 +453,20 @@ mod tests {
 
         // Invalid object names
         assert!(check_bucket_and_object_names("valid-bucket", "").is_err());
+    }
+
+    #[test]
+    fn test_check_bucket_name_rejects_leading_and_trailing_whitespace() {
+        for bucket in [" valid-bucket", "valid-bucket ", "valid-bucket\n", "valid-bucket\u{b}"] {
+            assert!(
+                check_valid_bucket_name_strict(bucket).is_err(),
+                "bucket name with leading or trailing whitespace must be rejected: {bucket:?}"
+            );
+            assert!(
+                check_valid_bucket_name(bucket).is_err(),
+                "legacy bucket validation must reject leading or trailing whitespace: {bucket:?}"
+            );
+        }
     }
 
     #[test]
