@@ -175,6 +175,11 @@ directly except temporary trait imports needed for method resolution. Remaining
 storage-owner compatibility symbols must be local constants, type aliases, or
 wrapper functions so storage-owned global state and helper access stays visible
 at the boundary.
+RustFS app, admin, and storage outer `storage_compat.rs` object and error
+facade aliases must stay anchored on storage-api associated object types and
+local `StorageError` aliases. They must not reintroduce raw
+`rustfs_ecstore::api::object::{ObjectInfo,ObjectOptions}` or
+`rustfs_ecstore::api::error::{Error,Result}` references.
 Scanner, notify, observability, and e2e `storage_compat.rs` boundaries must
 also stay narrow. Scanner must not restore grouped bucket compatibility exports
 for target, lifecycle, metadata, replication, or versioning modules. Notify

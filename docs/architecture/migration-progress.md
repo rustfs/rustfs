@@ -5,17 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-trait-import-compat-cleanup`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088`.
-- Stacked on: `origin/main` after API-088 merged.
+- Branch: `overtrue/arch-outer-compat-surface-prune`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089`.
+- Stacked on: `origin/main` after API-089 merged.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move remaining ECStore method-resolution trait imports
-  from compatibility boundaries into direct call sites, and narrow scanner,
-  heal, and e2e compatibility helpers to local aliases and wrappers.
-- CI/script changes: tighten the compatibility re-export guard while allowing
-  temporary ECStore method-resolution trait imports at call sites.
-- Docs changes: record the API-089 trait import compatibility cleanup.
+- Rust code changes: prune raw ECStore object/error facade aliases from outer
+  app/admin/storage compatibility boundaries.
+- CI/script changes: guard app/admin/storage compatibility boundaries against
+  restoring raw ECStore object/error facade aliases.
+- Docs changes: record the API-090 outer compatibility facade alias cleanup.
 
 ## Phase 0 Tasks
 
@@ -279,6 +278,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: RustFS and edge crate compile coverage, compatibility
     re-export residual scan, migration guard, formatting, diff hygiene, Rust
     risk scan, pre-commit quality gate, and three-expert review.
+- [x] `API-090` Prune outer compat object/error facade aliases.
+  - Completed slice: replace app/admin/storage raw ECStore object/error facade
+    aliases with storage-api associated object aliases and local `StorageError`
+    aliases.
+  - Acceptance: app/admin/storage compatibility boundaries no longer refer to
+    `rustfs_ecstore::api::object::{ObjectInfo,ObjectOptions}` or
+    `rustfs_ecstore::api::error::{Error,Result}` while behavior stays
+    unchanged.
+  - Must preserve: lifecycle restore/options, object-lock deletion checks,
+    replication scheduling decisions, admin/storage config error matching, and
+    storage S3 error mapping.
+  - Verification: RustFS compile coverage, residual scan, migration guard,
+    formatting, diff hygiene, Rust risk scan, pre-commit quality gate, and
+    three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3312,13 +3325,23 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-089 removes ECStore API re-export compatibility from the remaining app/admin/storage/scanner/heal/e2e boundaries while limiting direct imports to method-resolution traits. |
-| Migration preservation | passed | Scanner, heal, e2e, app, admin, and storage consumers keep non-trait ECStore access behind local aliases, wrappers, or proxy statics with existing behavior preserved. |
-| Testing/verification | passed | Targeted compile coverage, ECStore API re-export residual scan, migration guard, formatting, diff hygiene, Rust risk scan, full pre-commit, and three-expert review passed. |
+| Quality/architecture | passed | API-090 replaces raw ECStore object/error facade aliases in outer app/admin/storage compatibility boundaries with storage-api object aliases and local StorageError aliases. |
+| Migration preservation | passed | Lifecycle, object-lock, replication, admin config, and storage S3 error paths keep the same concrete ECStore contracts through narrower local names. |
+| Testing/verification | passed | RustFS compile coverage, outer facade alias residual scan, migration guard, formatting, diff hygiene, Rust risk scan, full pre-commit, and three-expert review passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-090 current slice:
+  - `cargo check -p rustfs`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Outer app/admin/storage object/error facade alias residual scan: passed.
+  - Rust added-line risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-089 current slice:
   - `cargo check -p rustfs -p rustfs-scanner -p rustfs-heal -p e2e_test`:
