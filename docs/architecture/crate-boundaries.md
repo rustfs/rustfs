@@ -169,6 +169,10 @@ must not restore broad `config`/`global` module imports. Observability must
 consume data usage through a local DTO projection instead of re-exporting the
 ECStore data-usage loader. The e2e harness must not restore grouped RPC
 passthroughs.
+Test and fuzz `storage_compat.rs` harnesses must also stay narrow. Heal and
+scanner test harnesses must expose ECStore contracts through direct aliases or
+local wrappers, and fuzz harnesses must wrap bucket utility entrypoints instead
+of restoring grouped ECStore passthrough exports.
 
 ECStore ClusterControlPlane read models must stay owned by the crate-private
 `cluster` module. Public access goes through `rustfs_ecstore::api::cluster` so
