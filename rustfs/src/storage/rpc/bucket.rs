@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use super::*;
-use rustfs_ecstore::api::rpc::PeerS3Client as _;
 
 impl NodeService {
     pub(super) async fn handle_delete_bucket_metadata(

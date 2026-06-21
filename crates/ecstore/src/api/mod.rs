@@ -77,12 +77,14 @@ pub mod disk {
     pub use crate::disk::endpoint::Endpoint;
     pub use crate::disk::error::DiskError;
     pub use crate::disk::error_reduce::is_all_buckets_not_found;
+    pub use crate::disk::local::ScanGuard;
     pub use crate::disk::{
-        BUCKET_META_PREFIX, DeleteOptions, Disk, DiskAPI, DiskInfoOptions, DiskOption, DiskStore, FileInfoVersions,
-        RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, STORAGE_FORMAT_FILE, UpdateMetadataOpts, VolumeInfo,
-        WalkDirOptions, new_disk,
+        BUCKET_META_PREFIX, CheckPartsResp, DeleteOptions, Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption,
+        DiskStore, FileInfoVersions, FileReader, FileWriter, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions,
+        RenameDataResp, STORAGE_FORMAT_FILE, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, new_disk,
     };
     pub use crate::disk::{endpoint, error, error_reduce};
+    pub use bytes::Bytes;
 }
 
 pub mod error {

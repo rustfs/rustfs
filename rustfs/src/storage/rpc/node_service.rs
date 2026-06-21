@@ -19,16 +19,15 @@ use crate::admin::service::{
 use crate::storage::storage_compat::{
     CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, FileInfoVersions, LocalPeerS3Client, MetricType,
     PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG,
-    SERVICE_SIGNAL_RELOAD_DYNAMIC, UpdateMetadataOpts, all_local_disk_path, collect_local_metrics, find_local_disk_by_ref,
-    get_global_lock_client, get_local_server_property, load_bucket_metadata, reload_transition_tier_config,
-    resolve_object_store_handle, set_bucket_metadata,
+    SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StoragePeerS3ClientExt as _, UpdateMetadataOpts, all_local_disk_path,
+    collect_local_metrics, find_local_disk_by_ref, get_global_lock_client, get_local_server_property, load_bucket_metadata,
+    reload_transition_tier_config, resolve_object_store_handle, set_bucket_metadata,
 };
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
 use rmp_serde::Deserializer;
 use rustfs_common::{get_global_local_node_name, heal_channel::HealOpts};
-use rustfs_ecstore::api::disk::DiskAPI as _;
 use rustfs_filemeta::{FileInfo, MetacacheReader};
 use rustfs_iam::{get_global_iam_sys, store::UserType};
 use rustfs_lock::{LockClient, LockRequest};

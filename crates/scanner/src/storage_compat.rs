@@ -19,6 +19,7 @@ use rustfs_ecstore::api::{
     set_disk as ecstore_set_disk, storage as ecstore_storage, tier as ecstore_tier,
 };
 use rustfs_storage_api::{HTTPRangeSpec, ObjectIO, ObjectToDelete};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -30,7 +31,9 @@ pub(crate) const TRANSITION_COMPLETE: &str = ecstore_bucket::lifecycle::lifecycl
 pub(crate) type Disk = ecstore_disk::Disk;
 #[cfg(test)]
 pub(crate) type DiskStore = ecstore_disk::DiskStore;
+pub(crate) type DiskLocation = ecstore_disk::DiskLocation;
 pub(crate) type DiskError = ecstore_disk::error::DiskError;
+pub(crate) type DiskResult<T> = ecstore_disk::error::Result<T>;
 pub(crate) type ECStore = ecstore_storage::ECStore;
 pub(crate) type EcstoreError = ecstore_error::Error;
 pub(crate) type EcstoreResult<T> = ecstore_error::Result<T>;
@@ -45,6 +48,7 @@ pub(crate) type ObjectOpts = ecstore_bucket::lifecycle::lifecycle::ObjectOpts;
 pub(crate) type ReplicationConfig = ecstore_bucket::replication::ReplicationConfig;
 pub(crate) type ReplicationHealQueueResult = ecstore_bucket::replication::ReplicationHealQueueResult;
 pub(crate) type ReplicationQueueAdmission = ecstore_bucket::replication::ReplicationQueueAdmission;
+pub(crate) type ScanGuard = ecstore_disk::ScanGuard;
 pub(crate) type SetDisks = ecstore_set_disk::SetDisks;
 pub(crate) type StorageError = ecstore_error::StorageError;
 
@@ -130,6 +134,39 @@ impl ScannerVersioningConfigExt for s3s::dto::VersioningConfiguration {
 
     fn versioned(&self, prefix: &str) -> bool {
         <s3s::dto::VersioningConfiguration as ecstore_bucket::versioning::VersioningApi>::versioned(self, prefix)
+    }
+}
+
+pub(crate) trait ScannerDiskExt {
+    async fn disk_info(&self, opts: &DiskInfoOptions) -> DiskResult<ecstore_disk::DiskInfo>;
+    async fn read_metadata(&self, volume: &str, path: &str) -> DiskResult<ecstore_disk::Bytes>;
+    fn path(&self) -> PathBuf;
+    fn get_disk_location(&self) -> DiskLocation;
+    fn start_scan(&self) -> ScanGuard;
+}
+
+impl<T> ScannerDiskExt for T
+where
+    T: ecstore_disk::DiskAPI,
+{
+    async fn disk_info(&self, opts: &DiskInfoOptions) -> DiskResult<ecstore_disk::DiskInfo> {
+        ecstore_disk::DiskAPI::disk_info(self, opts).await
+    }
+
+    async fn read_metadata(&self, volume: &str, path: &str) -> DiskResult<ecstore_disk::Bytes> {
+        ecstore_disk::DiskAPI::read_metadata(self, volume, path).await
+    }
+
+    fn path(&self) -> PathBuf {
+        ecstore_disk::DiskAPI::path(self)
+    }
+
+    fn get_disk_location(&self) -> DiskLocation {
+        ecstore_disk::DiskAPI::get_disk_location(self)
+    }
+
+    fn start_scan(&self) -> ScanGuard {
+        ecstore_disk::DiskAPI::start_scan(self)
     }
 }
 
