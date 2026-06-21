@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-admin-app-compat-aliases`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082`.
-- Stacked on: API-082 storage compatibility alias pruning.
+- Branch: `overtrue/arch-edge-compat-alias-prune`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083`.
+- Stacked on: API-083 admin/app compatibility alias pruning.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: prune admin/app bucket-facing compatibility passthroughs
-  into explicit local compatibility modules and aliases.
-- CI/script changes: guard against restoring broad admin/app bucket, client,
-  and storage-class compatibility passthroughs.
-- Docs changes: record the API-083 admin/app compatibility alias boundary.
+- Rust code changes: prune scanner, notify, observability, and e2e edge
+  compatibility passthroughs into explicit aliases, wrappers, and local DTOs.
+- CI/script changes: guard against restoring broad edge compatibility
+  passthroughs.
+- Docs changes: record the API-084 edge compatibility alias boundary.
 
 ## Phase 0 Tasks
 
@@ -187,6 +187,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: RustFS compile coverage, admin/app compatibility residual
     scans, formatting, diff hygiene, risk scan, architecture guard, pre-commit
     quality gate, and three-expert review.
+- [x] `API-084` Prune edge compatibility passthrough aliases.
+  - Completed slice: replace scanner grouped bucket compatibility exports,
+    notify broad config/global imports, observability data-usage passthroughs,
+    and e2e grouped RPC passthroughs with explicit edge-local aliases,
+    wrappers, and DTO projections.
+  - Acceptance: scanner bucket contracts stay explicitly named, notify config
+    persistence routes through local wrappers, observability metrics consume a
+    local data-usage DTO, and e2e RPC helper access stays narrow.
+  - Must preserve: scanner lifecycle and replication behavior, notification
+    server-config update semantics, observability cluster/bucket usage metrics,
+    and e2e RPC client/interceptor call sites.
+  - Verification: focused edge crate compile coverage, edge compatibility
+    residual scans, formatting, diff hygiene, risk scan, architecture guard,
+    pre-commit quality gate, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3220,13 +3234,23 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-083 narrows admin/app bucket-facing compatibility passthroughs into explicit local aliases without adding new ECStore ownership cycles. |
-| Migration preservation | passed | Admin replication, site-replication metadata, bucket targets, quota, tier stats, app bucket/object/multipart/lifecycle, ETag conversion, and storage-class behavior remain preserved. |
-| Testing/verification | passed | RustFS compile coverage, admin/app compatibility residual scans, migration guard, formatting, diff hygiene, added-line risk scan, full pre-commit, and three-expert review passed. |
+| Quality/architecture | passed | API-084 narrows scanner/notify/obs/e2e edge compatibility passthroughs without adding ECStore ownership cycles or new runtime dependencies. |
+| Migration preservation | passed | Scanner lifecycle/replication helpers, notify config persistence, obs usage metrics, and e2e RPC helper behavior remain preserved behind local aliases/wrappers. |
+| Testing/verification | passed | Focused edge compile coverage, compatibility residual scans, migration guard, formatting, diff hygiene, added-line risk scan, full pre-commit, and three-expert review passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-084 current slice:
+  - `cargo check --tests -p rustfs-scanner -p rustfs-notify -p rustfs-obs -p e2e_test`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Scanner/notify/obs/e2e broad compatibility residual scans: passed.
+  - Rust added-line risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-083 current slice:
   - `cargo check -p rustfs --lib`: passed.
