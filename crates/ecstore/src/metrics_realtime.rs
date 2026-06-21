@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{admin_server_info::get_local_server_property, resolve_object_store_handle};
+use crate::admin_server_info::get_local_server_property;
+use crate::global::resolve_object_store_handle;
 use chrono::Utc;
 use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, heal_channel::DriveState, metrics::global_metrics};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;

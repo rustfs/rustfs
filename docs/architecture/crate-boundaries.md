@@ -140,6 +140,8 @@ boundary is established; outer crates should use `rustfs_ecstore::api::*`
 instead of legacy root module paths. This includes storage/layout surfaces as
 well as remaining bitrot, erasure coding, object DTO/reader, event, list, and
 batch processor root modules once their facade groups exist.
+ECStore root `global` re-exports must also stay removed once consumers use
+`rustfs_ecstore::api::global` or crate-internal `crate::global` paths.
 
 RustFS startup internals must stay crate-private after the startup owner split.
 Only `startup_entrypoint` remains a public startup module for the binary

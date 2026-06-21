@@ -483,6 +483,21 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     coverage, formatting, diff hygiene, Rust risk scan, branch freshness check,
     pre-commit quality gate, and three-expert review.
 
+- [x] `API-078` Prune ECStore root global re-exports.
+  - Completed slice: remove the remaining `pub use global::*` compatibility
+    exports from the ECStore crate root and route internal ECStore users to
+    `crate::global` directly.
+  - Acceptance: outer access to ECStore global helpers remains available only
+    through `rustfs_ecstore::api::global`, internal ECStore modules use the
+    real owner path, and the migration guard rejects restoring root global
+    re-exports.
+  - Must preserve: object-store resolver behavior, endpoint/global lock client
+    publication, erasure-type updates, tier/notification/data-usage metadata
+    loading, and existing `api::global` facade names.
+  - Verification: migration guard, ECStore and RustFS compile coverage,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.
   - Acceptance: `./scripts/check_architecture_migration_rules.sh` parses the
     allowed PR types from [`crate-boundaries.md`](crate-boundaries.md) and fails
@@ -3011,13 +3026,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | R-069 narrows startup owner item visibility and API-077 removes remaining facade-covered ECStore root modules without runtime logic changes. |
-| Migration preservation | passed | `startup_entrypoint` remains the only public startup module; ECStore bitrot, erasure, object, event, list, and batch surfaces now route through `rustfs_ecstore::api`. |
-| Testing/verification | passed | ECStore all-target compile, migration/layer/unsafe guards, formatting, diff hygiene, added-line risk scan, and pre-commit gate passed. |
+| Quality/architecture | passed | API-078 removes remaining ECStore global root re-exports without runtime logic changes. |
+| Migration preservation | passed | Outer access remains through `rustfs_ecstore::api::global`; internal ECStore users route directly to `crate::global`. |
+| Testing/verification | passed | ECStore all-target and RustFS lib/bin compile coverage, migration guards, formatting, diff hygiene, added-line risk scan, and pre-commit gate passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-078 current slice:
+  - `cargo check -p rustfs-ecstore --all-targets`: passed.
+  - `cargo check -p rustfs --lib --bins`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Rust added-line risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 R-069 current slice:
   - `cargo check -p rustfs --lib`: passed.

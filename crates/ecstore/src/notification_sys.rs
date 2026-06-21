@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use crate::admin_server_info::get_commit_id;
+use crate::endpoints::EndpointServerPools;
 use crate::error::{Error, Result};
-use crate::global::{GLOBAL_BOOT_TIME, get_global_endpoints};
+use crate::global::{GLOBAL_BOOT_TIME, get_global_endpoints, resolve_object_store_handle};
 use crate::metrics_realtime::{CollectMetricsOpts, MetricType};
 use crate::rebalance::RebalSaveOpt;
 use crate::rpc::PeerRestClient;
-use crate::{endpoints::EndpointServerPools, resolve_object_store_handle};
 use futures::future::join_all;
 use lazy_static::lazy_static;
 use rustfs_madmin::health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConfig, SysErrors, SysServices};
