@@ -16,16 +16,16 @@
 
 use crate::app::context::{AppContext, get_global_app_context, resolve_object_store_handle_for_context};
 use crate::app::object_usecase::{build_put_like_object_lock_metadata, validate_existing_object_lock_for_write};
-use crate::app::storage_compat::ECStore;
-use crate::app::storage_compat::is_disk_compressible;
-use crate::app::storage_compat::is_valid_storage_class;
-use crate::app::storage_compat::object_api_utils::to_s3s_etag;
-use crate::app::storage_compat::quota::checker::QuotaChecker;
+use crate::app::usecase_storage_compat::ECStore;
+use crate::app::usecase_storage_compat::is_disk_compressible;
+use crate::app::usecase_storage_compat::is_valid_storage_class;
+use crate::app::usecase_storage_compat::object_api_utils::to_s3s_etag;
+use crate::app::usecase_storage_compat::quota::checker::QuotaChecker;
 #[cfg(test)]
-use crate::app::storage_compat::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
-use crate::app::storage_compat::{HashReader, WritePlan};
-use crate::app::storage_compat::{StorageError, is_err_object_not_found, is_err_version_not_found};
-use crate::app::storage_compat::{
+use crate::app::usecase_storage_compat::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
+use crate::app::usecase_storage_compat::{HashReader, WritePlan};
+use crate::app::usecase_storage_compat::{StorageError, is_err_object_not_found, is_err_version_not_found};
+use crate::app::usecase_storage_compat::{
     lifecycle::{bucket_lifecycle_audit::LcEventSrc, bucket_lifecycle_ops::enqueue_transition_immediate},
     metadata_sys,
     quota::QuotaOperation,
@@ -482,7 +482,7 @@ impl DefaultMultipartUsecase {
                         ));
                     }
                     // Update quota tracking after successful multipart upload
-                    crate::app::storage_compat::record_bucket_object_write_memory(
+                    crate::app::usecase_storage_compat::record_bucket_object_write_memory(
                         &bucket,
                         previous_current_size,
                         obj_info.size.max(0) as u64,
@@ -675,7 +675,7 @@ impl DefaultMultipartUsecase {
             rustfs_utils::http::insert_str(
                 &mut metadata,
                 rustfs_utils::http::SUFFIX_COMPRESSION,
-                crate::app::storage_compat::compression_metadata_value(CompressionAlgorithm::default()),
+                crate::app::usecase_storage_compat::compression_metadata_value(CompressionAlgorithm::default()),
             );
         }
 
@@ -894,9 +894,12 @@ impl DefaultMultipartUsecase {
             .ok_or_else(|| ApiError::from(StorageError::other("Missing SSE-C session material")))?;
             let ssec_write = match ssec_material.key_kind {
                 crate::storage::sse::EncryptionKeyKind::Object => {
-                    crate::app::storage_compat::WriteEncryption::multipart_object_key(ssec_material.key_bytes, part_id as u32)
+                    crate::app::usecase_storage_compat::WriteEncryption::multipart_object_key(
+                        ssec_material.key_bytes,
+                        part_id as u32,
+                    )
                 }
-                crate::storage::sse::EncryptionKeyKind::Direct => crate::app::storage_compat::WriteEncryption::multipart(
+                crate::storage::sse::EncryptionKeyKind::Direct => crate::app::usecase_storage_compat::WriteEncryption::multipart(
                     ssec_material.key_bytes,
                     ssec_material.base_nonce,
                     part_id,
@@ -916,9 +919,12 @@ impl DefaultMultipartUsecase {
             .ok_or_else(|| ApiError::from(StorageError::other("Missing managed SSE session material")))?;
             let managed_write = match managed_material.key_kind {
                 crate::storage::sse::EncryptionKeyKind::Object => {
-                    crate::app::storage_compat::WriteEncryption::multipart_object_key(managed_material.key_bytes, part_id as u32)
+                    crate::app::usecase_storage_compat::WriteEncryption::multipart_object_key(
+                        managed_material.key_bytes,
+                        part_id as u32,
+                    )
                 }
-                crate::storage::sse::EncryptionKeyKind::Direct => crate::app::storage_compat::WriteEncryption::multipart(
+                crate::storage::sse::EncryptionKeyKind::Direct => crate::app::usecase_storage_compat::WriteEncryption::multipart(
                     managed_material.key_bytes,
                     managed_material.base_nonce,
                     part_id,
@@ -1237,9 +1243,12 @@ impl DefaultMultipartUsecase {
             .ok_or_else(|| ApiError::from(StorageError::other("Missing SSE-C session material")))?;
             let ssec_write = match ssec_material.key_kind {
                 crate::storage::sse::EncryptionKeyKind::Object => {
-                    crate::app::storage_compat::WriteEncryption::multipart_object_key(ssec_material.key_bytes, part_id as u32)
+                    crate::app::usecase_storage_compat::WriteEncryption::multipart_object_key(
+                        ssec_material.key_bytes,
+                        part_id as u32,
+                    )
                 }
-                crate::storage::sse::EncryptionKeyKind::Direct => crate::app::storage_compat::WriteEncryption::multipart(
+                crate::storage::sse::EncryptionKeyKind::Direct => crate::app::usecase_storage_compat::WriteEncryption::multipart(
                     ssec_material.key_bytes,
                     ssec_material.base_nonce,
                     part_id,
@@ -1263,9 +1272,12 @@ impl DefaultMultipartUsecase {
             .ok_or_else(|| ApiError::from(StorageError::other("Missing managed SSE session material")))?;
             let managed_write = match managed_material.key_kind {
                 crate::storage::sse::EncryptionKeyKind::Object => {
-                    crate::app::storage_compat::WriteEncryption::multipart_object_key(managed_material.key_bytes, part_id as u32)
+                    crate::app::usecase_storage_compat::WriteEncryption::multipart_object_key(
+                        managed_material.key_bytes,
+                        part_id as u32,
+                    )
                 }
-                crate::storage::sse::EncryptionKeyKind::Direct => crate::app::storage_compat::WriteEncryption::multipart(
+                crate::storage::sse::EncryptionKeyKind::Direct => crate::app::usecase_storage_compat::WriteEncryption::multipart(
                     managed_material.key_bytes,
                     managed_material.base_nonce,
                     part_id,

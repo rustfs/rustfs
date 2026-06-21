@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::handlers::storage_compat::PeerRestClient;
 use crate::admin::router::Operation;
-use crate::admin::storage_compat::PeerRestClient;
 use crate::app::context::resolve_endpoints_handle;
 use http::StatusCode;
 use hyper::Uri;

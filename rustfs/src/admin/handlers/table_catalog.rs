@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::storage_compat::{ECStore, metadata::table_catalog_path_hash, metadata_sys};
+use crate::admin::handlers::storage_compat::{ECStore, metadata::table_catalog_path_hash, metadata_sys};
 use crate::admin::{
     auth::{AdminResourceScope, validate_admin_request, validate_admin_request_with_bucket_object},
     router::{AdminOperation, Operation, S3Router},

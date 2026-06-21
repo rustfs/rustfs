@@ -21,6 +21,7 @@ mod global;
 mod handles;
 mod interfaces;
 mod startup;
+pub(crate) mod storage_compat;
 
 pub use compat::*;
 pub use global::*;

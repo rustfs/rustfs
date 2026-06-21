@@ -15,10 +15,10 @@
 //! Quota admin handlers for HTTP API
 
 use crate::admin::auth::{validate_admin_request, validate_admin_request_with_bucket};
+use crate::admin::handlers::storage_compat::metadata_sys::BucketMetadataSys;
+use crate::admin::handlers::storage_compat::quota::checker::QuotaChecker;
+use crate::admin::handlers::storage_compat::quota::{BucketQuota, QuotaError, QuotaOperation};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::storage_compat::metadata_sys::BucketMetadataSys;
-use crate::admin::storage_compat::quota::checker::QuotaChecker;
-use crate::admin::storage_compat::quota::{BucketQuota, QuotaError, QuotaOperation};
 use crate::app::context::{resolve_bucket_metadata_handle, resolve_object_store_handle};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::ADMIN_PREFIX;
@@ -175,7 +175,7 @@ async fn current_usage_from_context(bucket: &str) -> u64 {
         return 0;
     };
 
-    match crate::admin::storage_compat::load_data_usage_from_backend(store).await {
+    match crate::admin::handlers::storage_compat::load_data_usage_from_backend(store).await {
         Ok(data_usage_info) => data_usage_info
             .buckets_usage
             .get(bucket)
