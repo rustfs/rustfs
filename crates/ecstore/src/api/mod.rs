@@ -144,8 +144,8 @@ pub mod rebalance {
 
 pub mod rio {
     pub use crate::rio::{
-        DecryptReader, DynReader, EncryptReader, HardLimitReader, HashReader, WriteEncryption, WritePlan, boxed_reader,
-        compression_metadata_value, wrap_reader,
+        DecryptReader, DynReader, EncryptReader, HardLimitReader, HashReader, ReadStream, Reader, WriteEncryption, WritePlan,
+        boxed_reader, compression_metadata_value, wrap_reader,
     };
 }
 

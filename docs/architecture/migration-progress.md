@@ -246,6 +246,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: RustFS compile coverage, storage-owner re-export residual
     scan, migration guard, formatting, diff hygiene, Rust risk scan,
     pre-commit quality gate, and three-expert review.
+- [x] `API-088` Prune admin and app compatibility re-exports.
+  - Completed slice: replace RustFS admin and app `storage_compat.rs` ECStore
+    API re-exports with local constants, type aliases, proxy statics, and
+    wrapper functions; keep only temporary trait imports required for method
+    resolution.
+  - Acceptance: admin handlers and app object/runtime paths keep their existing
+    compatibility names while the admin and app boundaries no longer expose
+    direct ECStore API symbol re-exports for functions, constants, globals, or
+    DTO aliases.
+  - Must preserve: admin config reads/writes, bucket metadata access, lifecycle
+    enqueue/restore behavior, replication admission and scheduling, object-lock
+    checks, RIO reader wrapping, data usage accounting, global object-store
+    access, and local disk initialization behavior.
+  - Verification: RustFS compile coverage, admin/app re-export residual scan,
+    migration guard, formatting, diff hygiene, Rust risk scan, pre-commit
+    quality gate, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records

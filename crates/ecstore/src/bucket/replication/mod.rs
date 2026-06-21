@@ -23,5 +23,5 @@ pub use config::*;
 pub use datatypes::*;
 pub use replication_pool::*;
 pub use replication_resyncer::*;
-pub use replication_state::BucketStats;
+pub use replication_state::{BucketStats, ReplicationStats};
 pub use rule::*;
