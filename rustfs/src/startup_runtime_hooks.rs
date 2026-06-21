@@ -27,7 +27,7 @@ const EVENT_CRYPTO_PROVIDER_STATE: &str = "crypto_provider_state";
 const EVENT_DIAL9_RUNTIME_STATUS: &str = "dial9_runtime_status";
 const EVENT_RUNTIME_LICENSE_STATUS: &str = "runtime_license_status";
 
-pub fn log_startup_runtime_diagnostics() {
+pub(crate) fn log_startup_runtime_diagnostics() {
     log_dial9_runtime_status();
     log_runtime_license_status();
     debug!("{}", crate::server::LOGO);
@@ -66,7 +66,7 @@ fn log_runtime_license_status() {
     );
 }
 
-pub async fn init_profiling_runtime() {
+pub(crate) async fn init_profiling_runtime() {
     init_profiling_runtime_with(crate::profiling::init_from_env).await;
 }
 
@@ -78,7 +78,7 @@ where
     init().await;
 }
 
-pub fn shutdown_profiling_runtime() {
+pub(crate) fn shutdown_profiling_runtime() {
     shutdown_profiling_runtime_with(crate::profiling::shutdown_profiling);
 }
 
@@ -89,7 +89,7 @@ where
     shutdown();
 }
 
-pub fn install_default_crypto_provider() {
+pub(crate) fn install_default_crypto_provider() {
     if default_provider().install_default().is_err() {
         debug!(
             target: "rustfs::main",
@@ -103,7 +103,7 @@ pub fn install_default_crypto_provider() {
     }
 }
 
-pub async fn init_embedded_runtime_hooks(obs_endpoint: String) -> Result<()> {
+pub(crate) async fn init_embedded_runtime_hooks(obs_endpoint: String) -> Result<()> {
     let guard = rustfs_obs::init_obs(Some(obs_endpoint))
         .await
         .map_err(|err| Error::other(format!("init_obs: {err}")))?;

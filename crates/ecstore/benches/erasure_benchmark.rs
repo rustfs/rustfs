@@ -44,7 +44,7 @@
 //! - SIMD optimization for different shard sizes
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use rustfs_ecstore::erasure_coding::{BitrotReader, BitrotWriter, Erasure, calc_shard_size};
+use rustfs_ecstore::api::erasure::{BitrotReader, BitrotWriter, Erasure, calc_shard_size};
 use rustfs_utils::HashAlgorithm;
 use std::hint::black_box;
 use std::io::Cursor;

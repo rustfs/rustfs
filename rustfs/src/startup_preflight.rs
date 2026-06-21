@@ -29,7 +29,7 @@ const EVENT_OBSERVABILITY_GUARD_SET: &str = "observability_guard_set";
 const EVENT_OBSERVABILITY_GUARD_SET_FAILED: &str = "observability_guard_set_failed";
 
 #[derive(Debug)]
-pub enum StartupServerPreflightError {
+pub(crate) enum StartupServerPreflightError {
     ObservabilityInit(Error),
     Other(Error),
 }
@@ -54,12 +54,12 @@ impl std::error::Error for StartupServerPreflightError {
     }
 }
 
-pub fn bootstrap_external_prefix_compat() -> Result<ExternalEnvCompatReport> {
+pub(crate) fn bootstrap_external_prefix_compat() -> Result<ExternalEnvCompatReport> {
     let env_compat_report = apply_external_env_compat();
     Ok(env_compat_report)
 }
 
-pub async fn init_startup_server_preflight(
+pub(crate) async fn init_startup_server_preflight(
     config: &Config,
     env_compat_report: &ExternalEnvCompatReport,
 ) -> std::result::Result<(), StartupServerPreflightError> {

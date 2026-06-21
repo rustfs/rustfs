@@ -39,12 +39,12 @@ const EVENT_STORAGE_POOL_HOST_RISK: &str = "storage_pool_host_risk";
 const EVENT_EMBEDDED_STORAGE_INIT_FAILED: &str = "embedded_storage_init_failed";
 const EVENT_EMBEDDED_STORAGE_INIT_RETRY: &str = "embedded_storage_init_retry";
 
-pub struct StartupStorageRuntime {
-    pub store: Arc<ECStore>,
-    pub shutdown_token: CancellationToken,
+pub(crate) struct StartupStorageRuntime {
+    pub(crate) store: Arc<ECStore>,
+    pub(crate) shutdown_token: CancellationToken,
 }
 
-pub async fn init_startup_storage_foundation(server_address: &str, volumes: &[String]) -> Result<EndpointServerPools> {
+pub(crate) async fn init_startup_storage_foundation(server_address: &str, volumes: &[String]) -> Result<EndpointServerPools> {
     info!(
         target: "rustfs::main::run",
         event = EVENT_ENDPOINT_PARSING_STARTED,
@@ -106,7 +106,10 @@ pub async fn init_startup_storage_foundation(server_address: &str, volumes: &[St
     Ok(endpoint_pools)
 }
 
-pub async fn init_embedded_startup_storage_foundation(server_address: &str, volumes: &[String]) -> Result<EndpointServerPools> {
+pub(crate) async fn init_embedded_startup_storage_foundation(
+    server_address: &str,
+    volumes: &[String],
+) -> Result<EndpointServerPools> {
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address, volumes.to_vec())
         .await
         .map_err(|err| Error::other(format!("endpoints: {err}")))?;
@@ -123,7 +126,7 @@ pub async fn init_embedded_startup_storage_foundation(server_address: &str, volu
     Ok(endpoint_pools)
 }
 
-pub async fn init_startup_storage_runtime(
+pub(crate) async fn init_startup_storage_runtime(
     server_addr: SocketAddr,
     endpoint_pools: &EndpointServerPools,
     readiness: Arc<GlobalReadiness>,
@@ -164,7 +167,7 @@ pub async fn init_startup_storage_runtime(
     })
 }
 
-pub async fn init_embedded_startup_storage_runtime(
+pub(crate) async fn init_embedded_startup_storage_runtime(
     server_addr: SocketAddr,
     endpoint_pools: &EndpointServerPools,
     readiness: Arc<GlobalReadiness>,

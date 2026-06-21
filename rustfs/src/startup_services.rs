@@ -32,17 +32,17 @@ use rustfs_common::GlobalReadiness;
 use std::{io::Result, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
-pub struct StartupServiceRuntime {
-    pub optional_runtimes: OptionalRuntimeServices,
-    pub iam_bootstrap: IamBootstrapDisposition,
-    pub enable_scanner: bool,
+pub(crate) struct StartupServiceRuntime {
+    pub(crate) optional_runtimes: OptionalRuntimeServices,
+    pub(crate) iam_bootstrap: IamBootstrapDisposition,
+    pub(crate) enable_scanner: bool,
 }
 
-pub struct EmbeddedStartupServiceRuntime {
-    pub iam_bootstrap: IamBootstrapDisposition,
+pub(crate) struct EmbeddedStartupServiceRuntime {
+    pub(crate) iam_bootstrap: IamBootstrapDisposition,
 }
 
-pub async fn init_embedded_startup_runtime_services(
+pub(crate) async fn init_embedded_startup_runtime_services(
     config: &Config,
     endpoint_pools: EndpointServerPools,
     store: Arc<ECStore>,
@@ -59,7 +59,7 @@ pub async fn init_embedded_startup_runtime_services(
     Ok(EmbeddedStartupServiceRuntime { iam_bootstrap })
 }
 
-pub async fn init_startup_runtime_services(
+pub(crate) async fn init_startup_runtime_services(
     config: &Config,
     endpoint_pools: EndpointServerPools,
     store: Arc<ECStore>,
