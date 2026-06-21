@@ -250,7 +250,8 @@ Depth 8 — TOP:
 
 - **Three-layer BackpressureConfig/DeadlockConfig duplication** across io-core,
   concurrency, and rustfs/storage. Storage policies now expose and consume
-  explicit projections into the concurrency/io-core policy shapes; later work
+  explicit projections into the concurrency/io-core policy shapes, and workload
+  admission snapshots are composed through provider registries; later work
   should use those bridges before deleting compatibility wrappers.
 
 ### Medium
