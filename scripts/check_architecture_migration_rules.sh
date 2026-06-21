@@ -88,6 +88,7 @@ RUSTFS_ADMIN_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_admin_buc
 RUSTFS_APP_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_app_bucket_storage_compat_module_hits.txt"
 RUSTFS_OUTER_COMPAT_FACADE_ALIAS_HITS_FILE="${TMP_DIR}/rustfs_outer_compat_facade_alias_hits.txt"
 RUSTFS_OUTER_COMPAT_SIGNATURE_ALIAS_HITS_FILE="${TMP_DIR}/rustfs_outer_compat_signature_alias_hits.txt"
+RUSTFS_STORAGE_COMPAT_RAW_FACADE_PATH_HITS_FILE="${TMP_DIR}/rustfs_storage_compat_raw_facade_path_hits.txt"
 SCANNER_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/scanner_bucket_storage_compat_module_hits.txt"
 NOTIFY_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/notify_storage_compat_module_hits.txt"
 OBS_STORAGE_COMPAT_PASSTHROUGH_HITS_FILE="${TMP_DIR}/obs_storage_compat_passthrough_hits.txt"
@@ -903,6 +904,16 @@ fi
 
 if [[ -s "$RUSTFS_OUTER_COMPAT_SIGNATURE_ALIAS_HITS_FILE" ]]; then
   report_failure "RustFS outer storage compatibility signatures must use local aliases for metadata, object-lock, lifecycle, monitor, and notification facade types: $(paste -sd '; ' "$RUSTFS_OUTER_COMPAT_SIGNATURE_ALIAS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'rustfs_ecstore::api::' rustfs/src/storage/storage_compat.rs \
+    | rg -v '^[0-9]+:use rustfs_ecstore::api::\{|^[0-9]+:use rustfs_ecstore::api::config as ecstore_config;' || true
+) >"$RUSTFS_STORAGE_COMPAT_RAW_FACADE_PATH_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_COMPAT_RAW_FACADE_PATH_HITS_FILE" ]]; then
+  report_failure "RustFS storage owner compatibility must use local ecstore_* module aliases instead of scattered raw ECStore facade paths: $(paste -sd '; ' "$RUSTFS_STORAGE_COMPAT_RAW_FACADE_PATH_HITS_FILE")"
 fi
 
 (

@@ -5,17 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-outer-compat-common-facade-prune`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090`.
-- Stacked on: `origin/main` after API-090 merged.
+- Branch: `overtrue/arch-outer-compat-call-facade-prune`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091`.
+- Stacked on: `origin/main` after API-091 merged.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: prune raw ECStore metadata/object-lock/lifecycle/monitor/
-  notification facade paths from outer app/admin/storage compatibility
-  signatures.
-- CI/script changes: guard app/admin/storage compatibility signatures against
-  restoring raw ECStore facade paths for those narrowed types.
-- Docs changes: record the API-091 outer compatibility signature alias cleanup.
+- Rust code changes: centralize RustFS storage-owner raw ECStore facade paths
+  behind local `ecstore_*` module aliases.
+- CI/script changes: guard the RustFS storage-owner compatibility boundary
+  against restoring scattered raw ECStore facade paths.
+- Docs changes: record the API-092 storage-owner facade path cleanup.
 
 ## Phase 0 Tasks
 
@@ -307,6 +306,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: RustFS compile coverage, signature residual scan, migration
     guard, formatting, diff hygiene, Rust risk scan, pre-commit quality gate,
     and three-expert review.
+- [x] `API-092` Prune storage-owner raw facade paths.
+  - Completed slice: replace scattered raw `rustfs_ecstore::api::...` paths in
+    the RustFS storage-owner compatibility boundary with local `ecstore_*`
+    module aliases.
+  - Acceptance: `rustfs/src/storage/storage_compat.rs` no longer contains raw
+    `rustfs_ecstore::api::...` facade paths outside the centralized module alias
+    import.
+  - Must preserve: storage metadata, object-lock, replication stats, tagging,
+    RPC signature, metrics, tier reload, local disk lookup, and object I/O
+    associated type compatibility.
+  - Verification: RustFS compile coverage, storage-owner raw facade path
+    residual scan, migration guard, formatting, diff hygiene, Rust risk scan,
+    pre-commit quality gate, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3340,13 +3352,23 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-091 replaces raw ECStore facade paths in outer app/admin/storage compatibility signatures with local aliases. |
-| Migration preservation | passed | Metadata-system, object-lock, lifecycle journal, bandwidth monitor, and notification-system access keep the same ECStore contracts through narrower local names. |
-| Testing/verification | passed | RustFS compile coverage, signature residual scan, migration guard, formatting, diff hygiene, Rust risk scan, full pre-commit, and three-expert review passed. |
+| Quality/architecture | passed | API-092 centralizes RustFS storage-owner ECStore facade paths behind local `ecstore_*` module aliases. |
+| Migration preservation | passed | Storage metadata, object-lock, replication stats, tagging, RPC signature, metrics, tier reload, local disk lookup, and object I/O associated type compatibility keep the same ECStore contracts. |
+| Testing/verification | passed | RustFS compile coverage, storage-owner raw facade path residual scan, migration guard, formatting, diff hygiene, Rust risk scan, full pre-commit, and three-expert review passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-092 current slice:
+  - `cargo check -p rustfs`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - RustFS storage-owner raw facade path residual scan: passed.
+  - Rust added-line risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-091 current slice:
   - `cargo check -p rustfs`: passed.

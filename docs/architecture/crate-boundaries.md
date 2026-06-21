@@ -184,6 +184,9 @@ Outer compatibility function signatures must also use local aliases for ECStore
 metadata, object-lock, lifecycle journal, monitor, and notification facade
 types. The boundary may define the local alias, but call signatures must not
 expose the raw ECStore facade path once narrowed.
+The RustFS storage owner compatibility boundary must keep raw ECStore facade
+paths centralized behind local `ecstore_*` module aliases rather than scattering
+`rustfs_ecstore::api::...` references through its aliases and wrappers.
 Scanner, notify, observability, and e2e `storage_compat.rs` boundaries must
 also stay narrow. Scanner must not restore grouped bucket compatibility exports
 for target, lifecycle, metadata, replication, or versioning modules. Notify
