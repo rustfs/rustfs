@@ -229,9 +229,10 @@ impl BackpressurePipe {
 
     /// Create a new backpressure-aware pipe with custom configuration.
     pub fn with_config(config: ObjectPipeBackpressurePolicy) -> Self {
-        let (reader, writer) = duplex(config.buffer_size);
-        let high_watermark_bytes = config.high_watermark_bytes();
-        let low_watermark_bytes = config.low_watermark_bytes();
+        let policy = config.to_concurrency_policy();
+        let (reader, writer) = duplex(policy.buffer_size);
+        let high_watermark_bytes = policy.high_watermark_bytes();
+        let low_watermark_bytes = policy.low_watermark_bytes();
 
         debug!(
             buffer_size = config.buffer_size,
@@ -396,8 +397,9 @@ impl BackpressureMonitor {
 
     /// Create a new monitor with custom configuration.
     pub fn with_config(config: ObjectPipeBackpressurePolicy) -> Self {
-        let high_watermark_bytes = config.high_watermark_bytes();
-        let low_watermark_bytes = config.low_watermark_bytes();
+        let policy = config.to_concurrency_policy();
+        let high_watermark_bytes = policy.high_watermark_bytes();
+        let low_watermark_bytes = policy.low_watermark_bytes();
         Self {
             config,
             buffer_usage: AtomicUsize::new(0),
@@ -519,6 +521,36 @@ mod tests {
         assert_eq!(core.high_water_mark, 0.75);
         assert_eq!(core.low_water_mark, 0.40);
         assert!(core.enabled);
+    }
+
+    #[test]
+    fn test_backpressure_pipe_consumes_concurrency_policy_thresholds() {
+        let config = ObjectPipeBackpressurePolicy {
+            buffer_size: 2000,
+            high_watermark: 75,
+            low_watermark: 40,
+        };
+        let concurrency = config.to_concurrency_policy();
+        let pipe = BackpressurePipe::with_config(config);
+
+        assert_eq!(pipe.capacity(), concurrency.buffer_size);
+        assert_eq!(pipe.high_watermark_bytes, concurrency.high_watermark_bytes());
+        assert_eq!(pipe.low_watermark_bytes, concurrency.low_watermark_bytes());
+    }
+
+    #[test]
+    fn test_backpressure_monitor_consumes_concurrency_policy_thresholds() {
+        let config = ObjectPipeBackpressurePolicy {
+            buffer_size: 2000,
+            high_watermark: 75,
+            low_watermark: 40,
+        };
+        let concurrency = config.to_concurrency_policy();
+        let monitor = BackpressureMonitor::with_config(config);
+
+        assert_eq!(monitor.meta().buffer_capacity, concurrency.buffer_size);
+        assert_eq!(monitor.high_watermark_bytes, concurrency.high_watermark_bytes());
+        assert_eq!(monitor.low_watermark_bytes, concurrency.low_watermark_bytes());
     }
 
     #[test]

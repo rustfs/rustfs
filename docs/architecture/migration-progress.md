@@ -5,15 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-concurrency-policy-bridges`
-- Baseline: completed `C-004/C-005/C-006`.
-- Stacked on: ECStore cluster status snapshots.
+- Branch: `overtrue/arch-storage-concurrency-policy-consumers`
+- Baseline: completed `C-004/C-005/C-006/C-011`.
+- Stacked on: storage concurrency policy bridges.
 - PR type for this branch: `api-extraction`
 - Runtime behavior changes: none.
-- Rust code changes: add storage-to-concurrency policy bridge projections for
-  object backpressure and request hang/deadlock detection.
+- Rust code changes: route storage object backpressure and request hang/deadlock
+  runtime config consumption through the shared concurrency facade policies.
 - CI/script changes: none.
-- Docs changes: record the C-011 policy bridge precondition for later
+- Docs changes: record the C-012 policy consumer precondition for later
   controller status work.
 
 ## Phase 0 Tasks
@@ -82,6 +82,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: storage backpressure/deadlock policy tests, compile coverage,
     formatting, diff hygiene, risk scan, architecture guard, pre-commit quality
     gate, and three-expert review.
+- [x] `C-012-POLICY` Consume storage concurrency policy bridges.
+  - Completed slice: route object backpressure threshold derivation and request
+    hang/deadlock runtime policy reads through the shared `rustfs-concurrency`
+    facade policies.
+  - Acceptance: storage keeps env/default ownership and local state machines,
+    while threshold and hang-policy consumption is anchored on the shared
+    concurrency policy shapes.
+  - Must preserve: no worker start/stop, no object pipe state-machine change, no
+    deadlock detector lifecycle change, no metrics label change, and no S3 I/O
+    behavior change.
+  - Verification: storage backpressure/deadlock consumer tests, compile
+    coverage, formatting, diff hygiene, risk scan, architecture guard,
+    pre-commit quality gate, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3115,13 +3128,23 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | C-011 exposes storage backpressure and request-hang policies through existing `rustfs-concurrency` and `rustfs-io-core` policy shapes without adding ownership cycles. |
-| Migration preservation | passed | Bridge methods preserve storage env/default ownership, object pipe state, deadlock detector lifecycle, metrics labels, and S3 I/O behavior. |
-| Testing/verification | passed | Focused storage policy tests, RustFS lib compile coverage, migration guard, formatting, diff hygiene, added-line risk scan, full pre-commit, and three-expert review passed. |
+| Quality/architecture | passed | C-012 routes storage backpressure and request-hang runtime consumers through existing `rustfs-concurrency` policy shapes without adding ownership cycles. |
+| Migration preservation | passed | Consumer changes preserve storage env/default ownership, object pipe state, deadlock detector lifecycle, metrics labels, and S3 I/O behavior. |
+| Testing/verification | passed | Focused storage consumer tests, RustFS lib compile coverage, migration guard, formatting, diff hygiene, added-line risk scan, full pre-commit, and three-expert review passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 C-012 current slice:
+  - `cargo test -p rustfs --lib storage::backpressure::tests:: -- --nocapture`: passed.
+  - `cargo test -p rustfs --lib storage::deadlock_detector::tests:: -- --nocapture`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Rust added-line risk scan on changed storage Rust files: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 C-011 current slice:
   - `cargo test -p rustfs --lib storage::deadlock_detector::tests::test_request_hang_policy_projects_to_concurrency_and_core_config -- --nocapture`: passed.
