@@ -690,6 +690,7 @@ fi
     rustfs/src crates fuzz/fuzz_targets \
     --glob '!crates/ecstore/**' \
     --glob '!**/storage_compat.rs' \
+    --glob '!**/*storage_compat.rs' \
     --glob '!target/**' || true
 ) |
   cat >"$DIRECT_ECSTORE_IMPORT_HITS_FILE"
@@ -818,12 +819,12 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --no-heading 'pub\(crate\)\s+(?:async\s+)?fn\s+(?:all_local_disk|read_ecstore_config|save_ecstore_config|get_global_endpoints_opt|get_global_lock_clients|is_dist_erasure|resolve_object_store_handle|register_event_dispatch_hook|verify_rpc_signature)\b|pub\(crate\)\s+(?:const|type)\s+(?:TONIC_RPC_PREFIX|EcstoreEventArgs)\b|pub\(crate\)\s+trait\s+DiskAPI\b' \
+  rg -n --no-heading 'pub\(crate\)\s+(?:async\s+)?fn\s+(?:all_local_disk|read_ecstore_config|save_ecstore_config|get_global_endpoints_opt|get_global_lock_clients|is_dist_erasure|resolve_object_store_handle|register_event_dispatch_hook|verify_rpc_signature|get_notification_config|init_bucket_metadata_sys|try_migrate_bucket_metadata|try_migrate_iam_config|init_background_replication|init_ecstore_config|init_global_config_sys|try_migrate_server_config|get_global_region|set_global_endpoints|set_global_region|set_global_rustfs_port|shutdown_background_services|update_erasure_type|new_global_notification_sys|init_local_disks|init_lock_clients|prewarm_local_disk_id_map)\b|pub\(crate\)\s+(?:const|type)\s+(?:TONIC_RPC_PREFIX|EcstoreEventArgs|ECStore|EcstoreResult)\b|pub\(crate\)\s+trait\s+DiskAPI\b' \
     rustfs/src/storage_compat.rs || true
 ) >"$RUSTFS_ROOT_CONSUMER_COMPAT_HITS_FILE"
 
 if [[ -s "$RUSTFS_ROOT_CONSUMER_COMPAT_HITS_FILE" ]]; then
-  report_failure "RustFS root storage compatibility must not own capacity/server consumer wrappers: $(paste -sd '; ' "$RUSTFS_ROOT_CONSUMER_COMPAT_HITS_FILE")"
+  report_failure "RustFS root storage compatibility must not own capacity/server/startup consumer wrappers: $(paste -sd '; ' "$RUSTFS_ROOT_CONSUMER_COMPAT_HITS_FILE")"
 fi
 
 (

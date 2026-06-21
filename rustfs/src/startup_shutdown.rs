@@ -17,7 +17,7 @@ use crate::{
     startup_optional_runtime_sidecars::{
         OptionalRuntimeServices, prepare_optional_runtime_shutdowns, shutdown_optional_runtime_services,
     },
-    storage_compat::shutdown_background_services,
+    startup_storage_compat::shutdown_background_services,
 };
 use rustfs_heal::shutdown_ahm_services;
 use rustfs_utils::get_env_bool_with_aliases;

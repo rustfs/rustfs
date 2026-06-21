@@ -90,6 +90,7 @@ pub(crate) mod startup_server;
 pub(crate) mod startup_services;
 pub(crate) mod startup_shutdown;
 pub(crate) mod startup_storage;
+pub(crate) mod startup_storage_compat;
 pub(crate) mod startup_tls_material;
 pub mod storage;
 pub(crate) mod storage_compat;
