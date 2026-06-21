@@ -149,6 +149,10 @@ boundaries that still need module-local owner cleanup.
 Root runtime storage config initialization and disk endpoint contracts must also
 stay explicit aliases. The root compatibility boundary must not restore `com`,
 bare `init`, or grouped `endpoint::Endpoint` passthroughs.
+RustFS root `storage_compat.rs` must not re-export ECStore API symbols directly;
+remaining root runtime compatibility symbols must be local type aliases,
+constants, traits, or wrapper functions so ownership stays visible at the
+boundary.
 RustFS admin `storage_compat.rs` must expose config IO and default
 initialization through explicit aliases. The admin compatibility boundary must
 not restore broad `com` or bare `init` passthroughs.

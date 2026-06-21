@@ -78,6 +78,7 @@ TEST_HARNESS_NESTED_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/test_harness_nested_sto
 RUSTFS_NESTED_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/rustfs_nested_storage_compat_hits.txt"
 RUSTFS_RUNTIME_SCALAR_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/rustfs_runtime_scalar_storage_compat_hits.txt"
 RUSTFS_RUNTIME_SECONDARY_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/rustfs_runtime_secondary_storage_compat_hits.txt"
+RUSTFS_ROOT_STORAGE_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_root_storage_compat_reexport_hits.txt"
 RUSTFS_ROOT_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_root_bucket_storage_compat_module_hits.txt"
 RUSTFS_ROOT_RUNTIME_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_root_runtime_storage_compat_module_hits.txt"
 RUSTFS_ADMIN_CONFIG_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_admin_config_storage_compat_module_hits.txt"
@@ -774,6 +775,16 @@ fi
 
 if [[ -s "$RUSTFS_RUNTIME_SECONDARY_STORAGE_COMPAT_HITS_FILE" ]]; then
   report_failure "RustFS runtime secondary storage compatibility paths must use direct aliases instead of bucket/config/rio/client/tier/compress/disk/rebalance modules: $(paste -sd '; ' "$RUSTFS_RUNTIME_SECONDARY_STORAGE_COMPAT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub\(crate\)\s+use\s+rustfs_ecstore::api::' \
+    rustfs/src/storage_compat.rs || true
+) >"$RUSTFS_ROOT_STORAGE_COMPAT_REEXPORT_HITS_FILE"
+
+if [[ -s "$RUSTFS_ROOT_STORAGE_COMPAT_REEXPORT_HITS_FILE" ]]; then
+  report_failure "RustFS root storage compatibility must use local aliases or wrappers instead of re-exporting ECStore API symbols: $(paste -sd '; ' "$RUSTFS_ROOT_STORAGE_COMPAT_REEXPORT_HITS_FILE")"
 fi
 
 (
