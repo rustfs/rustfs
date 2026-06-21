@@ -5,17 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-root-runtime-compat-aliases`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079`.
-- Stacked on: API-079 root runtime bucket compatibility pruning.
+- Branch: `overtrue/arch-admin-config-compat-aliases`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080`.
+- Stacked on: API-080 root runtime compatibility alias pruning.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: prune root config read/write, config initialization, and
-  disk endpoint compatibility passthroughs into explicit aliases for startup
-  and runtime consumers.
-- CI/script changes: guard against restoring broad root config and disk endpoint
+- Rust code changes: prune admin config read/write/delete, server-config read,
+  server-config save, and config-default initialization passthroughs into
+  explicit aliases for admin handlers and services.
+- CI/script changes: guard against restoring broad admin config compatibility
   module passthroughs.
-- Docs changes: record the API-080 root runtime compatibility alias boundary.
+- Docs changes: record the API-081 admin config compatibility alias boundary.
 
 ## Phase 0 Tasks
 
@@ -142,6 +142,21 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     readiness marking, and all app/admin/storage compatibility paths.
   - Verification: RustFS compile coverage, formatting, diff hygiene, risk
     scan, architecture guard, pre-commit quality gate, and three-expert review.
+- [x] `API-081` Prune admin config compatibility aliases.
+  - Completed slice: replace admin config `com` and `init` passthroughs with
+    explicit aliases for config object read/write/delete, server-config
+    read/write, storage-class subsystem access, and config-default
+    initialization.
+  - Acceptance: admin config handlers, dynamic KMS/OIDC/audit handlers, site
+    replication state, router notification reads, and dynamic config reload
+    paths use direct admin compatibility aliases while preserving their
+    existing storage keys and config defaults.
+  - Must preserve: admin auth/authorization behavior, config history object
+    names, KMS/OIDC/audit runtime persistence, site-replication state
+    persistence, storage-class subsystem semantics, and admin route contracts.
+  - Verification: RustFS compile coverage, admin focused compile coverage,
+    formatting, diff hygiene, risk scan, architecture guard, pre-commit quality
+    gate, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3175,13 +3190,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | API-080 narrows root runtime config and disk endpoint compatibility to explicit aliases without adding new ECStore ownership cycles. |
-| Migration preservation | passed | Startup config initialization, module switch persistence, endpoint handling, local disk/lock setup, readiness, and app/admin/storage compatibility paths remain preserved. |
+| Quality/architecture | passed | API-081 narrows admin config compatibility to explicit aliases without adding new ECStore ownership cycles. |
+| Migration preservation | passed | Admin config history, dynamic KMS/OIDC/audit config, site-replication state, router notification reads, storage-class defaults, and route contracts remain preserved. |
 | Testing/verification | passed | RustFS compile coverage, migration guard, formatting, diff hygiene, added-line risk scan, full pre-commit, and three-expert review passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-081 current slice:
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Admin compatibility residual scan for broad `com`, bare `init`, and old
+    config IO call paths: passed.
+  - Rust added-line risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-080 current slice:
   - `cargo check -p rustfs --lib`: passed.
