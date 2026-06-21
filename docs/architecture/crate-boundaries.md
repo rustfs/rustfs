@@ -152,6 +152,12 @@ bare `init`, or grouped `endpoint::Endpoint` passthroughs.
 RustFS admin `storage_compat.rs` must expose config IO and default
 initialization through explicit aliases. The admin compatibility boundary must
 not restore broad `com` or bare `init` passthroughs.
+RustFS storage `storage_compat.rs` must expose bucket metadata, object-lock,
+policy, replication, tagging, versioning, object API, and test-only
+storage-class config contracts through explicit aliases. The storage
+compatibility boundary must not restore broad `metadata`, `metadata_sys`,
+`object_lock`, `policy_sys`, `replication`, `tagging`, `utils`, `versioning`,
+`versioning_sys`, `object_api_utils`, or `com` passthroughs.
 
 ECStore ClusterControlPlane read models must stay owned by the crate-private
 `cluster` module. Public access goes through `rustfs_ecstore::api::cluster` so

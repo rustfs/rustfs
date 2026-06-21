@@ -13,12 +13,36 @@
 // limitations under the License.
 
 pub(crate) use rustfs_ecstore::api::admin::get_local_server_property;
-pub(crate) use rustfs_ecstore::api::bucket::{
-    metadata, metadata_sys, object_lock, policy_sys, replication, tagging, utils, versioning, versioning_sys,
-};
-pub(crate) use rustfs_ecstore::api::client::object_api_utils;
 #[cfg(test)]
-pub(crate) use rustfs_ecstore::api::config::com;
+pub(crate) use rustfs_ecstore::api::bucket::metadata::BucketMetadata;
+pub(crate) use rustfs_ecstore::api::bucket::metadata::{
+    BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_VERSIONING_CONFIG,
+    BUCKET_WEBSITE_CONFIG, OBJECT_LOCK_CONFIG, load_bucket_metadata,
+};
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::{
+    GLOBAL_BucketMetadataSys as GLOBAL_BUCKET_METADATA_SYS, get_global_bucket_metadata_sys,
+};
+pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::{
+    delete as delete_bucket_metadata_config, get as get_bucket_metadata, get_accelerate_config as get_bucket_accelerate_config,
+    get_bucket_policy_raw, get_cors_config as get_bucket_cors_config, get_logging_config as get_bucket_logging_config,
+    get_object_lock_config as get_bucket_object_lock_config, get_public_access_block_config,
+    get_replication_config as get_bucket_replication_config, get_request_payment_config as get_bucket_request_payment_config,
+    get_sse_config as get_bucket_sse_config, get_website_config as get_bucket_website_config, set_bucket_metadata,
+    update as update_bucket_metadata_config,
+};
+pub(crate) use rustfs_ecstore::api::bucket::object_lock::objectlock_sys::{
+    add_years as add_object_lock_years, check_retention_for_modification,
+};
+pub(crate) use rustfs_ecstore::api::bucket::policy_sys::PolicySys;
+pub(crate) use rustfs_ecstore::api::bucket::replication::{GLOBAL_REPLICATION_STATS, ReplicationConfigurationExt};
+pub(crate) use rustfs_ecstore::api::bucket::tagging::{decode_tags, decode_tags_to_map, encode_tags};
+pub(crate) use rustfs_ecstore::api::bucket::utils::serialize;
+pub(crate) use rustfs_ecstore::api::bucket::versioning::VersioningApi;
+pub(crate) use rustfs_ecstore::api::bucket::versioning_sys::BucketVersioningSys;
+pub(crate) use rustfs_ecstore::api::client::object_api_utils::to_s3s_etag;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::config::com::STORAGE_CLASS_SUB_SYS;
 pub(crate) use rustfs_ecstore::api::disk::error::DiskError;
 pub(crate) use rustfs_ecstore::api::disk::{
     DeleteOptions, DiskAPI, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadMultipleResp, ReadOptions,
