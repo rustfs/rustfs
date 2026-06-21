@@ -20,12 +20,14 @@ pub(crate) type DiskError = rustfs_ecstore::api::disk::error::DiskError;
 pub(crate) type DynReader = rustfs_ecstore::api::rio::DynReader;
 pub(crate) type ECStore = rustfs_ecstore::api::storage::ECStore;
 pub(crate) type EndpointServerPools = rustfs_ecstore::api::layout::EndpointServerPools;
-pub(crate) type Error = rustfs_ecstore::api::error::Error;
 pub(crate) type HashReader = rustfs_ecstore::api::rio::HashReader;
 pub(crate) type ObjectStoreResolver = dyn Fn() -> Option<Arc<ECStore>> + Send + Sync + 'static;
+pub(crate) type ObjectInfo = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
+pub(crate) type ObjectOptions = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
 pub(crate) type PoolDecommissionInfo = rustfs_ecstore::api::capacity::PoolDecommissionInfo;
 pub(crate) type PoolStatus = rustfs_ecstore::api::capacity::PoolStatus;
 pub(crate) type StorageError = rustfs_ecstore::api::error::StorageError;
+pub(crate) type Error = StorageError;
 pub(crate) type TierConfigMgr = rustfs_ecstore::api::tier::tier::TierConfigMgr;
 pub(crate) type WriteEncryption = rustfs_ecstore::api::rio::WriteEncryption;
 pub(crate) type WritePlan = rustfs_ecstore::api::rio::WritePlan;
@@ -112,7 +114,7 @@ pub(crate) mod lifecycle {
                 .await
         }
 
-        pub(crate) async fn enqueue_transition_immediate(oi: &rustfs_ecstore::api::object::ObjectInfo, src: LcEventSrc) {
+        pub(crate) async fn enqueue_transition_immediate(oi: &super::super::ObjectInfo, src: LcEventSrc) {
             rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::enqueue_transition_immediate(oi, src).await;
         }
 
@@ -120,7 +122,7 @@ pub(crate) mod lifecycle {
             version_id: &str,
             bucket: &str,
             object: &str,
-        ) -> Result<rustfs_ecstore::api::object::ObjectOptions, std::io::Error> {
+        ) -> Result<super::super::ObjectOptions, std::io::Error> {
             rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::post_restore_opts(version_id, bucket, object).await
         }
 
@@ -318,7 +320,7 @@ pub(crate) mod object_lock {
 
         pub(crate) async fn check_object_lock_for_deletion(
             bucket: &str,
-            obj_info: &rustfs_ecstore::api::object::ObjectInfo,
+            obj_info: &super::super::ObjectInfo,
             bypass_governance: bool,
         ) -> Option<ObjectLockBlockReason> {
             rustfs_ecstore::api::bucket::object_lock::objectlock_sys::check_object_lock_for_deletion(
@@ -359,8 +361,8 @@ pub(crate) mod replication {
     pub(crate) async fn check_replicate_delete(
         bucket: &str,
         dobj: &rustfs_storage_api::ObjectToDelete,
-        oi: &rustfs_ecstore::api::object::ObjectInfo,
-        del_opts: &rustfs_ecstore::api::object::ObjectOptions,
+        oi: &super::ObjectInfo,
+        del_opts: &super::ObjectOptions,
         gerr: Option<String>,
     ) -> ReplicateDecision {
         rustfs_ecstore::api::bucket::replication::check_replicate_delete(bucket, dobj, oi, del_opts, gerr).await
@@ -371,7 +373,7 @@ pub(crate) mod replication {
         user_tags: String,
         status: rustfs_filemeta::ReplicationStatusType,
         op_type: rustfs_filemeta::ReplicationType,
-        opts: rustfs_ecstore::api::object::ObjectOptions,
+        opts: super::ObjectOptions,
     ) -> MustReplicateOptions {
         rustfs_ecstore::api::bucket::replication::get_must_replicate_options(user_defined, user_tags, status, op_type, opts)
     }
@@ -381,7 +383,7 @@ pub(crate) mod replication {
     }
 
     pub(crate) async fn schedule_replication(
-        oi: rustfs_ecstore::api::object::ObjectInfo,
+        oi: super::ObjectInfo,
         store: Arc<super::ECStore>,
         dsc: ReplicateDecision,
         op_type: rustfs_filemeta::ReplicationType,
