@@ -64,7 +64,7 @@ jobs:
       RUSTFLAGS: "--cfg tokio_unstable -C target-feature=-crt-static"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -124,7 +124,7 @@ jobs:
       RUSTFLAGS: "--cfg tokio_unstable -C target-feature=-crt-static"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup

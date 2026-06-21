@@ -47,7 +47,7 @@ jobs:
 
     steps:
       - name: Checkout helm chart repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Normalize release version
         id: version
@@ -105,7 +105,7 @@ jobs:
 
     steps:
       - name: Checkout helm package repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: rustfs/helm
           token: ${{ secrets.RUSTFS_HELM_PACKAGE }}

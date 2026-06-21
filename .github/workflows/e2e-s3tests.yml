@@ -66,7 +66,7 @@ jobs:
     runs-on: ubicloud-standard-2
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Cache pip downloads
         uses: actions/cache@v4
@@ -228,7 +228,7 @@ jobs:
     runs-on: ubicloud-standard-2
     timeout-minutes: 150
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Cache pip downloads
         uses: actions/cache@v4

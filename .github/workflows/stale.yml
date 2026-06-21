@@ -1,3 +1,17 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 name: "Mark stale issues"
 on:
   schedule:
@@ -13,8 +27,8 @@ jobs:
           stale-issue-message: 'This issue has been automatically marked as stale because it has not had recent activity. It will be closed if no further activity occurs.'
           stale-issue-label: 'stale'
           ## Mark if there is no activity for more than 7 days
-          days-before-stale: 7  
+          days-before-stale: 7
           # If no one responds after 3 days, the tag will be closed.
-          days-before-close: 3   
+          days-before-close: 3
           # These tags are exempt and will not close automatically.
           exempt-issue-labels: 'pinned,security'

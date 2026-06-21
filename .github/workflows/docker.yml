@@ -84,7 +84,7 @@ jobs:
       create_latest: ${{ steps.check.outputs.create_latest }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           # For workflow_run events, checkout the specific commit that triggered the workflow
@@ -266,19 +266,19 @@ jobs:
     runs-on: ubicloud-standard-2
     timeout-minutes: 60
     strategy:
-          fail-fast: false
-          matrix:
-            include:
-              - variant: musl
-                file: Dockerfile
-                suffix: ""
-              - variant: glibc
-                file: Dockerfile.glibc
-                suffix: "-glibc"
+      fail-fast: false
+      matrix:
+        include:
+          - variant: musl
+            file: Dockerfile
+            suffix: ""
+          - variant: glibc
+            file: Dockerfile.glibc
+            suffix: "-glibc"
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3
