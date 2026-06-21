@@ -39,6 +39,10 @@ use rustfs_common::metrics::{
     IlmAction, Metric, Metrics, ScannerReplicationRepairKind, ScannerSourceWorkUpdate, ScannerWorkSource, UpdateCurrentPathFn,
     current_path_updater, global_metrics,
 };
+use rustfs_ecstore::api::bucket::lifecycle::lifecycle::Lifecycle as _;
+use rustfs_ecstore::api::bucket::replication::ReplicationConfigurationExt as _;
+use rustfs_ecstore::api::bucket::versioning::VersioningApi as _;
+use rustfs_ecstore::api::disk::DiskAPI as _;
 use rustfs_filemeta::{
     MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ReplicateObjectInfo, ReplicationStatusType, ReplicationType,
 };
@@ -51,10 +55,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use crate::storage_compat::{
-    BucketVersioningSys, Disk, DiskAPI as _, DiskError, DiskInfoOptions, Evaluator, Event, GLOBAL_ExpiryState, LcEventSrc,
-    Lifecycle, ListPathRawOptions, ObjectOpts, ReplicationConfig, ReplicationConfigurationExt as _, ReplicationQueueAdmission,
-    StorageError, VersioningApi, apply_expiry_rule, apply_transition_rule, is_erasure, is_reserved_or_invalid_bucket,
-    list_path_raw, path2_bucket_object, path2_bucket_object_with_base_path, queue_replication_heal_internal,
+    BucketVersioningSys, Disk, DiskError, DiskInfoOptions, Evaluator, Event, LcEventSrc, ListPathRawOptions, ObjectOpts,
+    ReplicationConfig, ReplicationQueueAdmission, StorageError, apply_expiry_rule, apply_transition_rule,
+    enqueue_global_newer_noncurrent, is_erasure, is_reserved_or_invalid_bucket, list_path_raw, path2_bucket_object,
+    path2_bucket_object_with_base_path, queue_replication_heal_internal,
 };
 use crate::{ScannerObjectInfo as ObjectInfo, ScannerObjectToDelete as ObjectToDelete};
 
@@ -896,11 +900,7 @@ impl ScannerItem {
             let action = event.action;
             let count = u64::try_from(to_delete_objs.len()).unwrap_or(u64::MAX);
             let done_ilm = Metrics::time_ilm(action);
-            let queued = GLOBAL_ExpiryState
-                .write()
-                .await
-                .enqueue_by_newer_noncurrent(&self.bucket, to_delete_objs, event, &LcEventSrc::Scanner)
-                .await;
+            let queued = enqueue_global_newer_noncurrent(&self.bucket, to_delete_objs, event, &LcEventSrc::Scanner).await;
             if record_scanner_ilm_action_if_queued(global_metrics(), action, count, queued) {
                 done_ilm(count)();
                 remaining_versions = remaining_versions.saturating_sub(noncurrent_accounting.len());

@@ -14,11 +14,6 @@
 
 use std::sync::Arc;
 
-pub(crate) use rustfs_ecstore::api::bucket::replication::ReplicationConfigurationExt;
-pub(crate) use rustfs_ecstore::api::bucket::versioning::VersioningApi;
-pub(crate) use rustfs_ecstore::api::disk::DiskAPI;
-pub(crate) use rustfs_ecstore::api::rpc::PeerS3Client;
-
 pub(crate) const BUCKET_ACCELERATE_CONFIG: &str = rustfs_ecstore::api::bucket::metadata::BUCKET_ACCELERATE_CONFIG;
 pub(crate) const BUCKET_LOGGING_CONFIG: &str = rustfs_ecstore::api::bucket::metadata::BUCKET_LOGGING_CONFIG;
 pub(crate) const BUCKET_REQUEST_PAYMENT_CONFIG: &str = rustfs_ecstore::api::bucket::metadata::BUCKET_REQUEST_PAYMENT_CONFIG;

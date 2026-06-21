@@ -23,16 +23,18 @@ use crate::storage::options::get_opts;
 use crate::storage::s3_api::acl;
 use crate::storage::storage_compat::{
     BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_VERSIONING_CONFIG,
-    BUCKET_WEBSITE_CONFIG, BucketVersioningSys, OBJECT_LOCK_CONFIG, ReplicationConfigurationExt, StorageError, VersioningApi,
-    check_retention_for_modification, decode_tags, decode_tags_to_map, delete_bucket_metadata_config, encode_tags,
-    get_bucket_accelerate_config, get_bucket_logging_config, get_bucket_object_lock_config, get_bucket_replication_config,
-    get_bucket_request_payment_config, get_bucket_website_config, is_err_bucket_not_found, is_err_object_not_found,
-    is_err_version_not_found, record_replication_proxy, serialize, update_bucket_metadata_config,
+    BUCKET_WEBSITE_CONFIG, BucketVersioningSys, OBJECT_LOCK_CONFIG, StorageError, check_retention_for_modification, decode_tags,
+    decode_tags_to_map, delete_bucket_metadata_config, encode_tags, get_bucket_accelerate_config, get_bucket_logging_config,
+    get_bucket_object_lock_config, get_bucket_replication_config, get_bucket_request_payment_config, get_bucket_website_config,
+    is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found, record_replication_proxy, serialize,
+    update_bucket_metadata_config,
 };
 use crate::storage::{parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled};
 use crate::table_catalog;
 use http::StatusCode;
 use metrics::{counter, histogram};
+use rustfs_ecstore::api::bucket::replication::ReplicationConfigurationExt as _;
+use rustfs_ecstore::api::bucket::versioning::VersioningApi as _;
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use rustfs_storage_api::{BucketOperations, BucketOptions, ObjectLockRetentionOptions, ObjectOperations as _};

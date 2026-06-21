@@ -196,8 +196,6 @@ pub(crate) mod quota {
 pub(crate) mod replication {
     use std::sync::Arc;
 
-    pub(crate) use rustfs_ecstore::api::bucket::replication::ReplicationConfigurationExt;
-
     pub(crate) type BucketReplicationResyncStatus = rustfs_ecstore::api::bucket::replication::BucketReplicationResyncStatus;
     pub(crate) type BucketStats = rustfs_ecstore::api::bucket::replication::BucketStats;
     pub(crate) type DynReplicationPool = rustfs_ecstore::api::bucket::replication::DynReplicationPool;
@@ -250,9 +248,7 @@ pub(crate) mod utils {
     }
 }
 
-pub(crate) mod versioning {
-    pub(crate) use rustfs_ecstore::api::bucket::versioning::VersioningApi;
-}
+pub(crate) mod versioning {}
 
 pub(crate) mod versioning_sys {
     pub(crate) type BucketVersioningSys = rustfs_ecstore::api::bucket::versioning_sys::BucketVersioningSys;

@@ -25,11 +25,9 @@ use crate::admin::storage_compat::metadata::BUCKET_TARGETS_FILE;
 use crate::admin::storage_compat::metadata_sys;
 use crate::admin::storage_compat::read_admin_config_without_migrate;
 use crate::admin::storage_compat::replication::{
-    BucketReplicationResyncStatus, BucketStats, GLOBAL_REPLICATION_STATS, ObjectOpts, ReplicationConfigurationExt, ResyncOpts,
-    get_global_replication_pool,
+    BucketReplicationResyncStatus, BucketStats, GLOBAL_REPLICATION_STATS, ObjectOpts, ResyncOpts, get_global_replication_pool,
 };
 use crate::admin::storage_compat::target::{BucketTarget, BucketTargetType, BucketTargets};
-use crate::admin::storage_compat::versioning::VersioningApi;
 use crate::admin::storage_compat::versioning_sys::BucketVersioningSys;
 use crate::admin::storage_compat::{get_global_bucket_monitor, get_global_deployment_id, get_global_region};
 use crate::app::context::resolve_object_store_handle;
@@ -62,6 +60,8 @@ use rustfs_config::{
     ENABLE_KEY, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT,
     WEBHOOK_SKIP_TLS_VERIFY,
 };
+use rustfs_ecstore::api::bucket::replication::ReplicationConfigurationExt as _;
+use rustfs_ecstore::api::bucket::versioning::VersioningApi as _;
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_madmin::utils::parse_duration;
 use rustfs_notify::{Event as NotificationEvent, notification_system};

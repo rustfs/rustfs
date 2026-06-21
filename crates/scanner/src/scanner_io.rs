@@ -26,6 +26,10 @@ use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{Metric, Metrics, emit_scan_bucket_drive_complete, emit_scan_bucket_drive_partial, global_metrics};
 #[cfg(test)]
 use rustfs_config::{ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS};
+use rustfs_ecstore::api::bucket::lifecycle::lifecycle::Lifecycle as _;
+use rustfs_ecstore::api::bucket::replication::ReplicationConfigurationExt as _;
+use rustfs_ecstore::api::bucket::versioning::VersioningApi as _;
+use rustfs_ecstore::api::disk::DiskAPI as _;
 use rustfs_filemeta::FileMeta;
 use rustfs_storage_api::{BucketInfo, BucketOperations, BucketOptions, DiskSetSelector, StorageAdminApi};
 use rustfs_utils::path::path_join_buf;
@@ -44,10 +48,9 @@ use tracing::{debug, error, warn};
 
 use crate::ScannerObjectInfo as ObjectInfo;
 use crate::storage_compat::{
-    BucketTargetSys, BucketVersioningSys, Disk, DiskAPI, DiskError, ECStore, EcstoreError as Error, EcstoreResult as Result,
-    GLOBAL_ExpiryState, GLOBAL_TierConfigMgr, Lifecycle, ReplicationConfig, ReplicationConfigurationExt, STORAGE_FORMAT_FILE,
-    SetDisks, StorageError, VersioningApi as _, get_lifecycle_config, get_object_lock_config, get_replication_config,
-    resolve_scanner_object_store_handle, storageclass,
+    BucketTargetSys, BucketVersioningSys, Disk, DiskError, ECStore, EcstoreError as Error, EcstoreResult as Result,
+    ReplicationConfig, STORAGE_FORMAT_FILE, SetDisks, StorageError, enqueue_global_free_version, get_lifecycle_config,
+    get_object_lock_config, get_replication_config, list_global_tiers, resolve_scanner_object_store_handle, storageclass,
 };
 
 pub(crate) const SCANNER_SKIP_FILE_ERROR: &str = "skip file";
@@ -1349,10 +1352,7 @@ impl ScannerIODisk for Disk {
 
         let mut size_summary = SizeSummary::default();
 
-        let tiers = {
-            let tier_config_mgr = GLOBAL_TierConfigMgr.read().await;
-            tier_config_mgr.list_tiers()
-        };
+        let tiers = list_global_tiers().await;
 
         for tier in tiers.iter() {
             size_summary.tier_stats.insert(tier.name.clone(), TierStats::default());
@@ -1374,9 +1374,8 @@ impl ScannerIODisk for Disk {
         item.apply_actions(object_infos, lock_config, &mut size_summary).await;
 
         if !free_version_infos.is_empty() {
-            let mut expiry_state = GLOBAL_ExpiryState.write().await;
             for oi in free_version_infos {
-                expiry_state.enqueue_free_version(oi).await;
+                enqueue_global_free_version(oi).await;
             }
         }
 

@@ -19,7 +19,9 @@ pub(crate) type TonicInterceptor = rustfs_ecstore::api::rpc::TonicInterceptor;
 pub(crate) type VolumeInfo = rustfs_ecstore::api::disk::VolumeInfo;
 pub(crate) type WalkDirOptions = rustfs_ecstore::api::disk::WalkDirOptions;
 
-pub(crate) use rustfs_ecstore::api::rpc::gen_tonic_signature_interceptor;
+pub(crate) fn gen_tonic_signature_interceptor() -> TonicInterceptor {
+    TonicInterceptor::Signature(rustfs_ecstore::api::rpc::gen_tonic_signature_interceptor())
+}
 
 pub(crate) async fn node_service_time_out_client(
     addr: &String,

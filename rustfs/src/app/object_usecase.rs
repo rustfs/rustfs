@@ -62,8 +62,8 @@ use crate::app::storage_compat::{get_lock_acquire_timeout, is_valid_storage_clas
 use crate::app::storage_compat::{
     lifecycle::{
         bucket_lifecycle_audit::LcEventSrc,
-        bucket_lifecycle_ops::{RestoreRequestOps, enqueue_transition_immediate, post_restore_opts},
-        lifecycle::{self, Lifecycle, TransitionOptions},
+        bucket_lifecycle_ops::{enqueue_transition_immediate, post_restore_opts},
+        lifecycle::{self, TransitionOptions},
     },
     metadata_sys,
     object_lock::{
@@ -72,15 +72,18 @@ use crate::app::storage_compat::{
     },
     quota::QuotaOperation,
     replication::{
-        DeletedObjectReplicationInfo, ObjectOpts as ReplicationObjectOpts, ReplicationConfigurationExt, check_replicate_delete,
-        get_must_replicate_options, must_replicate, schedule_replication, schedule_replication_delete,
+        DeletedObjectReplicationInfo, ObjectOpts as ReplicationObjectOpts, check_replicate_delete, get_must_replicate_options,
+        must_replicate, schedule_replication, schedule_replication_delete,
     },
     tagging::decode_tags,
-    versioning::VersioningApi,
     versioning_sys::BucketVersioningSys,
 };
 use crate::server::convert_ecstore_object_info;
 use rustfs_concurrency::GetObjectQueueSnapshot;
+use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::RestoreRequestOps as _;
+use rustfs_ecstore::api::bucket::lifecycle::lifecycle::Lifecycle as _;
+use rustfs_ecstore::api::bucket::replication::ReplicationConfigurationExt as _;
+use rustfs_ecstore::api::bucket::versioning::VersioningApi as _;
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateTargetDecision, ReplicationState, ReplicationStatusType,
     ReplicationType, RestoreStatusOps, VersionPurgeStatusType, parse_restore_obj_status, replication_statuses_map,

@@ -14,8 +14,8 @@
 // limitations under the License.
 
 use crate::common::workspace_root;
-use crate::storage_compat::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
 use crate::storage_compat::{VolumeInfo, WalkDirOptions};
+use crate::storage_compat::{gen_tonic_signature_interceptor, node_service_time_out_client};
 use futures::future::join_all;
 use rmp_serde::{Deserializer, Serializer};
 use rustfs_filemeta::{MetaCacheEntry, MetacacheReader, MetacacheWriter};
@@ -53,9 +53,7 @@ async fn ping() -> Result<(), Box<dyn Error>> {
     assert!(decoded_payload.is_ok());
 
     // Create client
-    let mut client =
-        node_service_time_out_client(&CLUSTER_ADDR.to_string(), TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
-            .await?;
+    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string(), gen_tonic_signature_interceptor()).await?;
 
     // Construct PingRequest
     let request = Request::new(PingRequest {
@@ -80,9 +78,7 @@ async fn ping() -> Result<(), Box<dyn Error>> {
 #[tokio::test]
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn make_volume() -> Result<(), Box<dyn Error>> {
-    let mut client =
-        node_service_time_out_client(&CLUSTER_ADDR.to_string(), TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
-            .await?;
+    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string(), gen_tonic_signature_interceptor()).await?;
     let request = Request::new(MakeVolumeRequest {
         disk: "data".to_string(),
         volume: "dandan".to_string(),
@@ -100,9 +96,7 @@ async fn make_volume() -> Result<(), Box<dyn Error>> {
 #[tokio::test]
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn list_volumes() -> Result<(), Box<dyn Error>> {
-    let mut client =
-        node_service_time_out_client(&CLUSTER_ADDR.to_string(), TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
-            .await?;
+    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string(), gen_tonic_signature_interceptor()).await?;
     let request = Request::new(ListVolumesRequest {
         disk: "data".to_string(),
     });
@@ -132,9 +126,7 @@ async fn walk_dir() -> Result<(), Box<dyn Error>> {
     let (rd, mut wr) = tokio::io::duplex(1024);
     let mut buf = Vec::new();
     opts.serialize(&mut Serializer::new(&mut buf))?;
-    let mut client =
-        node_service_time_out_client(&CLUSTER_ADDR.to_string(), TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
-            .await?;
+    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string(), gen_tonic_signature_interceptor()).await?;
     let disk_path = std::env::var_os("RUSTFS_DISK_PATH").map(PathBuf::from).unwrap_or_else(|| {
         let mut path = workspace_root();
         path.push("target");
@@ -187,9 +179,7 @@ async fn walk_dir() -> Result<(), Box<dyn Error>> {
 #[tokio::test]
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn read_all() -> Result<(), Box<dyn Error>> {
-    let mut client =
-        node_service_time_out_client(&CLUSTER_ADDR.to_string(), TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
-            .await?;
+    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string(), gen_tonic_signature_interceptor()).await?;
     let request = Request::new(ReadAllRequest {
         disk: "data".to_string(),
         volume: "ff".to_string(),
@@ -207,9 +197,7 @@ async fn read_all() -> Result<(), Box<dyn Error>> {
 #[tokio::test]
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn storage_info() -> Result<(), Box<dyn Error>> {
-    let mut client =
-        node_service_time_out_client(&CLUSTER_ADDR.to_string(), TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
-            .await?;
+    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string(), gen_tonic_signature_interceptor()).await?;
     let request = Request::new(LocalStorageInfoRequest { metrics: true });
 
     let response = client.local_storage_info(request).await?.into_inner();

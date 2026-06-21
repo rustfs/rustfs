@@ -42,7 +42,7 @@ pub mod capacity {
 }
 
 pub mod client {
-    pub use crate::client::{admin_handler_utils, object_api_utils, transition_api};
+    pub use crate::client::{admin_handler_utils, api_put_object, object_api_utils, transition_api};
 }
 
 pub mod cluster {
