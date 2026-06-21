@@ -83,6 +83,7 @@ RUSTFS_ROOT_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_root_bucke
 RUSTFS_ROOT_RUNTIME_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_root_runtime_storage_compat_module_hits.txt"
 RUSTFS_ADMIN_CONFIG_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_admin_config_storage_compat_module_hits.txt"
 RUSTFS_STORAGE_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_storage_bucket_storage_compat_module_hits.txt"
+RUSTFS_STORAGE_OWNER_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_compat_reexport_hits.txt"
 RUSTFS_ADMIN_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_admin_bucket_storage_compat_module_hits.txt"
 RUSTFS_APP_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_app_bucket_storage_compat_module_hits.txt"
 SCANNER_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/scanner_bucket_storage_compat_module_hits.txt"
@@ -825,6 +826,26 @@ fi
 
 if [[ -s "$RUSTFS_STORAGE_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE" ]]; then
   report_failure "RustFS storage compatibility must expose bucket/object-api/config contracts as explicit aliases: $(paste -sd '; ' "$RUSTFS_STORAGE_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  perl -0ne '
+    while (/pub\(crate\)\s+use\s+rustfs_ecstore::api::([^;]+);/g) {
+      my $path = $1;
+      $path =~ s/\s+/ /g;
+      $path =~ s/^\s+|\s+$//g;
+      next if $path eq "bucket::replication::ReplicationConfigurationExt";
+      next if $path eq "bucket::versioning::VersioningApi";
+      next if $path eq "disk::DiskAPI";
+      next if $path eq "rpc::PeerS3Client";
+      print "$ARGV:pub(crate) use rustfs_ecstore::api::$path;\n";
+    }
+  ' rustfs/src/storage/storage_compat.rs || true
+) >"$RUSTFS_STORAGE_OWNER_COMPAT_REEXPORT_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_OWNER_COMPAT_REEXPORT_HITS_FILE" ]]; then
+  report_failure "RustFS storage owner compatibility must use local aliases or wrappers instead of re-exporting ECStore API symbols except temporary traits: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_COMPAT_REEXPORT_HITS_FILE")"
 fi
 
 (
