@@ -149,6 +149,9 @@ boundaries that still need module-local owner cleanup.
 Root runtime storage config initialization and disk endpoint contracts must also
 stay explicit aliases. The root compatibility boundary must not restore `com`,
 bare `init`, or grouped `endpoint::Endpoint` passthroughs.
+RustFS admin `storage_compat.rs` must expose config IO and default
+initialization through explicit aliases. The admin compatibility boundary must
+not restore broad `com` or bare `init` passthroughs.
 
 ECStore ClusterControlPlane read models must stay owned by the crate-private
 `cluster` module. Public access goes through `rustfs_ecstore::api::cluster` so

@@ -19,7 +19,12 @@ pub(crate) use rustfs_ecstore::api::bucket::{
 };
 pub(crate) use rustfs_ecstore::api::capacity::is_reserved_or_invalid_bucket;
 pub(crate) use rustfs_ecstore::api::client::admin_handler_utils::AdminError;
-pub(crate) use rustfs_ecstore::api::config::{com, init, set_global_storage_class, storageclass};
+pub(crate) use rustfs_ecstore::api::config::com::{
+    STORAGE_CLASS_SUB_SYS, delete_config as delete_admin_config, read_config as read_admin_config,
+    read_config_without_migrate as read_admin_config_without_migrate, save_config as save_admin_config,
+    save_server_config as save_admin_server_config,
+};
+pub(crate) use rustfs_ecstore::api::config::{init as init_admin_config_defaults, set_global_storage_class, storageclass};
 pub(crate) use rustfs_ecstore::api::data_usage::load_data_usage_from_backend;
 pub(crate) use rustfs_ecstore::api::disk::RUSTFS_META_BUCKET;
 #[cfg(test)]

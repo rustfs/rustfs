@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::admin::handlers::target_descriptor::AdminTargetSpec;
+use crate::admin::storage_compat::{read_admin_config_without_migrate, save_admin_server_config};
 use crate::app::context::resolve_object_store_handle;
 use rustfs_audit::{audit_system, start_audit_system as start_global_audit_system, system::AuditSystemState};
 use rustfs_config::DEFAULT_DELIMITER;
@@ -24,7 +25,7 @@ pub(crate) async fn load_server_config_from_store() -> S3Result<Config> {
         return Ok(Config::new());
     };
 
-    crate::admin::storage_compat::com::read_config_without_migrate(store)
+    read_admin_config_without_migrate(store)
         .await
         .map_err(|e| s3_error!(InternalError, "failed to read server config: {}", e))
 }
@@ -82,7 +83,7 @@ where
         return Err(s3_error!(InternalError, "server storage not initialized"));
     };
 
-    let mut config = crate::admin::storage_compat::com::read_config_without_migrate(store.clone())
+    let mut config = read_admin_config_without_migrate(store.clone())
         .await
         .map_err(|e| s3_error!(InternalError, "failed to read server config: {}", e))?;
 
@@ -90,7 +91,7 @@ where
         return Ok(());
     }
 
-    crate::admin::storage_compat::com::save_server_config(store, &config)
+    save_admin_server_config(store, &config)
         .await
         .map_err(|e| s3_error!(InternalError, "failed to save audit config: {}", e))?;
 
