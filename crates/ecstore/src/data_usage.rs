@@ -789,7 +789,7 @@ pub async fn load_data_usage_cache(store: &crate::set_disk::SetDisks, name: &str
 pub async fn save_data_usage_cache(cache: &DataUsageCache, name: &str) -> crate::error::Result<()> {
     use crate::config::com::save_config;
     use crate::disk::BUCKET_META_PREFIX;
-    use crate::resolve_object_store_handle;
+    use crate::global::resolve_object_store_handle;
     use std::path::Path;
 
     let Some(store) = resolve_object_store_handle() else {

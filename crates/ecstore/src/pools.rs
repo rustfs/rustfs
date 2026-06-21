@@ -35,9 +35,9 @@ use crate::error::{
     StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_data_movement_overwrite, is_err_object_not_found,
     is_err_operation_canceled, is_err_version_not_found,
 };
+use crate::global::resolve_object_store_handle;
 use crate::notification_sys::get_global_notification_sys;
 use crate::object_api::{GetObjectReader, ObjectOptions};
-use crate::resolve_object_store_handle;
 use crate::set_disk::SetDisks;
 use crate::{global::GLOBAL_LifecycleSys, sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
