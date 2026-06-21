@@ -152,6 +152,10 @@ bare `init`, or grouped `endpoint::Endpoint` passthroughs.
 RustFS admin `storage_compat.rs` must expose config IO and default
 initialization through explicit aliases. The admin compatibility boundary must
 not restore broad `com` or bare `init` passthroughs.
+RustFS admin and app `storage_compat.rs` bucket-facing compatibility contracts
+must stay explicitly whitelisted. They must not restore broad bucket module,
+client object API, client transition API, or storage-class module passthroughs
+once a local compatibility boundary has narrowed them to specific aliases.
 RustFS storage `storage_compat.rs` must expose bucket metadata, object-lock,
 policy, replication, tagging, versioning, object API, and test-only
 storage-class config contracts through explicit aliases. The storage
