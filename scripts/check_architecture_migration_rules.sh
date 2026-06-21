@@ -81,6 +81,7 @@ RUSTFS_RUNTIME_SECONDARY_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/rustfs_runtime_sec
 RUSTFS_ROOT_STORAGE_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_root_storage_compat_reexport_hits.txt"
 RUSTFS_ROOT_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_root_bucket_storage_compat_module_hits.txt"
 RUSTFS_ROOT_RUNTIME_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_root_runtime_storage_compat_module_hits.txt"
+RUSTFS_ROOT_CONSUMER_COMPAT_HITS_FILE="${TMP_DIR}/rustfs_root_consumer_compat_hits.txt"
 RUSTFS_ADMIN_CONFIG_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_admin_config_storage_compat_module_hits.txt"
 RUSTFS_STORAGE_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_storage_bucket_storage_compat_module_hits.txt"
 RUSTFS_STORAGE_OWNER_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_compat_reexport_hits.txt"
@@ -813,6 +814,16 @@ fi
 
 if [[ -s "$RUSTFS_ROOT_RUNTIME_STORAGE_COMPAT_MODULE_HITS_FILE" ]]; then
   report_failure "RustFS root storage compatibility must expose config init and disk endpoint contracts as explicit aliases: $(paste -sd '; ' "$RUSTFS_ROOT_RUNTIME_STORAGE_COMPAT_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub\(crate\)\s+(?:async\s+)?fn\s+(?:all_local_disk|read_ecstore_config|save_ecstore_config|get_global_endpoints_opt|get_global_lock_clients|is_dist_erasure|resolve_object_store_handle|register_event_dispatch_hook|verify_rpc_signature)\b|pub\(crate\)\s+(?:const|type)\s+(?:TONIC_RPC_PREFIX|EcstoreEventArgs)\b|pub\(crate\)\s+trait\s+DiskAPI\b' \
+    rustfs/src/storage_compat.rs || true
+) >"$RUSTFS_ROOT_CONSUMER_COMPAT_HITS_FILE"
+
+if [[ -s "$RUSTFS_ROOT_CONSUMER_COMPAT_HITS_FILE" ]]; then
+  report_failure "RustFS root storage compatibility must not own capacity/server consumer wrappers: $(paste -sd '; ' "$RUSTFS_ROOT_CONSUMER_COMPAT_HITS_FILE")"
 fi
 
 (

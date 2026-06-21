@@ -12,10 +12,10 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+use super::storage_compat::{EcstoreEventArgs, register_event_dispatch_hook};
 use super::{module_switch::resolve_notify_module_state, refresh_persisted_module_switches_from_store};
 use crate::app::context::resolve_server_config;
 use crate::storage::StorageObjectInfo;
-use crate::storage_compat::{EcstoreEventArgs, register_event_dispatch_hook};
 use chrono::{DateTime, Utc};
 use rustfs_notify::{EventArgs as NotifyEventArgs, NotifyObjectInfo};
 use rustfs_s3_types::EventName;
