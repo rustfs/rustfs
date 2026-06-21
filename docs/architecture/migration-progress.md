@@ -5,17 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-workload-admission-provider-compose`
-- Baseline: completed `C-011/C-012/API-055/API-059`.
-- Stacked on: storage concurrency policy consumers.
-- PR type for this branch: `api-extraction`
+- Branch: `overtrue/arch-root-runtime-compat-boundaries`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059`.
+- Stacked on: main after workload admission provider composition.
+- PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: route storage object backpressure and request hang/deadlock
-  runtime config consumption through shared concurrency facade policies, then
-  compose RustFS workload admission through provider registries.
-- CI/script changes: none.
-- Docs changes: record the C-013 admission provider composition precondition
-  for later controller status work.
+- Rust code changes: prune broad root bucket metadata/quota compatibility module
+  passthroughs into explicit aliases for the current RustFS root consumers.
+- CI/script changes: guard against restoring broad root bucket compatibility
+  module passthroughs.
+- Docs changes: record the API-079 root runtime bucket compatibility boundary.
 
 ## Phase 0 Tasks
 
@@ -111,6 +110,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: workload contract tests, RustFS workload admission tests,
     compile coverage, formatting, diff hygiene, risk scan, architecture guard,
     pre-commit quality gate, and three-expert review.
+- [x] `API-079` Prune root runtime bucket compatibility modules.
+  - Completed slice: collapse RustFS root `storage_compat.rs` bucket
+    metadata/quota module passthroughs into explicit notification-config,
+    table-catalog metadata, and quota-error aliases, and guard the boundary
+    against broad module restores.
+  - Acceptance: root runtime consumers use direct compatibility aliases for
+    bucket notification loading, table-catalog metadata checks, and quota error
+    mapping, while app/admin/storage owner-local compatibility modules keep
+    their narrower module paths until their own cleanup slices.
+  - Must preserve: bucket notification loading, notifier event registration,
+    table-bucket mutation guards, quota error to S3 error mapping, ECStore
+    bucket metadata ownership, and all app/admin/storage compatibility paths.
+  - Verification: RustFS compile coverage, formatting, diff hygiene, risk
+    scan, architecture guard, pre-commit quality gate, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3144,9 +3157,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | C-013 composes workload admission providers through the shared registry contract without adding ownership cycles or ECStore dependencies. |
-| Migration preservation | passed | Provider composition preserves storage foreground-read ownership, scanner activity, heal counters, replication stats, metadata runtime checks, and object/queue behavior. |
-| Testing/verification | passed | Focused workload admission tests, RustFS/concurrency compile coverage, migration guard, formatting, diff hygiene, added-line risk scan, full pre-commit, and three-expert review passed. |
+| Quality/architecture | passed | API-079 narrows the root RustFS bucket compatibility boundary to explicit aliases without adding new ECStore ownership cycles. |
+| Migration preservation | passed | Bucket notification loading, table-catalog metadata checks, quota error mapping, and app/admin/storage compatibility paths remain preserved. |
+| Testing/verification | passed | RustFS compile coverage, migration guard, formatting, diff hygiene, added-line risk scan, full pre-commit, and three-expert review passed. |
 
 ## Verification Notes
 
@@ -3163,6 +3176,15 @@ Passed before push:
   - `git diff --check`: passed.
   - `./scripts/check_architecture_migration_rules.sh`: passed.
   - Rust added-line risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-079 current slice:
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Rust added-line risk scan on changed Rust files and guard script: passed.
   - `make pre-commit`: passed.
 
 - Issue #660 C-012 current slice:

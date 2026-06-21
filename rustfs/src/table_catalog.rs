@@ -29,13 +29,9 @@ use std::{
 
 use crate::storage_compat::RUSTFS_META_BUCKET;
 use crate::storage_compat::get_lock_acquire_timeout;
-use crate::storage_compat::{EcstoreError, StorageError};
 use crate::storage_compat::{
-    metadata::{
-        BUCKET_TABLE_CATALOG_META_PREFIX, BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG,
-        BUCKET_TABLE_RESERVED_PREFIX, table_catalog_path_hash,
-    },
-    metadata_sys,
+    BUCKET_TABLE_CATALOG_META_PREFIX, BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG,
+    BUCKET_TABLE_RESERVED_PREFIX, EcstoreError, StorageError, get_bucket_metadata, table_catalog_path_hash,
 };
 use bytes::Bytes;
 use datafusion::{
@@ -7007,7 +7003,7 @@ pub fn validate_object_mutation(table_bucket_enabled: bool, object_key: &str) ->
 }
 
 pub(crate) async fn validate_bucket_object_mutation(bucket: &str, object_key: &str) -> Result<(), TableObjectMutationError> {
-    let table_bucket_enabled = metadata_sys::get(bucket)
+    let table_bucket_enabled = get_bucket_metadata(bucket)
         .await
         .is_ok_and(|metadata| metadata.table_bucket_enabled());
 

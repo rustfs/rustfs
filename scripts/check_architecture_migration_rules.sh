@@ -78,6 +78,7 @@ TEST_HARNESS_NESTED_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/test_harness_nested_sto
 RUSTFS_NESTED_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/rustfs_nested_storage_compat_hits.txt"
 RUSTFS_RUNTIME_SCALAR_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/rustfs_runtime_scalar_storage_compat_hits.txt"
 RUSTFS_RUNTIME_SECONDARY_STORAGE_COMPAT_HITS_FILE="${TMP_DIR}/rustfs_runtime_secondary_storage_compat_hits.txt"
+RUSTFS_ROOT_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_root_bucket_storage_compat_module_hits.txt"
 PRODUCTION_UNUSED_COMPAT_ALLOW_HITS_FILE="${TMP_DIR}/production_unused_compat_allow_hits.txt"
 BROAD_STORE_API_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/broad_store_api_compat_reexport_hits.txt"
 NESTED_STORE_API_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/nested_store_api_compat_module_hits.txt"
@@ -763,6 +764,16 @@ fi
 
 if [[ -s "$RUSTFS_RUNTIME_SECONDARY_STORAGE_COMPAT_HITS_FILE" ]]; then
   report_failure "RustFS runtime secondary storage compatibility paths must use direct aliases instead of bucket/config/rio/client/tier/compress/disk/rebalance modules: $(paste -sd '; ' "$RUSTFS_RUNTIME_SECONDARY_STORAGE_COMPAT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub\(crate\)\s+use rustfs_ecstore::api::bucket::\{[^}]*\b(?:metadata|metadata_sys|quota)\b[^}]*\}\s*;|pub\(crate\)\s+use rustfs_ecstore::api::bucket::(?:metadata|metadata_sys|quota)\s*;' \
+    rustfs/src/storage_compat.rs || true
+) >"$RUSTFS_ROOT_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE"
+
+if [[ -s "$RUSTFS_ROOT_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE" ]]; then
+  report_failure "RustFS root storage compatibility must expose bucket metadata/quota contracts as explicit aliases: $(paste -sd '; ' "$RUSTFS_ROOT_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE")"
 fi
 
 (
