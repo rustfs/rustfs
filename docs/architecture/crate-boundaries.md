@@ -146,6 +146,9 @@ ECStore root `global` re-exports must also stay removed once consumers use
 ECStore ClusterControlPlane read models must stay owned by the crate-private
 `cluster` module. Public access goes through `rustfs_ecstore::api::cluster` so
 outer crates cannot depend on ECStore root control-plane internals.
+Pool-state, local-node storage, and peer-health status projections are part of
+the same facade boundary and must remain read-only until a later controller
+slice explicitly wires dynamic health or membership behavior.
 
 RustFS startup internals must stay crate-private after the startup owner split.
 Only `startup_entrypoint` remains a public startup module for the binary
