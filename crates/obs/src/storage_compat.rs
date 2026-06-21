@@ -16,12 +16,16 @@ use crate::metrics::collectors::{
     BucketReplicationStats as MetricBucketReplicationStats, BucketReplicationTargetStats,
     ReplicationStats as MetricReplicationStats,
 };
+use rustfs_ecstore::api::{
+    bucket as ecstore_bucket, capacity as ecstore_capacity, data_usage as ecstore_data_usage, error as ecstore_error,
+    global as ecstore_global, storage as ecstore_storage,
+};
 use rustfs_storage_api::StorageAdminApi;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub(crate) type ObsStore = rustfs_ecstore::api::storage::ECStore;
+pub(crate) type ObsStore = ecstore_storage::ECStore;
 type ObsStorageInfo = <ObsStore as StorageAdminApi>::StorageInfo;
 
 pub(crate) struct ObsDataUsageInfo {
@@ -42,10 +46,8 @@ pub(crate) struct ObsBucketUsageInfo {
     pub(crate) delete_markers_count: u64,
 }
 
-pub(crate) async fn load_obs_data_usage_from_backend(
-    store: Arc<ObsStore>,
-) -> rustfs_ecstore::api::error::Result<ObsDataUsageInfo> {
-    let data_usage = rustfs_ecstore::api::data_usage::load_data_usage_from_backend(store).await?;
+pub(crate) async fn load_obs_data_usage_from_backend(store: Arc<ObsStore>) -> ecstore_error::Result<ObsDataUsageInfo> {
+    let data_usage = ecstore_data_usage::load_data_usage_from_backend(store).await?;
 
     Ok(ObsDataUsageInfo {
         buckets_count: data_usage.buckets_count,
@@ -94,25 +96,19 @@ pub(crate) struct ObsIlmRuntimeSnapshot {
 }
 
 pub(crate) fn resolve_obs_object_store_handle() -> Option<Arc<ObsStore>> {
-    rustfs_ecstore::api::global::resolve_object_store_handle()
+    ecstore_global::resolve_object_store_handle()
 }
 
 pub(crate) fn obs_total_usable_capacity_bytes(storage_info: &ObsStorageInfo) -> u64 {
-    usize_to_u64_saturating(rustfs_ecstore::api::capacity::get_total_usable_capacity(
-        &storage_info.disks,
-        storage_info,
-    ))
+    usize_to_u64_saturating(ecstore_capacity::get_total_usable_capacity(&storage_info.disks, storage_info))
 }
 
 pub(crate) fn obs_total_usable_capacity_free_bytes(storage_info: &ObsStorageInfo) -> u64 {
-    usize_to_u64_saturating(rustfs_ecstore::api::capacity::get_total_usable_capacity_free(
-        &storage_info.disks,
-        storage_info,
-    ))
+    usize_to_u64_saturating(ecstore_capacity::get_total_usable_capacity_free(&storage_info.disks, storage_info))
 }
 
 pub(crate) async fn obs_bucket_quota_limit_bytes(bucket: &str) -> u64 {
-    rustfs_ecstore::api::bucket::metadata_sys::get_quota_config(bucket)
+    ecstore_bucket::metadata_sys::get_quota_config(bucket)
         .await
         .ok()
         .and_then(|(quota, _)| quota.get_quota_limit())
@@ -120,11 +116,11 @@ pub(crate) async fn obs_bucket_quota_limit_bytes(bucket: &str) -> u64 {
 }
 
 pub(crate) fn obs_bucket_monitor_available() -> bool {
-    rustfs_ecstore::api::global::get_global_bucket_monitor().is_some()
+    ecstore_global::get_global_bucket_monitor().is_some()
 }
 
 pub(crate) fn obs_bucket_replication_bandwidth_stats() -> Option<Vec<ObsBucketReplicationBandwidthStats>> {
-    let monitor = rustfs_ecstore::api::global::get_global_bucket_monitor()?;
+    let monitor = ecstore_global::get_global_bucket_monitor()?;
     Some(
         monitor
             .get_report(|_| true)
@@ -142,12 +138,12 @@ pub(crate) fn obs_bucket_replication_bandwidth_stats() -> Option<Vec<ObsBucketRe
 
 pub(crate) async fn obs_ilm_runtime_snapshot() -> ObsIlmRuntimeSnapshot {
     let expiry_pending_tasks = {
-        let expiry = rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState
+        let expiry = ecstore_bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState
             .read()
             .await;
         usize_to_u64_saturating(expiry.pending_tasks())
     };
-    let transition = &rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState;
+    let transition = &ecstore_bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState;
 
     ObsIlmRuntimeSnapshot {
         expiry_pending_tasks,
@@ -162,7 +158,7 @@ pub(crate) async fn obs_ilm_runtime_snapshot() -> ObsIlmRuntimeSnapshot {
 }
 
 pub(crate) async fn obs_bucket_replication_detail_stats() -> Vec<MetricBucketReplicationStats> {
-    let Some(stats) = rustfs_ecstore::api::bucket::replication::GLOBAL_REPLICATION_STATS.get() else {
+    let Some(stats) = ecstore_bucket::replication::GLOBAL_REPLICATION_STATS.get() else {
         return Vec::new();
     };
 
@@ -234,7 +230,7 @@ pub(crate) async fn obs_bucket_replication_detail_stats() -> Vec<MetricBucketRep
 }
 
 pub(crate) async fn obs_site_replication_stats() -> MetricReplicationStats {
-    let Some(stats) = rustfs_ecstore::api::bucket::replication::GLOBAL_REPLICATION_STATS.get() else {
+    let Some(stats) = ecstore_bucket::replication::GLOBAL_REPLICATION_STATS.get() else {
         return MetricReplicationStats::default();
     };
 

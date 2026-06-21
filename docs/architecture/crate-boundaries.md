@@ -190,6 +190,10 @@ paths centralized behind local `ecstore_*` module aliases rather than scattering
 The RustFS app/admin storage compatibility boundaries must likewise route raw
 ECStore facade access through their local `ecstore_*` module aliases instead of
 scattering `rustfs_ecstore::api::...` paths through compatibility wrappers.
+Peripheral consumer storage compatibility boundaries must follow the same
+pattern. IAM, heal, scanner, notify, observability, Swift, S3 Select, test, and
+fuzz storage compatibility modules keep raw ECStore facade access centralized
+behind local `ecstore_*` module aliases.
 Scanner, notify, observability, and e2e `storage_compat.rs` boundaries must
 also stay narrow. Scanner must not restore grouped bucket compatibility exports
 for target, lifecycle, metadata, replication, or versioning modules. Notify

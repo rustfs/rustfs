@@ -12,16 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) const DATA_USAGE_CACHE_NAME: &str = rustfs_ecstore::api::data_usage::DATA_USAGE_CACHE_NAME;
-pub(crate) const BUCKET_META_PREFIX: &str = rustfs_ecstore::api::disk::BUCKET_META_PREFIX;
-pub(crate) const RUSTFS_META_BUCKET: &str = rustfs_ecstore::api::disk::RUSTFS_META_BUCKET;
+use rustfs_ecstore::api::{
+    data_usage as ecstore_data_usage, disk as ecstore_disk, error as ecstore_error, global as ecstore_global,
+    storage as ecstore_storage,
+};
 
-pub(crate) type DiskError = rustfs_ecstore::api::disk::error::DiskError;
-pub(crate) type DiskStore = rustfs_ecstore::api::disk::DiskStore;
-pub(crate) type ECStore = rustfs_ecstore::api::storage::ECStore;
-pub(crate) type EcstoreError = rustfs_ecstore::api::error::Error;
-pub(crate) type Endpoint = rustfs_ecstore::api::disk::endpoint::Endpoint;
-pub(crate) type StorageError = rustfs_ecstore::api::error::StorageError;
+pub(crate) const DATA_USAGE_CACHE_NAME: &str = ecstore_data_usage::DATA_USAGE_CACHE_NAME;
+pub(crate) const BUCKET_META_PREFIX: &str = ecstore_disk::BUCKET_META_PREFIX;
+pub(crate) const RUSTFS_META_BUCKET: &str = ecstore_disk::RUSTFS_META_BUCKET;
+
+pub(crate) type DiskError = ecstore_disk::error::DiskError;
+pub(crate) type DiskStore = ecstore_disk::DiskStore;
+pub(crate) type ECStore = ecstore_storage::ECStore;
+pub(crate) type EcstoreError = ecstore_error::Error;
+pub(crate) type Endpoint = ecstore_disk::endpoint::Endpoint;
+pub(crate) type StorageError = ecstore_error::StorageError;
 pub(crate) type LocalDiskMap = std::collections::HashMap<String, Option<DiskStore>>;
 
 pub(crate) struct GlobalLocalDiskMap;
@@ -30,16 +35,16 @@ pub(crate) static GLOBAL_LOCAL_DISK_MAP: GlobalLocalDiskMap = GlobalLocalDiskMap
 
 impl GlobalLocalDiskMap {
     pub(crate) async fn read(&self) -> tokio::sync::RwLockReadGuard<'static, LocalDiskMap> {
-        rustfs_ecstore::api::global::GLOBAL_LOCAL_DISK_MAP.read().await
+        ecstore_global::GLOBAL_LOCAL_DISK_MAP.read().await
     }
 }
 
 #[cfg(test)]
-pub(crate) type DiskOption = rustfs_ecstore::api::disk::DiskOption;
+pub(crate) type DiskOption = ecstore_disk::DiskOption;
 
 #[cfg(test)]
-pub(crate) async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> rustfs_ecstore::api::disk::error::Result<DiskStore> {
-    rustfs_ecstore::api::disk::new_disk(ep, opt).await
+pub(crate) async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> ecstore_disk::error::Result<DiskStore> {
+    ecstore_disk::new_disk(ep, opt).await
 }
 
 pub type HealObjectInfo = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
