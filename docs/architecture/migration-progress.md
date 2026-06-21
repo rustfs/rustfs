@@ -5,16 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-concurrency-policy-consumers`
-- Baseline: completed `C-004/C-005/C-006/C-011`.
-- Stacked on: storage concurrency policy bridges.
+- Branch: `overtrue/arch-workload-admission-provider-compose`
+- Baseline: completed `C-011/C-012/API-055/API-059`.
+- Stacked on: storage concurrency policy consumers.
 - PR type for this branch: `api-extraction`
 - Runtime behavior changes: none.
 - Rust code changes: route storage object backpressure and request hang/deadlock
-  runtime config consumption through the shared concurrency facade policies.
+  runtime config consumption through shared concurrency facade policies, then
+  compose RustFS workload admission through provider registries.
 - CI/script changes: none.
-- Docs changes: record the C-012 policy consumer precondition for later
-  controller status work.
+- Docs changes: record the C-013 admission provider composition precondition
+  for later controller status work.
 
 ## Phase 0 Tasks
 
@@ -94,6 +95,21 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     behavior change.
   - Verification: storage backpressure/deadlock consumer tests, compile
     coverage, formatting, diff hygiene, risk scan, architecture guard,
+    pre-commit quality gate, and three-expert review.
+- [x] `C-013-ADMISSION` Compose workload admission providers.
+  - Completed slice: add workload admission registry overlay support, compose
+    the RustFS workload admission provider from the storage concurrency
+    provider plus RustFS runtime owner snapshots, and guard the composition
+    boundary.
+  - Acceptance: foreground-read admission remains owned by the storage
+    concurrency provider, RustFS runtime owner snapshots overlay metadata,
+    scanner, repair, replication, and foreground-write status, and later
+    controller/status work can consume one provider-composed registry.
+  - Must preserve: disk-read semaphore acquisition, scanner activity counter,
+    heal task/queue counters, replication worker/queue stats, metadata runtime
+    initialization checks, object write paths, and queue behavior.
+  - Verification: workload contract tests, RustFS workload admission tests,
+    compile coverage, formatting, diff hygiene, risk scan, architecture guard,
     pre-commit quality gate, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
@@ -3128,13 +3144,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | passed | C-012 routes storage backpressure and request-hang runtime consumers through existing `rustfs-concurrency` policy shapes without adding ownership cycles. |
-| Migration preservation | passed | Consumer changes preserve storage env/default ownership, object pipe state, deadlock detector lifecycle, metrics labels, and S3 I/O behavior. |
-| Testing/verification | passed | Focused storage consumer tests, RustFS lib compile coverage, migration guard, formatting, diff hygiene, added-line risk scan, full pre-commit, and three-expert review passed. |
+| Quality/architecture | passed | C-013 composes workload admission providers through the shared registry contract without adding ownership cycles or ECStore dependencies. |
+| Migration preservation | passed | Provider composition preserves storage foreground-read ownership, scanner activity, heal counters, replication stats, metadata runtime checks, and object/queue behavior. |
+| Testing/verification | passed | Focused workload admission tests, RustFS/concurrency compile coverage, migration guard, formatting, diff hygiene, added-line risk scan, full pre-commit, and three-expert review passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 C-013 current slice:
+  - `cargo test -p rustfs-concurrency workload::tests:: -- --nocapture`:
+    passed.
+  - `cargo test -p rustfs --lib workload_admission::tests:: -- --nocapture`:
+    passed.
+  - `cargo check -p rustfs-concurrency`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Rust added-line risk scan on changed Rust files: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 C-012 current slice:
   - `cargo test -p rustfs --lib storage::backpressure::tests:: -- --nocapture`: passed.

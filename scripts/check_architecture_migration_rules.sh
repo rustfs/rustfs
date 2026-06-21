@@ -89,6 +89,7 @@ STORE_API_MODULE_PATH_HITS_FILE="${TMP_DIR}/store_api_module_path_hits.txt"
 ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE="${TMP_DIR}/ecstore_compat_passthrough_expected.txt"
 ECSTORE_COMPAT_PASSTHROUGH_ACTUAL_FILE="${TMP_DIR}/ecstore_compat_passthrough_actual.txt"
 ECSTORE_COMPAT_PASSTHROUGH_DIFF_FILE="${TMP_DIR}/ecstore_compat_passthrough_diff.txt"
+RUSTFS_WORKLOAD_DIRECT_FOREGROUND_MAPPING_HITS_FILE="${TMP_DIR}/rustfs_workload_direct_foreground_mapping_hits.txt"
 
 awk '
   /^## PR Types$/ {
@@ -370,19 +371,23 @@ require_source_contains \
   "RustFS workload admission snapshot provider implementation"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
-  "pub fn foreground_read_workload_admission_snapshot() -> WorkloadAdmissionSnapshot" \
-  "RustFS foreground-read workload admission snapshot helper"
+  "storage_concurrency_workload_admission_snapshot().overlay(runtime_owner_workload_admission_registry_snapshot())" \
+  "RustFS workload admission provider composition"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
-  "WorkloadClass::ForegroundRead => foreground_read_workload_admission_snapshot()" \
-  "RustFS foreground-read workload admission class mapping"
+  "let storage_provider: &dyn WorkloadAdmissionSnapshotProvider = get_concurrency_manager();" \
+  "RustFS workload admission storage provider boundary"
+require_source_contains \
+  "rustfs/src/workload_admission.rs" \
+  "pub fn foreground_read_workload_admission_snapshot() -> WorkloadAdmissionSnapshot" \
+  "RustFS foreground-read workload admission snapshot helper"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
   "pub fn metadata_workload_admission_snapshot() -> WorkloadAdmissionSnapshot" \
   "RustFS metadata workload admission snapshot helper"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
-  "WorkloadClass::Metadata => metadata_workload_admission_snapshot()" \
+  "WorkloadClass::Metadata => Some(metadata_workload_admission_snapshot())" \
   "RustFS metadata workload admission class mapping"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
@@ -390,7 +395,7 @@ require_source_contains \
   "RustFS scanner workload admission snapshot helper"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
-  "WorkloadClass::Scanner => scanner_workload_admission_snapshot()" \
+  "WorkloadClass::Scanner => Some(scanner_workload_admission_snapshot())" \
   "RustFS scanner workload admission class mapping"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
@@ -398,7 +403,7 @@ require_source_contains \
   "RustFS repair workload admission snapshot helper"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
-  "WorkloadClass::Repair => repair_workload_admission_snapshot()" \
+  "WorkloadClass::Repair => Some(repair_workload_admission_snapshot())" \
   "RustFS repair workload admission class mapping"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
@@ -406,8 +411,18 @@ require_source_contains \
   "RustFS replication workload admission snapshot helper"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
-  "WorkloadClass::Replication => replication_workload_admission_snapshot()" \
+  "WorkloadClass::Replication => Some(replication_workload_admission_snapshot())" \
   "RustFS replication workload admission class mapping"
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'WorkloadClass::ForegroundRead => foreground_read_workload_admission_snapshot\(\)' \
+    rustfs/src/workload_admission.rs || true
+) >"$RUSTFS_WORKLOAD_DIRECT_FOREGROUND_MAPPING_HITS_FILE"
+
+if [[ -s "$RUSTFS_WORKLOAD_DIRECT_FOREGROUND_MAPPING_HITS_FILE" ]]; then
+  report_failure "RustFS workload admission foreground reads must be composed through the storage provider registry: $(paste -sd '; ' "$RUSTFS_WORKLOAD_DIRECT_FOREGROUND_MAPPING_HITS_FILE")"
+fi
 
 (
   cd "$ROOT_DIR"

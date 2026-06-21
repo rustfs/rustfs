@@ -150,6 +150,20 @@ impl WorkloadAdmissionRegistrySnapshot {
     pub fn get(&self, class: WorkloadClass) -> Option<&WorkloadAdmissionSnapshot> {
         self.entries.iter().find(|entry| entry.class == class)
     }
+
+    /// Return a registry where matching entries from `overlay` replace this
+    /// registry's entries, and new classes are appended in overlay order.
+    pub fn overlay(mut self, overlay: Self) -> Self {
+        for entry in overlay.entries {
+            if let Some(existing) = self.entries.iter_mut().find(|existing| existing.class == entry.class) {
+                *existing = entry;
+            } else {
+                self.entries.push(entry);
+            }
+        }
+
+        self
+    }
 }
 
 /// Provider boundary for future read-only workload admission snapshots.
@@ -204,6 +218,35 @@ mod tests {
                 .get(WorkloadClass::ForegroundRead)
                 .and_then(|snapshot| snapshot.limit),
             Some(8)
+        );
+    }
+
+    #[test]
+    fn admission_registry_overlay_replaces_existing_classes_and_appends_new_ones() {
+        let base = WorkloadAdmissionRegistrySnapshot::new(vec![
+            WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundRead, AdmissionState::Open),
+            WorkloadAdmissionSnapshot::new(WorkloadClass::Scanner, AdmissionState::Unknown),
+        ]);
+        let overlay = WorkloadAdmissionRegistrySnapshot::new(vec![
+            WorkloadAdmissionSnapshot::new(WorkloadClass::Scanner, AdmissionState::Open).with_counts(Some(2), None, None),
+            WorkloadAdmissionSnapshot::new(WorkloadClass::Repair, AdmissionState::Open),
+        ]);
+
+        let registry = base.overlay(overlay);
+
+        assert_eq!(registry.entries().len(), 3);
+        assert_eq!(
+            registry.get(WorkloadClass::ForegroundRead).map(|snapshot| snapshot.state),
+            Some(AdmissionState::Open)
+        );
+        assert_eq!(
+            registry.get(WorkloadClass::Scanner).map(|snapshot| snapshot.state),
+            Some(AdmissionState::Open)
+        );
+        assert_eq!(registry.get(WorkloadClass::Scanner).and_then(|snapshot| snapshot.active), Some(2));
+        assert_eq!(
+            registry.get(WorkloadClass::Repair).map(|snapshot| snapshot.state),
+            Some(AdmissionState::Open)
         );
     }
 }
