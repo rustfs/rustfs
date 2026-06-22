@@ -5,16 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-runtime-local-compat-bridges`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116`.
-- Based on: API-116 slice.
+- Branch: `overtrue/arch-root-compat-bridge-cleanup`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121`.
+- Based on: API-121 slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: remove app/admin, storage core, nested, handler, capacity,
-  server, and S3 API secondary compatibility bridges.
-- CI/script changes: guard against reintroducing the removed secondary bridge
-  modules or their consumer paths.
-- Docs changes: record the API-117 through API-121 compatibility bridge cleanup.
+- Rust code changes: remove root one-off compatibility bridge modules for
+  config tests, error mapping, runtime capabilities, table catalog, and
+  workload admission.
+- CI/script changes: guard against reintroducing the removed root one-off
+  bridge modules or their consumer paths.
+- Docs changes: record the API-122 root one-off bridge cleanup.
 
 ## Phase 0 Tasks
 
@@ -709,6 +710,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: RustFS compile coverage, runtime local bridge residual scan,
     migration and layer guards, formatting, diff hygiene, path-only risk
     review, and three-expert review.
+- [x] `API-122` Remove root one-off compatibility bridges.
+  - Completed slice: replace config test, error mapping, runtime capability,
+    table catalog, and workload admission consumers with direct ECStore API
+    imports, then delete the root one-off bridge modules.
+  - Acceptance: the deleted bridge files and module declarations are gone;
+    migration rules reject reintroduced files, declarations, or bridge
+    references.
+  - Must preserve: config disk-layout tests, API error mapping, runtime
+    topology snapshots, table-catalog paths and lock behavior, and workload
+    admission snapshots.
+  - Verification: RustFS compile coverage, root one-off bridge residual scan,
+    migration and layer guards, formatting, diff hygiene, Rust risk scan, and
+    three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3742,13 +3756,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-121 removes capacity, server, and S3 API local bridge modules while keeping direct owner API calls explicit. |
-| Migration preservation | pass | The extended guard rejects deleted runtime bridge files, module declarations, and local bridge consumers. |
-| Testing/verification | pass | RustFS compile, runtime local bridge residual scan, migration guard, layer guard, formatting, diff hygiene, pre-commit, and path-only risk review passed. |
+| Quality/architecture | pass | API-122 removes root one-off bridge modules while keeping direct ECStore owner API calls explicit. |
+| Migration preservation | pass | The extended guard rejects deleted root one-off bridge files, module declarations, and bridge consumers. |
+| Testing/verification | pass | RustFS compile, root one-off bridge residual scan, migration guard, layer guard, formatting, diff hygiene, and Rust risk scan passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-122 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Root one-off compatibility bridge residual scan: passed.
+  - Rust risk scan: passed.
 
 - Issue #660 API-121 current slice:
   - `cargo check -p rustfs --tests`: passed.

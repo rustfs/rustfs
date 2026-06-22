@@ -57,11 +57,9 @@ pub mod auth;
 pub mod auth_keystone;
 pub mod capacity;
 pub mod config;
-pub(crate) mod config_storage_compat;
 pub mod delete_tail_activity;
 pub mod embedded;
 pub mod error;
-pub(crate) mod error_storage_compat;
 pub mod init;
 pub mod license;
 pub mod memory_observability;
@@ -69,7 +67,6 @@ pub mod profiling;
 #[cfg(any(feature = "ftps", feature = "webdav", feature = "sftp"))]
 pub mod protocols;
 pub mod runtime_capabilities;
-pub(crate) mod runtime_capabilities_storage_compat;
 pub mod server;
 pub(crate) mod startup_audit;
 pub(crate) mod startup_auth;
@@ -97,12 +94,10 @@ pub(crate) mod startup_storage_compat;
 pub(crate) mod startup_tls_material;
 pub mod storage;
 pub(crate) mod table_catalog;
-pub(crate) mod table_catalog_storage_compat;
 pub mod tls;
 pub mod update;
 pub mod version;
 pub mod workload_admission;
-pub(crate) mod workload_admission_storage_compat;
 
 // Re-export from rustfs_utils so that config sub-modules can use
 // `crate::apply_external_env_compat` without breaking.

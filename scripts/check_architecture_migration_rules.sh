@@ -107,6 +107,7 @@ RUSTFS_STORAGE_SECONDARY_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/rustfs_storage_seco
 RUSTFS_NESTED_SECONDARY_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/rustfs_nested_secondary_compat_bridge_hits.txt"
 RUSTFS_STORAGE_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_local_compat_relative_consumer_hits.txt"
 RUSTFS_RUNTIME_LOCAL_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/rustfs_runtime_local_compat_bridge_hits.txt"
+RUSTFS_ROOT_ONE_OFF_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/rustfs_root_one_off_compat_bridge_hits.txt"
 RUSTFS_ADMIN_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_admin_local_compat_relative_consumer_hits.txt"
 RUSTFS_APP_SERVER_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_app_server_local_compat_relative_consumer_hits.txt"
 RUSTFS_HEAL_TEST_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_heal_test_local_compat_relative_consumer_hits.txt"
@@ -710,7 +711,7 @@ fi
     --glob '!**/storage_compat.rs' \
     --glob '!**/*storage_compat.rs' \
     --glob '!target/**' \
-    | rg -v '^(rustfs/src/capacity/service\.rs|rustfs/src/server/(event|http|module_switch|readiness)\.rs|rustfs/src/storage/s3_api/(bucket|multipart)\.rs):' || true
+    | rg -v '^(rustfs/src/(capacity/service|config/config_test|error|runtime_capabilities|table_catalog|workload_admission)\.rs|rustfs/src/server/(event|http|module_switch|readiness)\.rs|rustfs/src/storage/s3_api/(bucket|multipart)\.rs):' || true
 ) |
   cat >"$DIRECT_ECSTORE_IMPORT_HITS_FILE"
 
@@ -1058,7 +1059,7 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'crate::(?:startup_storage_compat|runtime_capabilities_storage_compat|workload_admission_storage_compat|table_catalog_storage_compat|error_storage_compat)' \
+  rg -n --with-filename 'crate::startup_storage_compat' \
     rustfs/src/startup_*.rs \
     rustfs/src/init.rs \
     rustfs/src/runtime_capabilities.rs \
@@ -1191,6 +1192,27 @@ fi
 
 if [[ -s "$RUSTFS_RUNTIME_LOCAL_COMPAT_BRIDGE_HITS_FILE" ]]; then
   report_failure "RustFS capacity/server/S3 API runtime consumers must use direct owner APIs instead of local compatibility bridge modules: $(paste -sd '; ' "$RUSTFS_RUNTIME_LOCAL_COMPAT_BRIDGE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    for file in \
+      rustfs/src/config_storage_compat.rs \
+      rustfs/src/error_storage_compat.rs \
+      rustfs/src/runtime_capabilities_storage_compat.rs \
+      rustfs/src/table_catalog_storage_compat.rs \
+      rustfs/src/workload_admission_storage_compat.rs; do
+      [[ -e "$file" ]] && printf '%s:1:root one-off bridge file exists\n' "$file"
+    done
+    rg -n --with-filename '\bmod\s+(?:config_storage_compat|error_storage_compat|runtime_capabilities_storage_compat|table_catalog_storage_compat|workload_admission_storage_compat)|(?:crate::|self::|super::)(?:config_storage_compat|error_storage_compat|runtime_capabilities_storage_compat|table_catalog_storage_compat|workload_admission_storage_compat)|(?:config_storage_compat|error_storage_compat|runtime_capabilities_storage_compat|table_catalog_storage_compat|workload_admission_storage_compat)::' \
+      rustfs/src \
+      -g '*.rs' || true
+  }
+) >"$RUSTFS_ROOT_ONE_OFF_COMPAT_BRIDGE_HITS_FILE"
+
+if [[ -s "$RUSTFS_ROOT_ONE_OFF_COMPAT_BRIDGE_HITS_FILE" ]]; then
+  report_failure "RustFS root one-off consumers must use direct ECStore owner APIs instead of compatibility bridge modules: $(paste -sd '; ' "$RUSTFS_ROOT_ONE_OFF_COMPAT_BRIDGE_HITS_FILE")"
 fi
 
 (
