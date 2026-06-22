@@ -36,7 +36,25 @@ pub struct AuthZPlugin {
     args: Args,
 }
 
-fn check() -> Result<(), String> {
+#[derive(Debug, thiserror::Error)]
+pub enum OpaConfigError {
+    #[error("Missing required env var: {0}")]
+    MissingRequiredEnv(&'static str),
+    #[error("Invalid env vars: {0:?}")]
+    InvalidEnvVars(HashMap<String, String>),
+    #[error("Error getting env var {name}: {source:?}")]
+    EnvRead {
+        name: &'static str,
+        #[source]
+        source: env::VarError,
+    },
+    #[error("OPA returned an error: {0}")]
+    InvalidStatus(reqwest::StatusCode),
+    #[error("Error connecting to OPA: {0}")]
+    Connection(reqwest::Error),
+}
+
+fn check() -> Result<(), OpaConfigError> {
     let env_list = env::vars();
     let mut candidate = HashMap::new();
     let prefix = format!("{ENV_PREFIX}{POLICY_PLUGIN_SUB_SYS}").to_uppercase();
@@ -48,17 +66,17 @@ fn check() -> Result<(), String> {
 
     //check required env vars
     if candidate.remove(ENV_POLICY_PLUGIN_OPA_URL).is_none() {
-        return Err(format!("Missing required env var: {ENV_POLICY_PLUGIN_OPA_URL}"));
+        return Err(OpaConfigError::MissingRequiredEnv(ENV_POLICY_PLUGIN_OPA_URL));
     }
 
     // check optional env vars
     candidate.remove(ENV_POLICY_PLUGIN_AUTH_TOKEN);
     if !candidate.is_empty() {
-        return Err(format!("Invalid env vars: {candidate:?}"));
+        return Err(OpaConfigError::InvalidEnvVars(candidate));
     }
     Ok(())
 }
-async fn validate(config: &Args) -> Result<(), String> {
+async fn validate(config: &Args) -> Result<(), OpaConfigError> {
     let client = reqwest::Client::new();
 
     match client.post(&config.url).send().await {
@@ -68,22 +86,23 @@ async fn validate(config: &Args) -> Result<(), String> {
                     info!("OPA is ready to accept requests.");
                 }
                 _ => {
-                    return Err(format!("OPA returned an error: {}", resp.status()));
+                    return Err(OpaConfigError::InvalidStatus(resp.status()));
                 }
             };
         }
         Err(err) => {
-            return Err(format!("Error connecting to OPA: {err}"));
+            return Err(OpaConfigError::Connection(err));
         }
     };
     Ok(())
 }
 
-pub async fn lookup_config() -> Result<Args, String> {
+pub async fn lookup_config() -> Result<Args, OpaConfigError> {
     let args = Args::default();
 
-    let get_cfg =
-        |cfg: &str| -> Result<String, String> { env::var(cfg).map_err(|e| format!("Error getting env var {cfg}: {e:?}")) };
+    let get_cfg = |cfg: &'static str| -> Result<String, OpaConfigError> {
+        env::var(cfg).map_err(|source| OpaConfigError::EnvRead { name: cfg, source })
+    };
 
     let url = match get_cfg(ENV_POLICY_PLUGIN_OPA_URL) {
         Ok(url) => url,
@@ -240,7 +259,7 @@ mod tests {
             temp_env::with_var("RUSTFS_POLICY_PLUGIN_AUTH_TOKEN", Some("test-token"), || {
                 let result = check();
                 assert!(result.is_err());
-                assert!(result.unwrap_err().contains("Missing required env var"));
+                assert!(matches!(result.unwrap_err(), OpaConfigError::MissingRequiredEnv(_)));
             });
         });
     }
@@ -255,7 +274,7 @@ mod tests {
             || {
                 let result = check();
                 assert!(result.is_err());
-                assert!(result.unwrap_err().contains("Invalid env vars"));
+                assert!(matches!(result.unwrap_err(), OpaConfigError::InvalidEnvVars(_)));
             },
         );
     }
