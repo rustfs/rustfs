@@ -95,6 +95,7 @@ RUSTFS_STORAGE_COMPAT_RAW_FACADE_PATH_HITS_FILE="${TMP_DIR}/rustfs_storage_compa
 RUSTFS_APP_ADMIN_COMPAT_RAW_FACADE_PATH_HITS_FILE="${TMP_DIR}/rustfs_app_admin_compat_raw_facade_path_hits.txt"
 OUTER_CONSUMER_COMPAT_RAW_FACADE_PATH_HITS_FILE="${TMP_DIR}/outer_consumer_compat_raw_facade_path_hits.txt"
 RUSTFS_ROOT_E2E_COMPAT_RAW_FACADE_PATH_HITS_FILE="${TMP_DIR}/rustfs_root_e2e_compat_raw_facade_path_hits.txt"
+ALL_STORAGE_COMPAT_RAW_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_raw_facade_path_hits.txt"
 SCANNER_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/scanner_bucket_storage_compat_module_hits.txt"
 NOTIFY_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/notify_storage_compat_module_hits.txt"
 OBS_STORAGE_COMPAT_PASSTHROUGH_HITS_FILE="${TMP_DIR}/obs_storage_compat_passthrough_hits.txt"
@@ -852,8 +853,10 @@ fi
   cd "$ROOT_DIR"
   rg -n --no-heading 'pub\(crate\)\s+use\s+crate::(?:admin|app|storage)::storage_compat::\*;' \
     rustfs/src/admin/router_storage_compat.rs \
+    rustfs/src/admin/handlers/storage_compat.rs \
     rustfs/src/admin/service/storage_compat.rs \
     rustfs/src/app/context/storage_compat.rs \
+    rustfs/src/app/usecase_storage_compat.rs \
     rustfs/src/storage/core_storage_compat.rs \
     rustfs/src/storage/rpc/storage_compat.rs || true
 ) >"$RUSTFS_LOCAL_COMPAT_GLOB_EXPORT_HITS_FILE"
@@ -995,6 +998,19 @@ fi
 
 if [[ -s "$RUSTFS_ROOT_E2E_COMPAT_RAW_FACADE_PATH_HITS_FILE" ]]; then
   report_failure "RustFS root/e2e storage compatibility must use local ecstore_* module aliases instead of scattered raw ECStore facade paths: $(paste -sd '; ' "$RUSTFS_ROOT_E2E_COMPAT_RAW_FACADE_PATH_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_ecstore::api::' rustfs/src crates fuzz \
+    --glob '*storage_compat.rs' \
+    --glob '*_compat.rs' \
+    | rg -v '^[^:]+:[0-9]+:use rustfs_ecstore::api::\{' \
+    | rg -v '^[^:]+:[0-9]+:use rustfs_ecstore::api::[a-z_]+ as ecstore_[a-z_]+;' || true
+) >"$ALL_STORAGE_COMPAT_RAW_FACADE_PATH_HITS_FILE"
+
+if [[ -s "$ALL_STORAGE_COMPAT_RAW_FACADE_PATH_HITS_FILE" ]]; then
+  report_failure "storage compatibility boundaries must keep raw ECStore facade paths behind local ecstore_* module aliases: $(paste -sd '; ' "$ALL_STORAGE_COMPAT_RAW_FACADE_PATH_HITS_FILE")"
 fi
 
 (

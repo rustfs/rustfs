@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-local-compat-explicit-exports`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103`.
-- Based on: latest `main` after the API-102 merge.
+- Branch: `overtrue/arch-root-compat-local-facade-aliases`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105`.
+- Based on: `overtrue/arch-remaining-local-compat-exports` after the API-104 slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: narrow selected local compatibility boundaries from glob
-  re-exports to explicit re-exports.
-- CI/script changes: guard narrowed local compatibility boundaries against
-  restoring glob re-exports.
-- Docs changes: record the API-103 local compatibility export cleanup.
+- Rust code changes: route the S3 API storage compatibility ETag helper through
+  a local ECStore client module alias.
+- CI/script changes: guard all storage compatibility boundaries against
+  scattered raw ECStore facade paths outside local `ecstore_*` module aliases.
+- Docs changes: record the API-105 root compatibility facade alias cleanup.
 
 ## Phase 0 Tasks
 
@@ -476,6 +476,33 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     compatibility glob-export scan, migration and layer guards, formatting,
     diff hygiene, Rust risk scan, pre-commit quality gate, and three-expert
     review.
+- [x] `API-104` Narrow remaining local compatibility re-exports.
+  - Completed slice: replace the remaining admin handler and app usecase local
+    compatibility glob re-exports with explicit re-export lists.
+  - Acceptance: no narrowed RustFS local compatibility boundary restores a glob
+    re-export from its owner `storage_compat.rs` facade; migration rules reject
+    regressions across all narrowed files.
+  - Must preserve: admin handler config, bucket metadata, site replication,
+    tier, rebalance, metrics, heal, quota, and object-zip behavior; app bucket,
+    object, multipart, admin, lifecycle transition, quota, object-lock, and
+    replication usecase behavior.
+  - Verification: RustFS test-target compile coverage, narrowed local
+    compatibility glob-export scan, migration and layer guards, formatting,
+    diff hygiene, Rust risk scan, pre-commit quality gate, and three-expert
+    review.
+- [x] `API-105` Guard root compatibility facade aliases.
+  - Completed slice: route the S3 API storage compatibility ETag helper through
+    a local ECStore client module alias and add a repository-wide storage
+    compatibility guard against scattered raw ECStore facade paths.
+  - Acceptance: storage compatibility boundaries may import ECStore facade
+    modules as local `ecstore_*` aliases, but no compatibility wrapper body or
+    signature may reintroduce a scattered raw `rustfs_ecstore::api::...` path.
+  - Must preserve: S3 API ETag conversion behavior and all existing
+    compatibility module import boundaries.
+  - Verification: RustFS test-target compile coverage, full storage
+    compatibility raw-facade residual scan, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, pre-commit quality gate, and
+    three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3509,13 +3536,37 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-103 narrows selected local compatibility re-export surfaces without changing owner call sites or ECStore contracts. |
-| Migration preservation | pass | The new guard rejects restoring glob re-exports in narrowed local compatibility boundaries. |
-| Testing/verification | pass | Focused compile, narrowed glob-export scan, migration guard, layer guard, formatting, diff hygiene, risk scan, and full pre-commit passed. |
+| Quality/architecture | pass | API-105 keeps S3 API ETag conversion behind a local ECStore client alias and extends guard coverage without changing call behavior. |
+| Migration preservation | pass | The guard now rejects scattered raw ECStore facade paths across storage compatibility boundaries while preserving local `ecstore_*` imports. |
+| Testing/verification | pass | Focused compile, raw-facade residual scan, migration guard, layer guard, formatting, diff hygiene, risk scan, and full pre-commit passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-105 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Full storage compatibility raw-facade residual scan: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-104 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Narrowed local compatibility glob-export scan: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-103 current slice:
   - `cargo check -p rustfs --tests`: passed.
