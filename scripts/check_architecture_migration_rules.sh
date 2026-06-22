@@ -108,6 +108,7 @@ RUSTFS_NESTED_SECONDARY_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/rustfs_nested_second
 RUSTFS_STORAGE_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_local_compat_relative_consumer_hits.txt"
 RUSTFS_RUNTIME_LOCAL_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/rustfs_runtime_local_compat_bridge_hits.txt"
 RUSTFS_ROOT_ONE_OFF_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/rustfs_root_one_off_compat_bridge_hits.txt"
+RUSTFS_STARTUP_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/rustfs_startup_compat_bridge_hits.txt"
 RUSTFS_ADMIN_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_admin_local_compat_relative_consumer_hits.txt"
 RUSTFS_APP_SERVER_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_app_server_local_compat_relative_consumer_hits.txt"
 RUSTFS_HEAL_TEST_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_heal_test_local_compat_relative_consumer_hits.txt"
@@ -711,7 +712,7 @@ fi
     --glob '!**/storage_compat.rs' \
     --glob '!**/*storage_compat.rs' \
     --glob '!target/**' \
-    | rg -v '^(rustfs/src/(capacity/service|config/config_test|error|runtime_capabilities|table_catalog|workload_admission)\.rs|rustfs/src/server/(event|http|module_switch|readiness)\.rs|rustfs/src/storage/s3_api/(bucket|multipart)\.rs):' || true
+    | rg -v '^(rustfs/src/(capacity/service|config/config_test|error|init|runtime_capabilities|startup_(background|bucket_metadata|fs_guard|iam|lifecycle|notification|server|services|shutdown|storage)|table_catalog|workload_admission)\.rs|rustfs/src/server/(event|http|module_switch|readiness)\.rs|rustfs/src/storage/s3_api/(bucket|multipart)\.rs):' || true
 ) |
   cat >"$DIRECT_ECSTORE_IMPORT_HITS_FILE"
 
@@ -1213,6 +1214,20 @@ fi
 
 if [[ -s "$RUSTFS_ROOT_ONE_OFF_COMPAT_BRIDGE_HITS_FILE" ]]; then
   report_failure "RustFS root one-off consumers must use direct ECStore owner APIs instead of compatibility bridge modules: $(paste -sd '; ' "$RUSTFS_ROOT_ONE_OFF_COMPAT_BRIDGE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e rustfs/src/startup_storage_compat.rs ]] && printf '%s:1:startup bridge file exists\n' "rustfs/src/startup_storage_compat.rs"
+    rg -n --with-filename '\bmod\s+startup_storage_compat|(?:crate::|self::|super::)startup_storage_compat|startup_storage_compat::' \
+      rustfs/src \
+      -g '*.rs' || true
+  }
+) >"$RUSTFS_STARTUP_COMPAT_BRIDGE_HITS_FILE"
+
+if [[ -s "$RUSTFS_STARTUP_COMPAT_BRIDGE_HITS_FILE" ]]; then
+  report_failure "RustFS startup consumers must use direct ECStore owner APIs instead of startup compatibility bridge modules: $(paste -sd '; ' "$RUSTFS_STARTUP_COMPAT_BRIDGE_HITS_FILE")"
 fi
 
 (

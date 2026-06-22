@@ -17,9 +17,9 @@ use crate::{
     startup_iam::{IamBootstrapDisposition, publish_ready_for_iam_bootstrap},
     startup_services::StartupServiceRuntime,
     startup_shutdown::run_startup_shutdown_sequence,
-    startup_storage_compat::ECStore,
 };
 use rustfs_common::GlobalReadiness;
+use rustfs_ecstore::api::storage::ECStore;
 use rustfs_scanner::init_data_scanner;
 use std::{
     io::Result,

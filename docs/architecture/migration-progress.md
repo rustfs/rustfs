@@ -5,17 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-root-compat-bridge-cleanup`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121`.
-- Based on: API-121 slice.
+- Branch: `overtrue/arch-startup-compat-bridge-cleanup`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122`.
+- Based on: API-122 slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: remove root one-off compatibility bridge modules for
-  config tests, error mapping, runtime capabilities, table catalog, and
-  workload admission.
-- CI/script changes: guard against reintroducing the removed root one-off
-  bridge modules or their consumer paths.
-- Docs changes: record the API-122 root one-off bridge cleanup.
+- Rust code changes: remove the startup storage compatibility bridge and route
+  startup/init consumers directly to ECStore API owner modules.
+- CI/script changes: guard against reintroducing the removed startup bridge
+  module or its consumer paths.
+- Docs changes: record the API-123 startup bridge cleanup.
 
 ## Phase 0 Tasks
 
@@ -721,6 +720,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     topology snapshots, table-catalog paths and lock behavior, and workload
     admission snapshots.
   - Verification: RustFS compile coverage, root one-off bridge residual scan,
+    migration and layer guards, formatting, diff hygiene, Rust risk scan, and
+    three-expert review.
+- [x] `API-123` Remove startup storage compatibility bridge.
+  - Completed slice: replace startup storage, notification, bucket metadata,
+    service, shutdown, server, lifecycle, IAM, background, fs guard, and init
+    consumers with direct ECStore API owner imports, then delete
+    `startup_storage_compat.rs`.
+  - Acceptance: startup/init consumers no longer route through the startup
+    compatibility bridge; migration rules reject the deleted file, module
+    declaration, or bridge references.
+  - Must preserve: endpoint parsing, unsupported filesystem policy, ECStore
+    initialization, global endpoint/erasure registration, local disk and lock
+    client initialization, config migration/retry behavior, metadata/IAM
+    migration, notification startup, background replication, scanner/heal
+    startup and shutdown, and readiness marking.
+  - Verification: RustFS compile coverage, startup bridge residual scan,
     migration and layer guards, formatting, diff hygiene, Rust risk scan, and
     three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
@@ -3756,13 +3771,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-122 removes root one-off bridge modules while keeping direct ECStore owner API calls explicit. |
-| Migration preservation | pass | The extended guard rejects deleted root one-off bridge files, module declarations, and bridge consumers. |
-| Testing/verification | pass | RustFS compile, root one-off bridge residual scan, migration guard, layer guard, formatting, diff hygiene, and Rust risk scan passed. |
+| Quality/architecture | pass | API-123 removes the startup bridge while keeping startup/init direct ECStore owner API calls explicit. |
+| Migration preservation | pass | The extended guard rejects the deleted startup bridge file, module declaration, and bridge consumers. |
+| Testing/verification | pass | RustFS compile, startup bridge residual scan, migration guard, layer guard, formatting, diff hygiene, and Rust risk scan passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-123 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Startup compatibility bridge residual scan: passed.
+  - Rust risk scan: passed.
 
 - Issue #660 API-122 current slice:
   - `cargo check -p rustfs --tests`: passed.

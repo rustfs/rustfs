@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::startup_storage_compat::{set_global_region, set_global_rustfs_port};
 use crate::{
     capacity::capacity_integration::init_capacity_management,
     config::Config,
@@ -20,6 +19,7 @@ use crate::{
 };
 use rustfs_common::{GlobalReadiness, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
+use rustfs_ecstore::api::global::{set_global_region, set_global_rustfs_port};
 use rustfs_utils::net::parse_and_resolve_address;
 use std::{
     io::{Error, Result},
