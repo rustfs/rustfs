@@ -52,7 +52,7 @@
 //! };
 //!
 //! if let Some(material) = sse_encryption(request).await? {
-//!     metadata.extend(encryption_material_to_metadata(&material));
+//!     metadata.extend(encryption_material_to_metadata(&material)?);
 //! }
 //!
 //! // Unified decryption API
@@ -1017,7 +1017,7 @@ pub(crate) fn build_ssec_read_headers(
     headers
 }
 
-pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> HashMap<String, String> {
+pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> Result<HashMap<String, String>, ApiError> {
     let mut metadata = HashMap::new();
 
     match material.sse_type {
@@ -1054,7 +1054,7 @@ pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> HashMap
             let encrypted_data_key = material
                 .encrypted_data_key
                 .as_deref()
-                .expect("managed SSE materials must carry an encrypted data key");
+                .ok_or_else(|| ApiError::from(StorageError::other("managed SSE materials must carry an encrypted data key")))?;
             metadata.insert(
                 "x-amz-server-side-encryption".to_string(),
                 material.server_side_encryption.as_str().to_string(),
@@ -1149,7 +1149,7 @@ pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> HashMap
         }
     }
 
-    metadata
+    Ok(metadata)
 }
 
 // ============================================================================
@@ -2685,7 +2685,8 @@ mod tests {
             .await
             .expect("prepare should accept ssec headers");
         assert!(material.is_some());
-        let metadata = encryption_material_to_metadata(&material.expect("ssec metadata should be generated"));
+        let metadata = encryption_material_to_metadata(&material.expect("ssec metadata should be generated"))
+            .expect("ssec metadata should be generated");
         assert_eq!(metadata.get("x-amz-server-side-encryption").unwrap(), "AES256");
         assert_eq!(metadata.get("x-amz-server-side-encryption-customer-algorithm").unwrap(), "AES256");
     }
@@ -2716,7 +2717,7 @@ mod tests {
             .expect("ssec metadata should be generated");
         assert_eq!(material.key_kind, EncryptionKeyKind::Object);
 
-        let metadata = encryption_material_to_metadata(&material);
+        let metadata = encryption_material_to_metadata(&material).expect("ssec metadata should serialize");
         assert!(metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_IV_HEADER));
         assert!(metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER));
     }
@@ -2736,7 +2737,8 @@ mod tests {
             key_kind: EncryptionKeyKind::Direct,
             managed_kms_context: None,
             managed_sealed_key: None,
-        });
+        })
+        .expect("ssec original-size metadata should serialize");
 
         assert_eq!(metadata.get(SSEC_ORIGINAL_SIZE_HEADER).map(String::as_str), Some("1024"));
     }
@@ -2842,7 +2844,8 @@ mod tests {
             key_kind: EncryptionKeyKind::Direct,
             managed_kms_context: None,
             managed_sealed_key: None,
-        });
+        })
+        .expect("managed SSE metadata should serialize");
 
         assert_eq!(metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("aws:kms"));
         assert_eq!(
@@ -2900,7 +2903,7 @@ mod tests {
             .await
             .expect("sse-kms encryption")
             .expect("managed sse-kms material");
-        let metadata = encryption_material_to_metadata(&material);
+        let metadata = encryption_material_to_metadata(&material).expect("kms metadata should serialize");
         let encoded_context = metadata
             .get(MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER)
             .expect("minio kms context header should exist");
@@ -2963,7 +2966,8 @@ mod tests {
             key_kind: EncryptionKeyKind::Direct,
             managed_kms_context: None,
             managed_sealed_key: None,
-        });
+        })
+        .expect("managed SSE metadata should serialize");
 
         assert_eq!(
             metadata.get(MINIO_INTERNAL_ENCRYPTION_IV_HEADER).map(String::as_str),
@@ -3011,7 +3015,7 @@ mod tests {
 
                 let material = sse_encryption(request).await.expect("sse-s3 encryption should succeed");
                 let material = material.expect("managed sse-s3 encryption should return material");
-                let metadata = encryption_material_to_metadata(&material);
+                let metadata = encryption_material_to_metadata(&material).expect("managed SSE-S3 metadata should serialize");
 
                 assert_eq!(material.kms_key_id, None);
                 assert_eq!(metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("AES256"));
@@ -3104,7 +3108,7 @@ mod tests {
                     .expect("managed sse material");
                 assert_eq!(material.key_kind, EncryptionKeyKind::Object);
 
-                let metadata = encryption_material_to_metadata(&material);
+                let metadata = encryption_material_to_metadata(&material).expect("managed SSE metadata should serialize");
                 assert!(!metadata.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER));
                 assert!(!metadata.contains_key(INTERNAL_ENCRYPTION_IV_HEADER));
 
@@ -3169,7 +3173,7 @@ mod tests {
 
         assert_eq!(material.key_kind, EncryptionKeyKind::Object);
 
-        let metadata = encryption_material_to_metadata(&material);
+        let metadata = encryption_material_to_metadata(&material).expect("sse-c metadata should serialize");
         assert_eq!(
             metadata.get(MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER).map(String::as_str),
             Some(MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM)
