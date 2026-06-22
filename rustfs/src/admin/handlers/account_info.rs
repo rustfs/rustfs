@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::storage_compat::versioning_sys::BucketVersioningSys;
+use super::super::storage_compat::versioning_sys::BucketVersioningSys;
 use crate::admin::auth::authenticate_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::app::context::resolve_object_store_handle;

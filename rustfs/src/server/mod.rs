@@ -24,7 +24,6 @@ mod prefix;
 mod readiness;
 mod runtime;
 mod service_state;
-mod storage_compat;
 pub mod tls_material;
 
 use tracing::warn;

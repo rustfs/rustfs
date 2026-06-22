@@ -102,7 +102,11 @@ RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE="${TMP_DIR}/rustfs_local_compat_ow
 RUSTFS_ROOT_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_compat_relative_consumer_hits.txt"
 RUSTFS_STORAGE_CORE_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_core_compat_relative_consumer_hits.txt"
 RUSTFS_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_local_compat_relative_consumer_hits.txt"
+RUSTFS_APP_ADMIN_SECONDARY_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/rustfs_app_admin_secondary_compat_bridge_hits.txt"
+RUSTFS_STORAGE_SECONDARY_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/rustfs_storage_secondary_compat_bridge_hits.txt"
+RUSTFS_NESTED_SECONDARY_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/rustfs_nested_secondary_compat_bridge_hits.txt"
 RUSTFS_STORAGE_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_local_compat_relative_consumer_hits.txt"
+RUSTFS_RUNTIME_LOCAL_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/rustfs_runtime_local_compat_bridge_hits.txt"
 RUSTFS_ADMIN_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_admin_local_compat_relative_consumer_hits.txt"
 RUSTFS_APP_SERVER_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_app_server_local_compat_relative_consumer_hits.txt"
 RUSTFS_HEAL_TEST_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_heal_test_local_compat_relative_consumer_hits.txt"
@@ -705,7 +709,8 @@ fi
     --glob '!crates/ecstore/**' \
     --glob '!**/storage_compat.rs' \
     --glob '!**/*storage_compat.rs' \
-    --glob '!target/**' || true
+    --glob '!target/**' \
+    | rg -v '^(rustfs/src/capacity/service\.rs|rustfs/src/server/(event|http|module_switch|readiness)\.rs|rustfs/src/storage/s3_api/(bucket|multipart)\.rs):' || true
 ) |
   cat >"$DIRECT_ECSTORE_IMPORT_HITS_FILE"
 
@@ -863,13 +868,7 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --no-heading 'pub\(crate\)\s+use\s+crate::(?:admin|app|storage)::storage_compat::\*;' \
-    rustfs/src/admin/router_storage_compat.rs \
-    rustfs/src/admin/handlers/storage_compat.rs \
-    rustfs/src/admin/service/storage_compat.rs \
-    rustfs/src/app/context/storage_compat.rs \
-    rustfs/src/app/usecase_storage_compat.rs \
-    rustfs/src/storage/core_storage_compat.rs \
-    rustfs/src/storage/rpc/storage_compat.rs || true
+    rustfs/src/admin/handlers/storage_compat.rs 2>/dev/null || true
 ) >"$RUSTFS_LOCAL_COMPAT_GLOB_EXPORT_HITS_FILE"
 
 if [[ -s "$RUSTFS_LOCAL_COMPAT_GLOB_EXPORT_HITS_FILE" ]]; then
@@ -1106,6 +1105,55 @@ fi
 
 (
   cd "$ROOT_DIR"
+  rg -n --with-filename 'router_storage_compat|usecase_storage_compat' \
+    rustfs/src/admin \
+    rustfs/src/app \
+    --glob '*.rs' || true
+) >"$RUSTFS_APP_ADMIN_SECONDARY_COMPAT_BRIDGE_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_ADMIN_SECONDARY_COMPAT_BRIDGE_HITS_FILE" ]]; then
+  report_failure "RustFS app/admin consumers must route directly through their owner storage_compat boundary instead of secondary compatibility bridges: $(paste -sd '; ' "$RUSTFS_APP_ADMIN_SECONDARY_COMPAT_BRIDGE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'core_storage_compat' \
+    rustfs/src/storage \
+    --glob '*.rs' || true
+) >"$RUSTFS_STORAGE_SECONDARY_COMPAT_BRIDGE_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_SECONDARY_COMPAT_BRIDGE_HITS_FILE" ]]; then
+  report_failure "RustFS storage owner consumers must route directly through storage_compat instead of the secondary core_storage_compat bridge: $(paste -sd '; ' "$RUSTFS_STORAGE_SECONDARY_COMPAT_BRIDGE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    for file in \
+      rustfs/src/admin/handlers/storage_compat.rs \
+      rustfs/src/admin/service/storage_compat.rs \
+      rustfs/src/app/context/storage_compat.rs \
+      rustfs/src/storage/rpc/storage_compat.rs; do
+      [[ -e "$file" ]] && printf '%s:1:secondary bridge file exists\n' "$file"
+    done
+    rg -n --with-filename 'mod storage_compat' \
+      rustfs/src/admin/handlers/mod.rs \
+      rustfs/src/admin/service/mod.rs \
+      rustfs/src/app/context.rs \
+      rustfs/src/storage/rpc/mod.rs || true
+    rg -n --with-filename --pcre2 '(?<!super::)super::storage_compat' \
+      rustfs/src/admin/handlers \
+      -g '*.rs' \
+      -g '!storage_compat.rs' || true
+  }
+) >"$RUSTFS_NESTED_SECONDARY_COMPAT_BRIDGE_HITS_FILE"
+
+if [[ -s "$RUSTFS_NESTED_SECONDARY_COMPAT_BRIDGE_HITS_FILE" ]]; then
+  report_failure "RustFS nested and handler consumers must route directly through owner storage_compat instead of secondary compatibility bridges: $(paste -sd '; ' "$RUSTFS_NESTED_SECONDARY_COMPAT_BRIDGE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
   {
     rg -n --with-filename 'crate::storage::rpc::storage_compat' \
       rustfs/src/storage/rpc/http_service.rs \
@@ -1118,6 +1166,31 @@ fi
 
 if [[ -s "$RUSTFS_STORAGE_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE" ]]; then
   report_failure "RustFS storage RPC/S3 API compatibility consumers must use relative owner paths instead of crate-qualified local compatibility paths: $(paste -sd '; ' "$RUSTFS_STORAGE_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    for file in \
+      rustfs/src/capacity/storage_compat.rs \
+      rustfs/src/server/storage_compat.rs \
+      rustfs/src/storage/s3_api/storage_compat.rs; do
+      [[ -e "$file" ]] && printf '%s:1:runtime local bridge file exists\n' "$file"
+    done
+    rg -n --with-filename 'mod storage_compat|pub\(crate\) mod storage_compat' \
+      rustfs/src/capacity/mod.rs \
+      rustfs/src/server/mod.rs \
+      rustfs/src/storage/s3_api/mod.rs || true
+    rg -n --with-filename 'super::storage_compat' \
+      rustfs/src/capacity \
+      rustfs/src/server \
+      rustfs/src/storage/s3_api \
+      -g '*.rs' || true
+  }
+) >"$RUSTFS_RUNTIME_LOCAL_COMPAT_BRIDGE_HITS_FILE"
+
+if [[ -s "$RUSTFS_RUNTIME_LOCAL_COMPAT_BRIDGE_HITS_FILE" ]]; then
+  report_failure "RustFS capacity/server/S3 API runtime consumers must use direct owner APIs instead of local compatibility bridge modules: $(paste -sd '; ' "$RUSTFS_RUNTIME_LOCAL_COMPAT_BRIDGE_HITS_FILE")"
 fi
 
 (
