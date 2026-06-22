@@ -12,16 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::service::{
-    config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
-    site_replication::reload_site_replication_runtime_state,
-};
-use crate::storage::rpc::storage_compat::{
+use super::storage_compat::{
     CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, FileInfoVersions, LocalPeerS3Client, MetricType,
     PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG,
     SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StoragePeerS3ClientExt as _, UpdateMetadataOpts, all_local_disk_path,
     collect_local_metrics, find_local_disk_by_ref, get_global_lock_client, get_local_server_property, load_bucket_metadata,
     reload_transition_tier_config, resolve_object_store_handle, set_bucket_metadata,
+};
+use crate::admin::service::{
+    config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
+    site_replication::reload_site_replication_runtime_state,
 };
 use bytes::Bytes;
 use futures::Stream;
@@ -122,8 +122,21 @@ fn unimplemented_rpc(method: &str) -> Status {
     Status::unimplemented(format!("{method} is not implemented"))
 }
 
-fn background_rebalance_start_error_message(result: crate::storage::rpc::storage_compat::Result<()>) -> Option<String> {
+fn background_rebalance_start_error_message(result: super::storage_compat::Result<()>) -> Option<String> {
     result.err().map(|err| format!("start_rebalance failed: {err}"))
+}
+
+fn stop_rebalance_response(result: super::storage_compat::Result<()>) -> StopRebalanceResponse {
+    match result {
+        Ok(_) => StopRebalanceResponse {
+            success: true,
+            error_info: None,
+        },
+        Err(err) => StopRebalanceResponse {
+            success: false,
+            error_info: Some(err.to_string()),
+        },
+    }
 }
 
 #[path = "bucket.rs"]
@@ -964,10 +977,16 @@ impl Node for NodeService {
             }));
         };
         match store.reload_pool_meta().await {
-            Ok(_) => Ok(Response::new(ReloadPoolMetaResponse {
-                success: true,
-                error_info: None,
-            })),
+            Ok(_) => match store.spawn_missing_local_decommission_routines().await {
+                Ok(_) => Ok(Response::new(ReloadPoolMetaResponse {
+                    success: true,
+                    error_info: None,
+                })),
+                Err(err) => Ok(Response::new(ReloadPoolMetaResponse {
+                    success: false,
+                    error_info: Some(err.to_string()),
+                })),
+            },
             Err(err) => Ok(Response::new(ReloadPoolMetaResponse {
                 success: false,
                 error_info: Some(err.to_string()),
@@ -975,7 +994,7 @@ impl Node for NodeService {
         }
     }
 
-    async fn stop_rebalance(&self, _request: Request<StopRebalanceRequest>) -> Result<Response<StopRebalanceResponse>, Status> {
+    async fn stop_rebalance(&self, request: Request<StopRebalanceRequest>) -> Result<Response<StopRebalanceResponse>, Status> {
         let Some(store) = resolve_object_store_handle() else {
             return Ok(Response::new(StopRebalanceResponse {
                 success: false,
@@ -983,11 +1002,12 @@ impl Node for NodeService {
             }));
         };
 
-        let _ = store.stop_rebalance().await;
-        Ok(Response::new(StopRebalanceResponse {
-            success: true,
-            error_info: None,
-        }))
+        let expected_rebalance_id = request.into_inner().expected_rebalance_id;
+        let expected_rebalance_id = (!expected_rebalance_id.is_empty()).then_some(expected_rebalance_id);
+
+        Ok(Response::new(stop_rebalance_response(
+            store.stop_rebalance_for_id(expected_rebalance_id.as_deref()).await,
+        )))
     }
 
     #[tracing::instrument(skip_all, fields(start_rebalance))]
@@ -1012,21 +1032,22 @@ impl Node for NodeService {
 
         if start_rebalance {
             log_background_rebalance_task_spawned!(start_rebalance);
-            let store = store.clone();
-            spawn(async move {
-                if let Some(message) = background_rebalance_start_error_message(store.start_rebalance().await) {
-                    error!(
-                        event = EVENT_RPC_BACKGROUND_TASK_FAILED,
-                        component = LOG_COMPONENT_STORAGE,
-                        subsystem = LOG_SUBSYSTEM_REBALANCE,
-                        operation = "start_rebalance",
-                        state = "failed",
-                        start_rebalance,
-                        error = %message,
-                        "node rpc background task failed"
-                    );
-                }
-            });
+            if let Some(message) = background_rebalance_start_error_message(store.start_rebalance().await) {
+                error!(
+                    event = EVENT_RPC_BACKGROUND_TASK_FAILED,
+                    component = LOG_COMPONENT_STORAGE,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    operation = "start_rebalance",
+                    state = "failed",
+                    start_rebalance,
+                    error = %message,
+                    "node rpc background task failed"
+                );
+                return Ok(Response::new(LoadRebalanceMetaResponse {
+                    success: false,
+                    error_info: Some(message),
+                }));
+            }
         }
 
         Ok(Response::new(LoadRebalanceMetaResponse {
@@ -2331,7 +2352,9 @@ mod tests {
     async fn test_stop_rebalance() {
         let service = create_test_node_service();
 
-        let request = Request::new(StopRebalanceRequest {});
+        let request = Request::new(StopRebalanceRequest {
+            expected_rebalance_id: String::new(),
+        });
 
         let response = service.stop_rebalance(request).await;
         assert!(response.is_ok());
@@ -2366,11 +2389,27 @@ mod tests {
 
     #[test]
     fn test_background_rebalance_start_error_message_formats_error() {
-        let message = background_rebalance_start_error_message(Err(crate::storage::rpc::storage_compat::Error::other("boom")))
+        let message = background_rebalance_start_error_message(Err(super::super::storage_compat::Error::other("boom")))
             .expect("background rebalance start failure should be formatted");
 
         assert!(message.contains("start_rebalance failed"));
         assert!(message.contains("boom"));
+    }
+
+    #[test]
+    fn test_stop_rebalance_response_reports_local_stop_error() {
+        let response = stop_rebalance_response(Err(super::super::storage_compat::Error::other("boom")));
+
+        assert!(!response.success);
+        assert!(response.error_info.as_deref().is_some_and(|message| message.contains("boom")));
+    }
+
+    #[test]
+    fn test_stop_rebalance_response_reports_success() {
+        let response = stop_rebalance_response(Ok(()));
+
+        assert!(response.success);
+        assert!(response.error_info.is_none());
     }
 
     #[tokio::test]
@@ -2697,7 +2736,7 @@ mod tests {
         vars.insert(PEER_RESTSIGNAL.to_string(), SERVICE_SIGNAL_RELOAD_DYNAMIC.to_string());
         vars.insert(
             PEER_RESTSUB_SYS.to_string(),
-            crate::storage::rpc::storage_compat::STORAGE_CLASS_SUB_SYS.to_string(),
+            super::super::storage_compat::STORAGE_CLASS_SUB_SYS.to_string(),
         );
 
         let request = Request::new(SignalServiceRequest {

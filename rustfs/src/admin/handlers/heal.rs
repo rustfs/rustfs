@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::storage_compat::is_reserved_or_invalid_bucket;
+use super::storage_compat::utils::is_valid_object_prefix;
 use crate::admin::auth::{authenticate_request, validate_admin_request};
-use crate::admin::handlers::storage_compat::is_reserved_or_invalid_bucket;
-use crate::admin::handlers::storage_compat::utils::is_valid_object_prefix;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::app::context::resolve_object_store_handle;
 use crate::server::ADMIN_PREFIX;
@@ -34,6 +34,7 @@ use rustfs_utils::path::path_join;
 use s3s::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::mpsc;
@@ -64,21 +65,28 @@ fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> 
     validate_heal_target(&hip.bucket, &hip.obj_prefix)?;
 
     if let Some(query) = uri.query() {
-        let params: Vec<&str> = query.split('&').collect();
-        for param in params {
-            let mut parts = param.split('=');
-            if let Some(key) = parts.next() {
-                if key == "clientToken"
-                    && let Some(value) = parts.next()
-                {
-                    hip.client_token = value.to_string();
+        let mut seen = HashSet::with_capacity(3);
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            match key.as_ref() {
+                "clientToken" => {
+                    if !seen.insert("clientToken") {
+                        return Err(s3_error!(InvalidArgument, "duplicate heal query parameter"));
+                    }
+                    hip.client_token = value.into_owned();
                 }
-                if key == "forceStart" && parts.next().is_some() {
-                    hip.force_start = true;
+                "forceStart" => {
+                    if !seen.insert("forceStart") {
+                        return Err(s3_error!(InvalidArgument, "duplicate heal query parameter"));
+                    }
+                    hip.force_start = parse_heal_query_bool(value.as_ref())?;
                 }
-                if key == "forceStop" && parts.next().is_some() {
-                    hip.force_stop = true;
+                "forceStop" => {
+                    if !seen.insert("forceStop") {
+                        return Err(s3_error!(InvalidArgument, "duplicate heal query parameter"));
+                    }
+                    hip.force_stop = parse_heal_query_bool(value.as_ref())?;
                 }
+                _ => return Err(s3_error!(InvalidArgument, "unknown heal query parameter")),
             }
         }
     }
@@ -107,6 +115,14 @@ fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> 
     }
 
     Ok(hip)
+}
+
+fn parse_heal_query_bool(value: &str) -> S3Result<bool> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(s3_error!(InvalidArgument, "invalid heal query boolean")),
+    }
 }
 
 fn validate_heal_target(bucket: &str, obj_prefix: &str) -> S3Result<()> {
@@ -362,10 +378,10 @@ fn should_handle_root_heal_directly(hip: &HealInitParams) -> bool {
         && hip.hs.set.is_none()
 }
 
-fn map_root_heal_status(heal_err: Option<crate::admin::handlers::storage_compat::Error>) -> S3Result<()> {
+fn map_root_heal_status(heal_err: Option<super::storage_compat::Error>) -> S3Result<()> {
     match heal_err {
         None => Ok(()),
-        Some(crate::admin::handlers::storage_compat::StorageError::NoHealRequired) => {
+        Some(super::storage_compat::StorageError::NoHealRequired) => {
             info!(
                 event = EVENT_ADMIN_RESPONSE_EMITTED,
                 component = LOG_COMPONENT_ADMIN_API,
@@ -714,13 +730,13 @@ impl Operation for BackgroundHealStatusHandler {
 
 #[cfg(test)]
 mod tests {
+    use super::super::storage_compat::StorageError;
     use super::extract_heal_init_params;
     use super::{
         HealInitParams, HealResp, build_heal_channel_request, encode_background_heal_status, encode_heal_start_success,
         encode_heal_task_status, heal_channel_response_items, heal_channel_response_summary, json_response, map_heal_response,
         map_root_heal_status, should_handle_root_heal_directly, validate_heal_request_mode, validate_heal_target,
     };
-    use crate::admin::handlers::storage_compat::StorageError;
     use bytes::Bytes;
     use http::StatusCode;
     use http::Uri;
@@ -815,6 +831,28 @@ mod tests {
         let parsed = extract_heal_init_params(&Bytes::new(), &uri, matched.params).expect("client-token stop should be accepted");
         assert_eq!(parsed.client_token, "token");
         assert!(parsed.force_stop);
+    }
+
+    #[test]
+    fn test_extract_heal_init_params_rejects_unknown_duplicate_and_invalid_bool() {
+        let mut router = Router::new();
+        router
+            .insert("/rustfs/admin/v3/heal/{bucket}", ())
+            .expect("route should insert");
+
+        for query in [
+            "forceStart=yes",
+            "forceStart=true&forceStart=false",
+            "clientToken=token&unexpected=true",
+        ] {
+            let uri: Uri = format!("/rustfs/admin/v3/heal/test-bucket?{query}")
+                .parse()
+                .expect("uri should parse");
+            let matched = router.at("/rustfs/admin/v3/heal/test-bucket").expect("route should match");
+            let err = extract_heal_init_params(&Bytes::new(), &uri, matched.params)
+                .expect_err("strict heal query should reject malformed input");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        }
     }
 
     #[test]

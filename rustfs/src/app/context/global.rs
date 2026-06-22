@@ -21,7 +21,7 @@ use super::interfaces::{
     BucketMetadataInterface, BufferConfigInterface, EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface,
     NotifyInterface, RegionInterface, ServerConfigInterface, TierConfigInterface,
 };
-use crate::app::context::storage_compat::{ECStore, set_object_store_resolver};
+use super::storage_compat::{ECStore, set_object_store_resolver};
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
 use std::sync::{Arc, OnceLock};

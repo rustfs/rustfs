@@ -494,10 +494,10 @@ impl HealChannelProcessor {
 
 #[cfg(test)]
 mod tests {
+    use super::super::storage_compat::{DiskStore, Endpoint};
     use super::*;
     use crate::heal::manager::HealConfig;
     use crate::heal::storage::{HealObjectInfo, HealStorageAPI};
-    use crate::heal::storage_compat::{DiskStore, Endpoint};
     use rustfs_common::heal_channel::{
         HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealRequestSource, HealScanMode,
     };

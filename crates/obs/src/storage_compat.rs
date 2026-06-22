@@ -16,10 +16,12 @@ use crate::metrics::collectors::{
     BucketReplicationStats as MetricBucketReplicationStats, BucketReplicationTargetStats,
     ReplicationStats as MetricReplicationStats,
 };
-use rustfs_ecstore::api::{
-    bucket as ecstore_bucket, capacity as ecstore_capacity, data_usage as ecstore_data_usage, error as ecstore_error,
-    global as ecstore_global, storage as ecstore_storage,
-};
+use rustfs_ecstore::api::bucket as ecstore_bucket;
+use rustfs_ecstore::api::capacity as ecstore_capacity;
+use rustfs_ecstore::api::data_usage as ecstore_data_usage;
+use rustfs_ecstore::api::error as ecstore_error;
+use rustfs_ecstore::api::global as ecstore_global;
+use rustfs_ecstore::api::storage as ecstore_storage;
 use rustfs_storage_api::StorageAdminApi;
 use std::collections::HashMap;
 use std::sync::Arc;

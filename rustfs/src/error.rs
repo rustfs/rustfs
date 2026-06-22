@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error_storage_compat::{QuotaError, StorageError};
+use super::error_storage_compat::{QuotaError, StorageError};
 use rustfs_storage_api::HTTPRangeError;
 use s3s::{S3Error, S3ErrorCode};
 

@@ -27,7 +27,7 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 
-use crate::table_catalog_storage_compat::{
+use super::table_catalog_storage_compat::{
     BUCKET_TABLE_CATALOG_META_PREFIX, BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG,
     BUCKET_TABLE_RESERVED_PREFIX, EcstoreError, RUSTFS_META_BUCKET, StorageError, get_bucket_metadata, get_lock_acquire_timeout,
     table_catalog_path_hash,

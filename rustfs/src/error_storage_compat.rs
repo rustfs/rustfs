@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::api::{bucket as ecstore_bucket, error as ecstore_error};
+use rustfs_ecstore::api::bucket as ecstore_bucket;
+use rustfs_ecstore::api::error as ecstore_error;
 
 pub(crate) type QuotaError = ecstore_bucket::quota::QuotaError;
 pub(crate) type StorageError = ecstore_error::StorageError;

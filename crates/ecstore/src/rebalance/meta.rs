@@ -1,8 +1,9 @@
 use super::{
     EVENT_REBALANCE_BUCKET, EVENT_REBALANCE_STATE, Error, GetObjectReader, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REBALANCE,
     ObjectInfo, ObjectOptions, PutObjReader, REBAL_META_FMT, REBAL_META_NAME, REBAL_META_VER,
-    REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX, RebalSaveOpt, RebalStatus, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStats,
-    Result,
+    REBALANCE_CLEANUP_WARNING_ENTRY_LIMIT, REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX, REBALANCE_STOP_PROPAGATION_ERROR_PREFIX,
+    RebalSaveOpt, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStats,
+    RebalanceStopPropagationRecord, Result,
 };
 use crate::config::com::{read_config_with_metadata, save_config_with_opts};
 use crate::error::is_err_operation_canceled;
@@ -197,15 +198,15 @@ pub(super) fn is_rebalance_pool_started(pool_stat: &RebalanceStats) -> bool {
     pool_stat.participating && pool_stat.info.status == RebalStatus::Started
 }
 
-pub(super) fn is_rebalance_in_progress(meta: &RebalanceMeta) -> bool {
-    if meta.stopped_at.is_some() {
-        return false;
-    }
-
-    meta.pool_stats.iter().any(is_rebalance_pool_started)
+pub(super) fn is_rebalance_pool_active(pool_stat: &RebalanceStats) -> bool {
+    is_rebalance_pool_started(pool_stat) || pool_stat.info.stopping
 }
 
-pub(super) fn is_rebalance_conflicting_with_decommission(meta: &RebalanceMeta) -> bool {
+pub(super) fn is_rebalance_in_progress(meta: &RebalanceMeta) -> bool {
+    meta.pool_stats.iter().any(is_rebalance_pool_active)
+}
+
+pub(crate) fn is_rebalance_conflicting_with_decommission(meta: &RebalanceMeta) -> bool {
     is_rebalance_in_progress(meta)
 }
 
@@ -224,6 +225,30 @@ pub(super) fn rebalance_meta_load_unknown_format_error(fmt: u16) -> Error {
 pub(super) fn rebalance_meta_load_unknown_version_error(ver: u16) -> Error {
     Error::other(format!("rebalance metadata load failed: unknown version {ver}"))
 }
+
+pub fn encode_rebalance_stop_propagation_record(record: &RebalanceStopPropagationRecord) -> String {
+    match serde_json::to_string(record) {
+        Ok(payload) => format!("{REBALANCE_STOP_PROPAGATION_ERROR_PREFIX}{payload}"),
+        Err(err) => {
+            let payload = serde_json::json!({
+                "encodeError": err.to_string(),
+                "stopFailures": [],
+                "terminalReloadFailures": [],
+            });
+            format!("{REBALANCE_STOP_PROPAGATION_ERROR_PREFIX}{payload}")
+        }
+    }
+}
+
+pub fn decode_rebalance_stop_propagation_record(message: &str) -> Option<RebalanceStopPropagationRecord> {
+    let payload = message.strip_prefix(REBALANCE_STOP_PROPAGATION_ERROR_PREFIX)?;
+    serde_json::from_str(payload).ok()
+}
+
+fn is_rebalance_stop_propagation_error(message: Option<&str>) -> bool {
+    message.is_some_and(|message| message.starts_with(REBALANCE_STOP_PROPAGATION_ERROR_PREFIX))
+}
+
 pub(super) fn rebalance_goal_reached(init_free_space: u64, init_capacity: u64, bytes: u64, percent_free_goal: f64) -> bool {
     if init_capacity == 0 {
         return false;
@@ -384,10 +409,17 @@ pub(super) fn record_rebalance_cleanup_warning_in_meta(
     };
 
     pool_stat.cleanup_warnings.count = pool_stat.cleanup_warnings.count.saturating_add(1);
-    pool_stat.cleanup_warnings.last_message = Some(message);
+    pool_stat.cleanup_warnings.last_message = Some(message.clone());
     pool_stat.cleanup_warnings.last_bucket = Some(bucket.to_string());
     pool_stat.cleanup_warnings.last_object = Some(object.to_string());
     pool_stat.cleanup_warnings.last_at = Some(now);
+    pool_stat.cleanup_warnings.entries.push(RebalanceCleanupWarningEntry {
+        bucket: bucket.to_string(),
+        object: object.to_string(),
+        message,
+        timestamp: Some(now),
+    });
+    truncate_rebalance_cleanup_warning_entries(&mut pool_stat.cleanup_warnings.entries);
     meta.last_refreshed_at = Some(now);
     Ok(())
 }
@@ -572,6 +604,17 @@ pub(super) fn validate_start_rebalance_state(decommission_running: bool, meta_lo
     Ok(())
 }
 
+pub(super) fn validate_init_rebalance_state(decommission_running: bool, current_meta: Option<&RebalanceMeta>) -> Result<()> {
+    if !ensure_rebalance_not_decommissioning(decommission_running) {
+        return Err(Error::DecommissionAlreadyRunning);
+    }
+    if current_meta.is_some_and(is_rebalance_in_progress) {
+        return Err(Error::RebalanceAlreadyRunning);
+    }
+
+    Ok(())
+}
+
 pub(super) fn should_skip_start_rebalance(cancel_attached: bool, in_progress: bool) -> bool {
     cancel_attached && in_progress
 }
@@ -654,6 +697,31 @@ pub(super) fn merge_rebalance_cleanup_warnings(remote: &mut RebalanceCleanupWarn
         remote.last_object = local.last_object.clone();
         remote.last_at = local.last_at;
     }
+
+    merge_rebalance_cleanup_warning_entries(&mut remote.entries, &local.entries);
+    let retained_entries = u64::try_from(remote.entries.len()).unwrap_or(u64::MAX);
+    remote.count = remote.count.max(retained_entries);
+}
+
+pub(super) fn merge_rebalance_cleanup_warning_entries(
+    remote: &mut Vec<RebalanceCleanupWarningEntry>,
+    local: &[RebalanceCleanupWarningEntry],
+) {
+    for entry in local {
+        if !remote.iter().any(|existing| existing == entry) {
+            remote.push(entry.clone());
+        }
+    }
+
+    remote.sort_by_key(|entry| entry.timestamp);
+    truncate_rebalance_cleanup_warning_entries(remote);
+}
+
+fn truncate_rebalance_cleanup_warning_entries(entries: &mut Vec<RebalanceCleanupWarningEntry>) {
+    if entries.len() > REBALANCE_CLEANUP_WARNING_ENTRY_LIMIT {
+        let remove_count = entries.len() - REBALANCE_CLEANUP_WARNING_ENTRY_LIMIT;
+        entries.drain(0..remove_count);
+    }
 }
 
 pub(super) fn should_replace_rebalance_cleanup_warning(
@@ -664,6 +732,16 @@ pub(super) fn should_replace_rebalance_cleanup_warning(
         (_, None) => false,
         (None, Some(_)) => true,
         (Some(remote), Some(local)) => local >= remote,
+    }
+}
+
+pub(super) fn merge_rebalance_stop_propagation_error(remote: Option<String>, local: Option<String>) -> Option<String> {
+    if is_rebalance_stop_propagation_error(local.as_deref()) {
+        local
+    } else if is_rebalance_stop_propagation_error(remote.as_deref()) {
+        remote
+    } else {
+        None
     }
 }
 
@@ -702,19 +780,23 @@ pub(super) fn merge_rebalance_pool_stats(remote: &mut RebalanceStats, local: &Re
     match local.info.status {
         RebalStatus::Failed => {
             remote.info.status = RebalStatus::Failed;
+            remote.info.stopping = false;
             remote.info.end_time = local.info.end_time.or(remote.info.end_time);
             remote.info.last_error = local.info.last_error.clone().or_else(|| remote.info.last_error.clone());
         }
         RebalStatus::Stopped => {
             if remote.info.status != RebalStatus::Failed {
                 remote.info.status = RebalStatus::Stopped;
+                remote.info.stopping = false;
                 remote.info.end_time = local.info.end_time.or(remote.info.end_time);
-                remote.info.last_error = None;
+                remote.info.last_error =
+                    merge_rebalance_stop_propagation_error(remote.info.last_error.clone(), local.info.last_error.clone());
             }
         }
         RebalStatus::Completed => {
             if !matches!(remote.info.status, RebalStatus::Failed | RebalStatus::Stopped) {
                 remote.info.status = RebalStatus::Completed;
+                remote.info.stopping = false;
                 remote.info.end_time = local.info.end_time.or(remote.info.end_time);
                 remote.info.last_error = None;
             }
@@ -722,6 +804,7 @@ pub(super) fn merge_rebalance_pool_stats(remote: &mut RebalanceStats, local: &Re
         RebalStatus::Started => {
             if !is_rebalance_terminal_status(remote.info.status) {
                 remote.info.status = RebalStatus::Started;
+                remote.info.stopping |= local.info.stopping;
                 remote.info.last_error = local.info.last_error.clone();
             }
         }
@@ -736,7 +819,6 @@ pub(super) fn merge_rebalance_meta(remote: &mut RebalanceMeta, local: &Rebalance
     }
 
     if !local.id.is_empty() && remote.id != local.id {
-        *remote = local.clone();
         return;
     }
 
@@ -761,35 +843,120 @@ pub(super) fn mark_started_rebalance_pools_stopped(meta: &mut RebalanceMeta, sto
     for pool_stat in meta.pool_stats.iter_mut() {
         if pool_stat.info.status == RebalStatus::Started {
             pool_stat.info.status = RebalStatus::Stopped;
+            pool_stat.info.stopping = false;
             pool_stat.info.end_time.get_or_insert(stop_time);
+            if !is_rebalance_stop_propagation_error(pool_stat.info.last_error.as_deref()) {
+                pool_stat.info.last_error = None;
+            }
+        }
+    }
+}
+
+pub(super) fn mark_started_rebalance_pools_stopping(meta: &mut RebalanceMeta) {
+    for pool_stat in meta.pool_stats.iter_mut() {
+        if pool_stat.info.status == RebalStatus::Started {
+            pool_stat.info.stopping = true;
             pool_stat.info.last_error = None;
         }
     }
 }
 
 pub(super) fn apply_stopped_at(meta: &mut RebalanceMeta, now: OffsetDateTime) {
-    meta.stopped_at = Some(now);
-    mark_started_rebalance_pools_stopped(meta, now);
+    meta.stopped_at.get_or_insert(now);
+    mark_started_rebalance_pools_stopping(meta);
+}
+
+pub(super) fn clear_rebalance_cancel_token(meta: Option<&mut RebalanceMeta>) -> bool {
+    let Some(meta) = meta else {
+        return false;
+    };
+    if let Some(cancel_tx) = meta.cancel.take() {
+        cancel_tx.cancel();
+        return true;
+    }
+    false
 }
 
 pub(super) fn stop_rebalance_state(meta: &mut RebalanceMeta, now: OffsetDateTime) {
-    if let Some(cancel_tx) = meta.cancel.take() {
-        cancel_tx.cancel();
-    }
-
-    let stop_time = meta.stopped_at.unwrap_or(now);
+    clear_rebalance_cancel_token(Some(meta));
     if meta.stopped_at.is_none() && is_rebalance_in_progress(meta) {
-        meta.stopped_at = Some(stop_time);
-    }
-
-    if meta.stopped_at.is_some() {
-        mark_started_rebalance_pools_stopped(meta, stop_time);
+        apply_stopped_at(meta, now);
+    } else if meta.stopped_at.is_some() {
+        mark_started_rebalance_pools_stopping(meta);
     }
 }
 
+pub(super) fn stop_rebalance_meta_snapshot_for_id(
+    meta: Option<&mut RebalanceMeta>,
+    now: OffsetDateTime,
+    expected_id: Option<&str>,
+) -> Result<Option<RebalanceMeta>> {
+    let Some(meta) = meta else {
+        return Ok(None);
+    };
+
+    if let Some(expected_id) = expected_id
+        && !expected_id.is_empty()
+        && meta.id != expected_id
+    {
+        return Err(Error::other(format!(
+            "rebalance stop id mismatch: expected {expected_id}, found {}",
+            meta.id
+        )));
+    }
+
+    stop_rebalance_state(meta, now);
+    meta.last_refreshed_at = Some(now);
+    Ok(Some(meta.clone()))
+}
+
+pub(super) fn rollback_rebalance_start_meta_snapshot_for_id(
+    meta: Option<&mut RebalanceMeta>,
+    now: OffsetDateTime,
+    expected_id: Option<&str>,
+    start_error: String,
+) -> Option<RebalanceMeta> {
+    meta.and_then(|meta| {
+        if let Some(expected_id) = expected_id
+            && !expected_id.is_empty()
+            && meta.id != expected_id
+        {
+            return None;
+        }
+
+        clear_rebalance_cancel_token(Some(meta));
+        meta.stopped_at.get_or_insert(now);
+        meta.last_refreshed_at = Some(now);
+        for pool_stat in meta.pool_stats.iter_mut() {
+            if pool_stat.info.status == RebalStatus::Started {
+                pool_stat.info.status = RebalStatus::Failed;
+                pool_stat.info.stopping = false;
+                pool_stat.info.end_time.get_or_insert(now);
+                pool_stat.info.last_error = Some(start_error.clone());
+            }
+        }
+        Some(meta.clone())
+    })
+}
+
 pub(super) fn stop_rebalance_meta_snapshot(meta: Option<&mut RebalanceMeta>, now: OffsetDateTime) -> Option<RebalanceMeta> {
+    let meta = meta?;
+    stop_rebalance_state(meta, now);
+    meta.last_refreshed_at = Some(now);
+    Some(meta.clone())
+}
+
+pub(super) fn record_rebalance_stop_propagation_snapshot(
+    meta: Option<&mut RebalanceMeta>,
+    encoded_error: String,
+    now: OffsetDateTime,
+) -> Option<RebalanceMeta> {
     meta.map(|meta| {
-        stop_rebalance_state(meta, now);
+        for pool_stat in meta.pool_stats.iter_mut() {
+            if pool_stat.participating || pool_stat.info.stopping || pool_stat.info.status == RebalStatus::Stopped {
+                pool_stat.info.last_error = Some(encoded_error.clone());
+            }
+        }
         meta.last_refreshed_at = Some(now);
         meta.clone()
     })

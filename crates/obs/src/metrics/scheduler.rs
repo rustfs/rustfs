@@ -23,6 +23,7 @@
 //! - Process disk I/O metrics
 //! - Host network I/O metrics
 
+use super::super::storage_compat::obs_bucket_monitor_available;
 use crate::metrics::collectors::{
     AuditTargetStats,
     BucketReplicationBandwidthStats,
@@ -81,7 +82,6 @@ use crate::metrics::stats_collector::{
     collect_ilm_metric_stats, collect_internode_network_stats, collect_process_metric_bundle, collect_replication_stats,
     collect_scanner_metric_stats, collect_system_cpu_and_memory_stats_with,
 };
-use crate::storage_compat::obs_bucket_monitor_available;
 use rustfs_audit::audit_target_metrics;
 use rustfs_notify::{notification_metrics_snapshot, notification_target_metrics};
 use rustfs_utils::get_env_opt_u64;

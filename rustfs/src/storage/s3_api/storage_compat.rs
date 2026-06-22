@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rustfs_ecstore::api::client as ecstore_client;
+
 pub(crate) fn to_s3s_etag(etag: &str) -> s3s::dto::ETag {
-    rustfs_ecstore::api::client::object_api_utils::to_s3s_etag(etag)
+    ecstore_client::object_api_utils::to_s3s_etag(etag)
 }

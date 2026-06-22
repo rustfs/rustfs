@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::api::{
-    error as ecstore_error, global as ecstore_global, set_disk as ecstore_set_disk, storage as ecstore_storage,
-};
+use rustfs_ecstore::api::error as ecstore_error;
+use rustfs_ecstore::api::global as ecstore_global;
+use rustfs_ecstore::api::set_disk as ecstore_set_disk;
+use rustfs_ecstore::api::storage as ecstore_storage;
 
 pub(crate) type SelectStorageError = ecstore_error::StorageError;
 pub(crate) type SelectStore = ecstore_storage::ECStore;

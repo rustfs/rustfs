@@ -4,6 +4,7 @@ use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RebalanceStats {
     #[serde(rename = "ifs")]
     pub init_free_space: u64, // Pool free space at the start of rebalance
@@ -70,6 +71,7 @@ pub enum RebalSaveOpt {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RebalanceInfo {
     #[serde(rename = "startTs")]
     pub start_time: Option<OffsetDateTime>, // Time at which rebalance-start was issued
@@ -79,9 +81,25 @@ pub struct RebalanceInfo {
     pub last_error: Option<String>, // Last rebalance error message
     #[serde(rename = "status")]
     pub status: RebalStatus, // Current state of rebalance operation
+    #[serde(rename = "stopping", default)]
+    pub stopping: bool, // True after stop is requested and before worker terminal acknowledgement
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RebalanceCleanupWarningEntry {
+    #[serde(rename = "bucket", default)]
+    pub bucket: String,
+    #[serde(rename = "object", default)]
+    pub object: String,
+    #[serde(rename = "message", default)]
+    pub message: String,
+    #[serde(rename = "timestamp", default)]
+    pub timestamp: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RebalanceCleanupWarnings {
     #[serde(rename = "count", default)]
     pub count: u64,
@@ -93,6 +111,27 @@ pub struct RebalanceCleanupWarnings {
     pub last_object: Option<String>,
     #[serde(rename = "lastAt", default)]
     pub last_at: Option<OffsetDateTime>,
+    #[serde(rename = "entries", default)]
+    pub entries: Vec<RebalanceCleanupWarningEntry>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RebalanceStopPropagationRecord {
+    #[serde(rename = "stopAttemptAt", default)]
+    pub stop_attempt_at: Option<OffsetDateTime>,
+    #[serde(rename = "stopFailures", default)]
+    pub stop_failures: Vec<String>,
+    #[serde(rename = "terminalReloadAttemptAt", default)]
+    pub terminal_reload_attempt_at: Option<OffsetDateTime>,
+    #[serde(rename = "terminalReloadFailures", default)]
+    pub terminal_reload_failures: Vec<String>,
+}
+
+impl RebalanceStopPropagationRecord {
+    pub fn has_failures(&self) -> bool {
+        !self.stop_failures.is_empty() || !self.terminal_reload_failures.is_empty()
+    }
 }
 
 #[allow(dead_code)]
@@ -103,6 +142,7 @@ pub struct DiskStat {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RebalanceMeta {
     #[serde(skip)]
     pub cancel: Option<CancellationToken>, // To be invoked on rebalance-stop

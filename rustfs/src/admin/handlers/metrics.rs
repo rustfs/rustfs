@@ -18,8 +18,8 @@
 //! keeping the response format explicitly NDJSON. It is not a Prometheus text
 //! exposition endpoint.
 
+use super::storage_compat::{CollectMetricsOpts, MetricType, collect_local_metrics};
 use crate::admin::auth::validate_admin_request;
-use crate::admin::handlers::storage_compat::{CollectMetricsOpts, MetricType, collect_local_metrics};
 use crate::admin::router::Operation;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::RemoteAddr;

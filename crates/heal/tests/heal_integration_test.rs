@@ -14,7 +14,7 @@
 
 mod common;
 
-use crate::common::storage_compat::{
+use common::storage_compat::{
     ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, init_bucket_metadata_sys, init_local_disks,
 };
 use http::HeaderMap;
