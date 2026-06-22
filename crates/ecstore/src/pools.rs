@@ -25,7 +25,7 @@ use crate::bucket::{
     object_lock::objectlock_sys::BucketObjectLockSys,
 };
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
-use crate::config::com::{CONFIG_PREFIX, read_config, save_config};
+use crate::config::com::{CONFIG_PREFIX, read_config, read_config_no_lock, save_config, save_config_with_opts};
 use crate::data_movement;
 use crate::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::disk::error::DiskError;
@@ -1248,23 +1248,13 @@ impl PoolMeta {
         }
     }
 
-    pub async fn load(&mut self, pool: Arc<Sets>, _pools: Vec<Arc<Sets>>) -> Result<()> {
-        let data = match read_config(pool, POOL_META_NAME).await {
-            Ok(data) => {
-                if data.is_empty() {
-                    return Ok(());
-                } else if data.len() <= 4 {
-                    return Err(Error::other("pool metadata load failed: metadata payload is too short"));
-                }
-                data
-            }
-            Err(err) => {
-                if err == Error::ConfigNotFound {
-                    return Ok(());
-                }
-                return Err(err);
-            }
-        };
+    fn load_from_config_data(&mut self, data: Vec<u8>) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        } else if data.len() <= 4 {
+            return Err(Error::other("pool metadata load failed: metadata payload is too short"));
+        }
+
         let format = LittleEndian::read_u16(&data[0..2]);
         if format != POOL_META_FORMAT {
             return Err(Error::other(format!("pool metadata load failed: unknown format {format}")));
@@ -1285,9 +1275,35 @@ impl PoolMeta {
         Ok(())
     }
 
-    pub async fn save(&self, pools: Vec<Arc<Sets>>) -> Result<()> {
+    pub async fn load(&mut self, pool: Arc<Sets>, _pools: Vec<Arc<Sets>>) -> Result<()> {
+        let data = match read_config(pool, POOL_META_NAME).await {
+            Ok(data) => data,
+            Err(err) => {
+                if err == Error::ConfigNotFound {
+                    return Ok(());
+                }
+                return Err(err);
+            }
+        };
+        self.load_from_config_data(data)
+    }
+
+    async fn load_no_lock(&mut self, pool: Arc<Sets>) -> Result<()> {
+        let data = match read_config_no_lock(pool, POOL_META_NAME).await {
+            Ok(data) => data,
+            Err(err) => {
+                if err == Error::ConfigNotFound {
+                    return Ok(());
+                }
+                return Err(err);
+            }
+        };
+        self.load_from_config_data(data)
+    }
+
+    fn encode_config_data(&self) -> Result<Vec<u8>> {
         if self.dont_save {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let mut data = Vec::new();
         data.write_u16::<LittleEndian>(POOL_META_FORMAT)?;
@@ -1295,9 +1311,38 @@ impl PoolMeta {
         let mut buf = Vec::new();
         PersistedPoolMeta::from(self).serialize(&mut Serializer::new(&mut buf))?;
         data.write_all(&buf)?;
+        Ok(data)
+    }
 
+    pub async fn save(&self, pools: Vec<Arc<Sets>>) -> Result<()> {
+        let data = self.encode_config_data()?;
+        if data.is_empty() {
+            return Ok(());
+        }
         for pool in pools {
             save_config(pool, POOL_META_NAME, data.clone()).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn save_no_lock(&self, pools: Vec<Arc<Sets>>) -> Result<()> {
+        let data = self.encode_config_data()?;
+        if data.is_empty() {
+            return Ok(());
+        }
+        for pool in pools {
+            save_config_with_opts(
+                pool,
+                POOL_META_NAME,
+                data.clone(),
+                &ObjectOptions {
+                    max_parity: true,
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await?;
         }
 
         Ok(())
@@ -1971,7 +2016,7 @@ impl ECStore {
             pool_meta.clone()
         };
         let mut latest_pool_meta = PoolMeta::default();
-        latest_pool_meta.load(rebalance_pool, self.pools.clone()).await?;
+        latest_pool_meta.load_no_lock(rebalance_pool).await?;
         if latest_pool_meta.pools.is_empty() {
             latest_pool_meta = current_pool_meta;
         }
@@ -1993,7 +2038,7 @@ impl ECStore {
             latest_pool_meta.queue_buckets(idx, decom_buckets.clone());
         }
 
-        latest_pool_meta.save(self.pools.clone()).await?;
+        latest_pool_meta.save_no_lock(self.pools.clone()).await?;
         {
             let mut pool_meta = self.pool_meta.write().await;
             *pool_meta = latest_pool_meta;
