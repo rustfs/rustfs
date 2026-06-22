@@ -1348,7 +1348,7 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
                     bucket = %bucket,
                     object = %object,
                     tmp_dir = %tmp_dir,
-                    duration_ms = rename_stage_ms as u64,
+                    duration_ms = { rename_stage_ms },
                     write_quorum,
                     state = "slow",
                     "SetDisk commit tail stage is slow"
