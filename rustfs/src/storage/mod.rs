@@ -123,7 +123,7 @@ pub(crate) mod ecstore_global {
 
 #[allow(unused_imports)]
 pub(crate) mod ecstore_layout {
-    pub(crate) use rustfs_ecstore::api::layout::{DisksLayout, EndpointServerPools, Endpoints, PoolEndpoints};
+    pub(crate) use rustfs_ecstore::api::layout::{DisksLayout, EndpointServerPools, Endpoints, PoolEndpoints, SetupType};
 }
 
 pub(crate) mod ecstore_metrics {
@@ -184,6 +184,7 @@ pub(crate) type DiskInfoOptions = ecstore_disk::DiskInfoOptions;
 pub(crate) type DiskResult<T> = ecstore_disk::error::Result<T>;
 pub(crate) type DiskStore = ecstore_disk::DiskStore;
 pub(crate) type ECStore = ecstore_storage::ECStore;
+pub(crate) type EndpointServerPools = ecstore_layout::EndpointServerPools;
 pub(crate) type FileInfoVersions = ecstore_disk::FileInfoVersions;
 pub(crate) type FileReader = ecstore_disk::FileReader;
 pub(crate) type FileWriter = ecstore_disk::FileWriter;
@@ -192,14 +193,16 @@ pub(crate) type MetricType = ecstore_metrics::MetricType;
 pub(crate) type ObjectPartInfo = rustfs_filemeta::ObjectPartInfo;
 pub(crate) type ObjectLockBlockReason = ecstore_bucket::object_lock::objectlock_sys::ObjectLockBlockReason;
 pub(crate) type PolicySys = ecstore_bucket::policy_sys::PolicySys;
+pub(crate) type PoolEndpoints = ecstore_layout::PoolEndpoints;
 pub(crate) type RawFileInfo = rustfs_filemeta::RawFileInfo;
 pub(crate) type ReadMultipleReq = ecstore_disk::ReadMultipleReq;
 pub(crate) type ReadMultipleResp = ecstore_disk::ReadMultipleResp;
 pub(crate) type ReadOptions = ecstore_disk::ReadOptions;
 pub(crate) type RenameDataResp = ecstore_disk::RenameDataResp;
+pub(crate) type SetupType = ecstore_layout::SetupType;
 pub(crate) type StorageError = ecstore_error::StorageError;
-pub(crate) type Error = StorageError;
-pub(crate) type Result<T> = core::result::Result<T, Error>;
+pub(crate) type Error = ecstore_error::Error;
+pub(crate) type Result<T> = ecstore_error::Result<T>;
 pub(crate) type UpdateMetadataOpts = ecstore_disk::UpdateMetadataOpts;
 pub(crate) type VolumeInfo = ecstore_disk::VolumeInfo;
 pub(crate) type WalkDirOptions = ecstore_disk::WalkDirOptions;
@@ -207,6 +210,54 @@ pub(crate) type WriteEncryption = ecstore_rio::WriteEncryption;
 
 pub(crate) async fn get_local_server_property() -> rustfs_madmin::ServerProperties {
     ecstore_admin::get_local_server_property().await
+}
+
+pub(crate) async fn init_background_replication(store: Arc<ECStore>) {
+    ecstore_bucket::replication::init_background_replication(store).await;
+}
+
+pub(crate) fn init_ecstore_config() {
+    ecstore_config::init();
+}
+
+pub(crate) async fn init_global_config_sys(store: Arc<ECStore>) -> Result<()> {
+    ecstore_config::init_global_config_sys(store).await
+}
+
+pub(crate) async fn init_local_disks(endpoint_pools: EndpointServerPools) -> Result<()> {
+    ecstore_storage::init_local_disks(endpoint_pools).await
+}
+
+pub(crate) fn init_lock_clients(endpoint_pools: EndpointServerPools) {
+    ecstore_storage::init_lock_clients(endpoint_pools);
+}
+
+pub(crate) async fn new_global_notification_sys(endpoint_pools: EndpointServerPools) -> Result<()> {
+    ecstore_notification::new_global_notification_sys(endpoint_pools).await
+}
+
+pub(crate) async fn prewarm_local_disk_id_map() {
+    ecstore_storage::prewarm_local_disk_id_map().await;
+}
+
+pub(crate) fn set_global_endpoints(endpoints: Vec<PoolEndpoints>) {
+    ecstore_global::set_global_endpoints(endpoints);
+}
+
+pub(crate) fn set_global_region(region: s3s::region::Region) {
+    ecstore_global::set_global_region(region);
+}
+
+pub(crate) fn set_global_rustfs_port(value: u16) {
+    ecstore_global::set_global_rustfs_port(value);
+}
+
+pub(crate) async fn try_migrate_server_config(store: Arc<ECStore>) {
+    ecstore_config::try_migrate_server_config(store).await;
+}
+
+pub(crate) async fn update_erasure_type(setup_type: SetupType) {
+    ecstore_global::update_erasure_type(setup_type).await;
 }
 
 pub(crate) trait StorageDiskRpcExt {

@@ -103,6 +103,7 @@ EXTERNAL_PRODUCTION_ECSTORE_IMPORT_HITS_FILE="${TMP_DIR}/external_production_ecs
 COMPLETED_EXTERNAL_OWNER_MODULE_ALIAS_HITS_FILE="${TMP_DIR}/completed_external_owner_module_alias_hits.txt"
 COMPLETED_OWNER_BARE_FACADE_IMPORT_HITS_FILE="${TMP_DIR}/completed_owner_bare_facade_import_hits.txt"
 COMPLETED_OWNER_SCATTERED_RAW_FACADE_PATH_HITS_FILE="${TMP_DIR}/completed_owner_scattered_raw_facade_path_hits.txt"
+RUSTFS_STARTUP_OWNER_MODULE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_startup_owner_module_consumer_hits.txt"
 ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_self_facade_path_hits.txt"
 RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE="${TMP_DIR}/rustfs_local_compat_owner_self_path_hits.txt"
 RUSTFS_ROOT_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_compat_relative_consumer_hits.txt"
@@ -1154,6 +1155,20 @@ fi
 
 if [[ -s "$COMPLETED_OWNER_SCATTERED_RAW_FACADE_PATH_HITS_FILE" ]]; then
   report_failure "completed owner and test/fuzz boundaries must keep raw ECStore facade subpaths in explicit import declarations: $(paste -sd '; ' "$COMPLETED_OWNER_SCATTERED_RAW_FACADE_PATH_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::storage::.*ecstore_|^\s*ecstore_[a-z_]+(?:::|,|\})' \
+    rustfs/src/startup_notification.rs \
+    rustfs/src/startup_fs_guard.rs \
+    rustfs/src/startup_services.rs \
+    rustfs/src/startup_server.rs \
+    rustfs/src/startup_storage.rs || true
+) >"$RUSTFS_STARTUP_OWNER_MODULE_CONSUMER_HITS_FILE"
+
+if [[ -s "$RUSTFS_STARTUP_OWNER_MODULE_CONSUMER_HITS_FILE" ]]; then
+  report_failure "RustFS startup runtime consumers must use storage owner symbols instead of ecstore_* modules: $(paste -sd '; ' "$RUSTFS_STARTUP_OWNER_MODULE_CONSUMER_HITS_FILE")"
 fi
 
 (
