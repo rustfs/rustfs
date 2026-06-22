@@ -14,18 +14,12 @@
 
 //! test endpoint index settings
 
-use rustfs_ecstore::api::disk as ecstore_disk;
-use rustfs_ecstore::api::layout as ecstore_layout;
-use rustfs_ecstore::api::storage as ecstore_storage;
+use rustfs_ecstore::api::disk::endpoint::Endpoint;
+use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
+use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
 use std::net::SocketAddr;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
-
-type ECStore = ecstore_storage::ECStore;
-type Endpoint = ecstore_disk::endpoint::Endpoint;
-type EndpointServerPools = ecstore_layout::EndpointServerPools;
-type Endpoints = ecstore_layout::Endpoints;
-type PoolEndpoints = ecstore_layout::PoolEndpoints;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_endpoint_index_settings() -> anyhow::Result<()> {
@@ -78,7 +72,7 @@ async fn test_endpoint_index_settings() -> anyhow::Result<()> {
     }
 
     // test ECStore initialization
-    ecstore_storage::init_local_disks(endpoint_pools.clone()).await?;
+    init_local_disks(endpoint_pools.clone()).await?;
 
     let server_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new()).await?;
