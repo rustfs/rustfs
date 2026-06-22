@@ -5,18 +5,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-runtime-test-ecstore-boundaries`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147`.
-- Based on: API-147 stacked slice.
+- Branch: `overtrue/arch-runtime-crate-ecstore-thin-bridges`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150`.
+- Based on: API-150 stacked slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move external test/e2e ECStore source imports into
-  crate-local `ecstore_test_compat` boundaries.
+- Rust code changes: remove the thin notify/obs/swift/s3select ECStore
+  compatibility bridge files and keep their ECStore source imports at each
+  owner root.
 - CI/script changes: lock completed owner and test/fuzz boundaries against
   bare/glob imports, scattered raw ECStore facade subpaths, and startup
   runtime/root-server/table/S3/app shared/app bucket/app ECStore/admin facade
-  regressions, plus external runtime and test ECStore compatibility bypasses.
-- Docs changes: record the API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148 owner facade cleanup.
+  regressions, plus external runtime, test, fuzz, and storage-owner module
+  ECStore compatibility bypasses, plus runtime crate thin bridge regressions.
+- Docs changes: record the API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151 owner facade cleanup.
 
 ## Phase 0 Tasks
 
@@ -4149,6 +4151,46 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     check, formatting, diff hygiene, Rust risk scan, branch freshness check,
     pre-commit, and three-expert review.
 
+- [x] `API-149` Route fuzz ECStore source imports through a local compatibility boundary.
+  - Do: move direct ECStore facade source imports in bucket validation and path
+    containment fuzz targets into `ecstore_fuzz_compat` wrapper functions.
+  - Acceptance: fuzz targets contain no direct `rustfs_ecstore::api::` source
+    paths outside `ecstore_fuzz_compat.rs`; migration guards reject restoring
+    those bypasses.
+  - Must preserve: bucket/object validation fuzz semantics, meta bucket
+    compatibility checks, object prefix/path component validation, and root
+    containment assertions.
+  - Verification: focused fuzz compile, migration guard, shell syntax check,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit, and three-expert review.
+
+- [x] `API-150` Move storage owner ECStore source imports into a compatibility module.
+  - Do: move the storage owner `ecstore_*` facade source modules out of
+    `rustfs/src/storage/mod.rs` and into `rustfs/src/storage/ecstore_compat.rs`.
+  - Acceptance: `rustfs/src/storage/mod.rs` contains no direct
+    `rustfs_ecstore::api::` source paths, while existing `crate::storage::*`
+    aliases and helper functions keep their public shape.
+  - Must preserve: storage owner type aliases, constants, wrapper functions,
+    disk RPC extension traits, bucket metadata helpers, runtime globals, and
+    startup storage wiring.
+  - Verification: RustFS compile coverage, migration guard, shell syntax check,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit, and three-expert review.
+
+- [x] `API-151` Collapse thin runtime crate ECStore compatibility bridges.
+  - Do: remove the thin `ecstore_compat.rs` files from notify, obs metrics,
+    Swift, and S3 Select, moving their aliases and wrappers to the owner root
+    modules.
+  - Acceptance: those crates no longer declare local `ecstore_compat` modules,
+    while their public/internal owner-root aliases and wrapper functions keep
+    the same call paths for downstream modules.
+  - Must preserve: notify server-config IO, metrics data/quota/replication
+    reads, S3 Select object-reader/error mapping, and Swift bucket metadata and
+    object reader aliases.
+  - Verification: focused runtime crate compile coverage, migration guard,
+    shell syntax check, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit, and three-expert review.
+
 ## Next PRs
 
 1. `pure-move`: continue pruning remaining facade compatibility and owner boundaries.
@@ -4157,13 +4199,27 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-148 moves selected external test/e2e ECStore source imports behind local compatibility files and guards those boundaries. |
-| Migration preservation | pass | Heal, scanner, and e2e tests keep the same aliases/helper calls while only the ECStore source location changes. |
-| Testing/verification | pass | Focused test-target compile, formatting, migration guard, diff hygiene, Rust risk scan, and pre-commit passed for API-148. |
+| Quality/architecture | pass | API-151 removes thin runtime crate ECStore bridge files and keeps the remaining source imports at owner roots. |
+| Migration preservation | pass | Notify, obs metrics, Swift, and S3 Select keep the same owner-root aliases and wrappers for existing consumers. |
+| Testing/verification | pass | Focused runtime crate compile, formatting, migration guard, shell syntax, diff hygiene, Rust risk scan, and pre-commit passed for API-151. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-151 current slice:
+  - `cargo check -p rustfs-notify -p rustfs-obs -p rustfs-s3select-api -p rustfs-protocols`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - Runtime thin bridge scan: passed; notify, obs metrics, Swift, and S3
+    Select no longer declare local `ecstore_compat` modules.
+  - Rust risk scan: no new production unwrap/expect, casts, panic/todo/unsafe,
+    or error-type risks added; changes only move import/source boundaries.
 
 - Issue #660 API-140 current slice:
   - `cargo check --tests -p rustfs`: passed.
@@ -4276,6 +4332,35 @@ Passed before push:
     reference `rustfs_ecstore::api::` only inside `ecstore_test_compat.rs`.
   - Rust risk scan: no new production unwrap/expect, casts, panic/todo/unsafe,
     or error-type risks added; changes only move import/source boundaries.
+
+- Issue #660 API-149 current slice:
+  - `cargo check --manifest-path fuzz/Cargo.toml --bins`: passed; Cargo
+    refreshed the stale fuzz lockfile during verification and the generated
+    lockfile change was not retained.
+  - `cargo fmt --all --manifest-path fuzz/Cargo.toml`: passed.
+  - `cargo fmt --all --check --manifest-path fuzz/Cargo.toml`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - Fuzz ECStore source bypass scan: passed; fuzz targets now reference
+    `rustfs_ecstore::api::` only inside `ecstore_fuzz_compat.rs`.
+  - Rust risk scan: no new production unwrap/expect, casts, panic/todo/unsafe,
+    or error-type risks added; changes only move fuzz import/source boundaries.
+
+- Issue #660 API-150 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - Storage owner direct ECStore source scan: passed; `rustfs/src/storage/mod.rs`
+    contains no direct `rustfs_ecstore::api::` source path.
+  - Rust risk scan: no new production unwrap/expect, casts, panic/todo/unsafe,
+    or error-type risks added; changes only move storage owner import/source
+    boundaries.
 
 - Issue #660 API-139 current slice:
   - `cargo check --tests -p rustfs`: passed.
