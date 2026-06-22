@@ -27,11 +27,6 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 
-use super::table_catalog_storage_compat::{
-    BUCKET_TABLE_CATALOG_META_PREFIX, BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG,
-    BUCKET_TABLE_RESERVED_PREFIX, EcstoreError, RUSTFS_META_BUCKET, StorageError, get_bucket_metadata, get_lock_acquire_timeout,
-    table_catalog_path_hash,
-};
 use bytes::Bytes;
 use datafusion::{
     arrow::datatypes::SchemaRef,
@@ -39,6 +34,10 @@ use datafusion::{
 };
 use http::HeaderMap;
 use metrics::{counter, histogram};
+use rustfs_ecstore::api::{
+    bucket::{metadata as ecstore_metadata, metadata_sys as ecstore_metadata_sys},
+    disk as ecstore_disk, error as ecstore_error, set_disk as ecstore_set_disk,
+};
 use rustfs_filemeta::FileInfo;
 use rustfs_storage_api::{
     HTTPPreconditions, HTTPRangeSpec, ListObjectVersionsInfo as StorageListObjectVersionsInfo,
@@ -56,7 +55,8 @@ use crate::storage::{
     StorageObjectOptions as ObjectOptions, StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
 };
 
-pub(crate) const TABLE_BUCKET_MARKER_CONFIG: &str = BUCKET_TABLE_CONFIG;
+pub(crate) const TABLE_BUCKET_MARKER_CONFIG: &str = ecstore_metadata::BUCKET_TABLE_CONFIG;
+const RUSTFS_META_BUCKET: &str = ecstore_disk::RUSTFS_META_BUCKET;
 pub(crate) const RESERVED_CATALOG_OBJECT_MESSAGE: &str = "Object key is reserved for the table catalog";
 pub(crate) const TABLE_BUCKET_CATALOG_TYPE: &str = "iceberg-rest";
 pub(crate) const TABLE_BUCKET_CONFIG_VERSION: u16 = 1;
@@ -69,7 +69,7 @@ pub(crate) const TABLE_MAINTENANCE_CONFIG_VERSION: u16 = 1;
 pub(crate) const TABLE_EXTERNAL_CATALOG_BRIDGE_VERSION: u16 = 1;
 pub(crate) const TABLE_CATALOG_BACKING_MANIFEST_VERSION: u16 = 1;
 pub(crate) const TABLE_METADATA_FILE_NAME_MAX_LEN: usize = 128;
-pub const TABLE_RESERVED_PREFIX: &str = BUCKET_TABLE_RESERVED_PREFIX;
+pub const TABLE_RESERVED_PREFIX: &str = ecstore_metadata::BUCKET_TABLE_RESERVED_PREFIX;
 const WAREHOUSE_ROOT: &str = "warehouses";
 const NAMESPACE_ROOT: &str = "namespaces";
 const TABLE_ROOT: &str = "tables";
@@ -85,8 +85,8 @@ const TABLE_BUCKET_ENTRY_FILE: &str = "table-bucket.json";
 const NAMESPACE_ENTRY_FILE: &str = "namespace-entry.json";
 const TABLE_ENTRY_FILE: &str = "table-entry.json";
 const VIEW_ENTRY_FILE: &str = "view-entry.json";
-const INTERNAL_CATALOG_ROOT: &str = BUCKET_TABLE_CATALOG_META_PREFIX;
-const TABLE_BUCKET_ROOT: &str = BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX;
+const INTERNAL_CATALOG_ROOT: &str = ecstore_metadata::BUCKET_TABLE_CATALOG_META_PREFIX;
+const TABLE_BUCKET_ROOT: &str = ecstore_metadata::BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX;
 const COMMIT_LOG_ROOT: &str = "commits";
 const COMMIT_IDEMPOTENCY_ROOT: &str = "commit-idempotency";
 const EXTERNAL_CATALOG_ROOT: &str = "external-catalog";
@@ -115,8 +115,10 @@ const ICEBERG_REF_MAX_REF_AGE_MS_FIELD: &str = "max-ref-age-ms";
 
 type CatalogListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
 type CatalogListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
+type EcstoreError = ecstore_error::Error;
 type CatalogObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, EcstoreError>;
 type CatalogWalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
+type StorageError = ecstore_error::StorageError;
 
 pub(crate) trait TableCatalogStorage:
     StorageObjectIO<
@@ -1461,7 +1463,7 @@ impl TableCatalogObjectPaths {
             "{}{}/{MAINTENANCE_ROOT}/{}/{MAINTENANCE_CONFIG_FILE}",
             self.table_entries_prefix(table_bucket, namespace),
             table.as_str(),
-            table_catalog_path_hash(table_id)
+            ecstore_metadata::table_catalog_path_hash(table_id)
         )
     }
 
@@ -1477,8 +1479,8 @@ impl TableCatalogObjectPaths {
             "{}{}/{MAINTENANCE_ROOT}/{}/{MAINTENANCE_JOB_ROOT}/{}.json",
             self.table_entries_prefix(table_bucket, namespace),
             table.as_str(),
-            table_catalog_path_hash(table_id),
-            table_catalog_path_hash(job_id)
+            ecstore_metadata::table_catalog_path_hash(table_id),
+            ecstore_metadata::table_catalog_path_hash(job_id)
         )
     }
 
@@ -1493,7 +1495,7 @@ impl TableCatalogObjectPaths {
             "{}{}/{MAINTENANCE_ROOT}/{}/{MAINTENANCE_LATEST_JOB_FILE}",
             self.table_entries_prefix(table_bucket, namespace),
             table.as_str(),
-            table_catalog_path_hash(table_id)
+            ecstore_metadata::table_catalog_path_hash(table_id)
         )
     }
 
@@ -1508,7 +1510,7 @@ impl TableCatalogObjectPaths {
             "{}{}/{MAINTENANCE_ROOT}/{}/{MAINTENANCE_CURRENT_JOB_FILE}",
             self.table_entries_prefix(table_bucket, namespace),
             table.as_str(),
-            table_catalog_path_hash(table_id)
+            ecstore_metadata::table_catalog_path_hash(table_id)
         )
     }
 
@@ -1517,8 +1519,8 @@ impl TableCatalogObjectPaths {
             "{}{}/{}/{}.json",
             self.table_bucket_root_prefix(table_bucket),
             COMMIT_LOG_ROOT,
-            table_catalog_path_hash(table_id),
-            table_catalog_path_hash(commit_id)
+            ecstore_metadata::table_catalog_path_hash(table_id),
+            ecstore_metadata::table_catalog_path_hash(commit_id)
         )
     }
 
@@ -1527,7 +1529,7 @@ impl TableCatalogObjectPaths {
             "{}{}/{}/",
             self.table_bucket_root_prefix(table_bucket),
             COMMIT_LOG_ROOT,
-            table_catalog_path_hash(table_id)
+            ecstore_metadata::table_catalog_path_hash(table_id)
         )
     }
 
@@ -1536,8 +1538,8 @@ impl TableCatalogObjectPaths {
             "{}{}/{}/{}.json",
             self.table_bucket_root_prefix(table_bucket),
             COMMIT_IDEMPOTENCY_ROOT,
-            table_catalog_path_hash(table_id),
-            table_catalog_path_hash(idempotency_key)
+            ecstore_metadata::table_catalog_path_hash(table_id),
+            ecstore_metadata::table_catalog_path_hash(idempotency_key)
         )
     }
 
@@ -1546,12 +1548,17 @@ impl TableCatalogObjectPaths {
             "{}{}/{}/",
             self.table_bucket_root_prefix(table_bucket),
             COMMIT_IDEMPOTENCY_ROOT,
-            table_catalog_path_hash(table_id)
+            ecstore_metadata::table_catalog_path_hash(table_id)
         )
     }
 
     fn table_bucket_root_prefix(&self, table_bucket: &str) -> String {
-        format!("{}/{}/{}/", self.catalog_root, TABLE_BUCKET_ROOT, table_catalog_path_hash(table_bucket))
+        format!(
+            "{}/{}/{}/",
+            self.catalog_root,
+            TABLE_BUCKET_ROOT,
+            ecstore_metadata::table_catalog_path_hash(table_bucket)
+        )
     }
 }
 
@@ -4031,7 +4038,7 @@ where
             .await
             .map_err(|err| storage_error_to_catalog("create catalog table lock", err))?;
         let guard = lock
-            .get_write_lock(get_lock_acquire_timeout())
+            .get_write_lock(ecstore_set_disk::get_lock_acquire_timeout())
             .await
             .map_err(|err| TableCatalogStoreError::Internal(format!("failed to acquire catalog table lock: {err}")))?;
         Ok(Box::new(guard))
@@ -7002,7 +7009,7 @@ pub fn validate_object_mutation(table_bucket_enabled: bool, object_key: &str) ->
 }
 
 pub(crate) async fn validate_bucket_object_mutation(bucket: &str, object_key: &str) -> Result<(), TableObjectMutationError> {
-    let table_bucket_enabled = get_bucket_metadata(bucket)
+    let table_bucket_enabled = ecstore_metadata_sys::get(bucket)
         .await
         .is_ok_and(|metadata| metadata.table_bucket_enabled());
 
@@ -7410,7 +7417,7 @@ mod tests {
         let bucket = "analytics";
         let namespace = Namespace::parse("analytics.daily_events").unwrap();
         let table = IdentifierSegment::parse("events").unwrap();
-        let bucket_root = format!("s3tables/catalog/table-buckets/{}/", table_catalog_path_hash(bucket));
+        let bucket_root = format!("s3tables/catalog/table-buckets/{}/", ecstore_metadata::table_catalog_path_hash(bucket));
 
         assert_eq!(paths.table_bucket_entry_path(bucket), format!("{bucket_root}table-bucket.json"));
         assert_eq!(

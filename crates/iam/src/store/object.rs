@@ -28,7 +28,7 @@ use futures::future::join_all;
 use rustfs_credentials::get_global_action_cred;
 use rustfs_io_metrics::record_system_path_failure;
 use rustfs_policy::{auth::UserIdentity, policy::PolicyDoc};
-use rustfs_storage_api::{HTTPPreconditions, ListOperations as _, ObjectInfoOrErr as StorageObjectInfoOrErr};
+use rustfs_storage_api::{HTTPPreconditions, ListOperations as _, ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectOperations};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use serde::{Serialize, de::DeserializeOwned};
 use std::sync::{LazyLock, Mutex};
@@ -37,8 +37,6 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::{self, Sender};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
-
-use super::storage_compat::{IamObjectInfo, IamObjectOptions};
 
 pub static IAM_CONFIG_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam"));
 pub static IAM_CONFIG_USERS_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam/users/"));
@@ -58,6 +56,8 @@ pub static IAM_CONFIG_POLICY_DB_GROUPS_PREFIX: LazyLock<String> =
     LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam/policydb/groups/"));
 
 type ObjectInfoOrErr = StorageObjectInfoOrErr<IamObjectInfo, IamStorageError>;
+type IamObjectInfo = <IamStore as ObjectOperations>::ObjectInfo;
+type IamObjectOptions = <IamStore as ObjectOperations>::ObjectOptions;
 
 const IAM_IDENTITY_FILE: &str = "identity.json";
 const IAM_POLICY_FILE: &str = "policy.json";

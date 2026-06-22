@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::startup_storage_compat::{ECStore, EndpointServerPools};
 use crate::{
     config::Config,
     init::{init_buffer_profile_system, init_kms_system},
@@ -29,6 +28,7 @@ use crate::{
     startup_optional_runtime_sidecars::{OptionalRuntimeServices, init_optional_runtime_services},
 };
 use rustfs_common::GlobalReadiness;
+use rustfs_ecstore::api::{layout::EndpointServerPools, storage::ECStore};
 use std::{io::Result, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
