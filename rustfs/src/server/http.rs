@@ -832,13 +832,13 @@ struct ConnectionContext {
 }
 
 #[derive(Clone)]
-struct PathDispatchService<S> {
-    external: S,
-    internode: S,
+struct PathDispatchService<A, B> {
+    external: A,
+    internode: B,
 }
 
-impl<S> PathDispatchService<S> {
-    fn new(external: S, internode: S) -> Self {
+impl<A, B> PathDispatchService<A, B> {
+    fn new(external: A, internode: B) -> Self {
         Self { external, internode }
     }
 
@@ -847,13 +847,15 @@ impl<S> PathDispatchService<S> {
     }
 }
 
-impl<S> Service<HttpRequest<Incoming>> for PathDispatchService<S>
+impl<A, B> Service<HttpRequest<Incoming>> for PathDispatchService<A, B>
 where
-    S: Service<HttpRequest<Incoming>> + Clone + Send + 'static,
-    S::Future: Send + 'static,
+    A: Service<HttpRequest<Incoming>> + Clone + Send + 'static,
+    A::Future: Send + 'static,
+    B: Service<HttpRequest<Incoming>, Response = A::Response, Error = A::Error> + Clone + Send + 'static,
+    B::Future: Send + 'static,
 {
-    type Response = S::Response;
-    type Error = S::Error;
+    type Response = A::Response;
+    type Error = A::Error;
     type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
@@ -1033,7 +1035,7 @@ fn process_connection(
         // identical while giving each path family a named construction boundary.
         // Later batches will trim internode-only middleware without risking drift in
         // the public HTTP stack.
-        let build_stack = |service| {
+        let build_external_stack = |service| {
             ServiceBuilder::new()
                 // NOTE: Both extension types are intentionally inserted to maintain compatibility:
                 // 1. `Option<RemoteAddr>` - Used by existing admin/storage handlers throughout the codebase
@@ -1197,8 +1199,156 @@ fn process_connection(
                 .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
                 .service(service)
         };
-        let external_stack_service = build_stack(external_service);
-        let internode_stack_service = build_stack(internode_service);
+        let build_internode_stack = |service| {
+            ServiceBuilder::new()
+                .layer(AddExtensionLayer::new(remote_addr))
+                .option_layer(remote_addr.map(|ra| AddExtensionLayer::new(ra.0)))
+                .option_layer(trusted_proxy_layer.clone())
+                .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+                .layer(RequestContextLayer)
+                .layer(EmptyBodyContentLengthCompatLayer)
+                .layer(CatchPanicLayer::new())
+                .layer(ReadinessGateLayer::new(readiness.clone()))
+                .layer(KeystoneAuthLayer::new(keystone_auth.clone()))
+                .layer(
+                    TraceLayer::new_for_http()
+                        .make_span_with(|request: &HttpRequest<_>| {
+                            let request_context = request.extensions().get::<crate::storage::request_context::RequestContext>();
+                            let request_id = request_context
+                                .map(|ctx| ctx.request_id.as_str())
+                                .unwrap_or("unknown");
+                            let trace_id = request_context
+                                .and_then(|ctx| ctx.trace_id.as_deref())
+                                .unwrap_or("unknown");
+                            let span_id = request_context
+                                .and_then(|ctx| ctx.span_id.as_deref())
+                                .unwrap_or("unknown");
+
+                            let parent_context = global::get_text_map_propagator(|propagator| {
+                                propagator.extract(&HeaderMapCarrier::new(request.headers()))
+                            });
+
+                            if parent_context.has_active_span() {
+                                let span_ref = parent_context.span();
+                                trace!(
+                                    otel_trace_id = %span_ref.span_context().trace_id(),
+                                    otel_parent_span_id = %span_ref.span_context().span_id(),
+                                    sampled = span_ref.span_context().is_sampled(),
+                                    "Extracted trace context from incoming request headers"
+                                );
+                            } else {
+                                trace!("No trace context found in request headers, will create root span");
+                            }
+                            let client_info = request.extensions().get::<ClientInfo>();
+                            let peer_addr = client_info
+                                .map(|info| info.real_ip.to_string())
+                                .or_else(|| request.extensions().get::<RemoteAddr>().map(|addr| addr.0.to_string()))
+                                .unwrap_or_else(|| "unknown".to_string());
+
+                            let span = tracing::info_span!("http-request",
+                                request_id = %request_id,
+                                trace_id = %trace_id,
+                                span_id = %span_id,
+                                status_code = tracing::field::Empty,
+                                method = %request.method(),
+                                peer_addr = %peer_addr,
+                                uri = %redact_sensitive_uri_query(request.uri()),
+                                version = ?request.version(),
+                                user_agent = tracing::field::Empty,
+                                content_type = tracing::field::Empty,
+                                content_length = tracing::field::Empty,
+                            );
+                            if span.is_disabled() {
+                                return span;
+                            }
+                            if let Err(e) = span.set_parent(parent_context) {
+                                debug!(component = LOG_COMPONENT_SERVER, subsystem = LOG_SUBSYSTEM_HTTP, error = ?e, "Failed to propagate tracing context");
+                            }
+                            for (header_name, header_value) in request.headers() {
+                                let value = header_value.to_str().unwrap_or("invalid");
+                                if header_name == "user-agent" {
+                                    span.record("user_agent", value);
+                                } else if header_name == "content-type" {
+                                    span.record("content_type", value);
+                                } else if header_name == "content-length" {
+                                    span.record("content_length", value);
+                                }
+                            }
+
+                            span
+                        })
+                        .on_request(|request: &HttpRequest<_>, span: &Span| {
+                            let _enter = span.enter();
+                            trace!("HTTP request started");
+                            let method = request_method_label(request.method());
+                            record_active_http_requests(1);
+                            counter!(
+                                METRIC_HTTP_SERVER_REQUESTS_TOTAL,
+                                LABEL_HTTP_METHOD => method
+                            )
+                            .increment(1);
+
+                            if let Some(cl) = request.headers().get("content-length")
+                                && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
+                            {
+                                counter!(METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL).increment(len);
+                                histogram!(
+                                    METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES,
+                                    LABEL_HTTP_METHOD => method
+                                )
+                                .record(len as f64);
+                            }
+                        })
+                        .on_response(trace_on_response)
+                        .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
+                            counter!(METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL).increment(chunk.len() as u64);
+                            #[cfg(feature = "tracing-chunk-debug")]
+                            {
+                                let _enter = span.enter();
+                                debug!(chunk_bytes = chunk.len(), duration_ms = duration_ms(latency), "HTTP response body chunk sent");
+                            }
+                            #[cfg(not(feature = "tracing-chunk-debug"))]
+                            {
+                                let _ = (latency, span);
+                            }
+                        })
+                        .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, span: &Span| {
+                            #[cfg(feature = "tracing-chunk-debug")]
+                            {
+                                let _enter = span.enter();
+                                debug!(duration_ms = duration_ms(stream_duration), "HTTP response stream closed");
+                            }
+                            #[cfg(not(feature = "tracing-chunk-debug"))]
+                            {
+                                let _ = (_trailers, stream_duration, span);
+                            }
+                        })
+                        .on_failure(|error, latency: Duration, span: &Span| {
+                            let _enter = span.enter();
+                            record_active_http_requests(-1);
+                            counter!(
+                                METRIC_HTTP_SERVER_FAILURES_TOTAL,
+                                LABEL_HTTP_STATUS_CLASS => "transport"
+                            )
+                            .increment(1);
+                            trace!(error = ?error, duration_ms = duration_ms(latency), "HTTP request failure captured by trace layer");
+                        }),
+                )
+                .layer(PropagateRequestIdLayer::x_request_id())
+                .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config.clone())))
+                .layer(PathCategoryInjectionLayer)
+                .layer(S3ErrorMessageCompatLayer)
+                .layer(ObjectAttributesEtagFixLayer)
+                .layer(ConditionalCorsLayer::new())
+                .option_layer(if is_console { Some(RedirectLayer) } else { None })
+                .layer(BodylessStatusFixLayer)
+                .layer(HeadRequestBodyFixLayer)
+                .layer(PublicHealthEndpointLayer)
+                .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
+                .service(service)
+        };
+        let external_stack_service = build_external_stack(external_service);
+        let internode_stack_service = build_internode_stack(internode_service);
         let hybrid_service = PathDispatchService::new(external_stack_service, internode_stack_service);
 
         let hybrid_service = TowerToHyperService::new(hybrid_service);
@@ -1721,11 +1871,11 @@ mod tests {
         let service =
             PathDispatchService::new(MarkerService::new("external", Arc::clone(&hits)), MarkerService::new("internode", hits));
 
-        assert!(PathDispatchService::<MarkerService>::is_internode_path(&format!(
+        assert!(PathDispatchService::<MarkerService, MarkerService>::is_internode_path(&format!(
             "{}/put_file_stream",
             crate::server::RPC_PREFIX
         )));
-        assert!(!PathDispatchService::<MarkerService>::is_internode_path("/bucket/object.txt"));
+        assert!(!PathDispatchService::<MarkerService, MarkerService>::is_internode_path("/bucket/object.txt"));
         let _ = service;
     }
 }
