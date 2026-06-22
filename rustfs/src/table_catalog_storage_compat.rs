@@ -14,7 +14,10 @@
 
 use std::{sync::Arc, time::Duration};
 
-use rustfs_ecstore::api::{bucket as ecstore_bucket, disk as ecstore_disk, error as ecstore_error, set_disk as ecstore_set_disk};
+use rustfs_ecstore::api::bucket as ecstore_bucket;
+use rustfs_ecstore::api::disk as ecstore_disk;
+use rustfs_ecstore::api::error as ecstore_error;
+use rustfs_ecstore::api::set_disk as ecstore_set_disk;
 
 pub(crate) const BUCKET_TABLE_CATALOG_META_PREFIX: &str = ecstore_bucket::metadata::BUCKET_TABLE_CATALOG_META_PREFIX;
 pub(crate) const BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX: &str =

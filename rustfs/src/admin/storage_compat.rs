@@ -15,12 +15,21 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
-use rustfs_ecstore::api::{
-    bucket as ecstore_bucket, capacity as ecstore_capacity, client as ecstore_client, config as ecstore_config,
-    data_usage as ecstore_data_usage, disk as ecstore_disk, error as ecstore_error, global as ecstore_global,
-    layout as ecstore_layout, metrics as ecstore_metrics, notification as ecstore_notification, rebalance as ecstore_rebalance,
-    rpc as ecstore_rpc, storage as ecstore_storage, tier as ecstore_tier,
-};
+use rustfs_ecstore::api::bucket as ecstore_bucket;
+use rustfs_ecstore::api::capacity as ecstore_capacity;
+use rustfs_ecstore::api::client as ecstore_client;
+use rustfs_ecstore::api::config as ecstore_config;
+use rustfs_ecstore::api::data_usage as ecstore_data_usage;
+use rustfs_ecstore::api::disk as ecstore_disk;
+use rustfs_ecstore::api::error as ecstore_error;
+use rustfs_ecstore::api::global as ecstore_global;
+use rustfs_ecstore::api::layout as ecstore_layout;
+use rustfs_ecstore::api::metrics as ecstore_metrics;
+use rustfs_ecstore::api::notification as ecstore_notification;
+use rustfs_ecstore::api::rebalance as ecstore_rebalance;
+use rustfs_ecstore::api::rpc as ecstore_rpc;
+use rustfs_ecstore::api::storage as ecstore_storage;
+use rustfs_ecstore::api::tier as ecstore_tier;
 
 pub(crate) const RUSTFS_META_BUCKET: &str = crate::admin::storage_compat::ecstore_disk::RUSTFS_META_BUCKET;
 pub(crate) const STORAGE_CLASS_SUB_SYS: &str = crate::admin::storage_compat::ecstore_config::com::STORAGE_CLASS_SUB_SYS;
