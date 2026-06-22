@@ -36,7 +36,8 @@ time = { workspace = true }
 moka = { workspace = true }
 rustfs-credentials = { workspace = true }
 rustfs-policy = { workspace = true }
-rustfs-utils = { workspace = true }
+rustfs-utils = { workspace = true, features = ["egress"] }
+url = { workspace = true }
 # Middleware dependencies
 tower = { workspace = true }
 http = { workspace = true }

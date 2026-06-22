@@ -28,7 +28,7 @@ use std::sync::{
 use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
 
-use super::storage_compat::DiskStore;
+use super::DiskStore;
 
 const LOG_COMPONENT_HEAL: &str = "heal";
 const LOG_SUBSYSTEM_ERASURE_HEALER: &str = "erasure_healer";

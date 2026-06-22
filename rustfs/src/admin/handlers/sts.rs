@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::storage_compat::utils::serialize;
+use super::super::ecstore_utils::serialize;
 use super::is_admin::IsAdminHandler;
 use crate::{
     admin::{
