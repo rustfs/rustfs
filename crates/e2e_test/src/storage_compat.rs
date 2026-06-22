@@ -14,7 +14,9 @@
 
 #![allow(dead_code, unused_imports)]
 
-use rustfs_ecstore::api::{bucket as ecstore_bucket, disk as ecstore_disk, rpc as ecstore_rpc};
+use rustfs_ecstore::api::bucket as ecstore_bucket;
+use rustfs_ecstore::api::disk as ecstore_disk;
+use rustfs_ecstore::api::rpc as ecstore_rpc;
 
 pub(crate) type BucketTargetSys = ecstore_bucket::bucket_target_sys::BucketTargetSys;
 pub(crate) type TonicInterceptor = ecstore_rpc::TonicInterceptor;
