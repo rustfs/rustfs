@@ -12,4 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use crate::admin::storage_compat::*;
+pub(crate) use crate::admin::storage_compat::{
+    Error, STORAGE_CLASS_SUB_SYS, get_global_notification_sys, read_admin_config, read_admin_config_without_migrate,
+    save_admin_config, set_global_storage_class,
+};
+
+#[cfg(test)]
+pub(crate) use crate::admin::storage_compat::init_admin_config_defaults;
+
+#[cfg(test)]
+pub(crate) mod metadata {
+    pub(crate) use crate::admin::storage_compat::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG};
+}
+
+pub(crate) mod storageclass {
+    pub(crate) use crate::admin::storage_compat::storageclass::lookup_config;
+}

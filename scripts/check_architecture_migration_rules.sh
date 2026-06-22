@@ -83,6 +83,7 @@ RUSTFS_ROOT_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_root_bucke
 RUSTFS_ROOT_RUNTIME_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_root_runtime_storage_compat_module_hits.txt"
 RUSTFS_ROOT_CONSUMER_COMPAT_HITS_FILE="${TMP_DIR}/rustfs_root_consumer_compat_hits.txt"
 RUSTFS_OWNER_COMPAT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_owner_compat_consumer_hits.txt"
+RUSTFS_LOCAL_COMPAT_GLOB_EXPORT_HITS_FILE="${TMP_DIR}/rustfs_local_compat_glob_export_hits.txt"
 RUSTFS_ADMIN_CONFIG_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_admin_config_storage_compat_module_hits.txt"
 RUSTFS_STORAGE_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_storage_bucket_storage_compat_module_hits.txt"
 RUSTFS_STORAGE_OWNER_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_compat_reexport_hits.txt"
@@ -845,6 +846,20 @@ fi
 
 if [[ -s "$RUSTFS_OWNER_COMPAT_CONSUMER_HITS_FILE" ]]; then
   report_failure "RustFS owner compatibility consumers must route through their local compatibility boundary: $(paste -sd '; ' "$RUSTFS_OWNER_COMPAT_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --no-heading 'pub\(crate\)\s+use\s+crate::(?:admin|app|storage)::storage_compat::\*;' \
+    rustfs/src/admin/router_storage_compat.rs \
+    rustfs/src/admin/service/storage_compat.rs \
+    rustfs/src/app/context/storage_compat.rs \
+    rustfs/src/storage/core_storage_compat.rs \
+    rustfs/src/storage/rpc/storage_compat.rs || true
+) >"$RUSTFS_LOCAL_COMPAT_GLOB_EXPORT_HITS_FILE"
+
+if [[ -s "$RUSTFS_LOCAL_COMPAT_GLOB_EXPORT_HITS_FILE" ]]; then
+  report_failure "Narrowed local compatibility boundaries must use explicit re-exports: $(paste -sd '; ' "$RUSTFS_LOCAL_COMPAT_GLOB_EXPORT_HITS_FILE")"
 fi
 
 (
