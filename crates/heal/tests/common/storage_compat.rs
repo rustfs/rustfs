@@ -16,9 +16,11 @@
 
 use std::sync::Arc;
 
-use rustfs_ecstore::api::{
-    bucket as ecstore_bucket, disk as ecstore_disk, error as ecstore_error, layout as ecstore_layout, storage as ecstore_storage,
-};
+use rustfs_ecstore::api::bucket as ecstore_bucket;
+use rustfs_ecstore::api::disk as ecstore_disk;
+use rustfs_ecstore::api::error as ecstore_error;
+use rustfs_ecstore::api::layout as ecstore_layout;
+use rustfs_ecstore::api::storage as ecstore_storage;
 
 pub(crate) type DiskStore = ecstore_disk::DiskStore;
 pub(crate) type ECStore = ecstore_storage::ECStore;
