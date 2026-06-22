@@ -841,6 +841,10 @@ impl<S> PathDispatchService<S> {
     fn new(external: S, internode: S) -> Self {
         Self { external, internode }
     }
+
+    fn is_internode_path(path: &str) -> bool {
+        path.starts_with(crate::server::RPC_PREFIX)
+    }
 }
 
 impl<S> Service<HttpRequest<Incoming>> for PathDispatchService<S>
@@ -860,7 +864,7 @@ where
     }
 
     fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
-        if req.uri().path().starts_with(crate::server::RPC_PREFIX) {
+        if Self::is_internode_path(req.uri().path()) {
             let mut internode = self.internode.clone();
             Box::pin(async move { internode.call(req).await })
         } else {
@@ -1424,12 +1428,13 @@ mod tests {
     use super::*;
     use crate::server::compress::RequestPathCategory;
     use bytes::Bytes;
-    use http::HeaderMap;
     use http::Request as HttpRequest;
-    use http_body_util::Empty;
+    use http::{HeaderMap, StatusCode};
+    use http_body_util::{Empty, Full};
     use opentelemetry::propagation::Extractor;
     use std::convert::Infallible;
     use std::future::Ready;
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use tower::{Layer, Service, ServiceBuilder};
 
@@ -1647,6 +1652,36 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct MarkerService {
+        name: &'static str,
+        hits: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl MarkerService {
+        fn new(name: &'static str, hits: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self { name, hits }
+        }
+    }
+
+    impl<ReqBody> Service<HttpRequest<ReqBody>> for MarkerService {
+        type Response = Response<Full<Bytes>>;
+        type Error = Infallible;
+        type Future = Ready<std::result::Result<Response<Full<Bytes>>, Infallible>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: HttpRequest<ReqBody>) -> Self::Future {
+            self.hits.lock().expect("hits").push(self.name);
+            std::future::ready(Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::from(Bytes::from_static(self.name.as_bytes())))
+                .expect("response")))
+        }
+    }
+
     #[test]
     fn test_service_builder_order_regression_for_response_extensions() {
         let request = HttpRequest::builder().uri("/bucket/archive.zip").body(()).expect("request");
@@ -1674,5 +1709,19 @@ mod tests {
             fixed_response.headers().get("x-category-seen").and_then(|v| v.to_str().ok()),
             Some("true")
         );
+    }
+
+    #[test]
+    fn path_dispatch_service_identifies_rpc_prefix() {
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let service =
+            PathDispatchService::new(MarkerService::new("external", Arc::clone(&hits)), MarkerService::new("internode", hits));
+
+        assert!(PathDispatchService::<MarkerService>::is_internode_path(&format!(
+            "{}/put_file_stream",
+            crate::server::RPC_PREFIX
+        )));
+        assert!(!PathDispatchService::<MarkerService>::is_internode_path("/bucket/object.txt"));
+        let _ = service;
     }
 }
