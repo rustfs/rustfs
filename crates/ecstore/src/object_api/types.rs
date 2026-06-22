@@ -25,6 +25,7 @@ pub struct ObjectOptions {
     pub skip_free_version: bool,
 
     pub data_movement: bool,
+    pub raw_data_movement_read: bool,
     pub src_pool_idx: usize,
     pub user_defined: HashMap<String, String>,
     pub preserve_etag: Option<String>,

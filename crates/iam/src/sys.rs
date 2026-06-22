@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::storage_compat::{
+    notify_iam_delete_policy, notify_iam_delete_service_account, notify_iam_delete_user, notify_iam_load_group,
+    notify_iam_load_policy, notify_iam_load_policy_mapping, notify_iam_load_service_account, notify_iam_load_user,
+};
 use crate::error::Error as IamError;
 use crate::error::is_err_no_such_account;
 use crate::error::is_err_no_such_temp_account;
@@ -19,10 +23,6 @@ use crate::error::{Error, Result};
 use crate::manager::extract_jwt_claims;
 use crate::manager::get_default_policyes;
 use crate::manager::{IamCache, IamSyncMetricsSnapshot};
-use crate::storage_compat::{
-    notify_iam_delete_policy, notify_iam_delete_service_account, notify_iam_delete_user, notify_iam_load_group,
-    notify_iam_load_policy, notify_iam_load_policy_mapping, notify_iam_load_service_account, notify_iam_load_user,
-};
 use crate::store::GroupInfo;
 use crate::store::MappedPolicy;
 use crate::store::Store;
@@ -1358,7 +1358,10 @@ mod tests {
     use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
     use rustfs_policy::policy::policy_uses_existing_object_tag_conditions;
     use serde_json::Value;
-    use std::collections::{HashMap, HashSet};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::{Arc, Mutex},
+    };
     use time::OffsetDateTime;
 
     #[test]
@@ -1404,6 +1407,16 @@ mod tests {
     struct StsTestMockStore {
         /// When true, parent user has no groups and no mapped policies (empty `policy_db_get`).
         empty_policies: bool,
+        saved_sts_users: Arc<Mutex<HashMap<String, UserIdentity>>>,
+    }
+
+    impl StsTestMockStore {
+        fn new(empty_policies: bool) -> Self {
+            Self {
+                empty_policies,
+                saved_sts_users: Arc::new(Mutex::new(HashMap::new())),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -1426,11 +1439,15 @@ mod tests {
 
         async fn save_user_identity(
             &self,
-            _name: &str,
+            name: &str,
             _user_type: UserType,
-            _item: UserIdentity,
+            item: UserIdentity,
             _ttl: Option<usize>,
         ) -> Result<()> {
+            self.saved_sts_users
+                .lock()
+                .expect("saved_sts_users mutex poisoned")
+                .insert(name.to_string(), item);
             Ok(())
         }
 
@@ -1438,8 +1455,13 @@ mod tests {
             Err(Error::InvalidArgument)
         }
 
-        async fn load_user_identity(&self, _name: &str, _user_type: UserType) -> Result<UserIdentity> {
-            Err(Error::InvalidArgument)
+        async fn load_user_identity(&self, name: &str, _user_type: UserType) -> Result<UserIdentity> {
+            self.saved_sts_users
+                .lock()
+                .expect("saved_sts_users mutex poisoned")
+                .get(name)
+                .cloned()
+                .ok_or_else(|| Error::NoSuchUser(name.to_string()))
         }
 
         async fn load_user(&self, name: &str, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()> {
@@ -1647,7 +1669,7 @@ mod tests {
     async fn test_new_service_account_without_expiration_omits_exp_claim() {
         ensure_test_global_credentials();
 
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -1670,7 +1692,7 @@ mod tests {
     async fn test_update_service_account_updates_exp_claim() {
         ensure_test_global_credentials();
 
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -1724,7 +1746,7 @@ mod tests {
     async fn test_update_service_account_adds_exp_claim_to_non_expiring_account() {
         ensure_test_global_credentials();
 
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -1766,7 +1788,7 @@ mod tests {
     async fn test_site_replicator_update_requires_explicit_internal_allowance() {
         ensure_test_global_credentials();
 
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -1832,7 +1854,7 @@ mod tests {
     async fn test_created_access_token_authorizes_with_parent_policy() {
         ensure_test_global_credentials();
 
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -1913,7 +1935,7 @@ mod tests {
     async fn test_created_sts_credentials_authorize_with_session_token_claims() {
         ensure_test_global_credentials();
 
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2017,7 +2039,7 @@ mod tests {
     /// would be denied.
     #[tokio::test]
     async fn test_sts_groups_fallback_temp_creds_receive_parent_group_policies() {
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2046,7 +2068,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sts_claim_policy_resolves_custom_canned_policy() {
-        let store = StsTestMockStore { empty_policies: true };
+        let store = StsTestMockStore::new(true);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2090,7 +2112,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sts_claim_policy_ignores_unsafe_and_missing_policy_names() {
-        let store = StsTestMockStore { empty_policies: true };
+        let store = StsTestMockStore::new(true);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2137,7 +2159,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sts_claim_policy_custom_canned_policy_does_not_grant_other_actions() {
-        let store = StsTestMockStore { empty_policies: true };
+        let store = StsTestMockStore::new(true);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2181,7 +2203,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sts_claim_policy_builtin_policy_remains_compatible() {
-        let store = StsTestMockStore { empty_policies: true };
+        let store = StsTestMockStore::new(true);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2211,7 +2233,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sts_claim_policy_missing_policy_denies() {
-        let store = StsTestMockStore { empty_policies: true };
+        let store = StsTestMockStore::new(true);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2243,7 +2265,7 @@ mod tests {
     /// so session policy Deny cannot be bypassed (see PR #2250 review).
     #[tokio::test]
     async fn test_sts_deny_only_session_policy_deny_blocks_when_iam_policies_empty() {
-        let store = StsTestMockStore { empty_policies: true };
+        let store = StsTestMockStore::new(true);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2283,7 +2305,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sts_deny_only_session_policy_allow_when_no_deny_on_action() {
-        let store = StsTestMockStore { empty_policies: true };
+        let store = StsTestMockStore::new(true);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2327,7 +2349,7 @@ mod tests {
     /// may miss users on follower nodes.
     #[tokio::test]
     async fn test_load_user_notification_populates_user_and_policy_caches() {
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2348,7 +2370,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_group_notification_populates_new_membership_entry() {
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2370,7 +2392,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sts_policy_mapping_notification_updates_sts_policy_cache() {
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2389,7 +2411,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_user_notification_cleans_related_cache_state() {
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2455,7 +2477,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_key_propagates_cache_miss_load_failure() {
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2466,7 +2488,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prepare_auth_eval_matches_prepare_sts_auth_for_parent_policy_fallback() {
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2494,7 +2516,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prepare_auth_detects_existing_object_tag_in_session_policy() {
-        let store = StsTestMockStore { empty_policies: true };
+        let store = StsTestMockStore::new(true);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
         let sts_access_key = "sts-session-tag-test-user";
@@ -2611,7 +2633,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prepare_auth_detects_existing_object_tag_in_encoded_session_policy() {
-        let store = StsTestMockStore { empty_policies: true };
+        let store = StsTestMockStore::new(true);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
         let sts_access_key = "sts-session-tag-encoded-test-user";
@@ -2661,7 +2683,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prepare_auth_service_account_inherited_ignores_session_policy_tag_hint() {
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2722,7 +2744,7 @@ mod tests {
     /// must still be returned.
     #[tokio::test]
     async fn test_policy_db_get_skips_nonexistent_groups() {
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2743,7 +2765,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_info_policy_returns_policy_as_json_object() {
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 

@@ -20,8 +20,8 @@ use crate::server::cors;
 use crate::server::hybrid::HybridBody;
 use crate::server::{
     ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX,
-    MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, active_http_requests, collect_dependency_readiness_report,
-    has_path_prefix, is_admin_path, is_table_catalog_path,
+    MINIO_ADMIN_V3_PREFIX, MINIO_HEALTH_LIVE_PATH, MINIO_HEALTH_READY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX,
+    active_http_requests, collect_dependency_readiness_report, has_path_prefix, is_admin_path, is_table_catalog_path,
 };
 use crate::storage::apply_cors_headers;
 use crate::storage::request_context::{
@@ -883,8 +883,8 @@ fn resolve_public_health_probe(method: &Method, path: &str) -> Option<HealthProb
     }
 
     match path {
-        HEALTH_PREFIX | HEALTH_COMPAT_LIVE_PATH => Some(HealthProbe::Liveness),
-        HEALTH_READY_PATH => Some(HealthProbe::Readiness),
+        HEALTH_PREFIX | HEALTH_COMPAT_LIVE_PATH | MINIO_HEALTH_LIVE_PATH => Some(HealthProbe::Liveness),
+        HEALTH_READY_PATH | MINIO_HEALTH_READY_PATH => Some(HealthProbe::Readiness),
         _ => None,
     }
 }
@@ -1279,8 +1279,15 @@ impl ConditionalCorsLayer {
     }
 
     /// Exact paths that should be excluded from being treated as S3 paths.
-    const EXCLUDED_EXACT_PATHS: &'static [&'static str] =
-        &["/health", "/health/live", "/health/ready", "/profile/cpu", "/profile/memory"];
+    const EXCLUDED_EXACT_PATHS: &'static [&'static str] = &[
+        "/health",
+        "/health/live",
+        "/health/ready",
+        "/minio/health/live",
+        "/minio/health/ready",
+        "/profile/cpu",
+        "/profile/memory",
+    ];
 
     fn is_s3_path(path: &str) -> bool {
         // Exclude Admin, Console, RPC, and configured special paths
@@ -1856,6 +1863,59 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn public_health_endpoint_layer_handles_minio_health_live_path() {
+        async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
+            let inner = CountingHybridService::default();
+            let calls = inner.calls();
+            let mut service = PublicHealthEndpointLayer.layer(inner);
+
+            let response = service
+                .call(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(MINIO_HEALTH_LIVE_PATH)
+                        .body(Full::<Bytes>::from(Bytes::new()))
+                        .expect("request"),
+                )
+                .await
+                .expect("health response");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn public_health_endpoint_layer_handles_minio_health_ready_head_before_inner_service() {
+        async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
+            let inner = CountingHybridService::default();
+            let calls = inner.calls();
+            let mut service = PublicHealthEndpointLayer.layer(inner);
+
+            let response = service
+                .call(
+                    Request::builder()
+                        .method(Method::HEAD)
+                        .uri(MINIO_HEALTH_READY_PATH)
+                        .body(Full::<Bytes>::from(Bytes::new()))
+                        .expect("request"),
+                )
+                .await
+                .expect("health response");
+
+            assert!(response.status() == StatusCode::OK || response.status() == StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
+            assert!(body.is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn public_health_endpoint_layer_forwards_unknown_health_path_when_endpoint_disabled() {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("false"))], async {
             let inner = CountingHybridService::default();
@@ -1867,6 +1927,31 @@ mod tests {
                     Request::builder()
                         .method(Method::GET)
                         .uri("/health/live")
+                        .body(Full::<Bytes>::from(Bytes::new()))
+                        .expect("request"),
+                )
+                .await
+                .expect("inner response");
+
+            assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn public_health_endpoint_layer_forwards_minio_health_alias_when_endpoint_disabled() {
+        async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("false"))], async {
+            let inner = CountingHybridService::default();
+            let calls = inner.calls();
+            let mut service = PublicHealthEndpointLayer.layer(inner);
+
+            let response = service
+                .call(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(MINIO_HEALTH_LIVE_PATH)
                         .body(Full::<Bytes>::from(Bytes::new()))
                         .expect("request"),
                 )

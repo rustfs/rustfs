@@ -93,7 +93,7 @@ use std::{
 };
 use time::OffsetDateTime;
 use tokio::select;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
@@ -188,6 +188,18 @@ pub struct ECStore {
     pub pool_meta: RwLock<PoolMeta>,
     pub rebalance_meta: RwLock<Option<RebalanceMeta>>,
     pub decommission_cancelers: RwLock<Vec<Option<CancellationToken>>>,
+    /// Serializes rebalance/decommission start transitions.
+    ///
+    /// Lock order: acquire `start_gate` before `pool_meta`, `rebalance_meta`,
+    /// or `decommission_cancelers`. The guarded sections may perform bounded
+    /// async metadata work so check/init/start cannot race across operations.
+    pub(crate) start_gate: Mutex<()>,
+    /// Serializes full-document pool metadata saves.
+    ///
+    /// Lock order: acquire `pool_meta_save_gate` without holding `pool_meta`.
+    /// The saver then clones the latest `pool_meta` under a short read lock and
+    /// releases it before awaiting disk writes.
+    pub(crate) pool_meta_save_gate: Mutex<()>,
 
     // Phase 2 migration pending - do not use directly.
     /// Local disk maps (migrated from GLOBAL_LOCAL_DISK_MAP/ID_MAP/SET_DRIVES)

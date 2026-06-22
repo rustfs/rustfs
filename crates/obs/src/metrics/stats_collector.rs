@@ -20,16 +20,16 @@
 //! RustFS internal sources (storage layer, bucket monitor, system info)
 //! and convert them to the Stats structs used by collectors.
 
+use super::super::storage_compat::{
+    load_obs_data_usage_from_backend, obs_bucket_quota_limit_bytes, obs_bucket_replication_bandwidth_stats,
+    obs_bucket_replication_detail_stats, obs_ilm_runtime_snapshot, obs_site_replication_stats, obs_total_usable_capacity_bytes,
+    obs_total_usable_capacity_free_bytes, resolve_obs_object_store_handle,
+};
 use crate::metrics::collectors::{
     BucketReplicationBandwidthStats, BucketReplicationStats, BucketStats, BucketUsageStats, ClusterConfigStats,
     ClusterHealthStats, ClusterStats, ClusterUsageStats, CpuStats, DiskStats, DriveCountStats, DriveDetailedStats,
     ErasureSetStats, HostNetworkStats, IamStats, IlmStats, MemoryStats, NetworkStats, ProcessStats, ProcessStatusType,
     ReplicationStats, ResourceStats, ScannerStats,
-};
-use crate::storage_compat::{
-    load_obs_data_usage_from_backend, obs_bucket_quota_limit_bytes, obs_bucket_replication_bandwidth_stats,
-    obs_bucket_replication_detail_stats, obs_ilm_runtime_snapshot, obs_site_replication_stats, obs_total_usable_capacity_bytes,
-    obs_total_usable_capacity_free_bytes, resolve_obs_object_store_handle,
 };
 use chrono::Utc;
 use rustfs_common::heal_channel::HealScanMode;

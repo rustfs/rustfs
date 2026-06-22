@@ -225,6 +225,7 @@ impl ECStore {
                                         "Preserved stopped rebalance status"
                                     );
                                 } else {
+                                    pool_stat.info.stopping = false;
                                     apply_rebalance_terminal_event(
                                         &mut pool_stat.info.status,
                                         &mut pool_stat.info.end_time,

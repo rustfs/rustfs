@@ -764,7 +764,9 @@ message ReloadPoolMetaResponse {
   optional string error_info = 2;
 }
 
-message StopRebalanceRequest {}
+message StopRebalanceRequest {
+  string expected_rebalance_id = 1;
+}
 
 message StopRebalanceResponse {
   bool success = 1;

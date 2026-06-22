@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use crate::storage::storage_compat::{
+pub(crate) use super::storage_compat::{
     BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_VERSIONING_CONFIG,
     BUCKET_WEBSITE_CONFIG, BucketVersioningSys, ECStore, Error, GetObjectReader, OBJECT_LOCK_CONFIG, ObjectInfo, ObjectOptions,
     PolicySys, PutObjReader, Result, StorageError, StorageReplicationConfigExt, StorageVersioningConfigExt, WriteEncryption,
@@ -25,7 +25,7 @@ pub(crate) use crate::storage::storage_compat::{
 };
 
 #[cfg(test)]
-pub(crate) use crate::storage::storage_compat::{
+pub(crate) use super::storage_compat::{
     BucketMetadata, DEFAULT_READ_BUFFER_SIZE, bucket_metadata_sys_initialized, get_global_bucket_metadata_sys,
     set_bucket_metadata,
 };

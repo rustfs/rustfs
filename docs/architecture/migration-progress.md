@@ -5,16 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-local-compat-explicit-exports`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103`.
-- Based on: latest `main` after the API-102 merge.
+- Branch: `overtrue/arch-standalone-crate-compat-relative-consumers`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114`.
+- Based on: API-114 slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: narrow selected local compatibility boundaries from glob
-  re-exports to explicit re-exports.
-- CI/script changes: guard narrowed local compatibility boundaries against
-  restoring glob re-exports.
-- Docs changes: record the API-103 local compatibility export cleanup.
+- Rust code changes: collapse standalone scanner/IAM/observability/S3 Select/e2e
+  compatibility consumer paths into relative owner paths.
+- CI/script changes: guard selected standalone crate local consumers
+  against crate-qualified compatibility paths.
+- Docs changes: record the API-115 standalone crate local compatibility consumer
+  cleanup.
 
 ## Phase 0 Tasks
 
@@ -476,6 +477,164 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     compatibility glob-export scan, migration and layer guards, formatting,
     diff hygiene, Rust risk scan, pre-commit quality gate, and three-expert
     review.
+- [x] `API-104` Narrow remaining local compatibility re-exports.
+  - Completed slice: replace the remaining admin handler and app usecase local
+    compatibility glob re-exports with explicit re-export lists.
+  - Acceptance: no narrowed RustFS local compatibility boundary restores a glob
+    re-export from its owner `storage_compat.rs` facade; migration rules reject
+    regressions across all narrowed files.
+  - Must preserve: admin handler config, bucket metadata, site replication,
+    tier, rebalance, metrics, heal, quota, and object-zip behavior; app bucket,
+    object, multipart, admin, lifecycle transition, quota, object-lock, and
+    replication usecase behavior.
+  - Verification: RustFS test-target compile coverage, narrowed local
+    compatibility glob-export scan, migration and layer guards, formatting,
+    diff hygiene, Rust risk scan, pre-commit quality gate, and three-expert
+    review.
+- [x] `API-105` Guard root compatibility facade aliases.
+  - Completed slice: route the S3 API storage compatibility ETag helper through
+    a local ECStore client module alias and add a repository-wide storage
+    compatibility guard against scattered raw ECStore facade paths.
+  - Acceptance: storage compatibility boundaries may import ECStore facade
+    modules as local `ecstore_*` aliases, but no compatibility wrapper body or
+    signature may reintroduce a scattered raw `rustfs_ecstore::api::...` path.
+  - Must preserve: S3 API ETag conversion behavior and all existing
+    compatibility module import boundaries.
+  - Verification: RustFS test-target compile coverage, full storage
+    compatibility raw-facade residual scan, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, pre-commit quality gate, and
+    three-expert review.
+- [x] `API-106` Split compatibility facade imports.
+  - Completed slice: replace grouped `rustfs_ecstore::api::{...}` imports
+    across storage compatibility boundaries with explicit per-module
+    `ecstore_*` aliases and extend migration guards to reject grouped facade
+    imports.
+  - Acceptance: storage compatibility boundaries keep every ECStore facade
+    module dependency visible as its own local alias, and wrapper bodies or
+    signatures still cannot reintroduce scattered raw
+    `rustfs_ecstore::api::...` paths.
+  - Must preserve: all compatibility wrapper bodies, public alias names,
+    storage/admin/app/runtime/edge/test/fuzz behavior, and API surface.
+  - Verification: RustFS test-target compile coverage, grouped-import and
+    raw-facade residual scans, migration and layer guards, formatting, diff
+    hygiene, Rust risk scan, pre-commit quality gate, and three-expert review.
+- [x] `API-107` Collapse compatibility facade self references.
+  - Completed slice: replace crate-qualified app/admin
+    `storage_compat::ecstore_*` self references with local `ecstore_*` aliases
+    at the root boundary and `super::ecstore_*` paths inside nested
+    compatibility modules.
+  - Acceptance: RustFS app/admin compatibility boundaries no longer route
+    wrapper bodies and aliases through their own crate-qualified
+    `storage_compat::ecstore_*` paths; migration rules reject regressions.
+  - Must preserve: app bucket/lifecycle/object-lock/replication helper
+    behavior, admin bucket metadata/target/replication/tier/config helper
+    behavior, public local compatibility names, and ECStore facade ownership.
+  - Verification: RustFS test-target compile coverage, local facade
+    self-reference residual scan, migration and layer guards, formatting, diff
+    hygiene, Rust risk scan, pre-commit quality gate, and three-expert review.
+- [x] `API-108` Collapse local compatibility bridge self paths.
+  - Completed slice: replace crate-qualified app/admin/storage
+    `storage_compat` references in local compatibility bridge modules with
+    relative `super::storage_compat` paths.
+  - Acceptance: RustFS local compatibility bridge modules no longer point back
+    to their owner `storage_compat` facades through crate-qualified paths;
+    migration rules reject regressions.
+  - Must preserve: all app usecase/context, admin router/handler/service, and
+    storage core/RPC compatibility re-export names and owner facade behavior.
+  - Verification: RustFS test-target compile coverage, local bridge owner
+    self-path residual scan, migration and layer guards, formatting, diff
+    hygiene, Rust risk scan, pre-commit quality gate, and three-expert review.
+- [x] `API-109` Collapse root compatibility consumer paths.
+  - Completed slice: replace crate-qualified root compatibility consumers in
+    startup/runtime/table/error/workload modules plus selected storage owner
+    consumers with relative `super::` or `self::` paths.
+  - Acceptance: selected root and storage owner modules no longer point back to
+    local compatibility facades through crate-qualified paths; migration rules
+    reject regressions.
+  - Must preserve: startup notification/storage/background/service behavior,
+    runtime capability snapshots, workload admission wiring, table catalog
+    helpers, root error aliases, storage SSE/access/ECFS helper behavior, and
+    public storage module aliases.
+  - Verification: RustFS test-target compile coverage, root/storage owner
+    compatibility consumer residual scans, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, pre-commit quality gate, and
+    three-expert review.
+- [x] `API-110` Collapse RustFS local compatibility consumer paths.
+  - Completed slice: replace crate-qualified app usecase, admin router, and
+    storage ECFS test compatibility consumers with relative owner paths.
+  - Acceptance: selected RustFS app/admin/storage consumers no longer point back
+    to local compatibility facades through crate-qualified paths; migration
+    rules reject regressions.
+  - Must preserve: app object/bucket/multipart/admin usecase behavior,
+    lifecycle transition and capacity tests, admin replication/router helpers,
+    and storage ECFS test coverage.
+  - Verification: RustFS test-target compile coverage, local compatibility
+    consumer residual scan, migration and layer guards, formatting, diff
+    hygiene, Rust risk scan, pre-commit quality gate, and three-expert review.
+- [x] `API-111` Collapse storage RPC and S3 API local compatibility consumers.
+  - Completed slice: replace crate-qualified storage RPC and S3 API local
+    compatibility consumers with relative owner paths.
+  - Acceptance: selected storage RPC and S3 API modules no longer point back to
+    local compatibility facades through crate-qualified paths; migration rules
+    reject regressions.
+  - Must preserve: internode RPC request handling, node service helper tests,
+    S3 list bucket output mapping, multipart listing output mapping, and ETag
+    helper behavior.
+  - Verification: RustFS test-target compile coverage, storage RPC/S3 API
+    local compatibility consumer residual scan, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, pre-commit quality gate, and
+    three-expert review.
+- [x] `API-112` Collapse admin local compatibility consumers.
+  - Completed slice: replace crate-qualified admin handlers/service local
+    compatibility consumers with relative owner paths.
+  - Acceptance: selected admin handlers and service modules no longer point back
+    to local compatibility facades through crate-qualified paths; migration
+    rules reject regressions.
+  - Must preserve: admin route contracts, replication/config/rebalance/heal
+    handler behavior, service config reload behavior, and admin test coverage.
+  - Verification: RustFS test-target compile coverage, admin local
+    compatibility consumer residual scan, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, pre-commit quality gate, and
+    three-expert review.
+- [x] `API-113` Collapse app context and server local compatibility consumers.
+  - Completed slice: replace crate-qualified app context and server readiness
+    local compatibility consumers with relative owner paths.
+  - Acceptance: selected app context and server readiness modules no longer
+    point back to local compatibility facades through crate-qualified paths;
+    migration rules reject regressions.
+  - Must preserve: app context dependency resolution, startup bootstrap,
+    default interface handles, readiness storage quorum behavior, and readiness
+    test coverage.
+  - Verification: RustFS test-target compile coverage, app context/server local
+    compatibility consumer residual scan, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, pre-commit quality gate, and
+    three-expert review.
+- [x] `API-114` Collapse config, heal, and scanner test compatibility consumers.
+  - Completed slice: replace crate-qualified config test, heal crate, and
+    heal/scanner integration test local compatibility consumers with relative
+    owner paths.
+  - Acceptance: selected config, heal, and scanner test harnesses no longer
+    point back to local compatibility facades through crate-qualified paths;
+    migration rules reject regressions.
+  - Must preserve: config layout parsing tests, heal channel/storage test
+    coverage, endpoint index tests, and scanner lifecycle integration coverage.
+  - Verification: RustFS test-target compile coverage, config/heal/scanner
+    local compatibility consumer residual scan, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, pre-commit quality gate, and
+    three-expert review.
+- [x] `API-115` Collapse standalone crate local compatibility consumers.
+  - Completed slice: replace crate-qualified scanner, IAM, observability,
+    S3 Select, and e2e local compatibility consumers with relative owner paths.
+  - Acceptance: selected standalone crate modules no longer point back to their
+    local compatibility facades through crate-qualified paths; migration rules
+    reject regressions.
+  - Must preserve: scanner data usage and object IO behavior, IAM storage
+    adapter contracts, observability metric collection, S3 Select object-store
+    reads, and e2e RPC helper coverage.
+  - Verification: standalone crate compile coverage, standalone local
+    compatibility consumer residual scan, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, pre-commit quality gate, and
+    three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3509,13 +3668,128 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-103 narrows selected local compatibility re-export surfaces without changing owner call sites or ECStore contracts. |
-| Migration preservation | pass | The new guard rejects restoring glob re-exports in narrowed local compatibility boundaries. |
-| Testing/verification | pass | Focused compile, narrowed glob-export scan, migration guard, layer guard, formatting, diff hygiene, risk scan, and full pre-commit passed. |
+| Quality/architecture | pass | API-115 keeps selected standalone crate local compatibility consumers owner-relative by replacing crate-qualified compatibility paths with scoped relative paths. |
+| Migration preservation | pass | The new guard rejects crate-qualified standalone crate local compatibility consumer paths while preserving the same facade names and aliases. |
+| Testing/verification | pass | Focused compile, standalone crate local compatibility consumer residual scan, migration guard, layer guard, formatting, diff hygiene, risk scan, and full pre-commit passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-115 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo check -p rustfs-scanner --tests`: passed.
+  - `cargo check -p rustfs-iam --tests`: passed.
+  - `cargo check -p rustfs-obs --tests`: passed.
+  - `cargo check -p rustfs-s3select-api --tests`: passed.
+  - `cargo check -p e2e_test --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Standalone crate local compatibility consumer residual scan: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-111 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Storage RPC/S3 API local compatibility consumer residual scan: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-110 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - RustFS local compatibility consumer residual scan: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-109 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Root compatibility consumer residual scan: passed.
+  - Storage owner compatibility consumer residual scan: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-108 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Full RustFS local bridge owner self-path residual scan: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-107 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Full storage compatibility self-reference residual scan: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-106 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Full storage compatibility grouped-import residual scan: passed.
+  - Full storage compatibility raw-facade residual scan: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-105 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Full storage compatibility raw-facade residual scan: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-104 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Narrowed local compatibility glob-export scan: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-103 current slice:
   - `cargo check -p rustfs --tests`: passed.

@@ -314,6 +314,24 @@ impl ReadPlan {
             rs = http_range_spec_from_object_info(oi, part_number);
         }
 
+        if opts.raw_data_movement_read {
+            let (visible_offset, visible_length) = if let Some(rs) = rs {
+                rs.get_offset_length(oi.size)?
+            } else {
+                (0, oi.size)
+            };
+
+            return Ok(Self {
+                storage_offset: visible_offset,
+                storage_length: visible_length,
+                object_size: oi.size,
+                transform: ReadTransform::Plain {
+                    visible_offset,
+                    visible_length,
+                },
+            });
+        }
+
         let mut is_encrypted = oi.is_encrypted();
         let (algo, compression_backend, mut is_compressed) = oi.compression_read_plan()?;
 
@@ -2158,6 +2176,101 @@ mod tests {
             ReadTransform::Plain {
                 visible_offset: 6,
                 visible_length: 4
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_raw_data_movement_read_plan_bypasses_compression_transform() {
+        let object_info = ObjectInfo {
+            size: 3_000_000,
+            user_defined: Arc::new(HashMap::from([
+                ("x-minio-internal-compression".to_string(), "klauspost/compress/s2".to_string()),
+                ("x-minio-internal-actual-size".to_string(), "4194304".to_string()),
+            ])),
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            raw_data_movement_read: true,
+            ..Default::default()
+        };
+
+        let plan = ReadPlan::build(None, &object_info, &opts, &HeaderMap::new())
+            .await
+            .expect("raw data movement read should bypass compression planning");
+
+        assert_eq!(plan.storage_offset, 0);
+        assert_eq!(plan.storage_length, object_info.size);
+        assert_eq!(plan.object_size, object_info.size);
+        assert!(matches!(
+            plan.transform,
+            ReadTransform::Plain {
+                visible_offset: 0,
+                visible_length: 3_000_000
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_raw_data_movement_read_plan_bypasses_encryption_transform() {
+        let object_info = ObjectInfo {
+            size: 128,
+            user_defined: Arc::new(HashMap::from([
+                ("X-Amz-Server-Side-Encryption".to_string(), "aws:kms".to_string()),
+                ("X-Amz-Server-Side-Encryption-Iv".to_string(), "AAAAAAAAAAAAAAAA".to_string()),
+                ("X-Amz-Server-Side-Encryption-Key".to_string(), BASE64_STANDARD.encode([7_u8; 32])),
+                ("x-rustfs-encryption-original-size".to_string(), "64".to_string()),
+            ])),
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            raw_data_movement_read: true,
+            ..Default::default()
+        };
+
+        let plan = ReadPlan::build(None, &object_info, &opts, &HeaderMap::new())
+            .await
+            .expect("raw data movement read should not require decryption material");
+
+        assert_eq!(plan.storage_offset, 0);
+        assert_eq!(plan.storage_length, object_info.size);
+        assert_eq!(plan.object_size, object_info.size);
+        assert!(matches!(
+            plan.transform,
+            ReadTransform::Plain {
+                visible_offset: 0,
+                visible_length: 128
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_raw_data_movement_read_plan_bypasses_ssec_header_resolution() {
+        let object_info = ObjectInfo {
+            size: 256,
+            user_defined: Arc::new(HashMap::from([
+                (SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string()),
+                (SSEC_KEY_MD5_HEADER.to_string(), "stored-key-md5".to_string()),
+            ])),
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            raw_data_movement_read: true,
+            ..Default::default()
+        };
+
+        let plan = ReadPlan::build(None, &object_info, &opts, &HeaderMap::new())
+            .await
+            .expect("raw data movement read should not require SSE-C request headers");
+
+        assert_eq!(plan.storage_offset, 0);
+        assert_eq!(plan.storage_length, object_info.size);
+        assert_eq!(plan.object_size, object_info.size);
+        assert!(matches!(
+            plan.transform,
+            ReadTransform::Plain {
+                visible_offset: 0,
+                visible_length: 256
             }
         ));
     }

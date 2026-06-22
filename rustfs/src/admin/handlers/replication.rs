@@ -12,17 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::storage_compat::StorageError;
+use super::storage_compat::bucket_target_sys::{BucketTargetError, BucketTargetSys};
+use super::storage_compat::global_rustfs_port;
+use super::storage_compat::metadata::BUCKET_TARGETS_FILE;
+use super::storage_compat::metadata_sys;
+use super::storage_compat::metadata_sys::get_replication_config;
+use super::storage_compat::replication::BucketStats;
+use super::storage_compat::replication::GLOBAL_REPLICATION_STATS;
+use super::storage_compat::target::BucketTarget;
 use crate::admin::auth::validate_admin_request;
 use crate::admin::handlers::site_replication::site_replication_peer_deployment_id_for_endpoint;
-use crate::admin::handlers::storage_compat::StorageError;
-use crate::admin::handlers::storage_compat::bucket_target_sys::{BucketTargetError, BucketTargetSys};
-use crate::admin::handlers::storage_compat::global_rustfs_port;
-use crate::admin::handlers::storage_compat::metadata::BUCKET_TARGETS_FILE;
-use crate::admin::handlers::storage_compat::metadata_sys;
-use crate::admin::handlers::storage_compat::metadata_sys::get_replication_config;
-use crate::admin::handlers::storage_compat::replication::BucketStats;
-use crate::admin::handlers::storage_compat::replication::GLOBAL_REPLICATION_STATS;
-use crate::admin::handlers::storage_compat::target::BucketTarget;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::utils::read_compatible_admin_body;
 use crate::app::context::resolve_object_store_handle;

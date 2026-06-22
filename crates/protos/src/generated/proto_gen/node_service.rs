@@ -1080,8 +1080,11 @@ pub struct ReloadPoolMetaResponse {
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct StopRebalanceRequest {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StopRebalanceRequest {
+    #[prost(string, tag = "1")]
+    pub expected_rebalance_id: ::prost::alloc::string::String,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StopRebalanceResponse {
     #[prost(bool, tag = "1")]

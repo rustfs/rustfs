@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::startup_storage_compat::{EcstoreResult, EndpointServerPools, new_global_notification_sys};
 use crate::init::add_bucket_notification_configuration;
-use crate::startup_storage_compat::{EcstoreResult, EndpointServerPools, new_global_notification_sys};
 use std::{
     future::Future,
     io::{Error, Result},
@@ -80,7 +80,7 @@ mod tests {
     #[tokio::test]
     async fn notification_system_returns_source_error() {
         let result =
-            init_notification_system_with(|| async { Err(crate::startup_storage_compat::EcstoreError::FaultyDisk) }).await;
+            init_notification_system_with(|| async { Err(super::super::startup_storage_compat::EcstoreError::FaultyDisk) }).await;
 
         assert!(result.is_err());
     }

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use crate::storage::storage_compat::{
+pub(crate) use super::super::storage_compat::{
     CollectMetricsOpts, DEFAULT_READ_BUFFER_SIZE, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, FileInfoVersions,
     LocalPeerS3Client, MetricType, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions, Result,
     SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt, StoragePeerS3ClientExt, UpdateMetadataOpts,
@@ -22,4 +22,4 @@ pub(crate) use crate::storage::storage_compat::{
 };
 
 #[cfg(test)]
-pub(crate) use crate::storage::storage_compat::{Error, STORAGE_CLASS_SUB_SYS};
+pub(crate) use super::super::storage_compat::{Error, STORAGE_CLASS_SUB_SYS};

@@ -127,6 +127,14 @@ jobs:
           cargo nextest run --all --exclude e2e_test
           cargo test --all --doc
 
+      - name: Run rebalance/decommission migration proofs
+        run: |
+          cargo test -p rustfs-ecstore data_movement --lib
+          cargo test -p rustfs-ecstore rebalance --lib
+          cargo test -p rustfs-ecstore decommission --lib
+          cargo test -p rustfs-ecstore source_cleanup --lib
+          cargo test -p rustfs-ecstore delete_marker --lib
+
       - name: Check code formatting
         run: cargo fmt --all --check
 
@@ -257,6 +265,9 @@ jobs:
 
       - name: Setup Rust toolchain for s3s-e2e installation
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Run delete-marker migration proof
+        run: cargo test -p e2e_test delete_marker_migration_semantics -- --nocapture --test-threads=1
 
       - name: Install s3s-e2e test tool
         uses: taiki-e/cache-cargo-install-action@v2

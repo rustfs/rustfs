@@ -2,7 +2,9 @@ use super::meta::{
     clone_first_arc, clone_rebalance_pool_stats, defer_bucket_in_rebalance_queue, ensure_valid_rebalance_pool_index,
     invalid_rebalance_pool_index_error, is_rebalance_conflicting_with_decommission, mark_rebalance_bucket_done,
     merge_rebalance_meta, percent_free_ratio, rebalance_metadata_not_initialized_error, record_rebalance_cleanup_warning_in_meta,
-    resolve_next_rebalance_bucket, should_accept_rebalance_stats_update, should_pool_participate, stop_rebalance_meta_snapshot,
+    record_rebalance_stop_propagation_snapshot, resolve_next_rebalance_bucket, rollback_rebalance_start_meta_snapshot_for_id,
+    should_accept_rebalance_stats_update, should_pool_participate, stop_rebalance_meta_snapshot_for_id,
+    validate_init_rebalance_state,
 };
 use super::worker::{
     rebalance_meta_lock_error, resolve_load_rebalance_stats_update_result, resolve_rebalance_meta_load_result,
@@ -10,7 +12,8 @@ use super::worker::{
 };
 use super::{
     DiskStat, EVENT_REBALANCE_BUCKET, EVENT_REBALANCE_STATE, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REBALANCE, REBAL_META_NAME,
-    RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats,
+    RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord,
+    encode_rebalance_stop_propagation_record,
 };
 use crate::error::{Error, Result};
 use crate::object_api::ObjectOptions;
@@ -247,6 +250,35 @@ impl ECStore {
         Ok(id)
     }
 
+    #[tracing::instrument(skip(self, bucktes))]
+    pub async fn init_and_start_rebalance(self: &Arc<Self>, bucktes: Vec<String>) -> Result<String> {
+        let _start_guard = self.start_gate.lock().await;
+
+        let decommission_running = self.is_decommission_running().await;
+        {
+            let rebalance_meta = self.rebalance_meta.read().await;
+            validate_init_rebalance_state(decommission_running, rebalance_meta.as_ref())?;
+        }
+
+        let id = self.init_rebalance_meta(bucktes).await?;
+        if let Err(start_err) = self.start_rebalance().await {
+            if let Err(rollback_err) = self
+                .rollback_rebalance_start_without_worker_for_id(Some(&id), start_err.to_string())
+                .await
+            {
+                return Err(Error::other(format!(
+                    "failed to start rebalance after metadata initialized for {id}: {start_err}; rollback failed: {rollback_err}"
+                )));
+            }
+
+            return Err(Error::other(format!(
+                "failed to start rebalance after metadata initialized for {id}; local metadata was finalized as failed: {start_err}"
+            )));
+        }
+
+        Ok(id)
+    }
+
     #[tracing::instrument(skip(self, fi))]
     pub async fn update_pool_stats(&self, pool_index: usize, bucket: String, fi: &FileInfo) -> Result<()> {
         self.update_pool_stats_batch(pool_index, bucket, &[fi]).await
@@ -389,12 +421,24 @@ impl ECStore {
         false
     }
 
+    pub async fn current_rebalance_id(&self) -> Option<String> {
+        let rebalance_meta = self.rebalance_meta.read().await;
+        rebalance_meta
+            .as_ref()
+            .and_then(|meta| (!meta.id.is_empty()).then(|| meta.id.clone()))
+    }
+
     #[tracing::instrument(skip(self))]
     pub async fn stop_rebalance(self: &Arc<Self>) -> Result<()> {
+        self.stop_rebalance_for_id(None).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn stop_rebalance_for_id(self: &Arc<Self>, expected_id: Option<&str>) -> Result<()> {
         let meta_to_save = {
             let mut rebalance_meta = self.rebalance_meta.write().await;
-            stop_rebalance_meta_snapshot(rebalance_meta.as_mut(), OffsetDateTime::now_utc())
-        };
+            stop_rebalance_meta_snapshot_for_id(rebalance_meta.as_mut(), OffsetDateTime::now_utc(), expected_id)
+        }?;
 
         if let Some(meta_to_save) = meta_to_save {
             let pool = clone_first_arc(self.pools.as_slice(), "stop_rebalance: no pools available")?;
@@ -402,6 +446,56 @@ impl ECStore {
                 self.save_rebalance_meta_with_merge(pool, &meta_to_save, "stop_rebalance")
                     .await,
                 "stop_rebalance",
+            )?;
+        }
+
+        Ok(())
+    }
+
+    async fn rollback_rebalance_start_without_worker_for_id(
+        self: &Arc<Self>,
+        expected_id: Option<&str>,
+        start_error: String,
+    ) -> Result<()> {
+        let meta_to_save = {
+            let mut rebalance_meta = self.rebalance_meta.write().await;
+            rollback_rebalance_start_meta_snapshot_for_id(
+                rebalance_meta.as_mut(),
+                OffsetDateTime::now_utc(),
+                expected_id,
+                start_error,
+            )
+        };
+
+        if let Some(meta_to_save) = meta_to_save {
+            let pool = clone_first_arc(self.pools.as_slice(), "rollback_rebalance_start: no pools available")?;
+            resolve_rebalance_meta_save_result(
+                self.save_rebalance_meta_with_merge(pool, &meta_to_save, "rollback_rebalance_start")
+                    .await,
+                "rollback_rebalance_start",
+            )?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn record_rebalance_stop_propagation(self: &Arc<Self>, record: RebalanceStopPropagationRecord) -> Result<()> {
+        if !record.has_failures() {
+            return Ok(());
+        }
+
+        let encoded_error = encode_rebalance_stop_propagation_record(&record);
+        let meta_to_save = {
+            let mut rebalance_meta = self.rebalance_meta.write().await;
+            record_rebalance_stop_propagation_snapshot(rebalance_meta.as_mut(), encoded_error, OffsetDateTime::now_utc())
+        };
+
+        if let Some(meta_to_save) = meta_to_save {
+            let pool = clone_first_arc(self.pools.as_slice(), "record_rebalance_stop_propagation: no pools available")?;
+            resolve_rebalance_meta_save_result(
+                self.save_rebalance_meta_with_merge(pool, &meta_to_save, "record_rebalance_stop_propagation")
+                    .await,
+                "record_rebalance_stop_propagation",
             )?;
         }
 

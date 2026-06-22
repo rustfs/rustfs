@@ -136,6 +136,8 @@ fn is_probe_path(path: &str) -> bool {
             | crate::server::HEALTH_PREFIX
             | crate::server::HEALTH_COMPAT_LIVE_PATH
             | crate::server::HEALTH_READY_PATH
+            | crate::server::MINIO_HEALTH_LIVE_PATH
+            | crate::server::MINIO_HEALTH_READY_PATH
             | crate::server::FAVICON_PATH
     );
 
@@ -837,7 +839,7 @@ mod tests {
 
     #[test]
     fn aggregate_lock_quorum_status_requires_each_set_to_meet_quorum() {
-        use crate::server::storage_compat::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
+        use super::super::storage_compat::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
 
         let endpoints = vec![
             Endpoint {
@@ -894,7 +896,7 @@ mod tests {
 
     #[test]
     fn aggregate_lock_quorum_status_fails_when_any_set_loses_quorum() {
-        use crate::server::storage_compat::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
+        use super::super::storage_compat::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
 
         let endpoints = vec![
             Endpoint {

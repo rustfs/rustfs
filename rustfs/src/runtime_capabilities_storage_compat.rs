@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rustfs_ecstore::api::cluster as ecstore_cluster;
 #[cfg(test)]
 use rustfs_ecstore::api::disk as ecstore_disk;
-use rustfs_ecstore::api::{cluster as ecstore_cluster, layout as ecstore_layout};
+use rustfs_ecstore::api::layout as ecstore_layout;
 
 #[cfg(test)]
 pub(crate) type Endpoint = ecstore_disk::endpoint::Endpoint;
