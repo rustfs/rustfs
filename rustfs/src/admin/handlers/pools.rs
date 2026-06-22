@@ -214,7 +214,7 @@ fn validate_start_decommission_guards(decommission_running: bool, rebalance_runn
 }
 
 fn validate_pool_mutation_leader(
-    endpoints: &super::storage_compat::EndpointServerPools,
+    endpoints: &crate::admin::storage_compat::EndpointServerPools,
     idx: usize,
     operation: &str,
     audit: PoolAuditContext<'_>,
@@ -905,7 +905,6 @@ impl Operation for ClearDecommission {
 
 #[cfg(test)]
 mod pools_handler_tests {
-    use super::super::storage_compat::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
     use super::{
         PoolAuditContext, contextualize_admin_pool_api_error, decommission_admin_not_initialized_error_with_audit,
         has_duplicate_indices, parse_mutation_pool_query, parse_pool_idx_by_id, parse_status_pool_query,
@@ -914,6 +913,7 @@ mod pools_handler_tests {
         pool_admin_pool_parse_error_with_audit, pool_admin_query_parse_error, pool_admin_query_parse_error_with_audit,
         validate_pool_mutation_leader, validate_start_decommission_guards,
     };
+    use crate::admin::storage_compat::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
 
     fn test_pool_endpoints(is_local: bool) -> EndpointServerPools {
         let mut endpoint = Endpoint::try_from("http://127.0.0.1:9000/disk").expect("test endpoint should parse");
