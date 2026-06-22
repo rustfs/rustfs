@@ -76,13 +76,14 @@ pub(crate) mod ecstore_admin {
 
 pub(crate) mod ecstore_bucket {
     pub(crate) use rustfs_ecstore::api::bucket::{
-        metadata, metadata_sys, migration, object_lock, policy_sys, replication, tagging, utils,
+        bucket_target_sys, lifecycle, metadata, metadata_sys, migration, object_lock, policy_sys, replication, tagging, target,
+        utils,
     };
     pub(crate) use rustfs_ecstore::api::bucket::{quota, versioning, versioning_sys};
 }
 
 pub(crate) mod ecstore_client {
-    pub(crate) use rustfs_ecstore::api::client::object_api_utils;
+    pub(crate) use rustfs_ecstore::api::client::{object_api_utils, transition_api};
 }
 
 pub(crate) mod ecstore_cluster {
@@ -90,7 +91,7 @@ pub(crate) mod ecstore_cluster {
 }
 
 pub(crate) mod ecstore_config {
-    pub(crate) use rustfs_ecstore::api::config::{com, init, init_global_config_sys, try_migrate_server_config};
+    pub(crate) use rustfs_ecstore::api::config::{com, init, init_global_config_sys, storageclass, try_migrate_server_config};
 }
 
 #[allow(unused_imports)]
