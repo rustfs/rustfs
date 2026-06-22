@@ -14,9 +14,9 @@
 
 //! test endpoint index settings
 
-mod ecstore_test_compat;
-
-use ecstore_test_compat::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, init_local_disks};
+use rustfs_ecstore::api::disk::endpoint::Endpoint;
+use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
+use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
 use std::net::SocketAddr;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;

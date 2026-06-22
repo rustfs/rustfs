@@ -5,20 +5,21 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-runtime-crate-ecstore-thin-bridges`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150`.
-- Based on: API-150 stacked slice.
+- Branch: `overtrue/arch-test-fuzz-ecstore-thin-bridges`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151`.
+- Based on: `main` after the API-151 stack merge.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: remove the thin notify/obs/swift/s3select ECStore
-  compatibility bridge files and keep their ECStore source imports at each
-  owner root.
+- Rust code changes: remove thin e2e/heal/scanner test and fuzz ECStore
+  compatibility bridge files and keep their ECStore source imports in the
+  owner test/fuzz files.
 - CI/script changes: lock completed owner and test/fuzz boundaries against
   bare/glob imports, scattered raw ECStore facade subpaths, and startup
   runtime/root-server/table/S3/app shared/app bucket/app ECStore/admin facade
   regressions, plus external runtime, test, fuzz, and storage-owner module
-  ECStore compatibility bypasses, plus runtime crate thin bridge regressions.
-- Docs changes: record the API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151 owner facade cleanup.
+  ECStore compatibility bypasses, plus runtime crate and test/fuzz thin bridge
+  regressions.
+- Docs changes: record the API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152 owner facade cleanup.
 
 ## Phase 0 Tasks
 
@@ -4191,6 +4192,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     shell syntax check, formatting, diff hygiene, Rust risk scan, branch
     freshness check, pre-commit, and three-expert review.
 
+- [x] `API-152` Collapse thin test and fuzz ECStore compatibility bridges.
+  - Do: remove the thin e2e, heal, scanner, and fuzz ECStore compatibility
+    bridge modules, moving their aliases and wrappers into the owner test/fuzz
+    files that consume them.
+  - Acceptance: those tests and fuzz targets no longer declare local
+    `ecstore_test_compat` or `ecstore_fuzz_compat` modules, while the same
+    ECStore API symbols remain available to the existing test and fuzz logic.
+  - Must preserve: e2e replication and reliant gRPC clients, heal endpoint and
+    integration fixtures, scanner lifecycle fixtures, bucket validation fuzzing,
+    and path containment fuzzing.
+  - Verification: focused test/fuzz compile coverage, migration guard, shell
+    syntax check, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, pre-commit, and three-expert review.
+
 ## Next PRs
 
 1. `pure-move`: continue pruning remaining facade compatibility and owner boundaries.
@@ -4199,27 +4214,31 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-151 removes thin runtime crate ECStore bridge files and keeps the remaining source imports at owner roots. |
-| Migration preservation | pass | Notify, obs metrics, Swift, and S3 Select keep the same owner-root aliases and wrappers for existing consumers. |
-| Testing/verification | pass | Focused runtime crate compile, formatting, migration guard, shell syntax, diff hygiene, Rust risk scan, and pre-commit passed for API-151. |
+| Quality/architecture | pass | API-152 removes thin test/fuzz ECStore bridge files and keeps direct imports in owner test/fuzz files. |
+| Migration preservation | pass | E2E, heal, scanner, and fuzz consumers keep the same ECStore API symbols and call paths. |
+| Testing/verification | pass | Focused test/fuzz compile, formatting, migration guard, shell syntax, diff hygiene, Rust risk scan, and pre-commit passed for API-152. |
 
 ## Verification Notes
 
 Passed before push:
 
-- Issue #660 API-151 current slice:
-  - `cargo check -p rustfs-notify -p rustfs-obs -p rustfs-s3select-api -p rustfs-protocols`:
+- Issue #660 API-152 current slice:
+  - `cargo check --tests -p rustfs-heal -p rustfs-scanner -p e2e_test`:
     passed.
+  - `cargo check --manifest-path fuzz/Cargo.toml --bins`: passed.
   - `cargo fmt --all`: passed.
+  - `cargo fmt --all --manifest-path fuzz/Cargo.toml`: passed.
   - `cargo fmt --all --check`: passed.
+  - `cargo fmt --all --check --manifest-path fuzz/Cargo.toml`: passed.
   - `git diff --check`: passed.
   - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
   - `./scripts/check_architecture_migration_rules.sh`: passed.
   - `make pre-commit`: passed.
-  - Runtime thin bridge scan: passed; notify, obs metrics, Swift, and S3
-    Select no longer declare local `ecstore_compat` modules.
+  - Test/fuzz thin bridge scan: passed; e2e, heal, scanner, and fuzz targets no
+    longer declare local `ecstore_test_compat` or `ecstore_fuzz_compat`
+    modules.
   - Rust risk scan: no new production unwrap/expect, casts, panic/todo/unsafe,
-    or error-type risks added; changes only move import/source boundaries.
+    or error-type risks added; changes only move test/fuzz import boundaries.
 
 - Issue #660 API-140 current slice:
   - `cargo check --tests -p rustfs`: passed.

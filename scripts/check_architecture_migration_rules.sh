@@ -1299,24 +1299,23 @@ fi
     crates/scanner/tests \
     crates/e2e_test/src \
     --glob '*.rs' \
-    --glob '!**/ecstore_test_compat.rs' \
-    --glob '!**/ecstore_test_compat/**' || true
+    | rg -v '^(crates/e2e_test/src/(replication_extension_test|reliant/(grpc_lock_client|node_interact_test))\.rs|crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)\.rs|crates/scanner/tests/lifecycle_integration_test\.rs):' || true
 ) >"$EXTERNAL_TEST_ECSTORE_COMPAT_BYPASS_HITS_FILE"
 
 if [[ -s "$EXTERNAL_TEST_ECSTORE_COMPAT_BYPASS_HITS_FILE" ]]; then
-  report_failure "external test crates must source ECStore API symbols through their ecstore_test_compat boundary: $(paste -sd '; ' "$EXTERNAL_TEST_ECSTORE_COMPAT_BYPASS_HITS_FILE")"
+  report_failure "external test ECStore API imports must stay in owner test files: $(paste -sd '; ' "$EXTERNAL_TEST_ECSTORE_COMPAT_BYPASS_HITS_FILE")"
 fi
 
 (
   cd "$ROOT_DIR"
   rg -n --with-filename 'rustfs_ecstore::api::' \
     fuzz/fuzz_targets \
-    --glob '*.rs' \
-    --glob '!**/ecstore_fuzz_compat.rs' || true
+    --glob '*.rs' |
+    rg -v '^fuzz/fuzz_targets/(bucket_validation|path_containment)\.rs:' || true
 ) >"$FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE"
 
 if [[ -s "$FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE" ]]; then
-  report_failure "fuzz targets must source ECStore API symbols through ecstore_fuzz_compat: $(paste -sd '; ' "$FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE")"
+  report_failure "fuzz ECStore API imports must stay in owner fuzz targets: $(paste -sd '; ' "$FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE")"
 fi
 
 (
@@ -1585,13 +1584,18 @@ fi
     for file in \
       crates/heal/tests/common/storage_compat.rs \
       crates/scanner/tests/common/storage_compat.rs \
+      crates/e2e_test/src/ecstore_test_compat.rs \
+      crates/heal/tests/ecstore_test_compat/mod.rs \
+      crates/scanner/tests/ecstore_test_compat/mod.rs \
+      fuzz/fuzz_targets/ecstore_fuzz_compat.rs \
       fuzz/fuzz_targets/bucket_validation/storage_compat.rs \
       fuzz/fuzz_targets/path_containment/storage_compat.rs; do
       [[ -e "$file" ]] && printf '%s:1:test/fuzz bridge file exists\n' "$file"
     done
-    rg -n --with-filename 'common::storage_compat|storage_compat::|\bmod\s+storage_compat|#\[path\s*=\s*"[^"]*storage_compat\.rs"\]' \
+    rg -n --with-filename 'common::storage_compat|storage_compat::|\bmod\s+storage_compat|#\[path\s*=\s*"[^"]*storage_compat\.rs"\]|ecstore_test_compat|ecstore_fuzz_compat' \
+      crates/e2e_test/src \
       crates/heal/tests \
-      crates/scanner/tests/lifecycle_integration_test.rs \
+      crates/scanner/tests \
       fuzz/fuzz_targets/bucket_validation.rs \
       fuzz/fuzz_targets/path_containment.rs \
       -g '*.rs' || true
@@ -1599,7 +1603,7 @@ fi
 ) >"$TEST_FUZZ_COMPAT_BRIDGE_HITS_FILE"
 
 if [[ -s "$TEST_FUZZ_COMPAT_BRIDGE_HITS_FILE" ]]; then
-  report_failure "heal/scanner test and fuzz targets must import ECStore owner APIs directly instead of local storage compatibility bridges: $(paste -sd '; ' "$TEST_FUZZ_COMPAT_BRIDGE_HITS_FILE")"
+  report_failure "test and fuzz targets must import ECStore owner APIs directly instead of local compatibility bridges: $(paste -sd '; ' "$TEST_FUZZ_COMPAT_BRIDGE_HITS_FILE")"
 fi
 
 (
