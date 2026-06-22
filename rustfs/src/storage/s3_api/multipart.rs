@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::storage::ecstore_client::object_api_utils::to_s3s_etag;
 use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
-use rustfs_ecstore::api::client::object_api_utils::to_s3s_etag;
 use rustfs_storage_api::{ListMultipartsInfo, ListPartsInfo};
 use s3s::dto::{CommonPrefix, ListMultipartUploadsOutput, ListPartsOutput, MultipartUpload, Part, Timestamp};
 use s3s::{S3Error, S3ErrorCode};
@@ -195,8 +195,8 @@ mod tests {
         MAX_MULTIPART_UPLOADS_LIST, build_list_multipart_uploads_output, build_list_parts_output,
         parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
     };
+    use crate::storage::ecstore_client::object_api_utils::to_s3s_etag;
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
-    use rustfs_ecstore::api::client::object_api_utils::to_s3s_etag;
     use rustfs_storage_api::{ListMultipartsInfo, ListPartsInfo, MultipartInfo, PartInfo};
     use s3s::S3ErrorCode;
     use s3s::dto::Timestamp;

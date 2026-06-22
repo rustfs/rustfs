@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::api::{cluster as ecstore_cluster, layout::EndpointServerPools};
+use crate::storage::{ecstore_cluster, ecstore_layout::EndpointServerPools};
 use rustfs_storage_api::{
     CapabilitySnapshotError, CapabilityStatus, DiskCapabilities, MemorySamplingState, ObservabilitySnapshot,
     ObservabilitySnapshotProvider, PlatformSupport, TopologyCapabilities, TopologySnapshot, TopologySnapshotProvider,
@@ -131,9 +131,9 @@ fn cgroup_memory_status() -> CapabilityStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_ecstore::api::{
-        disk::endpoint::Endpoint,
-        layout::{Endpoints, PoolEndpoints},
+    use crate::storage::{
+        ecstore_disk::endpoint::Endpoint,
+        ecstore_layout::{Endpoints, PoolEndpoints},
     };
     use rustfs_storage_api::{CapabilityState, ObservabilitySnapshotProvider, TopologySnapshotProvider};
 

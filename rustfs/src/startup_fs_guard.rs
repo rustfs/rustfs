@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::storage::ecstore_layout::EndpointServerPools;
 use rustfs_config::{
     DEFAULT_RUSTFS_UNSUPPORTED_FS_POLICY, ENV_RUSTFS_UNSUPPORTED_FS_POLICY, RUSTFS_UNSUPPORTED_FS_POLICY_FAIL,
     RUSTFS_UNSUPPORTED_FS_POLICY_WARN,
 };
-use rustfs_ecstore::api::layout::EndpointServerPools;
 use std::collections::BTreeSet;
 use std::io::{Error, Result};
 use tracing::warn;

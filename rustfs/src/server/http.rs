@@ -31,6 +31,7 @@ use crate::server::{
     },
 };
 use crate::storage;
+use crate::storage::ecstore_rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
 use crate::storage::rpc::InternodeRpcService;
 use crate::storage::tonic_service::make_server;
 use bytes::Bytes;
@@ -45,7 +46,6 @@ use metrics::{counter, gauge, histogram};
 use opentelemetry::global;
 use opentelemetry::trace::TraceContextExt;
 use rustfs_common::GlobalReadiness;
-use rustfs_ecstore::api::rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
 use rustfs_keystone::KeystoneAuthLayer;
 #[cfg(feature = "swift")]
 use rustfs_protocols::SwiftService;
