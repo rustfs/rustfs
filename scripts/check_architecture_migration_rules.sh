@@ -137,6 +137,7 @@ E2E_STORAGE_COMPAT_RPC_PASSTHROUGH_HITS_FILE="${TMP_DIR}/e2e_storage_compat_rpc_
 TEST_STORAGE_COMPAT_PASSTHROUGH_HITS_FILE="${TMP_DIR}/test_storage_compat_passthrough_hits.txt"
 TEST_FUZZ_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/test_fuzz_compat_bridge_hits.txt"
 STANDALONE_THIN_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/standalone_thin_compat_bridge_hits.txt"
+APP_NOTIFY_THIN_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/app_notify_thin_compat_bridge_hits.txt"
 EXTERNAL_OWNER_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/external_owner_compat_bridge_hits.txt"
 PRODUCTION_UNUSED_COMPAT_ALLOW_HITS_FILE="${TMP_DIR}/production_unused_compat_allow_hits.txt"
 BROAD_STORE_API_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/broad_store_api_compat_reexport_hits.txt"
@@ -1651,6 +1652,21 @@ fi
 
 if [[ -s "$STANDALONE_THIN_COMPAT_BRIDGE_HITS_FILE" ]]; then
   report_failure "storage owner and standalone e2e/IAM/heal/scanner/notify/obs/swift/s3select consumers must import owner APIs directly instead of local thin compatibility bridges: $(paste -sd '; ' "$STANDALONE_THIN_COMPAT_BRIDGE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e rustfs/src/app/context/compat.rs ]] && printf '%s:1:app context compatibility bridge file exists\n' "rustfs/src/app/context/compat.rs"
+    [[ -e crates/notify/src/event_bridge.rs ]] && printf '%s:1:notify event bridge re-export file exists\n' "crates/notify/src/event_bridge.rs"
+    rg -n --with-filename '\bmod\s+compat;|pub\s+use\s+compat::\*|\bmod\s+event_bridge;|pub\s+use\s+event_bridge::' \
+      rustfs/src/app/context.rs \
+      crates/notify/src/lib.rs || true
+  }
+) >"$APP_NOTIFY_THIN_COMPAT_BRIDGE_HITS_FILE"
+
+if [[ -s "$APP_NOTIFY_THIN_COMPAT_BRIDGE_HITS_FILE" ]]; then
+  report_failure "app context and notify event bridge thin compatibility modules must stay collapsed into owner roots: $(paste -sd '; ' "$APP_NOTIFY_THIN_COMPAT_BRIDGE_HITS_FILE")"
 fi
 
 (

@@ -31,7 +31,6 @@ mod bucket_config_manager;
 mod config_manager;
 mod error;
 mod event;
-mod event_bridge;
 pub mod factory;
 mod global;
 pub mod integration;
@@ -50,13 +49,12 @@ pub use bucket_config_manager::NotifyBucketConfigManager;
 pub use config_manager::{NotifyConfigManager, runtime_target_id_for_subsystem};
 pub use error::{LifecycleError, NotificationError};
 pub use event::{Event, EventArgs, EventArgsBuilder, NotifyObjectInfo};
-pub use event_bridge::{LiveEventHistory, NotifyEventBridge};
 pub use global::{
     initialize, initialize_live_events, is_notification_system_initialized, notification_metrics_snapshot, notification_system,
     notification_target_metrics, notifier_global,
 };
 pub use integration::{NotificationMetricSnapshot, NotificationSystem, NotificationTargetMetricSnapshot};
-pub use pipeline::NotifyPipeline;
+pub use pipeline::{LiveEventHistory, NotifyEventBridge, NotifyPipeline};
 pub use rule_engine::NotifyRuleEngine;
 pub use rules::BucketNotificationConfig;
 pub use runtime_facade::NotifyRuntimeFacade;
