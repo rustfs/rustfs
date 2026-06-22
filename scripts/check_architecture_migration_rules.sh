@@ -1284,11 +1284,12 @@ fi
     crates/s3select-api/src \
     crates/scanner/src \
     --glob '*.rs' \
-    --glob '!**/ecstore_compat.rs' || true
+    --glob '!**/ecstore_compat.rs' |
+    rg -v '^(crates/notify/src/lib.rs|crates/obs/src/metrics/mod.rs|crates/protocols/src/swift/mod.rs|crates/s3select-api/src/lib.rs):' || true
 ) >"$EXTERNAL_RUNTIME_ECSTORE_COMPAT_BYPASS_HITS_FILE"
 
 if [[ -s "$EXTERNAL_RUNTIME_ECSTORE_COMPAT_BYPASS_HITS_FILE" ]]; then
-  report_failure "external runtime crates must source ECStore API symbols through their ecstore_compat boundary: $(paste -sd '; ' "$EXTERNAL_RUNTIME_ECSTORE_COMPAT_BYPASS_HITS_FILE")"
+  report_failure "external runtime crates must source ECStore API symbols through their owner root or ecstore_compat boundary: $(paste -sd '; ' "$EXTERNAL_RUNTIME_ECSTORE_COMPAT_BYPASS_HITS_FILE")"
 fi
 
 (
@@ -1607,9 +1608,13 @@ fi
     for file in \
       crates/e2e_test/src/storage_compat.rs \
       crates/iam/src/store/storage_compat.rs \
+      crates/notify/src/ecstore_compat.rs \
       crates/notify/src/storage_compat.rs \
+      crates/obs/src/metrics/ecstore_compat.rs \
       crates/obs/src/storage_compat.rs \
+      crates/protocols/src/swift/ecstore_compat.rs \
       crates/protocols/src/swift/storage_compat.rs \
+      crates/s3select-api/src/ecstore_compat.rs \
       crates/s3select-api/src/storage_compat.rs; do
       [[ -e "$file" ]] && printf '%s:1:standalone thin bridge file exists\n' "$file"
     done
@@ -1620,6 +1625,12 @@ fi
       crates/protocols/src/swift \
       crates/s3select-api/src \
       -g '*.rs' || true
+    rg -n --with-filename 'ecstore_compat' \
+      crates/notify/src \
+      crates/obs/src/metrics \
+      crates/protocols/src/swift \
+      crates/s3select-api/src \
+      -g '*.rs' || true
     rg -n --with-filename '^\s*use\s+super::storage_compat|store::storage_compat|\bmod\s+storage_compat' \
       crates/iam/src/store.rs \
       crates/iam/src/store/object.rs || true
@@ -1627,7 +1638,7 @@ fi
 ) >"$STANDALONE_THIN_COMPAT_BRIDGE_HITS_FILE"
 
 if [[ -s "$STANDALONE_THIN_COMPAT_BRIDGE_HITS_FILE" ]]; then
-  report_failure "standalone e2e/IAM-store/notify consumers must import owner APIs directly instead of local storage compatibility bridges: $(paste -sd '; ' "$STANDALONE_THIN_COMPAT_BRIDGE_HITS_FILE")"
+  report_failure "standalone e2e/IAM-store/notify/obs/swift/s3select consumers must import owner APIs directly instead of local thin compatibility bridges: $(paste -sd '; ' "$STANDALONE_THIN_COMPAT_BRIDGE_HITS_FILE")"
 fi
 
 (
