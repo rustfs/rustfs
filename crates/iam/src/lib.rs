@@ -13,14 +13,23 @@
 // limitations under the License.
 
 use crate::error::{Error, Result};
-use ecstore_compat::{
-    ECSTORE_RUSTFS_CONFIG_PREFIX, EcstoreErrorType, EcstoreNotificationPeerErr, EcstoreResultType, EcstoreStorageError,
-    EcstoreStore, ecstore_classify_system_path_failure_reason, ecstore_delete_config, ecstore_get_global_notification_sys,
-    ecstore_is_first_cluster_node_local, ecstore_read_config_no_lock, ecstore_read_config_with_metadata, ecstore_save_config,
-    ecstore_save_config_with_opts,
-};
 use manager::IamCache;
 use oidc::OidcSys;
+use rustfs_ecstore::api::config::RUSTFS_CONFIG_PREFIX as ECSTORE_RUSTFS_CONFIG_PREFIX;
+use rustfs_ecstore::api::config::com::{
+    delete_config as ecstore_delete_config, read_config_no_lock as ecstore_read_config_no_lock,
+    read_config_with_metadata as ecstore_read_config_with_metadata, save_config as ecstore_save_config,
+    save_config_with_opts as ecstore_save_config_with_opts,
+};
+use rustfs_ecstore::api::error::{
+    Error as EcstoreErrorType, Result as EcstoreResultType, StorageError as EcstoreStorageError,
+    classify_system_path_failure_reason as ecstore_classify_system_path_failure_reason,
+};
+use rustfs_ecstore::api::global::is_first_cluster_node_local as ecstore_is_first_cluster_node_local;
+use rustfs_ecstore::api::notification::{
+    NotificationPeerErr as EcstoreNotificationPeerErr, get_global_notification_sys as ecstore_get_global_notification_sys,
+};
+use rustfs_ecstore::api::storage::ECStore as EcstoreStore;
 use std::sync::{Arc, OnceLock};
 use store::object::ObjectStore;
 use sys::IamSys;
@@ -33,7 +42,6 @@ const EVENT_IAM_STATE: &str = "iam_state";
 const EVENT_OIDC_STATE: &str = "oidc_state";
 
 pub mod cache;
-mod ecstore_compat;
 pub mod error;
 pub mod keyring;
 pub mod manager;

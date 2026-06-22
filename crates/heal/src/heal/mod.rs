@@ -22,15 +22,19 @@ pub mod storage;
 pub mod task;
 pub mod utils;
 
-use ecstore_compat::{
-    ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_GLOBAL_LOCAL_DISK_MAP, ECSTORE_RUSTFS_META_BUCKET,
-    EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskResult, EcstoreDiskStore,
-    EcstoreEndpoint, EcstoreErrorType, EcstoreStorageError, EcstoreStore,
+use rustfs_ecstore::api::data_usage::DATA_USAGE_CACHE_NAME as ECSTORE_DATA_USAGE_CACHE_NAME;
+use rustfs_ecstore::api::disk::endpoint::Endpoint as EcstoreEndpoint;
+use rustfs_ecstore::api::disk::error::{DiskError as EcstoreDiskError, Result as EcstoreDiskResult};
+use rustfs_ecstore::api::disk::{
+    BUCKET_META_PREFIX as ECSTORE_BUCKET_META_PREFIX, Bytes as EcstoreDiskBytes, DeleteOptions as EcstoreDeleteOptions,
+    DiskAPI as EcstoreDiskAPI, DiskStore as EcstoreDiskStore, RUSTFS_META_BUCKET as ECSTORE_RUSTFS_META_BUCKET,
 };
 #[cfg(test)]
-use ecstore_compat::{EcstoreDiskOption, ecstore_new_disk};
+use rustfs_ecstore::api::disk::{DiskOption as EcstoreDiskOption, new_disk as ecstore_new_disk};
+use rustfs_ecstore::api::error::{Error as EcstoreErrorType, StorageError as EcstoreStorageError};
+use rustfs_ecstore::api::global::GLOBAL_LOCAL_DISK_MAP as ECSTORE_GLOBAL_LOCAL_DISK_MAP;
+use rustfs_ecstore::api::storage::ECStore as EcstoreStore;
 
-mod ecstore_compat;
 pub use erasure_healer::ErasureSetHealer;
 pub use manager::{HealManager, HealOperationsSnapshot, HealPriorityCounts, HealSourceCounts};
 pub use resume::{CheckpointManager, ResumeCheckpoint, ResumeManager, ResumeState, ResumeUtils};
