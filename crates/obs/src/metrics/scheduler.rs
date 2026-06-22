@@ -70,6 +70,7 @@ use crate::metrics::config::{
     ENV_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL, ENV_CLUSTER_METRICS_INTERVAL, ENV_DEFAULT_METRICS_INTERVAL,
     ENV_NODE_METRICS_INTERVAL, ENV_NOTIFICATION_METRICS_INTERVAL, ENV_RESOURCE_METRICS_INTERVAL,
 };
+use crate::metrics::ecstore_global;
 use crate::metrics::report::{PrometheusMetric, report_metrics};
 use crate::metrics::schema::bucket_replication::{
     BUCKET_L, BUCKET_REPL_BANDWIDTH_CURRENT_MD, BUCKET_REPL_BANDWIDTH_LIMIT_MD, TARGET_ARN_L,
@@ -82,7 +83,6 @@ use crate::metrics::stats_collector::{
     collect_scanner_metric_stats, collect_system_cpu_and_memory_stats_with,
 };
 use rustfs_audit::audit_target_metrics;
-use rustfs_ecstore::api::global as ecstore_global;
 use rustfs_notify::{notification_metrics_snapshot, notification_target_metrics};
 use rustfs_utils::get_env_opt_u64;
 use serde::Serialize;

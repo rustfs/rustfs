@@ -26,15 +26,10 @@ use crate::metrics::collectors::{
     DriveDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmStats, MemoryStats, NetworkStats, ProcessStats,
     ProcessStatusType, ReplicationStats, ResourceStats, ScannerStats,
 };
+use crate::metrics::{ecstore_bucket, ecstore_capacity, ecstore_data_usage, ecstore_error, ecstore_global, ecstore_storage};
 use chrono::Utc;
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::global_metrics;
-use rustfs_ecstore::api::bucket as ecstore_bucket;
-use rustfs_ecstore::api::capacity as ecstore_capacity;
-use rustfs_ecstore::api::data_usage as ecstore_data_usage;
-use rustfs_ecstore::api::error as ecstore_error;
-use rustfs_ecstore::api::global as ecstore_global;
-use rustfs_ecstore::api::storage as ecstore_storage;
 use rustfs_iam::{get_global_iam_sys, oidc::oidc_plugin_authn_metrics_snapshot};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_io_metrics::{ProcessStatusSnapshot, snapshot_process_resource_and_system};

@@ -37,6 +37,10 @@ mod runtime_view;
 mod services;
 mod status_view;
 
+pub(crate) use rustfs_ecstore::api::config as ecstore_config;
+pub(crate) use rustfs_ecstore::api::global as ecstore_global;
+pub(crate) use rustfs_ecstore::api::storage as ecstore_storage;
+
 pub use bucket_config_manager::NotifyBucketConfigManager;
 pub use config_manager::{NotifyConfigManager, runtime_target_id_for_subsystem};
 pub use error::{LifecycleError, NotificationError};

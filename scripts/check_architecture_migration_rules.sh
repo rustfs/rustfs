@@ -99,6 +99,7 @@ ALL_STORAGE_COMPAT_RAW_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_raw_
 ALL_STORAGE_COMPAT_GROUPED_FACADE_IMPORT_HITS_FILE="${TMP_DIR}/all_storage_compat_grouped_facade_import_hits.txt"
 ALL_ECSTORE_API_GROUPED_FACADE_IMPORT_HITS_FILE="${TMP_DIR}/all_ecstore_api_grouped_facade_import_hits.txt"
 ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE="${TMP_DIR}/all_ecstore_api_raw_subpath_hits.txt"
+EXTERNAL_PRODUCTION_ECSTORE_IMPORT_HITS_FILE="${TMP_DIR}/external_production_ecstore_import_hits.txt"
 ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_self_facade_path_hits.txt"
 RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE="${TMP_DIR}/rustfs_local_compat_owner_self_path_hits.txt"
 RUSTFS_ROOT_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_compat_relative_consumer_hits.txt"
@@ -717,7 +718,7 @@ fi
     --glob '!**/storage_compat.rs' \
     --glob '!**/*storage_compat.rs' \
     --glob '!target/**' \
-    | rg -v '^(rustfs/src/(admin/mod|app/mod|storage/mod)\.rs|crates/e2e_test/src/(replication_extension_test|reliant/(grpc_lock_client|node_interact_test))\.rs|crates/heal/src/heal/mod\.rs|crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)\.rs|crates/iam/src/lib\.rs|crates/notify/src/config_manager\.rs|crates/obs/src/metrics/(scheduler|stats_collector)\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/object_store\.rs|crates/scanner/src/lib\.rs|crates/scanner/tests/lifecycle_integration_test\.rs|fuzz/fuzz_targets/(bucket_validation|path_containment)\.rs):' || true
+    | rg -v '^(rustfs/src/(admin/mod|app/mod|storage/mod)\.rs|crates/e2e_test/src/(replication_extension_test|reliant/(grpc_lock_client|node_interact_test))\.rs|crates/heal/src/heal/mod\.rs|crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)\.rs|crates/iam/src/lib\.rs|crates/notify/src/lib\.rs|crates/obs/src/metrics/mod\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/lib\.rs|crates/scanner/src/lib\.rs|crates/scanner/tests/lifecycle_integration_test\.rs|fuzz/fuzz_targets/(bucket_validation|path_containment)\.rs):' || true
 ) |
   cat >"$DIRECT_ECSTORE_IMPORT_HITS_FILE"
 
@@ -1064,6 +1065,18 @@ fi
 
 if [[ -s "$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE" ]]; then
   report_failure "non-ECStore sources must keep raw ECStore facade subpaths behind local ecstore_* module aliases: $(paste -sd '; ' "$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '^(?:pub\(crate\) )?use rustfs_ecstore::api::[a-z_]+ as ecstore_[a-z_]+;' \
+    crates/heal/src crates/iam/src crates/notify/src crates/obs/src crates/protocols/src crates/s3select-api/src crates/scanner/src \
+    --glob '*.rs' |
+    rg -v '^(crates/heal/src/heal/mod.rs|crates/iam/src/lib.rs|crates/notify/src/lib.rs|crates/obs/src/metrics/mod.rs|crates/protocols/src/swift/mod.rs|crates/s3select-api/src/lib.rs|crates/scanner/src/lib.rs):' || true
+) >"$EXTERNAL_PRODUCTION_ECSTORE_IMPORT_HITS_FILE"
+
+if [[ -s "$EXTERNAL_PRODUCTION_ECSTORE_IMPORT_HITS_FILE" ]]; then
+  report_failure "external production ECStore facade imports must stay at crate or module owner roots: $(paste -sd '; ' "$EXTERNAL_PRODUCTION_ECSTORE_IMPORT_HITS_FILE")"
 fi
 
 (

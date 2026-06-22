@@ -5,17 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-external-ecstore-facade-aliases`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129`.
-- Based on: API-129 slice.
+- Branch: `overtrue/arch-external-owner-ecstore-boundaries`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130`.
+- Based on: API-130 slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: centralize non-ECStore grouped/raw ECStore facade imports
-  behind per-module `ecstore_*` aliases across external owner modules, tests,
-  and fuzz targets.
-- CI/script changes: reject grouped `rustfs_ecstore::api::{...}` imports and
-  raw `rustfs_ecstore::api::<module>::...` subpaths outside ECStore.
-- Docs changes: record the API-130 external ECStore facade alias cleanup.
+- Rust code changes: move nested external production ECStore facade imports for
+  notify, observability, and S3 Select behind crate or module owner roots.
+- CI/script changes: reject nested external production `rustfs_ecstore::api`
+  imports outside the approved crate or module owner roots.
+- Docs changes: record the API-131 external owner boundary cleanup.
 
 ## Phase 0 Tasks
 
@@ -3862,6 +3861,23 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     scans, migration/layer guards, formatting, diff hygiene, Rust risk scan,
     branch freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `API-131` Route nested external production ECStore imports through owner roots.
+  - Do: expose notify, observability metrics, and S3 Select ECStore facade
+    aliases from their crate or module owner roots, and migrate nested
+    production files to import those local aliases instead of importing
+    `rustfs_ecstore::api` directly.
+  - Acceptance: nested production files under notify, observability, and S3
+    Select no longer import ECStore facade modules directly, while IAM,
+    scanner, heal, Swift, and owner root files remain the only approved
+    external production direct facade import points.
+  - Must preserve: notify config persistence, observability metrics collection
+    and scheduler bucket-monitor checks, S3 Select object-store error and
+    storage access behavior, and all public crate APIs.
+  - Verification: focused notify/obs/S3 Select compile, nested direct-import
+    residual scan, migration/layer guards, formatting, diff hygiene, Rust risk
+    scan, branch freshness check, pre-commit quality gate, and three-expert
+    review.
+
 ## Next PRs
 
 1. `pure-move`: continue pruning remaining facade compatibility and owner boundaries.
@@ -3870,13 +3886,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-130 keeps external ECStore facade access explicit through per-module `ecstore_*` aliases without adding behavior wrappers. |
-| Migration preservation | pass | IAM, notify, obs, Swift, S3 Select, e2e, heal/scanner test, and fuzz call paths keep the same ECStore symbols through local aliases. |
-| Testing/verification | pass | Focused external crate compile, residual scans, migration/layer guards, formatting, diff hygiene, and diff-only Rust risk scan passed. |
+| Quality/architecture | pass | API-131 keeps direct ECStore facade imports at external owner roots and leaves nested production modules on local aliases. |
+| Migration preservation | pass | Notify, observability, and S3 Select call paths keep the same ECStore symbols through owner-root aliases only. |
+| Testing/verification | pass | Focused notify/obs/S3 Select compile, nested direct-import residual scan, migration/layer guards, formatting, diff hygiene, and diff-only Rust risk scan passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-131 current slice:
+  - `cargo check --tests -p rustfs-notify -p rustfs-obs -p rustfs-s3select-api`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `make pre-commit`: passed, including clippy, script tests, nextest
+    `6518 passed, 111 skipped`, and doc-tests.
+  - Nested external production ECStore facade residual scan: passed.
+  - Rust risk scan: diff-only scan found new `as ecstore_*` import aliases
+    only; no new risky behavior added.
 
 - Issue #660 API-130 current slice:
   - `cargo check --tests -p rustfs-notify -p rustfs-obs -p rustfs-protocols -p rustfs-s3select-api -p e2e_test -p rustfs-heal -p rustfs-scanner -p rustfs-iam`: passed.

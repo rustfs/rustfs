@@ -19,6 +19,13 @@ pub mod scheduler;
 pub mod schema;
 pub mod stats_collector;
 
+pub(crate) use rustfs_ecstore::api::bucket as ecstore_bucket;
+pub(crate) use rustfs_ecstore::api::capacity as ecstore_capacity;
+pub(crate) use rustfs_ecstore::api::data_usage as ecstore_data_usage;
+pub(crate) use rustfs_ecstore::api::error as ecstore_error;
+pub(crate) use rustfs_ecstore::api::global as ecstore_global;
+pub(crate) use rustfs_ecstore::api::storage as ecstore_storage;
+
 pub use collectors::*;
 pub use config::*;
 pub use report::{PrometheusMetric, report_metrics};

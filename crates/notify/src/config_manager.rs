@@ -13,16 +13,14 @@
 // limitations under the License.
 
 use crate::{
-    Event, NotificationError, registry::TargetRegistry, rule_engine::NotifyRuleEngine, runtime_facade::NotifyRuntimeFacade,
+    Event, NotificationError, ecstore_config, ecstore_global, ecstore_storage, registry::TargetRegistry,
+    rule_engine::NotifyRuleEngine, runtime_facade::NotifyRuntimeFacade,
 };
 use rustfs_config::notify::{
     NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_SUB_SYS, NOTIFY_NATS_SUB_SYS,
     NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_REDIS_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::server_config::{Config, KVS};
-use rustfs_ecstore::api::config as ecstore_config;
-use rustfs_ecstore::api::global as ecstore_global;
-use rustfs_ecstore::api::storage as ecstore_storage;
 use rustfs_targets::{Target, arn::TargetID};
 use std::sync::Arc;
 use tokio::sync::RwLock;
