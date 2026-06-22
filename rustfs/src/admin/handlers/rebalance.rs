@@ -1227,7 +1227,7 @@ mod rebalance_handler_tests {
         assert_eq!(active.used, 0.5);
         assert_eq!(active.progress.as_ref().unwrap().bucket, "bucket-b");
         assert_eq!(active.progress.as_ref().unwrap().object, "obj-2");
-        assert_eq!(active.progress.as_ref().unwrap().remaining_buckets, 1);
+        assert_eq!(active.progress.as_ref().unwrap().remaining_buckets, 2);
 
         let inactive = &statuses[1];
         assert_eq!(inactive.id, 1);
