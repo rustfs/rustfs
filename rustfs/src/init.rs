@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::startup_storage_compat::{get_global_region, get_notification_config};
 use crate::server::ShutdownHandle;
-use crate::startup_storage_compat::{get_global_region, get_notification_config};
 use crate::storage::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
 use crate::{admin, config, version};
 use rustfs_config::{
