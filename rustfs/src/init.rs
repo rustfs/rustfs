@@ -596,7 +596,8 @@ pub fn init_buffer_profile_system(config: &config::Config) {
                     fallback_profile = DEFAULT_BUFFER_PROFILE,
                     "Fallback buffer profile validation failed"
                 );
-                panic!("Failed to initialize a valid RustFS buffer configuration");
+                set_buffer_profile_enabled(false);
+                return;
             }
             buffer_config = fallback_config;
         }

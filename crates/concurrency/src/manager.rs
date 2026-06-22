@@ -14,7 +14,7 @@
 
 //! Main concurrency manager
 
-use crate::config::ConcurrencyConfig;
+use crate::config::{ConcurrencyConfig, ConfigError};
 use std::sync::Arc;
 
 /// Snapshot of disk permit queue usage for GetObject orchestration.
@@ -76,13 +76,7 @@ pub struct ConcurrencyManager {
 }
 
 impl ConcurrencyManager {
-    /// Create a new concurrency manager with the given configuration
-    pub fn new(config: ConcurrencyConfig) -> Self {
-        // Validate configuration
-        if let Err(e) = config.validate() {
-            panic!("Invalid concurrency configuration: {}", e);
-        }
-
+    fn build(config: ConcurrencyConfig) -> Self {
         Self {
             #[cfg(feature = "timeout")]
             timeout: Arc::new(crate::timeout::TimeoutManager::from_policy(config.timeout_policy)),
@@ -106,9 +100,35 @@ impl ConcurrencyManager {
         }
     }
 
+    /// Try to create a new concurrency manager with the given configuration.
+    pub fn try_new(config: ConcurrencyConfig) -> Result<Self, ConfigError> {
+        config.validate()?;
+        Ok(Self::build(config))
+    }
+
+    /// Create a new concurrency manager with the given configuration.
+    ///
+    /// Invalid configurations are downgraded to the default configuration instead of
+    /// panicking so startup/runtime callers can remain fail-safe in production paths.
+    pub fn new(config: ConcurrencyConfig) -> Self {
+        match Self::try_new(config) {
+            Ok(manager) => manager,
+            Err(err) => {
+                tracing::warn!(
+                    event = "concurrency_manager.invalid_config_fallback",
+                    component = "concurrency",
+                    subsystem = "manager",
+                    error = %err,
+                    "Invalid concurrency configuration detected; falling back to defaults"
+                );
+                Self::build(ConcurrencyConfig::default())
+            }
+        }
+    }
+
     /// Create with default configuration
     pub fn with_defaults() -> Self {
-        Self::new(ConcurrencyConfig::default())
+        Self::build(ConcurrencyConfig::default())
     }
 
     /// Create from environment variables
@@ -303,6 +323,43 @@ mod tests {
     fn test_manager_creation() {
         let manager = ConcurrencyManager::with_defaults();
         assert!(manager.config().validate().is_ok());
+    }
+
+    #[test]
+    fn test_try_new_returns_error_for_invalid_config() {
+        let config = ConcurrencyConfig {
+            timeout_policy: crate::TimeoutManagerPolicy {
+                default_timeout: std::time::Duration::from_secs(10),
+                max_timeout: std::time::Duration::from_secs(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = match ConcurrencyManager::try_new(config) {
+            Ok(_) => panic!("invalid config should not build a manager"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ConfigError::InvalidTimeout(_)));
+    }
+
+    #[test]
+    fn test_new_falls_back_to_default_for_invalid_config() {
+        let config = ConcurrencyConfig {
+            timeout_policy: crate::TimeoutManagerPolicy {
+                default_timeout: std::time::Duration::from_secs(10),
+                max_timeout: std::time::Duration::from_secs(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let manager = ConcurrencyManager::new(config);
+        assert!(manager.config().validate().is_ok());
+        assert_eq!(
+            manager.config().timeout_policy.default_timeout,
+            ConcurrencyConfig::default().timeout_policy.default_timeout
+        );
     }
 
     #[tokio::test]
