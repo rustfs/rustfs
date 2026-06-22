@@ -38,6 +38,7 @@ const INTERNODE_OPERATION_RECV_BYTES_TOTAL: &str = "rustfs_system_network_intern
 const INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL: &str = "rustfs_system_network_internode_operation_requests_outgoing_total";
 const INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL: &str = "rustfs_system_network_internode_operation_requests_incoming_total";
 const INTERNODE_OPERATION_ERRORS_TOTAL: &str = "rustfs_system_network_internode_operation_errors_total";
+const INTERNODE_OPERATION_DURATION_MS: &str = "rustfs_system_network_internode_operation_duration_ms";
 const INTERNODE_OPERATION_CLASSIFIED_ERRORS_TOTAL: &str = "rustfs_system_network_internode_operation_classified_errors_total";
 const INTERNODE_OPERATION_RETRIES_TOTAL: &str = "rustfs_system_network_internode_operation_retries_total";
 const INTERNODE_OPERATION_RETRY_SUCCESSES_TOTAL: &str = "rustfs_system_network_internode_operation_retry_successes_total";
@@ -72,6 +73,10 @@ pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_ERRORS_TOTAL,
+        labels: OPERATION_BACKEND_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_DURATION_MS,
         labels: OPERATION_BACKEND_LABELS,
     },
     InternodeOperationMetricDescriptor {
@@ -206,6 +211,12 @@ impl InternodeMetrics {
     pub fn record_error_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
         self.record_error();
         counter!(INTERNODE_OPERATION_ERRORS_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend).increment(1);
+    }
+
+    pub fn record_duration_for_operation_and_backend(&self, operation: &'static str, backend: &'static str, duration: Duration) {
+        let duration_ms = duration.as_secs_f64() * 1000.0;
+        metrics::histogram!(INTERNODE_OPERATION_DURATION_MS, OPERATION_LABEL => operation, BACKEND_LABEL => backend)
+            .record(duration_ms);
     }
 
     pub fn record_classified_error_for_operation_and_backend(

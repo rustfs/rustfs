@@ -37,6 +37,7 @@ use serde_urlencoded::from_bytes;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Instant;
 use tokio::io::{self, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 use tower::Service;
@@ -279,6 +280,7 @@ fn is_internode_rpc_path(path: &str) -> bool {
 
 async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
     let operation = internode_http_operation(req.uri().path());
+    let started_at = Instant::now();
     if let Err(response) = verify_internode_rpc_signature(req.uri(), req.method(), req.headers()) {
         record_internode_rpc_error(operation);
         return *response;
@@ -296,6 +298,14 @@ async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
 
     if !response.status().is_success() {
         record_internode_rpc_error(operation);
+    }
+
+    if let Some(operation) = operation {
+        global_internode_metrics().record_duration_for_operation_and_backend(
+            operation,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+            started_at.elapsed(),
+        );
     }
 
     response
