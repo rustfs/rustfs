@@ -1376,7 +1376,7 @@ async fn apply_ssec_prepare_encryption_material(
             key: sse_key,
             key_md5: sse_key_md5.clone(),
         })?;
-        let object_key = derive_object_key(validated.key_bytes);
+        let object_key = derive_object_key(validated.key_bytes)?;
         let sealed_key = seal_object_key(object_key, validated.key_bytes, SSEType::SseC, bucket, key)?;
         (object_key, [0; 12], EncryptionKeyKind::Object, Some(sealed_key))
     } else {
@@ -1423,7 +1423,7 @@ async fn apply_ssec_encryption_material(
 
     #[cfg(feature = "rio-v2")]
     let (key_bytes, base_nonce, key_kind, managed_sealed_key) = {
-        let object_key = derive_object_key(validated.key_bytes);
+        let object_key = derive_object_key(validated.key_bytes)?;
         let sealed_key = seal_object_key(object_key, validated.key_bytes, SSEType::SseC, bucket, key)?;
         (object_key, [0; 12], EncryptionKeyKind::Object, Some(sealed_key))
     };
