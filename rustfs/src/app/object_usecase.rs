@@ -1132,6 +1132,23 @@ fn response_storage_class(info: &ObjectInfo, metadata: &HashMap<String, String>)
         .map(StorageClass::from)
 }
 
+fn response_storage_class_for_object_attributes(
+    info: &ObjectInfo,
+    metadata: &HashMap<String, String>,
+    requested: bool,
+) -> Option<StorageClass> {
+    if !requested {
+        return None;
+    }
+
+    info.storage_class
+        .clone()
+        .or_else(|| metadata.get(AMZ_STORAGE_CLASS).cloned())
+        .or_else(|| Some(storageclass::STANDARD.to_string()))
+        .filter(|storage_class| !storage_class.is_empty())
+        .map(StorageClass::from)
+}
+
 async fn apply_put_request_object_lock_opts(
     bucket: &str,
     object_lock_legal_hold_status: Option<ObjectLockLegalHoldStatus>,
@@ -2878,7 +2895,6 @@ impl DefaultObjectUsecase {
         validate_ssec_for_read(&info.user_defined, sse_customer_key.as_ref(), sse_customer_key_md5.as_ref())?;
 
         let metadata_map = info.user_defined.clone();
-        let storage_class = response_storage_class(&info, &metadata_map);
 
         debug!(
             "GetObjectAttributes raw object_attributes={:?}",
@@ -2886,6 +2902,8 @@ impl DefaultObjectUsecase {
         );
 
         let requested = |name: &'static str| -> bool { object_attributes_requested(&object_attributes, name) };
+        let storage_class =
+            response_storage_class_for_object_attributes(&info, &metadata_map, requested(ObjectAttributes::STORAGE_CLASS));
 
         let e_tag = if requested(ObjectAttributes::ETAG) {
             info.etag.as_ref().map(|etag| to_s3s_etag(etag))
@@ -5801,6 +5819,38 @@ mod tests {
         assert!(
             response_storage_class(&standard_metadata_info, &metadata).is_none(),
             "STANDARD must be omitted even when it only arrives via metadata fallback"
+        );
+    }
+
+    #[test]
+    fn response_storage_class_for_object_attributes_defaults_to_standard_when_requested() {
+        let metadata = HashMap::new();
+        let info = ObjectInfo {
+            storage_class: None,
+            user_defined: Arc::new(metadata.clone()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            response_storage_class_for_object_attributes(&info, &metadata, true)
+                .as_ref()
+                .map(StorageClass::as_str),
+            Some(storageclass::STANDARD)
+        );
+    }
+
+    #[test]
+    fn response_storage_class_for_object_attributes_skips_value_when_not_requested() {
+        let metadata = HashMap::new();
+        let info = ObjectInfo {
+            storage_class: Some(storageclass::STANDARD_IA.to_string()),
+            user_defined: Arc::new(metadata.clone()),
+            ..Default::default()
+        };
+
+        assert!(
+            response_storage_class_for_object_attributes(&info, &metadata, false).is_none(),
+            "StorageClass must only be returned when explicitly requested"
         );
     }
 

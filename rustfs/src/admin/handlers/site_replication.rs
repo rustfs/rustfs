@@ -2734,6 +2734,10 @@ fn site_replication_bucket_target_for_peer(
     let port = parsed.port_or_known_default().ok_or_else(|| {
         S3Error::with_message(S3ErrorCode::InvalidRequest, format!("peer endpoint missing port: {}", peer.endpoint))
     })?;
+    let region = get_global_region()
+        .map(|region| region.to_string())
+        .filter(|region| !region.is_empty())
+        .unwrap_or_else(|| "us-east-1".to_string());
     let arn = arn_override.unwrap_or_else(|| {
         ARN::new(
             BucketTargetType::ReplicationService,
@@ -2756,6 +2760,7 @@ fn site_replication_bucket_target_for_peer(
         target_bucket: bucket.to_string(),
         secure: parsed.scheme().eq_ignore_ascii_case("https"),
         arn,
+        region,
         target_type: BucketTargetType::ReplicationService,
         deployment_id: peer.deployment_id.clone(),
         ..Default::default()
@@ -3464,6 +3469,31 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
         )
         .await?;
     }
+
+    if item.r#type == "version-config"
+        && metadata_sys::get_versioning_config(&item.bucket)
+            .await
+            .ok()
+            .is_some_and(|(config, _)| config.enabled())
+        && let Some(runtime) = runtime_site_replication_targets().await?
+    {
+        ensure_site_replication_bucket_targets(
+            &item.bucket,
+            &runtime.state,
+            &runtime.local_peer,
+            replication_config.as_ref(),
+            &runtime.service_account_secret_key,
+        )
+        .await?;
+        ensure_site_replication_bucket_replication_config(
+            &item.bucket,
+            &runtime.state,
+            &runtime.local_peer,
+            &runtime.service_account_secret_key,
+        )
+        .await?;
+    }
+
     Ok(())
 }
 
@@ -5489,6 +5519,7 @@ mod tests {
         assert_eq!(target.target_bucket, "photos");
         assert_eq!(target.deployment_id, "remote");
         assert_eq!(target.arn, "arn:rustfs:replication::remote:photos");
+        assert_eq!(target.region, "us-east-1");
         let credentials = target
             .credentials
             .as_ref()
