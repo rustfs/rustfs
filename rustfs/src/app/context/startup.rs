@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::super::storage_compat::ECStore;
 use super::global::{AppContext, get_global_app_context, init_global_app_context};
-use super::storage_compat::ECStore;
 use rustfs_kms::KmsServiceManager;
 use std::io::{Error, Result};
 use std::sync::Arc;

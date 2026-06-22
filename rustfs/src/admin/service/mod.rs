@@ -14,4 +14,3 @@
 
 pub mod config;
 pub mod site_replication;
-pub(crate) mod storage_compat;

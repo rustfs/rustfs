@@ -104,6 +104,7 @@ RUSTFS_STORAGE_CORE_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storag
 RUSTFS_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_local_compat_relative_consumer_hits.txt"
 RUSTFS_APP_ADMIN_SECONDARY_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/rustfs_app_admin_secondary_compat_bridge_hits.txt"
 RUSTFS_STORAGE_SECONDARY_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/rustfs_storage_secondary_compat_bridge_hits.txt"
+RUSTFS_NESTED_SECONDARY_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/rustfs_nested_secondary_compat_bridge_hits.txt"
 RUSTFS_STORAGE_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_local_compat_relative_consumer_hits.txt"
 RUSTFS_ADMIN_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_admin_local_compat_relative_consumer_hits.txt"
 RUSTFS_APP_SERVER_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_app_server_local_compat_relative_consumer_hits.txt"
@@ -865,10 +866,7 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --no-heading 'pub\(crate\)\s+use\s+crate::(?:admin|app|storage)::storage_compat::\*;' \
-    rustfs/src/admin/handlers/storage_compat.rs \
-    rustfs/src/admin/service/storage_compat.rs \
-    rustfs/src/app/context/storage_compat.rs \
-    rustfs/src/storage/rpc/storage_compat.rs || true
+    rustfs/src/admin/handlers/storage_compat.rs || true
 ) >"$RUSTFS_LOCAL_COMPAT_GLOB_EXPORT_HITS_FILE"
 
 if [[ -s "$RUSTFS_LOCAL_COMPAT_GLOB_EXPORT_HITS_FILE" ]]; then
@@ -1124,6 +1122,26 @@ fi
 
 if [[ -s "$RUSTFS_STORAGE_SECONDARY_COMPAT_BRIDGE_HITS_FILE" ]]; then
   report_failure "RustFS storage owner consumers must route directly through storage_compat instead of the secondary core_storage_compat bridge: $(paste -sd '; ' "$RUSTFS_STORAGE_SECONDARY_COMPAT_BRIDGE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    for file in \
+      rustfs/src/admin/service/storage_compat.rs \
+      rustfs/src/app/context/storage_compat.rs \
+      rustfs/src/storage/rpc/storage_compat.rs; do
+      [[ -e "$file" ]] && printf '%s:1:secondary bridge file exists\n' "$file"
+    done
+    rg -n --with-filename 'mod storage_compat' \
+      rustfs/src/admin/service/mod.rs \
+      rustfs/src/app/context.rs \
+      rustfs/src/storage/rpc/mod.rs || true
+  }
+) >"$RUSTFS_NESTED_SECONDARY_COMPAT_BRIDGE_HITS_FILE"
+
+if [[ -s "$RUSTFS_NESTED_SECONDARY_COMPAT_BRIDGE_HITS_FILE" ]]; then
+  report_failure "RustFS nested service/context/rpc consumers must route directly through owner storage_compat instead of secondary compatibility bridges: $(paste -sd '; ' "$RUSTFS_NESTED_SECONDARY_COMPAT_BRIDGE_HITS_FILE")"
 fi
 
 (

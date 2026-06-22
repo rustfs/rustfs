@@ -5,16 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-core-secondary-compat-bridge`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117`.
-- Based on: API-117 slice.
+- Branch: `overtrue/arch-nested-secondary-compat-bridges`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118`.
+- Based on: API-118 slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: collapse storage owner secondary compatibility bridge
-  consumers directly into `storage_compat`.
-- CI/script changes: guard against reintroducing the storage
-  `core_storage_compat` bridge module.
-- Docs changes: record the API-118 storage secondary bridge cleanup.
+- Rust code changes: collapse admin service, app context, and storage RPC
+  nested secondary compatibility bridge consumers directly into owner
+  `storage_compat`.
+- CI/script changes: guard against reintroducing the nested service, context,
+  and RPC `storage_compat` bridge modules.
+- Docs changes: record the API-119 nested secondary bridge cleanup.
 
 ## Phase 0 Tasks
 
@@ -669,6 +670,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     encryption helpers, storage option resolution, and existing owner
     `storage_compat` aliases.
   - Verification: RustFS compile coverage, storage secondary bridge residual
+    scan, migration and layer guards, formatting, diff hygiene, path-only risk
+    review, and three-expert review.
+- [x] `API-119` Remove nested secondary compatibility bridges.
+  - Completed slice: replace admin service, app context, and storage RPC
+    consumers of nested `storage_compat` bridge modules with direct owner
+    `storage_compat` paths, then delete the nested bridge modules.
+  - Acceptance: nested service, context, and RPC modules no longer route
+    through a second local compatibility bridge; migration rules reject
+    reintroduced bridge files or module declarations.
+  - Must preserve: admin dynamic config and site-replication behavior, app
+    context handle wiring, storage RPC signature and disk lookup behavior, and
+    existing owner `storage_compat` aliases.
+  - Verification: RustFS compile coverage, nested secondary bridge residual
     scan, migration and layer guards, formatting, diff hygiene, path-only risk
     review, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
@@ -3704,13 +3718,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-118 removes the storage core secondary compatibility bridge while keeping consumers on the storage owner `storage_compat` boundary. |
-| Migration preservation | pass | The extended guard rejects reintroduced `core_storage_compat` references while preserving existing owner aliases. |
-| Testing/verification | pass | RustFS compile, storage secondary bridge residual scan, migration guard, layer guard, formatting, diff hygiene, and path-only risk review passed. |
+| Quality/architecture | pass | API-119 removes nested service/context/rpc secondary compatibility bridges while keeping consumers on owner `storage_compat` boundaries. |
+| Migration preservation | pass | The extended guard rejects reintroduced nested bridge files or module declarations while preserving existing owner aliases. |
+| Testing/verification | pass | RustFS compile, nested secondary bridge residual scan, migration guard, layer guard, formatting, diff hygiene, and path-only risk review passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-119 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Nested secondary compatibility bridge residual scan: passed.
+  - Rust risk review on path-only replacements and guard script: passed.
 
 - Issue #660 API-118 current slice:
   - `cargo check -p rustfs --tests`: passed.
