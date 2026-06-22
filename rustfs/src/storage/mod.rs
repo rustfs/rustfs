@@ -70,22 +70,92 @@ pub(crate) use sse::{
 
 use std::sync::Arc;
 
-pub(crate) use rustfs_ecstore::api::admin as ecstore_admin;
-pub(crate) use rustfs_ecstore::api::bucket as ecstore_bucket;
-pub(crate) use rustfs_ecstore::api::client as ecstore_client;
-pub(crate) use rustfs_ecstore::api::cluster as ecstore_cluster;
-pub(crate) use rustfs_ecstore::api::config as ecstore_config;
-pub(crate) use rustfs_ecstore::api::disk as ecstore_disk;
-pub(crate) use rustfs_ecstore::api::error as ecstore_error;
-pub(crate) use rustfs_ecstore::api::event as ecstore_event;
-pub(crate) use rustfs_ecstore::api::global as ecstore_global;
-pub(crate) use rustfs_ecstore::api::layout as ecstore_layout;
-pub(crate) use rustfs_ecstore::api::metrics as ecstore_metrics;
-pub(crate) use rustfs_ecstore::api::notification as ecstore_notification;
-pub(crate) use rustfs_ecstore::api::rio as ecstore_rio;
-pub(crate) use rustfs_ecstore::api::rpc as ecstore_rpc;
-pub(crate) use rustfs_ecstore::api::set_disk as ecstore_set_disk;
-pub(crate) use rustfs_ecstore::api::storage as ecstore_storage;
+pub(crate) mod ecstore_admin {
+    pub(crate) use rustfs_ecstore::api::admin::get_local_server_property;
+}
+
+pub(crate) mod ecstore_bucket {
+    pub(crate) use rustfs_ecstore::api::bucket::{
+        metadata, metadata_sys, migration, object_lock, policy_sys, replication, tagging, utils,
+    };
+    pub(crate) use rustfs_ecstore::api::bucket::{quota, versioning, versioning_sys};
+}
+
+pub(crate) mod ecstore_client {
+    pub(crate) use rustfs_ecstore::api::client::object_api_utils;
+}
+
+pub(crate) mod ecstore_cluster {
+    pub(crate) use rustfs_ecstore::api::cluster::topology_snapshot_from_endpoint_pools_with_capabilities;
+}
+
+pub(crate) mod ecstore_config {
+    pub(crate) use rustfs_ecstore::api::config::{com, init, init_global_config_sys, try_migrate_server_config};
+}
+
+#[allow(unused_imports)]
+pub(crate) mod ecstore_disk {
+    pub(crate) use rustfs_ecstore::api::disk::{
+        CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter,
+        RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo,
+        WalkDirOptions,
+    };
+    pub(crate) use rustfs_ecstore::api::disk::{endpoint, error, error_reduce};
+}
+
+pub(crate) mod ecstore_error {
+    pub(crate) use rustfs_ecstore::api::error::{
+        Error, Result, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
+    };
+}
+
+pub(crate) mod ecstore_event {
+    pub(crate) use rustfs_ecstore::api::event::{EventArgs, register_event_dispatch_hook};
+}
+
+pub(crate) mod ecstore_global {
+    pub(crate) use rustfs_ecstore::api::global::{
+        GLOBAL_TierConfigMgr, get_global_endpoints_opt, get_global_lock_client, get_global_lock_clients, get_global_region,
+        is_dist_erasure, resolve_object_store_handle, set_global_endpoints, set_global_region, set_global_rustfs_port,
+        shutdown_background_services, update_erasure_type,
+    };
+}
+
+#[allow(unused_imports)]
+pub(crate) mod ecstore_layout {
+    pub(crate) use rustfs_ecstore::api::layout::{DisksLayout, EndpointServerPools, Endpoints, PoolEndpoints};
+}
+
+pub(crate) mod ecstore_metrics {
+    pub(crate) use rustfs_ecstore::api::metrics::{CollectMetricsOpts, MetricType, collect_local_metrics};
+}
+
+#[allow(unused_imports)]
+pub(crate) mod ecstore_notification {
+    pub(crate) use rustfs_ecstore::api::notification::{NotificationSys, new_global_notification_sys};
+}
+
+pub(crate) mod ecstore_rio {
+    pub(crate) use rustfs_ecstore::api::rio::WriteEncryption;
+}
+
+pub(crate) mod ecstore_rpc {
+    pub(crate) use rustfs_ecstore::api::rpc::{
+        LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG,
+        SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, verify_rpc_signature,
+    };
+}
+
+pub(crate) mod ecstore_set_disk {
+    pub(crate) use rustfs_ecstore::api::set_disk::{DEFAULT_READ_BUFFER_SIZE, get_lock_acquire_timeout};
+}
+
+pub(crate) mod ecstore_storage {
+    pub(crate) use rustfs_ecstore::api::storage::{
+        ECStore, all_local_disk, all_local_disk_path, find_local_disk_by_ref, init_local_disks, init_lock_clients,
+        prewarm_local_disk_id_map,
+    };
+}
 
 pub(crate) const BUCKET_ACCELERATE_CONFIG: &str = ecstore_bucket::metadata::BUCKET_ACCELERATE_CONFIG;
 pub(crate) const BUCKET_LOGGING_CONFIG: &str = ecstore_bucket::metadata::BUCKET_LOGGING_CONFIG;

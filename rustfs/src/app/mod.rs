@@ -43,22 +43,92 @@ mod lifecycle_transition_api_test;
 
 use std::sync::Arc;
 
-use rustfs_ecstore::api::admin as ecstore_admin;
-use rustfs_ecstore::api::bucket as ecstore_bucket;
-use rustfs_ecstore::api::capacity as ecstore_capacity;
-use rustfs_ecstore::api::client as ecstore_client;
-use rustfs_ecstore::api::compression as ecstore_compression;
-use rustfs_ecstore::api::config as ecstore_config;
-use rustfs_ecstore::api::data_usage as ecstore_data_usage;
-use rustfs_ecstore::api::disk as ecstore_disk;
-use rustfs_ecstore::api::error as ecstore_error;
-use rustfs_ecstore::api::global as ecstore_global;
-use rustfs_ecstore::api::layout as ecstore_layout;
-use rustfs_ecstore::api::notification as ecstore_notification;
-use rustfs_ecstore::api::rio as ecstore_rio;
-use rustfs_ecstore::api::set_disk as ecstore_set_disk;
-use rustfs_ecstore::api::storage as ecstore_storage;
-use rustfs_ecstore::api::tier as ecstore_tier;
+mod ecstore_admin {
+    pub(crate) use rustfs_ecstore::api::admin::get_server_info;
+}
+
+mod ecstore_bucket {
+    pub(crate) use rustfs_ecstore::api::bucket::{
+        bucket_target_sys, lifecycle, metadata, metadata_sys, object_lock, policy_sys, quota, replication, tagging, target,
+        utils, versioning, versioning_sys,
+    };
+}
+
+mod ecstore_capacity {
+    pub(crate) use rustfs_ecstore::api::capacity::{
+        PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free,
+    };
+}
+
+#[allow(unused_imports)]
+mod ecstore_client {
+    pub(crate) use rustfs_ecstore::api::client::{object_api_utils, transition_api};
+}
+
+mod ecstore_compression {
+    pub(crate) use rustfs_ecstore::api::compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
+}
+
+mod ecstore_config {
+    pub(crate) use rustfs_ecstore::api::config::storageclass;
+}
+
+mod ecstore_data_usage {
+    pub(crate) use rustfs_ecstore::api::data_usage::{
+        apply_bucket_usage_memory_overlay, load_data_usage_from_backend, record_bucket_object_delete_memory,
+        record_bucket_object_write_memory,
+    };
+}
+
+#[allow(unused_imports)]
+mod ecstore_disk {
+    pub(crate) use rustfs_ecstore::api::disk::{endpoint, error, error_reduce};
+}
+
+mod ecstore_error {
+    pub(crate) use rustfs_ecstore::api::error::{
+        StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
+    };
+}
+
+#[allow(unused_imports)]
+mod ecstore_global {
+    pub(crate) use rustfs_ecstore::api::global::{
+        GLOBAL_TierConfigMgr, get_global_endpoints_opt, get_global_region, get_global_tier_config_mgr, new_object_layer_fn,
+        set_object_store_resolver,
+    };
+}
+
+#[allow(unused_imports)]
+mod ecstore_layout {
+    pub(crate) use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
+}
+
+mod ecstore_notification {
+    pub(crate) use rustfs_ecstore::api::notification::{NotificationSys, get_global_notification_sys};
+}
+
+#[allow(unused_imports)]
+mod ecstore_rio {
+    pub(crate) use rustfs_ecstore::api::rio::{
+        DecryptReader, DynReader, EncryptReader, HardLimitReader, HashReader, ReadStream, Reader, WriteEncryption, WritePlan,
+        boxed_reader, compression_metadata_value, wrap_reader,
+    };
+}
+
+mod ecstore_set_disk {
+    pub(crate) use rustfs_ecstore::api::set_disk::{get_lock_acquire_timeout, is_valid_storage_class};
+}
+
+#[allow(unused_imports)]
+mod ecstore_storage {
+    pub(crate) use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
+}
+
+#[allow(unused_imports)]
+mod ecstore_tier {
+    pub(crate) use rustfs_ecstore::api::tier::{tier, tier_config, warm_backend};
+}
 
 pub(crate) const MIN_DISK_COMPRESSIBLE_SIZE: usize = ecstore_compression::MIN_DISK_COMPRESSIBLE_SIZE;
 

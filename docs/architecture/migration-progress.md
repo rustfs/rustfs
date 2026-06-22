@@ -5,16 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-test-fuzz-owner-symbols`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134`.
-- Based on: API-134 slice.
+- Branch: `overtrue/arch-rustfs-runtime-owner-symbols`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135`.
+- Based on: API-135 stacked slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: replace e2e, heal/scanner integration-test, and fuzz-target
-  ECStore owner module aliases with explicit symbols.
-- CI/script changes: treat the completed test/fuzz files as explicit-symbol
-  boundaries and reject restored `ecstore_*` module aliases there.
-- Docs changes: record the API-135 test/fuzz owner facade symbol cleanup.
+- Rust code changes: replace RustFS app/admin/storage owner-root ECStore facade
+  aliases with owner-local curated symbol modules.
+- CI/script changes: treat the RustFS app/admin/storage owner roots as
+  completed explicit-symbol boundaries and reject restored broad `ecstore_*`
+  module aliases there.
+- Docs changes: record the API-136 RustFS runtime owner facade symbol cleanup.
 
 ## Phase 0 Tasks
 
@@ -3938,6 +3939,21 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     diff hygiene, Rust risk scan, branch freshness check, pre-commit quality
     gate, and three-expert review.
 
+- [x] `API-136` Replace RustFS runtime owner module aliases with symbols.
+  - Do: replace RustFS app/admin/storage owner-root `ecstore_*` facade aliases
+    with owner-local curated symbol modules that expose only the ECStore
+    submodules, functions, types, and constants consumed by those runtime
+    boundaries.
+  - Acceptance: `rustfs/src/app/mod.rs`, `rustfs/src/admin/mod.rs`, and
+    `rustfs/src/storage/mod.rs` no longer import broad ECStore facade modules
+    as `ecstore_*`; migration guards reject reintroducing those broad aliases.
+  - Must preserve: app object/lifecycle/replication helpers, admin config,
+    metrics, tiering, rebalance helpers, storage S3/RPC metadata helpers, and
+    startup/server consumers of the storage owner boundary.
+  - Verification: focused RustFS compile, runtime owner alias residual scan,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
 ## Next PRs
 
 1. `pure-move`: continue pruning remaining facade compatibility and owner boundaries.
@@ -3946,13 +3962,27 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-135 replaces e2e, heal/scanner integration-test, and fuzz-target ECStore owner module aliases with explicit imported symbols. |
-| Migration preservation | pass | RPC client construction, replication target access, heal ECStore setup, scanner lifecycle/tier/transition paths, and fuzz validation call targets keep the same ECStore facade symbols. |
-| Testing/verification | pass | Focused e2e/heal/scanner compile, fuzz manifest compile, completed test/fuzz alias residual scan, migration/layer guards, formatting, diff hygiene, full pre-commit, and diff-only Rust risk scan passed. |
+| Quality/architecture | pass | API-136 replaces RustFS app/admin/storage owner-root ECStore facade aliases with owner-local curated symbol modules and guards the completed owner roots against broad alias reintroduction. |
+| Migration preservation | pass | App, admin, storage, startup, server, capacity, and workload-admission call paths keep the same ECStore facade symbols behind local owner boundaries. |
+| Testing/verification | pass | Focused RustFS compile, completed runtime-owner alias residual scan, migration/layer guards, formatting, diff hygiene, pre-commit, and Rust risk scan passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-136 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `make pre-commit`: passed.
+  - Completed runtime-owner module-alias residual scan: passed.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or
+    risky behavior added; existing `Result<Vec<String>>` storage trait
+    signatures remain unchanged compatibility surfaces.
 
 - Issue #660 API-135 current slice:
   - `cargo check --tests -p e2e_test -p rustfs-heal -p rustfs-scanner`: passed.

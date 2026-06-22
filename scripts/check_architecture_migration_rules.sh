@@ -1062,7 +1062,7 @@ fi
   rg -n --with-filename 'rustfs_ecstore::api::[a-z_]+::' rustfs/src crates fuzz \
     --glob '*.rs' \
     --glob '!crates/ecstore/**' |
-    rg -v '^(fuzz/fuzz_targets/bucket_validation\.rs|fuzz/fuzz_targets/path_containment\.rs|crates/e2e_test/src/reliant/grpc_lock_client\.rs|crates/e2e_test/src/reliant/node_interact_test\.rs|crates/e2e_test/src/replication_extension_test\.rs|crates/heal/src/heal/mod\.rs|crates/heal/tests/endpoint_index_test\.rs|crates/heal/tests/heal_bug_fixes_test\.rs|crates/heal/tests/heal_integration_test\.rs|crates/iam/src/lib\.rs|crates/notify/src/lib\.rs|crates/obs/src/metrics/mod\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/lib\.rs|crates/scanner/src/lib\.rs|crates/scanner/tests/lifecycle_integration_test\.rs):' || true
+    rg -v '^(fuzz/fuzz_targets/bucket_validation\.rs|fuzz/fuzz_targets/path_containment\.rs|crates/e2e_test/src/reliant/grpc_lock_client\.rs|crates/e2e_test/src/reliant/node_interact_test\.rs|crates/e2e_test/src/replication_extension_test\.rs|crates/heal/src/heal/mod\.rs|crates/heal/tests/endpoint_index_test\.rs|crates/heal/tests/heal_bug_fixes_test\.rs|crates/heal/tests/heal_integration_test\.rs|crates/iam/src/lib\.rs|crates/notify/src/lib\.rs|crates/obs/src/metrics/mod\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/lib\.rs|crates/scanner/src/lib\.rs|crates/scanner/tests/lifecycle_integration_test\.rs|rustfs/src/admin/mod\.rs|rustfs/src/app/mod\.rs|rustfs/src/storage/mod\.rs):' || true
 ) >"$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE"
 
 if [[ -s "$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE" ]]; then
@@ -1086,6 +1086,9 @@ fi
     crates/e2e_test/src/reliant/grpc_lock_client.rs \
     crates/e2e_test/src/reliant/node_interact_test.rs \
     crates/e2e_test/src/replication_extension_test.rs \
+    rustfs/src/admin/mod.rs \
+    rustfs/src/app/mod.rs \
+    rustfs/src/storage/mod.rs \
     fuzz/fuzz_targets/bucket_validation.rs \
     fuzz/fuzz_targets/path_containment.rs || true
 ) >"$COMPLETED_EXTERNAL_OWNER_MODULE_ALIAS_HITS_FILE"
