@@ -27,6 +27,11 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 
+use crate::table_catalog_storage_compat::{
+    BUCKET_TABLE_CATALOG_META_PREFIX, BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG,
+    BUCKET_TABLE_RESERVED_PREFIX, EcstoreError, RUSTFS_META_BUCKET, StorageError, get_bucket_metadata, get_lock_acquire_timeout,
+    table_catalog_path_hash,
+};
 use bytes::Bytes;
 use datafusion::{
     arrow::datatypes::SchemaRef,
@@ -34,16 +39,6 @@ use datafusion::{
 };
 use http::HeaderMap;
 use metrics::{counter, histogram};
-use rustfs_ecstore::bucket::{
-    metadata::{
-        BUCKET_TABLE_CATALOG_META_PREFIX, BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG,
-        BUCKET_TABLE_RESERVED_PREFIX, table_catalog_path_hash,
-    },
-    metadata_sys,
-};
-use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
-use rustfs_ecstore::error::{Error as EcstoreError, StorageError};
-use rustfs_ecstore::set_disk::get_lock_acquire_timeout;
 use rustfs_filemeta::FileInfo;
 use rustfs_storage_api::{
     HTTPPreconditions, HTTPRangeSpec, ListObjectVersionsInfo as StorageListObjectVersionsInfo,
@@ -72,6 +67,7 @@ pub(crate) const TABLE_METADATA_POINTER_VERSION: u16 = 1;
 pub(crate) const TABLE_CATALOG_ENTRY_VERSION: u16 = 1;
 pub(crate) const TABLE_MAINTENANCE_CONFIG_VERSION: u16 = 1;
 pub(crate) const TABLE_EXTERNAL_CATALOG_BRIDGE_VERSION: u16 = 1;
+pub(crate) const TABLE_CATALOG_BACKING_MANIFEST_VERSION: u16 = 1;
 pub(crate) const TABLE_METADATA_FILE_NAME_MAX_LEN: usize = 128;
 pub const TABLE_RESERVED_PREFIX: &str = BUCKET_TABLE_RESERVED_PREFIX;
 const WAREHOUSE_ROOT: &str = "warehouses";
@@ -107,6 +103,7 @@ const TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS: i64 = 15 * 60;
 const TABLE_MAINTENANCE_RETRY_BACKOFF_MAX_SECONDS: u64 = 24 * 60 * 60;
 const TABLE_MAINTENANCE_WORKER_LEASE_TIMEOUT_DEFAULT_SECONDS: u64 = 15 * 60;
 const TABLE_MAINTENANCE_WORKER_LEASE_TIMEOUT_MAX_SECONDS: u64 = 24 * 60 * 60;
+const TABLE_MAINTENANCE_DELETE_DISABLED_REASON: &str = "metadata delete is disabled by maintenance config";
 const TABLE_COMMIT_SLOW_LOG_THRESHOLD: StdDuration = StdDuration::from_secs(2);
 const ICEBERG_MAIN_REF: &str = "main";
 const ICEBERG_MIN_SNAPSHOTS_TO_KEEP_PROPERTY: &str = "history.expire.min-snapshots-to-keep";
@@ -489,6 +486,8 @@ pub(crate) struct TableMetadataMaintenanceJob {
     pub status: TableMetadataMaintenanceJobStatus,
     #[serde(default)]
     pub failure_reason: Option<String>,
+    #[serde(default, rename = "recommended-actions")]
+    pub recommended_actions: Vec<TableMaintenanceRecommendedAction>,
     #[serde(default)]
     pub config_source: TableMaintenanceConfigSource,
     #[serde(default)]
@@ -756,6 +755,19 @@ pub(crate) enum TableMetadataMaintenanceJobStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableMaintenanceRecommendedAction {
+    NoActionRequired,
+    ReviewAndRunDelete,
+    EnableDelete,
+    EnableBackgroundMaintenance,
+    ResumeMaintenanceWorker,
+    WaitForRetryBackoff,
+    WaitForActiveWorker,
+    InvestigateFailure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableMetadataMaintenanceObjectState {
     Retained,
     PendingSafetyWindow,
@@ -843,6 +855,168 @@ pub(crate) struct TableCatalogExport {
     pub table_bucket: TableBucketEntry,
     pub namespace: NamespaceEntry,
     pub table: TableEntry,
+    pub backing_manifest: TableCatalogBackingManifest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableCatalogBackingManifest {
+    pub version: u16,
+    pub current: TableCatalogBackingProfile,
+    pub migration: TableCatalogBackingMigrationPlan,
+    pub ha: TableCatalogHaPolicy,
+    pub scale_validation: TableCatalogScaleValidation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableCatalogBackingProfile {
+    pub kind: TableCatalogBackingKind,
+    pub authority: TableCatalogAuthority,
+    pub consistency: TableCatalogConsistencyMode,
+    pub durability: TableCatalogDurabilityMode,
+    pub current_pointer_path: String,
+    pub wal: TableCatalogWalState,
+    pub snapshot: TableCatalogSnapshotState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogBackingKind {
+    ObjectBacked,
+    StrongKvWal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogAuthority {
+    RustfsSysObject,
+    LinearizableMetadataKv,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogConsistencyMode {
+    ConditionalObjectCas,
+    LinearizableCas,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogDurabilityMode {
+    StagedCommitLogBeforePointerUpdate,
+    WalBeforeStateMachineApply,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableCatalogWalState {
+    pub status: TableCatalogWalStatus,
+    pub commit_log_prefix: String,
+    pub idempotency_index_prefix: String,
+    pub committed_generation: u64,
+    pub staged_before_table_update_count: usize,
+    pub finalization_required_count: usize,
+    pub idempotency_repair_required_count: usize,
+    pub manual_review_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogWalStatus {
+    Recoverable,
+    RecoveryRequired,
+    ManualReviewRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableCatalogSnapshotState {
+    pub export_api: String,
+    pub includes_table_bucket: bool,
+    pub includes_namespace: bool,
+    pub includes_table_pointer: bool,
+    pub includes_backing_manifest: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableCatalogBackingMigrationPlan {
+    pub source_kind: TableCatalogBackingKind,
+    pub target_kind: TableCatalogBackingKind,
+    pub status: TableCatalogBackingMigrationStatus,
+    pub required_steps: Vec<TableCatalogBackingMigrationStep>,
+    pub blockers: Vec<TableCatalogBackingMigrationBlocker>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogBackingMigrationStatus {
+    ReadyToSnapshot,
+    RecoveryRequired,
+    ManualReviewRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogBackingMigrationStep {
+    SnapshotCatalogExport,
+    ReplayCommitLog,
+    VerifyCurrentPointer,
+    EnableSingleWriterFencing,
+    CutOverLinearizableReads,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogBackingMigrationBlocker {
+    CommitRecoveryRequired,
+    CommitManualReviewRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableCatalogHaPolicy {
+    pub writer_region_model: TableCatalogHaWriterModel,
+    pub read_replica_strategy: TableCatalogReadReplicaStrategy,
+    pub commit_read_requirement: TableCatalogCommitReadRequirement,
+    pub active_active_supported: bool,
+    pub failover_requires_operator_promotion: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogHaWriterModel {
+    SingleActiveWriterRegion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogReadReplicaStrategy {
+    ReadOnlyReplicasForListAndLoad,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogCommitReadRequirement {
+    LinearizableLeaderRead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableCatalogScaleValidation {
+    pub status: TableCatalogScaleValidationStatus,
+    pub benchmark_required: bool,
+    pub required_scenarios: Vec<TableCatalogScaleValidationScenario>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogScaleValidationStatus {
+    MatrixPublished,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogScaleValidationScenario {
+    ConcurrentCommitCas,
+    CommitLogRecoveryReplay,
+    MigrationSnapshotReplay,
+    ReadReplicaStaleReadGuard,
+    ClientConformanceMatrix,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -899,6 +1073,7 @@ pub(crate) struct TableCatalogDiagnosticsReport {
     pub recovery_status: TableCatalogRecoveryStatus,
     pub recommended_actions: Vec<TableCatalogRecoveryAction>,
     pub commit_recovery: TableCommitRecoveryReport,
+    pub backing_manifest: TableCatalogBackingManifest,
     pub orphan_metadata_candidate_locations: Vec<String>,
 }
 
@@ -1366,6 +1541,15 @@ impl TableCatalogObjectPaths {
         )
     }
 
+    pub fn commit_idempotency_entries_prefix(&self, table_bucket: &str, table_id: &str) -> String {
+        format!(
+            "{}{}/{}/",
+            self.table_bucket_root_prefix(table_bucket),
+            COMMIT_IDEMPOTENCY_ROOT,
+            table_catalog_path_hash(table_id)
+        )
+    }
+
     fn table_bucket_root_prefix(&self, table_bucket: &str) -> String {
         format!("{}/{}/{}/", self.catalog_root, TABLE_BUCKET_ROOT, table_catalog_path_hash(table_bucket))
     }
@@ -1375,6 +1559,99 @@ impl TableCatalogObjectPaths {
 pub(crate) struct ObjectTableCatalogStore<B> {
     backend: B,
     paths: TableCatalogObjectPaths,
+}
+
+fn table_catalog_backing_manifest(
+    paths: &TableCatalogObjectPaths,
+    namespace: &Namespace,
+    table: &IdentifierSegment,
+    entry: &TableEntry,
+    commit_recovery: &TableCommitRecoveryReport,
+) -> TableCatalogBackingManifest {
+    let recovery_required = commit_recovery.staged_before_table_update_count > 0
+        || commit_recovery.finalization_required_count > 0
+        || commit_recovery.idempotency_repair_required_count > 0;
+    let manual_review_required = commit_recovery.manual_review_count > 0;
+    let wal_status = if manual_review_required {
+        TableCatalogWalStatus::ManualReviewRequired
+    } else if recovery_required {
+        TableCatalogWalStatus::RecoveryRequired
+    } else {
+        TableCatalogWalStatus::Recoverable
+    };
+    let migration_status = if manual_review_required {
+        TableCatalogBackingMigrationStatus::ManualReviewRequired
+    } else if recovery_required {
+        TableCatalogBackingMigrationStatus::RecoveryRequired
+    } else {
+        TableCatalogBackingMigrationStatus::ReadyToSnapshot
+    };
+    let mut blockers = Vec::new();
+    if recovery_required {
+        blockers.push(TableCatalogBackingMigrationBlocker::CommitRecoveryRequired);
+    }
+    if manual_review_required {
+        blockers.push(TableCatalogBackingMigrationBlocker::CommitManualReviewRequired);
+    }
+
+    TableCatalogBackingManifest {
+        version: TABLE_CATALOG_BACKING_MANIFEST_VERSION,
+        current: TableCatalogBackingProfile {
+            kind: TableCatalogBackingKind::ObjectBacked,
+            authority: TableCatalogAuthority::RustfsSysObject,
+            consistency: TableCatalogConsistencyMode::ConditionalObjectCas,
+            durability: TableCatalogDurabilityMode::StagedCommitLogBeforePointerUpdate,
+            current_pointer_path: paths.table_entry_path(&entry.table_bucket, namespace, table),
+            wal: TableCatalogWalState {
+                status: wal_status,
+                commit_log_prefix: paths.commit_log_entries_prefix(&entry.table_bucket, &entry.table_id),
+                idempotency_index_prefix: paths.commit_idempotency_entries_prefix(&entry.table_bucket, &entry.table_id),
+                committed_generation: entry.generation,
+                staged_before_table_update_count: commit_recovery.staged_before_table_update_count,
+                finalization_required_count: commit_recovery.finalization_required_count,
+                idempotency_repair_required_count: commit_recovery.idempotency_repair_required_count,
+                manual_review_count: commit_recovery.manual_review_count,
+            },
+            snapshot: TableCatalogSnapshotState {
+                export_api: "GET /iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export".to_string(),
+                includes_table_bucket: true,
+                includes_namespace: true,
+                includes_table_pointer: true,
+                includes_backing_manifest: true,
+            },
+        },
+        migration: TableCatalogBackingMigrationPlan {
+            source_kind: TableCatalogBackingKind::ObjectBacked,
+            target_kind: TableCatalogBackingKind::StrongKvWal,
+            status: migration_status,
+            required_steps: vec![
+                TableCatalogBackingMigrationStep::SnapshotCatalogExport,
+                TableCatalogBackingMigrationStep::ReplayCommitLog,
+                TableCatalogBackingMigrationStep::VerifyCurrentPointer,
+                TableCatalogBackingMigrationStep::EnableSingleWriterFencing,
+                TableCatalogBackingMigrationStep::CutOverLinearizableReads,
+            ],
+            blockers,
+        },
+        ha: TableCatalogHaPolicy {
+            writer_region_model: TableCatalogHaWriterModel::SingleActiveWriterRegion,
+            read_replica_strategy: TableCatalogReadReplicaStrategy::ReadOnlyReplicasForListAndLoad,
+            commit_read_requirement: TableCatalogCommitReadRequirement::LinearizableLeaderRead,
+            active_active_supported: false,
+            failover_requires_operator_promotion: true,
+        },
+        scale_validation: TableCatalogScaleValidation {
+            status: TableCatalogScaleValidationStatus::MatrixPublished,
+            benchmark_required: true,
+            required_scenarios: vec![
+                TableCatalogScaleValidationScenario::ConcurrentCommitCas,
+                TableCatalogScaleValidationScenario::CommitLogRecoveryReplay,
+                TableCatalogScaleValidationScenario::MigrationSnapshotReplay,
+                TableCatalogScaleValidationScenario::ReadReplicaStaleReadGuard,
+                TableCatalogScaleValidationScenario::ClientConformanceMatrix,
+            ],
+        },
+    }
 }
 
 impl<B> ObjectTableCatalogStore<B>
@@ -1887,6 +2164,7 @@ where
         &self,
         report: &TableMetadataMaintenanceReport,
     ) -> TableCatalogStoreResult<()> {
+        let report = table_maintenance_report_with_recommended_actions(report.clone());
         let namespace = parse_namespace_for_store(&report.job.namespace)?;
         let table = parse_table_for_store(&report.job.table)?;
         let job_path = self.paths.table_maintenance_job_path(
@@ -1902,11 +2180,11 @@ where
         let current_job_path =
             self.paths
                 .table_maintenance_current_job_path(&report.job.table_bucket, &namespace, &table, &report.job.table_id);
-        self.write_entry(self.catalog_bucket(), &job_path, report, TableCatalogPutPrecondition::Any)
+        self.write_entry(self.catalog_bucket(), &job_path, &report, TableCatalogPutPrecondition::Any)
             .await?;
-        self.write_entry(self.catalog_bucket(), &latest_job_path, report, TableCatalogPutPrecondition::Any)
+        self.write_entry(self.catalog_bucket(), &latest_job_path, &report, TableCatalogPutPrecondition::Any)
             .await?;
-        self.write_entry(self.catalog_bucket(), &current_job_path, report, TableCatalogPutPrecondition::Any)
+        self.write_entry(self.catalog_bucket(), &current_job_path, &report, TableCatalogPutPrecondition::Any)
             .await
     }
 
@@ -1943,7 +2221,7 @@ where
         };
         self.read_entry::<TableMetadataMaintenanceReport>(self.catalog_bucket(), &job_path)
             .await
-            .map(|entry| entry.map(|(report, _)| report))
+            .map(|entry| entry.map(|(report, _)| table_maintenance_report_with_recommended_actions(report)))
     }
 
     pub(crate) async fn run_table_metadata_maintenance_worker_once(
@@ -2122,6 +2400,7 @@ where
                 operation: TableMetadataMaintenanceOperation::DryRun,
                 status: control.status,
                 failure_reason: Some(control.reason.to_string()),
+                recommended_actions: Vec::new(),
                 config_source: control.effective.source,
                 worker_id: Some(control.worker_id),
                 lease_id: String::new(),
@@ -2162,6 +2441,7 @@ where
             snapshot_expiration: None,
             compaction: None,
         };
+        let report = table_maintenance_report_with_recommended_actions(report);
         self.put_table_metadata_maintenance_report(&report).await?;
         Ok(report)
     }
@@ -2473,11 +2753,14 @@ where
                 table.as_str()
             )));
         };
+        let commit_recovery = self.table_commit_recovery_report_for_entry(&table_entry, 0).await?;
+        let backing_manifest = table_catalog_backing_manifest(&self.paths, &namespace, &table, &table_entry, &commit_recovery);
 
         Ok(TableCatalogExport {
             table_bucket: table_bucket_entry,
             namespace: namespace_entry,
             table: table_entry,
+            backing_manifest,
         })
     }
 
@@ -2550,6 +2833,8 @@ where
 
         let commit_recovery = self.plan_table_commit_recovery(table_bucket, namespace, table).await?;
         let (recovery_status, recommended_actions) = table_catalog_recovery_summary(&current_metadata_status, &commit_recovery);
+        let backing_manifest =
+            table_catalog_backing_manifest(&self.paths, &parsed_namespace, &parsed_table, &catalog.table, &commit_recovery);
 
         Ok(TableCatalogDiagnosticsReport {
             catalog,
@@ -2557,6 +2842,7 @@ where
             recovery_status,
             recommended_actions,
             commit_recovery,
+            backing_manifest,
             orphan_metadata_candidate_locations,
         })
     }
@@ -2722,7 +3008,7 @@ where
             )
             .await?;
 
-        Ok(TableMetadataMaintenanceReport {
+        Ok(table_maintenance_report_with_recommended_actions(TableMetadataMaintenanceReport {
             job: TableMetadataMaintenanceJob {
                 job_id: Uuid::new_v4().to_string(),
                 table_bucket: table_bucket.to_string(),
@@ -2732,6 +3018,7 @@ where
                 operation: TableMetadataMaintenanceOperation::DryRun,
                 status: TableMetadataMaintenanceJobStatus::Successful,
                 failure_reason: None,
+                recommended_actions: Vec::new(),
                 config_source: TableMaintenanceConfigSource::Default,
                 worker_id: None,
                 lease_id: String::new(),
@@ -2772,7 +3059,7 @@ where
             reachability_graph,
             snapshot_expiration: None,
             compaction: None,
-        })
+        }))
     }
 
     pub(crate) async fn delete_table_metadata_maintenance_candidates(
@@ -2853,14 +3140,16 @@ where
         report.job.heartbeat_at = Some(started_at.clone());
         report.job.started_at = Some(started_at);
         report.job.finished_at = None;
+        refresh_table_maintenance_report_recommended_actions(&mut report);
         self.put_table_metadata_maintenance_report(&report).await?;
 
         if delete && !effective.config.delete_enabled {
             let mut failed = report;
             failed.job.status = TableMetadataMaintenanceJobStatus::Failed;
-            failed.job.failure_reason = Some("metadata delete is disabled by maintenance config".to_string());
+            failed.job.failure_reason = Some(TABLE_MAINTENANCE_DELETE_DISABLED_REASON.to_string());
             apply_maintenance_retry_after(&mut failed.job, &effective.config, OffsetDateTime::now_utc());
             failed.job.finished_at = Some(maintenance_timestamp(OffsetDateTime::now_utc()));
+            refresh_table_maintenance_report_recommended_actions(&mut failed);
             self.put_table_metadata_maintenance_report(&failed).await?;
             return Ok(failed);
         }
@@ -2878,17 +3167,20 @@ where
                     failed.job.failure_reason = Some(err.to_string());
                     apply_maintenance_retry_after(&mut failed.job, &effective.config, OffsetDateTime::now_utc());
                     failed.job.finished_at = Some(maintenance_timestamp(OffsetDateTime::now_utc()));
+                    refresh_table_maintenance_report_recommended_actions(&mut failed);
                     self.put_table_metadata_maintenance_report(&failed).await?;
                     return Err(err);
                 }
             };
             deleted.job.finished_at = Some(maintenance_timestamp(OffsetDateTime::now_utc()));
+            refresh_table_maintenance_report_recommended_actions(&mut deleted);
             self.put_table_metadata_maintenance_report(&deleted).await?;
             return Ok(deleted);
         }
 
         report.job.status = TableMetadataMaintenanceJobStatus::Successful;
         report.job.finished_at = Some(maintenance_timestamp(OffsetDateTime::now_utc()));
+        refresh_table_maintenance_report_recommended_actions(&mut report);
         self.put_table_metadata_maintenance_report(&report).await?;
         Ok(report)
     }
@@ -3065,7 +3357,7 @@ where
         let mut object_cleanup_reports = report.object_cleanup_reports;
         mark_deleted_object_cleanup_reports(&mut object_cleanup_reports, &deleted_object_locations);
 
-        Ok(TableMetadataMaintenanceReport {
+        Ok(table_maintenance_report_with_recommended_actions(TableMetadataMaintenanceReport {
             job,
             current_metadata_location: entry.metadata_location,
             retained_metadata_locations,
@@ -3079,7 +3371,7 @@ where
             reachability_graph: report.reachability_graph,
             snapshot_expiration: report.snapshot_expiration,
             compaction: report.compaction,
-        })
+        }))
     }
 }
 
@@ -5851,6 +6143,58 @@ fn parse_maintenance_timestamp(timestamp: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(timestamp, &time::format_description::well_known::Rfc3339).ok()
 }
 
+fn table_maintenance_recommended_actions(job: &TableMetadataMaintenanceJob) -> Vec<TableMaintenanceRecommendedAction> {
+    let mut actions = Vec::new();
+    match job.status {
+        TableMetadataMaintenanceJobStatus::NotYetRun => {}
+        TableMetadataMaintenanceJobStatus::Running => {
+            actions.push(TableMaintenanceRecommendedAction::WaitForActiveWorker);
+        }
+        TableMetadataMaintenanceJobStatus::Successful => {
+            if matches!(job.operation, TableMetadataMaintenanceOperation::DryRun)
+                && (job.deletable_metadata_file_count > 0 || job.deletable_object_count > 0)
+            {
+                actions.push(TableMaintenanceRecommendedAction::ReviewAndRunDelete);
+            } else {
+                actions.push(TableMaintenanceRecommendedAction::NoActionRequired);
+            }
+        }
+        TableMetadataMaintenanceJobStatus::Failed => {
+            if job
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason == TABLE_MAINTENANCE_DELETE_DISABLED_REASON)
+            {
+                actions.push(TableMaintenanceRecommendedAction::EnableDelete);
+            }
+            if job.next_retry_after.is_some() {
+                actions.push(TableMaintenanceRecommendedAction::WaitForRetryBackoff);
+            }
+            if actions.is_empty() {
+                actions.push(TableMaintenanceRecommendedAction::InvestigateFailure);
+            }
+        }
+        TableMetadataMaintenanceJobStatus::Disabled => {
+            actions.push(TableMaintenanceRecommendedAction::EnableBackgroundMaintenance);
+        }
+        TableMetadataMaintenanceJobStatus::Paused => {
+            actions.push(TableMaintenanceRecommendedAction::ResumeMaintenanceWorker);
+        }
+    }
+    actions
+}
+
+fn refresh_table_maintenance_report_recommended_actions(report: &mut TableMetadataMaintenanceReport) {
+    report.job.recommended_actions = table_maintenance_recommended_actions(&report.job);
+}
+
+fn table_maintenance_report_with_recommended_actions(
+    mut report: TableMetadataMaintenanceReport,
+) -> TableMetadataMaintenanceReport {
+    refresh_table_maintenance_report_recommended_actions(&mut report);
+    report
+}
+
 fn table_maintenance_job_lease_is_active(
     job: &TableMetadataMaintenanceJob,
     worker_lease_timeout_seconds: u64,
@@ -6658,7 +7002,7 @@ pub fn validate_object_mutation(table_bucket_enabled: bool, object_key: &str) ->
 }
 
 pub(crate) async fn validate_bucket_object_mutation(bucket: &str, object_key: &str) -> Result<(), TableObjectMutationError> {
-    let table_bucket_enabled = metadata_sys::get(bucket)
+    let table_bucket_enabled = get_bucket_metadata(bucket)
         .await
         .is_ok_and(|metadata| metadata.table_bucket_enabled());
 
@@ -7541,7 +7885,7 @@ mod tests {
             .map(|(bucket, _)| bucket.as_str())
             .collect::<BTreeSet<_>>();
 
-        assert_eq!(object_buckets, BTreeSet::from([rustfs_ecstore::disk::RUSTFS_META_BUCKET]));
+        assert_eq!(object_buckets, BTreeSet::from([RUSTFS_META_BUCKET]));
     }
 
     #[tokio::test]
@@ -7835,6 +8179,10 @@ mod tests {
         assert_eq!(report.job.retained_metadata_file_count, 3);
         assert_eq!(report.job.cleanup_candidate_count, 2);
         assert_eq!(report.job.deletable_metadata_file_count, 1);
+        assert_eq!(
+            report.job.recommended_actions,
+            vec![TableMaintenanceRecommendedAction::ReviewAndRunDelete]
+        );
 
         let current_report = maintenance_object_report(&report, &current);
         assert_eq!(current_report.state, TableMetadataMaintenanceObjectState::Retained);
@@ -7866,6 +8214,54 @@ mod tests {
                 TableMetadataMaintenanceReason::NoCurrentReachability,
                 TableMetadataMaintenanceReason::SafetyWindowPending,
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_report_read_back_derives_actions_for_legacy_records() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+        let mut report = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .expect("maintenance report should be planned");
+        report.job.status = TableMetadataMaintenanceJobStatus::Running;
+        report.job.worker_id = Some("worker-a".to_string());
+        report.job.lease_id = "lease-a".to_string();
+        report.job.heartbeat_at = Some(maintenance_timestamp(OffsetDateTime::UNIX_EPOCH + Duration::seconds(10)));
+
+        let job_path = store
+            .paths
+            .table_maintenance_job_path(bucket, &namespace, &table, "table-id", &report.job.job_id);
+        let mut legacy_report = serde_json::to_value(&report).expect("legacy report should serialize");
+        legacy_report
+            .get_mut("job")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("legacy report job should be an object")
+            .remove("recommended-actions");
+        store
+            .write_entry(store.catalog_bucket(), &job_path, &legacy_report, TableCatalogPutPrecondition::Any)
+            .await
+            .expect("legacy maintenance report should be seeded");
+
+        let loaded = store
+            .get_table_metadata_maintenance_report(bucket, "sales", "orders", &report.job.job_id)
+            .await
+            .expect("legacy maintenance report lookup should succeed")
+            .expect("legacy maintenance report should be returned");
+
+        assert_eq!(
+            loaded.job.recommended_actions,
+            vec![TableMaintenanceRecommendedAction::WaitForActiveWorker]
         );
     }
 
@@ -8326,6 +8722,13 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("disabled"))
         );
+        assert_eq!(
+            report.job.recommended_actions,
+            vec![
+                TableMaintenanceRecommendedAction::EnableDelete,
+                TableMaintenanceRecommendedAction::WaitForRetryBackoff,
+            ]
+        );
         assert!(backend.object_exists(bucket, &old).await.unwrap());
 
         let latest = store
@@ -8335,6 +8738,7 @@ mod tests {
             .expect("failed maintenance job should be stored");
         assert_eq!(latest.job.job_id, report.job.job_id);
         assert_eq!(latest.job.status, TableMetadataMaintenanceJobStatus::Failed);
+        assert_eq!(latest.job.recommended_actions, report.job.recommended_actions);
     }
 
     #[tokio::test]
@@ -8360,6 +8764,10 @@ mod tests {
 
         assert_eq!(report.job.status, TableMetadataMaintenanceJobStatus::Disabled);
         assert_eq!(report.job.worker_id.as_deref(), Some("worker-a"));
+        assert_eq!(
+            report.job.recommended_actions,
+            vec![TableMaintenanceRecommendedAction::EnableBackgroundMaintenance]
+        );
         assert_eq!(report.job.deleted_metadata_file_count, 0);
         assert!(backend.object_exists(bucket, &old).await.unwrap());
     }
@@ -8403,6 +8811,10 @@ mod tests {
 
         assert_eq!(report.job.status, TableMetadataMaintenanceJobStatus::Paused);
         assert_eq!(report.job.operation, TableMetadataMaintenanceOperation::DryRun);
+        assert_eq!(
+            report.job.recommended_actions,
+            vec![TableMaintenanceRecommendedAction::ResumeMaintenanceWorker]
+        );
         assert_eq!(report.job.deleted_metadata_file_count, 0);
         assert!(backend.object_exists(bucket, &old).await.unwrap());
     }
@@ -8459,6 +8871,12 @@ mod tests {
         assert_eq!(deferred.job.job_id, failed.job.job_id);
         assert_eq!(deferred.job.status, TableMetadataMaintenanceJobStatus::Failed);
         assert_eq!(deferred.job.worker_id.as_deref(), Some("worker-a"));
+        assert!(
+            deferred
+                .job
+                .recommended_actions
+                .contains(&TableMaintenanceRecommendedAction::WaitForRetryBackoff)
+        );
         assert!(backend.object_exists(bucket, &old).await.unwrap());
     }
 
@@ -8513,6 +8931,10 @@ mod tests {
         assert_eq!(report.job.job_id, running.job.job_id);
         assert_eq!(report.job.status, TableMetadataMaintenanceJobStatus::Running);
         assert_eq!(report.job.worker_id.as_deref(), Some("worker-a"));
+        assert_eq!(
+            report.job.recommended_actions,
+            vec![TableMaintenanceRecommendedAction::WaitForActiveWorker]
+        );
     }
 
     #[tokio::test]
@@ -8582,6 +9004,10 @@ mod tests {
                 .failure_reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("lease expired"))
+        );
+        assert_eq!(
+            expired.job.recommended_actions,
+            vec![TableMaintenanceRecommendedAction::InvestigateFailure]
         );
     }
 
@@ -10149,6 +10575,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn export_catalog_entry_includes_backing_migration_manifest() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+
+        let export = store.export_table_catalog_entry(bucket, "sales", "orders").await.unwrap();
+
+        assert_eq!(export.backing_manifest.version, TABLE_CATALOG_BACKING_MANIFEST_VERSION);
+        assert_eq!(export.backing_manifest.current.kind, TableCatalogBackingKind::ObjectBacked);
+        assert_eq!(export.backing_manifest.current.authority, TableCatalogAuthority::RustfsSysObject);
+        assert_eq!(
+            export.backing_manifest.current.consistency,
+            TableCatalogConsistencyMode::ConditionalObjectCas
+        );
+        assert_eq!(export.backing_manifest.current.wal.finalization_required_count, 0);
+        assert_eq!(export.backing_manifest.migration.target_kind, TableCatalogBackingKind::StrongKvWal);
+        assert_eq!(
+            export.backing_manifest.migration.status,
+            TableCatalogBackingMigrationStatus::ReadyToSnapshot
+        );
+        assert!(
+            export
+                .backing_manifest
+                .migration
+                .required_steps
+                .contains(&TableCatalogBackingMigrationStep::ReplayCommitLog)
+        );
+        assert_eq!(
+            export.backing_manifest.ha.writer_region_model,
+            TableCatalogHaWriterModel::SingleActiveWriterRegion
+        );
+        assert!(!export.backing_manifest.ha.active_active_supported);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_backing_manifest_requires_recovery_before_migration() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let commit_path = TableCatalogObjectPaths::default().commit_log_entry_path(bucket, "table-id", "commit-1");
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+        store
+            .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
+            .await
+            .unwrap();
+        backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+        backend.fail_put_attempt(RUSTFS_META_BUCKET, &commit_path, 2).await;
+
+        store
+            .commit_table(TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                commit_id: "commit-1".to_string(),
+                idempotency_key: None,
+                operation: "append".to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current_metadata,
+                new_metadata_location: new_metadata,
+                requirements: Vec::new(),
+                writer: None,
+            })
+            .await
+            .unwrap();
+
+        let diagnostics = store.diagnose_table_catalog(bucket, "sales", "orders", 0).await.unwrap();
+
+        assert_eq!(diagnostics.backing_manifest.current.wal.finalization_required_count, 1);
+        assert_eq!(
+            diagnostics.backing_manifest.migration.status,
+            TableCatalogBackingMigrationStatus::RecoveryRequired
+        );
+        assert!(
+            diagnostics
+                .backing_manifest
+                .migration
+                .blockers
+                .contains(&TableCatalogBackingMigrationBlocker::CommitRecoveryRequired)
+        );
+    }
+
+    #[tokio::test]
     async fn consistency_check_reports_missing_metadata_object() {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend);
@@ -10408,9 +10930,7 @@ mod tests {
             .await
             .unwrap();
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
-        backend
-            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &idempotency_path, 1)
-            .await;
+        backend.fail_put_attempt(RUSTFS_META_BUCKET, &idempotency_path, 1).await;
 
         let err = store
             .commit_table(TableCommitRequest {
@@ -10458,9 +10978,7 @@ mod tests {
             .await
             .unwrap();
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
-        backend
-            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &commit_path, 2)
-            .await;
+        backend.fail_put_attempt(RUSTFS_META_BUCKET, &commit_path, 2).await;
 
         let request = TableCommitRequest {
             table_bucket: bucket.to_string(),
@@ -10513,9 +11031,7 @@ mod tests {
             .await
             .unwrap();
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
-        backend
-            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &commit_path, 2)
-            .await;
+        backend.fail_put_attempt(RUSTFS_META_BUCKET, &commit_path, 2).await;
 
         let result = store
             .commit_table(TableCommitRequest {
@@ -10567,9 +11083,7 @@ mod tests {
             .await
             .unwrap();
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
-        backend
-            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &commit_path, 2)
-            .await;
+        backend.fail_put_attempt(RUSTFS_META_BUCKET, &commit_path, 2).await;
 
         store
             .commit_table(TableCommitRequest {
@@ -10621,9 +11135,7 @@ mod tests {
             .await
             .unwrap();
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
-        backend
-            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &commit_path, 2)
-            .await;
+        backend.fail_put_attempt(RUSTFS_META_BUCKET, &commit_path, 2).await;
 
         store
             .commit_table(TableCommitRequest {
@@ -10672,9 +11184,7 @@ mod tests {
             .unwrap();
         backend.seed_object(bucket, &current_metadata, b"{}".to_vec()).await;
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
-        backend
-            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &table_path, 2)
-            .await;
+        backend.fail_put_attempt(RUSTFS_META_BUCKET, &table_path, 2).await;
 
         let err = store
             .commit_table(TableCommitRequest {
@@ -10729,9 +11239,7 @@ mod tests {
             .await
             .unwrap();
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
-        backend
-            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &idempotency_path, 2)
-            .await;
+        backend.fail_put_attempt(RUSTFS_META_BUCKET, &idempotency_path, 2).await;
 
         let result = store
             .commit_table(TableCommitRequest {

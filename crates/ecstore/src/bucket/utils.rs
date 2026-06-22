@@ -32,6 +32,9 @@ lazy_static::lazy_static! {
 pub fn check_bucket_name_common(bucket_name: &str, strict: bool) -> Result<()> {
     let bucket_name_trimmed = bucket_name.trim();
 
+    if strict && bucket_name_trimmed != bucket_name {
+        return Err(Error::other("Bucket name cannot contain leading or trailing whitespace"));
+    }
     if bucket_name_trimmed.is_empty() {
         return Err(Error::other("Bucket name cannot be empty"));
     }
@@ -137,25 +140,9 @@ pub fn has_bad_path_component(path: &str) -> bool {
             i += 1;
         }
 
-        // Trim whitespace of segment
-        let mut segment_start = start;
-        let mut segment_end = i;
-
-        while segment_start < segment_end && bytes[segment_start].is_ascii_whitespace() {
-            segment_start += 1;
-        }
-        while segment_end > segment_start && bytes[segment_end - 1].is_ascii_whitespace() {
-            segment_end -= 1;
-        }
-
-        // Check for ".." or "."
-        match segment_end - segment_start {
-            2 if segment_start + 1 < n && bytes[segment_start] == b'.' && bytes[segment_start + 1] == b'.' => {
-                return true;
-            }
-            1 if bytes[segment_start] == b'.' => {
-                return true;
-            }
+        // Trim whitespace of segment and check for ".." or "."
+        match path[start..i].trim() {
+            "." | ".." => return true,
             _ => {}
         }
 
@@ -436,6 +423,9 @@ mod tests {
         assert!(!is_valid_object_prefix("prefix/./other"));
         assert!(!is_valid_object_prefix("a/../b/../c"));
         assert!(!is_valid_object_prefix("a/./b/./c"));
+        assert!(!is_valid_object_prefix("\x0b./object"));
+        assert!(!is_valid_object_prefix("prefix/\x0b../object"));
+        assert!(!is_valid_object_prefix("\x0b.\\\\object"));
 
         // Invalid cases - double slashes
         assert!(!is_valid_object_prefix("prefix//with//double//slashes"));
@@ -463,6 +453,13 @@ mod tests {
 
         // Invalid object names
         assert!(check_bucket_and_object_names("valid-bucket", "").is_err());
+    }
+
+    #[test]
+    fn test_strict_bucket_name_rejects_surrounding_whitespace() {
+        assert!(check_valid_bucket_name_strict(" valid-bucket").is_err());
+        assert!(check_valid_bucket_name_strict("valid-bucket ").is_err());
+        assert!(check_valid_bucket_name_strict("\u{c}valid-bucket\u{c}").is_err());
     }
 
     #[test]

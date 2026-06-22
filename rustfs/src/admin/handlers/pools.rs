@@ -194,7 +194,7 @@ macro_rules! log_pool_response_emitted {
     };
 }
 
-fn endpoints_from_context() -> Option<crate::admin::storage_compat::ecstore::endpoints::EndpointServerPools> {
+fn endpoints_from_context() -> Option<crate::admin::handlers::storage_compat::EndpointServerPools> {
     resolve_endpoints_handle()
 }
 

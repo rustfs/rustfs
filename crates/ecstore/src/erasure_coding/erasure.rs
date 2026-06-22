@@ -368,7 +368,7 @@ fn recover_empty_payload_data_shards(
 ///
 /// # Example
 /// ```ignore
-/// use rustfs_ecstore::erasure_coding::Erasure;
+/// use rustfs_ecstore::api::erasure::Erasure;
 /// let erasure = Erasure::new(4, 2, 8);
 /// let data = b"hello world";
 /// let shards = erasure.encode_data(data).unwrap();

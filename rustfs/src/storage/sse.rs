@@ -69,13 +69,17 @@
 //! }
 //! ```
 
-use crate::storage::storage_compat::ecstore::error::StorageError;
+use crate::storage::core_storage_compat::StorageError;
+#[cfg(feature = "rio-v2")]
+use aes_gcm::aead::Payload;
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit},
 };
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+#[cfg(feature = "rio-v2")]
+use chacha20poly1305::ChaCha20Poly1305;
 #[cfg(feature = "rio-v2")]
 use hmac::{Hmac, Mac};
 use http::{HeaderMap, HeaderValue};
@@ -117,6 +121,8 @@ const DARE_VERSION_20: u8 = 0x20;
 #[cfg(feature = "rio-v2")]
 const DARE_CIPHER_AES_256_GCM: u8 = 0x00;
 #[cfg(feature = "rio-v2")]
+const DARE_CIPHER_CHACHA20_POLY1305: u8 = 0x01;
+#[cfg(feature = "rio-v2")]
 const DARE_HEADER_SIZE: usize = 16;
 #[cfg(feature = "rio-v2")]
 const DARE_TAG_SIZE: usize = 16;
@@ -128,8 +134,8 @@ const SEALED_KEY_SIZE: usize = DARE_HEADER_SIZE + 32 + DARE_TAG_SIZE;
 const OBJECT_KEY_DERIVATION_CONTEXT: &[u8] = b"object-encryption-key generation";
 
 use crate::error::ApiError;
-use crate::storage::storage_compat::ecstore::bucket::metadata_sys;
-use crate::storage::storage_compat::ecstore::error::Error;
+use crate::storage::core_storage_compat::Error;
+use crate::storage::core_storage_compat::get_bucket_sse_config;
 use rustfs_utils::http::headers::{
     AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
     AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5, AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT,
@@ -213,7 +219,7 @@ async fn prepare_sse_configuration(
     }
 
     // Get bucket default encryption configuration.
-    let bucket_sse_config_result = metadata_sys::get_sse_config(bucket).await;
+    let bucket_sse_config_result = get_bucket_sse_config(bucket).await;
     debug!(
         component = LOG_COMPONENT_STORAGE,
         subsystem = LOG_SUBSYSTEM_SSE,
@@ -745,29 +751,19 @@ pub struct ManagedSealedKey {
 }
 
 impl EncryptionMaterial {
-    pub fn write_encryption(
-        &self,
-        multipart_part_number: Option<usize>,
-    ) -> crate::storage::storage_compat::ecstore::rio::WriteEncryption {
+    pub fn write_encryption(&self, multipart_part_number: Option<usize>) -> crate::storage::core_storage_compat::WriteEncryption {
         match (self.key_kind, multipart_part_number) {
             (EncryptionKeyKind::Object, Some(part_number)) => {
-                crate::storage::storage_compat::ecstore::rio::WriteEncryption::multipart_object_key(
-                    self.key_bytes,
-                    part_number as u32,
-                )
+                crate::storage::core_storage_compat::WriteEncryption::multipart_object_key(self.key_bytes, part_number as u32)
             }
             (EncryptionKeyKind::Object, None) => {
-                crate::storage::storage_compat::ecstore::rio::WriteEncryption::singlepart_object_key(self.key_bytes)
+                crate::storage::core_storage_compat::WriteEncryption::singlepart_object_key(self.key_bytes)
             }
             (EncryptionKeyKind::Direct, Some(part_number)) => {
-                crate::storage::storage_compat::ecstore::rio::WriteEncryption::multipart(
-                    self.key_bytes,
-                    self.base_nonce,
-                    part_number,
-                )
+                crate::storage::core_storage_compat::WriteEncryption::multipart(self.key_bytes, self.base_nonce, part_number)
             }
             (EncryptionKeyKind::Direct, None) => {
-                crate::storage::storage_compat::ecstore::rio::WriteEncryption::singlepart(self.key_bytes, self.base_nonce)
+                crate::storage::core_storage_compat::WriteEncryption::singlepart(self.key_bytes, self.base_nonce)
             }
         }
     }
@@ -829,6 +825,36 @@ fn decode_minio_kms_context(metadata: &HashMap<String, String>) -> Result<Option
     serde_json::from_slice(&decoded)
         .map(Some)
         .map_err(|e| ApiError::from(StorageError::other(format!("Failed to parse MinIO KMS context: {e}"))))
+}
+
+#[cfg(feature = "rio-v2")]
+fn is_supported_sealed_object_key_cipher(cipher: u8) -> bool {
+    matches!(cipher, DARE_CIPHER_AES_256_GCM | DARE_CIPHER_CHACHA20_POLY1305)
+}
+
+#[cfg(feature = "rio-v2")]
+fn decrypt_sealed_object_key_payload(sealing_key: [u8; 32], header: &[u8], sealed_key: &[u8]) -> Result<Vec<u8>, ApiError> {
+    let nonce = &header[4..16];
+    let ciphertext = &sealed_key[DARE_HEADER_SIZE..];
+    let aad = &header[..4];
+    match header[1] {
+        DARE_CIPHER_AES_256_GCM => {
+            let cipher = Aes256Gcm::new_from_slice(&sealing_key)
+                .map_err(|err| ApiError::from(StorageError::other(format!("Invalid AES-GCM sealing key: {err}"))))?;
+            let nonce = Nonce::try_from(nonce)
+                .map_err(|_| ApiError::from(StorageError::other("Invalid sealed object-key package nonce")))?;
+            cipher.decrypt(&nonce, Payload { msg: ciphertext, aad })
+        }
+        DARE_CIPHER_CHACHA20_POLY1305 => {
+            let cipher = ChaCha20Poly1305::new_from_slice(&sealing_key)
+                .map_err(|err| ApiError::from(StorageError::other(format!("Invalid ChaCha20-Poly1305 sealing key: {err}"))))?;
+            let nonce = chacha20poly1305::Nonce::try_from(nonce)
+                .map_err(|_| ApiError::from(StorageError::other("Invalid sealed object-key package nonce")))?;
+            cipher.decrypt(&nonce, Payload { msg: ciphertext, aad })
+        }
+        _ => return Err(ApiError::from(StorageError::other("Unsupported sealed object-key DARE header"))),
+    }
+    .map_err(|err| ApiError::from(StorageError::other(format!("Failed to unseal object key: {err}"))))
 }
 
 #[cfg(feature = "rio-v2")]
@@ -928,7 +954,7 @@ fn unseal_object_key(
     object: &str,
 ) -> Result<[u8; 32], ApiError> {
     let header = &sealed.sealed_key[..DARE_HEADER_SIZE];
-    if header[0] != DARE_VERSION_20 || header[1] != DARE_CIPHER_AES_256_GCM {
+    if header[0] != DARE_VERSION_20 || !is_supported_sealed_object_key_cipher(header[1]) {
         return Err(ApiError::from(StorageError::other("Unsupported sealed object-key DARE header")));
     }
     if u16::from_le_bytes([header[2], header[3]]) != 31 || header[4] & 0x80 == 0 {
@@ -936,19 +962,7 @@ fn unseal_object_key(
     }
 
     let sealing_key = derive_sealing_key(external_key, sealed.iv, managed_sse_domain(sse_type), bucket, object);
-    let cipher = Aes256Gcm::new_from_slice(&sealing_key)
-        .map_err(|err| ApiError::from(StorageError::other(format!("Invalid sealing key: {err}"))))?;
-    let nonce = Nonce::try_from(&header[4..16])
-        .map_err(|_| ApiError::from(StorageError::other("Invalid sealed object-key package nonce")))?;
-    let plaintext = cipher
-        .decrypt(
-            &nonce,
-            aes_gcm::aead::Payload {
-                msg: &sealed.sealed_key[DARE_HEADER_SIZE..],
-                aad: &header[..4],
-            },
-        )
-        .map_err(|err| ApiError::from(StorageError::other(format!("Failed to unseal object key: {err}"))))?;
+    let plaintext = decrypt_sealed_object_key_payload(sealing_key, header, &sealed.sealed_key)?;
 
     let object_key: [u8; 32] = plaintext
         .as_slice()
@@ -3125,6 +3139,14 @@ mod tests {
         .await;
 
         reset_sse_dek_provider();
+    }
+
+    #[cfg(feature = "rio-v2")]
+    #[test]
+    fn test_supported_sealed_object_key_cipher_accepts_current_minio_fixture_value() {
+        assert!(is_supported_sealed_object_key_cipher(DARE_CIPHER_AES_256_GCM));
+        assert!(is_supported_sealed_object_key_cipher(DARE_CIPHER_CHACHA20_POLY1305));
+        assert!(!is_supported_sealed_object_key_cipher(0x02));
     }
 
     #[cfg(feature = "rio-v2")]

@@ -12,4 +12,53 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub type NotifyObjectInfo = rustfs_ecstore::store_api::ObjectInfo;
+use rustfs_config::server_config::Config;
+use rustfs_ecstore::api::{
+    config::com as ecstore_config_com, global::resolve_object_store_handle as ecstore_resolve_object_store_handle,
+    storage as ecstore_storage,
+};
+use std::sync::Arc;
+
+type NotifyStore = ecstore_storage::ECStore;
+
+#[derive(Debug)]
+pub(crate) enum NotifyConfigStoreError {
+    StorageNotAvailable,
+    Read(String),
+    Save(String),
+}
+
+pub(crate) async fn update_server_config<F>(mut modifier: F) -> Result<Option<Config>, NotifyConfigStoreError>
+where
+    F: FnMut(&mut Config) -> bool,
+{
+    let Some(store) = resolve_notify_object_store_handle() else {
+        return Err(NotifyConfigStoreError::StorageNotAvailable);
+    };
+
+    let mut new_config = read_notify_server_config_without_migrate(store.clone()).await?;
+
+    if !modifier(&mut new_config) {
+        return Ok(None);
+    }
+
+    save_notify_server_config(store, &new_config).await?;
+
+    Ok(Some(new_config))
+}
+
+fn resolve_notify_object_store_handle() -> Option<Arc<NotifyStore>> {
+    ecstore_resolve_object_store_handle()
+}
+
+async fn read_notify_server_config_without_migrate(store: Arc<NotifyStore>) -> Result<Config, NotifyConfigStoreError> {
+    ecstore_config_com::read_config_without_migrate(store)
+        .await
+        .map_err(|err| NotifyConfigStoreError::Read(err.to_string()))
+}
+
+async fn save_notify_server_config(store: Arc<NotifyStore>, config: &Config) -> Result<(), NotifyConfigStoreError> {
+    ecstore_config_com::save_server_config(store, config)
+        .await
+        .map_err(|err| NotifyConfigStoreError::Save(err.to_string()))
+}

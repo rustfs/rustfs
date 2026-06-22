@@ -14,7 +14,7 @@
 
 use crate::bucket::metadata_sys::get_object_lock_config;
 use crate::bucket::object_lock::objectlock;
-use crate::store_api::ObjectInfo;
+use crate::object_api::ObjectInfo;
 use s3s::dto::{DefaultRetention, ObjectLockLegalHoldStatus, ObjectLockRetentionMode};
 use std::sync::Arc;
 use time::OffsetDateTime;

@@ -24,11 +24,11 @@ use crate::bucket::lifecycle::lifecycle;
 use crate::bucket::replication::{DeletedObjectReplicationInfo, check_replicate_delete, schedule_replication_delete};
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
+use crate::object_api::ObjectOptions;
 use crate::store::ECStore;
-use crate::store_api::{ObjectOptions, ObjectToDelete};
 use rustfs_filemeta::{REPLICATE_INCOMING_DELETE, ReplicationState, version_purge_statuses_map};
 use rustfs_lock::MAX_DELETE_LIST;
-use rustfs_storage_api::ObjectOperations as _;
+use rustfs_storage_api::{ObjectOperations as _, ObjectToDelete};
 
 fn lifecycle_version_delete_replication_state(
     replicate_decision_str: String,

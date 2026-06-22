@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::storage_compat::IamStorageError;
 use rustfs_policy::policy::Error as PolicyError;
 
 pub type Result<T> = core::result::Result<T, Error>;
@@ -179,20 +180,20 @@ impl Error {
     }
 }
 
-impl From<rustfs_ecstore::error::StorageError> for Error {
-    fn from(e: rustfs_ecstore::error::StorageError) -> Self {
+impl From<IamStorageError> for Error {
+    fn from(e: IamStorageError) -> Self {
         match e {
-            rustfs_ecstore::error::StorageError::ConfigNotFound => Error::ConfigNotFound,
+            IamStorageError::ConfigNotFound => Error::ConfigNotFound,
             _ => Error::other(e),
         }
     }
 }
 
-impl From<Error> for rustfs_ecstore::error::StorageError {
+impl From<Error> for IamStorageError {
     fn from(e: Error) -> Self {
         match e {
-            Error::ConfigNotFound => rustfs_ecstore::error::StorageError::ConfigNotFound,
-            _ => rustfs_ecstore::error::StorageError::other(e),
+            Error::ConfigNotFound => IamStorageError::ConfigNotFound,
+            _ => IamStorageError::other(e),
         }
     }
 }
@@ -330,13 +331,13 @@ mod tests {
     #[test]
     fn test_iam_error_from_storage_error() {
         // Test conversion from StorageError
-        let storage_error = rustfs_ecstore::error::StorageError::ConfigNotFound;
+        let storage_error = IamStorageError::ConfigNotFound;
         let iam_error: Error = storage_error.into();
         assert_eq!(iam_error, Error::ConfigNotFound);
 
         // Test reverse conversion
-        let back_to_storage: rustfs_ecstore::error::StorageError = iam_error.into();
-        assert_eq!(back_to_storage, rustfs_ecstore::error::StorageError::ConfigNotFound);
+        let back_to_storage: IamStorageError = iam_error.into();
+        assert_eq!(back_to_storage, IamStorageError::ConfigNotFound);
     }
 
     #[test]

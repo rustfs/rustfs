@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::startup_storage_compat::EndpointServerPools;
 use rustfs_config::{
     DEFAULT_RUSTFS_UNSUPPORTED_FS_POLICY, ENV_RUSTFS_UNSUPPORTED_FS_POLICY, RUSTFS_UNSUPPORTED_FS_POLICY_FAIL,
     RUSTFS_UNSUPPORTED_FS_POLICY_WARN,
 };
-use rustfs_ecstore::endpoints::EndpointServerPools;
 use std::collections::BTreeSet;
 use std::io::{Error, Result};
 use tracing::warn;
@@ -72,7 +72,7 @@ fn collect_local_paths(endpoint_pools: &EndpointServerPools) -> Vec<String> {
     local_paths.into_iter().collect()
 }
 
-pub fn enforce_unsupported_fs_policy(endpoint_pools: &EndpointServerPools) -> Result<()> {
+pub(crate) fn enforce_unsupported_fs_policy(endpoint_pools: &EndpointServerPools) -> Result<()> {
     let local_paths = collect_local_paths(endpoint_pools);
     if local_paths.is_empty() {
         return Ok(());

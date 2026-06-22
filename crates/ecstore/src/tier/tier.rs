@@ -38,7 +38,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::client::admin_handler_utils::AdminError;
 use crate::error::{Error, Result, StorageError};
-use crate::resolve_object_store_handle;
+use crate::global::resolve_object_store_handle;
 use crate::tier::{
     tier_admin::TierCreds,
     tier_config::{TierConfig, TierType},
@@ -49,11 +49,13 @@ use crate::{
     config::com::{CONFIG_PREFIX, read_config},
     disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET},
     global::is_first_cluster_node_local,
+    object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
+    storage_api_contracts::{EcstoreObjectIO, EcstoreObjectOperations},
     store::ECStore,
-    store_api::{ObjectIO, ObjectOperations, ObjectOptions, PutObjReader},
 };
+use rustfs_filemeta::FileInfo;
 use rustfs_rio::HashReader;
-use rustfs_storage_api::{ObjectIO as _, ObjectOperations as _};
+use rustfs_storage_api::{DeletedObject, HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectToDelete};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join};
 use s3s::S3ErrorCode;
 
@@ -1032,19 +1034,36 @@ impl TierConfigMgr {
         self.save_tiering_config(api).await
     }
 
-    pub async fn save_tiering_config<S: ObjectIO>(&self, api: Arc<S>) -> std::result::Result<(), std::io::Error> {
+    pub async fn save_tiering_config<S>(&self, api: Arc<S>) -> std::result::Result<(), std::io::Error>
+    where
+        S: ObjectIO<
+                Error = Error,
+                RangeSpec = HTTPRangeSpec,
+                HeaderMap = HeaderMap,
+                ObjectOptions = ObjectOptions,
+                ObjectInfo = ObjectInfo,
+                GetObjectReader = GetObjectReader,
+                PutObjectReader = PutObjReader,
+            >,
+    {
         let data = encode_external_tiering_config_blob(self)?;
         let config_file = tier_config_path(TIER_CONFIG_FILE);
 
         self.save_config(api, &config_file, data).await
     }
 
-    pub async fn save_config<S: ObjectIO>(
-        &self,
-        api: Arc<S>,
-        file: &str,
-        data: Bytes,
-    ) -> std::result::Result<(), std::io::Error> {
+    pub async fn save_config<S>(&self, api: Arc<S>, file: &str, data: Bytes) -> std::result::Result<(), std::io::Error>
+    where
+        S: ObjectIO<
+                Error = Error,
+                RangeSpec = HTTPRangeSpec,
+                HeaderMap = HeaderMap,
+                ObjectOptions = ObjectOptions,
+                ObjectInfo = ObjectInfo,
+                GetObjectReader = GetObjectReader,
+                PutObjectReader = PutObjReader,
+            >,
+    {
         self.save_config_with_opts(
             api,
             file,
@@ -1057,13 +1076,24 @@ impl TierConfigMgr {
         .await
     }
 
-    pub async fn save_config_with_opts<S: ObjectIO>(
+    pub async fn save_config_with_opts<S>(
         &self,
         api: Arc<S>,
         file: &str,
         data: Bytes,
         opts: &ObjectOptions,
-    ) -> std::result::Result<(), std::io::Error> {
+    ) -> std::result::Result<(), std::io::Error>
+    where
+        S: ObjectIO<
+                Error = Error,
+                RangeSpec = HTTPRangeSpec,
+                HeaderMap = HeaderMap,
+                ObjectOptions = ObjectOptions,
+                ObjectInfo = ObjectInfo,
+                GetObjectReader = GetObjectReader,
+                PutObjectReader = PutObjReader,
+            >,
+    {
         debug!("save tier config:{}", file);
         let mut put_data = PutObjReader::from_vec(data.to_vec());
         let _ = api.put_object(RUSTFS_META_BUCKET, file, &mut put_data, opts).await?;
@@ -1099,7 +1129,10 @@ impl TierConfigMgr {
     }
 }
 
-async fn new_and_save_tiering_config<S: ObjectIO>(api: Arc<S>) -> Result<TierConfigMgr> {
+async fn new_and_save_tiering_config<S>(api: Arc<S>) -> Result<TierConfigMgr>
+where
+    S: EcstoreObjectIO,
+{
     let mut cfg = TierConfigMgr {
         driver_cache: HashMap::new(),
         tiers: HashMap::new(),
@@ -1158,12 +1191,15 @@ async fn load_tier_config(api: Arc<ECStore>) -> std::result::Result<TierConfigMg
     }
 }
 
-async fn read_tier_config_from_bucket<S: ObjectIO>(
+async fn read_tier_config_from_bucket<S>(
     api: Arc<S>,
     bucket: &str,
     path: &str,
     opts: &ObjectOptions,
-) -> io::Result<Option<Vec<u8>>> {
+) -> io::Result<Option<Vec<u8>>>
+where
+    S: EcstoreObjectIO,
+{
     let mut rd = match api.get_object_reader(bucket, path, None, HeaderMap::new(), opts).await {
         Ok(v) => v,
         Err(err) if is_err_config_not_found(&err) => return Ok(None),
@@ -1176,7 +1212,10 @@ async fn read_tier_config_from_bucket<S: ObjectIO>(
     Ok(Some(data))
 }
 
-async fn write_tier_config_to_rustfs<S: ObjectIO>(api: Arc<S>, path: &str, data: Bytes) -> io::Result<()> {
+async fn write_tier_config_to_rustfs<S>(api: Arc<S>, path: &str, data: Bytes) -> io::Result<()>
+where
+    S: EcstoreObjectIO,
+{
     let mut put_data = PutObjReader::from_vec(data.to_vec());
     api.put_object(
         RUSTFS_META_BUCKET,
@@ -1194,7 +1233,22 @@ async fn write_tier_config_to_rustfs<S: ObjectIO>(api: Arc<S>, path: &str, data:
 
 pub async fn try_migrate_tiering_config<S>(api: Arc<S>)
 where
-    S: ObjectIO + ObjectOperations,
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        > + ObjectOperations<
+            Error = Error,
+            ObjectInfo = ObjectInfo,
+            ObjectOptions = ObjectOptions,
+            FileInfo = FileInfo,
+            ObjectToDelete = ObjectToDelete,
+            DeletedObject = DeletedObject,
+        >,
 {
     let target_path = tier_config_path(TIER_CONFIG_FILE);
     if api

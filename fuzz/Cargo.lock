@@ -8758,8 +8758,10 @@ name = "rustfs-storage-api"
 version = "1.0.0-beta.8"
 dependencies = [
  "async-trait",
+ "rustfs-filemeta",
  "serde",
  "time",
+ "uuid",
 ]
 
 [[package]]
@@ -8789,6 +8791,7 @@ dependencies = [
  "rustfs-kafka-async",
  "rustfs-s3-types",
  "rustfs-tls-runtime",
+ "rustfs-utils",
  "rustls",
  "rustls-native-certs",
  "s3s",

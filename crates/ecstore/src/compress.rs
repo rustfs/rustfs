@@ -215,7 +215,6 @@ fn is_disk_compressible_with_config(headers: &http::HeaderMap, object_name: &str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temp_env;
 
     #[test]
     fn test_parse_disk_compression_enabled() {

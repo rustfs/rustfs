@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use rustfs_ecstore::erasure_coding::{BitrotWriterWrapper, CustomWriter, Erasure};
+use rustfs_ecstore::api::erasure::{BitrotWriterWrapper, CustomWriter, Erasure};
 use rustfs_utils::HashAlgorithm;
 use std::io::Cursor;
 use std::sync::Arc;

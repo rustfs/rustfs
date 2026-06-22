@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::error::{Error, Result};
+use crate::storage_compat::IamStore;
 use manager::IamCache;
 use oidc::OidcSys;
-use rustfs_ecstore::store::ECStore;
 use std::sync::{Arc, OnceLock};
 use store::object::ObjectStore;
 use sys::IamSys;
@@ -33,6 +33,7 @@ pub mod keyring;
 pub mod manager;
 pub mod oidc;
 pub mod oidc_state;
+mod storage_compat;
 pub mod store;
 pub mod sys;
 pub mod utils;
@@ -41,7 +42,7 @@ static IAM_SYS: OnceLock<Arc<IamSys<ObjectStore>>> = OnceLock::new();
 static OIDC_SYS: OnceLock<Arc<OidcSys>> = OnceLock::new();
 
 #[instrument(skip(ecstore))]
-pub async fn init_iam_sys(ecstore: Arc<ECStore>) -> Result<()> {
+pub async fn init_iam_sys(ecstore: Arc<IamStore>) -> Result<()> {
     if IAM_SYS.get().is_some() {
         info!(
             event = EVENT_IAM_STATE,

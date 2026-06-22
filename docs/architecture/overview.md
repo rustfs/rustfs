@@ -20,6 +20,9 @@ hot-path behavior must not drift during this migration.
 
 - [`runtime-lifecycle.md`](runtime-lifecycle.md): runtime, AppContext,
   startup/readiness, and shutdown contracts.
+- [`s3-tables-support-matrix.md`](s3-tables-support-matrix.md): supported,
+  preview, reference-only, and not-claimed S3 Tables and Iceberg REST Catalog
+  surfaces.
 - [`storage-control-data-plane.md`](storage-control-data-plane.md): boundaries
   between StorageCore, ECStore, ClusterControlPlane, and BackgroundControllers.
 - [`background-services-inventory.md`](background-services-inventory.md): current

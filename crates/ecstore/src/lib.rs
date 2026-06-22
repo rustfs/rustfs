@@ -15,51 +15,48 @@
 
 extern crate core;
 
-pub mod admin_server_info;
-pub mod batch_processor;
-pub mod bitrot;
-pub mod bucket;
-pub mod cache_value;
-pub mod compress;
-pub mod config;
+mod admin_server_info;
+pub mod api;
+mod batch_processor;
+mod bitrot;
+mod bucket;
+mod cache_value;
+mod cluster;
+mod compress;
+mod config;
 mod data_movement;
-pub mod data_usage;
-pub mod disk;
-pub mod disks_layout;
-pub mod endpoints;
-pub mod erasure_coding;
-pub mod error;
-pub mod global;
-pub mod metrics_realtime;
-pub mod notification_sys;
-pub mod pools;
-pub mod rebalance;
-pub mod rio;
-pub mod rpc;
-pub mod set_disk;
+mod data_usage;
+mod disk;
+mod disks_layout;
+mod endpoints;
+mod erasure_coding;
+mod error;
+mod global;
+pub(crate) mod layout;
+mod metrics_realtime;
+mod notification_sys;
+mod object_api;
+mod pools;
+mod rebalance;
+mod rio;
+mod rpc;
+mod set_disk;
 mod sets;
-pub mod store;
-pub mod store_api;
+mod storage_api_contracts;
+mod store;
 mod store_init;
-pub mod store_list_objects;
-pub mod store_utils;
+mod store_list_objects;
+mod store_utils;
 
 // pub mod checksum;
-pub mod client;
-pub mod event;
-pub mod event_notification;
+mod client;
+mod event;
+mod event_notification;
 #[cfg(test)]
 mod pools_test;
 #[cfg(test)]
 mod store_test;
-pub mod tier;
-
-pub use global::set_global_endpoints;
-pub use global::update_erasure_type;
-pub use global::{get_global_lock_client, get_global_lock_clients, set_global_lock_client, set_global_lock_clients};
-pub use global::{new_object_layer_fn, resolve_object_store_handle, set_object_store_resolver};
-
-pub use global::GLOBAL_Endpoints;
+mod tier;
 
 #[cfg(test)]
 mod rio_tests {

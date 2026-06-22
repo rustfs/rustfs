@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::storage_compat::{
+    SELECT_DEFAULT_READ_BUFFER_SIZE, SelectGetObjectReader, SelectObjectInfo, SelectObjectOptions, SelectStorageError,
+    SelectStore, resolve_select_object_store_handle, select_default_read_buffer_size_u64, select_is_err_bucket_not_found,
+    select_is_err_object_not_found, select_is_err_version_not_found,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
@@ -25,10 +30,6 @@ use object_store::{
 };
 use pin_project_lite::pin_project;
 use rustfs_common::DEFAULT_DELIMITER;
-use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
-use rustfs_ecstore::resolve_object_store_handle;
-use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
-use rustfs_ecstore::store::ECStore;
 use rustfs_storage_api::{HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
 use s3s::S3Result;
 use s3s::dto::SelectObjectContentInput;
@@ -47,8 +48,6 @@ use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::ReaderStream;
 use transform_stream::AsyncTryStream;
-
-use crate::storage_compat::{SelectGetObjectReader, SelectObjectInfo, SelectObjectOptions};
 
 /// Maximum allowed object size for JSON DOCUMENT mode.
 ///
@@ -81,7 +80,7 @@ pub struct EcObjectStore {
     /// this key in the root JSON object before flattening.
     json_sub_path: Option<String>,
 
-    store: Arc<ECStore>,
+    store: Arc<SelectStore>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -109,7 +108,7 @@ pub struct InvalidScanRange;
 
 impl EcObjectStore {
     pub fn new(input: Arc<SelectObjectContentInput>) -> S3Result<Self> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = resolve_select_object_store_handle() else {
             return Err(s3_error!(InternalError, "ec store not inited"));
         };
 
@@ -234,7 +233,7 @@ impl EcObjectStore {
             return Ok(Bytes::new());
         }
 
-        let mut end = (DEFAULT_READ_BUFFER_SIZE as u64).min(object_size);
+        let mut end = select_default_read_buffer_size_u64().min(object_size);
         loop {
             let bytes = self.read_raw_range_with_opts(0..end, opts).await?;
             if let Some(pos) = find_delimiter(&bytes, delimiter) {
@@ -331,8 +330,8 @@ fn find_delimiter(bytes: &[u8], delimiter: &[u8]) -> Option<usize> {
     bytes.windows(delimiter.len()).position(|window| window == delimiter)
 }
 
-fn map_storage_error(bucket: &str, object: &str, err: StorageError) -> o_Error {
-    if is_err_bucket_not_found(&err) || is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+fn map_storage_error(bucket: &str, object: &str, err: SelectStorageError) -> o_Error {
+    if select_is_err_bucket_not_found(&err) || select_is_err_object_not_found(&err) || select_is_err_version_not_found(&err) {
         return o_Error::NotFound {
             path: format!("{bucket}/{object}"),
             source: err.to_string().into(),
@@ -459,7 +458,7 @@ impl ObjectStore for EcObjectStore {
             GetResultPayload::Stream(stream::empty().boxed())
         } else if options.range.is_some() {
             let size = (result_range.end - result_range.start) as usize;
-            let stream = bytes_stream(ReaderStream::with_capacity(reader.stream, DEFAULT_READ_BUFFER_SIZE), size).boxed();
+            let stream = bytes_stream(ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE), size).boxed();
             GetResultPayload::Stream(stream)
         } else if self.is_json_document {
             // JSON DOCUMENT mode: gate on object size before doing any I/O.
@@ -499,7 +498,7 @@ impl ObjectStore for EcObjectStore {
                 None
             };
             let stream = scan_range_stream(
-                ReaderStream::with_capacity(reader.stream, DEFAULT_READ_BUFFER_SIZE),
+                ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE),
                 delimiter,
                 scan_range,
                 include_header && header.is_none(),
@@ -514,14 +513,17 @@ impl ObjectStore for EcObjectStore {
             GetResultPayload::Stream(convert_field_delimiter_stream(stream, self.need_convert.then(|| self.delimiter.clone())))
         } else if self.need_convert {
             let stream = bytes_stream(
-                ReaderStream::with_capacity(ConvertStream::new(reader.stream, self.delimiter.clone()), DEFAULT_READ_BUFFER_SIZE),
+                ReaderStream::with_capacity(
+                    ConvertStream::new(reader.stream, self.delimiter.clone()),
+                    SELECT_DEFAULT_READ_BUFFER_SIZE,
+                ),
                 original_size as usize,
             )
             .boxed();
             GetResultPayload::Stream(stream)
         } else {
             let stream = bytes_stream(
-                ReaderStream::with_capacity(reader.stream, DEFAULT_READ_BUFFER_SIZE),
+                ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE),
                 original_size as usize,
             )
             .boxed();
@@ -585,7 +587,7 @@ impl<R> ConvertStream<R> {
         ConvertStream {
             inner,
             converter: DelimiterConverter::new(delimiter.into_bytes()),
-            read_buf: vec![0; DEFAULT_READ_BUFFER_SIZE],
+            read_buf: vec![0; SELECT_DEFAULT_READ_BUFFER_SIZE],
             pending: Vec::new(),
             pending_pos: 0,
             eof: false,
@@ -605,7 +607,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for ConvertStream<R> {
                 return Poll::Ready(Ok(()));
             }
 
-            let read_len = DEFAULT_READ_BUFFER_SIZE.min(buf.remaining().max(1));
+            let read_len = SELECT_DEFAULT_READ_BUFFER_SIZE.min(buf.remaining().max(1));
             let bytes_read = {
                 let mut read_buf = ReadBuf::new(&mut this.read_buf[..read_len]);
                 ready!(Pin::new(&mut *this.inner).poll_read(cx, &mut read_buf))?;

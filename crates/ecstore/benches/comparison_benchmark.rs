@@ -33,7 +33,7 @@
 //! ```
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use rustfs_ecstore::erasure_coding::Erasure;
+use rustfs_ecstore::api::erasure::Erasure;
 use std::hint::black_box;
 use std::time::Duration;
 

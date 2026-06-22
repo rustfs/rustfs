@@ -16,10 +16,11 @@
 mod tests {
     use crate::config::WorkloadProfile;
     use crate::server::cors;
+    use crate::storage::core_storage_compat::{
+        BucketMetadata, DEFAULT_READ_BUFFER_SIZE, get_global_bucket_metadata_sys, set_bucket_metadata,
+    };
     use crate::storage::ecfs::{FS, validate_object_lock_configuration_input};
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
-    use crate::storage::storage_compat::ecstore::bucket::{metadata::BucketMetadata, metadata_sys};
-    use crate::storage::storage_compat::ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
     use crate::storage::{
         StorageObjectInfo as ObjectInfo, apply_cors_headers, apply_default_lock_retention_metadata, check_preconditions,
         get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, is_etag_equal, matches_origin_pattern, parse_etag,
@@ -940,15 +941,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_bucket_object_lock_enabled() {
-        use crate::storage::storage_compat::ecstore::bucket::metadata::BucketMetadata;
-        use crate::storage::storage_compat::ecstore::bucket::metadata_sys::set_bucket_metadata;
+        use crate::storage::core_storage_compat::bucket_metadata_sys_initialized;
+        use crate::storage::core_storage_compat::set_bucket_metadata;
         use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
         use time::OffsetDateTime;
 
-        if crate::storage::storage_compat::ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys
-            .get()
-            .is_none()
-        {
+        if !bucket_metadata_sys_initialized() {
             eprintln!("Skipping test: GLOBAL_BucketMetadataSys not initialized");
             return;
         }
@@ -1529,7 +1527,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_apply_cors_headers_unmatched_origin_with_cors_config() {
-        if metadata_sys::get_global_bucket_metadata_sys().is_none() {
+        if get_global_bucket_metadata_sys().is_none() {
             eprintln!("Skipping test: GLOBAL_BucketMetadataSys not initialized");
             return;
         }
@@ -1546,7 +1544,7 @@ mod tests {
                 max_age_seconds: None,
             }],
         });
-        metadata_sys::set_bucket_metadata(bucket.to_string(), bm).await.unwrap();
+        set_bucket_metadata(bucket.to_string(), bm).await.unwrap();
 
         let mut headers = HeaderMap::new();
         headers.insert(cors::standard::ORIGIN, "https://disallowed.example.com".parse().unwrap());
@@ -1560,14 +1558,14 @@ mod tests {
         assert!(result.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
         assert!(result.get(cors::response::ACCESS_CONTROL_ALLOW_METHODS).is_none());
 
-        metadata_sys::set_bucket_metadata(bucket.to_string(), BucketMetadata::new(bucket))
+        set_bucket_metadata(bucket.to_string(), BucketMetadata::new(bucket))
             .await
             .unwrap();
     }
 
     #[tokio::test]
     async fn test_apply_cors_headers_credentialed_request_with_wildcard_origin() {
-        if metadata_sys::get_global_bucket_metadata_sys().is_none() {
+        if get_global_bucket_metadata_sys().is_none() {
             eprintln!("Skipping test: GLOBAL_BucketMetadataSys not initialized");
             return;
         }
@@ -1584,7 +1582,7 @@ mod tests {
                 max_age_seconds: None,
             }],
         });
-        metadata_sys::set_bucket_metadata(bucket.to_string(), bm).await.unwrap();
+        set_bucket_metadata(bucket.to_string(), bm).await.unwrap();
 
         let mut headers = HeaderMap::new();
         headers.insert(cors::standard::ORIGIN, "https://console.localhost".parse().unwrap());
@@ -1600,7 +1598,7 @@ mod tests {
         assert_eq!(result.get(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS).unwrap(), "true");
         assert_eq!(result.get(cors::standard::VARY).unwrap(), "Origin");
 
-        metadata_sys::set_bucket_metadata(bucket.to_string(), BucketMetadata::new(bucket))
+        set_bucket_metadata(bucket.to_string(), BucketMetadata::new(bucket))
             .await
             .unwrap();
     }
@@ -1783,7 +1781,7 @@ mod tests {
     /// with a single-element vec value, matching the format expected by policy evaluation.
     #[test]
     fn test_object_tag_condition_key_format() {
-        use crate::storage::storage_compat::ecstore::bucket::tagging::decode_tags_to_map;
+        use crate::storage::core_storage_compat::decode_tags_to_map;
         use std::collections::HashMap;
 
         let tags_str = "security=public&project=webapp&env=prod";

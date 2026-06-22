@@ -9,7 +9,6 @@
 
 # Vendor-specific / non-portable tests
 test_account_usage
-test_atomic_conditional_write_1mb
 test_bucket_get_location
 test_bucket_head_extended
 test_bucket_header_acl_grants

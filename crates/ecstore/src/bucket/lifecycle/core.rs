@@ -26,7 +26,7 @@ use time::{self, Duration, OffsetDateTime};
 use tracing::debug;
 use uuid::Uuid;
 
-use crate::store_api::ObjectInfo;
+use crate::object_api::ObjectInfo;
 
 pub const TRANSITION_COMPLETE: &str = "complete";
 pub const TRANSITION_PENDING: &str = "pending";
@@ -934,10 +934,7 @@ impl Default for Event {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ExpirationOptions {
-    pub expire: bool,
-}
+pub use rustfs_storage_api::ExpirationOptions;
 
 #[derive(Debug, Clone)]
 pub struct TransitionOptions {

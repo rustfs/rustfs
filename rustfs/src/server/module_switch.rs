@@ -12,10 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::{
-    config::com::{read_config, save_config},
-    error::Error as StorageError,
-    resolve_object_store_handle,
+use super::storage_compat::{
+    EcstoreError as StorageError, read_ecstore_config, resolve_object_store_handle, save_ecstore_config,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -166,7 +164,7 @@ pub(crate) async fn refresh_persisted_module_switches_from_store() -> Result<Per
         return Err("storage layer not initialized".to_string());
     };
 
-    let (config, configured) = match read_config(store, MODULE_SWITCH_CONFIG_PATH).await {
+    let (config, configured) = match read_ecstore_config(store, MODULE_SWITCH_CONFIG_PATH).await {
         Ok(data) => (
             serde_json::from_slice::<PersistedModuleSwitches>(&data)
                 .map_err(|e| format!("failed to deserialize module switch config: {e}"))?,
@@ -188,7 +186,7 @@ pub(crate) async fn save_persisted_module_switches_to_store(config: PersistedMod
     };
 
     let data = serde_json::to_vec(&config).map_err(|e| format!("failed to serialize module switch config: {e}"))?;
-    save_config(store, MODULE_SWITCH_CONFIG_PATH, data)
+    save_ecstore_config(store, MODULE_SWITCH_CONFIG_PATH, data)
         .await
         .map_err(|e| format!("failed to save module switch config: {e}"))?;
 

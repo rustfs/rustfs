@@ -27,7 +27,8 @@ use crate::bucket::replication::replication_state::ReplicationStats;
 use crate::config::com::{read_config, save_config};
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::Error as EcstoreError;
-use crate::store_api::{ObjectIO, ObjectInfo, ObjectOptions};
+use crate::object_api::{ObjectInfo, ObjectOptions};
+use crate::storage_api_contracts::EcstoreObjectIO;
 use lazy_static::lazy_static;
 use rustfs_filemeta::MrfOpKind;
 use rustfs_filemeta::MrfReplicateEntry;
@@ -42,6 +43,7 @@ use rustfs_filemeta::VersionPurgeStatusType;
 use rustfs_filemeta::replication_statuses_map;
 use rustfs_filemeta::version_purge_statuses_map;
 use rustfs_filemeta::{REPLICATE_EXISTING, REPLICATE_HEAL, REPLICATE_HEAL_DELETE};
+use rustfs_storage_api::DeletedObject;
 use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
 use std::any::Any;
 use std::sync::Arc;
@@ -838,7 +840,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         // get_object_info here because the delete-marker or version may
                         // already be absent from the local store — that is expected.
                         let dv = DeletedObjectReplicationInfo {
-                            delete_object: crate::store_api::DeletedObject {
+                            delete_object: DeletedObject {
                                 object_name: entry.object.clone(),
                                 version_id: entry.version_id,
                                 delete_marker_version_id: entry.delete_marker_version_id,
@@ -1251,7 +1253,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 /// Returns `true` on success; on failure logs the error and returns `false`.
 /// Callers must NOT clear their in-memory buffer on `false` so the next tick
 /// can retry — otherwise a transient storage error permanently drops the batch.
-async fn flush_mrf_to_disk<S: ObjectIO>(entries: &[MrfReplicateEntry], storage: &Arc<S>) -> bool {
+async fn flush_mrf_to_disk<S: EcstoreObjectIO>(entries: &[MrfReplicateEntry], storage: &Arc<S>) -> bool {
     match encode_mrf_file(entries) {
         Ok(data) => {
             if let Err(e) = save_config(storage.clone(), MRF_REPLICATION_FILE, data).await {
@@ -1280,7 +1282,7 @@ async fn flush_mrf_to_disk<S: ObjectIO>(entries: &[MrfReplicateEntry], storage: 
 }
 
 /// Load bucket resync metadata from disk
-async fn load_bucket_resync_metadata<S: ObjectIO>(
+async fn load_bucket_resync_metadata<S: EcstoreObjectIO>(
     bucket: &str,
     obj_api: Arc<S>,
 ) -> Result<BucketReplicationResyncStatus, EcstoreError> {
@@ -1577,7 +1579,7 @@ pub async fn queue_replication_heal_internal(
         };
 
         let dv = DeletedObjectReplicationInfo {
-            delete_object: crate::store_api::DeletedObject {
+            delete_object: DeletedObject {
                 object_name: roi.name.clone(),
                 delete_marker_version_id: dm_version_id,
                 version_id,

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::store_api::{ObjectInfo as EcstoreObjectInfo, ObjectOptions as EcstoreObjectOptions};
+use crate::storage_compat::IamStore;
 
-pub(super) type IamObjectInfo = EcstoreObjectInfo;
-pub(super) type IamObjectOptions = EcstoreObjectOptions;
+pub(super) type IamObjectInfo = <IamStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
+pub(super) type IamObjectOptions = <IamStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;

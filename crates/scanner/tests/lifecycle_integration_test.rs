@@ -12,27 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod common;
+
+use crate::common::storage_compat::{
+    BUCKET_LIFECYCLE_CONFIG, BucketVersioningSys, DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints,
+    GLOBAL_TierConfigMgr, PoolEndpoints, ReadCloser, ReaderImpl, STORAGE_FORMAT_FILE, ScannerTestDiskExt as _,
+    ScannerWarmBackend, TierConfig, TierMinIO, TierType, TransitionOptions, WarmBackendGetOpts, build_transition_put_options,
+    enqueue_transition_for_existing_objects, get_bucket_metadata, init_background_expiry, init_bucket_metadata_sys,
+    init_local_disks, new_disk, path2_bucket_object_with_base_path, update_bucket_metadata,
+};
 use futures::FutureExt;
 use rustfs_config::ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT;
-use rustfs_ecstore::{
-    bucket::lifecycle::lifecycle::TransitionOptions,
-    bucket::metadata::BUCKET_LIFECYCLE_CONFIG,
-    bucket::{
-        lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects, metadata_sys,
-        versioning_sys::BucketVersioningSys,
-    },
-    client::transition_api::{ReadCloser, ReaderImpl},
-    disk::endpoint::Endpoint,
-    disk::{DiskAPI, DiskOption, STORAGE_FORMAT_FILE, new_disk},
-    endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
-    global::GLOBAL_TierConfigMgr,
-    pools::path2_bucket_object_with_base_path,
-    store::ECStore,
-    tier::{
-        tier_config::{TierConfig, TierMinIO, TierType},
-        warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
-    },
-};
 use rustfs_filemeta::FileMeta;
 use rustfs_scanner::scanner_folder::ScannerItem;
 use rustfs_scanner::scanner_io::ScannerIODisk;
@@ -123,7 +113,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
 
     // format disks (only first time)
-    rustfs_ecstore::store::init_local_disks(endpoint_pools.clone()).await.unwrap();
+    init_local_disks(endpoint_pools.clone()).await.unwrap();
 
     // create ECStore with dynamic port 0 (let OS assign) or fixed 9002 if free
     let port = 9002; // for simplicity
@@ -141,10 +131,10 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
         .await
         .unwrap();
     let buckets = buckets_list.into_iter().map(|v| v.name).collect();
-    rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
+    init_bucket_metadata_sys(ecstore.clone(), buckets).await;
 
     // Initialize background expiry workers
-    rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+    init_background_expiry(ecstore.clone()).await;
 
     // Store in global once lock
     let _ = GLOBAL_ENV.set((disk_paths.clone(), ecstore.clone()));
@@ -192,7 +182,7 @@ async fn setup_isolated_test_env(init_expiry: bool) -> (Vec<PathBuf>, Arc<ECStor
     };
 
     let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
-    rustfs_ecstore::store::init_local_disks(endpoint_pools.clone()).await.unwrap();
+    init_local_disks(endpoint_pools.clone()).await.unwrap();
 
     let server_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
@@ -207,10 +197,10 @@ async fn setup_isolated_test_env(init_expiry: bool) -> (Vec<PathBuf>, Arc<ECStor
         .await
         .unwrap();
     let buckets = buckets_list.into_iter().map(|v| v.name).collect();
-    rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
+    init_bucket_metadata_sys(ecstore.clone(), buckets).await;
 
     if init_expiry {
-        rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+        init_background_expiry(ecstore.clone()).await;
     }
 
     (disk_paths, ecstore)
@@ -279,7 +269,7 @@ async fn set_bucket_lifecycle(bucket_name: &str) -> Result<(), Box<dyn std::erro
     </Rule>
 </LifecycleConfiguration>"#;
 
-    metadata_sys::update(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec()).await?;
+    update_bucket_metadata(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec()).await?;
 
     Ok(())
 }
@@ -303,7 +293,7 @@ async fn set_bucket_lifecycle_deletemarker(bucket_name: &str) -> Result<(), Box<
     </Rule>
 </LifecycleConfiguration>"#;
 
-    metadata_sys::update(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec()).await?;
+    update_bucket_metadata(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec()).await?;
 
     Ok(())
 }
@@ -326,7 +316,7 @@ async fn set_bucket_lifecycle_delmarker_expiration(bucket_name: &str, days: i64)
 </LifecycleConfiguration>"#
     );
 
-    metadata_sys::update(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes()).await?;
+    update_bucket_metadata(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes()).await?;
 
     Ok(())
 }
@@ -370,7 +360,7 @@ async fn set_bucket_lifecycle_transition_with_tier(
 </LifecycleConfiguration>"#
     );
 
-    metadata_sys::update(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes()).await?;
+    update_bucket_metadata(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes()).await?;
 
     Ok(())
 }
@@ -605,7 +595,7 @@ async fn scan_object_with_lifecycle(disk_path: &Path, bucket: &str, object: &str
         .await
         .expect("failed to stat object metadata")
         .file_type();
-    let lifecycle = metadata_sys::get(bucket)
+    let lifecycle = get_bucket_metadata(bucket)
         .await
         .expect("failed to load bucket metadata")
         .lifecycle_config
@@ -695,7 +685,7 @@ impl MockWarmBackend {
 }
 
 #[async_trait::async_trait]
-impl WarmBackend for MockWarmBackend {
+impl ScannerWarmBackend for MockWarmBackend {
     async fn put(&self, object: &str, r: ReaderImpl, _length: i64) -> Result<String, std::io::Error> {
         let bytes = self.read_bytes(r).await?;
         Ok(self.put_bytes(object, bytes, HashMap::new()).await)
@@ -870,7 +860,7 @@ mod serial_tests {
         println!("✅ Lifecycle configuration set for bucket: {bucket_name}");
 
         // Verify lifecycle configuration was set
-        match rustfs_ecstore::bucket::metadata_sys::get(bucket_name.as_str()).await {
+        match get_bucket_metadata(bucket_name.as_str()).await {
             Ok(bucket_meta) => {
                 assert!(bucket_meta.lifecycle_config.is_some());
                 println!("✅ Bucket metadata retrieved successfully");
@@ -1276,7 +1266,7 @@ mod serial_tests {
             "stale transitioned remote object should still exist before scanner fallback runs"
         );
 
-        rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+        init_background_expiry(ecstore.clone()).await;
         scan_object_metadata(&disk_paths[0], bucket_name.as_str(), object_name).await;
 
         assert!(
@@ -1337,7 +1327,7 @@ mod serial_tests {
             "stale transitioned remote object should still exist before scanner cleanup runs"
         );
 
-        rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+        init_background_expiry(ecstore.clone()).await;
         scan_object_metadata(&disk_paths[0], bucket_name.as_str(), object_name).await;
 
         assert!(
@@ -1427,7 +1417,7 @@ mod serial_tests {
     </Rule>
 </LifecycleConfiguration>"#
         );
-        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
+        update_bucket_metadata(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
             .await
             .expect("Failed to set lifecycle configuration");
 
@@ -1512,7 +1502,7 @@ mod serial_tests {
     </Rule>
 </LifecycleConfiguration>"#
         );
-        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
+        update_bucket_metadata(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
             .await
             .expect("Failed to set lifecycle configuration");
 
@@ -1704,7 +1694,7 @@ mod serial_tests {
 
         assert!(object_exists(&ecstore, bucket_name.as_str(), object_name).await);
 
-        rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+        init_background_expiry(ecstore.clone()).await;
         scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
 
         assert!(
@@ -1739,7 +1729,7 @@ mod serial_tests {
     </Rule>
 </LifecycleConfiguration>"#
         );
-        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
+        update_bucket_metadata(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
             .await
             .expect("Failed to set lifecycle configuration");
 
@@ -1804,11 +1794,11 @@ mod serial_tests {
         </NoncurrentVersionExpiration>
     </Rule>
 </LifecycleConfiguration>"#;
-        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec())
+        update_bucket_metadata(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec())
             .await
             .expect("Failed to set noncurrent lifecycle configuration");
 
-        rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+        init_background_expiry(ecstore.clone()).await;
 
         scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
 
@@ -1842,7 +1832,7 @@ mod serial_tests {
         </NoncurrentVersionExpiration>
     </Rule>
 </LifecycleConfiguration>"#;
-        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec())
+        update_bucket_metadata(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec())
             .await
             .expect("Failed to set noncurrent lifecycle configuration");
 
@@ -1929,7 +1919,7 @@ mod serial_tests {
     </Rule>
 </LifecycleConfiguration>"#
         );
-        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
+        update_bucket_metadata(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
             .await
             .expect("Failed to set lifecycle configuration");
         upload_test_object(&ecstore, bucket_name.as_str(), object_name, b"expire immediately").await;

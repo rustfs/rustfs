@@ -18,25 +18,18 @@ use crate::app::multipart_usecase::DefaultMultipartUsecase;
 use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::error::ApiError;
 use crate::storage::access::has_bypass_governance_header;
+use crate::storage::core_storage_compat::{
+    BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_VERSIONING_CONFIG,
+    BUCKET_WEBSITE_CONFIG, BucketVersioningSys, OBJECT_LOCK_CONFIG, StorageError, check_retention_for_modification, decode_tags,
+    decode_tags_to_map, delete_bucket_metadata_config, encode_tags, get_bucket_accelerate_config, get_bucket_logging_config,
+    get_bucket_object_lock_config, get_bucket_replication_config, get_bucket_request_payment_config, get_bucket_website_config,
+    is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found, record_replication_proxy, serialize,
+    update_bucket_metadata_config,
+};
+use crate::storage::core_storage_compat::{StorageReplicationConfigExt as _, StorageVersioningConfigExt as _};
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::get_opts;
 use crate::storage::s3_api::acl;
-use crate::storage::storage_compat::ecstore::{
-    bucket::{
-        metadata::{
-            BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_VERSIONING_CONFIG,
-            BUCKET_WEBSITE_CONFIG, OBJECT_LOCK_CONFIG,
-        },
-        metadata_sys,
-        object_lock::objectlock_sys::check_retention_for_modification,
-        replication::{GLOBAL_REPLICATION_STATS, ReplicationConfigurationExt},
-        tagging::{decode_tags, decode_tags_to_map, encode_tags},
-        utils::serialize,
-        versioning::VersioningApi,
-        versioning_sys::BucketVersioningSys,
-    },
-    error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
-};
 use crate::storage::{parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled};
 use crate::table_catalog;
 use http::StatusCode;
@@ -85,7 +78,7 @@ impl FS {
     }
 
     async fn replication_tagging_enabled(bucket: &str, object: &str) -> bool {
-        metadata_sys::get_replication_config(bucket)
+        get_bucket_replication_config(bucket)
             .await
             .map(|(cfg, _)| cfg.has_active_rules(object, true))
             .unwrap_or(false)
@@ -95,9 +88,7 @@ impl FS {
         if !Self::replication_tagging_enabled(bucket, object).await {
             return;
         }
-        if let Some(stats) = GLOBAL_REPLICATION_STATS.get() {
-            stats.inc_proxy(bucket, api, is_err).await;
-        }
+        record_replication_proxy(bucket, api, is_err).await;
     }
 
     pub async fn get_object_tag_conditions_for_policy(
@@ -359,7 +350,7 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        metadata_sys::delete(&req.input.bucket, BUCKET_WEBSITE_CONFIG)
+        delete_bucket_metadata_config(&req.input.bucket, BUCKET_WEBSITE_CONFIG)
             .await
             .map_err(crate::error::ApiError::from)?;
 
@@ -464,6 +455,7 @@ impl S3 for FS {
 
         let result = Ok(S3Response::new(DeleteObjectTaggingOutput { version_id }));
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         let duration = start_time.elapsed();
         histogram!("rustfs_object_tagging_operation_duration_seconds", "operation" => "delete").record(duration.as_secs_f64());
         result
@@ -505,7 +497,7 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        match metadata_sys::get_accelerate_config(&req.input.bucket).await {
+        match get_bucket_accelerate_config(&req.input.bucket).await {
             Ok((accelerate, _)) => Ok(S3Response::new(GetBucketAccelerateConfigurationOutput {
                 status: accelerate.status,
                 ..Default::default()
@@ -595,7 +587,7 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        match metadata_sys::get_request_payment_config(&req.input.bucket).await {
+        match get_bucket_request_payment_config(&req.input.bucket).await {
             Ok((payment, _)) => Ok(S3Response::new(GetBucketRequestPaymentOutput {
                 payer: Some(payment.payer),
             })),
@@ -643,7 +635,7 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        match metadata_sys::get_website_config(&req.input.bucket).await {
+        match get_bucket_website_config(&req.input.bucket).await {
             Ok((website, _)) => Ok(S3Response::new(GetBucketWebsiteOutput {
                 error_document: website.error_document,
                 index_document: website.index_document,
@@ -772,7 +764,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let object_lock_configuration = match metadata_sys::get_object_lock_config(&bucket).await {
+        let object_lock_configuration = match get_bucket_object_lock_config(&bucket).await {
             Ok((cfg, _created)) => Some(cfg),
             Err(err) => {
                 if err == StorageError::ConfigNotFound {
@@ -1054,7 +1046,7 @@ impl S3 for FS {
 
         let accelerate_config = serialize(&req.input.accelerate_configuration)
             .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
-        metadata_sys::update(&req.input.bucket, BUCKET_ACCELERATE_CONFIG, accelerate_config)
+        update_bucket_metadata_config(&req.input.bucket, BUCKET_ACCELERATE_CONFIG, accelerate_config)
             .await
             .map_err(crate::error::ApiError::from)?;
 
@@ -1077,7 +1069,7 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        match metadata_sys::get_logging_config(&req.input.bucket).await {
+        match get_bucket_logging_config(&req.input.bucket).await {
             Ok((logging, _)) => Ok(S3Response::new(GetBucketLoggingOutput {
                 logging_enabled: logging.logging_enabled,
             })),
@@ -1098,7 +1090,7 @@ impl S3 for FS {
 
         let logging_config = serialize(&req.input.bucket_logging_status)
             .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
-        metadata_sys::update(&req.input.bucket, BUCKET_LOGGING_CONFIG, logging_config)
+        update_bucket_metadata_config(&req.input.bucket, BUCKET_LOGGING_CONFIG, logging_config)
             .await
             .map_err(crate::error::ApiError::from)?;
 
@@ -1157,7 +1149,7 @@ impl S3 for FS {
 
         let payment_config = serialize(&req.input.request_payment_configuration)
             .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
-        metadata_sys::update(&req.input.bucket, BUCKET_REQUEST_PAYMENT_CONFIG, payment_config)
+        update_bucket_metadata_config(&req.input.bucket, BUCKET_REQUEST_PAYMENT_CONFIG, payment_config)
             .await
             .map_err(crate::error::ApiError::from)?;
 
@@ -1199,7 +1191,7 @@ impl S3 for FS {
 
         let website_config = serialize(&req.input.website_configuration)
             .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
-        metadata_sys::update(&req.input.bucket, BUCKET_WEBSITE_CONFIG, website_config)
+        update_bucket_metadata_config(&req.input.bucket, BUCKET_WEBSITE_CONFIG, website_config)
             .await
             .map_err(crate::error::ApiError::from)?;
 
@@ -1298,6 +1290,7 @@ impl S3 for FS {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         result
     }
 
@@ -1325,7 +1318,7 @@ impl S3 for FS {
 
         validate_object_lock_configuration_input(&input_cfg)?;
 
-        match metadata_sys::get_object_lock_config(&bucket).await {
+        match get_bucket_object_lock_config(&bucket).await {
             Ok(_) => {}
             Err(err) => {
                 if err == StorageError::ConfigNotFound {
@@ -1347,7 +1340,7 @@ impl S3 for FS {
 
         let data = serialize(&input_cfg).map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{err}")))?;
 
-        metadata_sys::update(&bucket, OBJECT_LOCK_CONFIG, data)
+        update_bucket_metadata_config(&bucket, OBJECT_LOCK_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
 
@@ -1361,11 +1354,12 @@ impl S3 for FS {
             };
             let versioning_data = serialize(&enable_versioning_config)
                 .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{err}")))?;
-            metadata_sys::update(&bucket, BUCKET_VERSIONING_CONFIG, versioning_data)
+            update_bucket_metadata_config(&bucket, BUCKET_VERSIONING_CONFIG, versioning_data)
                 .await
                 .map_err(ApiError::from)?;
         }
 
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(PutObjectLockConfigurationOutput::default()))
     }
 
@@ -1444,6 +1438,7 @@ impl S3 for FS {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         result
     }
 
@@ -1521,6 +1516,7 @@ impl S3 for FS {
             version_id: req.input.version_id.clone(),
         }));
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         let duration = start_time.elapsed();
         histogram!("rustfs_object_tagging_operation_duration_seconds", "operation" => "put").record(duration.as_secs_f64());
         result

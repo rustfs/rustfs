@@ -17,9 +17,8 @@ use crate::error::{Error, Result};
 use crate::rpc::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
 use crate::{
     disk::endpoint::Endpoint,
-    global::{GLOBAL_BOOT_TIME, GLOBAL_Endpoints, get_global_deployment_id},
+    global::{GLOBAL_BOOT_TIME, GLOBAL_Endpoints, get_global_deployment_id, resolve_object_store_handle},
     notification_sys::get_global_notification_sys,
-    resolve_object_store_handle,
 };
 
 use crate::data_usage::load_data_usage_cache;

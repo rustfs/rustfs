@@ -14,24 +14,23 @@
 
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
-use crate::admin::storage_compat::ecstore::bucket::bandwidth::monitor::BandwidthDetails;
-use crate::admin::storage_compat::ecstore::bucket::bucket_target_sys::{
+use crate::admin::router_storage_compat::GLOBAL_BOOT_TIME;
+use crate::admin::router_storage_compat::PeerRestClient;
+use crate::admin::router_storage_compat::bandwidth::monitor::BandwidthDetails;
+use crate::admin::router_storage_compat::bucket_target_sys::{
     BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, TargetClient,
 };
-use crate::admin::storage_compat::ecstore::bucket::metadata::BUCKET_TARGETS_FILE;
-use crate::admin::storage_compat::ecstore::bucket::metadata_sys;
-use crate::admin::storage_compat::ecstore::bucket::replication::{
-    BucketReplicationResyncStatus, BucketStats, GLOBAL_REPLICATION_STATS, ObjectOpts, ReplicationConfigurationExt, ResyncOpts,
-    get_global_replication_pool,
+use crate::admin::router_storage_compat::get_global_notification_sys;
+use crate::admin::router_storage_compat::metadata::BUCKET_TARGETS_FILE;
+use crate::admin::router_storage_compat::metadata_sys;
+use crate::admin::router_storage_compat::read_admin_config_without_migrate;
+use crate::admin::router_storage_compat::replication::{
+    BucketReplicationResyncStatus, BucketStats, GLOBAL_REPLICATION_STATS, ObjectOpts, ResyncOpts, get_global_replication_pool,
 };
-use crate::admin::storage_compat::ecstore::bucket::target::{BucketTarget, BucketTargetType, BucketTargets};
-use crate::admin::storage_compat::ecstore::bucket::versioning::VersioningApi;
-use crate::admin::storage_compat::ecstore::bucket::versioning_sys::BucketVersioningSys;
-use crate::admin::storage_compat::ecstore::config::com::read_config_without_migrate;
-use crate::admin::storage_compat::ecstore::global::GLOBAL_BOOT_TIME;
-use crate::admin::storage_compat::ecstore::global::{get_global_bucket_monitor, get_global_deployment_id, get_global_region};
-use crate::admin::storage_compat::ecstore::notification_sys::get_global_notification_sys;
-use crate::admin::storage_compat::ecstore::rpc::PeerRestClient;
+use crate::admin::router_storage_compat::target::{BucketTarget, BucketTargetType, BucketTargets};
+use crate::admin::router_storage_compat::versioning_sys::BucketVersioningSys;
+use crate::admin::router_storage_compat::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
+use crate::admin::router_storage_compat::{get_global_bucket_monitor, get_global_deployment_id, get_global_region};
 use crate::app::context::resolve_object_store_handle;
 use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::auth::{check_key_valid, get_session_token};
@@ -636,7 +635,7 @@ async fn load_current_server_config() -> S3Result<Config> {
     }
 
     if let Some(store) = resolve_object_store_handle() {
-        match read_config_without_migrate(store).await {
+        match read_admin_config_without_migrate(store).await {
             Ok(config) => return Ok(config),
             Err(err) => {
                 warn!(
@@ -1420,7 +1419,7 @@ async fn ensure_replication_bucket_exists(bucket: &str) -> S3Result<()> {
 async fn ensure_replication_config_exists(bucket: &str) -> S3Result<()> {
     match metadata_sys::get_replication_config(bucket).await {
         Ok(_) => Ok(()),
-        Err(crate::admin::storage_compat::ecstore::error::StorageError::ConfigNotFound) => {
+        Err(crate::admin::router_storage_compat::StorageError::ConfigNotFound) => {
             Err(s3_error!(ReplicationConfigurationNotFoundError))
         }
         Err(err) => Err(ApiError::from(err).into()),
@@ -1947,7 +1946,7 @@ async fn resolve_replication_target_client(bucket: &str, target: &BucketTarget) 
 
 fn build_replication_probe_put_options(now: OffsetDateTime) -> PutObjectOptions {
     PutObjectOptions {
-        internal: crate::admin::storage_compat::ecstore::bucket::bucket_target_sys::AdvancedPutOptions {
+        internal: crate::admin::router_storage_compat::bucket_target_sys::AdvancedPutOptions {
             source_version_id: Uuid::new_v4().to_string(),
             replication_status: ReplicationStatusType::Replica,
             source_mtime: now,
@@ -2062,7 +2061,7 @@ async fn source_bucket_requires_object_lock(bucket: &str) -> S3Result<bool> {
             .object_lock_enabled
             .as_ref()
             .is_some_and(|state| state.as_str() == s3s::dto::ObjectLockEnabled::ENABLED)),
-        Err(crate::admin::storage_compat::ecstore::error::StorageError::ConfigNotFound) => Ok(false),
+        Err(crate::admin::router_storage_compat::StorageError::ConfigNotFound) => Ok(false),
         Err(err) => Err(ApiError::from(err).into()),
     }
 }
@@ -2776,7 +2775,7 @@ mod tests {
     #[test]
     fn apply_replication_reset_to_targets_updates_matching_target() {
         let mut targets = BucketTargets {
-            targets: vec![crate::admin::storage_compat::ecstore::bucket::target::BucketTarget {
+            targets: vec![crate::admin::router_storage_compat::target::BucketTarget {
                 arn: "arn:target".to_string(),
                 ..Default::default()
             }],
@@ -2798,10 +2797,10 @@ mod tests {
         let mut status = BucketReplicationResyncStatus::new();
         status.targets_map.insert(
             "arn:z".to_string(),
-            crate::admin::storage_compat::ecstore::bucket::replication::TargetReplicationResyncStatus {
+            crate::admin::router_storage_compat::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-z".to_string(),
                 last_update: Some(datetime!(2025-01-03 00:00 UTC)),
-                resync_status: crate::admin::storage_compat::ecstore::bucket::replication::ResyncStatusType::ResyncFailed,
+                resync_status: crate::admin::router_storage_compat::replication::ResyncStatusType::ResyncFailed,
                 failed_count: 2,
                 failed_size: 4,
                 bucket: "bucket-z".to_string(),
@@ -2811,10 +2810,10 @@ mod tests {
         );
         status.targets_map.insert(
             "arn:a".to_string(),
-            crate::admin::storage_compat::ecstore::bucket::replication::TargetReplicationResyncStatus {
+            crate::admin::router_storage_compat::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-a".to_string(),
                 last_update: Some(datetime!(2025-01-02 00:00 UTC)),
-                resync_status: crate::admin::storage_compat::ecstore::bucket::replication::ResyncStatusType::ResyncCompleted,
+                resync_status: crate::admin::router_storage_compat::replication::ResyncStatusType::ResyncCompleted,
                 replicated_count: 3,
                 replicated_size: 9,
                 bucket: "bucket-a".to_string(),
@@ -2844,10 +2843,10 @@ mod tests {
         let mut status = BucketReplicationResyncStatus::new();
         status.targets_map.insert(
             "arn:z".to_string(),
-            crate::admin::storage_compat::ecstore::bucket::replication::TargetReplicationResyncStatus {
+            crate::admin::router_storage_compat::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-z".to_string(),
                 last_update: Some(datetime!(2025-02-03 00:00 UTC)),
-                resync_status: crate::admin::storage_compat::ecstore::bucket::replication::ResyncStatusType::ResyncFailed,
+                resync_status: crate::admin::router_storage_compat::replication::ResyncStatusType::ResyncFailed,
                 failed_count: 2,
                 failed_size: 4,
                 bucket: "bucket-z".to_string(),
@@ -2857,10 +2856,10 @@ mod tests {
         );
         status.targets_map.insert(
             "arn:a".to_string(),
-            crate::admin::storage_compat::ecstore::bucket::replication::TargetReplicationResyncStatus {
+            crate::admin::router_storage_compat::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-a".to_string(),
                 last_update: Some(datetime!(2025-02-02 00:00 UTC)),
-                resync_status: crate::admin::storage_compat::ecstore::bucket::replication::ResyncStatusType::ResyncCompleted,
+                resync_status: crate::admin::router_storage_compat::replication::ResyncStatusType::ResyncCompleted,
                 replicated_count: 3,
                 replicated_size: 9,
                 bucket: "bucket-a".to_string(),

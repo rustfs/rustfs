@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::admin::auth::{authenticate_request, validate_admin_request};
+use crate::admin::handlers::storage_compat::is_reserved_or_invalid_bucket;
+use crate::admin::handlers::storage_compat::utils::is_valid_object_prefix;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::storage_compat::ecstore::bucket::utils::is_valid_object_prefix;
-use crate::admin::storage_compat::ecstore::store_utils::is_reserved_or_invalid_bucket;
 use crate::app::context::resolve_object_store_handle;
 use crate::server::ADMIN_PREFIX;
 use crate::server::RemoteAddr;
@@ -26,6 +26,7 @@ use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_common::heal_channel::{HealChannelPriority, HealChannelRequest, HealOpts, HealRequestSource};
 use rustfs_config::MAX_HEAL_REQUEST_SIZE;
+use rustfs_heal::heal::utils::format_set_disk_id;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_scanner::scanner::{BackgroundHealInfo, read_background_heal_info};
 use rustfs_storage_api::HealOperations as _;
@@ -263,7 +264,9 @@ fn encode_heal_task_status(
 }
 
 fn build_heal_channel_request(hip: &HealInitParams) -> HealChannelRequest {
-    let recursive = if !hip.bucket.is_empty() && hip.obj_prefix.is_empty() {
+    let root_erasure_set_target =
+        hip.bucket.is_empty() && hip.obj_prefix.is_empty() && matches!((hip.hs.pool, hip.hs.set), (Some(_), Some(_)));
+    let recursive = if (!hip.bucket.is_empty() && hip.obj_prefix.is_empty()) || root_erasure_set_target {
         true
     } else {
         hip.hs.recursive
@@ -281,6 +284,9 @@ fn build_heal_channel_request(hip: &HealInitParams) -> HealChannelRequest {
 
     heal_request.pool_index = hip.hs.pool;
     heal_request.set_index = hip.hs.set;
+    if root_erasure_set_target && let (Some(pool), Some(set)) = (hip.hs.pool, hip.hs.set) {
+        heal_request.disk = Some(format_set_disk_id(pool, set));
+    }
     heal_request.scan_mode = Some(hip.hs.scan_mode);
     heal_request.remove_corrupted = Some(hip.hs.remove);
     heal_request.recreate_missing = Some(hip.hs.recreate);
@@ -351,20 +357,31 @@ fn encode_background_heal_status(
 
 fn validate_heal_request_mode(hip: &HealInitParams) -> S3Result<()> {
     if hip.bucket.is_empty() && hip.client_token.is_empty() && !hip.force_stop {
-        return Err(s3_error!(InvalidRequest, "starting heal without a bucket target is not supported"));
+        return match (hip.hs.pool, hip.hs.set) {
+            (Some(_), Some(_)) => Ok(()),
+            (Some(_), None) | (None, Some(_)) => {
+                Err(s3_error!(InvalidRequest, "root heal erasure-set target requires both pool and set"))
+            }
+            (None, None) => Err(s3_error!(InvalidRequest, "starting heal without a bucket target is not supported")),
+        };
     }
 
     Ok(())
 }
 
 fn should_handle_root_heal_directly(hip: &HealInitParams) -> bool {
-    hip.bucket.is_empty() && hip.obj_prefix.is_empty() && hip.client_token.is_empty() && !hip.force_stop
+    hip.bucket.is_empty()
+        && hip.obj_prefix.is_empty()
+        && hip.client_token.is_empty()
+        && !hip.force_stop
+        && hip.hs.pool.is_none()
+        && hip.hs.set.is_none()
 }
 
-fn map_root_heal_status(heal_err: Option<crate::admin::storage_compat::ecstore::error::Error>) -> S3Result<()> {
+fn map_root_heal_status(heal_err: Option<crate::admin::handlers::storage_compat::Error>) -> S3Result<()> {
     match heal_err {
         None => Ok(()),
-        Some(crate::admin::storage_compat::ecstore::error::StorageError::NoHealRequired) => {
+        Some(crate::admin::handlers::storage_compat::StorageError::NoHealRequired) => {
             info!(
                 event = EVENT_ADMIN_RESPONSE_EMITTED,
                 component = LOG_COMPONENT_ADMIN_API,
@@ -719,7 +736,7 @@ mod tests {
         encode_heal_task_status, heal_channel_response_items, heal_channel_response_summary, json_response, map_heal_response,
         map_root_heal_status, should_handle_root_heal_directly, validate_heal_request_mode, validate_heal_target,
     };
-    use crate::admin::storage_compat::ecstore::error::StorageError;
+    use crate::admin::handlers::storage_compat::StorageError;
     use bytes::Bytes;
     use http::StatusCode;
     use http::Uri;
@@ -875,6 +892,33 @@ mod tests {
     }
 
     #[test]
+    fn test_root_heal_channel_request_with_pool_set_targets_erasure_set() {
+        let hip = HealInitParams {
+            hs: HealOpts {
+                scan_mode: HealScanMode::Deep,
+                recreate: true,
+                pool: Some(1),
+                set: Some(2),
+                ..Default::default()
+            },
+            force_start: true,
+            ..Default::default()
+        };
+
+        let request = build_heal_channel_request(&hip);
+
+        assert_eq!(request.bucket, "");
+        assert_eq!(request.disk.as_deref(), Some("pool_1_set_2"));
+        assert_eq!(request.priority, HealChannelPriority::High);
+        assert_eq!(request.source, HealRequestSource::Admin);
+        assert_eq!(request.pool_index, Some(1));
+        assert_eq!(request.set_index, Some(2));
+        assert_eq!(request.scan_mode, Some(HealScanMode::Deep));
+        assert_eq!(request.recursive, Some(true));
+        assert_eq!(request.recreate_missing, Some(true));
+    }
+
+    #[test]
     fn test_bucket_heal_channel_request_defaults_to_recursive() {
         let hip = HealInitParams {
             bucket: "bucket".to_string(),
@@ -934,6 +978,37 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_heal_request_mode_allows_root_erasure_set_target() {
+        validate_heal_request_mode(&HealInitParams {
+            hs: HealOpts {
+                pool: Some(1),
+                set: Some(2),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .expect("root heal with pool and set should start tracked erasure-set rebuild");
+    }
+
+    #[test]
+    fn test_validate_heal_request_mode_rejects_partial_root_erasure_set_target() {
+        let err = validate_heal_request_mode(&HealInitParams {
+            hs: HealOpts {
+                pool: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .expect_err("root heal must provide both pool and set");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert!(
+            err.to_string()
+                .contains("root heal erasure-set target requires both pool and set")
+        );
+    }
+
+    #[test]
     fn test_should_handle_root_heal_directly_for_root_start_modes() {
         assert!(should_handle_root_heal_directly(&HealInitParams::default()));
         assert!(should_handle_root_heal_directly(&HealInitParams {
@@ -954,6 +1029,14 @@ mod tests {
         }));
         assert!(!should_handle_root_heal_directly(&HealInitParams {
             bucket: "bucket".to_string(),
+            ..Default::default()
+        }));
+        assert!(!should_handle_root_heal_directly(&HealInitParams {
+            hs: HealOpts {
+                pool: Some(1),
+                set: Some(2),
+                ..Default::default()
+            },
             ..Default::default()
         }));
     }

@@ -12,30 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::{
-    bucket::{metadata::BucketMetadata, metadata_sys},
-    error::Result as EcstoreResult,
-    store::ECStore,
-    store_api::{
-        GetObjectReader as EcstoreGetObjectReader, ObjectInfo as EcstoreObjectInfo, ObjectOptions as EcstoreObjectOptions,
-        PutObjReader as EcstorePutObjReader,
-    },
-};
 use std::sync::Arc;
 
-pub type SwiftGetObjectReader = EcstoreGetObjectReader;
-pub type SwiftObjectInfo = EcstoreObjectInfo;
-pub type SwiftObjectOptions = EcstoreObjectOptions;
-pub type SwiftPutObjReader = EcstorePutObjReader;
+use rustfs_ecstore::api::{
+    bucket as ecstore_bucket, error as ecstore_error, global as ecstore_global, storage as ecstore_storage,
+};
 
-pub fn resolve_swift_object_store_handle() -> Option<Arc<ECStore>> {
-    rustfs_ecstore::resolve_object_store_handle()
+pub(super) type SwiftBucketMetadata = ecstore_bucket::metadata::BucketMetadata;
+pub(super) type SwiftStorageResult<T> = ecstore_error::Result<T>;
+pub(super) type SwiftStore = ecstore_storage::ECStore;
+pub type SwiftGetObjectReader = <SwiftStore as rustfs_storage_api::ObjectIO>::GetObjectReader;
+pub type SwiftObjectInfo = <SwiftStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
+pub type SwiftObjectOptions = <SwiftStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
+pub type SwiftPutObjReader = <SwiftStore as rustfs_storage_api::ObjectIO>::PutObjectReader;
+
+pub fn resolve_swift_object_store_handle() -> Option<Arc<SwiftStore>> {
+    ecstore_global::resolve_object_store_handle()
 }
 
-pub async fn get_swift_bucket_metadata(bucket: &str) -> EcstoreResult<Arc<BucketMetadata>> {
-    metadata_sys::get(bucket).await
+pub async fn get_swift_bucket_metadata(bucket: &str) -> SwiftStorageResult<Arc<SwiftBucketMetadata>> {
+    ecstore_bucket::metadata_sys::get(bucket).await
 }
 
-pub async fn set_swift_bucket_metadata(bucket: String, metadata: BucketMetadata) -> EcstoreResult<()> {
-    metadata_sys::set_bucket_metadata(bucket, metadata).await
+pub async fn set_swift_bucket_metadata(bucket: String, metadata: SwiftBucketMetadata) -> SwiftStorageResult<()> {
+    ecstore_bucket::metadata_sys::set_bucket_metadata(bucket, metadata).await
 }

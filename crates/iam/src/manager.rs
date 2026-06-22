@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::error::{Error, Result, is_err_config_not_found};
+use crate::storage_compat::is_iam_first_cluster_node_local;
 use crate::sys::{get_claims_from_token_with_secret, get_claims_from_token_with_secret_allow_missing_exp};
 use crate::{
     cache::{Cache, CacheEntity, LockedCache},
@@ -25,7 +26,6 @@ use crate::{
 };
 use futures::future::join_all;
 use rustfs_credentials::{Credentials, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, get_global_action_cred};
-use rustfs_ecstore::global::is_first_cluster_node_local;
 use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use rustfs_policy::{
     arn::ARN,
@@ -375,7 +375,7 @@ where
             return Ok(());
         }
 
-        if !is_first_cluster_node_local().await {
+        if !is_iam_first_cluster_node_local().await {
             return Ok(());
         }
 

@@ -4,21 +4,46 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use rustfs_ecstore::bitrot::create_bitrot_reader;
-use rustfs_ecstore::disk::endpoint::Endpoint;
-use rustfs_ecstore::disk::{DiskAPI as _, DiskOption, new_disk};
-use rustfs_ecstore::store_api::{GetObjectReader, ObjectInfo, ObjectOptions};
+use rustfs_ecstore::api::bitrot::create_bitrot_reader;
+use rustfs_ecstore::api::disk::endpoint::Endpoint;
+use rustfs_ecstore::api::disk::{DiskAPI as _, DiskOption, new_disk};
+use rustfs_ecstore::api::erasure::Erasure;
+use rustfs_ecstore::api::object::{GetObjectReader, ObjectInfo, ObjectOptions};
 use rustfs_filemeta::{FileInfo, FileInfoOpts, get_file_info};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use temp_env::async_with_vars;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWrite};
 
 #[derive(Debug, Deserialize)]
 struct ManifestRecord {
     bucket: String,
     object: String,
     backend_files: Vec<String>,
+}
+
+#[derive(Default)]
+struct VecAsyncWriter {
+    bytes: Vec<u8>,
+}
+
+impl AsyncWrite for VecAsyncWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.bytes.extend_from_slice(buf);
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
 }
 
 fn fixture_root() -> PathBuf {
@@ -93,23 +118,32 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 async fn encrypted_fixture_bytes(case_dir: &Path, manifest: &ManifestRecord, file_info: &FileInfo) -> Vec<u8> {
-    let disk_root = case_dir.join("backend").join("disk1");
-    let disk_root_str = disk_root
-        .to_str()
-        .unwrap_or_else(|| panic!("non-utf8 disk root {}", disk_root.display()));
-    let mut endpoint = Endpoint::try_from(disk_root_str).expect("fixture disk endpoint");
-    endpoint.set_pool_index(0);
-    endpoint.set_set_index(0);
-    endpoint.set_disk_index(0);
-    let disk = new_disk(
-        &endpoint,
-        &DiskOption {
-            cleanup: false,
-            health_check: false,
-        },
-    )
-    .await
-    .expect("open fixture disk");
+    let mut disks = Vec::with_capacity(file_info.erasure.distribution.len());
+    for disk_number in 1..=file_info.erasure.distribution.len() {
+        let disk_root = case_dir.join("backend").join(format!("disk{disk_number}"));
+        let disk_root_str = disk_root
+            .to_str()
+            .unwrap_or_else(|| panic!("non-utf8 disk root {}", disk_root.display()));
+        let mut endpoint = Endpoint::try_from(disk_root_str).expect("fixture disk endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(disk_number - 1);
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .unwrap_or_else(|err| panic!("open fixture disk {disk_number}: {err}"));
+        disks.push(disk);
+    }
+    let mut disk_order = vec![None; disks.len()];
+    for (idx, disk) in disks.iter().enumerate() {
+        let block_index = file_info.erasure.distribution[idx];
+        disk_order[block_index - 1] = Some(disk);
+    }
     let data_dir = file_info
         .data_dir
         .as_ref()
@@ -119,37 +153,42 @@ async fn encrypted_fixture_bytes(case_dir: &Path, manifest: &ManifestRecord, fil
     for part in &file_info.parts {
         let checksum_info = file_info.erasure.get_checksum_info(part.number);
         let path = format!("{}/{}/part.{}", manifest.object, data_dir, part.number);
-        let mut reader = create_bitrot_reader(
-            None,
-            Some(&disk),
-            &manifest.bucket,
-            &path,
-            0,
-            part.size,
-            file_info.erasure.shard_size(),
-            checksum_info.algorithm.clone(),
-            false,
-            false,
-        )
-        .await
-        .unwrap_or_else(|err| panic!("create bitrot reader for {path}: {err:?}"))
-        .unwrap_or_else(|| panic!("missing bitrot reader for {path}"));
-        let mut block = vec![0u8; file_info.erasure.shard_size()];
-        loop {
-            let n = reader
-                .read(&mut block)
-                .await
-                .unwrap_or_else(|err| panic!("read decoded encrypted bytes from {path}: {err}"));
-            if n == 0 {
-                break;
-            }
-            encrypted.extend_from_slice(&block[..n]);
-            if n < block.len() {
-                break;
-            }
+        let shard_read_len = file_info.erasure.shard_file_size(part.size as i64);
+        let mut readers = Vec::with_capacity(disks.len());
+        for (idx, disk) in disk_order.iter().enumerate() {
+            let reader = create_bitrot_reader(
+                None,
+                *disk,
+                &manifest.bucket,
+                &path,
+                0,
+                shard_read_len as usize,
+                file_info.erasure.shard_size(),
+                checksum_info.algorithm.clone(),
+                false,
+                false,
+            )
+            .await
+            .unwrap_or_else(|err| panic!("create bitrot reader for disk{} {path}: {err:?}", idx + 1));
+            readers.push(reader);
         }
+
+        let erasure = Erasure::new(
+            file_info.erasure.data_blocks,
+            file_info.erasure.parity_blocks,
+            file_info.erasure.block_size,
+        );
+        let mut writer = VecAsyncWriter::default();
+        let (written, err) = erasure.decode(&mut writer, readers, 0, part.size, part.size).await;
+        if let Some(err) = err {
+            panic!("decode erasure shards for {path}: {err}");
+        }
+        assert_eq!(written, part.size, "decoded part size should match xl.meta part size");
+        encrypted.extend_from_slice(&writer.bytes);
     }
-    disk.close().await.expect("close fixture disk");
+    for disk in disks {
+        disk.close().await.expect("close fixture disk");
+    }
     encrypted
 }
 

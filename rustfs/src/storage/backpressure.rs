@@ -42,6 +42,8 @@ use tokio::io::{DuplexStream, duplex};
 use tracing::{debug, warn};
 
 use metrics::counter;
+use rustfs_concurrency::PipeBackpressurePolicy;
+use rustfs_io_core::BackpressureConfig as CoreBackpressureConfig;
 
 /// Object-transfer duplex pipe backpressure policy.
 #[derive(Debug, Clone, Copy)]
@@ -97,6 +99,20 @@ impl ObjectPipeBackpressurePolicy {
     /// Calculate low watermark threshold in bytes.
     pub fn low_watermark_bytes(&self) -> usize {
         (self.buffer_size as u64 * self.low_watermark as u64 / 100) as usize
+    }
+
+    /// Project this object-transfer policy into the shared concurrency facade policy.
+    pub fn to_concurrency_policy(&self) -> PipeBackpressurePolicy {
+        PipeBackpressurePolicy {
+            buffer_size: self.buffer_size,
+            high_watermark: self.high_watermark,
+            low_watermark: self.low_watermark,
+        }
+    }
+
+    /// Project this object-transfer policy into the reusable io-core admission config.
+    pub fn to_core_config(&self) -> CoreBackpressureConfig {
+        self.to_concurrency_policy().to_core_config()
     }
 }
 
@@ -213,9 +229,10 @@ impl BackpressurePipe {
 
     /// Create a new backpressure-aware pipe with custom configuration.
     pub fn with_config(config: ObjectPipeBackpressurePolicy) -> Self {
-        let (reader, writer) = duplex(config.buffer_size);
-        let high_watermark_bytes = config.high_watermark_bytes();
-        let low_watermark_bytes = config.low_watermark_bytes();
+        let policy = config.to_concurrency_policy();
+        let (reader, writer) = duplex(policy.buffer_size);
+        let high_watermark_bytes = policy.high_watermark_bytes();
+        let low_watermark_bytes = policy.low_watermark_bytes();
 
         debug!(
             buffer_size = config.buffer_size,
@@ -380,8 +397,9 @@ impl BackpressureMonitor {
 
     /// Create a new monitor with custom configuration.
     pub fn with_config(config: ObjectPipeBackpressurePolicy) -> Self {
-        let high_watermark_bytes = config.high_watermark_bytes();
-        let low_watermark_bytes = config.low_watermark_bytes();
+        let policy = config.to_concurrency_policy();
+        let high_watermark_bytes = policy.high_watermark_bytes();
+        let low_watermark_bytes = policy.low_watermark_bytes();
         Self {
             config,
             buffer_usage: AtomicUsize::new(0),
@@ -485,6 +503,54 @@ mod tests {
         };
         assert_eq!(config.high_watermark_bytes(), 800);
         assert_eq!(config.low_watermark_bytes(), 500);
+    }
+
+    #[test]
+    fn test_backpressure_policy_projects_to_concurrency_and_core_config() {
+        let config = ObjectPipeBackpressurePolicy {
+            buffer_size: 2000,
+            high_watermark: 75,
+            low_watermark: 40,
+        };
+        let concurrency = config.to_concurrency_policy();
+        let core = config.to_core_config();
+
+        assert_eq!(concurrency.buffer_size, config.buffer_size);
+        assert_eq!(concurrency.high_watermark, config.high_watermark);
+        assert_eq!(concurrency.low_watermark, config.low_watermark);
+        assert_eq!(core.high_water_mark, 0.75);
+        assert_eq!(core.low_water_mark, 0.40);
+        assert!(core.enabled);
+    }
+
+    #[test]
+    fn test_backpressure_pipe_consumes_concurrency_policy_thresholds() {
+        let config = ObjectPipeBackpressurePolicy {
+            buffer_size: 2000,
+            high_watermark: 75,
+            low_watermark: 40,
+        };
+        let concurrency = config.to_concurrency_policy();
+        let pipe = BackpressurePipe::with_config(config);
+
+        assert_eq!(pipe.capacity(), concurrency.buffer_size);
+        assert_eq!(pipe.high_watermark_bytes, concurrency.high_watermark_bytes());
+        assert_eq!(pipe.low_watermark_bytes, concurrency.low_watermark_bytes());
+    }
+
+    #[test]
+    fn test_backpressure_monitor_consumes_concurrency_policy_thresholds() {
+        let config = ObjectPipeBackpressurePolicy {
+            buffer_size: 2000,
+            high_watermark: 75,
+            low_watermark: 40,
+        };
+        let concurrency = config.to_concurrency_policy();
+        let monitor = BackpressureMonitor::with_config(config);
+
+        assert_eq!(monitor.meta().buffer_capacity, concurrency.buffer_size);
+        assert_eq!(monitor.high_watermark_bytes, concurrency.high_watermark_bytes());
+        assert_eq!(monitor.low_watermark_bytes, concurrency.low_watermark_bytes());
     }
 
     #[test]

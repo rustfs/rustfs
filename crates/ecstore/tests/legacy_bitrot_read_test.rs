@@ -27,9 +27,9 @@
 //!
 //! For MinIO data: RUSTFS_LEGACY_TEST_ROOT=/path/to/minio (disk "test" and .minio.sys auto-detected).
 
-use rustfs_ecstore::bitrot::create_bitrot_reader;
-use rustfs_ecstore::disk::endpoint::Endpoint;
-use rustfs_ecstore::disk::{DiskOption, STORAGE_FORMAT_FILE, new_disk};
+use rustfs_ecstore::api::bitrot::create_bitrot_reader;
+use rustfs_ecstore::api::disk::endpoint::Endpoint;
+use rustfs_ecstore::api::disk::{DiskOption, STORAGE_FORMAT_FILE, new_disk};
 use rustfs_filemeta::{FileInfoOpts, get_file_info};
 use rustfs_utils::HashAlgorithm;
 use std::path::PathBuf;

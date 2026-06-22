@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::context::{AppContext, get_global_app_context, init_global_app_context};
+use crate::app::context::AppContext;
 use crate::server::{ServiceStateManager, publish_ready_when_runtime_ready};
+use crate::startup_storage_compat::ECStore;
 use rustfs_common::{GlobalReadiness, SystemStage};
-use rustfs_ecstore::store::ECStore;
 use rustfs_iam::init_iam_sys;
 use rustfs_kms::KmsServiceManager;
 use std::future::Future;
@@ -39,12 +39,12 @@ const IAM_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(30);
 const IAM_RETRY_ESCALATION_THRESHOLD: u64 = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IamBootstrapDisposition {
+pub(crate) enum IamBootstrapDisposition {
     ReadyInline,
     Deferred,
 }
 
-pub async fn publish_ready_for_iam_bootstrap(
+pub(crate) async fn publish_ready_for_iam_bootstrap(
     disposition: IamBootstrapDisposition,
     readiness: &GlobalReadiness,
     state_manager: Option<&ServiceStateManager>,
@@ -71,28 +71,13 @@ where
     Ok(false)
 }
 
-fn init_app_context_if_needed(store: Arc<ECStore>, kms_interface: Arc<KmsServiceManager>) -> bool {
-    if get_global_app_context().is_some() {
-        return false;
-    }
-
-    let Ok(iam_interface) = rustfs_iam::get() else {
-        return false;
-    };
-
-    init_global_app_context(AppContext::with_default_interfaces(store, iam_interface, kms_interface));
-    true
-}
-
 async fn finalize_iam_recovery(
     store: Arc<ECStore>,
     kms_interface: Arc<KmsServiceManager>,
     readiness: Arc<GlobalReadiness>,
     state_manager: Option<Arc<ServiceStateManager>>,
 ) -> Result<()> {
-    if !init_app_context_if_needed(store, kms_interface) && get_global_app_context().is_none() {
-        return Err(std::io::Error::other("IAM recovered but app context is still unavailable"));
-    }
+    AppContext::ensure_startup_after_iam(store, kms_interface)?;
 
     readiness.mark_stage(SystemStage::IamReady);
     publish_ready_when_runtime_ready(readiness.as_ref(), state_manager.as_deref()).await
@@ -297,7 +282,8 @@ fn should_fail_test_init_attempt() -> bool {
 /// call re-reads the environment variable by restoring the sentinel value.
 /// Intended for use in integration tests that share a process.
 #[doc(hidden)]
-pub fn reset_test_failure_counter() {
+#[allow(dead_code)]
+pub(crate) fn reset_test_failure_counter() {
     use std::sync::atomic::Ordering;
     TEST_REMAINING_FAILURES.store(u64::MAX, Ordering::SeqCst);
 }
@@ -321,7 +307,7 @@ async fn attempt_init_iam_sys(store: Arc<ECStore>) -> std::result::Result<(), st
 /// Returns `Ok(ReadyInline)` if IAM initialized immediately, `Ok(Deferred)` if
 /// recovery is happening in the background, or `Err` if IAM succeeded but
 /// app context initialization failed (unexpected, indicates a bug).
-pub async fn bootstrap_or_defer_iam_init(
+pub(crate) async fn bootstrap_or_defer_iam_init(
     store: Arc<ECStore>,
     kms_interface: Arc<KmsServiceManager>,
     readiness: Arc<GlobalReadiness>,
@@ -330,9 +316,7 @@ pub async fn bootstrap_or_defer_iam_init(
 ) -> Result<IamBootstrapDisposition> {
     match attempt_init_iam_sys(store.clone()).await {
         Ok(()) => {
-            if !init_app_context_if_needed(store, kms_interface) && get_global_app_context().is_none() {
-                return Err(std::io::Error::other("IAM bootstrap succeeded but app context is still unavailable"));
-            }
+            AppContext::ensure_startup_after_iam(store, kms_interface)?;
             readiness.mark_stage(SystemStage::IamReady);
             return Ok(IamBootstrapDisposition::ReadyInline);
         }
@@ -363,6 +347,33 @@ pub async fn bootstrap_or_defer_iam_init(
     }
 
     Ok(IamBootstrapDisposition::Deferred)
+}
+
+pub(crate) async fn bootstrap_or_defer_iam_init_with_startup_kms(
+    store: Arc<ECStore>,
+    readiness: Arc<GlobalReadiness>,
+    state_manager: Option<Arc<ServiceStateManager>>,
+    shutdown_token: Option<tokio_util::sync::CancellationToken>,
+) -> Result<IamBootstrapDisposition> {
+    let kms_interface = AppContext::ensure_startup_kms_interface();
+    bootstrap_or_defer_iam_init(store, kms_interface, readiness, state_manager, shutdown_token).await
+}
+
+pub(crate) async fn init_embedded_iam_runtime(
+    store: Arc<ECStore>,
+    ctx: tokio_util::sync::CancellationToken,
+    readiness: Arc<GlobalReadiness>,
+) -> Result<IamBootstrapDisposition> {
+    bootstrap_or_defer_iam_init_with_startup_kms(store, readiness, None, Some(ctx)).await
+}
+
+pub(crate) async fn init_iam_runtime(
+    store: Arc<ECStore>,
+    ctx: tokio_util::sync::CancellationToken,
+    readiness: Arc<GlobalReadiness>,
+    state_manager: Arc<ServiceStateManager>,
+) -> Result<IamBootstrapDisposition> {
+    bootstrap_or_defer_iam_init_with_startup_kms(store, readiness, Some(state_manager), Some(ctx)).await
 }
 
 #[cfg(test)]

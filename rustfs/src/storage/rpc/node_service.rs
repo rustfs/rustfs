@@ -16,22 +16,12 @@ use crate::admin::service::{
     config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
     site_replication::reload_site_replication_runtime_state,
 };
-use crate::storage::storage_compat::ecstore::{
-    admin_server_info::get_local_server_property,
-    bucket::{metadata::load_bucket_metadata, metadata_sys},
-    disk::{
-        DeleteOptions, DiskAPI, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-        UpdateMetadataOpts, error::DiskError,
-    },
-    get_global_lock_client,
-    global::GLOBAL_TierConfigMgr,
-    metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics},
-    resolve_object_store_handle,
-    rpc::{
-        LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG,
-        SERVICE_SIGNAL_RELOAD_DYNAMIC,
-    },
-    store::{all_local_disk_path, find_local_disk_by_ref},
+use crate::storage::rpc::storage_compat::{
+    CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, FileInfoVersions, LocalPeerS3Client, MetricType,
+    PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG,
+    SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StoragePeerS3ClientExt as _, UpdateMetadataOpts, all_local_disk_path,
+    collect_local_metrics, find_local_disk_by_ref, get_global_lock_client, get_local_server_property, load_bucket_metadata,
+    reload_transition_tier_config, resolve_object_store_handle, set_bucket_metadata,
 };
 use bytes::Bytes;
 use futures::Stream;
@@ -132,13 +122,11 @@ fn unimplemented_rpc(method: &str) -> Status {
     Status::unimplemented(format!("{method} is not implemented"))
 }
 
-fn background_rebalance_start_error_message(
-    result: crate::storage::storage_compat::ecstore::error::Result<()>,
-) -> Option<String> {
+fn background_rebalance_start_error_message(result: crate::storage::rpc::storage_compat::Result<()>) -> Option<String> {
     result.err().map(|err| format!("start_rebalance failed: {err}"))
 }
 
-fn stop_rebalance_response(result: rustfs_ecstore::error::Result<()>) -> StopRebalanceResponse {
+fn stop_rebalance_response(result: crate::storage::rpc::storage_compat::Result<()>) -> StopRebalanceResponse {
     match result {
         Ok(_) => StopRebalanceResponse {
             success: true,
@@ -1079,7 +1067,7 @@ impl Node for NodeService {
             }));
         };
 
-        match GLOBAL_TierConfigMgr.write().await.reload(store).await {
+        match reload_transition_tier_config(store).await {
             Ok(_) => Ok(Response::new(LoadTransitionTierConfigResponse {
                 success: true,
                 error_info: None,
@@ -2401,9 +2389,8 @@ mod tests {
 
     #[test]
     fn test_background_rebalance_start_error_message_formats_error() {
-        let message =
-            background_rebalance_start_error_message(Err(crate::storage::storage_compat::ecstore::error::Error::other("boom")))
-                .expect("background rebalance start failure should be formatted");
+        let message = background_rebalance_start_error_message(Err(crate::storage::rpc::storage_compat::Error::other("boom")))
+            .expect("background rebalance start failure should be formatted");
 
         assert!(message.contains("start_rebalance failed"));
         assert!(message.contains("boom"));
@@ -2411,7 +2398,7 @@ mod tests {
 
     #[test]
     fn test_stop_rebalance_response_reports_local_stop_error() {
-        let response = stop_rebalance_response(Err(rustfs_ecstore::error::Error::other("boom")));
+        let response = stop_rebalance_response(Err(crate::storage::rpc::storage_compat::Error::other("boom")));
 
         assert!(!response.success);
         assert!(response.error_info.as_deref().is_some_and(|message| message.contains("boom")));
@@ -2749,7 +2736,7 @@ mod tests {
         vars.insert(PEER_RESTSIGNAL.to_string(), SERVICE_SIGNAL_RELOAD_DYNAMIC.to_string());
         vars.insert(
             PEER_RESTSUB_SYS.to_string(),
-            crate::storage::storage_compat::ecstore::config::com::STORAGE_CLASS_SUB_SYS.to_string(),
+            crate::storage::rpc::storage_compat::STORAGE_CLASS_SUB_SYS.to_string(),
         );
 
         let request = Request::new(SignalServiceRequest {

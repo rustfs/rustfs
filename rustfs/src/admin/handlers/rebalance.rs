@@ -12,14 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::storage_compat::ecstore::{
-    error::StorageError,
-    notification_sys::{NotificationSys, get_global_notification_sys},
-    rebalance::{
-        DiskStat, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStopPropagationRecord,
-        decode_rebalance_stop_propagation_record,
-    },
-    store::ECStore,
+use crate::admin::handlers::storage_compat::{
+    DiskStat, ECStore, NotificationSys, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStopPropagationRecord,
+    StorageError, decode_rebalance_stop_propagation_record, get_global_notification_sys,
 };
 use crate::{
     admin::{
@@ -301,7 +296,7 @@ fn build_rebalance_pool_progress(
     now: OffsetDateTime,
     stop_time: Option<OffsetDateTime>,
     percent_free_goal: f64,
-    ps: &crate::admin::storage_compat::ecstore::rebalance::RebalanceStats,
+    ps: &crate::admin::handlers::storage_compat::RebalanceStats,
 ) -> Option<RebalPoolProgress> {
     let total_bytes_to_rebal = ps.init_capacity as f64 * percent_free_goal - ps.init_free_space as f64;
     let terminal_time = ps.info.end_time.or(stop_time);
@@ -344,7 +339,7 @@ fn build_rebalance_pool_statuses(
     now: OffsetDateTime,
     stop_time: Option<OffsetDateTime>,
     percent_free_goal: f64,
-    pool_stats: &[crate::admin::storage_compat::ecstore::rebalance::RebalanceStats],
+    pool_stats: &[crate::admin::handlers::storage_compat::RebalanceStats],
     disk_stats: &[DiskStat],
 ) -> Vec<RebalancePoolStatus> {
     pool_stats
@@ -908,9 +903,9 @@ mod rebalance_handler_tests {
         rebalance_pool_used, rebalance_query_present, rebalance_remaining_buckets, rebalance_rollback_failure_message,
         rebalance_rollback_stop_failure_message, rebalance_start_rollback_error, rebalance_used_pct, rollback_result_label,
     };
-    use crate::admin::storage_compat::ecstore::rebalance::{
-        DiskStat, RebalStatus, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta, RebalanceStats,
-        RebalanceStopPropagationRecord, encode_rebalance_stop_propagation_record,
+    use crate::admin::handlers::storage_compat::{
+        DiskStat, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta,
+        RebalanceStats, RebalanceStopPropagationRecord, encode_rebalance_stop_propagation_record,
     };
     use time::OffsetDateTime;
 
@@ -1333,7 +1328,7 @@ mod rebalance_handler_tests {
                     last_bucket: Some("bucket-a".to_string()),
                     last_object: Some("obj".to_string()),
                     last_at: Some(OffsetDateTime::from_unix_timestamp(1_001).unwrap()),
-                    entries: vec![rustfs_ecstore::rebalance::RebalanceCleanupWarningEntry {
+                    entries: vec![RebalanceCleanupWarningEntry {
                         bucket: "bucket-a".to_string(),
                         object: "obj".to_string(),
                         message: "cleanup warning".to_string(),

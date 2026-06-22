@@ -33,7 +33,7 @@ use crate::client::{
     credentials::{CredContext, Credentials, SignatureType, Static},
     signer_error,
 };
-use crate::{client::checksum::ChecksumMode, store_api::GetObjectReader};
+use crate::{client::checksum::ChecksumMode, object_api::GetObjectReader};
 use futures::{Future, StreamExt};
 use http::{HeaderMap, HeaderName};
 use http::{

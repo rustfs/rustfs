@@ -12,18 +12,87 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use rustfs_ecstore::{
-    data_usage::DATA_USAGE_CACHE_NAME,
-    disk::{BUCKET_META_PREFIX, DiskAPI, DiskStore, RUSTFS_META_BUCKET, endpoint::Endpoint, error::DiskError},
-    error::{Error as EcstoreError, StorageError},
-    global::GLOBAL_LOCAL_DISK_MAP,
-    store::ECStore,
-    store_api::{ObjectInfo as EcstoreObjectInfo, ObjectOptions as EcstoreObjectOptions, PutObjReader as EcstorePutObjReader},
+use rustfs_ecstore::api::{
+    data_usage as ecstore_data_usage, disk as ecstore_disk, error as ecstore_error, global as ecstore_global,
+    storage as ecstore_storage,
 };
 
-#[cfg(test)]
-pub(crate) use rustfs_ecstore::disk::{DiskOption, new_disk};
+pub(crate) const DATA_USAGE_CACHE_NAME: &str = ecstore_data_usage::DATA_USAGE_CACHE_NAME;
+pub(crate) const BUCKET_META_PREFIX: &str = ecstore_disk::BUCKET_META_PREFIX;
+pub(crate) const RUSTFS_META_BUCKET: &str = ecstore_disk::RUSTFS_META_BUCKET;
 
-pub type HealObjectInfo = EcstoreObjectInfo;
-pub type HealObjectOptions = EcstoreObjectOptions;
-pub type HealPutObjReader = EcstorePutObjReader;
+pub(crate) type DiskError = ecstore_disk::error::DiskError;
+pub(crate) type DiskResult<T> = ecstore_disk::error::Result<T>;
+pub(crate) type DiskStore = ecstore_disk::DiskStore;
+pub(crate) type ECStore = ecstore_storage::ECStore;
+pub(crate) type EcstoreError = ecstore_error::Error;
+pub(crate) type Endpoint = ecstore_disk::endpoint::Endpoint;
+pub(crate) type StorageError = ecstore_error::StorageError;
+pub(crate) type LocalDiskMap = std::collections::HashMap<String, Option<DiskStore>>;
+
+pub(crate) struct GlobalLocalDiskMap;
+
+pub(crate) static GLOBAL_LOCAL_DISK_MAP: GlobalLocalDiskMap = GlobalLocalDiskMap;
+
+impl GlobalLocalDiskMap {
+    pub(crate) async fn read(&self) -> tokio::sync::RwLockReadGuard<'static, LocalDiskMap> {
+        ecstore_global::GLOBAL_LOCAL_DISK_MAP.read().await
+    }
+}
+
+#[cfg(test)]
+pub(crate) type DiskOption = ecstore_disk::DiskOption;
+
+#[cfg(test)]
+pub(crate) async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> ecstore_disk::error::Result<DiskStore> {
+    ecstore_disk::new_disk(ep, opt).await
+}
+
+pub(crate) trait HealDiskExt {
+    fn endpoint(&self) -> Endpoint;
+    async fn get_disk_id(&self) -> DiskResult<Option<uuid::Uuid>>;
+    async fn read_all(&self, volume: &str, path: &str) -> DiskResult<ecstore_disk::Bytes>;
+    async fn write_all(&self, volume: &str, path: &str, data: ecstore_disk::Bytes) -> DiskResult<()>;
+    async fn delete(&self, volume: &str, path: &str, options: ecstore_disk::DeleteOptions) -> DiskResult<()>;
+    async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> DiskResult<Vec<String>>;
+    #[cfg(test)]
+    async fn make_volume(&self, volume: &str) -> DiskResult<()>;
+}
+
+impl<T> HealDiskExt for T
+where
+    T: ecstore_disk::DiskAPI,
+{
+    fn endpoint(&self) -> Endpoint {
+        ecstore_disk::DiskAPI::endpoint(self)
+    }
+
+    async fn get_disk_id(&self) -> DiskResult<Option<uuid::Uuid>> {
+        ecstore_disk::DiskAPI::get_disk_id(self).await
+    }
+
+    async fn read_all(&self, volume: &str, path: &str) -> DiskResult<ecstore_disk::Bytes> {
+        ecstore_disk::DiskAPI::read_all(self, volume, path).await
+    }
+
+    async fn write_all(&self, volume: &str, path: &str, data: ecstore_disk::Bytes) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::write_all(self, volume, path, data).await
+    }
+
+    async fn delete(&self, volume: &str, path: &str, options: ecstore_disk::DeleteOptions) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::delete(self, volume, path, options).await
+    }
+
+    async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> DiskResult<Vec<String>> {
+        ecstore_disk::DiskAPI::list_dir(self, origvolume, volume, dir_path, count).await
+    }
+
+    #[cfg(test)]
+    async fn make_volume(&self, volume: &str) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::make_volume(self, volume).await
+    }
+}
+
+pub type HealObjectInfo = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
+pub type HealObjectOptions = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
+pub type HealPutObjReader = <ECStore as rustfs_storage_api::ObjectIO>::PutObjectReader;

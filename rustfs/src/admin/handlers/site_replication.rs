@@ -13,28 +13,26 @@
 // limitations under the License.
 
 use crate::admin::auth::validate_admin_request;
+use crate::admin::handlers::storage_compat::Error as StorageError;
+use crate::admin::handlers::storage_compat::bucket_target_sys::BucketTargetSys;
+use crate::admin::handlers::storage_compat::metadata::{
+    BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE, BUCKET_REPLICATION_CONFIG,
+    BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG,
+};
+use crate::admin::handlers::storage_compat::metadata_sys;
+use crate::admin::handlers::storage_compat::replication::GLOBAL_REPLICATION_STATS;
+use crate::admin::handlers::storage_compat::replication::{ResyncOpts, get_global_replication_pool};
+use crate::admin::handlers::storage_compat::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
+use crate::admin::handlers::storage_compat::utils::{deserialize, serialize};
+use crate::admin::handlers::storage_compat::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
+use crate::admin::handlers::storage_compat::{delete_admin_config, read_admin_config, save_admin_config};
+use crate::admin::handlers::storage_compat::{
+    get_global_deployment_id, get_global_endpoints_opt, get_global_region, global_rustfs_port,
+};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::site_replication_identity::{
     canonical_endpoint, deployment_id_for_endpoint, normalize_peer_map_by_identity_with, same_identity_endpoint,
     site_identity_key,
-};
-use crate::admin::storage_compat::ecstore::bucket::bucket_target_sys::BucketTargetSys;
-use crate::admin::storage_compat::ecstore::bucket::metadata::{
-    BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE, BUCKET_REPLICATION_CONFIG,
-    BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG,
-};
-use crate::admin::storage_compat::ecstore::bucket::metadata_sys;
-use crate::admin::storage_compat::ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
-use crate::admin::storage_compat::ecstore::bucket::replication::{
-    ReplicationConfigurationExt, ResyncOpts, get_global_replication_pool,
-};
-use crate::admin::storage_compat::ecstore::bucket::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
-use crate::admin::storage_compat::ecstore::bucket::utils::{deserialize, serialize};
-use crate::admin::storage_compat::ecstore::bucket::versioning::VersioningApi;
-use crate::admin::storage_compat::ecstore::config::com::{delete_config, read_config, save_config};
-use crate::admin::storage_compat::ecstore::error::Error as StorageError;
-use crate::admin::storage_compat::ecstore::global::{
-    get_global_deployment_id, get_global_endpoints_opt, get_global_region, global_rustfs_port,
 };
 use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
 use crate::app::context::resolve_object_store_handle;
@@ -545,7 +543,7 @@ async fn load_site_replication_state() -> S3Result<SiteReplicationState> {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
-    match read_config(store, SITE_REPLICATION_STATE_PATH).await {
+    match read_admin_config(store, SITE_REPLICATION_STATE_PATH).await {
         Ok(data) => {
             let mut state: SiteReplicationState = serde_json::from_slice(&data)
                 .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid site replication state: {e}")))?;
@@ -570,7 +568,7 @@ async fn save_site_replication_state(state: &SiteReplicationState) -> S3Result<(
 
     let data = serde_json::to_vec(&normalized)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize state failed: {e}")))?;
-    save_config(store, SITE_REPLICATION_STATE_PATH, data)
+    save_admin_config(store, SITE_REPLICATION_STATE_PATH, data)
         .await
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("save state failed: {e}")))?;
     Ok(())
@@ -581,7 +579,7 @@ async fn clear_site_replication_state() -> S3Result<()> {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
-    match delete_config(store, SITE_REPLICATION_STATE_PATH).await {
+    match delete_admin_config(store, SITE_REPLICATION_STATE_PATH).await {
         Ok(()) | Err(StorageError::ConfigNotFound) => Ok(()),
         Err(err) => Err(S3Error::with_message(S3ErrorCode::InternalError, format!("clear state failed: {err}"))),
     }
@@ -656,7 +654,7 @@ async fn site_replication_peer_client() -> S3Result<reqwest::Client> {
     built
 }
 
-fn runtime_tls_enabled_with(endpoints: Option<&crate::admin::storage_compat::ecstore::endpoints::EndpointServerPools>) -> bool {
+fn runtime_tls_enabled_with(endpoints: Option<&crate::admin::handlers::storage_compat::EndpointServerPools>) -> bool {
     if !rustfs_utils::get_env_str(ENV_RUSTFS_TLS_PATH, DEFAULT_RUSTFS_TLS_PATH).is_empty() {
         return true;
     }
@@ -3357,7 +3355,7 @@ fn is_stale_update(local_updated_at: OffsetDateTime, incoming_updated_at: Option
 }
 
 fn bucket_meta_local_updated_at(
-    bucket_meta: &crate::admin::storage_compat::ecstore::bucket::metadata::BucketMetadata,
+    bucket_meta: &crate::admin::handlers::storage_compat::metadata::BucketMetadata,
     config_file: &str,
 ) -> OffsetDateTime {
     match config_file {
@@ -4578,8 +4576,8 @@ impl Operation for SRRotateServiceAccountHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::storage_compat::ecstore::disk::endpoint::Endpoint;
-    use crate::admin::storage_compat::ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+    use crate::admin::handlers::storage_compat::Endpoint;
+    use crate::admin::handlers::storage_compat::{EndpointServerPools, Endpoints, PoolEndpoints};
     use http::{HeaderMap, HeaderValue, Uri};
     use rustfs_common::{get_global_outbound_tls_generation, set_global_outbound_tls_generation};
     use rustfs_policy::policy::action::S3Action;

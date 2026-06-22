@@ -51,7 +51,7 @@ impl NodeService {
 
         match load_bucket_metadata(store, &bucket).await {
             Ok(meta) => {
-                if let Err(err) = metadata_sys::set_bucket_metadata(bucket, meta).await {
+                if let Err(err) = set_bucket_metadata(bucket, meta).await {
                     return Ok(Response::new(LoadBucketMetadataResponse {
                         success: false,
                         error_info: Some(err.to_string()),

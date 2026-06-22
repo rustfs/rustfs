@@ -12,10 +12,12 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+use super::storage_compat::{EcstoreEventArgs, register_event_dispatch_hook};
 use super::{module_switch::resolve_notify_module_state, refresh_persisted_module_switches_from_store};
 use crate::app::context::resolve_server_config;
-use rustfs_ecstore::event_notification::{EventArgs as EcstoreEventArgs, register_event_dispatch_hook};
-use rustfs_notify::EventArgs as NotifyEventArgs;
+use crate::storage::StorageObjectInfo;
+use chrono::{DateTime, Utc};
+use rustfs_notify::{EventArgs as NotifyEventArgs, NotifyObjectInfo};
 use rustfs_s3_types::EventName;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,6 +38,30 @@ pub fn refresh_notify_module_enabled() -> bool {
 
 pub fn is_notify_module_enabled() -> bool {
     NOTIFY_MODULE_ENABLED.load(Ordering::Relaxed)
+}
+
+pub(crate) fn convert_ecstore_object_info(object: StorageObjectInfo) -> NotifyObjectInfo {
+    NotifyObjectInfo {
+        bucket: object.bucket,
+        name: object.name,
+        size: object.size,
+        etag: object.etag,
+        content_type: object.content_type,
+        user_defined: object
+            .user_defined
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        version_id: object.version_id.map(|version_id| version_id.to_string()),
+        mod_time: object
+            .mod_time
+            .and_then(|value| DateTime::<Utc>::from_timestamp(value.unix_timestamp(), value.nanosecond())),
+        restore_expires: object
+            .restore_expires
+            .and_then(|value| DateTime::<Utc>::from_timestamp(value.unix_timestamp(), value.nanosecond())),
+        storage_class: object.storage_class,
+        transitioned_tier: (!object.transitioned_object.tier.is_empty()).then_some(object.transitioned_object.tier),
+    }
 }
 
 fn convert_ecstore_event_args(args: EcstoreEventArgs) -> Option<NotifyEventArgs> {
@@ -59,7 +85,7 @@ fn convert_ecstore_event_args(args: EcstoreEventArgs) -> Option<NotifyEventArgs>
     Some(NotifyEventArgs {
         event_name,
         bucket_name: args.bucket_name,
-        object: args.object,
+        object: convert_ecstore_object_info(args.object),
         req_params,
         resp_elements,
         version_id,
@@ -209,7 +235,12 @@ pub async fn init_event_notifier() {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_host_and_port;
+    use super::{convert_ecstore_object_info, parse_host_and_port};
+    use crate::storage::StorageObjectInfo;
+    use chrono::{DateTime, Utc};
+    use rustfs_storage_api::TransitionedObject;
+    use std::{collections::HashMap, sync::Arc};
+    use time::{Duration, OffsetDateTime};
 
     #[test]
     fn parse_host_and_port_with_ipv4_and_port() {
@@ -237,5 +268,41 @@ mod tests {
         let (host, port) = parse_host_and_port("localhost:9001".to_string());
         assert_eq!(host, "localhost");
         assert_eq!(port, 9001);
+    }
+
+    #[test]
+    fn convert_ecstore_object_info_preserves_notify_event_fields() {
+        let mod_time = OffsetDateTime::UNIX_EPOCH + Duration::seconds(42);
+        let restore_expires = OffsetDateTime::UNIX_EPOCH + Duration::seconds(1_700_000_000);
+        let mut metadata = HashMap::new();
+        metadata.insert("x-amz-meta-key".to_string(), "value".to_string());
+
+        let converted = convert_ecstore_object_info(StorageObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            size: 123,
+            etag: Some("etag".to_string()),
+            content_type: Some("text/plain".to_string()),
+            user_defined: Arc::new(metadata),
+            mod_time: Some(mod_time),
+            restore_expires: Some(restore_expires),
+            storage_class: Some("GLACIER".to_string()),
+            transitioned_object: TransitionedObject {
+                tier: "DEEP_ARCHIVE".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        assert_eq!(converted.bucket, "bucket");
+        assert_eq!(converted.name, "object");
+        assert_eq!(converted.size, 123);
+        assert_eq!(converted.etag.as_deref(), Some("etag"));
+        assert_eq!(converted.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(converted.user_defined.get("x-amz-meta-key").map(String::as_str), Some("value"));
+        assert_eq!(converted.mod_time, DateTime::<Utc>::from_timestamp(42, 0));
+        assert_eq!(converted.restore_expires, DateTime::<Utc>::from_timestamp(1_700_000_000, 0));
+        assert_eq!(converted.storage_class.as_deref(), Some("GLACIER"));
+        assert_eq!(converted.transitioned_tier.as_deref(), Some("DEEP_ARCHIVE"));
     }
 }

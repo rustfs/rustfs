@@ -60,17 +60,17 @@ impl RuntimeDriveHealthState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriveRecoveryClass {
-    ShortOffline,
-    MediumOffline,
-    LongOffline,
+    Short,
+    Medium,
+    Long,
 }
 
 impl DriveRecoveryClass {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::ShortOffline => "short_offline",
-            Self::MediumOffline => "medium_offline",
-            Self::LongOffline => "long_offline",
+            Self::Short => "short_offline",
+            Self::Medium => "medium_offline",
+            Self::Long => "long_offline",
         }
     }
 }
@@ -112,11 +112,11 @@ pub fn get_drive_long_offline_threshold() -> Duration {
 
 pub fn classify_drive_recovery(duration: Duration) -> DriveRecoveryClass {
     if duration <= get_drive_offline_grace_period() {
-        DriveRecoveryClass::ShortOffline
+        DriveRecoveryClass::Short
     } else if duration >= get_drive_long_offline_threshold() {
-        DriveRecoveryClass::LongOffline
+        DriveRecoveryClass::Long
     } else {
-        DriveRecoveryClass::MediumOffline
+        DriveRecoveryClass::Medium
     }
 }
 

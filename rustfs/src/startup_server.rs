@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::startup_storage_compat::{set_global_region, set_global_rustfs_port};
 use crate::{
     capacity::capacity_integration::init_capacity_management,
     config::Config,
@@ -19,13 +20,14 @@ use crate::{
 };
 use rustfs_common::{GlobalReadiness, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
-use rustfs_ecstore::global::set_global_rustfs_port;
 use rustfs_utils::net::parse_and_resolve_address;
 use std::{
     io::{Error, Result},
     net::SocketAddr,
+    path::Path,
     sync::Arc,
 };
+use tempfile::TempDir;
 use tracing::{debug, error, info, warn};
 
 const LOG_COMPONENT_MAIN: &str = "main";
@@ -38,26 +40,49 @@ const EVENT_ACTION_CREDENTIALS_INITIALIZED: &str = "action_credentials_initializ
 const EVENT_ACTION_CREDENTIALS_INITIALIZATION_FAILED: &str = "action_credentials_initialization_failed";
 const DEFAULT_CREDENTIALS_WARNING_MESSAGE: &str = "Detected default root credentials; set RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY to non-default values for production deployments";
 
-pub struct StartupListenContext {
-    pub readiness: Arc<GlobalReadiness>,
-    pub server_addr: SocketAddr,
-    pub server_address: String,
+pub(crate) struct StartupListenContext {
+    pub(crate) readiness: Arc<GlobalReadiness>,
+    pub(crate) server_addr: SocketAddr,
+    pub(crate) server_address: String,
 }
 
-pub struct StartupHttpServers {
-    pub state_manager: Arc<ServiceStateManager>,
-    pub s3_shutdown_tx: Option<ShutdownHandle>,
-    pub console_shutdown_tx: Option<ShutdownHandle>,
+pub(crate) struct EmbeddedStartupListenContext {
+    pub(crate) readiness: Arc<GlobalReadiness>,
+    pub(crate) server_addr: SocketAddr,
+    pub(crate) server_address: String,
 }
 
-pub async fn init_startup_listen_context(config: &Config) -> Result<StartupListenContext> {
+pub(crate) struct EmbeddedStartupConfig {
+    pub(crate) config: Config,
+    pub(crate) identity: EmbeddedServerIdentity,
+    pub(crate) temp_dir_guard: Option<TempDir>,
+}
+
+pub(crate) struct EmbeddedServerIdentity {
+    pub(crate) access_key: String,
+    pub(crate) secret_key: String,
+    pub(crate) region: String,
+}
+
+pub(crate) struct EmbeddedHttpServer {
+    pub(crate) shutdown_handle: ShutdownHandle,
+    pub(crate) bound_addr: SocketAddr,
+}
+
+pub(crate) struct StartupHttpServers {
+    pub(crate) state_manager: Arc<ServiceStateManager>,
+    pub(crate) s3_shutdown_tx: Option<ShutdownHandle>,
+    pub(crate) console_shutdown_tx: Option<ShutdownHandle>,
+}
+
+pub(crate) async fn init_startup_listen_context(config: &Config) -> Result<StartupListenContext> {
     log_sanitized_server_config(config);
     let readiness = Arc::new(GlobalReadiness::new());
 
     if let Some(region_str) = &config.region {
         region_str
             .parse::<s3s::region::Region>()
-            .map(rustfs_ecstore::global::set_global_region)
+            .map(set_global_region)
             .map_err(|err| Error::other(format!("invalid region '{}': {}", region_str, err)))?;
     }
 
@@ -99,7 +124,97 @@ pub async fn init_startup_listen_context(config: &Config) -> Result<StartupListe
     })
 }
 
-pub async fn init_startup_http_servers(config: &Config, readiness: Arc<GlobalReadiness>) -> Result<StartupHttpServers> {
+pub(crate) async fn prepare_embedded_startup_config(
+    address: String,
+    access_key: String,
+    secret_key: String,
+    mut volumes: Vec<String>,
+    region: String,
+) -> Result<EmbeddedStartupConfig> {
+    let mut temp_dir_guard = None;
+    if volumes.is_empty() {
+        let dir = tempfile::tempdir().map_err(|err| Error::other(format!("failed to create temp dir: {err}")))?;
+        volumes.push(dir.path().display().to_string());
+        temp_dir_guard = Some(dir);
+    }
+
+    for volume in &volumes {
+        let path = Path::new(volume);
+        if !path.exists() {
+            tokio::fs::create_dir_all(path)
+                .await
+                .map_err(|err| Error::other(format!("failed to create volume dir {volume}: {err}")))?;
+        }
+    }
+
+    let mut config = Config::new(&address, volumes);
+    config.access_key = access_key.clone();
+    config.secret_key = secret_key.clone();
+    config.region = Some(region.clone());
+    config.console_enable = false;
+
+    Ok(EmbeddedStartupConfig {
+        config,
+        identity: EmbeddedServerIdentity {
+            access_key,
+            secret_key,
+            region,
+        },
+        temp_dir_guard,
+    })
+}
+
+pub(crate) fn find_embedded_available_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
+}
+
+pub(crate) async fn init_embedded_startup_listen_context(config: &Config) -> Result<EmbeddedStartupListenContext> {
+    let readiness = Arc::new(GlobalReadiness::new());
+
+    let server_addr =
+        parse_and_resolve_address(config.address.as_str()).map_err(|err| Error::other(format!("address: {err}")))?;
+    if server_addr.port() == 0 {
+        return Err(Error::other(
+            "port 0 is not supported in embedded mode because startup requires \
+             a stable listen address and port before endpoint/global initialization. \
+             Use `find_available_port()` to obtain a free port.",
+        ));
+    }
+
+    init_global_action_credentials(Some(config.access_key.clone()), Some(config.secret_key.clone()))
+        .map_err(|err| Error::other(format!("credentials: {err:?}")))?;
+
+    if let Some(region_str) = &config.region {
+        region_str
+            .parse::<s3s::region::Region>()
+            .map(set_global_region)
+            .map_err(|err| Error::other(format!("invalid region '{region_str}': {err}")))?;
+    }
+
+    set_global_rustfs_port(server_addr.port());
+    set_global_addr(&config.address).await;
+
+    Ok(EmbeddedStartupListenContext {
+        readiness,
+        server_addr,
+        server_address: server_addr.to_string(),
+    })
+}
+
+pub(crate) async fn start_embedded_http_server(config: &Config, readiness: Arc<GlobalReadiness>) -> Result<EmbeddedHttpServer> {
+    let s3_config = s3_http_server_config(config);
+    let (shutdown_handle, bound_addr) = start_http_server(&s3_config, readiness).await?;
+
+    Ok(EmbeddedHttpServer {
+        shutdown_handle,
+        bound_addr,
+    })
+}
+
+pub(crate) async fn init_startup_http_servers(config: &Config, readiness: Arc<GlobalReadiness>) -> Result<StartupHttpServers> {
     init_capacity_management().await;
     let state_manager = Arc::new(ServiceStateManager::new());
     state_manager.update(ServiceState::Starting);
@@ -185,7 +300,10 @@ fn console_http_server_config(config: &Config) -> Option<Config> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_CREDENTIALS_WARNING_MESSAGE, console_http_server_config, s3_http_server_config};
+    use super::{
+        DEFAULT_CREDENTIALS_WARNING_MESSAGE, console_http_server_config, find_embedded_available_port,
+        prepare_embedded_startup_config, s3_http_server_config,
+    };
     use crate::config::Config;
 
     #[test]
@@ -252,5 +370,57 @@ mod tests {
         assert!(DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_config::ENV_RUSTFS_SECRET_KEY));
         assert!(!DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_credentials::DEFAULT_ACCESS_KEY));
         assert!(!DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_credentials::DEFAULT_SECRET_KEY));
+    }
+
+    #[test]
+    fn find_embedded_available_port_returns_tcp_port() {
+        let port = find_embedded_available_port().expect("available port should be found");
+
+        assert_ne!(port, 0);
+    }
+
+    #[tokio::test]
+    async fn prepare_embedded_startup_config_creates_temp_volume_when_missing() {
+        let prepared = prepare_embedded_startup_config(
+            "127.0.0.1:9000".to_string(),
+            "access".to_string(),
+            "secret".to_string(),
+            Vec::new(),
+            "us-west-2".to_string(),
+        )
+        .await
+        .expect("embedded startup config should be prepared");
+
+        assert_eq!(prepared.config.address, "127.0.0.1:9000");
+        assert_eq!(prepared.config.access_key, "access");
+        assert_eq!(prepared.config.secret_key, "secret");
+        assert_eq!(prepared.config.region.as_deref(), Some("us-west-2"));
+        assert_eq!(prepared.identity.access_key, "access");
+        assert_eq!(prepared.identity.secret_key, "secret");
+        assert_eq!(prepared.identity.region, "us-west-2");
+        assert!(!prepared.config.console_enable);
+        assert_eq!(prepared.config.volumes.len(), 1);
+        assert!(std::path::Path::new(&prepared.config.volumes[0]).exists());
+        assert!(prepared.temp_dir_guard.is_some());
+    }
+
+    #[tokio::test]
+    async fn prepare_embedded_startup_config_creates_missing_custom_volume() {
+        let parent = tempfile::tempdir().expect("temp parent");
+        let volume = parent.path().join("data");
+
+        let prepared = prepare_embedded_startup_config(
+            "127.0.0.1:9000".to_string(),
+            "access".to_string(),
+            "secret".to_string(),
+            vec![volume.display().to_string()],
+            "us-east-1".to_string(),
+        )
+        .await
+        .expect("embedded startup config should create custom volume");
+
+        assert_eq!(prepared.config.volumes, vec![volume.display().to_string()]);
+        assert!(volume.exists());
+        assert!(prepared.temp_dir_guard.is_none());
     }
 }

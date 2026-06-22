@@ -242,4 +242,19 @@ mod tests {
         assert_eq!(pipe.state(), BackpressureState::Normal);
         assert_eq!(pipe.meta().buffer_capacity, 1024);
     }
+
+    #[test]
+    fn test_backpressure_pipe_meta_is_read_only() {
+        let manager = BackpressureManager::new(2048, 80, 50);
+        let pipe = manager.create_pipe();
+        let first = pipe.meta();
+        let second = pipe.meta();
+
+        assert_eq!(first.buffer_capacity, 2048);
+        assert_eq!(first.state, BackpressureState::Normal);
+        assert_eq!(second.buffer_capacity, first.buffer_capacity);
+        assert_eq!(second.state, first.state);
+        assert!(second.age >= first.age);
+        assert_eq!(manager.state(), BackpressureState::Normal);
+    }
 }

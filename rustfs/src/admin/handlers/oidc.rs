@@ -14,8 +14,8 @@
 
 use super::sts::create_oidc_sts_credentials;
 use crate::admin::auth::validate_admin_request;
+use crate::admin::handlers::storage_compat::{read_admin_config_without_migrate, save_admin_server_config};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::storage_compat::ecstore::config::com::{read_config_without_migrate, save_server_config};
 use crate::app::context::resolve_object_store_handle;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, MINIO_ADMIN_PREFIX, RemoteAddr};
@@ -797,7 +797,7 @@ async fn load_server_config_from_store() -> S3Result<ServerConfig> {
         return Err(s3_error!(InternalError, "storage layer not initialized"));
     };
 
-    read_config_without_migrate(store)
+    read_admin_config_without_migrate(store)
         .await
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to load server config: {e}")))
 }
@@ -807,7 +807,7 @@ async fn save_server_config_to_store(config: &ServerConfig) -> S3Result<()> {
         return Err(s3_error!(InternalError, "storage layer not initialized"));
     };
 
-    save_server_config(store, config)
+    save_admin_server_config(store, config)
         .await
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to save server config: {e}")))
 }

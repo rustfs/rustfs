@@ -17,12 +17,12 @@ use crate::auth::{check_key_valid, get_condition_values_with_query_and_client_in
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::RemoteAddr;
+use crate::storage::core_storage_compat::ECStore;
+use crate::storage::core_storage_compat::resolve_object_store_handle;
+use crate::storage::core_storage_compat::{
+    PolicySys, StorageError, get_bucket_metadata, get_bucket_policy_raw, get_public_access_block_config, is_err_bucket_not_found,
+};
 use crate::storage::request_context::RequestContext;
-use crate::storage::storage_compat::ecstore::bucket::metadata_sys;
-use crate::storage::storage_compat::ecstore::bucket::policy_sys::PolicySys;
-use crate::storage::storage_compat::ecstore::error::{StorageError, is_err_bucket_not_found};
-use crate::storage::storage_compat::ecstore::resolve_object_store_handle;
-use crate::storage::storage_compat::ecstore::store::ECStore;
 use metrics::counter;
 use rustfs_iam::error::Error as IamError;
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
@@ -136,7 +136,7 @@ fn classify_bucket_policy_raw_load_error(err: &StorageError) -> BucketPolicyRawL
 
 /// Load and parse bucket policy once for ExistingObjectTag hint checks.
 async fn load_bucket_policy_existing_object_tag_hint(bucket: &str, action: Action) -> BucketPolicyExistingObjectTagHint {
-    let (policy_str, _) = match metadata_sys::get_bucket_policy_raw(bucket).await {
+    let (policy_str, _) = match get_bucket_policy_raw(bucket).await {
         Ok(v) => v,
         Err(err) => match classify_bucket_policy_raw_load_error(&err) {
             BucketPolicyRawLoadErrorKind::PolicyMissing => {
@@ -671,7 +671,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             if policy_allowed {
                 deny_anonymous_table_data_plane_if_needed(action, bucket.as_str(), object.as_str()).await?;
                 // RestrictPublicBuckets: when true, deny public access even if bucket policy allows it.
-                match metadata_sys::get_public_access_block_config(bucket_name).await {
+                match get_public_access_block_config(bucket_name).await {
                     Ok((config, _)) => {
                         if config.restrict_public_buckets.unwrap_or(false) {
                             return Err(s3_error!(AccessDenied, "Access Denied"));
@@ -797,7 +797,7 @@ async fn table_data_plane_resource_for_request(
         return Ok(None);
     }
 
-    match metadata_sys::get(bucket).await {
+    match get_bucket_metadata(bucket).await {
         Ok(metadata) if metadata.table_bucket_enabled() => {}
         Ok(_) | Err(StorageError::ConfigNotFound) => return Ok(None),
         Err(err) if is_err_bucket_not_found(&err) => return Ok(None),
@@ -930,7 +930,7 @@ impl S3Access for FS {
         let req_info = ReqInfo {
             cred,
             is_owner,
-            region: crate::storage::storage_compat::ecstore::global::get_global_region(),
+            region: crate::storage::core_storage_compat::get_global_region(),
             request_context,
             ..Default::default()
         };

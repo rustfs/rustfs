@@ -177,6 +177,25 @@ response per endpoint listed in `--metrics-endpoints`, and one by-host admin
 metrics response per listed endpoint. When `--metrics-endpoints` is omitted,
 the harness captures background-heal status only from `--endpoint`.
 
+For bucket metrics freshness validation, use the same harness around a
+post-start bucket creation workload:
+
+1. Start RustFS from an empty data path.
+2. Start the harness before creating buckets.
+3. Create a bucket, upload objects, and keep the harness running until at
+   least one usage save is observed.
+4. Compare `scanner-summary.csv` with
+   `/rustfs/admin/v3/metrics?types=1&n=1` bucket metrics.
+
+This covers the issue 3496 timing where scanner startup sees no buckets, the
+bucket is created after startup, and the first metrics collection must not
+confuse cold usage cache with real zero usage. The expected evidence is that
+dirty usage is marked, `life_time_scan_cycle` or
+`life_time_scan_bucket_drive` advances, `life_time_scan_object` advances for
+object workloads, and `life_time_save_usage` plus
+`usage_last_save_result=success` appear before accepting non-zero bucket usage
+metrics as fresh.
+
 For distributed runs, capture scanner admin metrics from every node with
 `by-host=true`. The metrics endpoint reports the node that handles the request;
 `by-host=true` preserves that node's host view but does not collect peer nodes.
@@ -327,6 +346,16 @@ Compare these fields between baseline and tuned runs:
 | `metrics.lifecycle_transition.queue_full` | Shows transition queue pressure outside the scanner walk itself. |
 | `metrics.lifecycle_transition.compensation_pending` | Shows transition compensation still pending or running after queue pressure. |
 | `metrics.lifecycle_transition.failed` | Shows transition worker failures, which should also surface as lifecycle source failure. |
+| `metrics.current_cycle_usage_saves` | Shows usage cache saves produced by the active scan cycle. |
+| `metrics.last_cycle_usage_saves` | Shows usage cache saves produced by the previous completed or partial scan cycle. |
+| `metrics.usage_freshness.dirty_pending_buckets` | Shows whether bucket/object mutations are still waiting for usage refresh. |
+| `metrics.usage_freshness.last_cycle_dirty_buckets` | Shows how many dirty buckets were picked up by the last cycle. |
+| `metrics.usage_freshness.last_cycle_cleared_dirty_buckets` | Shows how many dirty bucket marks were cleared by a successful cycle. |
+| `metrics.usage_freshness.last_usage_save_result` | Confirms whether the last usage save succeeded, failed, or was skipped. |
+| `metrics.life_time_ops.scan_cycle` | Confirms scanner cycles actually started after the workload. |
+| `metrics.life_time_ops.scan_bucket_drive` | Confirms bucket-drive scan work reached the storage layer. |
+| `metrics.life_time_ops.scan_object` | Confirms object metadata scanning advanced for object workloads. |
+| `metrics.life_time_ops.save_usage` | Confirms `DataUsageInfo` save work happened; this is the key freshness signal for bucket metrics. |
 | `metrics.scan_checkpoint` | Confirms partial cycles preserve resume context. |
 | `metrics.oldest_active_path_age_seconds` | Helps identify scanner paths that may be stuck. |
 
@@ -353,6 +382,23 @@ the background-heal status snapshots captured across `--metrics-endpoints`.
 | `heal_admin_queued` | Manual/admin heal work waiting in the queue. |
 | `heal_auto_heal_queued` | Auto-heal work waiting in the queue, typically from disk/set recovery paths. |
 
+`scanner-summary.csv` also includes usage freshness columns for quick
+post-start bucket metrics validation:
+
+| Field | Why it matters |
+|---|---|
+| `current_cycle_usage_saves` | Usage saves during the current cycle. |
+| `last_cycle_usage_saves` | Usage saves from the last finished or partial cycle. |
+| `usage_dirty_pending_buckets` | Dirty buckets still waiting for scanner refresh. |
+| `usage_last_cycle_dirty_buckets` | Dirty buckets selected by the last cycle. |
+| `usage_last_cycle_cleared_dirty_buckets` | Dirty bucket marks cleared by the last cycle. |
+| `usage_last_save_result` | Last `DataUsageInfo` save result. |
+| `usage_last_save_unix_secs` | Last `DataUsageInfo` save timestamp. |
+| `life_time_scan_cycle` | Total scanner cycles observed by the node. |
+| `life_time_scan_bucket_drive` | Total bucket-drive scans completed by the node. |
+| `life_time_scan_object` | Total object scan operations observed by the node. |
+| `life_time_save_usage` | Total usage save operations observed by the node. |
+
 ## Interpreting Results
 
 A useful tuning result has all of these properties:
@@ -377,6 +423,8 @@ Treat these as failure signals:
 - lifecycle transition `scanner_missed`, `queue_full`,
   `compensation_pending`, or `failed` grows during a run that was expected to
   reduce backlog;
+- bucket metrics show zero usage after post-start uploads while dirty usage
+  remains pending and `life_time_save_usage` does not advance;
 - heal or bitrot work moves from `queued` to `missed` after a scanner pacing
   change.
 
@@ -392,6 +440,8 @@ For scanner behavior PRs, include this evidence when available:
 - Observation window and sample interval.
 - Scanner status snapshots or time series.
 - Host CPU and disk telemetry.
+- Usage freshness fields from `scanner-summary.csv` when validating bucket
+  metrics or issue 3496-style timing.
 - Short conclusion that separates pressure reduction from scanner progress.
 - `scanner-validation-report.md` from the harness when using the scripted
   collection path.
@@ -405,6 +455,7 @@ at least these runs:
 | Run | Required evidence |
 |---|---|
 | Single-node, single-disk small-object idle | Scanner status series, host telemetry, `scanner-summary.csv`, and a conclusion that CPU or disk pressure is lower without scan progress stopping. |
+| Single-node post-start bucket metrics freshness | Empty data path startup, post-start bucket creation/upload, bucket metrics snapshots, `scanner-summary.csv` usage freshness columns, and evidence that `DataUsageInfo` save work occurred before accepting bucket usage metrics. |
 | Single-node erasure or multi-disk | Checkpoint movement, active path age, set/disk scan pressure, data usage freshness, and before/after scanner config. |
 | Distributed lifecycle backlog | `maintenance_control`, lifecycle expiry/transition queue fields, source work missed/failed counts, and by-host admin metrics. |
 | Distributed replication backlog | Bucket replication repair kind counters, site replication passive/active boundary counters, source work queued/skipped/missed counts, and by-host admin metrics. |

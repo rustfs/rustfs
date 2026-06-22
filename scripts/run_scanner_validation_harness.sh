@@ -161,7 +161,7 @@ setup_output() {
   mkdir -p "$OUT_DIR/heal"
   mkdir -p "$OUT_DIR/metrics"
   SUMMARY_CSV="$OUT_DIR/scanner-summary.csv"
-  echo "timestamp,primary_pressure,current_cycle_objects_scanned,current_cycle_directories_scanned,last_cycle_result,last_cycle_partial_reason,last_cycle_partial_source,lifecycle_transition_scanner_missed,source_work_missed_total,heal_queue_length,heal_active_tasks,heal_scanner_queued,heal_admin_queued,heal_auto_heal_queued" >"$SUMMARY_CSV"
+  echo "timestamp,primary_pressure,current_cycle_objects_scanned,current_cycle_directories_scanned,last_cycle_result,last_cycle_partial_reason,last_cycle_partial_source,lifecycle_transition_scanner_missed,source_work_missed_total,current_cycle_usage_saves,last_cycle_usage_saves,usage_dirty_pending_buckets,usage_last_cycle_dirty_buckets,usage_last_cycle_cleared_dirty_buckets,usage_last_save_result,usage_last_save_unix_secs,life_time_scan_cycle,life_time_scan_bucket_drive,life_time_scan_object,life_time_save_usage,heal_queue_length,heal_active_tasks,heal_scanner_queued,heal_admin_queued,heal_auto_heal_queued" >"$SUMMARY_CSV"
 }
 
 git_value() {
@@ -403,6 +403,17 @@ capture_status_sample() {
       (.metrics.last_cycle_partial_source // ""),
       (.metrics.lifecycle_transition.scanner_missed // 0),
       ((.metrics.source_work // []) | map(.missed // 0) | add // 0),
+      (.metrics.current_cycle_usage_saves // 0),
+      (.metrics.last_cycle_usage_saves // 0),
+      (.metrics.usage_freshness.dirty_pending_buckets // 0),
+      (.metrics.usage_freshness.last_cycle_dirty_buckets // 0),
+      (.metrics.usage_freshness.last_cycle_cleared_dirty_buckets // 0),
+      (.metrics.usage_freshness.last_usage_save_result // ""),
+      (.metrics.usage_freshness.last_usage_save_unix_secs // 0),
+      (.metrics.life_time_ops.scan_cycle // 0),
+      (.metrics.life_time_ops.scan_bucket_drive // 0),
+      (.metrics.life_time_ops.scan_object // 0),
+      (.metrics.life_time_ops.save_usage // 0),
       ($heal.healOperations.queueLength // $heal.healQueueLength // 0),
       ($heal.healOperations.activeTasks // $heal.healActiveTasks // 0),
       ($heal.healOperations.queuedBySource.scanner // 0),
@@ -455,11 +466,14 @@ Interval seconds: $INTERVAL_SECS
 - Background heal status snapshots: $heal_status_count
 - Distributed admin metrics snapshots: $metrics_count
 - Summary CSV: scanner-summary.csv
+- Usage freshness summary: current/last usage saves, dirty bucket state, last usage save result, and scanner life_time_ops.
 - Run metadata: run-metadata.env
 
 ## Review Checklist
 
 - Compare scanner progress and pressure in scanner-summary.csv.
+- Confirm dirty usage marks lead to usage saves when validating post-start bucket metrics freshness.
+- Check life_time_ops scan_cycle, scan_bucket_drive, scan_object, and save_usage before accepting bucket metrics freshness results.
 - Check source work missed totals before accepting pressure reductions.
 - Check healOperations queued and active counts when heal or bitrot pressure is involved.
 - Use distributed admin metrics snapshots for by-host investigation when metrics endpoints were provided.

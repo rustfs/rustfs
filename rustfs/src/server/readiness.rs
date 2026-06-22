@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::storage_compat::{
+    Endpoint, EndpointServerPools, get_global_endpoints_opt, get_global_lock_clients, is_dist_erasure,
+    resolve_object_store_handle,
+};
 use crate::server::{ServiceState, ServiceStateManager};
 use crate::server::{has_path_prefix, is_table_catalog_path};
 use bytes::Bytes;
@@ -21,9 +25,6 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use metrics::{counter, gauge};
 use rustfs_common::GlobalReadiness;
-use rustfs_ecstore::global::is_dist_erasure;
-use rustfs_ecstore::global::{get_global_endpoints_opt, get_global_lock_clients};
-use rustfs_ecstore::resolve_object_store_handle;
 use rustfs_iam::get_global_iam_sys;
 use rustfs_madmin::{Disk, StorageInfo};
 use rustfs_storage_api::StorageAdminApi;
@@ -496,13 +497,10 @@ async fn collect_storage_readiness_uncached() -> bool {
     }
 }
 
-fn set_lock_quorum_status(
-    online_hosts: &HashSet<String>,
-    set_endpoints: &[rustfs_ecstore::disk::endpoint::Endpoint],
-) -> LockQuorumStatus {
+fn set_lock_quorum_status(online_hosts: &HashSet<String>, set_endpoints: &[Endpoint]) -> LockQuorumStatus {
     let total_clients = set_endpoints
         .iter()
-        .map(rustfs_ecstore::disk::endpoint::Endpoint::host_port)
+        .map(Endpoint::host_port)
         .filter(|host| !host.is_empty())
         .collect::<HashSet<_>>();
     let total_clients_len = total_clients.len();
@@ -525,10 +523,7 @@ fn set_lock_quorum_status(
     }
 }
 
-fn aggregate_lock_quorum_status(
-    pool_endpoints: &rustfs_ecstore::endpoints::EndpointServerPools,
-    online_hosts: &HashSet<String>,
-) -> LockQuorumStatus {
+fn aggregate_lock_quorum_status(pool_endpoints: &EndpointServerPools, online_hosts: &HashSet<String>) -> LockQuorumStatus {
     let mut connected_clients = 0usize;
     let mut total_clients = 0usize;
     let mut required_quorum = 0usize;
@@ -842,8 +837,7 @@ mod tests {
 
     #[test]
     fn aggregate_lock_quorum_status_requires_each_set_to_meet_quorum() {
-        use rustfs_ecstore::disk::endpoint::Endpoint;
-        use rustfs_ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+        use crate::server::storage_compat::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
 
         let endpoints = vec![
             Endpoint {
@@ -900,8 +894,7 @@ mod tests {
 
     #[test]
     fn aggregate_lock_quorum_status_fails_when_any_set_loses_quorum() {
-        use rustfs_ecstore::disk::endpoint::Endpoint;
-        use rustfs_ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+        use crate::server::storage_compat::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
 
         let endpoints = vec![
             Endpoint {
