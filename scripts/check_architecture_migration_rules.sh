@@ -103,6 +103,7 @@ RUSTFS_ROOT_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_compat_re
 RUSTFS_STORAGE_CORE_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_core_compat_relative_consumer_hits.txt"
 RUSTFS_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_local_compat_relative_consumer_hits.txt"
 RUSTFS_APP_ADMIN_SECONDARY_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/rustfs_app_admin_secondary_compat_bridge_hits.txt"
+RUSTFS_STORAGE_SECONDARY_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/rustfs_storage_secondary_compat_bridge_hits.txt"
 RUSTFS_STORAGE_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_local_compat_relative_consumer_hits.txt"
 RUSTFS_ADMIN_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_admin_local_compat_relative_consumer_hits.txt"
 RUSTFS_APP_SERVER_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_app_server_local_compat_relative_consumer_hits.txt"
@@ -867,7 +868,6 @@ fi
     rustfs/src/admin/handlers/storage_compat.rs \
     rustfs/src/admin/service/storage_compat.rs \
     rustfs/src/app/context/storage_compat.rs \
-    rustfs/src/storage/core_storage_compat.rs \
     rustfs/src/storage/rpc/storage_compat.rs || true
 ) >"$RUSTFS_LOCAL_COMPAT_GLOB_EXPORT_HITS_FILE"
 
@@ -1113,6 +1113,17 @@ fi
 
 if [[ -s "$RUSTFS_APP_ADMIN_SECONDARY_COMPAT_BRIDGE_HITS_FILE" ]]; then
   report_failure "RustFS app/admin consumers must route directly through their owner storage_compat boundary instead of secondary compatibility bridges: $(paste -sd '; ' "$RUSTFS_APP_ADMIN_SECONDARY_COMPAT_BRIDGE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'core_storage_compat' \
+    rustfs/src/storage \
+    --glob '*.rs' || true
+) >"$RUSTFS_STORAGE_SECONDARY_COMPAT_BRIDGE_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_SECONDARY_COMPAT_BRIDGE_HITS_FILE" ]]; then
+  report_failure "RustFS storage owner consumers must route directly through storage_compat instead of the secondary core_storage_compat bridge: $(paste -sd '; ' "$RUSTFS_STORAGE_SECONDARY_COMPAT_BRIDGE_HITS_FILE")"
 fi
 
 (

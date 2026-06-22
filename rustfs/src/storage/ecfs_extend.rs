@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::core_storage_compat::StorageReplicationConfigExt as _;
-use super::core_storage_compat::{
+use super::storage_compat::StorageReplicationConfigExt as _;
+use super::storage_compat::{
     StorageError, add_object_lock_years, get_bucket_cors_config, get_bucket_object_lock_config, get_bucket_replication_config,
     resolve_object_store_handle,
 };
@@ -738,7 +738,7 @@ pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelet
 }
 
 /// Helper function to get store and validate bucket exists
-pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<super::core_storage_compat::ECStore>> {
+pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<super::storage_compat::ECStore>> {
     let Some(store) = resolve_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
