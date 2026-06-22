@@ -41,6 +41,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use reqwest::Client as HttpClient;
 use rustfs_config::{DEFAULT_TRUST_LEAF_CERT_AS_CA, ENV_TRUST_LEAF_CERT_AS_CA, RUSTFS_CA_CERT, RUSTFS_TLS_CERT};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
+use rustfs_utils::egress::validate_outbound_url;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE,
     AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_STORAGE_CLASS, AMZ_WEBSITE_REDIRECT_LOCATION, is_amz_header, is_minio_header,
@@ -646,6 +647,16 @@ impl BucketTargetSys {
         } else {
             format!("http://{}", target.endpoint)
         };
+        let parsed_endpoint = Url::parse(&endpoint).map_err(|err| BucketTargetError::RemoteTargetConnectionErr {
+            bucket: target.target_bucket.clone(),
+            access_key: credentials.access_key.clone(),
+            error: format!("invalid target endpoint: {err}"),
+        })?;
+        validate_outbound_url(&parsed_endpoint).map_err(|err| BucketTargetError::RemoteTargetConnectionErr {
+            bucket: target.target_bucket.clone(),
+            access_key: credentials.access_key.clone(),
+            error: format!("target endpoint is not allowed: {err}"),
+        })?;
 
         let mut config_builder = S3Config::builder()
             .endpoint_url(endpoint.clone())
@@ -1616,5 +1627,28 @@ mod tests {
             rustfs_utils::http::get_header(&headers, SUFFIX_SOURCE_DELETEMARKER).is_none(),
             "delete-marker version purges must not masquerade as delete-marker creations"
         );
+    }
+
+    #[tokio::test]
+    async fn get_remote_target_client_internal_rejects_loopback_endpoint() {
+        let sys = BucketTargetSys::default();
+        let err = sys
+            .get_remote_target_client_internal(&BucketTarget {
+                endpoint: "127.0.0.1:9000".to_string(),
+                secure: true,
+                target_bucket: "bucket".to_string(),
+                region: "us-east-1".to_string(),
+                credentials: Some(Credentials {
+                    access_key: "access".to_string(),
+                    secret_key: "secret".to_string(),
+                    session_token: None,
+                    expiration: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect_err("loopback endpoint should be rejected");
+
+        assert!(err.to_string().contains("not allowed"));
     }
 }
