@@ -383,9 +383,9 @@ fn issue3031_diag_enabled() -> bool {
     rustfs_utils::get_env_bool(ENV_ISSUE3031_DIAG_ENABLE, false)
 }
 
-fn log_put_object_stage_summary(
-    bucket: &str,
-    object: &str,
+struct PutObjectStageSummary<'a> {
+    bucket: &'a str,
+    object: &'a str,
     write_quorum: usize,
     write_path: &'static str,
     writer_setup_ms: u64,
@@ -394,22 +394,24 @@ fn log_put_object_stage_summary(
     cleanup_ms: Option<u64>,
     commit_tail_ms: u64,
     result: &'static str,
-) {
+}
+
+fn log_put_object_stage_summary(summary: PutObjectStageSummary<'_>) {
     warn!(
         event = EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY,
         component = LOG_COMPONENT_ECSTORE,
         subsystem = LOG_SUBSYSTEM_SET_DISK,
-        bucket = %bucket,
-        object = %object,
-        write_quorum,
-        write_path,
-        writer_setup_ms,
-        encode_ms,
-        rename_ms,
-        cleanup_ms = cleanup_ms.unwrap_or_default(),
-        cleanup_present = cleanup_ms.is_some(),
-        commit_tail_ms,
-        result,
+        bucket = %summary.bucket,
+        object = %summary.object,
+        write_quorum = summary.write_quorum,
+        write_path = summary.write_path,
+        writer_setup_ms = summary.writer_setup_ms,
+        encode_ms = summary.encode_ms,
+        rename_ms = summary.rename_ms,
+        cleanup_ms = summary.cleanup_ms.unwrap_or_default(),
+        cleanup_present = summary.cleanup_ms.is_some(),
+        commit_tail_ms = summary.commit_tail_ms,
+        result = summary.result,
         "SetDisk put_object stage summary"
     );
 }
@@ -1431,18 +1433,18 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
             }
 
             if issue3031_diag_enabled() {
-                log_put_object_stage_summary(
+                log_put_object_stage_summary(PutObjectStageSummary {
                     bucket,
                     object,
                     write_quorum,
-                    write_path.metric_label(),
+                    write_path: write_path.metric_label(),
                     writer_setup_ms,
                     encode_ms,
-                    rename_stage_ms,
-                    cleanup_stage_ms,
-                    total_commit_tail_ms as u64,
-                    "success",
-                );
+                    rename_ms: rename_stage_ms,
+                    cleanup_ms: cleanup_stage_ms,
+                    commit_tail_ms: total_commit_tail_ms as u64,
+                    result: "success",
+                });
             }
 
             Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
