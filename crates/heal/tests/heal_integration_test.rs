@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod ecstore_test_compat;
+
+use ecstore_test_compat::{
+    ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, init_bucket_metadata_sys, init_local_disks,
+};
 use http::HeaderMap;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
-use rustfs_ecstore::api::bucket::metadata_sys::init_bucket_metadata_sys;
-use rustfs_ecstore::api::disk::endpoint::Endpoint;
-use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
-use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
 use rustfs_heal::heal::{
     manager::{HealConfig, HealManager},
     storage::{ECStoreHealStorage, HealObjectOptions as ObjectOptions, HealPutObjReader as PutObjReader, HealStorageAPI},
