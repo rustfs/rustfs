@@ -1875,7 +1875,9 @@ mod tests {
             "{}/put_file_stream",
             crate::server::RPC_PREFIX
         )));
-        assert!(!PathDispatchService::<MarkerService, MarkerService>::is_internode_path("/bucket/object.txt"));
+        assert!(!PathDispatchService::<MarkerService, MarkerService>::is_internode_path(
+            "/bucket/object.txt"
+        ));
         let _ = service;
     }
 }
