@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::global::{AppContext, get_global_app_context, init_global_app_context};
-use crate::app::context::storage_compat::ECStore;
+use super::storage_compat::ECStore;
 use rustfs_kms::KmsServiceManager;
 use std::io::{Error, Result};
 use std::sync::Arc;
