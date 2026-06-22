@@ -36,6 +36,7 @@ use crate::storage::rpc::InternodeRpcService;
 use crate::storage::tonic_service::make_server;
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request as HttpRequest, Response};
+use hyper::body::Incoming;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto::Builder as ConnBuilder,
@@ -56,12 +57,14 @@ use s3s::{host::MultiDomain, service::S3Service, service::S3ServiceBuilder};
 use socket2::{SockRef, TcpKeepalive};
 use std::io::{Error, Result};
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tonic::{Request, Status};
-use tower::ServiceBuilder;
+use tower::{Service, ServiceBuilder};
 use tower_http::add_extension::AddExtensionLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
@@ -218,6 +221,34 @@ fn record_active_http_requests(delta: i64) {
 
 pub(crate) fn active_http_requests() -> u64 {
     ACTIVE_HTTP_REQUESTS.load(Ordering::Relaxed)
+}
+
+fn trace_on_response<ResBody>(response: &Response<ResBody>, latency: Duration, span: &Span) {
+    span.record("status_code", tracing::field::display(response.status()));
+    let _enter = span.enter();
+    let status_class = status_class_label(response.status());
+    record_active_http_requests(-1);
+    histogram!(
+        METRIC_HTTP_SERVER_REQUEST_DURATION_SECONDS,
+        LABEL_HTTP_STATUS_CLASS => status_class
+    )
+    .record(latency.as_secs_f64());
+    if response.status().is_client_error() || response.status().is_server_error() {
+        counter!(
+            METRIC_HTTP_SERVER_FAILURES_TOTAL,
+            LABEL_HTTP_STATUS_CLASS => status_class
+        )
+        .increment(1);
+    }
+    if let Some(cl) = response.headers().get("content-length")
+        && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
+    {
+        histogram!(
+            METRIC_HTTP_SERVER_RESPONSE_BODY_SIZE_BYTES,
+            LABEL_HTTP_STATUS_CLASS => status_class
+        )
+        .record(len as f64);
+    }
 }
 
 pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalReadiness>) -> Result<(ShutdownHandle, SocketAddr)> {
@@ -800,6 +831,45 @@ struct ConnectionContext {
     trusted_proxy_layer: Option<rustfs_trusted_proxies::TrustedProxyLayer>,
 }
 
+#[derive(Clone)]
+struct PathDispatchService<S> {
+    external: S,
+    internode: S,
+}
+
+impl<S> PathDispatchService<S> {
+    fn new(external: S, internode: S) -> Self {
+        Self { external, internode }
+    }
+}
+
+impl<S> Service<HttpRequest<Incoming>> for PathDispatchService<S>
+where
+    S: Service<HttpRequest<Incoming>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        match self.external.poll_ready(cx)? {
+            Poll::Ready(()) => self.internode.poll_ready(cx),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
+        if req.uri().path().starts_with(crate::server::RPC_PREFIX) {
+            let mut internode = self.internode.clone();
+            Box::pin(async move { internode.call(req).await })
+        } else {
+            let mut external = self.external.clone();
+            Box::pin(async move { external.call(req).await })
+        }
+    }
+}
+
 /// Adapter that implements the OpenTelemetry [`Extractor`] trait for Hyper's
 /// [`HeaderMap`], enabling trace context propagation by extracting
 /// OpenTelemetry headers from incoming HTTP requests.
@@ -912,7 +982,8 @@ fn process_connection(
         let http_service = s3_service;
         let http_service = InternodeRpcService::new(http_service);
 
-        let service = hybrid(http_service, rpc_service);
+        let external_service = hybrid(http_service.clone(), rpc_service.clone());
+        let internode_service = hybrid(http_service, rpc_service);
 
         let remote_addr = match socket.peer_addr() {
             Ok(addr) => Some(RemoteAddr(addr)),
@@ -954,217 +1025,173 @@ fn process_connection(
         // 21. PublicHealthEndpointLayer              — handles public health before s3s host parsing
         // 22. VirtualHostStyleHintLayer              — actionable error for unroutable virtual-hosted-style (conditional)
         // ─────────────────────────────────────────────────────────────
-        let hybrid_service = ServiceBuilder::new()
-            // NOTE: Both extension types are intentionally inserted to maintain compatibility:
-            // 1. `Option<RemoteAddr>` - Used by existing admin/storage handlers throughout the codebase
-            // 2. `std::net::SocketAddr` - Required by TrustedProxyMiddleware for proxy validation
-            // This dual insertion is necessary because the middleware expects the raw SocketAddr type
-            // while our application code uses the RemoteAddr wrapper. Consolidating these would
-            // require either modifying the third-party middleware or refactoring all existing handlers.
-            .layer(AddExtensionLayer::new(remote_addr))
-            .option_layer(remote_addr.map(|ra| AddExtensionLayer::new(ra.0)))
-            // Add TrustedProxyLayer to handle X-Forwarded-For and other proxy headers
-            // This should be placed before TraceLayer so that logs reflect the real client IP
-            // Pre-computed in ConnectionContext to avoid per-connection is_enabled() check.
-            .option_layer(trusted_proxy_layer)
-            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-            .layer(RequestContextLayer)
-            .layer(EmptyBodyContentLengthCompatLayer)
-            .layer(CatchPanicLayer::new())
-            // CRITICAL: Insert ReadinessGateLayer before business logic
-            // This stops requests from hitting IAMAuth or Storage if they are not ready.
-            .layer(ReadinessGateLayer::new(readiness))
-            // Add Keystone authentication middleware
-            // This validates X-Auth-Token headers and stores credentials in task-local storage
-            // Must be placed AFTER ReadinessGateLayer but BEFORE business logic
-            // Pre-computed in ConnectionContext to avoid per-connection OnceLock read.
-            .layer(KeystoneAuthLayer::new(keystone_auth))
-            .layer(
-                TraceLayer::new_for_http()
-                    .make_span_with(|request: &HttpRequest<_>| {
-                        let request_context = request.extensions().get::<crate::storage::request_context::RequestContext>();
-                        let request_id = request_context
-                            .map(|ctx| ctx.request_id.as_str())
-                            .unwrap_or("unknown");
-                        let trace_id = request_context
-                            .and_then(|ctx| ctx.trace_id.as_deref())
-                            .unwrap_or("unknown");
-                        let span_id = request_context
-                            .and_then(|ctx| ctx.span_id.as_deref())
-                            .unwrap_or("unknown");
+        let build_stack = |service| {
+            ServiceBuilder::new()
+                // NOTE: Both extension types are intentionally inserted to maintain compatibility:
+                // 1. `Option<RemoteAddr>` - Used by existing admin/storage handlers throughout the codebase
+                // 2. `std::net::SocketAddr` - Required by TrustedProxyMiddleware for proxy validation
+                // This dual insertion is necessary because the middleware expects the raw SocketAddr type
+                // while our application code uses the RemoteAddr wrapper. Consolidating these would
+                // require either modifying the third-party middleware or refactoring all existing handlers.
+                .layer(AddExtensionLayer::new(remote_addr))
+                .option_layer(remote_addr.map(|ra| AddExtensionLayer::new(ra.0)))
+                // Add TrustedProxyLayer to handle X-Forwarded-For and other proxy headers
+                // This should be placed before TraceLayer so that logs reflect the real client IP
+                // Pre-computed in ConnectionContext to avoid per-connection is_enabled() check.
+                .option_layer(trusted_proxy_layer.clone())
+                .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+                .layer(RequestContextLayer)
+                .layer(EmptyBodyContentLengthCompatLayer)
+                .layer(CatchPanicLayer::new())
+                // CRITICAL: Insert ReadinessGateLayer before business logic
+                // This stops requests from hitting IAMAuth or Storage if they are not ready.
+                .layer(ReadinessGateLayer::new(readiness.clone()))
+                // Add Keystone authentication middleware
+                // This validates X-Auth-Token headers and stores credentials in task-local storage
+                // Must be placed AFTER ReadinessGateLayer but BEFORE business logic
+                // Pre-computed in ConnectionContext to avoid per-connection OnceLock read.
+                .layer(KeystoneAuthLayer::new(keystone_auth.clone()))
+                .layer(
+                    TraceLayer::new_for_http()
+                        .make_span_with(|request: &HttpRequest<_>| {
+                            let request_context = request.extensions().get::<crate::storage::request_context::RequestContext>();
+                            let request_id = request_context
+                                .map(|ctx| ctx.request_id.as_str())
+                                .unwrap_or("unknown");
+                            let trace_id = request_context
+                                .and_then(|ctx| ctx.trace_id.as_deref())
+                                .unwrap_or("unknown");
+                            let span_id = request_context
+                                .and_then(|ctx| ctx.span_id.as_deref())
+                                .unwrap_or("unknown");
 
-                        let parent_context = global::get_text_map_propagator(|propagator| {
-                            propagator.extract(&HeaderMapCarrier::new(request.headers()))
-                        });
+                            let parent_context = global::get_text_map_propagator(|propagator| {
+                                propagator.extract(&HeaderMapCarrier::new(request.headers()))
+                            });
 
-                        // Log trace context extraction for debugging distributed tracing
-                        if parent_context.has_active_span() {
-                            let span_ref = parent_context.span();
-                            trace!(
-                                otel_trace_id = %span_ref.span_context().trace_id(),
-                                otel_parent_span_id = %span_ref.span_context().span_id(),
-                                sampled = span_ref.span_context().is_sampled(),
-                                "Extracted trace context from incoming request headers"
-                            );
-                        } else {
-                            trace!("No trace context found in request headers, will create root span");
-                        }
-                        // Extract real client IP from trusted proxy middleware if available
-                        let client_info = request.extensions().get::<ClientInfo>();
-                        let peer_addr = client_info
-                            .map(|info| info.real_ip.to_string())
-                            .or_else(|| request.extensions().get::<RemoteAddr>().map(|addr| addr.0.to_string()))
-                            .unwrap_or_else(|| "unknown".to_string());
-
-                        let span = tracing::info_span!("http-request",
-                            request_id = %request_id,
-                            trace_id = %trace_id,
-                            span_id = %span_id,
-                            status_code = tracing::field::Empty,
-                            method = %request.method(),
-                            peer_addr = %peer_addr,
-                            uri = %redact_sensitive_uri_query(request.uri()),
-                            version = ?request.version(),
-                            user_agent = tracing::field::Empty,
-                            content_type = tracing::field::Empty,
-                            content_length = tracing::field::Empty,
-                        );
-                        if span.is_disabled() {
-                            return span;
-                        }
-                        if let Err(e) = span.set_parent(parent_context) {
-                            debug!(component = LOG_COMPONENT_SERVER, subsystem = LOG_SUBSYSTEM_HTTP, error = ?e, "Failed to propagate tracing context");
-                        }
-                        for (header_name, header_value) in request.headers() {
-                            let value = header_value.to_str().unwrap_or("invalid");
-                            if header_name == "user-agent" {
-                                span.record("user_agent", value);
-                            } else if header_name == "content-type" {
-                                span.record("content_type", value);
-                            } else if header_name == "content-length" {
-                                span.record("content_length", value);
+                            if parent_context.has_active_span() {
+                                let span_ref = parent_context.span();
+                                trace!(
+                                    otel_trace_id = %span_ref.span_context().trace_id(),
+                                    otel_parent_span_id = %span_ref.span_context().span_id(),
+                                    sampled = span_ref.span_context().is_sampled(),
+                                    "Extracted trace context from incoming request headers"
+                                );
+                            } else {
+                                trace!("No trace context found in request headers, will create root span");
                             }
-                        }
+                            let client_info = request.extensions().get::<ClientInfo>();
+                            let peer_addr = client_info
+                                .map(|info| info.real_ip.to_string())
+                                .or_else(|| request.extensions().get::<RemoteAddr>().map(|addr| addr.0.to_string()))
+                                .unwrap_or_else(|| "unknown".to_string());
 
-                        span
-                    })
-                    .on_request(|request: &HttpRequest<_>, span: &Span| {
-                        let _enter = span.enter();
-                        trace!("HTTP request started");
-                        let method = request_method_label(request.method());
-                        record_active_http_requests(1);
-                        counter!(
-                            METRIC_HTTP_SERVER_REQUESTS_TOTAL,
-                            LABEL_HTTP_METHOD => method
-                        )
-                        .increment(1);
+                            let span = tracing::info_span!("http-request",
+                                request_id = %request_id,
+                                trace_id = %trace_id,
+                                span_id = %span_id,
+                                status_code = tracing::field::Empty,
+                                method = %request.method(),
+                                peer_addr = %peer_addr,
+                                uri = %redact_sensitive_uri_query(request.uri()),
+                                version = ?request.version(),
+                                user_agent = tracing::field::Empty,
+                                content_type = tracing::field::Empty,
+                                content_length = tracing::field::Empty,
+                            );
+                            if span.is_disabled() {
+                                return span;
+                            }
+                            if let Err(e) = span.set_parent(parent_context) {
+                                debug!(component = LOG_COMPONENT_SERVER, subsystem = LOG_SUBSYSTEM_HTTP, error = ?e, "Failed to propagate tracing context");
+                            }
+                            for (header_name, header_value) in request.headers() {
+                                let value = header_value.to_str().unwrap_or("invalid");
+                                if header_name == "user-agent" {
+                                    span.record("user_agent", value);
+                                } else if header_name == "content-type" {
+                                    span.record("content_type", value);
+                                } else if header_name == "content-length" {
+                                    span.record("content_length", value);
+                                }
+                            }
 
-                        if let Some(cl) = request.headers().get("content-length")
-                            && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
-                        {
-                            counter!(METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL).increment(len);
-                            histogram!(
-                                METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES,
+                            span
+                        })
+                        .on_request(|request: &HttpRequest<_>, span: &Span| {
+                            let _enter = span.enter();
+                            trace!("HTTP request started");
+                            let method = request_method_label(request.method());
+                            record_active_http_requests(1);
+                            counter!(
+                                METRIC_HTTP_SERVER_REQUESTS_TOTAL,
                                 LABEL_HTTP_METHOD => method
                             )
-                            .record(len as f64);
-                        }
-                    })
-                    .on_response(|response: &Response<_>, latency: Duration, span: &Span| {
-                        span.record("status_code", tracing::field::display(response.status()));
-                        let _enter = span.enter();
-                        let status_class = status_class_label(response.status());
-                        record_active_http_requests(-1);
-                        histogram!(
-                            METRIC_HTTP_SERVER_REQUEST_DURATION_SECONDS,
-                            LABEL_HTTP_STATUS_CLASS => status_class
-                        )
-                        .record(latency.as_secs_f64());
-                        if response.status().is_client_error() || response.status().is_server_error() {
+                            .increment(1);
+
+                            if let Some(cl) = request.headers().get("content-length")
+                                && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
+                            {
+                                counter!(METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL).increment(len);
+                                histogram!(
+                                    METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES,
+                                    LABEL_HTTP_METHOD => method
+                                )
+                                .record(len as f64);
+                            }
+                        })
+                        .on_response(trace_on_response)
+                        .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
+                            counter!(METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL).increment(chunk.len() as u64);
+                            #[cfg(feature = "tracing-chunk-debug")]
+                            {
+                                let _enter = span.enter();
+                                debug!(chunk_bytes = chunk.len(), duration_ms = duration_ms(latency), "HTTP response body chunk sent");
+                            }
+                            #[cfg(not(feature = "tracing-chunk-debug"))]
+                            {
+                                let _ = (latency, span);
+                            }
+                        })
+                        .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, span: &Span| {
+                            #[cfg(feature = "tracing-chunk-debug")]
+                            {
+                                let _enter = span.enter();
+                                debug!(duration_ms = duration_ms(stream_duration), "HTTP response stream closed");
+                            }
+                            #[cfg(not(feature = "tracing-chunk-debug"))]
+                            {
+                                let _ = (_trailers, stream_duration, span);
+                            }
+                        })
+                        .on_failure(|error, latency: Duration, span: &Span| {
+                            let _enter = span.enter();
+                            record_active_http_requests(-1);
                             counter!(
                                 METRIC_HTTP_SERVER_FAILURES_TOTAL,
-                                LABEL_HTTP_STATUS_CLASS => status_class
+                                LABEL_HTTP_STATUS_CLASS => "transport"
                             )
                             .increment(1);
-                        }
-                        if let Some(cl) = response.headers().get("content-length")
-                            && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
-                        {
-                            histogram!(
-                                METRIC_HTTP_SERVER_RESPONSE_BODY_SIZE_BYTES,
-                                LABEL_HTTP_STATUS_CLASS => status_class
-                            )
-                            .record(len as f64);
-                        }
-                    })
-                    .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
-                        counter!(METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL).increment(chunk.len() as u64);
-                        #[cfg(feature = "tracing-chunk-debug")]
-                        {
-                            let _enter = span.enter();
-                            debug!(chunk_bytes = chunk.len(), duration_ms = duration_ms(latency), "HTTP response body chunk sent");
-                        }
-                        #[cfg(not(feature = "tracing-chunk-debug"))]
-                        {
-                            let _ = (latency, span);
-                        }
-                    })
-                    .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, span: &Span| {
-                        #[cfg(feature = "tracing-chunk-debug")]
-                        {
-                            let _enter = span.enter();
-                            debug!(duration_ms = duration_ms(stream_duration), "HTTP response stream closed");
-                        }
-                        #[cfg(not(feature = "tracing-chunk-debug"))]
-                        {
-                            let _ = (_trailers, stream_duration, span);
-                        }
-                    })
-                    .on_failure(|_error, latency: Duration, span: &Span| {
-                        let _enter = span.enter();
-                        record_active_http_requests(-1);
-                        counter!(
-                            METRIC_HTTP_SERVER_FAILURES_TOTAL,
-                            LABEL_HTTP_STATUS_CLASS => "transport"
-                        )
-                        .increment(1);
-                        trace!(error = ?_error, duration_ms = duration_ms(latency), "HTTP request failure captured by trace layer");
-                    }),
-            )
-            .layer(RequestLoggingLayer)
-            .layer(PropagateRequestIdLayer::x_request_id())
-            // Compress responses based on whitelist configuration
-            // Only compresses when enabled and matches configured extensions/MIME types
-            .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config)))
-            .layer(PathCategoryInjectionLayer)
-            .layer(S3ErrorMessageCompatLayer)
-            .layer(ObjectAttributesEtagFixLayer)
-            // Conditional CORS layer: only applies to S3 API requests (not Admin, not Console)
-            // Admin has its own CORS handling in router.rs
-            // Console has its own CORS layer in setup_console_middleware_stack()
-            // S3 API uses this system default CORS (RUSTFS_CORS_ALLOWED_ORIGINS)
-            // Bucket-level CORS takes precedence when configured (handled in router.rs for OPTIONS, and in ecfs.rs for actual requests)
-            .layer(ConditionalCorsLayer::new())
-            .option_layer(if is_console { Some(RedirectLayer) } else { None })
-            // Must run before outer response-transforming layers: clear the body and remove
-            // Content-Length, Content-Type, and Transfer-Encoding for statuses
-            // that MUST NOT carry a body (1xx/204/304). Placed inside those
-            // layers so they see the already-bodyless
-            // response and so no layer (e.g. CORS) re-adds body headers afterward.
-            .layer(BodylessStatusFixLayer)
-            // HEAD responses must not send body bytes even when the inner S3 layer
-            // serializes an XML error payload.
-            .layer(HeadRequestBodyFixLayer)
-            // Health probes are public admin routes, but s3s parses virtual-host
-            // buckets before custom routes. Handle them here so SERVER_DOMAINS
-            // cannot turn /health into an S3 bucket request.
-            .layer(PublicHealthEndpointLayer)
-            // Virtual-hosted-style S3 requests (the AWS SDK / Terraform default) cannot be
-            // routed when no server domain is configured: s3s parses them path-style and
-            // returns an opaque 501. When RUSTFS_SERVER_DOMAINS is unset, return an actionable
-            // error pointing at the fix. Inert (not installed) once domains are configured.
-            .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
-            .service(service);
+                            trace!(error = ?error, duration_ms = duration_ms(latency), "HTTP request failure captured by trace layer");
+                        }),
+                )
+                .layer(RequestLoggingLayer)
+                .layer(PropagateRequestIdLayer::x_request_id())
+                .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config.clone())))
+                .layer(PathCategoryInjectionLayer)
+                .layer(S3ErrorMessageCompatLayer)
+                .layer(ObjectAttributesEtagFixLayer)
+                .layer(ConditionalCorsLayer::new())
+                .option_layer(if is_console { Some(RedirectLayer) } else { None })
+                .layer(BodylessStatusFixLayer)
+                .layer(HeadRequestBodyFixLayer)
+                .layer(PublicHealthEndpointLayer)
+                .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
+                .service(service)
+        };
+        let external_service = build_stack(external_service);
+        let internode_service = build_stack(internode_service);
+        let hybrid_service = PathDispatchService::new(external_service, internode_service);
 
         let hybrid_service = TowerToHyperService::new(hybrid_service);
 
