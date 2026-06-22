@@ -102,6 +102,7 @@ RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE="${TMP_DIR}/rustfs_local_compat_ow
 RUSTFS_ROOT_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_compat_relative_consumer_hits.txt"
 RUSTFS_STORAGE_CORE_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_core_compat_relative_consumer_hits.txt"
 RUSTFS_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_local_compat_relative_consumer_hits.txt"
+RUSTFS_APP_ADMIN_SECONDARY_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/rustfs_app_admin_secondary_compat_bridge_hits.txt"
 RUSTFS_STORAGE_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_local_compat_relative_consumer_hits.txt"
 RUSTFS_ADMIN_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_admin_local_compat_relative_consumer_hits.txt"
 RUSTFS_APP_SERVER_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_app_server_local_compat_relative_consumer_hits.txt"
@@ -863,11 +864,9 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --no-heading 'pub\(crate\)\s+use\s+crate::(?:admin|app|storage)::storage_compat::\*;' \
-    rustfs/src/admin/router_storage_compat.rs \
     rustfs/src/admin/handlers/storage_compat.rs \
     rustfs/src/admin/service/storage_compat.rs \
     rustfs/src/app/context/storage_compat.rs \
-    rustfs/src/app/usecase_storage_compat.rs \
     rustfs/src/storage/core_storage_compat.rs \
     rustfs/src/storage/rpc/storage_compat.rs || true
 ) >"$RUSTFS_LOCAL_COMPAT_GLOB_EXPORT_HITS_FILE"
@@ -1102,6 +1101,18 @@ fi
 
 if [[ -s "$RUSTFS_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE" ]]; then
   report_failure "RustFS local compatibility consumers must use relative owner paths instead of crate-qualified local compatibility paths: $(paste -sd '; ' "$RUSTFS_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'router_storage_compat|usecase_storage_compat' \
+    rustfs/src/admin \
+    rustfs/src/app \
+    --glob '*.rs' || true
+) >"$RUSTFS_APP_ADMIN_SECONDARY_COMPAT_BRIDGE_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_ADMIN_SECONDARY_COMPAT_BRIDGE_HITS_FILE" ]]; then
+  report_failure "RustFS app/admin consumers must route directly through their owner storage_compat boundary instead of secondary compatibility bridges: $(paste -sd '; ' "$RUSTFS_APP_ADMIN_SECONDARY_COMPAT_BRIDGE_HITS_FILE")"
 fi
 
 (

@@ -21,7 +21,6 @@ mod plugin_contract;
 #[allow(dead_code)]
 pub(crate) mod route_policy;
 pub mod router;
-pub(crate) mod router_storage_compat;
 pub mod service;
 pub mod site_replication_identity;
 pub(crate) mod storage_compat;
