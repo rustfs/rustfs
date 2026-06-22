@@ -12,10 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::storage_compat::{
-    Endpoint, EndpointServerPools, get_global_endpoints_opt, get_global_lock_clients, is_dist_erasure,
-    resolve_object_store_handle,
-};
 use crate::server::{ServiceState, ServiceStateManager};
 use crate::server::{has_path_prefix, is_table_catalog_path};
 use bytes::Bytes;
@@ -25,6 +21,13 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use metrics::{counter, gauge};
 use rustfs_common::GlobalReadiness;
+#[cfg(test)]
+use rustfs_ecstore::api::layout::{Endpoints, PoolEndpoints};
+use rustfs_ecstore::api::{
+    disk::endpoint::Endpoint,
+    global::{get_global_endpoints_opt, get_global_lock_clients, is_dist_erasure, resolve_object_store_handle},
+    layout::EndpointServerPools,
+};
 use rustfs_iam::get_global_iam_sys;
 use rustfs_madmin::{Disk, StorageInfo};
 use rustfs_storage_api::StorageAdminApi;
@@ -839,8 +842,6 @@ mod tests {
 
     #[test]
     fn aggregate_lock_quorum_status_requires_each_set_to_meet_quorum() {
-        use super::super::storage_compat::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
-
         let endpoints = vec![
             Endpoint {
                 url: url::Url::parse("http://node1:9000/data1").unwrap(),
@@ -896,8 +897,6 @@ mod tests {
 
     #[test]
     fn aggregate_lock_quorum_status_fails_when_any_set_loses_quorum() {
-        use super::super::storage_compat::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
-
         let endpoints = vec![
             Endpoint {
                 url: url::Url::parse("http://node1:9000/data1").unwrap(),
