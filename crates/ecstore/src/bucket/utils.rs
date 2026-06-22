@@ -457,7 +457,13 @@ mod tests {
 
     #[test]
     fn test_check_bucket_name_rejects_leading_and_trailing_whitespace() {
-        for bucket in [" valid-bucket", "valid-bucket ", "valid-bucket\n", "valid-bucket\u{b}", "\u{c}valid-bucket\u{c}"] {
+        for bucket in [
+            " valid-bucket",
+            "valid-bucket ",
+            "valid-bucket\n",
+            "valid-bucket\u{b}",
+            "\u{c}valid-bucket\u{c}",
+        ] {
             assert!(
                 check_valid_bucket_name_strict(bucket).is_err(),
                 "bucket name with leading or trailing whitespace must be rejected: {bucket:?}"
