@@ -156,12 +156,12 @@ impl ECStore {
 
     #[instrument(skip(self))]
     pub(super) async fn handle_check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()> {
-        let _ = (bucket, object, opts);
+        let _ = opts;
+        check_new_multipart_args(bucket, object)?;
         // Stale multipart reconciliation is already owned by the lifecycle-driven
-        // background cleanup path in `bucket_lifecycle_ops.rs`. There is currently
-        // no stable object-heal contract that should fan this request out through
-        // pool/set storage layers, so keep the placeholder explicit at the ECStore
-        // boundary instead of dispatching into lower layers.
-        Err(StorageError::NotImplemented)
+        // background cleanup path in `bucket_lifecycle_ops.rs`. Keep this explicit
+        // object-heal entrypoint as a validated no-op instead of reporting
+        // `NotImplemented` from production trait implementations.
+        Ok(())
     }
 }

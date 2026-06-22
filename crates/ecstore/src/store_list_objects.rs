@@ -2231,6 +2231,560 @@ impl Sets {
 }
 
 impl SetDisks {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn inner_list_objects_v2(
+        self: Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        continuation_token: Option<String>,
+        delimiter: Option<String>,
+        max_keys: i32,
+        _fetch_owner: bool,
+        start_after: Option<String>,
+        incl_deleted: bool,
+    ) -> Result<ListObjectsV2Info> {
+        let marker = if continuation_token.is_none() {
+            start_after
+        } else {
+            continuation_token.clone()
+        };
+
+        let loi = self
+            .list_objects_generic(bucket, prefix, marker, delimiter, max_keys, incl_deleted)
+            .await?;
+        Ok(ListObjectsV2Info {
+            is_truncated: loi.is_truncated,
+            continuation_token,
+            next_continuation_token: loi.next_marker,
+            objects: loi.objects,
+            prefixes: loi.prefixes,
+        })
+    }
+
+    pub async fn list_objects_generic(
+        self: Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        marker: Option<String>,
+        delimiter: Option<String>,
+        max_keys: i32,
+        incl_deleted: bool,
+    ) -> Result<ListObjectsInfo> {
+        let max_keys = normalize_max_keys(max_keys);
+        let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
+        let opts = ListPathOptions {
+            bucket: bucket.to_owned(),
+            prefix: prefix.to_owned(),
+            separator: delimiter.clone(),
+            limit: effective_max_keys,
+            marker,
+            incl_deleted,
+            ask_disks: list_quorum_from_env(),
+            ..Default::default()
+        };
+
+        if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() {
+            match self
+                .get_object_info(
+                    &opts.bucket,
+                    &opts.prefix,
+                    &ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(res) => {
+                    return Ok(ListObjectsInfo {
+                        objects: vec![res],
+                        ..Default::default()
+                    });
+                }
+                Err(err) => {
+                    if is_err_bucket_not_found(&err) {
+                        return Err(err);
+                    }
+                }
+            };
+        }
+
+        let mut list_result = self
+            .list_path_result(&opts)
+            .await
+            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
+                err: Some(err.into()),
+                ..Default::default()
+            });
+
+        let disk_has_more = list_result.err.is_none();
+
+        if let Some(err) = list_result.err.take()
+            && err != rustfs_filemeta::Error::Unexpected
+        {
+            return Err(to_object_err(err.into(), vec![bucket, prefix]));
+        }
+
+        if let Some(result) = list_result.entries.as_mut() {
+            result.forward_past(opts.marker);
+        }
+
+        let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
+            &list_result.entries.unwrap_or_default(),
+            bucket,
+            prefix,
+            delimiter.clone(),
+        )
+        .await;
+
+        let mut is_truncated = false;
+        if max_keys <= 0 {
+            get_objects.clear();
+        } else if get_objects.len() > max_keys as usize {
+            is_truncated = true;
+            get_objects.truncate(max_keys as usize);
+        }
+
+        let mut next_marker = if is_truncated {
+            get_objects.last().map(|last| last.name.clone())
+        } else {
+            None
+        };
+
+        let mut prefixes: Vec<String> = Vec::new();
+        let mut prefix_set: HashSet<String> = HashSet::new();
+        let mut objects = Vec::with_capacity(get_objects.len());
+        for obj in get_objects {
+            if delimiter.is_some() {
+                if obj.is_dir && obj.mod_time.is_none() {
+                    if prefix_set.insert(obj.name.clone()) {
+                        prefixes.push(obj.name);
+                    }
+                } else {
+                    objects.push(obj);
+                }
+            } else {
+                objects.push(obj);
+            }
+        }
+
+        if !is_truncated && disk_has_more {
+            let visible_count = objects.len() + prefixes.len();
+            let should_truncate = if delimiter.is_none() {
+                visible_count > 0
+            } else {
+                visible_count >= max_keys as usize
+            };
+            if should_truncate {
+                is_truncated = true;
+                next_marker = objects
+                    .last()
+                    .map(|last| last.name.clone())
+                    .or_else(|| prefixes.last().cloned());
+            }
+        }
+
+        Ok(ListObjectsInfo {
+            is_truncated,
+            next_marker,
+            objects,
+            prefixes,
+        })
+    }
+
+    pub async fn inner_list_object_versions(
+        self: Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        marker: Option<String>,
+        version_marker: Option<String>,
+        delimiter: Option<String>,
+        max_keys: i32,
+    ) -> Result<ListObjectVersionsInfo> {
+        let max_keys = normalize_max_keys(max_keys);
+        if marker.is_none() && version_marker.is_some() {
+            return Err(StorageError::NotImplemented);
+        }
+
+        let has_version_marker = version_marker.is_some();
+        let version_marker = if let Some(marker) = version_marker {
+            Some(parse_version_marker(marker)?)
+        } else {
+            None
+        };
+
+        let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
+        let opts = ListPathOptions {
+            bucket: bucket.to_owned(),
+            prefix: prefix.to_owned(),
+            separator: delimiter.clone(),
+            limit: effective_max_keys,
+            marker,
+            incl_deleted: true,
+            ask_disks: list_quorum_from_env(),
+            versioned: true,
+            include_marker: has_version_marker,
+            ..Default::default()
+        };
+
+        let mut list_result = self
+            .list_path_result(&opts)
+            .await
+            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
+                err: Some(err.into()),
+                ..Default::default()
+            });
+
+        let disk_has_more = list_result.err.is_none();
+
+        if let Some(err) = list_result.err.take()
+            && err != rustfs_filemeta::Error::Unexpected
+        {
+            return Err(to_object_err(err.into(), vec![bucket, prefix]));
+        }
+
+        if let Some(result) = list_result.entries.as_mut()
+            && !has_version_marker
+        {
+            result.forward_past(opts.marker.clone());
+        }
+
+        let version_marker = version_marker_for_entries(list_result.entries.as_ref(), opts.marker.as_deref(), version_marker);
+
+        let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
+            &list_result.entries.unwrap_or_default(),
+            bucket,
+            prefix,
+            delimiter.clone(),
+            version_marker,
+        )
+        .await;
+
+        let mut is_truncated = false;
+        if max_keys <= 0 {
+            get_objects.clear();
+        } else if get_objects.len() > max_keys as usize {
+            is_truncated = true;
+            get_objects.truncate(max_keys as usize);
+        }
+
+        let mut next_marker: Option<String> = None;
+        let mut next_version_idmarker: Option<String> = None;
+        if is_truncated && let Some(last) = get_objects.last() {
+            next_marker = Some(last.name.clone());
+            next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
+        }
+
+        let mut prefixes: Vec<String> = Vec::new();
+        let mut prefix_set: HashSet<String> = HashSet::new();
+        let mut objects = Vec::with_capacity(get_objects.len());
+        for obj in get_objects {
+            if delimiter.is_some() {
+                if obj.is_dir && obj.mod_time.is_none() {
+                    if prefix_set.insert(obj.name.clone()) {
+                        prefixes.push(obj.name);
+                    }
+                } else {
+                    objects.push(obj);
+                }
+            } else {
+                objects.push(obj);
+            }
+        }
+
+        if !is_truncated && disk_has_more {
+            let visible_count = objects.len() + prefixes.len();
+            let should_truncate = if delimiter.is_none() {
+                visible_count > 0
+            } else {
+                visible_count >= max_keys as usize
+            };
+            if should_truncate {
+                is_truncated = true;
+                if let Some(last) = objects.last() {
+                    next_marker = Some(last.name.clone());
+                    next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
+                } else if let Some(last_prefix) = prefixes.last().cloned() {
+                    next_marker = Some(last_prefix);
+                    next_version_idmarker = None;
+                }
+            }
+        }
+
+        Ok(ListObjectVersionsInfo {
+            is_truncated,
+            next_marker,
+            next_version_idmarker,
+            objects,
+            prefixes,
+        })
+    }
+
+    pub async fn walk_internal(
+        self: Arc<Self>,
+        rx: CancellationToken,
+        bucket: &str,
+        prefix: &str,
+        result: Sender<ObjectInfoOrErr>,
+        opts: WalkOptions,
+    ) -> Result<()> {
+        check_list_objs_args(bucket, prefix, &None)?;
+
+        let (entry_tx, mut entry_rx) = mpsc::channel::<MetaCacheEntry>(100);
+        let bucket_name = bucket.to_owned();
+        let bucket_name_for_list = bucket_name.clone();
+
+        let versioning_config = match get_versioning_config(&bucket_name).await {
+            Ok((res, _)) => Some(res),
+            Err(_) => None,
+        };
+
+        let result_task = tokio::spawn(
+            async move {
+                while let Some(entry) = entry_rx.recv().await {
+                    if opts.latest_only {
+                        let fi = match entry.to_fileinfo(&bucket_name) {
+                            Ok(res) => res,
+                            Err(err) => {
+                                let item = ObjectInfoOrErr {
+                                    item: None,
+                                    err: Some(err.into()),
+                                };
+                                let _ = result.send(item).await;
+                                return;
+                            }
+                        };
+
+                        if let Some(filter) = opts.filter
+                            && !filter(&fi)
+                        {
+                            continue;
+                        }
+
+                        let item = ObjectInfoOrErr {
+                            item: Some(ObjectInfo::from_file_info(&fi, &bucket_name, &fi.name, {
+                                if let Some(v) = &versioning_config {
+                                    v.versioned(&fi.name)
+                                } else {
+                                    false
+                                }
+                            })),
+                            err: None,
+                        };
+                        let _ = result.send(item).await;
+                        continue;
+                    }
+
+                    let versions = match if opts.include_free_versions {
+                        entry.file_info_versions_with_free_versions(&bucket_name)
+                    } else {
+                        entry.file_info_versions(&bucket_name)
+                    } {
+                        Ok(res) => res,
+                        Err(err) => {
+                            let item = ObjectInfoOrErr {
+                                item: None,
+                                err: Some(err.into()),
+                            };
+                            let _ = result.send(item).await;
+                            return;
+                        }
+                    };
+
+                    for fi in &versions.versions {
+                        if let Some(filter) = opts.filter
+                            && !filter(fi)
+                        {
+                            continue;
+                        }
+
+                        let item = ObjectInfoOrErr {
+                            item: Some(ObjectInfo::from_file_info(fi, &bucket_name, &fi.name, {
+                                if let Some(v) = &versioning_config {
+                                    v.versioned(&fi.name)
+                                } else {
+                                    false
+                                }
+                            })),
+                            err: None,
+                        };
+                        let _ = result.send(item).await;
+                    }
+
+                    if opts.include_free_versions {
+                        for fi in &versions.free_versions {
+                            if let Some(filter) = opts.filter
+                                && !filter(fi)
+                            {
+                                continue;
+                            }
+
+                            let item = ObjectInfoOrErr {
+                                item: Some(ObjectInfo::from_file_info(fi, &bucket_name, &fi.name, {
+                                    if let Some(v) = &versioning_config {
+                                        v.versioned(&fi.name)
+                                    } else {
+                                        false
+                                    }
+                                })),
+                                err: None,
+                            };
+                            let _ = result.send(item).await;
+                        }
+                    }
+                }
+            }
+            .instrument(tracing::Span::current()),
+        );
+
+        let limit = i32::try_from(opts.limit).unwrap_or(i32::MAX);
+        let list_result = self
+            .list_path(
+                rx,
+                ListPathOptions {
+                    bucket: bucket_name_for_list,
+                    prefix: prefix.to_owned(),
+                    marker: opts.marker.clone(),
+                    limit,
+                    ask_disks: opts.ask_disks.clone(),
+                    incl_deleted: true,
+                    recursive: true,
+                    versioned: true,
+                    ..Default::default()
+                },
+                entry_tx,
+            )
+            .await;
+
+        let _ = result_task.await;
+
+        match list_result {
+            Ok(()) => Ok(()),
+            Err(err) => walk_result_from_set_errors(&[Some(err)]),
+        }
+    }
+
+    pub async fn list_path_result(self: Arc<Self>, o: &ListPathOptions) -> Result<MetaCacheEntriesSortedResult> {
+        check_list_objs_args(&o.bucket, &o.prefix, &o.marker)?;
+
+        let mut o = o.clone();
+        o.marker = o.marker.filter(|v| v >= &o.prefix);
+
+        if let Some(marker) = &o.marker
+            && !o.prefix.is_empty()
+            && !marker.starts_with(&o.prefix)
+        {
+            return Err(Error::Unexpected);
+        }
+
+        if o.limit == 0 {
+            return Err(Error::Unexpected);
+        }
+
+        if o.prefix.starts_with(SLASH_SEPARATOR) {
+            return Err(Error::Unexpected);
+        }
+
+        let slash_separator = Some(SLASH_SEPARATOR.to_owned());
+        o.include_directories = o.separator == slash_separator;
+
+        if (o.separator == slash_separator || o.separator.is_none()) && !o.recursive {
+            o.recursive = o.separator != slash_separator;
+            o.separator = slash_separator;
+        } else {
+            o.recursive = true;
+        }
+
+        o.parse_marker();
+
+        if o.base_dir.is_empty() {
+            o.base_dir = base_dir_from_prefix(&o.prefix);
+        }
+
+        o.transient = o.transient || is_reserved_or_invalid_bucket(&o.bucket, false);
+        o.set_filter();
+        if o.transient {
+            o.create = false;
+        }
+
+        let cancel = CancellationToken::new();
+        let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
+        let (sender, recv) = mpsc::channel(o.limit as usize);
+
+        let set = self.clone();
+        let opts = o.clone();
+        let cancel_rx1 = cancel.clone();
+        let cancel_rx1_for_err = cancel_rx1.clone();
+        let err_tx1 = err_tx.clone();
+        let job1 = tokio::spawn(
+            async move {
+                let mut opts = opts;
+                opts.stop_disk_at_limit = true;
+                if let Err(err) = set.list_path(cancel_rx1, opts, sender).await
+                    && !cancel_rx1_for_err.is_cancelled()
+                {
+                    error!("list_path err {:?}", err);
+                    let _ = err_tx1.send(Arc::new(err));
+                }
+            }
+            .instrument(tracing::Span::current()),
+        );
+
+        let cancel_rx2 = cancel.clone();
+        let (result_tx, mut result_rx) = mpsc::channel(1);
+        let err_tx2 = err_tx.clone();
+        let opts = o.clone();
+        let job2 = tokio::spawn(
+            async move {
+                if let Err(err) = gather_results(cancel_rx2, opts, recv, result_tx).await {
+                    error!("gather_results err {:?}", err);
+                    let _ = err_tx2.send(Arc::new(err));
+                }
+                cancel.cancel();
+            }
+            .instrument(tracing::Span::current()),
+        );
+
+        let mut result = tokio::select! {
+            res = err_rx.recv() => {
+                match res {
+                    Ok(err) => MetaCacheEntriesSortedResult { entries: None, err: Some(err.as_ref().clone().into()) },
+                    Err(err) => MetaCacheEntriesSortedResult { entries: None, err: Some(rustfs_filemeta::Error::other(err)) },
+                }
+            }
+            Some(result) = result_rx.recv() => result,
+        };
+
+        join_all(vec![job1, job2]).await;
+
+        if let Ok(err) = err_rx.try_recv() {
+            result.err = Some(err.as_ref().clone().into());
+        }
+
+        if result.err.is_some() {
+            return Ok(result);
+        }
+
+        if let Some(entries) = result.entries.as_mut() {
+            entries.reuse = true;
+            let truncated = !entries.entries().is_empty() || result.err.is_none();
+            entries.o.0.truncate(o.limit as usize);
+            if !o.transient && truncated {
+                entries.list_id = if let Some(id) = o.id {
+                    Some(id)
+                } else {
+                    Some(Uuid::new_v4().to_string())
+                };
+            }
+
+            if !truncated {
+                result.err = Some(Error::Unexpected.into());
+            }
+        }
+
+        Ok(result)
+    }
+
     pub async fn list_path(&self, rx: CancellationToken, opts: ListPathOptions, sender: Sender<MetaCacheEntry>) -> Result<()> {
         let (mut disks, infos, _) = self.get_online_disks_with_healing_and_info(true).await;
 
