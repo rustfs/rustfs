@@ -16,15 +16,19 @@ pub(crate) use super::super::storage_compat::{
     AdminError, AdminReplicationConfigExt, AdminVersioningConfigExt, CollectMetricsOpts, DailyAllTierStats, DiskStat, ECStore,
     ERR_TIER_ALREADY_EXISTS, ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_CONNECT_ERR,
     ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_MISSING_CREDENTIALS, ERR_TIER_NAME_NOT_UPPERCASE, ERR_TIER_NOT_FOUND,
-    EndpointServerPools, Error, MetricType, PeerRestClient, RUSTFS_META_BUCKET, RebalSaveOpt, RebalanceCleanupWarnings,
-    RebalanceMeta, RebalanceStats, STORAGE_CLASS_SUB_SYS, StorageError, TierConfig, TierCreds, TierType, collect_local_metrics,
-    delete_admin_config, get_global_deployment_id, get_global_endpoints_opt, get_global_notification_sys, get_global_region,
-    global_rustfs_port, init_admin_config_defaults, is_reserved_or_invalid_bucket, load_data_usage_from_backend,
-    read_admin_config, read_admin_config_without_migrate, save_admin_config, save_admin_server_config,
+    EndpointServerPools, Error, MetricType, NotificationSys, PeerRestClient, RUSTFS_META_BUCKET, RebalSaveOpt,
+    RebalanceCleanupWarnings, RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord, STORAGE_CLASS_SUB_SYS, StorageError,
+    TierConfig, TierCreds, TierType, collect_local_metrics, decode_rebalance_stop_propagation_record, delete_admin_config,
+    get_global_deployment_id, get_global_endpoints_opt, get_global_notification_sys, get_global_region, global_rustfs_port,
+    init_admin_config_defaults, is_reserved_or_invalid_bucket, load_data_usage_from_backend, read_admin_config,
+    read_admin_config_without_migrate, save_admin_config, save_admin_server_config,
 };
 
 #[cfg(test)]
-pub(crate) use super::super::storage_compat::{Endpoint, Endpoints, PoolEndpoints, RebalStatus, RebalanceInfo};
+pub(crate) use super::super::storage_compat::{
+    Endpoint, Endpoints, PoolEndpoints, RebalStatus, RebalanceCleanupWarningEntry, RebalanceInfo,
+    encode_rebalance_stop_propagation_record,
+};
 
 pub(crate) mod bucket_target_sys {
     pub(crate) use super::super::super::storage_compat::bucket_target_sys::{BucketTargetError, BucketTargetSys};

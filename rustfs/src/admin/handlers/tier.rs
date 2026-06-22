@@ -43,7 +43,7 @@ use s3s::{
     s3_error,
 };
 use serde_urlencoded::from_bytes;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use time::OffsetDateTime;
 use tracing::{debug, warn};
 
@@ -811,19 +811,42 @@ pub struct ClearTierQuery {
     pub force: String,
 }
 
+fn parse_clear_tier_query(uri: &Uri) -> S3Result<ClearTierQuery> {
+    let mut parsed = ClearTierQuery::default();
+    let mut seen = HashSet::with_capacity(2);
+    let Some(query) = uri.query() else {
+        return Ok(parsed);
+    };
+
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        match key.as_ref() {
+            "rand" => {
+                if !seen.insert("rand") {
+                    return Err(s3_error!(InvalidArgument, "duplicate clear-tier query parameter"));
+                }
+                parsed.rand = Some(value.into_owned());
+            }
+            "force" => {
+                if !seen.insert("force") {
+                    return Err(s3_error!(InvalidArgument, "duplicate clear-tier query parameter"));
+                }
+                match value.as_ref() {
+                    "true" | "false" => parsed.force = value.into_owned(),
+                    _ => return Err(s3_error!(InvalidArgument, "invalid force flag")),
+                }
+            }
+            _ => return Err(s3_error!(InvalidArgument, "unknown clear-tier query parameter")),
+        }
+    }
+
+    Ok(parsed)
+}
+
 pub struct ClearTier {}
 #[async_trait::async_trait]
 impl Operation for ClearTier {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let query = {
-            if let Some(query) = req.uri.query() {
-                let input: ClearTierQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
-                input
-            } else {
-                ClearTierQuery::default()
-            }
-        };
+        let query = parse_clear_tier_query(&req.uri)?;
 
         let Some(input_cred) = req.credentials else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
@@ -845,7 +868,9 @@ impl Operation for ClearTier {
         let mut force: bool = false;
         let force_str = query.force;
         if !force_str.is_empty() {
-            force = force_str.parse().unwrap();
+            force = force_str
+                .parse()
+                .map_err(|_e| s3_error!(InvalidArgument, "invalid force flag"))?;
         }
 
         let t = OffsetDateTime::now_utc();
@@ -1048,6 +1073,30 @@ mod tests {
 
         assert_eq!(mapped.code(), &S3ErrorCode::Custom("TierVerificationFailed".into()));
         assert_eq!(mapped.message(), Some("tier verification failed. backend unavailable"));
+    }
+
+    #[test]
+    fn parse_clear_tier_query_rejects_unknown_duplicate_and_invalid_force() {
+        for raw in [
+            "/rustfs/admin/v3/tier?rand=token&force=yes",
+            "/rustfs/admin/v3/tier?rand=token&rand=other",
+            "/rustfs/admin/v3/tier?rand=token&unexpected=true",
+        ] {
+            let uri: Uri = raw.parse().expect("uri should parse");
+            let err = parse_clear_tier_query(&uri).expect_err("strict clear-tier query should reject malformed input");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        }
+    }
+
+    #[test]
+    fn parse_clear_tier_query_accepts_valid_force() {
+        let uri: Uri = "/rustfs/admin/v3/tier?rand=token&force=true"
+            .parse()
+            .expect("uri should parse");
+        let query = parse_clear_tier_query(&uri).expect("valid clear-tier query should parse");
+
+        assert_eq!(query.rand.as_deref(), Some("token"));
+        assert_eq!(query.force, "true");
     }
 
     fn sample_daily_stats() -> DailyAllTierStats {

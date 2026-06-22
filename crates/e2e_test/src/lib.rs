@@ -83,6 +83,10 @@ mod delete_objects_versioning_test;
 #[cfg(test)]
 mod delete_object_no_content_length_test;
 
+// Delete-marker visibility baseline for data-movement migration proof.
+#[cfg(test)]
+mod delete_marker_migration_semantics_test;
+
 // Regression test for Issue #2252: ListObjectVersions misses newest version after put -> delete -> put
 #[cfg(test)]
 mod list_object_versions_regression_test;

@@ -18,6 +18,7 @@ use crate::global::{
     GLOBAL_EventNotifier, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr,
     get_global_bucket_monitor, is_dist_erasure, is_first_cluster_node_local,
 };
+use crate::pools::local_decommission_queue_prefix;
 use tracing::{debug, error, info, warn};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -52,6 +53,22 @@ const LOCAL_DECOMMISSION_RESUME_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 fn should_retry_local_decommission_resume(err: &Error, attempt: usize) -> bool {
     matches!(err, Error::ConfigNotFound) && attempt < LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES
+}
+
+fn should_auto_start_rebalance_after_init(decommission_running: bool, rebalance_meta_loaded: bool) -> bool {
+    rebalance_meta_loaded && !decommission_running
+}
+
+fn pool_meta_has_active_decommission(meta: &PoolMeta) -> bool {
+    meta.pools.iter().any(|pool| {
+        pool.decommission
+            .as_ref()
+            .is_some_and(|info| !info.complete && !info.failed && !info.canceled)
+    })
+}
+
+fn should_auto_start_rebalance_after_recovered_meta(pool_meta: &PoolMeta, rebalance_meta_loaded: bool) -> bool {
+    should_auto_start_rebalance_after_init(pool_meta_has_active_decommission(pool_meta), rebalance_meta_loaded)
 }
 
 async fn wait_for_local_decommission_resume_delay(rx: &CancellationToken, delay: Duration) -> bool {
@@ -305,6 +322,8 @@ impl ECStore {
             pool_meta: RwLock::new(pool_meta),
             rebalance_meta: RwLock::new(None),
             decommission_cancelers,
+            start_gate: tokio::sync::Mutex::new(()),
+            pool_meta_save_gate: tokio::sync::Mutex::new(()),
 
             local_disk_map: GLOBAL_LOCAL_DISK_MAP.clone(),
             local_disk_id_map: GLOBAL_LOCAL_DISK_ID_MAP.clone(),
@@ -354,11 +373,6 @@ impl ECStore {
     pub async fn init(self: &Arc<Self>, rx: CancellationToken) -> Result<()> {
         GLOBAL_BOOT_TIME.get_or_init(|| async { SystemTime::now() }).await;
 
-        resolve_store_init_stage_result(self.load_rebalance_meta().await, "load_rebalance_meta")?;
-        if self.rebalance_meta.read().await.is_some() {
-            resolve_store_init_stage_result(self.start_rebalance().await, "start_rebalance")?;
-        }
-
         let mut meta = PoolMeta::default();
         resolve_store_init_stage_result(
             meta.load(
@@ -375,11 +389,8 @@ impl ECStore {
         let endpoints = get_global_endpoints();
         let should_persist_pool_meta = is_first_cluster_node_local().await;
 
-        if !update {
-            {
-                let mut pool_meta = self.pool_meta.write().await;
-                *pool_meta = meta.clone();
-            }
+        let installed_pool_meta = if !update {
+            meta.clone()
         } else {
             let new_meta = PoolMeta::new(&self.pools, &meta);
             // Only one local node should persist validated pool metadata here; otherwise
@@ -387,13 +398,32 @@ impl ECStore {
             if should_persist_pool_meta {
                 resolve_store_init_stage_result(new_meta.save(self.pools.clone()).await, "save_validated_pool_meta")?;
             }
-            {
-                let mut pool_meta = self.pool_meta.write().await;
-                *pool_meta = new_meta;
-            }
+            new_meta
+        };
+
+        {
+            let mut pool_meta = self.pool_meta.write().await;
+            *pool_meta = installed_pool_meta.clone();
         }
 
-        let pools = meta.return_resumable_pools();
+        resolve_store_init_stage_result(self.load_rebalance_meta().await, "load_rebalance_meta")?;
+        let rebalance_meta_loaded = self.rebalance_meta.read().await.is_some();
+        let decommission_running =
+            pool_meta_has_active_decommission(&installed_pool_meta) || self.is_decommission_running().await;
+        if should_auto_start_rebalance_after_init(decommission_running, rebalance_meta_loaded) {
+            resolve_store_init_stage_result(self.start_rebalance().await, "start_rebalance")?;
+        } else if decommission_running && rebalance_meta_loaded {
+            warn!(
+                event = EVENT_ECSTORE_INIT_STATUS,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_STORE_INIT,
+                stage = "start_rebalance",
+                reason = "active_decommission",
+                "Deferred rebalance auto-start during store init because decommission is active"
+            );
+        }
+
+        let pools = installed_pool_meta.return_resumable_pools();
         let mut pool_indices = Vec::with_capacity(pools.len());
 
         for p in pools.iter() {
@@ -407,18 +437,16 @@ impl ECStore {
             }
         }
 
-        if !pool_indices.is_empty() {
-            let idx = pool_indices[0];
-            if should_resume_local_decommission(&endpoints, idx)? {
-                let store = self.clone();
+        let local_pool_indices = local_decommission_queue_prefix(&endpoints, &pool_indices)?;
+        if !local_pool_indices.is_empty() {
+            let store = self.clone();
 
-                tokio::spawn(async move {
-                    if !wait_for_local_decommission_resume_delay(&rx, LOCAL_DECOMMISSION_INITIAL_RESUME_DELAY).await {
-                        return;
-                    }
-                    resume_local_decommission_after_init(store, rx, pool_indices).await;
-                });
-            }
+            tokio::spawn(async move {
+                if !wait_for_local_decommission_resume_delay(&rx, LOCAL_DECOMMISSION_INITIAL_RESUME_DELAY).await {
+                    return;
+                }
+                resume_local_decommission_after_init(store, rx, local_pool_indices).await;
+            });
         }
 
         let num_nodes = get_global_endpoints().get_nodes().len() as u64;
@@ -448,15 +476,32 @@ impl ECStore {
 mod tests {
     use super::{
         LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES, pool_first_endpoint_is_local, resolve_store_init_stage_result,
+        should_auto_start_rebalance_after_init, should_auto_start_rebalance_after_recovered_meta,
         should_resume_local_decommission, should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
     };
     use crate::{
         disk::endpoint::Endpoint,
         endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
         error::StorageError,
+        pools::{POOL_META_VERSION, PoolDecommissionInfo, PoolMeta, PoolStatus},
+        rebalance::RebalanceMeta,
     };
     use std::time::Duration;
+    use time::OffsetDateTime;
     use tokio_util::sync::CancellationToken;
+
+    fn init_test_pool_meta(decommission: Option<PoolDecommissionInfo>) -> PoolMeta {
+        PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission,
+            }],
+            dont_save: false,
+        }
+    }
 
     #[test]
     fn test_should_resume_local_decommission_respects_local_flag() {
@@ -517,6 +562,43 @@ mod tests {
     #[test]
     fn test_should_retry_local_decommission_resume_rejects_non_config_errors() {
         assert!(!should_retry_local_decommission_resume(&StorageError::SlowDown, 0));
+    }
+
+    #[test]
+    fn test_should_auto_start_rebalance_after_init_allows_loaded_rebalance_without_decommission() {
+        assert!(should_auto_start_rebalance_after_init(false, true));
+    }
+
+    #[test]
+    fn test_should_auto_start_rebalance_after_init_rejects_active_decommission() {
+        assert!(!should_auto_start_rebalance_after_init(true, true));
+    }
+
+    #[test]
+    fn test_should_auto_start_rebalance_after_init_rejects_missing_rebalance_meta() {
+        assert!(!should_auto_start_rebalance_after_init(false, false));
+    }
+
+    #[test]
+    fn test_store_init_recovery_skips_rebalance_when_decommission_metadata_is_active() {
+        let pool_meta = init_test_pool_meta(Some(PoolDecommissionInfo {
+            start_time: Some(OffsetDateTime::UNIX_EPOCH),
+            complete: false,
+            failed: false,
+            canceled: false,
+            ..Default::default()
+        }));
+        let rebalance_meta = Some(RebalanceMeta::default());
+
+        assert!(!should_auto_start_rebalance_after_recovered_meta(&pool_meta, rebalance_meta.is_some()));
+    }
+
+    #[test]
+    fn test_store_init_recovery_allows_rebalance_when_only_rebalance_metadata_exists() {
+        let pool_meta = init_test_pool_meta(None);
+        let rebalance_meta = Some(RebalanceMeta::default());
+
+        assert!(should_auto_start_rebalance_after_recovered_meta(&pool_meta, rebalance_meta.is_some()));
     }
 
     #[test]
