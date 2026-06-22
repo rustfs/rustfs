@@ -1,7 +1,9 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use rustfs_ecstore::api::bucket as ecstore_bucket;
+use rustfs_ecstore::api::bucket::utils::{
+    check_object_name_for_length_and_slash, has_bad_path_component, is_valid_object_prefix,
+};
 use rustfs_utils::path::{clean, path_join};
 use std::path::{Path, PathBuf};
 
@@ -92,9 +94,9 @@ fuzz_target!(|data: &[u8]| {
     let (bucket, base_object, extra, flags) = parse_case(data);
     let object = materialize_object(base_object, &extra, &flags);
 
-    let has_bad_component = ecstore_bucket::utils::has_bad_path_component(&object);
-    let is_valid_prefix = ecstore_bucket::utils::is_valid_object_prefix(&object);
-    let length_and_slash_ok = ecstore_bucket::utils::check_object_name_for_length_and_slash(&bucket, &object).is_ok();
+    let has_bad_component = has_bad_path_component(&object);
+    let is_valid_prefix = is_valid_object_prefix(&object);
+    let length_and_slash_ok = check_object_name_for_length_and_slash(&bucket, &object).is_ok();
 
     if object.is_empty() || !(is_valid_prefix && length_and_slash_ok) {
         return;
