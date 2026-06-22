@@ -2897,12 +2897,7 @@ impl DefaultObjectUsecase {
         validate_ssec_for_read(&info.user_defined, sse_customer_key.as_ref(), sse_customer_key_md5.as_ref())?;
 
         let metadata_map = info.user_defined.clone();
-        let storage_class = info
-            .storage_class
-            .clone()
-            .or_else(|| metadata_map.get(AMZ_STORAGE_CLASS).cloned())
-            .filter(|s| !s.is_empty())
-            .map(StorageClass::from);
+        let storage_class = response_storage_class(&info, &metadata_map);
 
         debug!(
             "GetObjectAttributes raw object_attributes={:?}",
@@ -5824,6 +5819,18 @@ mod tests {
                 .as_ref()
                 .map(StorageClass::as_str),
             Some(storageclass::STANDARD_IA)
+        );
+
+        let mut metadata = HashMap::new();
+        metadata.insert(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD.to_string());
+        let standard_metadata_info = ObjectInfo {
+            storage_class: None,
+            user_defined: Arc::new(metadata.clone()),
+            ..Default::default()
+        };
+        assert!(
+            response_storage_class(&standard_metadata_info, &metadata).is_none(),
+            "STANDARD must be omitted even when it only arrives via metadata fallback"
         );
     }
 
