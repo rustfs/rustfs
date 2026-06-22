@@ -107,6 +107,7 @@ RUSTFS_STARTUP_OWNER_MODULE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_startup_owner_
 RUSTFS_RUNTIME_OWNER_MODULE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_runtime_owner_module_consumer_hits.txt"
 RUSTFS_ROOT_SERVER_OWNER_MODULE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_server_owner_module_consumer_hits.txt"
 RUSTFS_TABLE_S3_OWNER_MODULE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_table_s3_owner_module_consumer_hits.txt"
+RUSTFS_APP_SHARED_OWNER_MODULE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_app_shared_owner_module_consumer_hits.txt"
 ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_self_facade_path_hits.txt"
 RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE="${TMP_DIR}/rustfs_local_compat_owner_self_path_hits.txt"
 RUSTFS_ROOT_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_compat_relative_consumer_hits.txt"
@@ -1214,6 +1215,16 @@ fi
 
 if [[ -s "$RUSTFS_TABLE_S3_OWNER_MODULE_CONSUMER_HITS_FILE" ]]; then
   report_failure "RustFS table/S3/startup consumers must use storage owner symbols instead of ecstore_* modules: $(paste -sd '; ' "$RUSTFS_TABLE_S3_OWNER_MODULE_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'ecstore_(?:disk::(?:error::DiskError|endpoint::Endpoint|error_reduce::is_all_buckets_not_found)|error::(?:StorageError|is_err_bucket_not_found|is_err_object_not_found|is_err_version_not_found)|global::(?:get_global_endpoints_opt|get_global_region|get_global_tier_config_mgr|new_object_layer_fn|set_object_store_resolver)|layout::(?:EndpointServerPools|Endpoints|PoolEndpoints)|notification::(?:NotificationSys|get_global_notification_sys)|rio::(?:DynReader|HashReader|WriteEncryption|WritePlan|DecryptReader|EncryptReader|HardLimitReader|boxed_reader|compression_metadata_value|wrap_reader)|set_disk::(?:get_lock_acquire_timeout|is_valid_storage_class)|storage::(?:ECStore|init_local_disks))' \
+    rustfs/src/app/mod.rs || true
+) >"$RUSTFS_APP_SHARED_OWNER_MODULE_CONSUMER_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_SHARED_OWNER_MODULE_CONSUMER_HITS_FILE" ]]; then
+  report_failure "RustFS app shared runtime facade must use storage owner symbols instead of duplicate ecstore_* calls: $(paste -sd '; ' "$RUSTFS_APP_SHARED_OWNER_MODULE_CONSUMER_HITS_FILE")"
 fi
 
 (

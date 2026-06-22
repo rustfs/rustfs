@@ -6,16 +6,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
 - Branch: `overtrue/arch-rustfs-runtime-owner-symbols`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141`.
-- Based on: API-141 stacked slice.
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142`.
+- Based on: API-142 stacked slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: replace RustFS startup/table/S3 runtime
+- Rust code changes: replace RustFS app shared runtime
   `ecstore_*` owner-module consumers with storage-owner symbols and wrappers.
 - CI/script changes: lock completed owner and test/fuzz boundaries against
   bare/glob imports, scattered raw ECStore facade subpaths, and startup
-  runtime/root-server/table/S3 owner-module consumer regressions.
-- Docs changes: record the API-136/API-137/API-138/API-139/API-140/API-141/API-142 owner facade cleanup.
+  runtime/root-server/table/S3/app shared owner-module consumer regressions.
+- Docs changes: record the API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143 owner facade cleanup.
 
 ## Phase 0 Tasks
 
@@ -4056,6 +4056,23 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     syntax check, formatting, diff hygiene, Rust risk scan, branch freshness
     check, and three-expert review.
 
+- [x] `API-143` Route app shared runtime facade through storage owner symbols.
+  - Do: expose storage-owner aliases and wrappers for app-shared ECStore,
+    endpoint layout, rio readers, notification access, global object-store
+    resolver, shared error helpers, storage-class validation, and test local
+    disk initialization, then migrate the duplicate app facade entries to
+    delegate to storage-owner symbols.
+  - Acceptance: `rustfs/src/app/mod.rs` delegates shared IO/error/global/
+    notification/storage wrappers to `crate::storage` owner symbols instead
+    of duplicate `ecstore_*` calls; migration guards reject restoring those
+    duplicate calls.
+  - Must preserve: app context resolution, object-store resolver fallback,
+    notification system access, rio reader boxing/wrapping, lock timeout,
+    storage-class validation, S3 ETag rendering, and app test disk setup.
+  - Verification: focused RustFS test-target compile, migration guard, shell
+    syntax check, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, and three-expert review.
+
 ## Next PRs
 
 1. `pure-move`: continue pruning remaining facade compatibility and owner boundaries.
@@ -4064,9 +4081,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-142 routes table, S3 API, startup, shutdown, and config-test consumers through storage-owner symbols and guards against restored `ecstore_*` module consumers. |
-| Migration preservation | pass | Metadata migration/init, replication resync, shutdown, S3 ETag conversion, table catalog metadata roots/hash/lookup, lock timeout, and disk-layout parsing still delegate to the same ECStore backend functions through storage-owner wrappers. |
-| Testing/verification | pass | Focused RustFS test-target compile, shell syntax, migration guard, formatting, diff hygiene, Rust risk scan, and pre-commit passed for API-142. |
+| Quality/architecture | pass | API-143 routes app shared runtime facade entries through storage-owner symbols and guards against restoring duplicate `ecstore_*` calls. |
+| Migration preservation | pass | ECStore aliases, endpoint layout, rio readers, notification access, object-store resolver hooks, shared error helpers, lock timeout, storage-class validation, and local disk init still delegate to the same ECStore backend functions through storage-owner wrappers. |
+| Testing/verification | pass | Focused RustFS test-target compile, shell syntax, migration guard, formatting, diff hygiene, Rust risk scan, and pre-commit passed for API-143. |
 
 ## Verification Notes
 
@@ -4106,6 +4123,18 @@ Passed before push:
   - Rust risk scan: no new production unwrap/expect, casts, panic/todo/unsafe,
     or error-type risks added; only type/import aliases were reported by the
     textual `as` scan.
+
+- Issue #660 API-143 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - Rust risk scan: no new production unwrap/expect, casts, panic/todo/unsafe,
+    or error-type risks added; only existing `DiskResult<Vec<String>>`
+    textual matches were reported by the broad error-type scan.
 
 - Issue #660 API-139 current slice:
   - `cargo check --tests -p rustfs`: passed.

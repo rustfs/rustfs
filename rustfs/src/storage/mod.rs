@@ -116,8 +116,8 @@ pub(crate) mod ecstore_event {
 pub(crate) mod ecstore_global {
     pub(crate) use rustfs_ecstore::api::global::{
         GLOBAL_TierConfigMgr, get_global_endpoints_opt, get_global_lock_client, get_global_lock_clients, get_global_region,
-        is_dist_erasure, resolve_object_store_handle, set_global_endpoints, set_global_region, set_global_rustfs_port,
-        shutdown_background_services, update_erasure_type,
+        get_global_tier_config_mgr, is_dist_erasure, new_object_layer_fn, resolve_object_store_handle, set_global_endpoints,
+        set_global_region, set_global_rustfs_port, set_object_store_resolver, shutdown_background_services, update_erasure_type,
     };
 }
 
@@ -132,11 +132,17 @@ pub(crate) mod ecstore_metrics {
 
 #[allow(unused_imports)]
 pub(crate) mod ecstore_notification {
-    pub(crate) use rustfs_ecstore::api::notification::{NotificationSys, new_global_notification_sys};
+    pub(crate) use rustfs_ecstore::api::notification::{
+        NotificationSys, get_global_notification_sys, new_global_notification_sys,
+    };
 }
 
 pub(crate) mod ecstore_rio {
-    pub(crate) use rustfs_ecstore::api::rio::WriteEncryption;
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::rio::{DecryptReader, EncryptReader, HardLimitReader, Reader, boxed_reader};
+    pub(crate) use rustfs_ecstore::api::rio::{
+        DynReader, HashReader, ReadStream, WriteEncryption, WritePlan, compression_metadata_value, wrap_reader,
+    };
 }
 
 pub(crate) mod ecstore_rpc {
@@ -147,7 +153,7 @@ pub(crate) mod ecstore_rpc {
 }
 
 pub(crate) mod ecstore_set_disk {
-    pub(crate) use rustfs_ecstore::api::set_disk::{DEFAULT_READ_BUFFER_SIZE, get_lock_acquire_timeout};
+    pub(crate) use rustfs_ecstore::api::set_disk::{DEFAULT_READ_BUFFER_SIZE, get_lock_acquire_timeout, is_valid_storage_class};
 }
 
 pub(crate) mod ecstore_storage {
@@ -155,6 +161,10 @@ pub(crate) mod ecstore_storage {
         ECStore, all_local_disk, all_local_disk_path, find_local_disk_by_ref, init_local_disks, init_lock_clients,
         prewarm_local_disk_id_map,
     };
+}
+
+pub(crate) mod ecstore_tier {
+    pub(crate) use rustfs_ecstore::api::tier::tier::TierConfigMgr;
 }
 
 pub(crate) const BUCKET_ACCELERATE_CONFIG: &str = ecstore_bucket::metadata::BUCKET_ACCELERATE_CONFIG;
@@ -193,6 +203,7 @@ pub(crate) type DiskStore = ecstore_disk::DiskStore;
 #[cfg(test)]
 pub(crate) type DisksLayout = ecstore_layout::DisksLayout;
 pub(crate) type DynReplicationPool = ecstore_bucket::replication::DynReplicationPool;
+pub(crate) type DynReader = ecstore_rio::DynReader;
 pub(crate) type ECStore = ecstore_storage::ECStore;
 pub(crate) type Endpoint = ecstore_disk::endpoint::Endpoint;
 #[cfg(test)]
@@ -202,10 +213,12 @@ pub(crate) type EventArgs = ecstore_event::EventArgs;
 pub(crate) type FileInfoVersions = ecstore_disk::FileInfoVersions;
 pub(crate) type FileReader = ecstore_disk::FileReader;
 pub(crate) type FileWriter = ecstore_disk::FileWriter;
+pub(crate) type HashReader = ecstore_rio::HashReader;
 pub(crate) type LocalPeerS3Client = ecstore_rpc::LocalPeerS3Client;
 pub(crate) type MetricType = ecstore_metrics::MetricType;
 pub(crate) type ObjectPartInfo = rustfs_filemeta::ObjectPartInfo;
 pub(crate) type ObjectLockBlockReason = ecstore_bucket::object_lock::objectlock_sys::ObjectLockBlockReason;
+pub(crate) type ObjectStoreResolver = dyn Fn() -> Option<Arc<ECStore>> + Send + Sync + 'static;
 pub(crate) type PolicySys = ecstore_bucket::policy_sys::PolicySys;
 pub(crate) type PoolEndpoints = ecstore_layout::PoolEndpoints;
 pub(crate) type QuotaError = ecstore_bucket::quota::QuotaError;
@@ -216,12 +229,21 @@ pub(crate) type ReadOptions = ecstore_disk::ReadOptions;
 pub(crate) type RenameDataResp = ecstore_disk::RenameDataResp;
 pub(crate) type SetupType = ecstore_layout::SetupType;
 pub(crate) type StorageError = ecstore_error::StorageError;
+pub(crate) type TierConfigMgr = ecstore_tier::TierConfigMgr;
 pub(crate) type Error = ecstore_error::Error;
 pub(crate) type Result<T> = ecstore_error::Result<T>;
 pub(crate) type UpdateMetadataOpts = ecstore_disk::UpdateMetadataOpts;
 pub(crate) type VolumeInfo = ecstore_disk::VolumeInfo;
 pub(crate) type WalkDirOptions = ecstore_disk::WalkDirOptions;
 pub(crate) type WriteEncryption = ecstore_rio::WriteEncryption;
+pub(crate) type WritePlan = ecstore_rio::WritePlan;
+#[cfg(test)]
+pub(crate) type DecryptReader<R> = ecstore_rio::DecryptReader<R>;
+#[cfg(test)]
+pub(crate) type EncryptReader<R> = ecstore_rio::EncryptReader<R>;
+#[cfg(test)]
+pub(crate) type HardLimitReader<R> = ecstore_rio::HardLimitReader<R>;
+pub(crate) type NotificationSys = ecstore_notification::NotificationSys;
 
 pub(crate) async fn get_local_server_property() -> rustfs_madmin::ServerProperties {
     ecstore_admin::get_local_server_property().await
@@ -756,6 +778,10 @@ pub(crate) fn is_err_version_not_found(err: &Error) -> bool {
     ecstore_error::is_err_version_not_found(err)
 }
 
+pub(crate) fn is_all_buckets_not_found(errs: &[Option<DiskError>]) -> bool {
+    ecstore_disk::error_reduce::is_all_buckets_not_found(errs)
+}
+
 pub(crate) fn get_global_lock_client() -> Option<Arc<dyn rustfs_lock::client::LockClient>> {
     ecstore_global::get_global_lock_client()
 }
@@ -771,6 +797,22 @@ pub(crate) fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
 
 pub(crate) fn get_global_region() -> Option<s3s::region::Region> {
     ecstore_global::get_global_region()
+}
+
+pub(crate) fn get_global_tier_config_mgr() -> Arc<tokio::sync::RwLock<TierConfigMgr>> {
+    ecstore_global::get_global_tier_config_mgr()
+}
+
+pub(crate) fn new_object_layer_fn() -> Option<Arc<ECStore>> {
+    ecstore_global::new_object_layer_fn()
+}
+
+pub(crate) fn set_object_store_resolver(resolver: Arc<ObjectStoreResolver>) -> bool {
+    ecstore_global::set_object_store_resolver(resolver)
+}
+
+pub(crate) fn get_global_notification_sys() -> Option<&'static NotificationSys> {
+    ecstore_notification::get_global_notification_sys()
 }
 
 pub(crate) async fn is_dist_erasure() -> bool {
@@ -802,6 +844,29 @@ pub(crate) fn table_catalog_path_hash(value: &str) -> String {
 
 pub(crate) fn get_lock_acquire_timeout() -> std::time::Duration {
     ecstore_set_disk::get_lock_acquire_timeout()
+}
+
+#[cfg(test)]
+pub(crate) fn boxed_reader<R>(reader: R) -> DynReader
+where
+    R: ecstore_rio::Reader + 'static,
+{
+    ecstore_rio::boxed_reader(reader)
+}
+
+pub(crate) fn compression_metadata_value(algorithm: rustfs_utils::CompressionAlgorithm) -> String {
+    ecstore_rio::compression_metadata_value(algorithm)
+}
+
+pub(crate) fn wrap_reader<R>(reader: R) -> DynReader
+where
+    R: ecstore_rio::ReadStream + 'static,
+{
+    ecstore_rio::wrap_reader(reader)
+}
+
+pub(crate) fn is_valid_storage_class(storage_class: &str) -> bool {
+    ecstore_set_disk::is_valid_storage_class(storage_class)
 }
 
 pub(crate) fn register_event_dispatch_hook<F>(hook: F) -> bool
