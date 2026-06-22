@@ -1,8 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-mod ecstore_fuzz_compat;
-use ecstore_fuzz_compat::{
+use rustfs_ecstore::api::bucket::utils::{
     check_bucket_and_object_names, check_list_objs_args, check_valid_bucket_name_strict, is_meta_bucketname,
 };
 

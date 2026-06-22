@@ -736,7 +736,7 @@ fi
     --glob '!**/ecstore_test_compat/**' \
     --glob '!**/ecstore_fuzz_compat.rs' \
     --glob '!target/**' \
-    | rg -v '^(rustfs/src/(admin/mod|app/mod)\.rs|crates/e2e_test/src/(replication_extension_test|reliant/(grpc_lock_client|node_interact_test))\.rs|crates/heal/src/heal/mod\.rs|crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)\.rs|crates/iam/src/lib\.rs|crates/notify/src/lib\.rs|crates/obs/src/metrics/mod\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/lib\.rs|crates/scanner/src/lib\.rs|crates/scanner/tests/lifecycle_integration_test\.rs|fuzz/fuzz_targets/(bucket_validation|path_containment)\.rs):' || true
+    | rg -v '^(rustfs/src/(admin/mod|app/mod|storage/mod)\.rs|crates/e2e_test/src/(replication_extension_test|reliant/(grpc_lock_client|node_interact_test))\.rs|crates/heal/src/heal/mod\.rs|crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)\.rs|crates/iam/src/lib\.rs|crates/notify/src/lib\.rs|crates/obs/src/metrics/mod\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/lib\.rs|crates/scanner/src/lib\.rs|crates/scanner/tests/lifecycle_integration_test\.rs|fuzz/fuzz_targets/(bucket_validation|path_containment)\.rs):' || true
 ) |
   cat >"$DIRECT_ECSTORE_IMPORT_HITS_FILE"
 
@@ -1085,7 +1085,7 @@ fi
     --glob '!**/ecstore_compat.rs' \
     --glob '!**/ecstore_test_compat.rs' \
     --glob '!**/ecstore_test_compat/**' |
-    rg -v '^(fuzz/fuzz_targets/bucket_validation\.rs|fuzz/fuzz_targets/path_containment\.rs|crates/e2e_test/src/reliant/grpc_lock_client\.rs|crates/e2e_test/src/reliant/node_interact_test\.rs|crates/e2e_test/src/replication_extension_test\.rs|crates/heal/src/heal/mod\.rs|crates/heal/tests/endpoint_index_test\.rs|crates/heal/tests/heal_bug_fixes_test\.rs|crates/heal/tests/heal_integration_test\.rs|crates/iam/src/lib\.rs|crates/notify/src/lib\.rs|crates/obs/src/metrics/mod\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/lib\.rs|crates/scanner/src/lib\.rs|crates/scanner/tests/lifecycle_integration_test\.rs|rustfs/src/admin/mod\.rs|rustfs/src/app/mod\.rs):' || true
+    rg -v '^(fuzz/fuzz_targets/bucket_validation\.rs|fuzz/fuzz_targets/path_containment\.rs|crates/e2e_test/src/reliant/grpc_lock_client\.rs|crates/e2e_test/src/reliant/node_interact_test\.rs|crates/e2e_test/src/replication_extension_test\.rs|crates/heal/src/heal/mod\.rs|crates/heal/tests/endpoint_index_test\.rs|crates/heal/tests/heal_bug_fixes_test\.rs|crates/heal/tests/heal_integration_test\.rs|crates/iam/src/lib\.rs|crates/notify/src/lib\.rs|crates/obs/src/metrics/mod\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/lib\.rs|crates/scanner/src/lib\.rs|crates/scanner/tests/lifecycle_integration_test\.rs|rustfs/src/admin/mod\.rs|rustfs/src/app/mod\.rs|rustfs/src/storage/mod\.rs):' || true
 ) >"$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE"
 
 if [[ -s "$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE" ]]; then
@@ -1285,7 +1285,7 @@ fi
     crates/scanner/src \
     --glob '*.rs' \
     --glob '!**/ecstore_compat.rs' |
-    rg -v '^(crates/notify/src/lib.rs|crates/obs/src/metrics/mod.rs|crates/protocols/src/swift/mod.rs|crates/s3select-api/src/lib.rs):' || true
+    rg -v '^(crates/heal/src/heal/mod.rs|crates/iam/src/lib.rs|crates/notify/src/lib.rs|crates/obs/src/metrics/mod.rs|crates/protocols/src/swift/mod.rs|crates/s3select-api/src/lib.rs|crates/scanner/src/lib.rs):' || true
 ) >"$EXTERNAL_RUNTIME_ECSTORE_COMPAT_BYPASS_HITS_FILE"
 
 if [[ -s "$EXTERNAL_RUNTIME_ECSTORE_COMPAT_BYPASS_HITS_FILE" ]]; then
@@ -1299,24 +1299,23 @@ fi
     crates/scanner/tests \
     crates/e2e_test/src \
     --glob '*.rs' \
-    --glob '!**/ecstore_test_compat.rs' \
-    --glob '!**/ecstore_test_compat/**' || true
+    | rg -v '^(crates/e2e_test/src/(replication_extension_test|reliant/(grpc_lock_client|node_interact_test))\.rs|crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)\.rs|crates/scanner/tests/lifecycle_integration_test\.rs):' || true
 ) >"$EXTERNAL_TEST_ECSTORE_COMPAT_BYPASS_HITS_FILE"
 
 if [[ -s "$EXTERNAL_TEST_ECSTORE_COMPAT_BYPASS_HITS_FILE" ]]; then
-  report_failure "external test crates must source ECStore API symbols through their ecstore_test_compat boundary: $(paste -sd '; ' "$EXTERNAL_TEST_ECSTORE_COMPAT_BYPASS_HITS_FILE")"
+  report_failure "external test ECStore API imports must stay in owner test files: $(paste -sd '; ' "$EXTERNAL_TEST_ECSTORE_COMPAT_BYPASS_HITS_FILE")"
 fi
 
 (
   cd "$ROOT_DIR"
   rg -n --with-filename 'rustfs_ecstore::api::' \
     fuzz/fuzz_targets \
-    --glob '*.rs' \
-    --glob '!**/ecstore_fuzz_compat.rs' || true
+    --glob '*.rs' |
+    rg -v '^fuzz/fuzz_targets/(bucket_validation|path_containment)\.rs:' || true
 ) >"$FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE"
 
 if [[ -s "$FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE" ]]; then
-  report_failure "fuzz targets must source ECStore API symbols through ecstore_fuzz_compat: $(paste -sd '; ' "$FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE")"
+  report_failure "fuzz ECStore API imports must stay in owner fuzz targets: $(paste -sd '; ' "$FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE")"
 fi
 
 (
@@ -1585,13 +1584,18 @@ fi
     for file in \
       crates/heal/tests/common/storage_compat.rs \
       crates/scanner/tests/common/storage_compat.rs \
+      crates/e2e_test/src/ecstore_test_compat.rs \
+      crates/heal/tests/ecstore_test_compat/mod.rs \
+      crates/scanner/tests/ecstore_test_compat/mod.rs \
+      fuzz/fuzz_targets/ecstore_fuzz_compat.rs \
       fuzz/fuzz_targets/bucket_validation/storage_compat.rs \
       fuzz/fuzz_targets/path_containment/storage_compat.rs; do
       [[ -e "$file" ]] && printf '%s:1:test/fuzz bridge file exists\n' "$file"
     done
-    rg -n --with-filename 'common::storage_compat|storage_compat::|\bmod\s+storage_compat|#\[path\s*=\s*"[^"]*storage_compat\.rs"\]' \
+    rg -n --with-filename 'common::storage_compat|storage_compat::|\bmod\s+storage_compat|#\[path\s*=\s*"[^"]*storage_compat\.rs"\]|ecstore_test_compat|ecstore_fuzz_compat' \
+      crates/e2e_test/src \
       crates/heal/tests \
-      crates/scanner/tests/lifecycle_integration_test.rs \
+      crates/scanner/tests \
       fuzz/fuzz_targets/bucket_validation.rs \
       fuzz/fuzz_targets/path_containment.rs \
       -g '*.rs' || true
@@ -1599,7 +1603,7 @@ fi
 ) >"$TEST_FUZZ_COMPAT_BRIDGE_HITS_FILE"
 
 if [[ -s "$TEST_FUZZ_COMPAT_BRIDGE_HITS_FILE" ]]; then
-  report_failure "heal/scanner test and fuzz targets must import ECStore owner APIs directly instead of local storage compatibility bridges: $(paste -sd '; ' "$TEST_FUZZ_COMPAT_BRIDGE_HITS_FILE")"
+  report_failure "test and fuzz targets must import ECStore owner APIs directly instead of local compatibility bridges: $(paste -sd '; ' "$TEST_FUZZ_COMPAT_BRIDGE_HITS_FILE")"
 fi
 
 (
@@ -1607,6 +1611,9 @@ fi
   {
     for file in \
       crates/e2e_test/src/storage_compat.rs \
+      rustfs/src/storage/ecstore_compat.rs \
+      crates/heal/src/heal/ecstore_compat.rs \
+      crates/iam/src/ecstore_compat.rs \
       crates/iam/src/store/storage_compat.rs \
       crates/notify/src/ecstore_compat.rs \
       crates/notify/src/storage_compat.rs \
@@ -1614,6 +1621,7 @@ fi
       crates/obs/src/storage_compat.rs \
       crates/protocols/src/swift/ecstore_compat.rs \
       crates/protocols/src/swift/storage_compat.rs \
+      crates/scanner/src/ecstore_compat.rs \
       crates/s3select-api/src/ecstore_compat.rs \
       crates/s3select-api/src/storage_compat.rs; do
       [[ -e "$file" ]] && printf '%s:1:standalone thin bridge file exists\n' "$file"
@@ -1626,9 +1634,13 @@ fi
       crates/s3select-api/src \
       -g '*.rs' || true
     rg -n --with-filename 'ecstore_compat' \
+      rustfs/src/storage \
+      crates/heal/src/heal \
+      crates/iam/src \
       crates/notify/src \
       crates/obs/src/metrics \
       crates/protocols/src/swift \
+      crates/scanner/src \
       crates/s3select-api/src \
       -g '*.rs' || true
     rg -n --with-filename '^\s*use\s+super::storage_compat|store::storage_compat|\bmod\s+storage_compat' \
@@ -1638,7 +1650,7 @@ fi
 ) >"$STANDALONE_THIN_COMPAT_BRIDGE_HITS_FILE"
 
 if [[ -s "$STANDALONE_THIN_COMPAT_BRIDGE_HITS_FILE" ]]; then
-  report_failure "standalone e2e/IAM-store/notify/obs/swift/s3select consumers must import owner APIs directly instead of local thin compatibility bridges: $(paste -sd '; ' "$STANDALONE_THIN_COMPAT_BRIDGE_HITS_FILE")"
+  report_failure "storage owner and standalone e2e/IAM/heal/scanner/notify/obs/swift/s3select consumers must import owner APIs directly instead of local thin compatibility bridges: $(paste -sd '; ' "$STANDALONE_THIN_COMPAT_BRIDGE_HITS_FILE")"
 fi
 
 (

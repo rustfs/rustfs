@@ -14,13 +14,10 @@
 // limitations under the License.
 
 use crate::common::workspace_root;
-use crate::ecstore_test_compat::{
-    E2eTonicInterceptor as TonicInterceptor, E2eVolumeInfo as VolumeInfo, E2eWalkDirOptions as WalkDirOptions,
-    e2e_node_service_time_out_client as node_service_time_out_client,
-    gen_e2e_tonic_signature_interceptor as gen_tonic_signature_interceptor,
-};
 use futures::future::join_all;
 use rmp_serde::{Deserializer, Serializer};
+use rustfs_ecstore::api::disk::{VolumeInfo, WalkDirOptions};
+use rustfs_ecstore::api::rpc::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
 use rustfs_filemeta::{MetaCacheEntry, MetacacheReader, MetacacheWriter};
 use rustfs_protos::proto_gen::node_service::WalkDirRequest;
 use rustfs_protos::{
