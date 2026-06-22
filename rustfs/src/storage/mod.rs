@@ -168,6 +168,7 @@ pub(crate) const PEER_RESTSIGNAL: &str = ecstore_rpc::PEER_RESTSIGNAL;
 pub(crate) const PEER_RESTSUB_SYS: &str = ecstore_rpc::PEER_RESTSUB_SYS;
 pub(crate) const SERVICE_SIGNAL_REFRESH_CONFIG: u64 = ecstore_rpc::SERVICE_SIGNAL_REFRESH_CONFIG;
 pub(crate) const SERVICE_SIGNAL_RELOAD_DYNAMIC: u64 = ecstore_rpc::SERVICE_SIGNAL_RELOAD_DYNAMIC;
+pub(crate) const TONIC_RPC_PREFIX: &str = ecstore_rpc::TONIC_RPC_PREFIX;
 #[cfg(test)]
 pub(crate) const STORAGE_CLASS_SUB_SYS: &str = ecstore_config::com::STORAGE_CLASS_SUB_SYS;
 
@@ -183,6 +184,7 @@ pub(crate) type DiskInfo = ecstore_disk::DiskInfo;
 pub(crate) type DiskInfoOptions = ecstore_disk::DiskInfoOptions;
 pub(crate) type DiskResult<T> = ecstore_disk::error::Result<T>;
 pub(crate) type DiskStore = ecstore_disk::DiskStore;
+pub(crate) type DynReplicationPool = ecstore_bucket::replication::DynReplicationPool;
 pub(crate) type ECStore = ecstore_storage::ECStore;
 pub(crate) type EndpointServerPools = ecstore_layout::EndpointServerPools;
 pub(crate) type FileInfoVersions = ecstore_disk::FileInfoVersions;
@@ -216,6 +218,26 @@ pub(crate) async fn init_background_replication(store: Arc<ECStore>) {
     ecstore_bucket::replication::init_background_replication(store).await;
 }
 
+pub(crate) async fn all_local_disk() -> Vec<DiskStore> {
+    ecstore_storage::all_local_disk().await
+}
+
+pub(crate) fn bucket_metadata_runtime_initialized() -> bool {
+    ecstore_bucket::metadata_sys::get_global_bucket_metadata_sys().is_some()
+}
+
+pub(crate) fn disk_drive_path(disk: &DiskStore) -> String {
+    ecstore_disk::DiskAPI::to_string(disk.as_ref())
+}
+
+pub(crate) fn disk_endpoint(disk: &DiskStore) -> String {
+    ecstore_disk::DiskAPI::endpoint(disk.as_ref()).to_string()
+}
+
+pub(crate) fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
+    ecstore_bucket::replication::get_global_replication_pool()
+}
+
 pub(crate) fn init_ecstore_config() {
     ecstore_config::init();
 }
@@ -238,6 +260,16 @@ pub(crate) async fn new_global_notification_sys(endpoint_pools: EndpointServerPo
 
 pub(crate) async fn prewarm_local_disk_id_map() {
     ecstore_storage::prewarm_local_disk_id_map().await;
+}
+
+pub(crate) fn replication_queue_current_count() -> Option<i64> {
+    ecstore_bucket::replication::GLOBAL_REPLICATION_STATS.get().and_then(|stats| {
+        stats
+            .q_cache
+            .try_lock()
+            .ok()
+            .map(|cache| cache.sr_queue_stats.curr.get_current_count())
+    })
 }
 
 pub(crate) fn set_global_endpoints(endpoints: Vec<PoolEndpoints>) {
