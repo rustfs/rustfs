@@ -16,10 +16,8 @@
 use crate::common::workspace_root;
 use futures::future::join_all;
 use rmp_serde::{Deserializer, Serializer};
-use rustfs_ecstore::api::{
-    disk::{VolumeInfo, WalkDirOptions},
-    rpc::{self as ecstore_rpc, TonicInterceptor},
-};
+use rustfs_ecstore::api::disk as ecstore_disk;
+use rustfs_ecstore::api::rpc as ecstore_rpc;
 use rustfs_filemeta::{MetaCacheEntry, MetacacheReader, MetacacheWriter};
 use rustfs_protos::proto_gen::node_service::WalkDirRequest;
 use rustfs_protos::{
@@ -37,6 +35,10 @@ use tonic::Request;
 use tonic::codegen::tokio_stream::StreamExt;
 
 const CLUSTER_ADDR: &str = "http://localhost:9000";
+
+type TonicInterceptor = ecstore_rpc::TonicInterceptor;
+type VolumeInfo = ecstore_disk::VolumeInfo;
+type WalkDirOptions = ecstore_disk::WalkDirOptions;
 
 fn signature_interceptor() -> TonicInterceptor {
     TonicInterceptor::Signature(ecstore_rpc::gen_tonic_signature_interceptor())

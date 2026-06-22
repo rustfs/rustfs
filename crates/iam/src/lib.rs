@@ -15,10 +15,11 @@
 use crate::error::{Error, Result};
 use manager::IamCache;
 use oidc::OidcSys;
-use rustfs_ecstore::api::{
-    config as ecstore_config, error as ecstore_error, global as ecstore_global, notification as ecstore_notification,
-    storage as ecstore_storage,
-};
+use rustfs_ecstore::api::config as ecstore_config;
+use rustfs_ecstore::api::error as ecstore_error;
+use rustfs_ecstore::api::global as ecstore_global;
+use rustfs_ecstore::api::notification as ecstore_notification;
+use rustfs_ecstore::api::storage as ecstore_storage;
 use std::sync::{Arc, OnceLock};
 use store::object::ObjectStore;
 use sys::IamSys;

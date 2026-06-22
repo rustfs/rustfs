@@ -20,7 +20,9 @@ use rustfs_config::notify::{
     NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_REDIS_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::server_config::{Config, KVS};
-use rustfs_ecstore::api::{config as ecstore_config, global as ecstore_global, storage as ecstore_storage};
+use rustfs_ecstore::api::config as ecstore_config;
+use rustfs_ecstore::api::global as ecstore_global;
+use rustfs_ecstore::api::storage as ecstore_storage;
 use rustfs_targets::{Target, arn::TargetID};
 use std::sync::Arc;
 use tokio::sync::RwLock;
