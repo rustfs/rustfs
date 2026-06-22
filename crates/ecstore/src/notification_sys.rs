@@ -1228,7 +1228,7 @@ mod tests {
         let sys = NotificationSys {
             peer_clients: Vec::new(),
             all_peer_clients: vec![Some(PeerRestClient::new(
-                "node-a:9000".parse().expect("peer host should parse"),
+                "node-a:9000".to_string().try_into().expect("peer host should parse"),
                 "http://node-a:9000".to_string(),
             ))],
             peer_admin_caches: Vec::new(),
