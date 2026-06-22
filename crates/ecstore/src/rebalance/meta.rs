@@ -604,6 +604,17 @@ pub(super) fn validate_start_rebalance_state(decommission_running: bool, meta_lo
     Ok(())
 }
 
+pub(super) fn validate_init_rebalance_state(decommission_running: bool, current_meta: Option<&RebalanceMeta>) -> Result<()> {
+    if !ensure_rebalance_not_decommissioning(decommission_running) {
+        return Err(Error::DecommissionAlreadyRunning);
+    }
+    if current_meta.is_some_and(is_rebalance_in_progress) {
+        return Err(Error::RebalanceAlreadyRunning);
+    }
+
+    Ok(())
+}
+
 pub(super) fn should_skip_start_rebalance(cancel_attached: bool, in_progress: bool) -> bool {
     cancel_attached && in_progress
 }

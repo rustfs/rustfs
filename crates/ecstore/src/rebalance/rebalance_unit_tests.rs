@@ -25,7 +25,7 @@ use super::meta::{
     record_rebalance_cleanup_warning_in_meta, remove_rebalanced_buckets_from_queue, resolve_next_rebalance_bucket,
     resolve_rebalance_participants, should_accept_rebalance_stats_update, should_ignore_rebalance_data_usage_cache,
     should_pool_participate, should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_meta_snapshot,
-    stop_rebalance_state, take_bucket_from_rebalance_queue, validate_start_rebalance_state,
+    stop_rebalance_state, take_bucket_from_rebalance_queue, validate_init_rebalance_state, validate_start_rebalance_state,
 };
 use super::migration::{
     MigrationBackend, MigrationVersionResult, migrate_entry_version, migrate_entry_version_with_retry_wait,
@@ -2172,6 +2172,93 @@ fn test_validate_start_rebalance_state_rejects_missing_meta() {
 #[test]
 fn test_validate_start_rebalance_state_allows_loaded_meta() {
     validate_start_rebalance_state(false, true).expect("loaded rebalance meta should allow start");
+}
+
+#[test]
+fn test_validate_init_rebalance_state_rejects_running_decommission() {
+    let err = validate_init_rebalance_state(true, None).expect_err("running decommission should block rebalance init");
+    assert!(matches!(err, Error::DecommissionAlreadyRunning));
+}
+
+#[test]
+fn test_validate_init_rebalance_state_rejects_active_rebalance() {
+    let now = OffsetDateTime::now_utc();
+    let meta = RebalanceMeta {
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                start_time: Some(now),
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let err = validate_init_rebalance_state(false, Some(&meta)).expect_err("active rebalance should block rebalance init");
+    assert!(matches!(err, Error::RebalanceAlreadyRunning));
+}
+
+#[test]
+fn test_validate_init_rebalance_state_allows_terminal_or_missing_rebalance() {
+    let completed = RebalanceMeta {
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Completed,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    validate_init_rebalance_state(false, None).expect("missing rebalance meta should allow init");
+    validate_init_rebalance_state(false, Some(&completed)).expect("terminal rebalance meta should allow init");
+}
+
+#[tokio::test]
+async fn test_init_and_start_rebalance_rejects_second_start_after_gate() {
+    let now = OffsetDateTime::now_utc();
+    let active_meta = RebalanceMeta {
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                start_time: Some(now),
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let endpoint_pools: crate::endpoints::EndpointServerPools = Vec::new().into();
+    let store = Arc::new(crate::store::ECStore {
+        id: uuid::Uuid::new_v4(),
+        disk_map: std::collections::HashMap::new(),
+        pools: Vec::new(),
+        peer_sys: crate::rpc::S3PeerSys::new(&endpoint_pools),
+        pool_meta: tokio::sync::RwLock::new(crate::pools::PoolMeta::default()),
+        rebalance_meta: tokio::sync::RwLock::new(Some(active_meta)),
+        decommission_cancelers: tokio::sync::RwLock::new(Vec::new()),
+        start_gate: tokio::sync::Mutex::new(()),
+        pool_meta_save_gate: tokio::sync::Mutex::new(()),
+        local_disk_map: crate::global::GLOBAL_LOCAL_DISK_MAP.clone(),
+        local_disk_id_map: crate::global::GLOBAL_LOCAL_DISK_ID_MAP.clone(),
+        local_disk_set_drives: crate::global::GLOBAL_LOCAL_DISK_SET_DRIVES.clone(),
+        tier_config_mgr: crate::tier::tier::TierConfigMgr::new(),
+        event_notifier: crate::event_notification::EventNotifier::new(),
+        bucket_monitor: std::sync::OnceLock::new(),
+    });
+
+    let err = store
+        .init_and_start_rebalance(vec!["bucket".to_string()])
+        .await
+        .expect_err("second rebalance start should be rejected before metadata init");
+
+    assert!(matches!(err, Error::RebalanceAlreadyRunning));
 }
 
 #[test]

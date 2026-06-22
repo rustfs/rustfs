@@ -4,6 +4,7 @@ use super::meta::{
     merge_rebalance_meta, percent_free_ratio, rebalance_metadata_not_initialized_error, record_rebalance_cleanup_warning_in_meta,
     record_rebalance_stop_propagation_snapshot, resolve_next_rebalance_bucket, rollback_rebalance_start_meta_snapshot_for_id,
     should_accept_rebalance_stats_update, should_pool_participate, stop_rebalance_meta_snapshot_for_id,
+    validate_init_rebalance_state,
 };
 use super::worker::{
     rebalance_meta_lock_error, resolve_load_rebalance_stats_update_result, resolve_rebalance_meta_load_result,
@@ -252,6 +253,12 @@ impl ECStore {
     #[tracing::instrument(skip(self, bucktes))]
     pub async fn init_and_start_rebalance(self: &Arc<Self>, bucktes: Vec<String>) -> Result<String> {
         let _start_guard = self.start_gate.lock().await;
+
+        let decommission_running = self.is_decommission_running().await;
+        {
+            let rebalance_meta = self.rebalance_meta.read().await;
+            validate_init_rebalance_state(decommission_running, rebalance_meta.as_ref())?;
+        }
 
         let id = self.init_rebalance_meta(bucktes).await?;
         if let Err(start_err) = self.start_rebalance().await {
