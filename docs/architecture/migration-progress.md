@@ -5,17 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-rpc-s3-local-compat-consumers`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111`.
-- Based on: API-110 slice.
+- Branch: `overtrue/arch-admin-compat-relative-consumers`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112`.
+- Based on: API-111 slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: collapse crate-qualified storage RPC and S3 API local
+- Rust code changes: collapse crate-qualified admin handlers/service local
   compatibility consumer paths into relative `super::`/`super::super::` paths.
-- CI/script changes: guard selected storage RPC and S3 API local consumers
+- CI/script changes: guard selected admin handlers/service local consumers
   against crate-qualified compatibility paths.
-- Docs changes: record the API-111 relative storage RPC/S3 API local
-  compatibility consumer cleanup.
+- Docs changes: record the API-112 relative admin local compatibility consumer
+  cleanup.
 
 ## Phase 0 Tasks
 
@@ -582,6 +582,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     helper behavior.
   - Verification: RustFS test-target compile coverage, storage RPC/S3 API
     local compatibility consumer residual scan, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, pre-commit quality gate, and
+    three-expert review.
+- [x] `API-112` Collapse admin local compatibility consumers.
+  - Completed slice: replace crate-qualified admin handlers/service local
+    compatibility consumers with relative owner paths.
+  - Acceptance: selected admin handlers and service modules no longer point back
+    to local compatibility facades through crate-qualified paths; migration
+    rules reject regressions.
+  - Must preserve: admin route contracts, replication/config/rebalance/heal
+    handler behavior, service config reload behavior, and admin test coverage.
+  - Verification: RustFS test-target compile coverage, admin local
+    compatibility consumer residual scan, migration and layer guards,
     formatting, diff hygiene, Rust risk scan, pre-commit quality gate, and
     three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
@@ -3617,13 +3629,25 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-111 keeps selected storage RPC and S3 API local compatibility consumers owner-relative by replacing crate-qualified compatibility paths with scoped `super::` or `super::super::` paths. |
-| Migration preservation | pass | The new guard rejects crate-qualified storage RPC/S3 API local compatibility consumer paths while preserving the same facade names and aliases. |
-| Testing/verification | pass | Focused compile, storage RPC/S3 API local compatibility consumer residual scan, migration guard, layer guard, formatting, diff hygiene, risk scan, and full pre-commit passed. |
+| Quality/architecture | pass | API-112 keeps selected admin handlers/service local compatibility consumers owner-relative by replacing crate-qualified compatibility paths with scoped `super::` or `super::super::` paths. |
+| Migration preservation | pass | The new guard rejects crate-qualified admin handlers/service local compatibility consumer paths while preserving the same facade names and aliases. |
+| Testing/verification | pass | Focused compile, admin local compatibility consumer residual scan, migration guard, layer guard, formatting, diff hygiene, risk scan, and full pre-commit passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-112 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Admin local compatibility consumer residual scan: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-111 current slice:
   - `cargo check -p rustfs --tests`: passed.
