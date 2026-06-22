@@ -885,7 +885,7 @@ impl<A, B> PathDispatchService<A, B> {
     }
 
     fn is_internode_path(path: &str) -> bool {
-        path.starts_with(crate::server::RPC_PREFIX)
+        crate::server::has_path_prefix(path, crate::server::RPC_PREFIX)
     }
 }
 
@@ -1920,6 +1920,7 @@ mod tests {
         assert!(!PathDispatchService::<MarkerService, MarkerService>::is_internode_path(
             "/bucket/object.txt"
         ));
+        assert!(!PathDispatchService::<MarkerService, MarkerService>::is_internode_path("/rustfs/rpcx"));
         let _ = service;
     }
 }
