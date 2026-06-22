@@ -160,6 +160,11 @@ pub(crate) mod ecstore_storage {
 pub(crate) const BUCKET_ACCELERATE_CONFIG: &str = ecstore_bucket::metadata::BUCKET_ACCELERATE_CONFIG;
 pub(crate) const BUCKET_LOGGING_CONFIG: &str = ecstore_bucket::metadata::BUCKET_LOGGING_CONFIG;
 pub(crate) const BUCKET_REQUEST_PAYMENT_CONFIG: &str = ecstore_bucket::metadata::BUCKET_REQUEST_PAYMENT_CONFIG;
+pub(crate) const BUCKET_TABLE_CATALOG_META_PREFIX: &str = ecstore_bucket::metadata::BUCKET_TABLE_CATALOG_META_PREFIX;
+pub(crate) const BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX: &str =
+    ecstore_bucket::metadata::BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX;
+pub(crate) const BUCKET_TABLE_CONFIG: &str = ecstore_bucket::metadata::BUCKET_TABLE_CONFIG;
+pub(crate) const BUCKET_TABLE_RESERVED_PREFIX: &str = ecstore_bucket::metadata::BUCKET_TABLE_RESERVED_PREFIX;
 pub(crate) const BUCKET_VERSIONING_CONFIG: &str = ecstore_bucket::metadata::BUCKET_VERSIONING_CONFIG;
 pub(crate) const BUCKET_WEBSITE_CONFIG: &str = ecstore_bucket::metadata::BUCKET_WEBSITE_CONFIG;
 pub(crate) const DEFAULT_READ_BUFFER_SIZE: usize = ecstore_set_disk::DEFAULT_READ_BUFFER_SIZE;
@@ -168,6 +173,7 @@ pub(crate) const PEER_RESTSIGNAL: &str = ecstore_rpc::PEER_RESTSIGNAL;
 pub(crate) const PEER_RESTSUB_SYS: &str = ecstore_rpc::PEER_RESTSUB_SYS;
 pub(crate) const SERVICE_SIGNAL_REFRESH_CONFIG: u64 = ecstore_rpc::SERVICE_SIGNAL_REFRESH_CONFIG;
 pub(crate) const SERVICE_SIGNAL_RELOAD_DYNAMIC: u64 = ecstore_rpc::SERVICE_SIGNAL_RELOAD_DYNAMIC;
+pub(crate) const RUSTFS_META_BUCKET: &str = ecstore_disk::RUSTFS_META_BUCKET;
 pub(crate) const TONIC_RPC_PREFIX: &str = ecstore_rpc::TONIC_RPC_PREFIX;
 #[cfg(test)]
 pub(crate) const STORAGE_CLASS_SUB_SYS: &str = ecstore_config::com::STORAGE_CLASS_SUB_SYS;
@@ -184,6 +190,8 @@ pub(crate) type DiskInfo = ecstore_disk::DiskInfo;
 pub(crate) type DiskInfoOptions = ecstore_disk::DiskInfoOptions;
 pub(crate) type DiskResult<T> = ecstore_disk::error::Result<T>;
 pub(crate) type DiskStore = ecstore_disk::DiskStore;
+#[cfg(test)]
+pub(crate) type DisksLayout = ecstore_layout::DisksLayout;
 pub(crate) type DynReplicationPool = ecstore_bucket::replication::DynReplicationPool;
 pub(crate) type ECStore = ecstore_storage::ECStore;
 pub(crate) type Endpoint = ecstore_disk::endpoint::Endpoint;
@@ -231,6 +239,10 @@ pub(crate) async fn get_bucket_notification_config(bucket: &str) -> Result<Optio
     ecstore_bucket::metadata_sys::get_notification_config(bucket).await
 }
 
+pub(crate) async fn init_bucket_metadata_sys(api: Arc<ECStore>, buckets: Vec<String>) {
+    ecstore_bucket::metadata_sys::init_bucket_metadata_sys(api, buckets).await;
+}
+
 pub(crate) fn bucket_metadata_runtime_initialized() -> bool {
     ecstore_bucket::metadata_sys::get_global_bucket_metadata_sys().is_some()
 }
@@ -245,6 +257,14 @@ pub(crate) fn disk_endpoint(disk: &DiskStore) -> String {
 
 pub(crate) fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
     ecstore_bucket::replication::get_global_replication_pool()
+}
+
+pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>) {
+    ecstore_bucket::migration::try_migrate_bucket_metadata(store).await;
+}
+
+pub(crate) async fn try_migrate_iam_config(store: Arc<ECStore>) {
+    ecstore_bucket::migration::try_migrate_iam_config(store).await;
 }
 
 pub(crate) fn init_ecstore_config() {
@@ -287,6 +307,10 @@ pub(crate) fn replication_queue_current_count() -> Option<i64> {
 
 pub(crate) async fn save_config(api: Arc<ECStore>, file: &str, data: Vec<u8>) -> Result<()> {
     ecstore_config::com::save_config(api, file, data).await
+}
+
+pub(crate) fn shutdown_background_services() {
+    ecstore_global::shutdown_background_services();
 }
 
 pub(crate) fn set_global_endpoints(endpoints: Vec<PoolEndpoints>) {
@@ -766,6 +790,18 @@ pub(crate) async fn collect_local_metrics(
 
 pub(crate) fn verify_rpc_signature(url: &str, method: &http::Method, headers: &http::HeaderMap) -> std::io::Result<()> {
     ecstore_rpc::verify_rpc_signature(url, method, headers)
+}
+
+pub(crate) fn to_s3s_etag(etag: &str) -> s3s::dto::ETag {
+    ecstore_client::object_api_utils::to_s3s_etag(etag)
+}
+
+pub(crate) fn table_catalog_path_hash(value: &str) -> String {
+    ecstore_bucket::metadata::table_catalog_path_hash(value)
+}
+
+pub(crate) fn get_lock_acquire_timeout() -> std::time::Duration {
+    ecstore_set_disk::get_lock_acquire_timeout()
 }
 
 pub(crate) fn register_event_dispatch_hook<F>(hook: F) -> bool

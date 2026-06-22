@@ -13,8 +13,7 @@
 // limitations under the License.
 
 use crate::storage::{
-    ECStore,
-    ecstore_bucket::{metadata_sys as ecstore_metadata_sys, migration as ecstore_migration, replication as ecstore_replication},
+    ECStore, get_global_replication_pool, init_bucket_metadata_sys, try_migrate_bucket_metadata, try_migrate_iam_config,
 };
 use rustfs_storage_api::{BucketOperations, BucketOptions};
 use std::{
@@ -34,9 +33,9 @@ pub(crate) async fn init_embedded_bucket_metadata_runtime(store: Arc<ECStore>) -
 
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
-    ecstore_migration::try_migrate_bucket_metadata(store.clone()).await;
-    ecstore_metadata_sys::init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
-    ecstore_migration::try_migrate_iam_config(store).await;
+    try_migrate_bucket_metadata(store.clone()).await;
+    init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
+    try_migrate_iam_config(store).await;
 
     Ok(buckets)
 }
@@ -52,14 +51,14 @@ pub(crate) async fn init_bucket_metadata_runtime(store: Arc<ECStore>, ctx: Cance
 
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
-    ecstore_migration::try_migrate_bucket_metadata(store.clone()).await;
+    try_migrate_bucket_metadata(store.clone()).await;
 
-    if let Some(pool) = ecstore_replication::get_global_replication_pool() {
+    if let Some(pool) = get_global_replication_pool() {
         pool.init_resync(ctx, buckets.clone()).await?;
     }
 
-    ecstore_migration::try_migrate_iam_config(store.clone()).await;
-    ecstore_metadata_sys::init_bucket_metadata_sys(store, buckets.clone()).await;
+    try_migrate_iam_config(store.clone()).await;
+    init_bucket_metadata_sys(store, buckets.clone()).await;
 
     Ok(buckets)
 }
