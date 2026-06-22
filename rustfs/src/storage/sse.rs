@@ -867,17 +867,18 @@ fn canonical_sse_path(bucket: &str, object: &str) -> String {
 }
 
 #[cfg(feature = "rio-v2")]
-fn derive_object_key(external_key: [u8; 32]) -> [u8; 32] {
+fn derive_object_key(external_key: [u8; 32]) -> Result<[u8; 32], ApiError> {
     let mut random = [0u8; 32];
     rand::rng().fill(&mut random);
 
-    let mut mac = HmacSha256::new_from_slice(&external_key).expect("32-byte HMAC key");
+    let mut mac = HmacSha256::new_from_slice(&external_key)
+        .map_err(|err| ApiError::from(StorageError::other(format!("Invalid HMAC key for object-key derivation: {err}"))))?;
     mac.update(OBJECT_KEY_DERIVATION_CONTEXT);
     mac.update(&random);
 
     let mut object_key = [0u8; 32];
     object_key.copy_from_slice(mac.finalize().into_bytes().as_slice());
-    object_key
+    Ok(object_key)
 }
 
 #[cfg(feature = "rio-v2")]
@@ -887,8 +888,9 @@ fn derive_sealing_key(
     domain: &str,
     bucket: &str,
     object: &str,
-) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(&external_key).expect("32-byte HMAC key");
+) -> Result<[u8; 32], ApiError> {
+    let mut mac = HmacSha256::new_from_slice(&external_key)
+        .map_err(|err| ApiError::from(StorageError::other(format!("Invalid HMAC key for sealing-key derivation: {err}"))))?;
     mac.update(&iv);
     mac.update(domain.as_bytes());
     mac.update(MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.as_bytes());
@@ -896,7 +898,7 @@ fn derive_sealing_key(
 
     let mut sealing_key = [0u8; 32];
     sealing_key.copy_from_slice(mac.finalize().into_bytes().as_slice());
-    sealing_key
+    Ok(sealing_key)
 }
 
 #[cfg(feature = "rio-v2")]
@@ -909,7 +911,7 @@ fn seal_object_key(
 ) -> Result<ManagedSealedKey, ApiError> {
     let mut iv = [0u8; SEALED_KEY_IV_SIZE];
     rand::rng().fill(&mut iv);
-    let sealing_key = derive_sealing_key(external_key, iv, managed_sse_domain(sse_type), bucket, object);
+    let sealing_key = derive_sealing_key(external_key, iv, managed_sse_domain(sse_type), bucket, object)?;
 
     let mut header = [0u8; DARE_HEADER_SIZE];
     header[0] = DARE_VERSION_20;
@@ -957,7 +959,7 @@ fn unseal_object_key(
         return Err(ApiError::from(StorageError::other("Invalid sealed object-key payload header")));
     }
 
-    let sealing_key = derive_sealing_key(external_key, sealed.iv, managed_sse_domain(sse_type), bucket, object);
+    let sealing_key = derive_sealing_key(external_key, sealed.iv, managed_sse_domain(sse_type), bucket, object)?;
     let plaintext = decrypt_sealed_object_key_payload(sealing_key, header, &sealed.sealed_key)?;
 
     let object_key: [u8; 32] = plaintext
@@ -1557,7 +1559,7 @@ async fn apply_managed_encryption_material(
     let algorithm = server_side_encryption.as_str().to_string();
     #[cfg(feature = "rio-v2")]
     let (key_bytes, base_nonce, key_kind, managed_sealed_key) = {
-        let object_key = derive_object_key(data_key.plaintext_key);
+        let object_key = derive_object_key(data_key.plaintext_key)?;
         let sealed_key = seal_object_key(object_key, data_key.plaintext_key, encryption_type, bucket, key)?;
         (object_key, [0u8; 12], EncryptionKeyKind::Object, Some(sealed_key))
     };
