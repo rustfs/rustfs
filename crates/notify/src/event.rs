@@ -133,6 +133,7 @@ pub struct Event {
     /// The AWS region where the event occurred
     pub aws_region: String,
     /// The time when the event occurred
+    #[serde(serialize_with = "serialize_event_time_millis")]
     pub event_time: DateTime<Utc>,
     /// The name of the event
     pub event_name: EventName,
@@ -307,6 +308,13 @@ impl Event {
             },
         }
     }
+}
+
+fn serialize_event_time_millis<S>(value: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&value.to_rfc3339_opts(SecondsFormat::Millis, true))
 }
 
 fn initialize_response_elements(elements: &mut HashMap<String, String>, keys: &[&str]) {
@@ -527,6 +535,15 @@ mod tests {
         let glacier = event.glacier_event_data.expect("glacier event data should be present");
         assert_eq!(glacier.restore_event_data.lifecycle_restoration_expiry_time, "2023-11-14T22:13:20.000Z");
         assert_eq!(glacier.restore_event_data.lifecycle_restore_storage_class, "GLACIER");
+    }
+
+    #[test]
+    fn event_time_serializes_with_millisecond_precision() {
+        let mut event = Event::new_test_event("bucket", "key", EventName::ObjectCreatedPut);
+        event.event_time = DateTime::<Utc>::from_timestamp(1_711_423_698, 870_816_000).expect("timestamp should be valid");
+
+        let json = serde_json::to_value(&event).expect("event should serialize");
+        assert_eq!(json.get("eventTime").and_then(|value| value.as_str()), Some("2024-03-26T03:28:18.870Z"));
     }
 }
 

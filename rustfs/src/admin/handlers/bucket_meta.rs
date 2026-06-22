@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::handlers::storage_compat::utils::{deserialize, serialize};
-use crate::admin::handlers::storage_compat::{
+use super::storage_compat::utils::{deserialize, serialize};
+use super::storage_compat::{
     StorageError,
     metadata::{
         BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE,

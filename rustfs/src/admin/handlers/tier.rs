@@ -13,8 +13,8 @@
 // limitations under the License.
 #![allow(unused_variables, unused_mut, unused_must_use)]
 
-use crate::admin::handlers::storage_compat::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState;
-use crate::admin::handlers::storage_compat::{
+use super::storage_compat::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState;
+use super::storage_compat::{
     AdminError, DailyAllTierStats, ERR_TIER_ALREADY_EXISTS, ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY,
     ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_MISSING_CREDENTIALS, ERR_TIER_NAME_NOT_UPPERCASE,
     ERR_TIER_NOT_FOUND, TierConfig, TierCreds, TierType, get_global_notification_sys, storageclass,
@@ -930,8 +930,8 @@ impl Operation for ClearTier {
 
 #[cfg(test)]
 mod tests {
+    use super::super::storage_compat::lifecycle::tier_last_day_stats::LastDayTierStats;
     use super::*;
-    use crate::admin::handlers::storage_compat::lifecycle::tier_last_day_stats::LastDayTierStats;
     use http::Uri;
     use matchit::Router;
 
