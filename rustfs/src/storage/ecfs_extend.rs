@@ -17,7 +17,8 @@ use super::{
     StorageError, add_object_lock_years, get_bucket_cors_config, get_bucket_object_lock_config, get_bucket_replication_config,
     resolve_object_store_handle,
 };
-use crate::config::{RustFSBufferConfig, WorkloadProfile, get_global_buffer_config, is_buffer_profile_enabled};
+use crate::app::context::resolve_buffer_config;
+use crate::config::{RustFSBufferConfig, WorkloadProfile, is_buffer_profile_enabled};
 use crate::error::ApiError;
 use crate::server::cors;
 use crate::storage::ecfs::ListObjectUnorderedQuery;
@@ -261,8 +262,8 @@ pub(crate) fn get_adaptive_buffer_size_with_profile(file_size: i64, profile: Opt
 /// ```
 pub(crate) fn get_buffer_size_opt_in(file_size: i64) -> usize {
     let buffer_size = if is_buffer_profile_enabled() {
-        // Use globally configured workload profile (enabled by default in Phase 3)
-        let config = get_global_buffer_config();
+        // Use the AppContext-owned profile when available, with global fallback during migration.
+        let config = resolve_buffer_config();
         config.get_buffer_size(file_size)
     } else {
         // Opt-out mode: Use GeneralPurpose profile for consistent behavior

@@ -5,14 +5,14 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-app-notify-compat-boundaries`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154`.
-- Based on: `overtrue/arch-test-fuzz-ecstore-thin-bridges` after API-154.
-- PR type for this branch: `pure-move`
+- Branch: `overtrue/arch-app-context-runtime-resolvers`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155`.
+- Based on: `overtrue/arch-app-notify-compat-boundaries` after API-155.
+- PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: remove the app context resolver compatibility module and
-  notify event-bridge re-export module, keeping their public symbols at the
-  owner roots.
+- Rust code changes: route selected KMS readiness, notification, and buffer
+  profile consumers through AppContext resolver helpers with legacy global
+  fallback.
 - CI/script changes: lock completed owner and test/fuzz boundaries against
   bare/glob imports, scattered raw ECStore facade subpaths, and startup
   runtime/root-server/table/S3/app shared/app bucket/app ECStore/admin facade
@@ -20,7 +20,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   ECStore compatibility bypasses, plus runtime crate, owner crate, test/fuzz,
   and storage owner thin bridge regressions, plus app context and notify
   event-bridge thin module regressions.
-- Docs changes: record the API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155 owner facade cleanup.
+- Docs changes: record the API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156 owner facade cleanup.
 
 ## Phase 0 Tasks
 
@@ -4247,9 +4247,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     syntax check, formatting, diff hygiene, Rust risk scan, branch freshness
     check, pre-commit, and three-expert review.
 
+- [x] `API-156` Route app runtime consumers through AppContext resolvers.
+  - Do: add notify and buffer profile resolver helpers, route bucket/object
+    notification users through the notify resolver, route ECFS buffer sizing
+    through the buffer resolver, and route public health KMS readiness through
+    the KMS runtime resolver.
+  - Acceptance: selected app/server/storage consumers no longer open-code
+    direct global notifier, buffer config, or KMS service manager fallback when
+    an AppContext resolver already owns the migration boundary.
+  - Must preserve: context-first behavior when an AppContext exists, legacy
+    global fallback when it does not, notification delivery semantics, buffer
+    opt-in behavior, and public health readiness behavior.
+  - Verification: RustFS compile coverage, migration guard, shell syntax check,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit, and three-expert review.
+
 ## Next PRs
 
-1. `pure-move`: continue pruning remaining facade compatibility and owner boundaries.
+1. `consumer-migration`: continue reducing direct global reads behind AppContext resolver boundaries.
 
 ## Pre-Push Review Log
 
@@ -4267,10 +4282,27 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 | Quality/architecture | pass | API-155 removes app context and notify thin compatibility modules while keeping owner-root exports. |
 | Migration preservation | pass | AppContext resolver precedence and notify pipeline public aliases keep the same public call paths. |
 | Testing/verification | pass | RustFS/notify focused compile, targeted tests, formatting, migration guard, shell syntax, diff hygiene, bridge scan, Rust risk scan, and pre-commit passed for API-155. |
+| Quality/architecture | pass | API-156 centralizes selected app/server/storage runtime fallbacks behind AppContext resolver helpers without adding new abstractions. |
+| Migration preservation | pass | KMS readiness, notification dispatch, and ECFS buffer sizing keep existing global fallback semantics when no AppContext is available. |
+| Testing/verification | pass | RustFS focused compile, formatting, migration guard, shell syntax, diff hygiene, Rust risk scan, and pre-commit passed for API-156. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-156 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - AppContext runtime resolver scan: passed; selected bucket/object notify,
+    ECFS buffer sizing, and public health KMS readiness consumers use resolver
+    helpers.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or
+    cast risks added.
 
 - Issue #660 API-155 current slice:
   - `cargo check --tests -p rustfs -p rustfs-notify`: passed.

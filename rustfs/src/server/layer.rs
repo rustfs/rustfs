@@ -14,6 +14,7 @@
 
 use crate::admin::console::is_console_path;
 use crate::admin::handlers::health::{HealthProbe, build_health_response_parts};
+use crate::app::context::resolve_kms_runtime_service_manager;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::server::cors;
@@ -903,7 +904,7 @@ fn is_public_health_endpoint_request(method: &Method, path: &str) -> bool {
 }
 
 async fn health_kms_ready() -> bool {
-    let Some(service_manager) = rustfs_kms::get_global_kms_service_manager() else {
+    let Some(service_manager) = resolve_kms_runtime_service_manager() else {
         return true;
     };
 
