@@ -13,17 +13,14 @@
 // limitations under the License.
 
 use crate::{
-    Event, NotificationError,
-    registry::TargetRegistry,
-    rule_engine::NotifyRuleEngine,
-    runtime_facade::NotifyRuntimeFacade,
-    storage_compat::{self, NotifyConfigStoreError},
+    Event, NotificationError, registry::TargetRegistry, rule_engine::NotifyRuleEngine, runtime_facade::NotifyRuntimeFacade,
 };
 use rustfs_config::notify::{
     NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_SUB_SYS, NOTIFY_NATS_SUB_SYS,
     NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_REDIS_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::server_config::{Config, KVS};
+use rustfs_ecstore::api::{config as ecstore_config, global as ecstore_global, storage as ecstore_storage};
 use rustfs_targets::{Target, arn::TargetID};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -33,6 +30,50 @@ const LOG_COMPONENT_NOTIFY: &str = "notify";
 const LOG_SUBSYSTEM_CONFIG: &str = "config";
 const EVENT_NOTIFY_RUNTIME_LIFECYCLE: &str = "notify_runtime_lifecycle";
 const EVENT_NOTIFY_CONFIG_UPDATE: &str = "notify_config_update";
+
+type NotifyStore = ecstore_storage::ECStore;
+
+#[derive(Debug)]
+enum NotifyConfigStoreError {
+    StorageNotAvailable,
+    Read(String),
+    Save(String),
+}
+
+async fn update_server_config<F>(mut modifier: F) -> Result<Option<Config>, NotifyConfigStoreError>
+where
+    F: FnMut(&mut Config) -> bool,
+{
+    let Some(store) = resolve_notify_object_store_handle() else {
+        return Err(NotifyConfigStoreError::StorageNotAvailable);
+    };
+
+    let mut new_config = read_notify_server_config_without_migrate(store.clone()).await?;
+
+    if !modifier(&mut new_config) {
+        return Ok(None);
+    }
+
+    save_notify_server_config(store, &new_config).await?;
+
+    Ok(Some(new_config))
+}
+
+fn resolve_notify_object_store_handle() -> Option<Arc<NotifyStore>> {
+    ecstore_global::resolve_object_store_handle()
+}
+
+async fn read_notify_server_config_without_migrate(store: Arc<NotifyStore>) -> Result<Config, NotifyConfigStoreError> {
+    ecstore_config::com::read_config_without_migrate(store)
+        .await
+        .map_err(|err| NotifyConfigStoreError::Read(err.to_string()))
+}
+
+async fn save_notify_server_config(store: Arc<NotifyStore>, config: &Config) -> Result<(), NotifyConfigStoreError> {
+    ecstore_config::com::save_server_config(store, config)
+        .await
+        .map_err(|err| NotifyConfigStoreError::Save(err.to_string()))
+}
 
 pub(crate) fn notify_configuration_hint() -> String {
     let webhook_enable_primary = format!("{}_PRIMARY", rustfs_config::notify::ENV_NOTIFY_WEBHOOK_ENABLE);
@@ -320,15 +361,13 @@ impl NotifyConfigManager {
     where
         F: FnMut(&mut Config) -> bool,
     {
-        let Some(new_config) = storage_compat::update_server_config(&mut modifier)
-            .await
-            .map_err(|err| match err {
-                NotifyConfigStoreError::StorageNotAvailable => NotificationError::StorageNotAvailable(
-                    "Failed to save target configuration: server storage not initialized".to_string(),
-                ),
-                NotifyConfigStoreError::Read(err) => NotificationError::ReadConfig(err),
-                NotifyConfigStoreError::Save(err) => NotificationError::SaveConfig(err),
-            })?
+        let Some(new_config) = update_server_config(&mut modifier).await.map_err(|err| match err {
+            NotifyConfigStoreError::StorageNotAvailable => NotificationError::StorageNotAvailable(
+                "Failed to save target configuration: server storage not initialized".to_string(),
+            ),
+            NotifyConfigStoreError::Read(err) => NotificationError::ReadConfig(err),
+            NotifyConfigStoreError::Save(err) => NotificationError::SaveConfig(err),
+        })?
         else {
             debug!(
                 event = EVENT_NOTIFY_CONFIG_UPDATE,

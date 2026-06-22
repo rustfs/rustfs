@@ -13,7 +13,6 @@
 // limitations under the License.
 
 mod reliant;
-mod storage_compat;
 
 // Common utilities for all E2E tests
 #[cfg(test)]
