@@ -1062,7 +1062,7 @@ fi
   rg -n --with-filename 'rustfs_ecstore::api::[a-z_]+::' rustfs/src crates fuzz \
     --glob '*.rs' \
     --glob '!crates/ecstore/**' |
-    rg -v '^(crates/notify/src/lib\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/lib\.rs):' || true
+    rg -v '^(crates/notify/src/lib\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/lib\.rs|crates/scanner/src/lib\.rs):' || true
 ) >"$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE"
 
 if [[ -s "$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE" ]]; then
@@ -1074,7 +1074,8 @@ fi
   rg -n --with-filename '^(?:pub\(crate\) )?use rustfs_ecstore::api::[a-z_]+ as ecstore_[a-z_]+;' \
     crates/notify/src/lib.rs \
     crates/protocols/src/swift/mod.rs \
-    crates/s3select-api/src/lib.rs || true
+    crates/s3select-api/src/lib.rs \
+    crates/scanner/src/lib.rs || true
 ) >"$COMPLETED_EXTERNAL_OWNER_MODULE_ALIAS_HITS_FILE"
 
 if [[ -s "$COMPLETED_EXTERNAL_OWNER_MODULE_ALIAS_HITS_FILE" ]]; then
