@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use crate::app::storage_compat::{
+pub(crate) use super::super::storage_compat::{
     ECStore, EndpointServerPools, TierConfigMgr, get_global_endpoints_opt, get_global_region, get_global_tier_config_mgr,
     new_object_layer_fn, set_object_store_resolver,
 };
 
 pub(crate) mod metadata_sys {
-    pub(crate) use crate::app::storage_compat::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
+    pub(crate) use super::super::super::storage_compat::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
 }
 
 #[cfg(test)]
-pub(crate) use crate::app::storage_compat::{Endpoint, Endpoints, PoolEndpoints, init_local_disks};
+pub(crate) use super::super::storage_compat::{Endpoint, Endpoints, PoolEndpoints, init_local_disks};
