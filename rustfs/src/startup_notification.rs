@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::init::add_bucket_notification_configuration;
-use crate::storage::{ecstore_error, ecstore_layout::EndpointServerPools, ecstore_notification};
+use crate::storage::{EndpointServerPools, Result as StorageResult, new_global_notification_sys};
 use std::{
     future::Future,
     io::{Error, Result},
@@ -50,14 +50,14 @@ pub(crate) async fn init_notification_runtime(endpoint_pools: EndpointServerPool
     })
 }
 
-pub(crate) async fn init_notification_system(endpoint_pools: EndpointServerPools) -> ecstore_error::Result<()> {
-    init_notification_system_with(|| ecstore_notification::new_global_notification_sys(endpoint_pools)).await
+pub(crate) async fn init_notification_system(endpoint_pools: EndpointServerPools) -> StorageResult<()> {
+    init_notification_system_with(|| new_global_notification_sys(endpoint_pools)).await
 }
 
-async fn init_notification_system_with<InitFn, InitFuture>(init_notification: InitFn) -> ecstore_error::Result<()>
+async fn init_notification_system_with<InitFn, InitFuture>(init_notification: InitFn) -> StorageResult<()>
 where
     InitFn: FnOnce() -> InitFuture,
-    InitFuture: Future<Output = ecstore_error::Result<()>>,
+    InitFuture: Future<Output = StorageResult<()>>,
 {
     init_notification().await
 }
@@ -76,7 +76,7 @@ fn log_embedded_optional_service_skipped(service: &str, err: impl std::fmt::Disp
 #[cfg(test)]
 mod tests {
     use super::init_notification_system_with;
-    use crate::storage::ecstore_error::Error as EcstoreError;
+    use crate::storage::Error as EcstoreError;
 
     #[tokio::test]
     async fn notification_system_returns_source_error() {

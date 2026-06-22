@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::api::disk::{DiskStore, endpoint::Endpoint};
+mod ecstore_test_compat;
+
+use ecstore_test_compat::{DiskStore, Endpoint};
 use rustfs_heal::heal::{
     event::{HealEvent, Severity},
     task::{HealPriority, HealType},

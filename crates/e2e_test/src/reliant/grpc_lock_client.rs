@@ -15,8 +15,10 @@
 // Used by test_distributed_lock_4_nodes_grpc in lock.rs
 #![allow(dead_code)]
 
+use crate::ecstore_test_compat::{
+    E2eTonicInterceptor as TonicInterceptor, e2e_node_service_time_out_client_no_auth as node_service_time_out_client_no_auth,
+};
 use async_trait::async_trait;
-use rustfs_ecstore::api::rpc::{TonicInterceptor, node_service_time_out_client_no_auth};
 use rustfs_lock::{
     LockClient, LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats, LockStatus, LockType, Result,
     types::{LockMetadata, LockPriority},

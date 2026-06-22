@@ -14,13 +14,12 @@
 
 use crate::server::{ServiceState, ServiceStateManager};
 use crate::server::{has_path_prefix, is_table_catalog_path};
-#[cfg(test)]
-use crate::storage::ecstore_layout::{Endpoints, PoolEndpoints};
 use crate::storage::{
-    ecstore_disk::endpoint::Endpoint,
-    ecstore_global::{get_global_endpoints_opt, get_global_lock_clients, is_dist_erasure, resolve_object_store_handle},
-    ecstore_layout::EndpointServerPools,
+    Endpoint, EndpointServerPools, get_global_endpoints_opt, get_global_lock_clients, is_dist_erasure,
+    resolve_object_store_handle,
 };
+#[cfg(test)]
+use crate::storage::{Endpoints, PoolEndpoints};
 use bytes::Bytes;
 use http::{Request as HttpRequest, Response, StatusCode};
 use http_body::Body;
