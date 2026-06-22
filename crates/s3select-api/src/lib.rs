@@ -16,6 +16,11 @@ use datafusion::{common::DataFusionError, sql::sqlparser::parser::ParserError};
 use snafu::{Backtrace, Location, Snafu};
 use std::fmt::Display;
 
+pub(crate) use rustfs_ecstore::api::error as ecstore_error;
+pub(crate) use rustfs_ecstore::api::global as ecstore_global;
+pub(crate) use rustfs_ecstore::api::set_disk as ecstore_set_disk;
+pub(crate) use rustfs_ecstore::api::storage as ecstore_storage;
+
 pub mod object_store;
 pub mod query;
 pub mod server;

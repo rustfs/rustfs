@@ -35,9 +35,10 @@
 
 use std::sync::Arc;
 
-use rustfs_ecstore::api::{
-    bucket as ecstore_bucket, error as ecstore_error, global as ecstore_global, storage as ecstore_storage,
-};
+use rustfs_ecstore::api::bucket as ecstore_bucket;
+use rustfs_ecstore::api::error as ecstore_error;
+use rustfs_ecstore::api::global as ecstore_global;
+use rustfs_ecstore::api::storage as ecstore_storage;
 
 pub mod account;
 pub mod acl;
