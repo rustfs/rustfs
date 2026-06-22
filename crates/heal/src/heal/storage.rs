@@ -23,8 +23,8 @@ use rustfs_storage_api::{
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
-use super::storage_compat::{DiskStore, ECStore, Endpoint, StorageError};
-pub use super::storage_compat::{HealObjectInfo, HealObjectOptions, HealPutObjReader};
+use super::{DiskStore, ECStore, Endpoint, StorageError};
+pub use super::{HealObjectInfo, HealObjectOptions, HealPutObjReader};
 
 const LOG_COMPONENT_HEAL: &str = "heal";
 const LOG_SUBSYSTEM_STORAGE: &str = "storage";
@@ -1232,7 +1232,7 @@ impl HealStorageAPI for ECStoreHealStorage {
 
 #[cfg(test)]
 mod tests {
-    use super::super::storage_compat::StorageError;
+    use super::super::StorageError;
     use super::{is_transient_object_exists_error, is_transient_object_exists_message};
 
     #[test]

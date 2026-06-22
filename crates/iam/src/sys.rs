@@ -12,10 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::storage_compat::{
-    notify_iam_delete_policy, notify_iam_delete_service_account, notify_iam_delete_user, notify_iam_load_group,
-    notify_iam_load_policy, notify_iam_load_policy_mapping, notify_iam_load_service_account, notify_iam_load_user,
-};
 use crate::error::Error as IamError;
 use crate::error::is_err_no_such_account;
 use crate::error::is_err_no_such_temp_account;
@@ -28,6 +24,10 @@ use crate::store::MappedPolicy;
 use crate::store::Store;
 use crate::store::UserType;
 use crate::utils::{extract_claims, extract_claims_allow_missing_exp};
+use crate::{
+    notify_iam_delete_policy, notify_iam_delete_service_account, notify_iam_delete_user, notify_iam_load_group,
+    notify_iam_load_policy, notify_iam_load_policy_mapping, notify_iam_load_service_account, notify_iam_load_user,
+};
 use rustfs_credentials::{Credentials, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, get_global_action_cred};
 use rustfs_madmin::AddOrUpdateUserReq;
 use rustfs_madmin::GroupDesc;

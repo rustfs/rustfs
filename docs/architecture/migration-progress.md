@@ -5,17 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-standalone-thin-compat-cleanup`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124`.
-- Based on: API-124 slice.
+- Branch: `overtrue/arch-external-owner-compat-cleanup`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126`.
+- Based on: API-126 slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: remove standalone thin storage compatibility bridges from
-  e2e, IAM store, notify, OBS, Swift, and S3 Select, then route their consumers
-  directly to ECStore API owner modules.
-- CI/script changes: allow migrated standalone consumers to import owner APIs
-  directly and reject reintroduced bridge modules.
-- Docs changes: record the API-125/API-126 standalone bridge cleanup.
+- Rust code changes: remove external owner storage compatibility bridges from
+  IAM root, heal, and scanner, then route their consumers directly through
+  owner API definitions.
+- CI/script changes: allow migrated owner roots to import ECStore facade APIs
+  directly and reject reintroduced IAM/heal/scanner bridge modules.
+- Docs changes: record the API-127 external owner bridge cleanup.
 
 ## Phase 0 Tasks
 
@@ -778,6 +778,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: affected crate compile coverage, remaining standalone bridge
     residual scan, migration and layer guards, formatting, diff hygiene, Rust
     risk scan, and three-expert review.
+- [x] `API-127` Remove external owner compatibility bridges.
+  - Completed slice: move IAM root, heal, and scanner bridge contracts into
+    their owner modules, delete their local `storage_compat.rs` bridge modules,
+    and update consumers to import owner APIs directly.
+  - Acceptance: IAM root, heal, and scanner no longer route through local
+    storage compatibility bridges; migration rules reject deleted files, module
+    declarations, or bridge consumers.
+  - Must preserve: IAM config object IO and notification wrappers, heal disk
+    extension behavior and object aliases, scanner lifecycle/replication/disk
+    wrappers, data-usage persistence, and scanner object IO contracts.
+  - Verification: focused IAM/heal/scanner compile coverage, external owner
+    bridge residual scan, migration and layer guards, formatting, diff hygiene,
+    Rust risk scan, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3811,13 +3824,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-125/API-126 remove only standalone thin bridge modules and keep call sites on explicit owner APIs. |
-| Migration preservation | pass | The migration guard now rejects the deleted e2e, IAM-store, notify, OBS, Swift, and S3 Select bridge files, module declarations, and bridge consumers. |
-| Testing/verification | pass | Affected crate compile, residual scan, migration guard, layer guard, formatting, diff hygiene, and diff-only Rust risk scan passed. |
+| Quality/architecture | pass | API-127 removes only external owner bridge modules and keeps call sites on explicit owner APIs. |
+| Migration preservation | pass | The migration guard now rejects deleted IAM-root, heal, and scanner bridge files, module declarations, and bridge consumers. |
+| Testing/verification | pass | Focused IAM/heal/scanner compile, residual scan, migration guard, layer guard, formatting, diff hygiene, and diff-only Rust risk scan passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-127 current slice:
+  - `cargo check --tests -p rustfs-iam -p rustfs-heal -p rustfs-scanner`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - External owner compatibility bridge residual scan: passed.
+  - Rust risk scan: diff-only scan found no new unwrap/expect, numeric casts,
+    string-error public APIs, boxed public errors, println/eprintln, or relaxed
+    ordering.
 
 - Issue #660 API-126 current slice:
   - `cargo check --tests -p e2e_test -p rustfs-iam -p rustfs-notify -p rustfs-obs -p rustfs-protocols -p rustfs-s3select-api`: passed.
