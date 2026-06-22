@@ -1,7 +1,9 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use rustfs_ecstore::api::bucket as ecstore_bucket;
+use rustfs_ecstore::api::bucket::utils::{
+    check_bucket_and_object_names, check_list_objs_args, check_valid_bucket_name_strict, is_meta_bucketname,
+};
 
 fn parse_case(data: &[u8]) -> (String, String) {
     let text = String::from_utf8_lossy(data);
@@ -22,10 +24,10 @@ fn looks_like_ipv4(text: &str) -> bool {
 fuzz_target!(|data: &[u8]| {
     let (bucket, object) = parse_case(data);
 
-    let strict_bucket_ok = ecstore_bucket::utils::check_valid_bucket_name_strict(&bucket).is_ok();
-    let valid_bucket_for_object_ops = strict_bucket_ok || ecstore_bucket::utils::is_meta_bucketname(&bucket);
-    let pair_ok = ecstore_bucket::utils::check_bucket_and_object_names(&bucket, &object).is_ok();
-    let list_ok = ecstore_bucket::utils::check_list_objs_args(&bucket, &object, &None).is_ok();
+    let strict_bucket_ok = check_valid_bucket_name_strict(&bucket).is_ok();
+    let valid_bucket_for_object_ops = strict_bucket_ok || is_meta_bucketname(&bucket);
+    let pair_ok = check_bucket_and_object_names(&bucket, &object).is_ok();
+    let list_ok = check_list_objs_args(&bucket, &object, &None).is_ok();
 
     if strict_bucket_ok {
         let trimmed = bucket.trim();
