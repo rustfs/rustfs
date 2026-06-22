@@ -101,6 +101,7 @@ ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_sel
 RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE="${TMP_DIR}/rustfs_local_compat_owner_self_path_hits.txt"
 RUSTFS_ROOT_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_compat_relative_consumer_hits.txt"
 RUSTFS_STORAGE_CORE_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_core_compat_relative_consumer_hits.txt"
+RUSTFS_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_local_compat_relative_consumer_hits.txt"
 SCANNER_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/scanner_bucket_storage_compat_module_hits.txt"
 NOTIFY_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/notify_storage_compat_module_hits.txt"
 OBS_STORAGE_COMPAT_PASSTHROUGH_HITS_FILE="${TMP_DIR}/obs_storage_compat_passthrough_hits.txt"
@@ -1080,6 +1081,22 @@ fi
 
 if [[ -s "$RUSTFS_STORAGE_CORE_COMPAT_RELATIVE_CONSUMER_HITS_FILE" ]]; then
   report_failure "RustFS storage owner consumers must use relative core_storage_compat paths instead of crate-qualified storage owner paths: $(paste -sd '; ' "$RUSTFS_STORAGE_CORE_COMPAT_RELATIVE_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename 'crate::app::usecase_storage_compat' \
+      rustfs/src/app/*.rs || true
+    rg -n --with-filename 'crate::admin::router_storage_compat' \
+      rustfs/src/admin/router.rs || true
+    rg -n --with-filename 'crate::storage::core_storage_compat' \
+      rustfs/src/storage/ecfs_test.rs || true
+  }
+) >"$RUSTFS_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE"
+
+if [[ -s "$RUSTFS_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE" ]]; then
+  report_failure "RustFS local compatibility consumers must use relative owner paths instead of crate-qualified local compatibility paths: $(paste -sd '; ' "$RUSTFS_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE")"
 fi
 
 (
