@@ -27,7 +27,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use super::storage_compat::{BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME, RUSTFS_META_BUCKET};
+use super::{BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME, RUSTFS_META_BUCKET};
 
 const LOG_COMPONENT_HEAL: &str = "heal";
 const LOG_SUBSYSTEM_TASK: &str = "task";
@@ -2047,7 +2047,7 @@ impl std::fmt::Debug for HealTask {
 
 #[cfg(test)]
 mod tests {
-    use super::super::storage_compat::{DiskStore, Endpoint};
+    use super::super::{DiskStore, Endpoint};
     use super::*;
     use crate::heal::storage::{DiskStatus, HealObjectInfo};
     use rustfs_madmin::heal_commands::HealResultItem;
