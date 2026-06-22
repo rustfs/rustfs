@@ -48,21 +48,17 @@ use metrics::{counter, histogram};
 use pin_project_lite::pin_project;
 use rustfs_object_capacity::capacity_manager::get_capacity_manager;
 // Performance metrics recording (with zero-copy-metrics integration)
-use super::storage_compat::ECStore;
-use super::storage_compat::object_api_utils::to_s3s_etag;
-use super::storage_compat::quota::checker::QuotaChecker;
-use super::storage_compat::storageclass;
-use super::storage_compat::{
-    AppReplicationConfigExt as _, AppVersioningConfigExt as _, predict_lifecycle_expiration, validate_restore_request,
-};
-use super::storage_compat::{DiskError, is_all_buckets_not_found};
-use super::storage_compat::{DynReader, HashReader, WritePlan, wrap_reader};
-use super::storage_compat::{
-    Error as EcstoreError, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
-};
-use super::storage_compat::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
-use super::storage_compat::{get_lock_acquire_timeout, is_valid_storage_class};
-use super::storage_compat::{
+use super::ECStore;
+use super::object_api_utils::to_s3s_etag;
+use super::quota::checker::QuotaChecker;
+use super::storageclass;
+use super::{AppReplicationConfigExt as _, AppVersioningConfigExt as _, predict_lifecycle_expiration, validate_restore_request};
+use super::{DiskError, is_all_buckets_not_found};
+use super::{DynReader, HashReader, WritePlan, wrap_reader};
+use super::{Error as EcstoreError, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
+use super::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
+use super::{get_lock_acquire_timeout, is_valid_storage_class};
+use super::{
     lifecycle::{
         bucket_lifecycle_audit::LcEventSrc,
         bucket_lifecycle_ops::{enqueue_transition_immediate, post_restore_opts},
@@ -279,10 +275,10 @@ async fn enqueue_transitioned_delete_cleanup(
     let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Cleanup);
 
     let je = if opts.delete_prefix {
-        super::storage_compat::lifecycle::tier_sweeper::transitioned_force_delete_journal_entry(&existing.transitioned_object)
+        super::lifecycle::tier_sweeper::transitioned_force_delete_journal_entry(&existing.transitioned_object)
     } else {
         let version_id = opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok());
-        super::storage_compat::lifecycle::tier_sweeper::transitioned_delete_journal_entry(
+        super::lifecycle::tier_sweeper::transitioned_delete_journal_entry(
             version_id,
             opts.versioned,
             opts.version_suspended,
@@ -293,11 +289,9 @@ async fn enqueue_transitioned_delete_cleanup(
         return Ok(());
     };
 
-    super::storage_compat::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry(store, &je).await?;
+    super::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry(store, &je).await?;
 
-    let mut expiry_state = super::storage_compat::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState
-        .write()
-        .await;
+    let mut expiry_state = super::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState.write().await;
     if let Err(err) = expiry_state.enqueue_tier_journal_entry(&je).await {
         warn!(
             bucket,
@@ -708,7 +702,9 @@ struct PutObjectChecksums {
     crc64nvme: Option<String>,
 }
 
-fn normalize_delete_objects_version_id(version_id: Option<String>) -> Result<(Option<String>, Option<Uuid>), String> {
+fn normalize_delete_objects_version_id(
+    version_id: Option<String>,
+) -> std::result::Result<(Option<String>, Option<Uuid>), String> {
     let version_id = version_id.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     match version_id {
         Some(id) => {
@@ -1601,7 +1597,7 @@ impl DefaultObjectUsecase {
     #[allow(clippy::too_many_arguments)]
     async fn prepare_get_object_read(
         req: &S3Request<GetObjectInput>,
-        store: &super::storage_compat::ECStore,
+        store: &super::ECStore,
         manager: &ConcurrencyManager,
         bucket: &str,
         key: &str,
@@ -2192,11 +2188,7 @@ impl DefaultObjectUsecase {
                 StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
             );
             let algorithm = CompressionAlgorithm::default();
-            insert_str(
-                &mut metadata,
-                SUFFIX_COMPRESSION,
-                super::storage_compat::compression_metadata_value(algorithm),
-            );
+            insert_str(&mut metadata, SUFFIX_COMPRESSION, super::compression_metadata_value(algorithm));
             insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
             let mut hrd =
@@ -2207,11 +2199,7 @@ impl DefaultObjectUsecase {
             }
 
             opts.want_checksum = hrd.checksum();
-            insert_str(
-                &mut opts.user_defined,
-                SUFFIX_COMPRESSION,
-                super::storage_compat::compression_metadata_value(algorithm),
-            );
+            insert_str(&mut opts.user_defined, SUFFIX_COMPRESSION, super::compression_metadata_value(algorithm));
             insert_str(&mut opts.user_defined, SUFFIX_ACTUAL_SIZE, size.to_string());
 
             size = HashReader::SIZE_PRESERVE_LAYER;
@@ -2402,8 +2390,7 @@ impl DefaultObjectUsecase {
         maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
 
         // Fast in-memory update for immediate quota and admin usage consistency
-        super::storage_compat::record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64)
-            .await;
+        super::record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
 
         let raw_version = obj_info.version_id.map(|v| v.to_string());
 
@@ -3263,7 +3250,7 @@ impl DefaultObjectUsecase {
             insert_str(
                 &mut compress_metadata,
                 SUFFIX_COMPRESSION,
-                super::storage_compat::compression_metadata_value(CompressionAlgorithm::default()),
+                super::compression_metadata_value(CompressionAlgorithm::default()),
             );
             insert_str(&mut compress_metadata, SUFFIX_ACTUAL_SIZE, actual_size.to_string());
         } else {
@@ -3356,7 +3343,7 @@ impl DefaultObjectUsecase {
 
         // Update quota tracking after successful copy
         if has_bucket_metadata {
-            super::storage_compat::record_bucket_object_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64).await;
+            super::record_bucket_object_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64).await;
         }
 
         let raw_dest_version = oi.version_id.map(|v| v.to_string());
@@ -3439,7 +3426,7 @@ impl DefaultObjectUsecase {
         #[derive(Default, Clone)]
         struct DeleteResult {
             delete_object: Option<StorageDeletedObject>,
-            error: Option<Error>,
+            error: Option<s3s::dto::Error>,
         }
 
         let mut delete_results = vec![DeleteResult::default(); delete.objects.len()];
@@ -3453,7 +3440,7 @@ impl DefaultObjectUsecase {
             let (version_id, version_uuid) = match normalize_delete_objects_version_id(raw_version_id.clone()) {
                 Ok(parsed) => parsed,
                 Err(err) => {
-                    delete_results[idx].error = Some(Error {
+                    delete_results[idx].error = Some(s3s::dto::Error {
                         code: Some("NoSuchVersion".to_string()),
                         key: Some(obj_id.key.clone()),
                         message: Some(err),
@@ -3472,7 +3459,7 @@ impl DefaultObjectUsecase {
 
             let auth_res = authorize_request(&mut req, Action::S3Action(S3Action::DeleteObjectAction)).await;
             if let Err(e) = auth_res {
-                delete_results[idx].error = Some(Error {
+                delete_results[idx].error = Some(s3s::dto::Error {
                     code: Some("AccessDenied".to_string()),
                     key: Some(obj_id.key.clone()),
                     message: Some(e.to_string()),
@@ -3484,7 +3471,7 @@ impl DefaultObjectUsecase {
             if bypass_governance {
                 let auth_res = authorize_request(&mut req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await;
                 if let Err(e) = auth_res {
-                    delete_results[idx].error = Some(Error {
+                    delete_results[idx].error = Some(s3s::dto::Error {
                         code: Some("AccessDenied".to_string()),
                         key: Some(obj_id.key.clone()),
                         message: Some(e.to_string()),
@@ -3495,7 +3482,7 @@ impl DefaultObjectUsecase {
             }
 
             if let Err(err) = validate_table_catalog_object_mutation(&bucket, &obj_id.key).await {
-                delete_results[idx].error = Some(Error {
+                delete_results[idx].error = Some(s3s::dto::Error {
                     code: Some("InvalidRequest".to_string()),
                     key: Some(obj_id.key.clone()),
                     message: Some(err.to_string()),
@@ -3530,7 +3517,7 @@ impl DefaultObjectUsecase {
                 && !delete_creates_delete_marker(&opts)
                 && let Some(block_reason) = check_object_lock_for_deletion(&bucket, &goi, bypass_governance).await
             {
-                delete_results[idx].error = Some(Error {
+                delete_results[idx].error = Some(s3s::dto::Error {
                     code: Some("AccessDenied".to_string()),
                     key: Some(obj_id.key.clone()),
                     message: Some(block_reason.error_message()),
@@ -3633,7 +3620,7 @@ impl DefaultObjectUsecase {
                     );
                 }
                 let size = object_sizes[i].max(0) as u64;
-                super::storage_compat::record_bucket_object_delete_memory(
+                super::record_bucket_object_delete_memory(
                     &bucket,
                     size,
                     existing_object_infos[i].is_some() && object_to_delete[i].version_id.is_none(),
@@ -3643,7 +3630,7 @@ impl DefaultObjectUsecase {
             }
 
             if let Some(err) = err.clone() {
-                delete_results[didx].error = Some(Error {
+                delete_results[didx].error = Some(s3s::dto::Error {
                     code: Some(err.to_string()),
                     key: Some(object_to_delete[i].object_name.clone()),
                     message: Some(err.to_string()),
@@ -3669,7 +3656,10 @@ impl DefaultObjectUsecase {
             })
             .collect();
 
-        let errors = delete_results.iter().filter_map(|v| v.error.clone()).collect::<Vec<Error>>();
+        let errors = delete_results
+            .iter()
+            .filter_map(|v| v.error.clone())
+            .collect::<Vec<s3s::dto::Error>>();
         let output = DeleteObjectsOutput {
             deleted: Some(deleted),
             errors: Some(errors),
@@ -3871,12 +3861,7 @@ impl DefaultObjectUsecase {
         }
 
         // Fast in-memory update for immediate quota and admin usage consistency
-        super::storage_compat::record_bucket_object_delete_memory(
-            &bucket,
-            obj_info.size.max(0) as u64,
-            opts.version_id.is_none(),
-        )
-        .await;
+        super::record_bucket_object_delete_memory(&bucket, obj_info.size.max(0) as u64, opts.version_id.is_none()).await;
 
         if obj_info.name.is_empty() {
             if replicate_force_delete {
@@ -4845,11 +4830,7 @@ impl DefaultObjectUsecase {
                     .map_err(ApiError::from)?
             } else if should_compress {
                 let algorithm = CompressionAlgorithm::default();
-                insert_str(
-                    &mut metadata,
-                    SUFFIX_COMPRESSION,
-                    super::storage_compat::compression_metadata_value(algorithm),
-                );
+                insert_str(&mut metadata, SUFFIX_COMPRESSION, super::compression_metadata_value(algorithm));
                 insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
                 let hrd = HashReader::from_stream(f, size, actual_size, None, None, false).map_err(ApiError::from)?;

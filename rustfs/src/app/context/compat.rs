@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::storage_compat::ECStore;
-use super::super::storage_compat::EndpointServerPools;
-use super::super::storage_compat::TierConfigMgr;
-use super::super::storage_compat::metadata_sys::BucketMetadataSys;
-use super::super::storage_compat::new_object_layer_fn;
+use super::super::ECStore;
+use super::super::EndpointServerPools;
+use super::super::TierConfigMgr;
+use super::super::metadata_sys::BucketMetadataSys;
+use super::super::new_object_layer_fn;
 use super::global::{AppContext, get_global_app_context};
 use super::handles::{
     default_bucket_metadata_interface, default_endpoints_interface, default_kms_runtime_interface,
@@ -119,10 +119,10 @@ fn resolve_buffer_config_with(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::storage_compat::Endpoint;
-    use super::super::super::storage_compat::init_local_disks;
-    use super::super::super::storage_compat::new_object_layer_fn;
-    use super::super::super::storage_compat::{Endpoints, PoolEndpoints};
+    use super::super::super::Endpoint;
+    use super::super::super::init_local_disks;
+    use super::super::super::new_object_layer_fn;
+    use super::super::super::{Endpoints, PoolEndpoints};
     use super::*;
     use crate::app::context::global::AppContextTestInterfaces;
     use crate::app::context::handles::{default_notify_interface, default_region_interface};

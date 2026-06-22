@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::storage_compat::{
+use super::super::{
     DiskStat, ECStore, NotificationSys, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStopPropagationRecord,
     StorageError, decode_rebalance_stop_propagation_record, get_global_notification_sys,
 };
@@ -296,7 +296,7 @@ fn build_rebalance_pool_progress(
     now: OffsetDateTime,
     stop_time: Option<OffsetDateTime>,
     percent_free_goal: f64,
-    ps: &super::super::storage_compat::RebalanceStats,
+    ps: &super::super::RebalanceStats,
 ) -> Option<RebalPoolProgress> {
     let total_bytes_to_rebal = ps.init_capacity as f64 * percent_free_goal - ps.init_free_space as f64;
     let terminal_time = ps.info.end_time.or(stop_time);
@@ -339,7 +339,7 @@ fn build_rebalance_pool_statuses(
     now: OffsetDateTime,
     stop_time: Option<OffsetDateTime>,
     percent_free_goal: f64,
-    pool_stats: &[super::super::storage_compat::RebalanceStats],
+    pool_stats: &[super::super::RebalanceStats],
     disk_stats: &[DiskStat],
 ) -> Vec<RebalancePoolStatus> {
     pool_stats
@@ -895,7 +895,7 @@ mod offsetdatetime_rfc3339 {
 
 #[cfg(test)]
 mod rebalance_handler_tests {
-    use super::super::super::storage_compat::{
+    use super::super::super::{
         DiskStat, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta,
         RebalanceStats, RebalanceStopPropagationRecord, encode_rebalance_stop_propagation_record,
     };

@@ -14,11 +14,11 @@
 
 //! Admin application use-case contracts.
 
-use super::storage_compat::ECStore;
-use super::storage_compat::EndpointServerPools;
-use super::storage_compat::get_server_info;
-use super::storage_compat::{PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free};
-use super::storage_compat::{apply_bucket_usage_memory_overlay, load_data_usage_from_backend};
+use super::ECStore;
+use super::EndpointServerPools;
+use super::get_server_info;
+use super::{PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free};
+use super::{apply_bucket_usage_memory_overlay, load_data_usage_from_backend};
 use crate::app::context::{AppContext, get_global_app_context, resolve_object_store_handle_for_context};
 use crate::capacity::resolve_admin_used_capacity;
 use crate::error::ApiError;
@@ -401,7 +401,7 @@ impl DefaultAdminUsecase {
 
 #[cfg(test)]
 mod tests {
-    use super::super::storage_compat::{PoolDecommissionInfo, PoolStatus};
+    use super::super::{PoolDecommissionInfo, PoolStatus};
     use super::*;
     use time::OffsetDateTime;
 
