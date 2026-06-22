@@ -14,7 +14,7 @@
 
 #[cfg(test)]
 mod tests {
-    use super::super::core_storage_compat::{
+    use super::super::storage_compat::{
         BucketMetadata, DEFAULT_READ_BUFFER_SIZE, get_global_bucket_metadata_sys, set_bucket_metadata,
     };
     use crate::config::WorkloadProfile;
@@ -941,8 +941,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_bucket_object_lock_enabled() {
-        use super::super::core_storage_compat::bucket_metadata_sys_initialized;
-        use super::super::core_storage_compat::set_bucket_metadata;
+        use super::super::storage_compat::bucket_metadata_sys_initialized;
+        use super::super::storage_compat::set_bucket_metadata;
         use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
         use time::OffsetDateTime;
 
@@ -1781,7 +1781,7 @@ mod tests {
     /// with a single-element vec value, matching the format expected by policy evaluation.
     #[test]
     fn test_object_tag_condition_key_format() {
-        use super::super::core_storage_compat::decode_tags_to_map;
+        use super::super::storage_compat::decode_tags_to_map;
         use std::collections::HashMap;
 
         let tags_str = "security=public&project=webapp&env=prod";

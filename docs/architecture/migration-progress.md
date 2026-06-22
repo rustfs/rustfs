@@ -5,17 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-fuzz-compat-relative-consumers`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115`.
-- Based on: API-115 slice.
+- Branch: `overtrue/arch-runtime-local-compat-bridges`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116`.
+- Based on: API-116 slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: collapse fuzz-target compatibility consumer paths into
-  relative owner paths.
-- CI/script changes: extend the standalone crate local consumer guard to fuzz
-  targets.
-- Docs changes: record the API-116 fuzz-target local compatibility consumer
-  cleanup.
+- Rust code changes: remove app/admin, storage core, nested, handler, capacity,
+  server, and S3 API secondary compatibility bridges.
+- CI/script changes: guard against reintroducing the removed secondary bridge
+  modules or their consumer paths.
+- Docs changes: record the API-117 through API-121 compatibility bridge cleanup.
 
 ## Phase 0 Tasks
 
@@ -647,6 +646,69 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: fuzz package compile coverage, fuzz-target local
     compatibility consumer residual scan, migration and layer guards,
     formatting, diff hygiene, Rust risk scan, and three-expert review.
+- [x] `API-117` Remove app/admin secondary compatibility bridges.
+  - Completed slice: replace app use-case and admin router consumers of
+    `usecase_storage_compat` and `router_storage_compat` with direct owner
+    `storage_compat` paths, then delete the secondary bridge modules.
+  - Acceptance: app use-cases, app tests, and the admin router no longer route
+    through a second local compatibility bridge; migration rules reject
+    reintroduced bridge names.
+  - Must preserve: app object/bucket/multipart use-case behavior, lifecycle
+    transition test setup, admin route replication/bucket-target contracts, and
+    existing owner `storage_compat` aliases.
+  - Verification: RustFS compile coverage, app/admin secondary bridge residual
+    scan, migration and layer guards, formatting, diff hygiene, Rust risk scan,
+    and three-expert review.
+- [x] `API-118` Remove storage core secondary compatibility bridge.
+  - Completed slice: replace storage owner consumers of `core_storage_compat`
+    with direct `storage_compat` paths, then delete the secondary bridge module.
+  - Acceptance: storage owner modules and tests no longer route through a
+    second local compatibility bridge; migration rules reject reintroduced
+    `core_storage_compat` references.
+  - Must preserve: ECFS object operations, storage access checks, SSE
+    encryption helpers, storage option resolution, and existing owner
+    `storage_compat` aliases.
+  - Verification: RustFS compile coverage, storage secondary bridge residual
+    scan, migration and layer guards, formatting, diff hygiene, path-only risk
+    review, and three-expert review.
+- [x] `API-119` Remove nested secondary compatibility bridges.
+  - Completed slice: replace admin service, app context, and storage RPC
+    consumers of nested `storage_compat` bridge modules with direct owner
+    `storage_compat` paths, then delete the nested bridge modules.
+  - Acceptance: nested service, context, and RPC modules no longer route
+    through a second local compatibility bridge; migration rules reject
+    reintroduced bridge files or module declarations.
+  - Must preserve: admin dynamic config and site-replication behavior, app
+    context handle wiring, storage RPC signature and disk lookup behavior, and
+    existing owner `storage_compat` aliases.
+  - Verification: RustFS compile coverage, nested secondary bridge residual
+    scan, migration and layer guards, formatting, diff hygiene, path-only risk
+    review, and three-expert review.
+- [x] `API-120` Remove admin handlers secondary compatibility bridge.
+  - Completed slice: replace admin handler consumers of
+    `handlers::storage_compat` with direct admin owner `storage_compat` paths,
+    then delete the handler bridge module.
+  - Acceptance: admin handler modules no longer route through a second local
+    compatibility bridge; migration rules reject the bridge file, module
+    declaration, or direct handler-level `super::storage_compat` consumers.
+  - Must preserve: admin handler config, replication, rebalance, quota, tier,
+    table catalog, metrics, trace, and heal behavior plus existing admin owner
+    `storage_compat` aliases.
+  - Verification: RustFS admin handler compile coverage, handler secondary
+    bridge residual scan, migration and layer guards, formatting, diff hygiene,
+    path-only risk review, and three-expert review.
+- [x] `API-121` Remove runtime local compatibility bridges.
+  - Completed slice: replace capacity, server, and S3 API local compatibility
+    bridge consumers with direct owner APIs, then delete the bridge modules.
+  - Acceptance: capacity, server, and S3 API modules no longer route through
+    local `storage_compat` bridges; migration rules reject bridge files, module
+    declarations, or bridge consumers.
+  - Must preserve: capacity disk discovery, HTTP RPC signature verification,
+    event dispatch hook wiring, module-switch persistence, readiness quorum
+    checks, and S3 ETag conversion behavior.
+  - Verification: RustFS compile coverage, runtime local bridge residual scan,
+    migration and layer guards, formatting, diff hygiene, path-only risk
+    review, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3680,13 +3742,69 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-116 keeps selected fuzz-target local compatibility consumers owner-relative by replacing crate-qualified compatibility paths with scoped relative paths. |
-| Migration preservation | pass | The extended guard rejects crate-qualified fuzz-target local compatibility consumer paths while preserving the same facade names and aliases. |
-| Testing/verification | pass | Fuzz package compile, fuzz-target local compatibility consumer residual scan, migration guard, layer guard, formatting, diff hygiene, and risk scan passed. |
+| Quality/architecture | pass | API-121 removes capacity, server, and S3 API local bridge modules while keeping direct owner API calls explicit. |
+| Migration preservation | pass | The extended guard rejects deleted runtime bridge files, module declarations, and local bridge consumers. |
+| Testing/verification | pass | RustFS compile, runtime local bridge residual scan, migration guard, layer guard, formatting, diff hygiene, pre-commit, and path-only risk review passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-121 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Runtime local compatibility bridge residual scan: passed.
+  - Rust risk review on path-only replacements and guard script: passed.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-120 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Admin handlers secondary compatibility bridge residual scan: passed.
+  - Rust risk review on path-only replacements and guard script: passed.
+
+- Issue #660 API-119 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Nested secondary compatibility bridge residual scan: passed.
+  - Rust risk review on path-only replacements and guard script: passed.
+
+- Issue #660 API-118 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Storage secondary compatibility bridge residual scan: passed.
+  - Rust risk review on path-only replacements and guard script: passed.
+
+- Issue #660 API-117 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - App/admin secondary compatibility bridge residual scan: passed.
+  - Rust risk review on path-only replacements and guard script: passed.
 
 - Issue #660 API-116 current slice:
   - `cargo check --manifest-path fuzz/Cargo.toml --bins`: passed.
