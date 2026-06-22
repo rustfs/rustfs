@@ -26,7 +26,11 @@ use crate::metrics::collectors::{
     DriveDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmStats, MemoryStats, NetworkStats, ProcessStats,
     ProcessStatusType, ReplicationStats, ResourceStats, ScannerStats,
 };
-use crate::metrics::{ecstore_bucket, ecstore_capacity, ecstore_data_usage, ecstore_error, ecstore_global, ecstore_storage};
+use crate::metrics::{
+    OBS_GLOBAL_EXPIRY_STATE, OBS_GLOBAL_REPLICATION_STATS, OBS_GLOBAL_TRANSITION_STATE, ObsEcstoreResult, ObsStore,
+    obs_get_global_bucket_monitor, obs_get_quota_config, obs_get_total_usable_capacity, obs_get_total_usable_capacity_free,
+    obs_load_data_usage_from_backend, obs_resolve_object_store_handle,
+};
 use chrono::Utc;
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::global_metrics;
@@ -42,7 +46,6 @@ const LOG_COMPONENT_OBS: &str = "obs";
 const LOG_SUBSYSTEM_METRICS_COLLECTOR: &str = "metrics_collector";
 const EVENT_METRICS_COLLECTOR_STATE: &str = "metrics_collector_state";
 
-type ObsStore = ecstore_storage::ECStore;
 type ObsStorageInfo = <ObsStore as StorageAdminApi>::StorageInfo;
 
 struct ObsDataUsageInfo {
@@ -95,8 +98,8 @@ fn i32_to_u64_floor_zero(value: i32) -> u64 {
     u64::try_from(value.max(0)).unwrap_or(0)
 }
 
-async fn load_obs_data_usage_from_backend(store: Arc<ObsStore>) -> ecstore_error::Result<ObsDataUsageInfo> {
-    let data_usage = ecstore_data_usage::load_data_usage_from_backend(store).await?;
+async fn load_obs_data_usage_from_backend(store: Arc<ObsStore>) -> ObsEcstoreResult<ObsDataUsageInfo> {
+    let data_usage = obs_load_data_usage_from_backend(store).await?;
 
     Ok(ObsDataUsageInfo {
         buckets_count: data_usage.buckets_count,
@@ -125,19 +128,19 @@ async fn load_obs_data_usage_from_backend(store: Arc<ObsStore>) -> ecstore_error
 }
 
 fn resolve_obs_object_store_handle() -> Option<Arc<ObsStore>> {
-    ecstore_global::resolve_object_store_handle()
+    obs_resolve_object_store_handle()
 }
 
 fn obs_total_usable_capacity_bytes(storage_info: &ObsStorageInfo) -> u64 {
-    usize_to_u64_saturating(ecstore_capacity::get_total_usable_capacity(&storage_info.disks, storage_info))
+    usize_to_u64_saturating(obs_get_total_usable_capacity(&storage_info.disks, storage_info))
 }
 
 fn obs_total_usable_capacity_free_bytes(storage_info: &ObsStorageInfo) -> u64 {
-    usize_to_u64_saturating(ecstore_capacity::get_total_usable_capacity_free(&storage_info.disks, storage_info))
+    usize_to_u64_saturating(obs_get_total_usable_capacity_free(&storage_info.disks, storage_info))
 }
 
 async fn obs_bucket_quota_limit_bytes(bucket: &str) -> u64 {
-    ecstore_bucket::metadata_sys::get_quota_config(bucket)
+    obs_get_quota_config(bucket)
         .await
         .ok()
         .and_then(|(quota, _)| quota.get_quota_limit())
@@ -145,7 +148,7 @@ async fn obs_bucket_quota_limit_bytes(bucket: &str) -> u64 {
 }
 
 fn obs_bucket_replication_bandwidth_stats() -> Option<Vec<ObsBucketReplicationBandwidthStats>> {
-    let monitor = ecstore_global::get_global_bucket_monitor()?;
+    let monitor = obs_get_global_bucket_monitor()?;
     Some(
         monitor
             .get_report(|_| true)
@@ -163,12 +166,10 @@ fn obs_bucket_replication_bandwidth_stats() -> Option<Vec<ObsBucketReplicationBa
 
 async fn obs_ilm_runtime_snapshot() -> ObsIlmRuntimeSnapshot {
     let expiry_pending_tasks = {
-        let expiry = ecstore_bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState
-            .read()
-            .await;
+        let expiry = OBS_GLOBAL_EXPIRY_STATE.read().await;
         usize_to_u64_saturating(expiry.pending_tasks())
     };
-    let transition = &ecstore_bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState;
+    let transition = &OBS_GLOBAL_TRANSITION_STATE;
 
     ObsIlmRuntimeSnapshot {
         expiry_pending_tasks,
@@ -183,7 +184,7 @@ async fn obs_ilm_runtime_snapshot() -> ObsIlmRuntimeSnapshot {
 }
 
 async fn obs_bucket_replication_detail_stats() -> Vec<BucketReplicationStats> {
-    let Some(stats) = ecstore_bucket::replication::GLOBAL_REPLICATION_STATS.get() else {
+    let Some(stats) = OBS_GLOBAL_REPLICATION_STATS.get() else {
         return Vec::new();
     };
 
@@ -255,7 +256,7 @@ async fn obs_bucket_replication_detail_stats() -> Vec<BucketReplicationStats> {
 }
 
 async fn obs_site_replication_stats() -> ReplicationStats {
-    let Some(stats) = ecstore_bucket::replication::GLOBAL_REPLICATION_STATS.get() else {
+    let Some(stats) = OBS_GLOBAL_REPLICATION_STATS.get() else {
         return ReplicationStats::default();
     };
 
