@@ -243,7 +243,9 @@ fn derive_rpc_secret(access_key: &str, secret_key: &str) -> Option<String> {
         return None;
     }
 
-    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret_key.as_bytes()).expect("HMAC can take key of any size");
+    let Ok(mut mac) = <HmacSha256 as KeyInit>::new_from_slice(secret_key.as_bytes()) else {
+        return None;
+    };
     mac.update(RPC_SECRET_DERIVATION_CONTEXT);
     mac.update(&[0]);
     mac.update(access_key.as_bytes());
