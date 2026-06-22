@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-startup-compat-bridge-cleanup`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122`.
-- Based on: API-122 slice.
+- Branch: `overtrue/arch-test-fuzz-compat-bridge-cleanup`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123`.
+- Based on: API-123 slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: remove the startup storage compatibility bridge and route
-  startup/init consumers directly to ECStore API owner modules.
-- CI/script changes: guard against reintroducing the removed startup bridge
-  module or its consumer paths.
-- Docs changes: record the API-123 startup bridge cleanup.
+- Rust code changes: remove heal/scanner test and fuzz storage compatibility
+  bridges, then route their consumers directly to ECStore API owner modules.
+- CI/script changes: allow the migrated test/fuzz targets to import owner APIs
+  directly and reject reintroduced test/fuzz bridge modules.
+- Docs changes: record the API-124 test/fuzz bridge cleanup.
 
 ## Phase 0 Tasks
 
@@ -738,6 +738,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: RustFS compile coverage, startup bridge residual scan,
     migration and layer guards, formatting, diff hygiene, Rust risk scan, and
     three-expert review.
+- [x] `API-124` Remove test and fuzz storage compatibility bridges.
+  - Completed slice: replace heal tests, scanner lifecycle tests, and bucket/path
+    fuzz targets with direct ECStore API owner imports, then delete their local
+    `storage_compat.rs` modules.
+  - Acceptance: migrated test/fuzz targets no longer route through local
+    storage compatibility bridges; migration rules reject deleted files, module
+    declarations, or bridge references.
+  - Must preserve: heal endpoint indexing, heal mock storage signatures,
+    lifecycle metadata updates, scanner warm-tier mocks, fuzz target validation
+    invariants, and direct compile coverage for affected crates/targets.
+  - Verification: heal/scanner test compile coverage, fuzz target compile
+    coverage, test/fuzz bridge residual scan, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3771,13 +3784,25 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-123 removes the startup bridge while keeping startup/init direct ECStore owner API calls explicit. |
-| Migration preservation | pass | The extended guard rejects the deleted startup bridge file, module declaration, and bridge consumers. |
-| Testing/verification | pass | RustFS compile, startup bridge residual scan, migration guard, layer guard, formatting, diff hygiene, and Rust risk scan passed. |
+| Quality/architecture | pass | API-124 removes only test/fuzz bridge modules and keeps call sites on explicit ECStore owner APIs. |
+| Migration preservation | pass | The migration guard now rejects the deleted test/fuzz bridge files, module declarations, and bridge consumers. |
+| Testing/verification | pass | Heal/scanner test compile, fuzz target compile, residual scan, migration guard, layer guard, formatting, and diff hygiene passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-124 current slice:
+  - `cargo check --tests -p rustfs-heal -p rustfs-scanner`: passed.
+  - `cargo check --manifest-path fuzz/Cargo.toml --bins`: passed; transient `fuzz/Cargo.lock` refresh was restored to avoid dependency churn.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Test/fuzz compatibility bridge residual scan: passed.
+  - Rust risk scan: reviewed pre-existing test-only unwrap/expect/panic/unsafe usage; no new production risk.
 
 - Issue #660 API-123 current slice:
   - `cargo check -p rustfs --tests`: passed.

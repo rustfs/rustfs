@@ -118,6 +118,7 @@ NOTIFY_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/notify_storage_compat_module_
 OBS_STORAGE_COMPAT_PASSTHROUGH_HITS_FILE="${TMP_DIR}/obs_storage_compat_passthrough_hits.txt"
 E2E_STORAGE_COMPAT_RPC_PASSTHROUGH_HITS_FILE="${TMP_DIR}/e2e_storage_compat_rpc_passthrough_hits.txt"
 TEST_STORAGE_COMPAT_PASSTHROUGH_HITS_FILE="${TMP_DIR}/test_storage_compat_passthrough_hits.txt"
+TEST_FUZZ_COMPAT_BRIDGE_HITS_FILE="${TMP_DIR}/test_fuzz_compat_bridge_hits.txt"
 PRODUCTION_UNUSED_COMPAT_ALLOW_HITS_FILE="${TMP_DIR}/production_unused_compat_allow_hits.txt"
 BROAD_STORE_API_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/broad_store_api_compat_reexport_hits.txt"
 NESTED_STORE_API_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/nested_store_api_compat_module_hits.txt"
@@ -712,7 +713,7 @@ fi
     --glob '!**/storage_compat.rs' \
     --glob '!**/*storage_compat.rs' \
     --glob '!target/**' \
-    | rg -v '^(rustfs/src/(capacity/service|config/config_test|error|init|runtime_capabilities|startup_(background|bucket_metadata|fs_guard|iam|lifecycle|notification|server|services|shutdown|storage)|table_catalog|workload_admission)\.rs|rustfs/src/server/(event|http|module_switch|readiness)\.rs|rustfs/src/storage/s3_api/(bucket|multipart)\.rs):' || true
+    | rg -v '^(rustfs/src/(capacity/service|config/config_test|error|init|runtime_capabilities|startup_(background|bucket_metadata|fs_guard|iam|lifecycle|notification|server|services|shutdown|storage)|table_catalog|workload_admission)\.rs|rustfs/src/server/(event|http|module_switch|readiness)\.rs|rustfs/src/storage/s3_api/(bucket|multipart)\.rs|crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)\.rs|crates/scanner/tests/lifecycle_integration_test\.rs|fuzz/fuzz_targets/(bucket_validation|path_containment)\.rs):' || true
 ) |
   cat >"$DIRECT_ECSTORE_IMPORT_HITS_FILE"
 
@@ -991,10 +992,6 @@ fi
     crates/protocols/src/swift/storage_compat.rs \
     crates/s3select-api/src/storage_compat.rs \
     crates/scanner/src/storage_compat.rs \
-    crates/heal/tests/common/storage_compat.rs \
-    crates/scanner/tests/common/storage_compat.rs \
-    fuzz/fuzz_targets/path_containment/storage_compat.rs \
-    fuzz/fuzz_targets/bucket_validation/storage_compat.rs \
     | rg -v '^[^:]+:[0-9]+:use rustfs_ecstore::api::[a-z_]+ as ecstore_[a-z_]+;' || true
 ) >"$OUTER_CONSUMER_COMPAT_RAW_FACADE_PATH_HITS_FILE"
 
@@ -1281,6 +1278,29 @@ fi
 
 if [[ -s "$RUSTFS_HEAL_TEST_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE" ]]; then
   report_failure "RustFS config/heal/scanner compatibility consumers must use relative owner paths instead of crate-qualified local compatibility paths: $(paste -sd '; ' "$RUSTFS_HEAL_TEST_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    for file in \
+      crates/heal/tests/common/storage_compat.rs \
+      crates/scanner/tests/common/storage_compat.rs \
+      fuzz/fuzz_targets/bucket_validation/storage_compat.rs \
+      fuzz/fuzz_targets/path_containment/storage_compat.rs; do
+      [[ -e "$file" ]] && printf '%s:1:test/fuzz bridge file exists\n' "$file"
+    done
+    rg -n --with-filename 'common::storage_compat|storage_compat::|\bmod\s+storage_compat|#\[path\s*=\s*"[^"]*storage_compat\.rs"\]' \
+      crates/heal/tests \
+      crates/scanner/tests/lifecycle_integration_test.rs \
+      fuzz/fuzz_targets/bucket_validation.rs \
+      fuzz/fuzz_targets/path_containment.rs \
+      -g '*.rs' || true
+  }
+) >"$TEST_FUZZ_COMPAT_BRIDGE_HITS_FILE"
+
+if [[ -s "$TEST_FUZZ_COMPAT_BRIDGE_HITS_FILE" ]]; then
+  report_failure "heal/scanner test and fuzz targets must import ECStore owner APIs directly instead of local storage compatibility bridges: $(paste -sd '; ' "$TEST_FUZZ_COMPAT_BRIDGE_HITS_FILE")"
 fi
 
 (
