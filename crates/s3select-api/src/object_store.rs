@@ -12,11 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::storage_compat::{
-    SELECT_DEFAULT_READ_BUFFER_SIZE, SelectGetObjectReader, SelectObjectInfo, SelectObjectOptions, SelectStorageError,
-    SelectStore, resolve_select_object_store_handle, select_default_read_buffer_size_u64, select_is_err_bucket_not_found,
-    select_is_err_object_not_found, select_is_err_version_not_found,
-};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
@@ -30,6 +25,9 @@ use object_store::{
 };
 use pin_project_lite::pin_project;
 use rustfs_common::DEFAULT_DELIMITER;
+use rustfs_ecstore::api::{
+    error as ecstore_error, global as ecstore_global, set_disk as ecstore_set_disk, storage as ecstore_storage,
+};
 use rustfs_storage_api::{HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
 use s3s::S3Result;
 use s3s::dto::SelectObjectContentInput;
@@ -48,6 +46,34 @@ use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::ReaderStream;
 use transform_stream::AsyncTryStream;
+
+type SelectStorageError = ecstore_error::StorageError;
+type SelectStore = ecstore_storage::ECStore;
+type SelectGetObjectReader = <SelectStore as rustfs_storage_api::ObjectIO>::GetObjectReader;
+type SelectObjectInfo = <SelectStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
+type SelectObjectOptions = <SelectStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
+
+const SELECT_DEFAULT_READ_BUFFER_SIZE: usize = ecstore_set_disk::DEFAULT_READ_BUFFER_SIZE;
+
+fn select_default_read_buffer_size_u64() -> u64 {
+    u64::try_from(SELECT_DEFAULT_READ_BUFFER_SIZE).unwrap_or(u64::MAX)
+}
+
+fn resolve_select_object_store_handle() -> Option<Arc<SelectStore>> {
+    ecstore_global::resolve_object_store_handle()
+}
+
+fn select_is_err_bucket_not_found(err: &SelectStorageError) -> bool {
+    ecstore_error::is_err_bucket_not_found(err)
+}
+
+fn select_is_err_object_not_found(err: &SelectStorageError) -> bool {
+    ecstore_error::is_err_object_not_found(err)
+}
+
+fn select_is_err_version_not_found(err: &SelectStorageError) -> bool {
+    ecstore_error::is_err_version_not_found(err)
+}
 
 /// Maximum allowed object size for JSON DOCUMENT mode.
 ///

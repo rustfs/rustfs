@@ -51,8 +51,7 @@
 
 use super::account::validate_account_access;
 use super::container::ContainerMapper;
-use super::storage_compat::resolve_swift_object_store_handle;
-use super::{SwiftError, SwiftResult};
+use super::{SwiftError, SwiftResult, resolve_swift_object_store_handle};
 use axum::http::HeaderMap;
 use rustfs_credentials::Credentials;
 use rustfs_rio::HashReader;
@@ -61,7 +60,7 @@ use std::collections::HashMap;
 use tracing::debug;
 use tracing::error;
 
-pub use super::storage_compat::{SwiftGetObjectReader, SwiftObjectInfo, SwiftObjectOptions, SwiftPutObjReader};
+pub use super::{SwiftGetObjectReader, SwiftObjectInfo, SwiftObjectOptions, SwiftPutObjReader};
 
 const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
 const LOG_SUBSYSTEM_SWIFT_OBJECT: &str = "swift_object";

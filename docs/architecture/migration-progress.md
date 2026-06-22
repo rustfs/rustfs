@@ -5,16 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-test-fuzz-compat-bridge-cleanup`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123`.
-- Based on: API-123 slice.
+- Branch: `overtrue/arch-standalone-thin-compat-cleanup`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124`.
+- Based on: API-124 slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: remove heal/scanner test and fuzz storage compatibility
-  bridges, then route their consumers directly to ECStore API owner modules.
-- CI/script changes: allow the migrated test/fuzz targets to import owner APIs
-  directly and reject reintroduced test/fuzz bridge modules.
-- Docs changes: record the API-124 test/fuzz bridge cleanup.
+- Rust code changes: remove standalone thin storage compatibility bridges from
+  e2e, IAM store, notify, OBS, Swift, and S3 Select, then route their consumers
+  directly to ECStore API owner modules.
+- CI/script changes: allow migrated standalone consumers to import owner APIs
+  directly and reject reintroduced bridge modules.
+- Docs changes: record the API-125/API-126 standalone bridge cleanup.
 
 ## Phase 0 Tasks
 
@@ -751,6 +752,32 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: heal/scanner test compile coverage, fuzz target compile
     coverage, test/fuzz bridge residual scan, migration and layer guards,
     formatting, diff hygiene, Rust risk scan, and three-expert review.
+- [x] `API-125` Remove standalone thin compatibility bridges.
+  - Completed slice: replace e2e tests, IAM store object access, and notify
+    config persistence consumers with direct owner APIs, then delete their local
+    `storage_compat.rs` bridge modules.
+  - Acceptance: e2e, IAM store, and notify no longer route through local thin
+    storage compatibility bridges; migration rules reject deleted files, module
+    declarations, or bridge consumers.
+  - Must preserve: e2e RPC client behavior, site-replication target contracts,
+    IAM object associated types, notify server-config read/modify/save behavior,
+    and reload-if-changed semantics.
+  - Verification: affected crate compile coverage, standalone thin bridge
+    residual scan, migration and layer guards, formatting, diff hygiene, Rust
+    risk scan, and three-expert review.
+- [x] `API-126` Remove remaining standalone owner compatibility bridges.
+  - Completed slice: replace OBS metrics, Swift object/container/account, and
+    S3 Select object-store consumers with direct owner APIs, then delete their
+    local `storage_compat.rs` bridge modules.
+  - Acceptance: OBS, Swift, and S3 Select no longer route through local thin
+    storage compatibility bridges; migration rules reject deleted files, module
+    declarations, or bridge consumers.
+  - Must preserve: OBS capacity, bucket usage, replication, and ILM metrics;
+    Swift bucket metadata and object IO contracts; S3 Select object reader,
+    error mapping, and default read-buffer behavior.
+  - Verification: affected crate compile coverage, remaining standalone bridge
+    residual scan, migration and layer guards, formatting, diff hygiene, Rust
+    risk scan, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3784,13 +3811,39 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-124 removes only test/fuzz bridge modules and keeps call sites on explicit ECStore owner APIs. |
-| Migration preservation | pass | The migration guard now rejects the deleted test/fuzz bridge files, module declarations, and bridge consumers. |
-| Testing/verification | pass | Heal/scanner test compile, fuzz target compile, residual scan, migration guard, layer guard, formatting, and diff hygiene passed. |
+| Quality/architecture | pass | API-125/API-126 remove only standalone thin bridge modules and keep call sites on explicit owner APIs. |
+| Migration preservation | pass | The migration guard now rejects the deleted e2e, IAM-store, notify, OBS, Swift, and S3 Select bridge files, module declarations, and bridge consumers. |
+| Testing/verification | pass | Affected crate compile, residual scan, migration guard, layer guard, formatting, diff hygiene, and diff-only Rust risk scan passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-126 current slice:
+  - `cargo check --tests -p e2e_test -p rustfs-iam -p rustfs-notify -p rustfs-obs -p rustfs-protocols -p rustfs-s3select-api`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Remaining standalone compatibility bridge residual scan: passed.
+  - Rust risk scan: diff-only scan found no new unwrap/expect, numeric casts,
+    string-error public APIs, boxed public errors, println/eprintln, or relaxed
+    ordering.
+
+- Issue #660 API-125 current slice:
+  - `cargo check --tests -p e2e_test -p rustfs-iam -p rustfs-notify`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Standalone thin compatibility bridge residual scan: passed.
+  - Rust risk scan: diff-only scan found no new unwrap/expect, numeric casts,
+    string-error public APIs, boxed public errors, println/eprintln, or relaxed
+    ordering.
 
 - Issue #660 API-124 current slice:
   - `cargo check --tests -p rustfs-heal -p rustfs-scanner`: passed.
