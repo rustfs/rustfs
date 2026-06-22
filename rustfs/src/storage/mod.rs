@@ -186,7 +186,11 @@ pub(crate) type DiskResult<T> = ecstore_disk::error::Result<T>;
 pub(crate) type DiskStore = ecstore_disk::DiskStore;
 pub(crate) type DynReplicationPool = ecstore_bucket::replication::DynReplicationPool;
 pub(crate) type ECStore = ecstore_storage::ECStore;
+pub(crate) type Endpoint = ecstore_disk::endpoint::Endpoint;
+#[cfg(test)]
+pub(crate) type Endpoints = ecstore_layout::Endpoints;
 pub(crate) type EndpointServerPools = ecstore_layout::EndpointServerPools;
+pub(crate) type EventArgs = ecstore_event::EventArgs;
 pub(crate) type FileInfoVersions = ecstore_disk::FileInfoVersions;
 pub(crate) type FileReader = ecstore_disk::FileReader;
 pub(crate) type FileWriter = ecstore_disk::FileWriter;
@@ -196,6 +200,7 @@ pub(crate) type ObjectPartInfo = rustfs_filemeta::ObjectPartInfo;
 pub(crate) type ObjectLockBlockReason = ecstore_bucket::object_lock::objectlock_sys::ObjectLockBlockReason;
 pub(crate) type PolicySys = ecstore_bucket::policy_sys::PolicySys;
 pub(crate) type PoolEndpoints = ecstore_layout::PoolEndpoints;
+pub(crate) type QuotaError = ecstore_bucket::quota::QuotaError;
 pub(crate) type RawFileInfo = rustfs_filemeta::RawFileInfo;
 pub(crate) type ReadMultipleReq = ecstore_disk::ReadMultipleReq;
 pub(crate) type ReadMultipleResp = ecstore_disk::ReadMultipleResp;
@@ -220,6 +225,10 @@ pub(crate) async fn init_background_replication(store: Arc<ECStore>) {
 
 pub(crate) async fn all_local_disk() -> Vec<DiskStore> {
     ecstore_storage::all_local_disk().await
+}
+
+pub(crate) async fn get_bucket_notification_config(bucket: &str) -> Result<Option<s3s::dto::NotificationConfiguration>> {
+    ecstore_bucket::metadata_sys::get_notification_config(bucket).await
 }
 
 pub(crate) fn bucket_metadata_runtime_initialized() -> bool {
@@ -258,6 +267,10 @@ pub(crate) async fn new_global_notification_sys(endpoint_pools: EndpointServerPo
     ecstore_notification::new_global_notification_sys(endpoint_pools).await
 }
 
+pub(crate) async fn read_config(api: Arc<ECStore>, file: &str) -> Result<Vec<u8>> {
+    ecstore_config::com::read_config(api, file).await
+}
+
 pub(crate) async fn prewarm_local_disk_id_map() {
     ecstore_storage::prewarm_local_disk_id_map().await;
 }
@@ -270,6 +283,10 @@ pub(crate) fn replication_queue_current_count() -> Option<i64> {
             .ok()
             .map(|cache| cache.sr_queue_stats.curr.get_current_count())
     })
+}
+
+pub(crate) async fn save_config(api: Arc<ECStore>, file: &str, data: Vec<u8>) -> Result<()> {
+    ecstore_config::com::save_config(api, file, data).await
 }
 
 pub(crate) fn set_global_endpoints(endpoints: Vec<PoolEndpoints>) {
@@ -719,8 +736,21 @@ pub(crate) fn get_global_lock_client() -> Option<Arc<dyn rustfs_lock::client::Lo
     ecstore_global::get_global_lock_client()
 }
 
+pub(crate) fn get_global_lock_clients()
+-> Option<&'static std::collections::HashMap<String, Arc<dyn rustfs_lock::client::LockClient>>> {
+    ecstore_global::get_global_lock_clients()
+}
+
+pub(crate) fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
+    ecstore_global::get_global_endpoints_opt()
+}
+
 pub(crate) fn get_global_region() -> Option<s3s::region::Region> {
     ecstore_global::get_global_region()
+}
+
+pub(crate) async fn is_dist_erasure() -> bool {
+    ecstore_global::is_dist_erasure().await
 }
 
 pub(crate) fn resolve_object_store_handle() -> Option<Arc<ECStore>> {
@@ -736,6 +766,21 @@ pub(crate) async fn collect_local_metrics(
 
 pub(crate) fn verify_rpc_signature(url: &str, method: &http::Method, headers: &http::HeaderMap) -> std::io::Result<()> {
     ecstore_rpc::verify_rpc_signature(url, method, headers)
+}
+
+pub(crate) fn register_event_dispatch_hook<F>(hook: F) -> bool
+where
+    F: Fn(EventArgs) + Send + Sync + 'static,
+{
+    ecstore_event::register_event_dispatch_hook(hook)
+}
+
+pub(crate) fn topology_snapshot_from_endpoint_pools_with_capabilities(
+    endpoint_pools: &EndpointServerPools,
+    capabilities: rustfs_storage_api::TopologyCapabilities,
+    disk_capabilities: rustfs_storage_api::DiskCapabilities,
+) -> rustfs_storage_api::TopologySnapshot {
+    ecstore_cluster::topology_snapshot_from_endpoint_pools_with_capabilities(endpoint_pools, capabilities, disk_capabilities)
 }
 
 pub(crate) async fn reload_transition_tier_config(api: Arc<ECStore>) -> std::io::Result<()> {

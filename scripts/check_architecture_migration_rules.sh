@@ -105,6 +105,7 @@ COMPLETED_OWNER_BARE_FACADE_IMPORT_HITS_FILE="${TMP_DIR}/completed_owner_bare_fa
 COMPLETED_OWNER_SCATTERED_RAW_FACADE_PATH_HITS_FILE="${TMP_DIR}/completed_owner_scattered_raw_facade_path_hits.txt"
 RUSTFS_STARTUP_OWNER_MODULE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_startup_owner_module_consumer_hits.txt"
 RUSTFS_RUNTIME_OWNER_MODULE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_runtime_owner_module_consumer_hits.txt"
+RUSTFS_ROOT_SERVER_OWNER_MODULE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_server_owner_module_consumer_hits.txt"
 ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_self_facade_path_hits.txt"
 RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE="${TMP_DIR}/rustfs_local_compat_owner_self_path_hits.txt"
 RUSTFS_ROOT_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_compat_relative_consumer_hits.txt"
@@ -1182,6 +1183,21 @@ fi
 
 if [[ -s "$RUSTFS_RUNTIME_OWNER_MODULE_CONSUMER_HITS_FILE" ]]; then
   report_failure "RustFS runtime server/capacity/workload consumers must use storage owner symbols instead of ecstore_* modules: $(paste -sd '; ' "$RUSTFS_RUNTIME_OWNER_MODULE_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::storage::.*ecstore_|^\s*ecstore_[a-z_]+(?:::|,|\})' \
+    rustfs/src/init.rs \
+    rustfs/src/runtime_capabilities.rs \
+    rustfs/src/server/readiness.rs \
+    rustfs/src/server/event.rs \
+    rustfs/src/server/module_switch.rs \
+    rustfs/src/error.rs || true
+) >"$RUSTFS_ROOT_SERVER_OWNER_MODULE_CONSUMER_HITS_FILE"
+
+if [[ -s "$RUSTFS_ROOT_SERVER_OWNER_MODULE_CONSUMER_HITS_FILE" ]]; then
+  report_failure "RustFS root/server runtime consumers must use storage owner symbols instead of ecstore_* modules: $(paste -sd '; ' "$RUSTFS_ROOT_SERVER_OWNER_MODULE_CONSUMER_HITS_FILE")"
 fi
 
 (
