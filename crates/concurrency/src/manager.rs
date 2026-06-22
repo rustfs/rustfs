@@ -336,11 +336,8 @@ mod tests {
             ..Default::default()
         };
 
-        let err = match ConcurrencyManager::try_new(config) {
-            Ok(_) => panic!("invalid config should not build a manager"),
-            Err(err) => err,
-        };
-        assert!(matches!(err, ConfigError::InvalidTimeout(_)));
+        let result = ConcurrencyManager::try_new(config);
+        assert!(matches!(result, Err(ConfigError::InvalidTimeout(_))));
     }
 
     #[test]
