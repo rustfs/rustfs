@@ -14,12 +14,12 @@
 
 //! Bucket application use-case contracts.
 
-use super::usecase_storage_compat::ECStore;
-use super::usecase_storage_compat::StorageError;
-use super::usecase_storage_compat::get_global_notification_sys;
-use super::usecase_storage_compat::object_api_utils::to_s3s_etag;
-use super::usecase_storage_compat::{AppObjectLockConfigExt as _, AppVersioningConfigExt as _};
-use super::usecase_storage_compat::{
+use super::storage_compat::ECStore;
+use super::storage_compat::StorageError;
+use super::storage_compat::get_global_notification_sys;
+use super::storage_compat::object_api_utils::to_s3s_etag;
+use super::storage_compat::{AppObjectLockConfigExt as _, AppVersioningConfigExt as _};
+use super::storage_compat::{
     bucket_target_sys::BucketTargetSys,
     lifecycle::bucket_lifecycle_ops::{
         enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects, validate_lifecycle_config,
@@ -2285,7 +2285,7 @@ mod tests {
         BucketTargets {
             targets: arns
                 .iter()
-                .map(|arn| super::super::usecase_storage_compat::target::BucketTarget {
+                .map(|arn| super::super::storage_compat::target::BucketTarget {
                     arn: (*arn).to_string(),
                     target_type: BucketTargetType::ReplicationService,
                     ..Default::default()

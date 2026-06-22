@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::core_storage_compat::ECStore;
-use super::core_storage_compat::resolve_object_store_handle;
-use super::core_storage_compat::{
+use super::ecfs::FS;
+use super::storage_compat::ECStore;
+use super::storage_compat::resolve_object_store_handle;
+use super::storage_compat::{
     PolicySys, StorageError, get_bucket_metadata, get_bucket_policy_raw, get_public_access_block_config, is_err_bucket_not_found,
 };
-use super::ecfs::FS;
 use crate::auth::{check_key_valid, get_condition_values_with_query_and_client_info, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
@@ -930,7 +930,7 @@ impl S3Access for FS {
         let req_info = ReqInfo {
             cred,
             is_owner,
-            region: super::core_storage_compat::get_global_region(),
+            region: super::storage_compat::get_global_region(),
             request_context,
             ..Default::default()
         };

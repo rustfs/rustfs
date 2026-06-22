@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::super::storage_compat::EndpointServerPools;
+use super::super::storage_compat::TierConfigMgr;
+use super::super::storage_compat::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
+use super::super::storage_compat::{get_global_endpoints_opt, get_global_region, get_global_tier_config_mgr};
 use super::interfaces::{
     BucketMetadataInterface, BufferConfigInterface, EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface,
     NotifyInterface, RegionInterface, ServerConfigInterface, TierConfigInterface,
 };
-use super::storage_compat::EndpointServerPools;
-use super::storage_compat::TierConfigMgr;
-use super::storage_compat::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
-use super::storage_compat::{get_global_endpoints_opt, get_global_region, get_global_tier_config_mgr};
 use crate::config::{RustFSBufferConfig, get_global_buffer_config};
 use async_trait::async_trait;
 use rustfs_config::server_config::Config;

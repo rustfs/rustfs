@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::storage_compat::CapacityDiskExt as _;
+use rustfs_ecstore::api::{disk as ecstore_disk, storage as ecstore_storage};
 use rustfs_io_metrics::capacity_metrics::{
     record_capacity_cache_hit, record_capacity_cache_miss, record_capacity_cache_served, record_capacity_refresh_request,
     record_capacity_scan_mode,
@@ -263,7 +263,7 @@ pub async fn init_capacity_management_for_local_disks() {
         "Capacity manager state changed"
     );
 
-    let disks = super::storage_compat::all_local_disk().await;
+    let disks = ecstore_storage::all_local_disk().await;
     if disks.is_empty() {
         warn!(
             component = LOG_COMPONENT_CAPACITY,
@@ -286,7 +286,12 @@ pub async fn init_capacity_management_for_local_disks() {
 
     let disk_refs = disks
         .iter()
-        .map(|ds| capacity_disk_ref(ds.endpoint().to_string(), ds.to_string()))
+        .map(|ds| {
+            capacity_disk_ref(
+                ecstore_disk::DiskAPI::endpoint(ds.as_ref()).to_string(),
+                ecstore_disk::DiskAPI::to_string(ds.as_ref()),
+            )
+        })
         .collect();
 
     info!(

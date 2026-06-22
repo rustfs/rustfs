@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::startup_storage_compat::{EcstoreResult, EndpointServerPools, new_global_notification_sys};
 use crate::init::add_bucket_notification_configuration;
+use rustfs_ecstore::api::{error as ecstore_error, layout::EndpointServerPools, notification as ecstore_notification};
 use std::{
     future::Future,
     io::{Error, Result},
@@ -50,14 +50,14 @@ pub(crate) async fn init_notification_runtime(endpoint_pools: EndpointServerPool
     })
 }
 
-pub(crate) async fn init_notification_system(endpoint_pools: EndpointServerPools) -> EcstoreResult<()> {
-    init_notification_system_with(|| new_global_notification_sys(endpoint_pools)).await
+pub(crate) async fn init_notification_system(endpoint_pools: EndpointServerPools) -> ecstore_error::Result<()> {
+    init_notification_system_with(|| ecstore_notification::new_global_notification_sys(endpoint_pools)).await
 }
 
-async fn init_notification_system_with<InitFn, InitFuture>(init_notification: InitFn) -> EcstoreResult<()>
+async fn init_notification_system_with<InitFn, InitFuture>(init_notification: InitFn) -> ecstore_error::Result<()>
 where
     InitFn: FnOnce() -> InitFuture,
-    InitFuture: Future<Output = EcstoreResult<()>>,
+    InitFuture: Future<Output = ecstore_error::Result<()>>,
 {
     init_notification().await
 }
@@ -76,11 +76,11 @@ fn log_embedded_optional_service_skipped(service: &str, err: impl std::fmt::Disp
 #[cfg(test)]
 mod tests {
     use super::init_notification_system_with;
+    use rustfs_ecstore::api::error::Error as EcstoreError;
 
     #[tokio::test]
     async fn notification_system_returns_source_error() {
-        let result =
-            init_notification_system_with(|| async { Err(super::super::startup_storage_compat::EcstoreError::FaultyDisk) }).await;
+        let result = init_notification_system_with(|| async { Err(EcstoreError::FaultyDisk) }).await;
 
         assert!(result.is_err());
     }
