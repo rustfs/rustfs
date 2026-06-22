@@ -1029,6 +1029,10 @@ fn process_connection(
         // 21. PublicHealthEndpointLayer              — handles public health before s3s host parsing
         // 22. VirtualHostStyleHintLayer              — actionable error for unroutable virtual-hosted-style (conditional)
         // ─────────────────────────────────────────────────────────────
+        // Batch 1 intentionally keeps the external and internode stacks behaviorally
+        // identical while giving each path family a named construction boundary.
+        // Later batches will trim internode-only middleware without risking drift in
+        // the public HTTP stack.
         let build_stack = |service| {
             ServiceBuilder::new()
                 // NOTE: Both extension types are intentionally inserted to maintain compatibility:
@@ -1193,9 +1197,9 @@ fn process_connection(
                 .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
                 .service(service)
         };
-        let external_service = build_stack(external_service);
-        let internode_service = build_stack(internode_service);
-        let hybrid_service = PathDispatchService::new(external_service, internode_service);
+        let external_stack_service = build_stack(external_service);
+        let internode_stack_service = build_stack(internode_service);
+        let hybrid_service = PathDispatchService::new(external_stack_service, internode_stack_service);
 
         let hybrid_service = TowerToHyperService::new(hybrid_service);
 
