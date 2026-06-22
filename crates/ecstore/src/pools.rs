@@ -4027,23 +4027,18 @@ mod tests {
     #[test]
     fn pool_meta_decode_supports_legacy_payload() {
         let start_time = OffsetDateTime::now_utc();
-        let legacy_meta = PoolMeta {
+        let legacy_meta = LegacyPoolMeta {
             version: POOL_META_VERSION,
-            pools: vec![PoolStatus {
+            pools: vec![LegacyPoolStatus {
                 id: 3,
                 cmd_line: "/legacy/pool".to_string(),
                 last_update: start_time,
-                decommission: Some(PoolDecommissionInfo {
+                decommission: Some(LegacyPoolDecommissionInfo {
                     start_time: Some(start_time),
                     items_decommissioned: 9,
                     items_decommission_failed: 2,
                     bytes_done: 2048,
                     bytes_failed: 256,
-                    queued_buckets: vec!["not-persisted".to_string()],
-                    decommissioned_buckets: vec!["not-persisted".to_string()],
-                    bucket: "not-persisted".to_string(),
-                    prefix: "not-persisted".to_string(),
-                    object: "not-persisted".to_string(),
                     ..Default::default()
                 }),
             }],
