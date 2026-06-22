@@ -596,6 +596,32 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     compatibility consumer residual scan, migration and layer guards,
     formatting, diff hygiene, Rust risk scan, pre-commit quality gate, and
     three-expert review.
+- [x] `API-113` Collapse app context and server local compatibility consumers.
+  - Completed slice: replace crate-qualified app context and server readiness
+    local compatibility consumers with relative owner paths.
+  - Acceptance: selected app context and server readiness modules no longer
+    point back to local compatibility facades through crate-qualified paths;
+    migration rules reject regressions.
+  - Must preserve: app context dependency resolution, startup bootstrap,
+    default interface handles, readiness storage quorum behavior, and readiness
+    test coverage.
+  - Verification: RustFS test-target compile coverage, app context/server local
+    compatibility consumer residual scan, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, pre-commit quality gate, and
+    three-expert review.
+- [x] `API-114` Collapse config, heal, and scanner test compatibility consumers.
+  - Completed slice: replace crate-qualified config test, heal crate, and
+    heal/scanner integration test local compatibility consumers with relative
+    owner paths.
+  - Acceptance: selected config, heal, and scanner test harnesses no longer
+    point back to local compatibility facades through crate-qualified paths;
+    migration rules reject regressions.
+  - Must preserve: config layout parsing tests, heal channel/storage test
+    coverage, endpoint index tests, and scanner lifecycle integration coverage.
+  - Verification: RustFS test-target compile coverage, config/heal/scanner
+    local compatibility consumer residual scan, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, pre-commit quality gate, and
+    three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3629,23 +3655,25 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-112 keeps selected admin handlers/service local compatibility consumers owner-relative by replacing crate-qualified compatibility paths with scoped `super::` or `super::super::` paths. |
-| Migration preservation | pass | The new guard rejects crate-qualified admin handlers/service local compatibility consumer paths while preserving the same facade names and aliases. |
-| Testing/verification | pass | Focused compile, admin local compatibility consumer residual scan, migration guard, layer guard, formatting, diff hygiene, risk scan, and full pre-commit passed. |
+| Quality/architecture | pass | API-114 keeps selected config/heal/scanner local compatibility consumers owner-relative by replacing crate-qualified compatibility paths with scoped relative paths. |
+| Migration preservation | pass | The new guard rejects crate-qualified config/heal/scanner local compatibility consumer paths while preserving the same facade names and aliases. |
+| Testing/verification | pass | Focused compile, config/heal/scanner local compatibility consumer residual scan, migration guard, layer guard, formatting, diff hygiene, risk scan, and full pre-commit passed. |
 
 ## Verification Notes
 
 Passed before push:
 
-- Issue #660 API-112 current slice:
+- Issue #660 API-114 current slice:
   - `cargo check -p rustfs --tests`: passed.
+  - `cargo check -p rustfs-heal --tests`: passed.
+  - `cargo check -p rustfs-scanner --tests`: passed.
   - `cargo fmt --all`: passed.
   - `cargo fmt --all --check`: passed.
   - `git diff --check`: passed.
   - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
   - `./scripts/check_architecture_migration_rules.sh`: passed.
   - `./scripts/check_layer_dependencies.sh`: passed.
-  - Admin local compatibility consumer residual scan: passed.
+  - Config/heal/scanner local compatibility consumer residual scan: passed.
   - Rust risk scan on changed Rust files and guard script: passed.
   - `make pre-commit`: passed.
 

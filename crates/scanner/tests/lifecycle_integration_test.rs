@@ -14,7 +14,7 @@
 
 mod common;
 
-use crate::common::storage_compat::{
+use common::storage_compat::{
     BUCKET_LIFECYCLE_CONFIG, BucketVersioningSys, DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints,
     GLOBAL_TierConfigMgr, PoolEndpoints, ReadCloser, ReaderImpl, STORAGE_FORMAT_FILE, ScannerTestDiskExt as _,
     ScannerWarmBackend, TierConfig, TierMinIO, TierType, TransitionOptions, WarmBackendGetOpts, build_transition_put_options,
