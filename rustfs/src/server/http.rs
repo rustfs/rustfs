@@ -909,11 +909,9 @@ where
 
     fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
         if Self::is_internode_path(req.uri().path()) {
-            let mut internode = self.internode.clone();
-            Box::pin(async move { internode.call(req).await })
+            Box::pin(self.internode.call(req))
         } else {
-            let mut external = self.external.clone();
-            Box::pin(async move { external.call(req).await })
+            Box::pin(self.external.call(req))
         }
     }
 }
