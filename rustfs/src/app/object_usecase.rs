@@ -48,21 +48,21 @@ use metrics::{counter, histogram};
 use pin_project_lite::pin_project;
 use rustfs_object_capacity::capacity_manager::get_capacity_manager;
 // Performance metrics recording (with zero-copy-metrics integration)
-use crate::app::storage_compat::ECStore;
-use crate::app::storage_compat::object_api_utils::to_s3s_etag;
-use crate::app::storage_compat::quota::checker::QuotaChecker;
-use crate::app::storage_compat::storageclass;
-use crate::app::storage_compat::{
+use crate::app::usecase_storage_compat::ECStore;
+use crate::app::usecase_storage_compat::object_api_utils::to_s3s_etag;
+use crate::app::usecase_storage_compat::quota::checker::QuotaChecker;
+use crate::app::usecase_storage_compat::storageclass;
+use crate::app::usecase_storage_compat::{
     AppReplicationConfigExt as _, AppVersioningConfigExt as _, predict_lifecycle_expiration, validate_restore_request,
 };
-use crate::app::storage_compat::{DiskError, is_all_buckets_not_found};
-use crate::app::storage_compat::{DynReader, HashReader, WritePlan, wrap_reader};
-use crate::app::storage_compat::{
+use crate::app::usecase_storage_compat::{DiskError, is_all_buckets_not_found};
+use crate::app::usecase_storage_compat::{DynReader, HashReader, WritePlan, wrap_reader};
+use crate::app::usecase_storage_compat::{
     Error as EcstoreError, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
 };
-use crate::app::storage_compat::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
-use crate::app::storage_compat::{get_lock_acquire_timeout, is_valid_storage_class};
-use crate::app::storage_compat::{
+use crate::app::usecase_storage_compat::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
+use crate::app::usecase_storage_compat::{get_lock_acquire_timeout, is_valid_storage_class};
+use crate::app::usecase_storage_compat::{
     lifecycle::{
         bucket_lifecycle_audit::LcEventSrc,
         bucket_lifecycle_ops::{enqueue_transition_immediate, post_restore_opts},
@@ -117,7 +117,7 @@ use rustfs_utils::http::{
     insert_str, remove_str,
 };
 use rustfs_utils::path::{encode_dir_object, is_dir_object, path_join_buf};
-use rustfs_zip::CompressionFormat;
+use rustfs_zip::{ArchiveLimits, CompressionFormat};
 use s3s::dto::*;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
@@ -279,12 +279,12 @@ async fn enqueue_transitioned_delete_cleanup(
     let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Cleanup);
 
     let je = if opts.delete_prefix {
-        crate::app::storage_compat::lifecycle::tier_sweeper::transitioned_force_delete_journal_entry(
+        crate::app::usecase_storage_compat::lifecycle::tier_sweeper::transitioned_force_delete_journal_entry(
             &existing.transitioned_object,
         )
     } else {
         let version_id = opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok());
-        crate::app::storage_compat::lifecycle::tier_sweeper::transitioned_delete_journal_entry(
+        crate::app::usecase_storage_compat::lifecycle::tier_sweeper::transitioned_delete_journal_entry(
             version_id,
             opts.versioned,
             opts.version_suspended,
@@ -295,9 +295,9 @@ async fn enqueue_transitioned_delete_cleanup(
         return Ok(());
     };
 
-    crate::app::storage_compat::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry(store, &je).await?;
+    crate::app::usecase_storage_compat::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry(store, &je).await?;
 
-    let mut expiry_state = crate::app::storage_compat::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState
+    let mut expiry_state = crate::app::usecase_storage_compat::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState
         .write()
         .await;
     if let Err(err) = expiry_state.enqueue_tier_journal_entry(&je).await {
@@ -1256,6 +1256,67 @@ fn resolve_put_object_extract_options(headers: &HeaderMap) -> S3Result<PutObject
     })
 }
 
+fn put_object_extract_limits() -> ArchiveLimits {
+    ArchiveLimits::default()
+}
+
+fn put_object_extract_quota_exceeded(current_usage: u64, quota_limit: u64) -> S3Error {
+    S3Error::with_message(
+        S3ErrorCode::InvalidRequest,
+        format!("Bucket quota exceeded. Current usage: {current_usage} bytes, limit: {quota_limit} bytes"),
+    )
+}
+
+fn validate_put_object_extract_entry_count(count: usize, limits: ArchiveLimits) -> S3Result<()> {
+    if count > limits.max_entries {
+        return Err(s3_error!(
+            InvalidArgument,
+            "Archive entry count exceeds limit: count={}, limit={}",
+            count,
+            limits.max_entries
+        ));
+    }
+    Ok(())
+}
+
+fn validate_put_object_extract_entry_size(path: &str, size: u64, limits: ArchiveLimits) -> S3Result<()> {
+    if size > limits.max_entry_size {
+        return Err(s3_error!(
+            InvalidArgument,
+            "Archive entry size exceeds limit for {}: size={}, limit={}",
+            path,
+            size,
+            limits.max_entry_size
+        ));
+    }
+    Ok(())
+}
+
+fn validate_put_object_extract_total_size(total_size: u64, limits: ArchiveLimits) -> S3Result<()> {
+    if total_size > limits.max_total_unpacked_size {
+        return Err(s3_error!(
+            InvalidArgument,
+            "Archive total unpacked size exceeds limit: size={}, limit={}",
+            total_size,
+            limits.max_total_unpacked_size
+        ));
+    }
+    Ok(())
+}
+
+fn validate_put_object_extract_entry_path(path: &str, limits: ArchiveLimits) -> S3Result<()> {
+    if path.len() > limits.max_path_length {
+        return Err(s3_error!(
+            InvalidArgument,
+            "Archive entry path exceeds limit for {}: length={}, limit={}",
+            path,
+            path.len(),
+            limits.max_path_length
+        ));
+    }
+    Ok(())
+}
+
 fn is_sse_kms_requested(input: &PutObjectInput, headers: &HeaderMap) -> bool {
     input
         .server_side_encryption
@@ -1542,7 +1603,7 @@ impl DefaultObjectUsecase {
     #[allow(clippy::too_many_arguments)]
     async fn prepare_get_object_read(
         req: &S3Request<GetObjectInput>,
-        store: &crate::app::storage_compat::ECStore,
+        store: &crate::app::usecase_storage_compat::ECStore,
         manager: &ConcurrencyManager,
         bucket: &str,
         key: &str,
@@ -2136,7 +2197,7 @@ impl DefaultObjectUsecase {
             insert_str(
                 &mut metadata,
                 SUFFIX_COMPRESSION,
-                crate::app::storage_compat::compression_metadata_value(algorithm),
+                crate::app::usecase_storage_compat::compression_metadata_value(algorithm),
             );
             insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
@@ -2151,7 +2212,7 @@ impl DefaultObjectUsecase {
             insert_str(
                 &mut opts.user_defined,
                 SUFFIX_COMPRESSION,
-                crate::app::storage_compat::compression_metadata_value(algorithm),
+                crate::app::usecase_storage_compat::compression_metadata_value(algorithm),
             );
             insert_str(&mut opts.user_defined, SUFFIX_ACTUAL_SIZE, size.to_string());
 
@@ -2343,7 +2404,7 @@ impl DefaultObjectUsecase {
         maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
 
         // Fast in-memory update for immediate quota and admin usage consistency
-        crate::app::storage_compat::record_bucket_object_write_memory(
+        crate::app::usecase_storage_compat::record_bucket_object_write_memory(
             &bucket,
             previous_current_size,
             obj_info.size.max(0) as u64,
@@ -3213,7 +3274,7 @@ impl DefaultObjectUsecase {
             insert_str(
                 &mut compress_metadata,
                 SUFFIX_COMPRESSION,
-                crate::app::storage_compat::compression_metadata_value(CompressionAlgorithm::default()),
+                crate::app::usecase_storage_compat::compression_metadata_value(CompressionAlgorithm::default()),
             );
             insert_str(&mut compress_metadata, SUFFIX_ACTUAL_SIZE, actual_size.to_string());
         } else {
@@ -3306,8 +3367,12 @@ impl DefaultObjectUsecase {
 
         // Update quota tracking after successful copy
         if has_bucket_metadata {
-            crate::app::storage_compat::record_bucket_object_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64)
-                .await;
+            crate::app::usecase_storage_compat::record_bucket_object_write_memory(
+                &bucket,
+                previous_current_size,
+                oi.size.max(0) as u64,
+            )
+            .await;
         }
 
         let raw_dest_version = oi.version_id.map(|v| v.to_string());
@@ -3584,7 +3649,7 @@ impl DefaultObjectUsecase {
                     );
                 }
                 let size = object_sizes[i].max(0) as u64;
-                crate::app::storage_compat::record_bucket_object_delete_memory(
+                crate::app::usecase_storage_compat::record_bucket_object_delete_memory(
                     &bucket,
                     size,
                     existing_object_infos[i].is_some() && object_to_delete[i].version_id.is_none(),
@@ -3822,7 +3887,7 @@ impl DefaultObjectUsecase {
         }
 
         // Fast in-memory update for immediate quota and admin usage consistency
-        crate::app::storage_compat::record_bucket_object_delete_memory(
+        crate::app::usecase_storage_compat::record_bucket_object_delete_memory(
             &bucket,
             obj_info.size.max(0) as u64,
             opts.version_id.is_none(),
@@ -4630,6 +4695,31 @@ impl DefaultObjectUsecase {
         };
 
         let extract_options = resolve_put_object_extract_options(&req.headers)?;
+        let extract_limits = put_object_extract_limits();
+        let extract_quota_snapshot = if let Some(metadata_sys) = self.bucket_metadata_sys() {
+            let quota_checker = QuotaChecker::new(metadata_sys);
+            match quota_checker.get_quota_config(&bucket).await {
+                Ok(quota) => {
+                    if let Some(limit) = quota.quota {
+                        match quota_checker.get_real_time_usage(&bucket).await {
+                            Ok(current_usage) => Some((current_usage, limit)),
+                            Err(err) => {
+                                warn!(bucket, error = %err, state = "extract_usage_snapshot_failed", "Bucket quota snapshot degraded to allow");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                }
+                Err(err) => {
+                    warn!(bucket, error = %err, state = "extract_quota_snapshot_failed", "Bucket quota snapshot degraded to allow");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let version_id = match event_version_id {
             Some(v) => v.to_string(),
             None => String::new(),
@@ -4645,6 +4735,8 @@ impl DefaultObjectUsecase {
         let port = get_request_port(&req.headers);
         let user_agent = get_request_user_agent(&req.headers);
         let mut wrote_any_entry = false;
+        let mut extracted_entry_count = 0usize;
+        let mut total_unpacked_size = 0u64;
 
         while let Some(entry) = entries.next().await {
             let mut f = match entry {
@@ -4658,6 +4750,8 @@ impl DefaultObjectUsecase {
                     return Err(s3_error!(InvalidArgument, "Failed to read archive entry: {:?}", e));
                 }
             };
+            extracted_entry_count = extracted_entry_count.saturating_add(1);
+            validate_put_object_extract_entry_count(extracted_entry_count, extract_limits)?;
 
             let fpath = match f.path() {
                 Ok(path) => path,
@@ -4681,6 +4775,7 @@ impl DefaultObjectUsecase {
                     return Err(err);
                 }
             };
+            validate_put_object_extract_entry_path(&fpath, extract_limits)?;
             validate_table_catalog_object_mutation(&bucket, &fpath).await?;
 
             let mut auth_req = S3Request {
@@ -4702,7 +4797,19 @@ impl DefaultObjectUsecase {
             }
             authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectAction)).await?;
 
-            let mut size = f.header().size().unwrap_or_default() as i64;
+            let entry_size = f.header().size().unwrap_or_default();
+            validate_put_object_extract_entry_size(&fpath, entry_size, extract_limits)?;
+            total_unpacked_size = total_unpacked_size
+                .checked_add(entry_size)
+                .ok_or_else(|| s3_error!(InvalidArgument, "Archive total unpacked size overflowed while processing entries"))?;
+            validate_put_object_extract_total_size(total_unpacked_size, extract_limits)?;
+            if let Some((current_usage, quota_limit)) = extract_quota_snapshot
+                && current_usage.saturating_add(total_unpacked_size) > quota_limit
+            {
+                return Err(put_object_extract_quota_exceeded(current_usage, quota_limit));
+            }
+            let mut size =
+                i64::try_from(entry_size).map_err(|_| s3_error!(InvalidArgument, "Archive entry size does not fit into i64"))?;
             let archive_entry_mod_time = f
                 .header()
                 .mtime()
@@ -4757,7 +4864,7 @@ impl DefaultObjectUsecase {
                 insert_str(
                     &mut metadata,
                     SUFFIX_COMPRESSION,
-                    crate::app::storage_compat::compression_metadata_value(algorithm),
+                    crate::app::usecase_storage_compat::compression_metadata_value(algorithm),
                 );
                 insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
@@ -5528,6 +5635,57 @@ mod tests {
         headers.insert(AMZ_SNOWBALL_PREFIX, HeaderValue::from_static("../victim-bucket"));
 
         assert!(resolve_put_object_extract_options(&headers).is_err());
+    }
+
+    #[test]
+    fn validate_put_object_extract_entry_count_rejects_limit_overflow() {
+        let limits = ArchiveLimits {
+            max_entries: 1,
+            ..ArchiveLimits::default()
+        };
+
+        let err = validate_put_object_extract_entry_count(2, limits).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn validate_put_object_extract_entry_size_rejects_oversized_entry() {
+        let limits = ArchiveLimits {
+            max_entry_size: 8,
+            ..ArchiveLimits::default()
+        };
+
+        let err = validate_put_object_extract_entry_size("payload.bin", 9, limits).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn validate_put_object_extract_total_size_rejects_cumulative_overflow() {
+        let limits = ArchiveLimits {
+            max_total_unpacked_size: 16,
+            ..ArchiveLimits::default()
+        };
+
+        let err = validate_put_object_extract_total_size(17, limits).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn validate_put_object_extract_entry_path_rejects_overlong_path() {
+        let limits = ArchiveLimits {
+            max_path_length: 8,
+            ..ArchiveLimits::default()
+        };
+
+        let err = validate_put_object_extract_entry_path("toolong-path", limits).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn put_object_extract_quota_exceeded_matches_existing_error_shape() {
+        let err = put_object_extract_quota_exceeded(10, 8);
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("Bucket quota exceeded. Current usage: 10 bytes, limit: 8 bytes"));
     }
 
     #[tokio::test]

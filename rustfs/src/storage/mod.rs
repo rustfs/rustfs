@@ -15,6 +15,7 @@
 pub mod access;
 pub mod backpressure;
 pub mod concurrency;
+pub(crate) mod core_storage_compat;
 pub mod deadlock_detector;
 pub mod ecfs;
 pub(crate) mod helper;
@@ -29,11 +30,11 @@ pub mod timeout_wrapper;
 pub mod tonic_service;
 
 pub(crate) type StorageDeletedObject = rustfs_storage_api::DeletedObject;
-pub(crate) type StorageGetObjectReader = crate::storage::storage_compat::GetObjectReader;
-pub(crate) type StorageObjectInfo = crate::storage::storage_compat::ObjectInfo;
-pub(crate) type StorageObjectOptions = crate::storage::storage_compat::ObjectOptions;
+pub(crate) type StorageGetObjectReader = crate::storage::core_storage_compat::GetObjectReader;
+pub(crate) type StorageObjectInfo = crate::storage::core_storage_compat::ObjectInfo;
+pub(crate) type StorageObjectOptions = crate::storage::core_storage_compat::ObjectOptions;
 pub(crate) type StorageObjectToDelete = rustfs_storage_api::ObjectToDelete;
-pub(crate) type StoragePutObjReader = crate::storage::storage_compat::PutObjReader;
+pub(crate) type StoragePutObjReader = crate::storage::core_storage_compat::PutObjReader;
 
 #[cfg(test)]
 mod concurrent_fix_test;

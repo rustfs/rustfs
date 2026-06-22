@@ -18,7 +18,7 @@ use rustfs_storage_api::{
     UserspaceProfilingCapability,
 };
 
-use crate::storage_compat::EndpointServerPools;
+use crate::runtime_capabilities_storage_compat::{EndpointServerPools, topology_snapshot_from_endpoint_pools_with_capabilities};
 
 const NOT_WIRED_INTO_RUNTIME: &str = "not wired into runtime";
 const STORAGE_MEDIA_NOT_REPORTED: &str = "storage media not reported by endpoints";
@@ -80,7 +80,7 @@ impl TopologySnapshotProvider for EndpointTopologySnapshotProvider {
 }
 
 pub fn topology_snapshot_from_endpoint_pools(endpoint_pools: &EndpointServerPools) -> TopologySnapshot {
-    crate::storage_compat::topology_snapshot_from_endpoint_pools_with_capabilities(
+    topology_snapshot_from_endpoint_pools_with_capabilities(
         endpoint_pools,
         TopologyCapabilities {
             profiling: cpu_profiling_status(),
@@ -132,7 +132,7 @@ fn cgroup_memory_status() -> CapabilityStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_compat::{Endpoint, Endpoints, PoolEndpoints};
+    use crate::runtime_capabilities_storage_compat::{Endpoint, Endpoints, PoolEndpoints};
     use rustfs_storage_api::{CapabilityState, ObservabilitySnapshotProvider, TopologySnapshotProvider};
 
     #[tokio::test]

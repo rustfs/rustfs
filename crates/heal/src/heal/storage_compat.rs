@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::api::{
-    data_usage as ecstore_data_usage, disk as ecstore_disk, error as ecstore_error, global as ecstore_global,
-    storage as ecstore_storage,
-};
+use rustfs_ecstore::api::data_usage as ecstore_data_usage;
+use rustfs_ecstore::api::disk as ecstore_disk;
+use rustfs_ecstore::api::error as ecstore_error;
+use rustfs_ecstore::api::global as ecstore_global;
+use rustfs_ecstore::api::storage as ecstore_storage;
 
 pub(crate) const DATA_USAGE_CACHE_NAME: &str = ecstore_data_usage::DATA_USAGE_CACHE_NAME;
 pub(crate) const BUCKET_META_PREFIX: &str = ecstore_disk::BUCKET_META_PREFIX;

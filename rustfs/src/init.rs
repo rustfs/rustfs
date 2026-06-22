@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::server::ShutdownHandle;
+use crate::startup_storage_compat::{get_global_region, get_notification_config};
 use crate::storage::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
-use crate::storage_compat::get_notification_config;
 use crate::{admin, config, version};
 use rustfs_config::{
     DEFAULT_BUFFER_MAX_SIZE, DEFAULT_BUFFER_MIN_SIZE, DEFAULT_BUFFER_PROFILE, DEFAULT_BUFFER_UNKNOWN_SIZE, DEFAULT_UPDATE_CHECK,
@@ -157,7 +157,7 @@ fn arn_to_target_id(arn_str: &str) -> Result<rustfs_targets::arn::TargetID, Targ
 /// * `buckets` - A vector of bucket names to process
 #[instrument(skip_all)]
 pub async fn add_bucket_notification_configuration(buckets: Vec<String>) {
-    let global_region = crate::storage_compat::get_global_region();
+    let global_region = get_global_region();
     let region = global_region
         .as_ref()
         .filter(|r| !r.as_str().is_empty())

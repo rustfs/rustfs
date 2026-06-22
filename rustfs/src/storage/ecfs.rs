@@ -18,10 +18,7 @@ use crate::app::multipart_usecase::DefaultMultipartUsecase;
 use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::error::ApiError;
 use crate::storage::access::has_bypass_governance_header;
-use crate::storage::helper::OperationHelper;
-use crate::storage::options::get_opts;
-use crate::storage::s3_api::acl;
-use crate::storage::storage_compat::{
+use crate::storage::core_storage_compat::{
     BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_VERSIONING_CONFIG,
     BUCKET_WEBSITE_CONFIG, BucketVersioningSys, OBJECT_LOCK_CONFIG, StorageError, check_retention_for_modification, decode_tags,
     decode_tags_to_map, delete_bucket_metadata_config, encode_tags, get_bucket_accelerate_config, get_bucket_logging_config,
@@ -29,7 +26,10 @@ use crate::storage::storage_compat::{
     is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found, record_replication_proxy, serialize,
     update_bucket_metadata_config,
 };
-use crate::storage::storage_compat::{StorageReplicationConfigExt as _, StorageVersioningConfigExt as _};
+use crate::storage::core_storage_compat::{StorageReplicationConfigExt as _, StorageVersioningConfigExt as _};
+use crate::storage::helper::OperationHelper;
+use crate::storage::options::get_opts;
+use crate::storage::s3_api::acl;
 use crate::storage::{parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled};
 use crate::table_catalog;
 use http::StatusCode;

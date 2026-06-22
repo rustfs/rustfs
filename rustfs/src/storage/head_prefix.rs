@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage::storage_compat::ECStore;
+use crate::storage::core_storage_compat::ECStore;
 use rustfs_storage_api::ListOperations as _;
 use std::sync::Arc;
 

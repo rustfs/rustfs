@@ -17,12 +17,12 @@ use crate::auth::{check_key_valid, get_condition_values_with_query_and_client_in
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::RemoteAddr;
-use crate::storage::request_context::RequestContext;
-use crate::storage::storage_compat::ECStore;
-use crate::storage::storage_compat::resolve_object_store_handle;
-use crate::storage::storage_compat::{
+use crate::storage::core_storage_compat::ECStore;
+use crate::storage::core_storage_compat::resolve_object_store_handle;
+use crate::storage::core_storage_compat::{
     PolicySys, StorageError, get_bucket_metadata, get_bucket_policy_raw, get_public_access_block_config, is_err_bucket_not_found,
 };
+use crate::storage::request_context::RequestContext;
 use metrics::counter;
 use rustfs_iam::error::Error as IamError;
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
@@ -930,7 +930,7 @@ impl S3Access for FS {
         let req_info = ReqInfo {
             cred,
             is_owner,
-            region: crate::storage::storage_compat::get_global_region(),
+            region: crate::storage::core_storage_compat::get_global_region(),
             request_context,
             ..Default::default()
         };

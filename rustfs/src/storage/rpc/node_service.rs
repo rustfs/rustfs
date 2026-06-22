@@ -16,7 +16,7 @@ use crate::admin::service::{
     config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
     site_replication::reload_site_replication_runtime_state,
 };
-use crate::storage::storage_compat::{
+use crate::storage::rpc::storage_compat::{
     CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, FileInfoVersions, LocalPeerS3Client, MetricType,
     PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG,
     SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StoragePeerS3ClientExt as _, UpdateMetadataOpts, all_local_disk_path,
@@ -122,7 +122,7 @@ fn unimplemented_rpc(method: &str) -> Status {
     Status::unimplemented(format!("{method} is not implemented"))
 }
 
-fn background_rebalance_start_error_message(result: crate::storage::storage_compat::Result<()>) -> Option<String> {
+fn background_rebalance_start_error_message(result: crate::storage::rpc::storage_compat::Result<()>) -> Option<String> {
     result.err().map(|err| format!("start_rebalance failed: {err}"))
 }
 
@@ -2366,7 +2366,7 @@ mod tests {
 
     #[test]
     fn test_background_rebalance_start_error_message_formats_error() {
-        let message = background_rebalance_start_error_message(Err(crate::storage::storage_compat::Error::other("boom")))
+        let message = background_rebalance_start_error_message(Err(crate::storage::rpc::storage_compat::Error::other("boom")))
             .expect("background rebalance start failure should be formatted");
 
         assert!(message.contains("start_rebalance failed"));
@@ -2697,7 +2697,7 @@ mod tests {
         vars.insert(PEER_RESTSIGNAL.to_string(), SERVICE_SIGNAL_RELOAD_DYNAMIC.to_string());
         vars.insert(
             PEER_RESTSUB_SYS.to_string(),
-            crate::storage::storage_compat::STORAGE_CLASS_SUB_SYS.to_string(),
+            crate::storage::rpc::storage_compat::STORAGE_CLASS_SUB_SYS.to_string(),
         );
 
         let request = Request::new(SignalServiceRequest {

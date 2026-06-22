@@ -15,12 +15,12 @@
 use crate::config::{RustFSBufferConfig, WorkloadProfile, get_global_buffer_config, is_buffer_profile_enabled};
 use crate::error::ApiError;
 use crate::server::cors;
-use crate::storage::ecfs::ListObjectUnorderedQuery;
-use crate::storage::storage_compat::StorageReplicationConfigExt as _;
-use crate::storage::storage_compat::{
+use crate::storage::core_storage_compat::StorageReplicationConfigExt as _;
+use crate::storage::core_storage_compat::{
     StorageError, add_object_lock_years, get_bucket_cors_config, get_bucket_object_lock_config, get_bucket_replication_config,
     resolve_object_store_handle,
 };
+use crate::storage::ecfs::ListObjectUnorderedQuery;
 use http::header::{IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::counter;
@@ -738,7 +738,7 @@ pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelet
 }
 
 /// Helper function to get store and validate bucket exists
-pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<crate::storage::storage_compat::ECStore>> {
+pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<crate::storage::core_storage_compat::ECStore>> {
     let Some(store) = resolve_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };

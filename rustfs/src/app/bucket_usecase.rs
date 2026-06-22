@@ -20,12 +20,12 @@ use crate::admin::handlers::site_replication::{
 use crate::app::context::{
     AppContext, default_notify_interface, get_global_app_context, resolve_object_store_handle_for_context,
 };
-use crate::app::storage_compat::ECStore;
-use crate::app::storage_compat::StorageError;
-use crate::app::storage_compat::get_global_notification_sys;
-use crate::app::storage_compat::object_api_utils::to_s3s_etag;
-use crate::app::storage_compat::{AppObjectLockConfigExt as _, AppVersioningConfigExt as _};
-use crate::app::storage_compat::{
+use crate::app::usecase_storage_compat::ECStore;
+use crate::app::usecase_storage_compat::StorageError;
+use crate::app::usecase_storage_compat::get_global_notification_sys;
+use crate::app::usecase_storage_compat::object_api_utils::to_s3s_etag;
+use crate::app::usecase_storage_compat::{AppObjectLockConfigExt as _, AppVersioningConfigExt as _};
+use crate::app::usecase_storage_compat::{
     bucket_target_sys::BucketTargetSys,
     lifecycle::bucket_lifecycle_ops::{
         enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects, validate_lifecycle_config,
@@ -2285,7 +2285,7 @@ mod tests {
         BucketTargets {
             targets: arns
                 .iter()
-                .map(|arn| crate::app::storage_compat::target::BucketTarget {
+                .map(|arn| crate::app::usecase_storage_compat::target::BucketTarget {
                     arn: (*arn).to_string(),
                     target_type: BucketTargetType::ReplicationService,
                     ..Default::default()

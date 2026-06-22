@@ -16,11 +16,11 @@
 mod tests {
     use crate::config::WorkloadProfile;
     use crate::server::cors;
-    use crate::storage::ecfs::{FS, validate_object_lock_configuration_input};
-    use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
-    use crate::storage::storage_compat::{
+    use crate::storage::core_storage_compat::{
         BucketMetadata, DEFAULT_READ_BUFFER_SIZE, get_global_bucket_metadata_sys, set_bucket_metadata,
     };
+    use crate::storage::ecfs::{FS, validate_object_lock_configuration_input};
+    use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
     use crate::storage::{
         StorageObjectInfo as ObjectInfo, apply_cors_headers, apply_default_lock_retention_metadata, check_preconditions,
         get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, is_etag_equal, matches_origin_pattern, parse_etag,
@@ -941,8 +941,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_bucket_object_lock_enabled() {
-        use crate::storage::storage_compat::bucket_metadata_sys_initialized;
-        use crate::storage::storage_compat::set_bucket_metadata;
+        use crate::storage::core_storage_compat::bucket_metadata_sys_initialized;
+        use crate::storage::core_storage_compat::set_bucket_metadata;
         use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
         use time::OffsetDateTime;
 
@@ -1781,7 +1781,7 @@ mod tests {
     /// with a single-element vec value, matching the format expected by policy evaluation.
     #[test]
     fn test_object_tag_condition_key_format() {
-        use crate::storage::storage_compat::decode_tags_to_map;
+        use crate::storage::core_storage_compat::decode_tags_to_map;
         use std::collections::HashMap;
 
         let tags_str = "security=public&project=webapp&env=prod";
