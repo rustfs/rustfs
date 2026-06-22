@@ -1138,6 +1138,15 @@ fn response_storage_class(info: &ObjectInfo, metadata: &HashMap<String, String>)
         .map(StorageClass::from)
 }
 
+fn response_storage_class_for_attributes(info: &ObjectInfo, metadata: &HashMap<String, String>) -> Option<StorageClass> {
+    info.storage_class
+        .clone()
+        .or_else(|| metadata.get(AMZ_STORAGE_CLASS).cloned())
+        .filter(|storage_class| !storage_class.is_empty())
+        .or_else(|| Some(storageclass::STANDARD.to_string()))
+        .map(StorageClass::from)
+}
+
 async fn apply_put_request_object_lock_opts(
     bucket: &str,
     object_lock_legal_hold_status: Option<ObjectLockLegalHoldStatus>,
@@ -2897,8 +2906,6 @@ impl DefaultObjectUsecase {
         validate_ssec_for_read(&info.user_defined, sse_customer_key.as_ref(), sse_customer_key_md5.as_ref())?;
 
         let metadata_map = info.user_defined.clone();
-        let storage_class = response_storage_class(&info, &metadata_map);
-
         debug!(
             "GetObjectAttributes raw object_attributes={:?}",
             object_attributes.iter().map(|value| value.as_str()).collect::<Vec<_>>()
@@ -2950,6 +2957,12 @@ impl DefaultObjectUsecase {
                 checksum_crc64nvme,
                 checksum_type,
             })
+        } else {
+            None
+        };
+
+        let storage_class = if requested("StorageClass") {
+            response_storage_class_for_attributes(&info, &metadata_map)
         } else {
             None
         };
@@ -5831,6 +5844,41 @@ mod tests {
         assert!(
             response_storage_class(&standard_metadata_info, &metadata).is_none(),
             "STANDARD must be omitted even when it only arrives via metadata fallback"
+        );
+    }
+
+    #[test]
+    fn response_storage_class_for_attributes_defaults_to_standard() {
+        let metadata = HashMap::new();
+        let info = ObjectInfo {
+            storage_class: None,
+            user_defined: Arc::new(metadata.clone()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            response_storage_class_for_attributes(&info, &metadata)
+                .as_ref()
+                .map(StorageClass::as_str),
+            Some(storageclass::STANDARD)
+        );
+    }
+
+    #[test]
+    fn response_storage_class_for_attributes_keeps_explicit_storage_class() {
+        let mut metadata = HashMap::new();
+        metadata.insert(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string());
+        let info = ObjectInfo {
+            storage_class: Some(storageclass::STANDARD_IA.to_string()),
+            user_defined: Arc::new(metadata.clone()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            response_storage_class_for_attributes(&info, &metadata)
+                .as_ref()
+                .map(StorageClass::as_str),
+            Some(storageclass::STANDARD_IA)
         );
     }
 
