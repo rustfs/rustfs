@@ -175,6 +175,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/pools/status"),
         admin_route(Method::POST, "/v3/pools/decommission"),
         admin_route(Method::POST, "/v3/pools/cancel"),
+        admin_route(Method::POST, "/v3/pools/clear"),
         admin_route(Method::POST, "/v3/rebalance/start"),
         admin_route(Method::GET, "/v3/rebalance/status"),
         admin_route(Method::POST, "/v3/rebalance/stop"),

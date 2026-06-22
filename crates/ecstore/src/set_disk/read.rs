@@ -342,6 +342,54 @@ impl SetDisks {
         Self::pick_latest_quorum_files_info(fileinfos, errs, bucket, object, read_data, incl_free_vers).await
     }
 
+    pub(crate) async fn load_file_info_versions_exact(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> Result<Option<rustfs_filemeta::FileInfoVersions>> {
+        let disks = self.get_disks_internal().await;
+        if disks.is_empty() {
+            return Err(to_object_err(StorageError::ErasureReadQuorum, vec![bucket, object]));
+        }
+
+        let read_quorum = disks.len().div_ceil(2).max(1);
+        let (raw_fileinfos, errs) = Self::read_all_raw_file_info(&disks, bucket, object, false).await;
+
+        if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
+            let object_err = to_object_err(err.into(), vec![bucket, object]);
+            if is_err_object_not_found(&object_err) || is_err_version_not_found(&object_err) {
+                return Ok(None);
+            }
+            return Err(object_err);
+        }
+
+        let mut shallow_versions = Vec::with_capacity(raw_fileinfos.len());
+        for raw_fileinfo in raw_fileinfos.into_iter().flatten() {
+            let meta = FileMeta::load(&raw_fileinfo.buf)
+                .map_err(|err| Error::other(format!("exact object metadata decode failed for {bucket}/{object}: {err}")))?;
+            shallow_versions.push(meta.versions);
+        }
+
+        if shallow_versions.len() < read_quorum {
+            return Err(to_object_err(StorageError::ErasureReadQuorum, vec![bucket, object]));
+        }
+
+        let versions = merge_file_meta_versions(read_quorum, true, 0, &shallow_versions);
+        if versions.is_empty() {
+            return Err(Error::other(format!(
+                "exact object metadata read returned no quorum versions for {bucket}/{object}"
+            )));
+        }
+
+        FileMeta {
+            versions,
+            ..Default::default()
+        }
+        .get_all_file_info_versions(bucket, object, true)
+        .map(Some)
+        .map_err(|err| Error::other(format!("exact object versions decode failed for {bucket}/{object}: {err}")))
+    }
+
     pub(super) async fn read_all_raw_file_info(
         disks: &[Option<DiskStore>],
         bucket: &str,

@@ -46,6 +46,7 @@ pub(crate) type RebalSaveOpt = ecstore_rebalance::RebalSaveOpt;
 pub(crate) type RebalanceCleanupWarnings = ecstore_rebalance::RebalanceCleanupWarnings;
 pub(crate) type RebalanceMeta = ecstore_rebalance::RebalanceMeta;
 pub(crate) type RebalanceStats = ecstore_rebalance::RebalanceStats;
+pub(crate) type RebalanceStopPropagationRecord = ecstore_rebalance::RebalanceStopPropagationRecord;
 pub(crate) type StorageError = ecstore_error::StorageError;
 pub(crate) type Error = StorageError;
 pub(crate) type Result<T> = core::result::Result<T, Error>;
@@ -62,7 +63,18 @@ pub(crate) type PoolEndpoints = ecstore_layout::PoolEndpoints;
 #[cfg(test)]
 pub(crate) type RebalStatus = ecstore_rebalance::RebalStatus;
 #[cfg(test)]
+pub(crate) type RebalanceCleanupWarningEntry = ecstore_rebalance::RebalanceCleanupWarningEntry;
+#[cfg(test)]
 pub(crate) type RebalanceInfo = ecstore_rebalance::RebalanceInfo;
+
+pub(crate) fn decode_rebalance_stop_propagation_record(message: &str) -> Option<RebalanceStopPropagationRecord> {
+    ecstore_rebalance::decode_rebalance_stop_propagation_record(message)
+}
+
+#[cfg(test)]
+pub(crate) fn encode_rebalance_stop_propagation_record(record: &RebalanceStopPropagationRecord) -> String {
+    ecstore_rebalance::encode_rebalance_stop_propagation_record(record)
+}
 
 pub(crate) trait AdminReplicationConfigExt {
     fn filter_target_arns(&self, obj: &replication::ObjectOpts) -> Vec<String>;

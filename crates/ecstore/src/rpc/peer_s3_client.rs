@@ -346,7 +346,8 @@ impl S3PeerSys {
 
 #[derive(Debug)]
 pub struct LocalPeerS3Client {
-    // pub local_disks: Vec<DiskStore>,
+    #[cfg(test)]
+    local_disks: Option<Vec<DiskStore>>,
     // pub node: Node,
     pub pools: Option<Vec<usize>>,
 }
@@ -354,13 +355,29 @@ pub struct LocalPeerS3Client {
 impl LocalPeerS3Client {
     pub fn new(_node: Option<Node>, pools: Option<Vec<usize>>) -> Self {
         Self {
-            // local_disks,
+            #[cfg(test)]
+            local_disks: None,
             // node,
             pools,
         }
     }
 
+    #[cfg(test)]
+    fn new_with_local_disks(_node: Option<Node>, pools: Option<Vec<usize>>, local_disks: Vec<DiskStore>) -> Self {
+        Self {
+            local_disks: Some(local_disks),
+            pools,
+        }
+    }
+
     async fn local_disks_for_pools(&self) -> Vec<DiskStore> {
+        #[cfg(test)]
+        let local_disks = if let Some(local_disks) = self.local_disks.as_ref() {
+            local_disks.clone()
+        } else {
+            all_local_disk().await
+        };
+        #[cfg(not(test))]
         let local_disks = all_local_disk().await;
         let Some(pools) = self.pools.as_ref() else {
             return local_disks;
@@ -1323,7 +1340,7 @@ mod tests {
 
             assert_eq!(walk_err, DiskError::Timeout);
 
-            let info = LocalPeerS3Client::new(None, Some(vec![0]))
+            let info = LocalPeerS3Client::new_with_local_disks(None, Some(vec![0]), disks.clone())
                 .get_bucket_info(bucket, &BucketOptions::default())
                 .await
                 .expect("bucket info should still succeed after prior walk timeout");
@@ -1347,7 +1364,7 @@ mod tests {
             .await
             .expect("bucket should be created on one disk");
 
-        let err = LocalPeerS3Client::new(None, Some(vec![0]))
+        let err = LocalPeerS3Client::new_with_local_disks(None, Some(vec![0]), disks.clone())
             .get_bucket_info("partial-bucket", &BucketOptions::default())
             .await
             .expect_err("partial bucket should not satisfy local write quorum");
@@ -1375,19 +1392,19 @@ mod tests {
             .await
             .expect("bucket should be created on pool 0 disk 1");
 
-        let pool0_info = LocalPeerS3Client::new(None, Some(vec![0]))
+        let pool0_info = LocalPeerS3Client::new_with_local_disks(None, Some(vec![0]), disks.clone())
             .get_bucket_info(bucket, &BucketOptions::default())
             .await
             .expect("pool 0 peer should see bucket on pool 0 disks");
         assert_eq!(pool0_info.name, bucket);
 
-        let pool1_err = LocalPeerS3Client::new(None, Some(vec![1]))
+        let pool1_err = LocalPeerS3Client::new_with_local_disks(None, Some(vec![1]), disks.clone())
             .get_bucket_info(bucket, &BucketOptions::default())
             .await
             .expect_err("pool 1 peer should not count pool 0 disks");
         assert_eq!(pool1_err, Error::VolumeNotFound);
 
-        let pool1_buckets = LocalPeerS3Client::new(None, Some(vec![1]))
+        let pool1_buckets = LocalPeerS3Client::new_with_local_disks(None, Some(vec![1]), disks.clone())
             .list_bucket(&BucketOptions::default())
             .await
             .expect("pool 1 local listing should succeed against its own disks");

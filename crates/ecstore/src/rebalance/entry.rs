@@ -122,7 +122,7 @@ impl ECStore {
                 true,
                 &crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Rebal,
             )
-            .await
+            .await?
             {
                 expired += 1;
                 debug!(

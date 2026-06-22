@@ -1234,7 +1234,10 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
 
             //TODO: userDefined
 
-            let etag = data.stream.try_resolve_etag().unwrap_or_default();
+            let mut etag = data.stream.try_resolve_etag().unwrap_or_default();
+            if let Some(ref tag) = opts.preserve_etag {
+                etag = tag.clone();
+            }
 
             user_defined.insert("etag".to_owned(), etag.clone());
 
@@ -2275,7 +2278,7 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
         if let Some(err) = &gerr
             && goi.name.is_empty()
         {
-            if opts.delete_marker {
+            if should_force_delete_marker_for_missing_version(&opts) {
                 version_found = false;
             } else {
                 return Err(err.clone());
@@ -2336,7 +2339,7 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
                 fi.set_skip_tier_free_version();
             }
 
-            fi.version_id = if let Some(vid) = opts.version_id {
+            fi.version_id = if let Some(vid) = opts.version_id.as_ref() {
                 Some(Uuid::parse_str(vid.as_str())?)
             } else if opts.versioned {
                 Some(Uuid::new_v4())
@@ -2344,7 +2347,7 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
                 None
             };
 
-            self.delete_object_version(bucket, object, &fi, opts.delete_marker)
+            self.delete_object_version(bucket, object, &fi, should_force_delete_marker_for_missing_version(&opts))
                 .await
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
@@ -2905,8 +2908,12 @@ fn should_preserve_delete_replication_state(opts: &ObjectOptions) -> bool {
     }) || opts.version_purge_status() == VersionPurgeStatusType::Complete
 }
 
+fn should_force_delete_marker_for_missing_version(opts: &ObjectOptions) -> bool {
+    opts.delete_marker || (opts.versioned && opts.version_id.is_none() && !opts.data_movement)
+}
+
 fn resolve_delete_version_state(opts: &ObjectOptions, goi: &ObjectInfo, version_found: bool) -> (bool, bool) {
-    let mut mark_delete = goi.version_id.is_some();
+    let mut mark_delete = goi.version_id.is_some() || (opts.versioned && opts.version_id.is_none());
     let mut delete_marker = opts.versioned;
 
     if opts.version_id.is_some() {
@@ -3956,15 +3963,7 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
             object_size += ext_part.size;
             object_actual_size += ext_part.actual_size;
 
-            fi.parts.push(ObjectPartInfo {
-                etag: ext_part.etag.clone(),
-                number: p.part_num,
-                size: ext_part.size,
-                mod_time: ext_part.mod_time,
-                actual_size: ext_part.actual_size,
-                index: ext_part.index.clone(),
-                ..Default::default()
-            });
+            fi.parts.push(completed_multipart_object_part(p.part_num, ext_part));
         }
 
         if let Some(wtcs) = opts.want_checksum.as_ref() {
@@ -4913,6 +4912,19 @@ fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {
     format!("{}-{}", etag_hex, parts.len())
 }
 
+fn completed_multipart_object_part(part_num: usize, ext_part: &ObjectPartInfo) -> ObjectPartInfo {
+    ObjectPartInfo {
+        etag: ext_part.etag.clone(),
+        number: part_num,
+        size: ext_part.size,
+        mod_time: ext_part.mod_time,
+        actual_size: ext_part.actual_size,
+        index: ext_part.index.clone(),
+        checksums: ext_part.checksums.clone(),
+        ..Default::default()
+    }
+}
+
 fn complete_part_checksum(part: &CompletePart, checksum_type: rustfs_rio::ChecksumType) -> Option<Option<String>> {
     match checksum_type.base() {
         rustfs_rio::ChecksumType::SHA256 => Some(part.checksum_sha256.clone()),
@@ -5301,6 +5313,42 @@ mod tests {
     }
 
     #[test]
+    fn resolve_delete_version_state_creates_marker_for_missing_latest_versioned_delete() {
+        let opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+
+        let (mark_delete, delete_marker) = resolve_delete_version_state(&opts, &ObjectInfo::default(), false);
+
+        assert!(mark_delete);
+        assert!(delete_marker);
+    }
+
+    #[test]
+    fn should_force_delete_marker_for_missing_version_rejects_data_movement_latest_delete() {
+        let opts = ObjectOptions {
+            versioned: true,
+            data_movement: true,
+            ..Default::default()
+        };
+
+        assert!(!should_force_delete_marker_for_missing_version(&opts));
+    }
+
+    #[test]
+    fn should_force_delete_marker_for_missing_version_allows_explicit_marker_creation() {
+        let opts = ObjectOptions {
+            versioned: true,
+            data_movement: true,
+            delete_marker: true,
+            ..Default::default()
+        };
+
+        assert!(should_force_delete_marker_for_missing_version(&opts));
+    }
+
+    #[test]
     fn resolve_delete_version_state_skips_marker_creation_for_replica_purge_when_version_missing() {
         let opts = ObjectOptions {
             versioned: true,
@@ -5431,6 +5479,33 @@ mod tests {
         }];
         let single_result = get_complete_multipart_md5(&single_part);
         assert!(single_result.ends_with("-1"));
+    }
+
+    #[test]
+    fn test_completed_multipart_object_part_preserves_checksums() {
+        let checksums = HashMap::from([
+            (rustfs_rio::ChecksumType::CRC32.to_string(), "crc32-value".to_string()),
+            (rustfs_rio::ChecksumType::CRC32C.to_string(), "crc32c-value".to_string()),
+        ]);
+        let ext_part = ObjectPartInfo {
+            number: 7,
+            etag: "etag-7".to_string(),
+            size: 123,
+            actual_size: 456,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            index: Some(Bytes::from_static(&[1, 2, 3])),
+            checksums: Some(checksums.clone()),
+            ..Default::default()
+        };
+
+        let completed = completed_multipart_object_part(7, &ext_part);
+
+        assert_eq!(completed.number, 7);
+        assert_eq!(completed.etag, ext_part.etag);
+        assert_eq!(completed.size, ext_part.size);
+        assert_eq!(completed.actual_size, ext_part.actual_size);
+        assert_eq!(completed.index, ext_part.index);
+        assert_eq!(completed.checksums, Some(checksums));
     }
 
     #[test]
@@ -6303,6 +6378,71 @@ mod tests {
         assert_eq!(err, StorageError::ErasureReadQuorum);
 
         drop(temp_dirs);
+    }
+
+    #[tokio::test]
+    async fn load_file_info_versions_exact_returns_none_for_explicit_not_found() {
+        let format = FormatV3::new(1, 1);
+        let (temp_dir, endpoint, disk) = make_formatted_local_disk_for_info_test(0, &format).await;
+        let bucket = "bucket";
+
+        disk.make_volume(bucket).await.expect("bucket should be created");
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(vec![Some(disk)])),
+            1,
+            0,
+            0,
+            0,
+            vec![endpoint],
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        let versions = set_disks
+            .load_file_info_versions_exact(bucket, "missing-object")
+            .await
+            .expect("explicit object not found should be accepted");
+
+        assert!(versions.is_none());
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn load_file_info_versions_exact_rejects_corrupt_metadata() {
+        let format = FormatV3::new(1, 1);
+        let (temp_dir, endpoint, disk) = make_formatted_local_disk_for_info_test(0, &format).await;
+        let bucket = "bucket";
+        let object = "object.txt";
+
+        disk.make_volume(bucket).await.expect("bucket should be created");
+        let metadata_path = format!("{object}/{STORAGE_FORMAT_FILE}");
+        disk.write_all(bucket, &metadata_path, bytes::Bytes::from_static(b"not-xl-meta"))
+            .await
+            .expect("corrupt metadata file should be written");
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(vec![Some(disk)])),
+            1,
+            0,
+            0,
+            0,
+            vec![endpoint],
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        let err = set_disks
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect_err("corrupt exact metadata must fail closed");
+
+        assert!(!is_err_object_not_found(&err), "corrupt metadata must not be treated as not found: {err}");
+        drop(temp_dir);
     }
 
     #[tokio::test]
