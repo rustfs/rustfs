@@ -16,10 +16,8 @@ use rustfs_concurrency::{
     AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadAdmissionSnapshotProvider,
     WorkloadClass,
 };
+use rustfs_ecstore::api::bucket::{metadata_sys, replication};
 
-use super::workload_admission_storage_compat::{
-    get_global_bucket_metadata_sys, get_global_replication_pool, replication_queue_current_count,
-};
 use crate::storage::concurrency::get_concurrency_manager;
 
 const BUCKET_METADATA_RUNTIME_NOT_INITIALIZED: &str = "bucket metadata runtime not initialized";
@@ -77,7 +75,7 @@ pub fn foreground_read_workload_admission_snapshot() -> WorkloadAdmissionSnapsho
 }
 
 pub fn metadata_workload_admission_snapshot() -> WorkloadAdmissionSnapshot {
-    metadata_workload_admission_snapshot_from_initialized(get_global_bucket_metadata_sys().is_some())
+    metadata_workload_admission_snapshot_from_initialized(metadata_sys::get_global_bucket_metadata_sys().is_some())
 }
 
 fn metadata_workload_admission_snapshot_from_initialized(runtime_initialized: bool) -> WorkloadAdmissionSnapshot {
@@ -153,7 +151,7 @@ fn repair_workload_admission_snapshot_from_counts(
 }
 
 pub fn replication_workload_admission_snapshot() -> WorkloadAdmissionSnapshot {
-    let Some(pool) = get_global_replication_pool() else {
+    let Some(pool) = replication::get_global_replication_pool() else {
         return replication_workload_admission_snapshot_from_counts(false, None, None);
     };
 
@@ -198,6 +196,16 @@ fn i64_to_usize_saturated(value: i64) -> usize {
 
 fn i32_to_usize_saturated(value: i32) -> usize {
     usize::try_from(value.max(0)).unwrap_or(usize::MAX)
+}
+
+fn replication_queue_current_count() -> Option<i64> {
+    replication::GLOBAL_REPLICATION_STATS.get().and_then(|stats| {
+        stats
+            .q_cache
+            .try_lock()
+            .ok()
+            .map(|cache| cache.sr_queue_stats.curr.get_current_count())
+    })
 }
 
 #[cfg(test)]

@@ -12,23 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::validate_admin_request;
-use crate::admin::handlers::storage_compat::Error as StorageError;
-use crate::admin::handlers::storage_compat::bucket_target_sys::BucketTargetSys;
-use crate::admin::handlers::storage_compat::metadata::{
+use super::super::storage_compat::Error as StorageError;
+use super::super::storage_compat::bucket_target_sys::BucketTargetSys;
+use super::super::storage_compat::metadata::{
     BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE, BUCKET_REPLICATION_CONFIG,
     BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG,
 };
-use crate::admin::handlers::storage_compat::metadata_sys;
-use crate::admin::handlers::storage_compat::replication::GLOBAL_REPLICATION_STATS;
-use crate::admin::handlers::storage_compat::replication::{ResyncOpts, get_global_replication_pool};
-use crate::admin::handlers::storage_compat::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
-use crate::admin::handlers::storage_compat::utils::{deserialize, serialize};
-use crate::admin::handlers::storage_compat::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
-use crate::admin::handlers::storage_compat::{delete_admin_config, read_admin_config, save_admin_config};
-use crate::admin::handlers::storage_compat::{
-    get_global_deployment_id, get_global_endpoints_opt, get_global_region, global_rustfs_port,
-};
+use super::super::storage_compat::metadata_sys;
+use super::super::storage_compat::replication::GLOBAL_REPLICATION_STATS;
+use super::super::storage_compat::replication::{ResyncOpts, get_global_replication_pool};
+use super::super::storage_compat::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
+use super::super::storage_compat::utils::{deserialize, serialize};
+use super::super::storage_compat::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
+use super::super::storage_compat::{delete_admin_config, read_admin_config, save_admin_config};
+use super::super::storage_compat::{get_global_deployment_id, get_global_endpoints_opt, get_global_region, global_rustfs_port};
+use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::site_replication_identity::{
     canonical_endpoint, deployment_id_for_endpoint, normalize_peer_map_by_identity_with, same_identity_endpoint,
@@ -654,7 +652,7 @@ async fn site_replication_peer_client() -> S3Result<reqwest::Client> {
     built
 }
 
-fn runtime_tls_enabled_with(endpoints: Option<&crate::admin::handlers::storage_compat::EndpointServerPools>) -> bool {
+fn runtime_tls_enabled_with(endpoints: Option<&super::super::storage_compat::EndpointServerPools>) -> bool {
     if !rustfs_utils::get_env_str(ENV_RUSTFS_TLS_PATH, DEFAULT_RUSTFS_TLS_PATH).is_empty() {
         return true;
     }
@@ -3360,7 +3358,7 @@ fn is_stale_update(local_updated_at: OffsetDateTime, incoming_updated_at: Option
 }
 
 fn bucket_meta_local_updated_at(
-    bucket_meta: &crate::admin::handlers::storage_compat::metadata::BucketMetadata,
+    bucket_meta: &super::super::storage_compat::metadata::BucketMetadata,
     config_file: &str,
 ) -> OffsetDateTime {
     match config_file {
@@ -4605,9 +4603,9 @@ impl Operation for SRRotateServiceAccountHandler {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::storage_compat::Endpoint;
+    use super::super::super::storage_compat::{EndpointServerPools, Endpoints, PoolEndpoints};
     use super::*;
-    use crate::admin::handlers::storage_compat::Endpoint;
-    use crate::admin::handlers::storage_compat::{EndpointServerPools, Endpoints, PoolEndpoints};
     use http::{HeaderMap, HeaderValue, Uri};
     use rustfs_common::{get_global_outbound_tls_generation, set_global_outbound_tls_generation};
     use rustfs_policy::policy::action::S3Action;

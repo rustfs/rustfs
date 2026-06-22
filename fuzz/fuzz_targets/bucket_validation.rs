@@ -1,10 +1,7 @@
 #![no_main]
 
-#[path = "bucket_validation/storage_compat.rs"]
-mod storage_compat;
-
 use libfuzzer_sys::fuzz_target;
-use crate::storage_compat::{
+use rustfs_ecstore::api::bucket::utils::{
     check_bucket_and_object_names, check_list_objs_args, check_valid_bucket_name_strict, is_meta_bucketname,
 };
 

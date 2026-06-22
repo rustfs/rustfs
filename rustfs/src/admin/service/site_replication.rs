@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::service::storage_compat::Error as StorageError;
-use crate::admin::service::storage_compat::{read_admin_config, save_admin_config};
+use super::super::storage_compat::Error as StorageError;
+use super::super::storage_compat::{read_admin_config, save_admin_config};
 use crate::admin::site_replication_identity::{deployment_id_for_endpoint, normalize_peer_map_by_identity_with};
 use crate::app::context::resolve_object_store_handle;
 use rustfs_madmin::PeerInfo;

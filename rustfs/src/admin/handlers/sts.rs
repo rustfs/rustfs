@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::super::storage_compat::utils::serialize;
 use super::is_admin::IsAdminHandler;
-use crate::admin::handlers::storage_compat::utils::serialize;
 use crate::{
     admin::{
         handlers::site_replication::site_replication_iam_change_hook,

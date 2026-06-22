@@ -786,6 +786,51 @@ async fn test_namespace_lock_distributed_unlock_retries_release_false() {
 }
 
 #[tokio::test]
+async fn test_namespace_lock_distributed_reclaims_expired_same_resource_after_failed_unlocks() {
+    let managers = (0..3).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
+    let flaky_clients = managers
+        .iter()
+        .map(|manager| Arc::new(FlakyReleaseClient::new(manager.clone(), 8)))
+        .collect::<Vec<_>>();
+    let clients = flaky_clients
+        .iter()
+        .map(|client| client.clone() as Arc<dyn LockClient>)
+        .collect::<Vec<_>>();
+
+    let lock = NamespaceLock::with_clients("expired-unlock-recovery".to_string(), clients);
+    let resource = create_test_object_key("bucket", "object-expired-unlock-recovery");
+    let request = LockRequest::new(resource.clone(), LockType::Exclusive, "owner-a")
+        .with_acquire_timeout(Duration::from_millis(100))
+        .with_ttl(Duration::from_millis(50));
+
+    let mut guard = lock
+        .acquire_guard(&request)
+        .await
+        .expect("initial owner should acquire the distributed lock")
+        .expect("distributed acquire should return a guard");
+
+    assert!(guard.release(), "distributed guard should enqueue unlock retries");
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let recovered_request = LockRequest::new(resource.clone(), LockType::Exclusive, "owner-b")
+        .with_acquire_timeout(Duration::from_millis(200))
+        .with_ttl(Duration::from_millis(50));
+
+    let recovered_guard = lock
+        .acquire_guard(&recovered_request)
+        .await
+        .expect("expired stale distributed guards should be reclaimed")
+        .expect("recovered acquire should return a guard");
+
+    drop(recovered_guard);
+
+    assert!(
+        flaky_clients.iter().all(|client| client.release_attempts() >= 1),
+        "unlock retries should have been attempted before TTL-based reclamation"
+    );
+}
+
+#[tokio::test]
 async fn test_namespace_lock_distributed_retries_transient_acquire_timeout() {
     let managers = (0..3).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
     let flaky_clients = managers

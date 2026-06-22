@@ -14,7 +14,6 @@
 
 pub mod http_service;
 pub mod node_service;
-pub(crate) mod storage_compat;
 
 pub use http_service::InternodeRpcService;
 pub use node_service::{NodeService, make_server};

@@ -33,6 +33,12 @@
 //! and stores credentials in task-local storage, which Swift handlers access
 //! to enforce tenant isolation.
 
+use std::sync::Arc;
+
+use rustfs_ecstore::api::{
+    bucket as ecstore_bucket, error as ecstore_error, global as ecstore_global, storage as ecstore_storage,
+};
+
 pub mod account;
 pub mod acl;
 pub mod bulk;
@@ -51,7 +57,6 @@ pub mod ratelimit;
 pub mod router;
 pub mod slo;
 pub mod staticweb;
-pub mod storage_compat;
 pub mod symlink;
 pub mod sync;
 pub mod tempurl;
@@ -63,3 +68,23 @@ pub use router::{SwiftRoute, SwiftRouter};
 // Note: Container, Object, and SwiftMetadata types used by Swift implementation
 #[allow(unused_imports)]
 pub use types::{Container, Object, SwiftMetadata};
+
+type SwiftBucketMetadata = ecstore_bucket::metadata::BucketMetadata;
+type SwiftStorageResult<T> = ecstore_error::Result<T>;
+type SwiftStore = ecstore_storage::ECStore;
+pub type SwiftGetObjectReader = <SwiftStore as rustfs_storage_api::ObjectIO>::GetObjectReader;
+pub type SwiftObjectInfo = <SwiftStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
+pub type SwiftObjectOptions = <SwiftStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
+pub type SwiftPutObjReader = <SwiftStore as rustfs_storage_api::ObjectIO>::PutObjectReader;
+
+fn resolve_swift_object_store_handle() -> Option<Arc<SwiftStore>> {
+    ecstore_global::resolve_object_store_handle()
+}
+
+async fn get_swift_bucket_metadata(bucket: &str) -> SwiftStorageResult<Arc<SwiftBucketMetadata>> {
+    ecstore_bucket::metadata_sys::get(bucket).await
+}
+
+async fn set_swift_bucket_metadata(bucket: String, metadata: SwiftBucketMetadata) -> SwiftStorageResult<()> {
+    ecstore_bucket::metadata_sys::set_bucket_metadata(bucket, metadata).await
+}
