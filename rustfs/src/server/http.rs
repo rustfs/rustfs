@@ -32,6 +32,7 @@ use crate::server::{
     },
 };
 use crate::storage;
+use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
 use crate::storage::rpc::InternodeRpcService;
 use crate::storage::tonic_service::make_server;
 use bytes::Bytes;
@@ -837,6 +838,47 @@ struct PathDispatchService<A, B> {
     internode: B,
 }
 
+#[derive(Clone, Default)]
+struct InternodeRequestContextLiteLayer;
+
+impl<S> tower::Layer<S> for InternodeRequestContextLiteLayer {
+    type Service = InternodeRequestContextLiteService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        InternodeRequestContextLiteService { inner }
+    }
+}
+
+#[derive(Clone)]
+struct InternodeRequestContextLiteService<S> {
+    inner: S,
+}
+
+impl<S, B> Service<HttpRequest<B>> for InternodeRequestContextLiteService<S>
+where
+    S: Service<HttpRequest<B>> + Clone,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: HttpRequest<B>) -> Self::Future {
+        let request_id = extract_request_id_from_headers(req.headers());
+        req.extensions_mut().insert(RequestContext {
+            x_amz_request_id: request_id.clone(),
+            request_id,
+            trace_id: None,
+            span_id: None,
+            start_time: std::time::Instant::now(),
+        });
+        self.inner.call(req)
+    }
+}
+
 impl<A, B> PathDispatchService<A, B> {
     fn new(external: A, internode: B) -> Self {
         Self { external, internode }
@@ -1050,7 +1092,7 @@ fn process_connection(
                 // Pre-computed in ConnectionContext to avoid per-connection is_enabled() check.
                 .option_layer(trusted_proxy_layer.clone())
                 .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-                .layer(RequestContextLayer)
+                .layer(InternodeRequestContextLiteLayer)
                 .layer(EmptyBodyContentLengthCompatLayer)
                 .layer(CatchPanicLayer::new())
                 // CRITICAL: Insert ReadinessGateLayer before business logic
