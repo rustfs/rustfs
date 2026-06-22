@@ -98,6 +98,7 @@ RUSTFS_ROOT_E2E_COMPAT_RAW_FACADE_PATH_HITS_FILE="${TMP_DIR}/rustfs_root_e2e_com
 ALL_STORAGE_COMPAT_RAW_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_raw_facade_path_hits.txt"
 ALL_STORAGE_COMPAT_GROUPED_FACADE_IMPORT_HITS_FILE="${TMP_DIR}/all_storage_compat_grouped_facade_import_hits.txt"
 ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_self_facade_path_hits.txt"
+RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE="${TMP_DIR}/rustfs_local_compat_owner_self_path_hits.txt"
 SCANNER_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/scanner_bucket_storage_compat_module_hits.txt"
 NOTIFY_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/notify_storage_compat_module_hits.txt"
 OBS_STORAGE_COMPAT_PASSTHROUGH_HITS_FILE="${TMP_DIR}/obs_storage_compat_passthrough_hits.txt"
@@ -1034,6 +1035,18 @@ fi
 
 if [[ -s "$ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE" ]]; then
   report_failure "storage compatibility boundaries must reference local ECStore facade aliases directly or through super::, not crate-qualified storage_compat self paths: $(paste -sd '; ' "$ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::(?:admin|app|storage)::storage_compat' \
+    rustfs/src/admin rustfs/src/app rustfs/src/storage \
+    --glob '*storage_compat.rs' \
+    --glob '*_storage_compat.rs' || true
+) >"$RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE"
+
+if [[ -s "$RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE" ]]; then
+  report_failure "RustFS local compatibility bridge modules must use relative owner storage_compat paths instead of crate-qualified owner self paths: $(paste -sd '; ' "$RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE")"
 fi
 
 (

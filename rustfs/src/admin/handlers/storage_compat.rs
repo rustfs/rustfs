@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use crate::admin::storage_compat::{
+pub(crate) use super::super::storage_compat::{
     AdminError, AdminReplicationConfigExt, AdminVersioningConfigExt, CollectMetricsOpts, DailyAllTierStats, DiskStat, ECStore,
     ERR_TIER_ALREADY_EXISTS, ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_CONNECT_ERR,
     ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_MISSING_CREDENTIALS, ERR_TIER_NAME_NOT_UPPERCASE, ERR_TIER_NOT_FOUND,
@@ -24,25 +24,25 @@ pub(crate) use crate::admin::storage_compat::{
 };
 
 #[cfg(test)]
-pub(crate) use crate::admin::storage_compat::{Endpoint, Endpoints, PoolEndpoints, RebalStatus, RebalanceInfo};
+pub(crate) use super::super::storage_compat::{Endpoint, Endpoints, PoolEndpoints, RebalStatus, RebalanceInfo};
 
 pub(crate) mod bucket_target_sys {
-    pub(crate) use crate::admin::storage_compat::bucket_target_sys::{BucketTargetError, BucketTargetSys};
+    pub(crate) use super::super::super::storage_compat::bucket_target_sys::{BucketTargetError, BucketTargetSys};
 }
 
 pub(crate) mod lifecycle {
     pub(crate) mod bucket_lifecycle_ops {
-        pub(crate) use crate::admin::storage_compat::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState;
+        pub(crate) use super::super::super::super::storage_compat::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState;
     }
 
     pub(crate) mod tier_last_day_stats {
         #[cfg(test)]
-        pub(crate) use crate::admin::storage_compat::lifecycle::tier_last_day_stats::LastDayTierStats;
+        pub(crate) use super::super::super::super::storage_compat::lifecycle::tier_last_day_stats::LastDayTierStats;
     }
 }
 
 pub(crate) mod metadata {
-    pub(crate) use crate::admin::storage_compat::metadata::{
+    pub(crate) use super::super::super::storage_compat::metadata::{
         BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE,
         BUCKET_REPLICATION_CONFIG, BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG,
         BucketMetadata, OBJECT_LOCK_CONFIG, table_catalog_path_hash,
@@ -50,7 +50,7 @@ pub(crate) mod metadata {
 }
 
 pub(crate) mod metadata_sys {
-    pub(crate) use crate::admin::storage_compat::metadata_sys::{
+    pub(crate) use super::super::super::storage_compat::metadata_sys::{
         BucketMetadataSys, delete, get, get_bucket_policy, get_bucket_targets_config, get_config_from_disk, get_lifecycle_config,
         get_notification_config, get_object_lock_config, get_quota_config, get_replication_config, get_sse_config,
         get_tagging_config, get_versioning_config, list_bucket_targets, update,
@@ -58,33 +58,35 @@ pub(crate) mod metadata_sys {
 }
 
 pub(crate) mod quota {
-    pub(crate) use crate::admin::storage_compat::quota::{BucketQuota, QuotaError, QuotaOperation};
+    pub(crate) use super::super::super::storage_compat::quota::{BucketQuota, QuotaError, QuotaOperation};
 
     pub(crate) mod checker {
-        pub(crate) use crate::admin::storage_compat::quota::checker::QuotaChecker;
+        pub(crate) use super::super::super::super::storage_compat::quota::checker::QuotaChecker;
     }
 }
 
 pub(crate) mod replication {
-    pub(crate) use crate::admin::storage_compat::replication::{
+    pub(crate) use super::super::super::storage_compat::replication::{
         BucketStats, GLOBAL_REPLICATION_STATS, ResyncOpts, get_global_replication_pool,
     };
 }
 
 pub(crate) mod storageclass {
-    pub(crate) use crate::admin::storage_compat::storageclass::{
+    pub(crate) use super::super::super::storage_compat::storageclass::{
         INLINE_BLOCK_ENV, OPTIMIZE_ENV, RRS, RRS_ENV, STANDARD, STANDARD_ENV,
     };
 }
 
 pub(crate) mod target {
-    pub(crate) use crate::admin::storage_compat::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
+    pub(crate) use super::super::super::storage_compat::target::{
+        ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials,
+    };
 }
 
 pub(crate) mod utils {
-    pub(crate) use crate::admin::storage_compat::utils::{deserialize, is_valid_object_prefix, serialize};
+    pub(crate) use super::super::super::storage_compat::utils::{deserialize, is_valid_object_prefix, serialize};
 }
 
 pub(crate) mod versioning_sys {
-    pub(crate) use crate::admin::storage_compat::versioning_sys::BucketVersioningSys;
+    pub(crate) use super::super::super::storage_compat::versioning_sys::BucketVersioningSys;
 }
