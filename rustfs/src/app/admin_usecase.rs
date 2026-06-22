@@ -81,6 +81,8 @@ pub struct AdminPoolDecommissionInfo {
     pub prefix: String,
     #[serde(rename = "object")]
     pub object: String,
+    #[serde(rename = "stage")]
+    pub stage: String,
     #[serde(rename = "objectsDecommissioned")]
     pub items_decommissioned: usize,
     #[serde(rename = "objectsDecommissionedFailed")]
@@ -363,6 +365,7 @@ impl DefaultAdminUsecase {
             bucket: info.bucket,
             prefix: info.prefix,
             object: info.object,
+            stage: info.stage,
             items_decommissioned: info.items_decommissioned,
             items_decommission_failed: info.items_decommission_failed,
             bytes_done: info.bytes_done,
@@ -549,6 +552,7 @@ mod tests {
                 bucket: "bucket-a".to_string(),
                 prefix: "prefix/".to_string(),
                 object: "object.txt".to_string(),
+                stage: "migrate_object".to_string(),
                 items_decommissioned: 7,
                 items_decommission_failed: 1,
                 bytes_done: 1024,
@@ -568,6 +572,7 @@ mod tests {
         assert_eq!(value["decommissionInfo"]["bucket"], "bucket-a");
         assert_eq!(value["decommissionInfo"]["prefix"], "prefix/");
         assert_eq!(value["decommissionInfo"]["object"], "object.txt");
+        assert_eq!(value["decommissionInfo"]["stage"], "migrate_object");
         assert_eq!(value["decommissionInfo"]["objectsDecommissioned"], 7);
         assert_eq!(value["decommissionInfo"]["objectsDecommissionedFailed"], 1);
         assert_eq!(value["decommissionInfo"]["bytesDecommissioned"], 1024);

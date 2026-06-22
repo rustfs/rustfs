@@ -77,6 +77,10 @@ const LOG_SUBSYSTEM_POOLS: &str = "pools";
 const EVENT_DECOMMISSION_STATE: &str = "decommission_state";
 const EVENT_DECOMMISSION_BUCKET: &str = "decommission_bucket";
 const EVENT_DECOMMISSION_ENTRY: &str = "decommission_entry";
+const DECOMMISSION_STAGE_MIGRATE_OBJECT: &str = "migrate_object";
+const DECOMMISSION_STAGE_CLEANUP_PREFLIGHT: &str = "cleanup_preflight";
+const DECOMMISSION_STAGE_SOURCE_CLEANUP: &str = "source_cleanup";
+const DECOMMISSION_STAGE_ENTRY_FINISHED: &str = "entry_finished";
 const DECOMMISSION_PROGRESS_SAVE_INTERVAL: Duration = Duration::seconds(30);
 const DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD: usize = 1000;
 const DECOMMISSION_BUCKET_CONCURRENCY_ENV: &str = "RUSTFS_DECOMMISSION_BUCKET_CONCURRENCY";
@@ -506,7 +510,13 @@ fn count_decommission_item(meta: &mut PoolMeta, idx: usize, size: usize, failed:
     Ok(())
 }
 
-fn track_decommission_current_object(meta: &mut PoolMeta, idx: usize, bucket: &str, object: &str) -> Result<()> {
+fn track_decommission_current_object_stage(
+    meta: &mut PoolMeta,
+    idx: usize,
+    bucket: &str,
+    object: &str,
+    stage: &str,
+) -> Result<()> {
     let pool_count = meta.pools.len();
     ensure_valid_decommission_pool_index(pool_count, idx)?;
 
@@ -519,6 +529,27 @@ fn track_decommission_current_object(meta: &mut PoolMeta, idx: usize, bucket: &s
 
     info.object = object.to_string();
     info.bucket = bucket.to_string();
+    info.stage = stage.to_string();
+    Ok(())
+}
+
+fn track_decommission_current_object(meta: &mut PoolMeta, idx: usize, bucket: &str, object: &str) -> Result<()> {
+    track_decommission_current_object_stage(meta, idx, bucket, object, "")
+}
+
+fn touch_decommission_progress(meta: &mut PoolMeta, idx: usize) -> Result<()> {
+    let pool_count = meta.pools.len();
+    ensure_valid_decommission_pool_index(pool_count, idx)?;
+
+    let Some(pool) = meta.pools.get_mut(idx) else {
+        return Err(invalid_decommission_pool_index_error(pool_count, idx));
+    };
+    let Some(info) = pool.decommission.as_mut() else {
+        return Err(decommission_metadata_not_initialized_error("touch decommission progress"));
+    };
+
+    pool.last_update = OffsetDateTime::now_utc();
+    info.mark_progress_saved();
     Ok(())
 }
 
@@ -1137,6 +1168,7 @@ impl TryFrom<PersistedPoolDecommissionInfo> for PoolDecommissionInfo {
             bucket: value.bucket,
             prefix: value.prefix,
             object: value.object,
+            stage: String::new(),
             items_decommissioned: value.items_decommissioned,
             items_decommission_failed: value.items_decommission_failed,
             bytes_done: value.bytes_done,
@@ -1167,6 +1199,7 @@ impl TryFrom<LegacyPoolDecommissionInfo> for PoolDecommissionInfo {
             bucket: String::new(),
             prefix: String::new(),
             object: String::new(),
+            stage: String::new(),
             items_decommissioned: value.items_decommissioned,
             items_decommission_failed: value.items_decommission_failed,
             bytes_done: value.bytes_done,
@@ -1612,6 +1645,10 @@ impl PoolMeta {
     }
 
     pub fn track_current_bucket_object(&mut self, idx: usize, bucket: String, object: String) {
+        self.track_current_bucket_object_stage(idx, bucket, object, String::new());
+    }
+
+    pub fn track_current_bucket_object_stage(&mut self, idx: usize, bucket: String, object: String, stage: String) {
         if self.pools.get(idx).is_none_or(|v| v.decommission.is_none()) {
             return;
         }
@@ -1621,6 +1658,7 @@ impl PoolMeta {
         {
             info.object = object;
             info.bucket = bucket;
+            info.stage = stage;
         }
     }
 
@@ -1769,6 +1807,8 @@ pub struct PoolDecommissionInfo {
     pub prefix: String,
     #[serde(skip)]
     pub object: String,
+    #[serde(skip)]
+    pub stage: String,
 
     #[serde(rename = "objectsDecommissioned")]
     pub items_decommissioned: usize,
@@ -2360,6 +2400,38 @@ impl ECStore {
         Ok(())
     }
 
+    async fn save_decommission_entry_progress_stage(
+        &self,
+        idx: usize,
+        bucket: &str,
+        object: &str,
+        stage: &'static str,
+    ) -> Result<()> {
+        {
+            let mut pool_meta = self.pool_meta.write().await;
+            track_decommission_current_object_stage(&mut pool_meta, idx, bucket, object, stage)
+                .map_err(|err| with_decommission_entry_context(stage, bucket, object, err))?;
+            touch_decommission_progress(&mut pool_meta, idx)
+                .map_err(|err| with_decommission_entry_context(stage, bucket, object, err))?;
+        }
+
+        if let Some(err) = resolve_decommission_progress_save_result(self.save_current_pool_meta().await) {
+            warn!(
+                event = EVENT_DECOMMISSION_ENTRY,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                pool_index = idx,
+                bucket = %bucket,
+                object = %object,
+                stage,
+                error = ?err,
+                "Decommission progress stage save failed"
+            );
+        }
+
+        Ok(())
+    }
+
     #[allow(unused_assignments, clippy::too_many_arguments)]
     #[tracing::instrument(skip(self, set, _worker_permit, lifecycle_config, lock_retention, replication_config))]
     async fn decommission_entry(
@@ -2599,6 +2671,14 @@ impl ECStore {
                 let bucket_name = bucket.clone();
                 let object_name = rd.object_info.name.clone();
 
+                self.save_decommission_entry_progress_stage(
+                    idx,
+                    bucket_name.as_str(),
+                    object_name.as_str(),
+                    DECOMMISSION_STAGE_MIGRATE_OBJECT,
+                )
+                .await?;
+
                 if let Err(err) = self.clone().decommission_object(idx, bucket, rd).await {
                     if is_decommission_copy_cleanup_safe_error(&err) {
                         ignore = true;
@@ -2669,6 +2749,14 @@ impl ECStore {
         if should_cleanup_decommission_source_entry(decommissioned, fivs.versions.len(), expired) {
             decommission_cancel_signal_result(rx.is_cancelled())?;
 
+            self.save_decommission_entry_progress_stage(
+                idx,
+                bucket.as_str(),
+                entry.name.as_str(),
+                DECOMMISSION_STAGE_CLEANUP_PREFLIGHT,
+            )
+            .await?;
+
             data_movement::ensure_source_cleanup_versions_unchanged(
                 set.clone(),
                 bucket.as_str(),
@@ -2679,6 +2767,14 @@ impl ECStore {
             )
             .await
             .map_err(|err| with_decommission_entry_context("cleanup_preflight", bucket.as_str(), entry.name.as_str(), err))?;
+
+            self.save_decommission_entry_progress_stage(
+                idx,
+                bucket.as_str(),
+                entry.name.as_str(),
+                DECOMMISSION_STAGE_SOURCE_CLEANUP,
+            )
+            .await?;
 
             let cleanup_result = set
                 .delete_object(
@@ -2728,6 +2824,9 @@ impl ECStore {
                 }
             }
         };
+
+        self.save_decommission_entry_progress_stage(idx, bucket.as_str(), entry.name.as_str(), DECOMMISSION_STAGE_ENTRY_FINISHED)
+            .await?;
 
         if should_save_progress {
             let save_result = self.save_current_pool_meta().await;
@@ -4003,6 +4102,7 @@ mod tests {
         assert_eq!(restored_decommission.bucket, "bucket-b");
         assert_eq!(restored_decommission.prefix, "prefix");
         assert_eq!(restored_decommission.object, "object.txt");
+        assert!(restored_decommission.stage.is_empty());
         assert_eq!(restored_decommission.items_decommissioned, 7);
         assert_eq!(restored_decommission.items_decommission_failed, 1);
         assert_eq!(restored_decommission.bytes_done, 1024);
@@ -4592,8 +4692,9 @@ mod pools_tests {
         should_continue_decommission_queue, should_count_decommission_version_complete,
         should_preserve_decommission_canceled_state, should_reject_decommission_cancel_as_terminal,
         should_retry_decommission_cancel_reload, should_skip_canceled_decommission_routine, split_decommission_buckets,
-        take_and_cancel_decommission_canceler, take_decommission_canceler, track_decommission_current_object,
-        validate_start_decommission_request, wait_decommission_worker_drain, with_decommission_entry_context,
+        take_and_cancel_decommission_canceler, take_decommission_canceler, touch_decommission_progress,
+        track_decommission_current_object, track_decommission_current_object_stage, validate_start_decommission_request,
+        wait_decommission_worker_drain, with_decommission_entry_context,
     };
     use crate::data_movement;
     use crate::disk::endpoint::Endpoint;
@@ -5163,6 +5264,28 @@ mod pools_tests {
         let info = meta.pools[0].decommission.as_ref().expect("decommission info should exist");
         assert_eq!(info.bucket, "bucket-a");
         assert_eq!(info.object, "object-a");
+        assert!(info.stage.is_empty());
+    }
+
+    #[test]
+    fn test_track_decommission_current_object_stage_updates_stage() {
+        let mut meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo::default()),
+            }],
+            ..Default::default()
+        };
+
+        track_decommission_current_object_stage(&mut meta, 0, "bucket-a", "object-a", "cleanup_preflight")
+            .expect("valid state should track bucket/object stage");
+
+        let info = meta.pools[0].decommission.as_ref().expect("decommission info should exist");
+        assert_eq!(info.bucket, "bucket-a");
+        assert_eq!(info.object, "object-a");
+        assert_eq!(info.stage, "cleanup_preflight");
     }
 
     #[test]
@@ -5590,6 +5713,29 @@ mod pools_tests {
             err.to_string()
                 .contains("failed to update decommission metadata timestamp: decommission metadata not initialized")
         );
+    }
+
+    #[test]
+    fn test_touch_decommission_progress_updates_last_update_and_save_baseline() {
+        let mut meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    items_decommissioned: 3,
+                    items_decommission_failed: 2,
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+
+        touch_decommission_progress(&mut meta, 0).expect("valid decommission progress should be touched");
+
+        assert!(meta.pools[0].last_update > OffsetDateTime::UNIX_EPOCH);
+        let info = meta.pools[0].decommission.as_ref().expect("decommission info should exist");
+        assert_eq!(info.items_since_last_progress_save(), 0);
     }
 
     #[test]
