@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::storage_compat::is_reserved_or_invalid_bucket;
-use super::super::storage_compat::utils::is_valid_object_prefix;
+use super::super::ecstore_utils::is_valid_object_prefix;
+use super::super::is_reserved_or_invalid_bucket;
 use crate::admin::auth::{authenticate_request, validate_admin_request};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::app::context::resolve_object_store_handle;
@@ -378,10 +378,10 @@ fn should_handle_root_heal_directly(hip: &HealInitParams) -> bool {
         && hip.hs.set.is_none()
 }
 
-fn map_root_heal_status(heal_err: Option<super::super::storage_compat::Error>) -> S3Result<()> {
+fn map_root_heal_status(heal_err: Option<super::super::Error>) -> S3Result<()> {
     match heal_err {
         None => Ok(()),
-        Some(super::super::storage_compat::StorageError::NoHealRequired) => {
+        Some(super::super::StorageError::NoHealRequired) => {
             info!(
                 event = EVENT_ADMIN_RESPONSE_EMITTED,
                 component = LOG_COMPONENT_ADMIN_API,
@@ -730,7 +730,7 @@ impl Operation for BackgroundHealStatusHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::storage_compat::StorageError;
+    use super::super::super::StorageError;
     use super::extract_heal_init_params;
     use super::{
         HealInitParams, HealResp, build_heal_channel_request, encode_background_heal_status, encode_heal_start_success,

@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::storage_compat::get_global_notification_sys;
-use super::super::storage_compat::set_global_storage_class;
-use super::super::storage_compat::storageclass;
-use super::super::storage_compat::{STORAGE_CLASS_SUB_SYS, read_admin_config_without_migrate};
+use super::super::get_global_notification_sys;
+use super::super::set_global_storage_class;
+use super::super::storageclass;
+use super::super::{STORAGE_CLASS_SUB_SYS, read_admin_config_without_migrate};
 use crate::app::context::resolve_object_store_handle;
 use rustfs_audit::reload_audit_config;
 use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_WEBHOOK_SUB_SYS};
@@ -370,7 +370,7 @@ pub async fn signal_config_snapshot_reload() {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::storage_compat::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG};
+    use super::super::super::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG};
     use super::*;
     use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
     use rustfs_config::oidc::{OIDC_CLIENT_ID, OIDC_CONFIG_URL, OIDC_SCOPES};
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn validate_notify_subsystem_config_rejects_invalid_webhook_endpoint() {
-        super::super::super::storage_compat::init_admin_config_defaults();
+        super::super::super::init_admin_config_defaults();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(NOTIFY_WEBHOOK_SUB_SYS).expect("notify webhook defaults");
         let kvs = targets.get_mut(DEFAULT_DELIMITER).expect("default target");
@@ -441,7 +441,7 @@ mod tests {
 
     #[test]
     fn validate_audit_subsystem_config_rejects_relative_queue_dir() {
-        super::super::super::storage_compat::init_admin_config_defaults();
+        super::super::super::init_admin_config_defaults();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(AUDIT_MQTT_SUB_SYS).expect("audit mqtt defaults");
         let kvs = targets.get_mut(DEFAULT_DELIMITER).expect("default target");
@@ -456,7 +456,7 @@ mod tests {
 
     #[test]
     fn validate_identity_openid_config_rejects_missing_openid_scope() {
-        super::super::super::storage_compat::init_admin_config_defaults();
+        super::super::super::init_admin_config_defaults();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(IDENTITY_OPENID_SUB_SYS).expect("openid defaults");
         let kvs = targets.get_mut(DEFAULT_DELIMITER).expect("default target");
@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn validate_identity_openid_config_rejects_invalid_named_provider_id() {
-        super::super::super::storage_compat::init_admin_config_defaults();
+        super::super::super::init_admin_config_defaults();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(IDENTITY_OPENID_SUB_SYS).expect("openid defaults");
         let default_kvs = targets.get(DEFAULT_DELIMITER).cloned().expect("default target");
