@@ -393,14 +393,14 @@ mod tests {
 
     #[test]
     fn operation_metric_descriptors_include_backend_and_operation_labels() {
-        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 9);
-        for metric in &INTERNODE_OPERATION_METRICS[..5] {
+        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 10);
+        for metric in &INTERNODE_OPERATION_METRICS[..6] {
             assert_eq!(metric.labels, &[OPERATION_LABEL, BACKEND_LABEL]);
         }
-        for metric in &INTERNODE_OPERATION_METRICS[5..8] {
+        for metric in &INTERNODE_OPERATION_METRICS[6..9] {
             assert_eq!(metric.labels, &[OPERATION_LABEL, BACKEND_LABEL, CLASSIFICATION_LABEL]);
         }
-        assert_eq!(INTERNODE_OPERATION_METRICS[8].labels, &[STAGE_LABEL, DOMINANT_ERROR_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[9].labels, &[STAGE_LABEL, DOMINANT_ERROR_LABEL]);
     }
 
     #[test]
@@ -417,18 +417,22 @@ mod tests {
 
         assert_eq!(
             INTERNODE_OPERATION_METRICS[5].name,
-            "rustfs_system_network_internode_operation_classified_errors_total"
+            "rustfs_system_network_internode_operation_duration_ms"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[6].name,
-            "rustfs_system_network_internode_operation_retries_total"
+            "rustfs_system_network_internode_operation_classified_errors_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[7].name,
-            "rustfs_system_network_internode_operation_retry_successes_total"
+            "rustfs_system_network_internode_operation_retries_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[8].name,
+            "rustfs_system_network_internode_operation_retry_successes_total"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[9].name,
             "rustfs_system_storage_erasure_write_quorum_failures_total"
         );
     }
