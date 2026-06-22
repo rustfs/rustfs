@@ -4206,6 +4206,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     syntax check, formatting, diff hygiene, Rust risk scan, branch freshness
     check, pre-commit, and three-expert review.
 
+- [x] `API-153` Collapse thin owner ECStore compatibility bridges.
+  - Do: remove the thin IAM, heal, and scanner `ecstore_compat.rs` modules,
+    moving their aliases and wrappers into the owner root modules.
+  - Acceptance: those owner crates no longer declare local `ecstore_compat`
+    modules, while their owner-root aliases and wrapper functions keep the same
+    call paths for downstream modules.
+  - Must preserve: IAM config/notification helpers, heal disk/local-map
+    contracts, scanner lifecycle/replication/data-usage helpers, and owner-root
+    storage aliases.
+  - Verification: focused owner crate compile coverage, migration guard, shell
+    syntax check, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, pre-commit, and three-expert review.
+
 ## Next PRs
 
 1. `pure-move`: continue pruning remaining facade compatibility and owner boundaries.
@@ -4217,10 +4230,27 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 | Quality/architecture | pass | API-152 removes thin test/fuzz ECStore bridge files and keeps direct imports in owner test/fuzz files. |
 | Migration preservation | pass | E2E, heal, scanner, and fuzz consumers keep the same ECStore API symbols and call paths. |
 | Testing/verification | pass | Focused test/fuzz compile, formatting, migration guard, shell syntax, diff hygiene, Rust risk scan, and pre-commit passed for API-152. |
+| Quality/architecture | pass | API-153 removes thin owner ECStore bridge files and keeps direct imports at owner roots. |
+| Migration preservation | pass | IAM, heal, and scanner owner-root aliases and wrapper functions keep the same call paths. |
+| Testing/verification | pass | Focused owner crate compile, formatting, migration guard, shell syntax, diff hygiene, Rust risk scan, and pre-commit passed for API-153. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-153 current slice:
+  - `cargo check --tests -p rustfs-heal -p rustfs-scanner -p rustfs-iam`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - Owner ECStore thin bridge scan: passed; IAM, heal, and scanner no longer
+    declare local `ecstore_compat` modules.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or
+    cast risks added; changes only move owner-root import boundaries.
 
 - Issue #660 API-152 current slice:
   - `cargo check --tests -p rustfs-heal -p rustfs-scanner -p e2e_test`:
