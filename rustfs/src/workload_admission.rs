@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::storage::ecstore_bucket::{metadata_sys, replication};
 use rustfs_concurrency::{
     AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadAdmissionSnapshotProvider,
     WorkloadClass,
 };
-use rustfs_ecstore::api::bucket::{metadata_sys, replication};
 
 use crate::storage::concurrency::get_concurrency_manager;
 

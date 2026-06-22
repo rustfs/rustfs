@@ -27,6 +27,10 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 
+use crate::storage::{
+    ecstore_bucket::{metadata as ecstore_metadata, metadata_sys as ecstore_metadata_sys},
+    ecstore_disk, ecstore_error, ecstore_set_disk,
+};
 use bytes::Bytes;
 use datafusion::{
     arrow::datatypes::SchemaRef,
@@ -34,10 +38,6 @@ use datafusion::{
 };
 use http::HeaderMap;
 use metrics::{counter, histogram};
-use rustfs_ecstore::api::{
-    bucket::{metadata as ecstore_metadata, metadata_sys as ecstore_metadata_sys},
-    disk as ecstore_disk, error as ecstore_error, set_disk as ecstore_set_disk,
-};
 use rustfs_filemeta::FileInfo;
 use rustfs_storage_api::{
     HTTPPreconditions, HTTPRangeSpec, ListObjectVersionsInfo as StorageListObjectVersionsInfo,

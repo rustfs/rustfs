@@ -5,17 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-rustfs-owner-compat-cleanup`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127`.
-- Based on: API-127 slice.
+- Branch: `overtrue/arch-rustfs-ecstore-boundary-cleanup`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128`.
+- Based on: API-128 slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: remove RustFS runtime owner storage compatibility bridges
-  from app, admin, and storage, then route consumers directly through owner API
-  definitions.
-- CI/script changes: allow migrated RustFS owner roots to import ECStore facade
-  APIs directly and reject reintroduced app/admin/storage bridge modules.
-- Docs changes: record the API-128 RustFS owner bridge cleanup.
+- Rust code changes: route RustFS crate startup, server, capacity, config,
+  table-catalog, workload, and S3 API consumers through the storage owner
+  ECStore boundary instead of direct ECStore facade imports.
+- CI/script changes: narrow RustFS direct ECStore import allowance to the
+  app/admin/storage owner modules.
+- Docs changes: record the API-129 RustFS internal ECStore boundary cleanup.
 
 ## Phase 0 Tasks
 
@@ -3829,6 +3829,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     formatting, diff hygiene, Rust risk scan, branch freshness check,
     pre-commit quality gate, and three-expert review.
 
+- [x] `API-129` Route RustFS internal ECStore consumers through owner boundary.
+  - Do: expose crate-local ECStore facade module aliases from
+    `rustfs/src/storage/mod.rs` and migrate RustFS startup, server, capacity,
+    config, table-catalog, workload admission, and S3 API helper consumers to
+    import those aliases from `crate::storage`.
+  - Acceptance: non-owner RustFS files no longer import `rustfs_ecstore::api`
+    directly, while `app`, `admin`, and `storage` owner modules remain the only
+    RustFS crate direct ECStore facade import points.
+  - Must preserve: startup sequencing, global endpoint/config side effects,
+    readiness checks, RPC signature verification, notification event dispatch,
+    capacity refresh behavior, table-catalog constants, workload admission
+    snapshots, and S3 ETag conversion behavior.
+  - Verification: focused RustFS compile, direct import residual scan,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
 ## Next PRs
 
 1. `pure-move`: continue pruning remaining facade compatibility and owner boundaries.
@@ -3837,13 +3853,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-128 removes only RustFS owner bridge modules and keeps call sites on explicit owner APIs. |
-| Migration preservation | pass | The migration guard now rejects deleted app, admin, and storage bridge files, module declarations, and bridge consumers. |
-| Testing/verification | pass | Focused RustFS compile, residual scan, migration guard, layer guard, formatting, diff hygiene, and diff-only Rust risk scan passed. |
+| Quality/architecture | pass | API-129 keeps ECStore facade exposure in the storage owner boundary and migrates RustFS internal consumers without new wrappers. |
+| Migration preservation | pass | Startup, readiness, server, capacity, table-catalog, workload, and S3 helper call paths keep the same ECStore symbols through `crate::storage`. |
+| Testing/verification | pass | Full pre-commit, focused RustFS compile, residual scan, migration/layer guards, formatting, diff hygiene, and diff-only Rust risk scan passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-129 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `make pre-commit`: passed, including clippy, script tests, nextest
+    `6509 passed, 111 skipped`, and doc-tests.
+  - RustFS direct ECStore facade residual scan outside owner modules: passed.
+  - Rust risk scan: diff-only scan found no new unwrap/expect, panic/todo,
+    debug prints, relaxed ordering, or integer casts.
 
 - Issue #660 API-128 current slice:
   - `cargo check --tests -p rustfs`: passed.

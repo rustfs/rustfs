@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::api::{config as ecstore_config, error::Error as StorageError, global::resolve_object_store_handle};
+use crate::storage::{ecstore_config, ecstore_error::Error as StorageError, ecstore_global::resolve_object_store_handle};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 
