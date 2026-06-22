@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage::core_storage_compat::BucketVersioningSys;
-use crate::storage::core_storage_compat::Result;
-use crate::storage::core_storage_compat::StorageError;
+use super::core_storage_compat::BucketVersioningSys;
+use super::core_storage_compat::Result;
+use super::core_storage_compat::StorageError;
 use http::header::{IF_MATCH, IF_NONE_MATCH};
 use http::{HeaderMap, HeaderValue};
 use rustfs_utils::http::{
