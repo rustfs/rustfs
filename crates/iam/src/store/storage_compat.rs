@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_compat::IamStore;
+use super::super::storage_compat::IamStore;
 
 pub(super) type IamObjectInfo = <IamStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
 pub(super) type IamObjectOptions = <IamStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;

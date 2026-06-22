@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-admin-compat-relative-consumers`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112`.
-- Based on: API-111 slice.
+- Branch: `overtrue/arch-standalone-crate-compat-relative-consumers`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114`.
+- Based on: API-114 slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: collapse crate-qualified admin handlers/service local
-  compatibility consumer paths into relative `super::`/`super::super::` paths.
-- CI/script changes: guard selected admin handlers/service local consumers
+- Rust code changes: collapse standalone scanner/IAM/observability/S3 Select/e2e
+  compatibility consumer paths into relative owner paths.
+- CI/script changes: guard selected standalone crate local consumers
   against crate-qualified compatibility paths.
-- Docs changes: record the API-112 relative admin local compatibility consumer
+- Docs changes: record the API-115 standalone crate local compatibility consumer
   cleanup.
 
 ## Phase 0 Tasks
@@ -620,6 +620,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     coverage, endpoint index tests, and scanner lifecycle integration coverage.
   - Verification: RustFS test-target compile coverage, config/heal/scanner
     local compatibility consumer residual scan, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, pre-commit quality gate, and
+    three-expert review.
+- [x] `API-115` Collapse standalone crate local compatibility consumers.
+  - Completed slice: replace crate-qualified scanner, IAM, observability,
+    S3 Select, and e2e local compatibility consumers with relative owner paths.
+  - Acceptance: selected standalone crate modules no longer point back to their
+    local compatibility facades through crate-qualified paths; migration rules
+    reject regressions.
+  - Must preserve: scanner data usage and object IO behavior, IAM storage
+    adapter contracts, observability metric collection, S3 Select object-store
+    reads, and e2e RPC helper coverage.
+  - Verification: standalone crate compile coverage, standalone local
+    compatibility consumer residual scan, migration and layer guards,
     formatting, diff hygiene, Rust risk scan, pre-commit quality gate, and
     three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
@@ -3655,25 +3668,28 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-114 keeps selected config/heal/scanner local compatibility consumers owner-relative by replacing crate-qualified compatibility paths with scoped relative paths. |
-| Migration preservation | pass | The new guard rejects crate-qualified config/heal/scanner local compatibility consumer paths while preserving the same facade names and aliases. |
-| Testing/verification | pass | Focused compile, config/heal/scanner local compatibility consumer residual scan, migration guard, layer guard, formatting, diff hygiene, risk scan, and full pre-commit passed. |
+| Quality/architecture | pass | API-115 keeps selected standalone crate local compatibility consumers owner-relative by replacing crate-qualified compatibility paths with scoped relative paths. |
+| Migration preservation | pass | The new guard rejects crate-qualified standalone crate local compatibility consumer paths while preserving the same facade names and aliases. |
+| Testing/verification | pass | Focused compile, standalone crate local compatibility consumer residual scan, migration guard, layer guard, formatting, diff hygiene, risk scan, and full pre-commit passed. |
 
 ## Verification Notes
 
 Passed before push:
 
-- Issue #660 API-114 current slice:
+- Issue #660 API-115 current slice:
   - `cargo check -p rustfs --tests`: passed.
-  - `cargo check -p rustfs-heal --tests`: passed.
   - `cargo check -p rustfs-scanner --tests`: passed.
+  - `cargo check -p rustfs-iam --tests`: passed.
+  - `cargo check -p rustfs-obs --tests`: passed.
+  - `cargo check -p rustfs-s3select-api --tests`: passed.
+  - `cargo check -p e2e_test --tests`: passed.
   - `cargo fmt --all`: passed.
   - `cargo fmt --all --check`: passed.
   - `git diff --check`: passed.
   - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
   - `./scripts/check_architecture_migration_rules.sh`: passed.
   - `./scripts/check_layer_dependencies.sh`: passed.
-  - Config/heal/scanner local compatibility consumer residual scan: passed.
+  - Standalone crate local compatibility consumer residual scan: passed.
   - Rust risk scan on changed Rust files and guard script: passed.
   - `make pre-commit`: passed.
 
