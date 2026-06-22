@@ -1221,6 +1221,117 @@ fn test_merge_rebalance_meta_preserves_updates_from_multiple_pools() {
 }
 
 #[test]
+fn test_merge_rebalance_meta_replaces_terminal_metadata_for_new_rebalance() {
+    let old_completed_at = OffsetDateTime::from_unix_timestamp(1_000).expect("valid old completion timestamp");
+    let new_started_at = OffsetDateTime::from_unix_timestamp(2_000).expect("valid new start timestamp");
+    let mut remote = RebalanceMeta {
+        id: "old-rebalance".to_string(),
+        percent_free_goal: 0.25,
+        pool_stats: vec![
+            RebalanceStats {
+                buckets: Vec::new(),
+                rebalanced_buckets: vec!["bucket-a".to_string()],
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Completed,
+                    end_time: Some(old_completed_at),
+                    ..Default::default()
+                },
+                num_versions: 7,
+                bytes: 700,
+                ..Default::default()
+            },
+            RebalanceStats::default(),
+        ],
+        ..Default::default()
+    };
+    let local = RebalanceMeta {
+        id: "new-rebalance".to_string(),
+        percent_free_goal: 0.5,
+        pool_stats: vec![
+            RebalanceStats {
+                buckets: vec!["bucket-a".to_string()],
+                participating: true,
+                info: RebalanceInfo {
+                    start_time: Some(new_started_at),
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            RebalanceStats {
+                buckets: vec!["bucket-a".to_string()],
+                participating: true,
+                info: RebalanceInfo {
+                    start_time: Some(new_started_at),
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            RebalanceStats::default(),
+        ],
+        ..Default::default()
+    };
+
+    merge_rebalance_meta(&mut remote, &local);
+
+    assert_eq!(remote.id, "new-rebalance");
+    assert_eq!(remote.percent_free_goal, 0.5);
+    assert_eq!(remote.pool_stats.len(), 3);
+    assert_eq!(remote.pool_stats[0].info.status, RebalStatus::Started);
+    assert_eq!(remote.pool_stats[0].buckets, vec!["bucket-a"]);
+    assert_eq!(remote.pool_stats[0].rebalanced_buckets, Vec::<String>::new());
+    assert_eq!(remote.pool_stats[0].num_versions, 0);
+    assert_eq!(remote.pool_stats[1].info.status, RebalStatus::Started);
+    assert!(remote.pool_stats[1].participating);
+}
+
+#[test]
+fn test_merge_rebalance_meta_preserves_active_metadata_for_different_rebalance_id() {
+    let old_started_at = OffsetDateTime::from_unix_timestamp(1_000).expect("valid old start timestamp");
+    let new_started_at = OffsetDateTime::from_unix_timestamp(2_000).expect("valid new start timestamp");
+    let mut remote = RebalanceMeta {
+        id: "active-rebalance".to_string(),
+        percent_free_goal: 0.25,
+        pool_stats: vec![RebalanceStats {
+            buckets: vec!["bucket-a".to_string()],
+            participating: true,
+            info: RebalanceInfo {
+                start_time: Some(old_started_at),
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let local = RebalanceMeta {
+        id: "new-rebalance".to_string(),
+        percent_free_goal: 0.5,
+        pool_stats: vec![RebalanceStats {
+            buckets: vec!["bucket-b".to_string()],
+            participating: true,
+            info: RebalanceInfo {
+                start_time: Some(new_started_at),
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    merge_rebalance_meta(&mut remote, &local);
+
+    assert_eq!(remote.id, "active-rebalance");
+    assert_eq!(remote.percent_free_goal, 0.25);
+    assert_eq!(remote.pool_stats.len(), 1);
+    assert_eq!(remote.pool_stats[0].buckets, vec!["bucket-a"]);
+    assert_eq!(remote.pool_stats[0].info.start_time, Some(old_started_at));
+}
+
+#[test]
 fn test_merge_rebalance_meta_does_not_overwrite_failed_with_started_stats() {
     let now = OffsetDateTime::from_unix_timestamp(2_000).unwrap();
     let mut remote = RebalanceMeta {

@@ -819,6 +819,9 @@ pub(super) fn merge_rebalance_meta(remote: &mut RebalanceMeta, local: &Rebalance
     }
 
     if !local.id.is_empty() && remote.id != local.id {
+        if !is_rebalance_in_progress(remote) {
+            *remote = local.clone();
+        }
         return;
     }
 
