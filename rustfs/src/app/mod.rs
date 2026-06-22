@@ -44,7 +44,7 @@ mod lifecycle_transition_api_test;
 use std::sync::Arc;
 
 mod ecstore_admin {
-    pub(crate) use rustfs_ecstore::api::admin::get_server_info;
+    pub(crate) use crate::storage::ecstore_admin::get_server_info;
 }
 
 mod ecstore_bucket {
@@ -55,7 +55,7 @@ mod ecstore_bucket {
 }
 
 mod ecstore_capacity {
-    pub(crate) use rustfs_ecstore::api::capacity::{
+    pub(crate) use crate::storage::ecstore_capacity::{
         PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free,
     };
 }
@@ -66,7 +66,7 @@ mod ecstore_client {
 }
 
 mod ecstore_compression {
-    pub(crate) use rustfs_ecstore::api::compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
+    pub(crate) use crate::storage::ecstore_compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
 }
 
 mod ecstore_config {
@@ -74,7 +74,7 @@ mod ecstore_config {
 }
 
 mod ecstore_data_usage {
-    pub(crate) use rustfs_ecstore::api::data_usage::{
+    pub(crate) use crate::storage::ecstore_data_usage::{
         apply_bucket_usage_memory_overlay, load_data_usage_from_backend, record_bucket_object_delete_memory,
         record_bucket_object_write_memory,
     };
@@ -82,12 +82,12 @@ mod ecstore_data_usage {
 
 #[cfg(test)]
 mod ecstore_global {
-    pub(crate) use rustfs_ecstore::api::global::GLOBAL_TierConfigMgr;
+    pub(crate) use crate::storage::ecstore_global::GLOBAL_TierConfigMgr;
 }
 
 #[allow(unused_imports)]
 mod ecstore_tier {
-    pub(crate) use rustfs_ecstore::api::tier::{tier, tier_config, warm_backend};
+    pub(crate) use crate::storage::ecstore_tier::{tier, tier_config, warm_backend};
 }
 
 pub(crate) const MIN_DISK_COMPRESSIBLE_SIZE: usize = ecstore_compression::MIN_DISK_COMPRESSIBLE_SIZE;

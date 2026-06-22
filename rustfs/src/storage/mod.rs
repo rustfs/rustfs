@@ -71,7 +71,7 @@ pub(crate) use sse::{
 use std::sync::Arc;
 
 pub(crate) mod ecstore_admin {
-    pub(crate) use rustfs_ecstore::api::admin::get_local_server_property;
+    pub(crate) use rustfs_ecstore::api::admin::{get_local_server_property, get_server_info};
 }
 
 pub(crate) mod ecstore_bucket {
@@ -82,8 +82,18 @@ pub(crate) mod ecstore_bucket {
     pub(crate) use rustfs_ecstore::api::bucket::{quota, versioning, versioning_sys};
 }
 
+pub(crate) mod ecstore_capacity {
+    pub(crate) use rustfs_ecstore::api::capacity::{
+        PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free,
+    };
+}
+
 pub(crate) mod ecstore_client {
     pub(crate) use rustfs_ecstore::api::client::{object_api_utils, transition_api};
+}
+
+pub(crate) mod ecstore_compression {
+    pub(crate) use rustfs_ecstore::api::compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
 }
 
 pub(crate) mod ecstore_cluster {
@@ -92,6 +102,13 @@ pub(crate) mod ecstore_cluster {
 
 pub(crate) mod ecstore_config {
     pub(crate) use rustfs_ecstore::api::config::{com, init, init_global_config_sys, storageclass, try_migrate_server_config};
+}
+
+pub(crate) mod ecstore_data_usage {
+    pub(crate) use rustfs_ecstore::api::data_usage::{
+        apply_bucket_usage_memory_overlay, load_data_usage_from_backend, record_bucket_object_delete_memory,
+        record_bucket_object_write_memory,
+    };
 }
 
 #[allow(unused_imports)]
@@ -166,6 +183,7 @@ pub(crate) mod ecstore_storage {
 
 pub(crate) mod ecstore_tier {
     pub(crate) use rustfs_ecstore::api::tier::tier::TierConfigMgr;
+    pub(crate) use rustfs_ecstore::api::tier::{tier, tier_config, warm_backend};
 }
 
 pub(crate) const BUCKET_ACCELERATE_CONFIG: &str = ecstore_bucket::metadata::BUCKET_ACCELERATE_CONFIG;
