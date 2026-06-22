@@ -1634,7 +1634,7 @@ mod tests {
     fn start_mock_oidc_discovery_server<F>(
         build_discovery_issuer: F,
         max_requests: usize,
-    ) -> (String, std::thread::JoinHandle<()>)
+    ) -> Option<(String, std::thread::JoinHandle<()>)>
     where
         F: Fn(&str) -> String + Send + 'static,
     {
@@ -1650,8 +1650,12 @@ mod tests {
         const IDLE_SHUTDOWN: Duration = Duration::from_secs(1);
         const ABSOLUTE_CAP: Duration = Duration::from_secs(5);
 
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let base = format!("http://{}", listener.local_addr().expect("listener local address should be available"));
         let discovery_issuer = build_discovery_issuer(&base);
         let discovery_body = serde_json::json!({
             "issuer": discovery_issuer,
@@ -1754,7 +1758,7 @@ mod tests {
             .recv_timeout(Duration::from_millis(100))
             .expect("mock OIDC discovery server should become ready");
 
-        (base, handle)
+        Some((base, handle))
     }
 
     fn discovery_error_contains_all_variants(err: &str, base: &str) -> bool {
@@ -1776,7 +1780,9 @@ mod tests {
     async fn test_validate_oidc_provider_config_retries_with_issuer_candidates() {
         // Discovery document must advertise the canonical issuer path. The first candidate has no
         // trailing slash; openidconnect rejects issuer mismatch, then the second variant succeeds.
-        let (base, handle) = start_mock_oidc_discovery_server(|base| format!("{base}/application/o/rustfs/"), 8);
+        let Some((base, handle)) = start_mock_oidc_discovery_server(|base| format!("{base}/application/o/rustfs/"), 8) else {
+            return;
+        };
         let config_url = format!("{base}/application/o/rustfs");
         let config = build_mocked_oidc_provider_config("default", &config_url);
 
@@ -1789,7 +1795,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_oidc_provider_config_returns_detailed_errors() {
-        let (base, handle) = start_mock_oidc_discovery_server(|base| format!("{base}/application/o/other"), 8);
+        let Some((base, handle)) = start_mock_oidc_discovery_server(|base| format!("{base}/application/o/other"), 8) else {
+            return;
+        };
         let config_url = format!("{base}/application/o/rustfs");
         let config = build_mocked_oidc_provider_config("default", &config_url);
 

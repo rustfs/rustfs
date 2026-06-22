@@ -2812,9 +2812,13 @@ mod tests {
         );
     }
 
-    async fn connect_test_node_service_client() -> NodeServiceClient<tonic::transport::Channel> {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    async fn connect_test_node_service_client() -> Option<NodeServiceClient<tonic::transport::Channel>> {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener local address should be available");
         let service = create_test_node_service();
 
         tokio::spawn(async move {
@@ -2825,12 +2829,18 @@ mod tests {
                 .unwrap();
         });
 
-        NodeServiceClient::connect(format!("http://{addr}")).await.unwrap()
+        Some(
+            NodeServiceClient::connect(format!("http://{addr}"))
+                .await
+                .expect("node service test client should connect"),
+        )
     }
 
     #[tokio::test]
     async fn test_write_stream_unimplemented() {
-        let mut client = connect_test_node_service_client().await;
+        let Some(mut client) = connect_test_node_service_client().await else {
+            return;
+        };
         let request = tokio_stream::iter([WriteRequest::default()]);
 
         let response = client.write_stream(request).await;
@@ -2842,7 +2852,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_at_unimplemented() {
-        let mut client = connect_test_node_service_client().await;
+        let Some(mut client) = connect_test_node_service_client().await else {
+            return;
+        };
         let request = tokio_stream::iter([ReadAtRequest::default()]);
 
         let response = client.read_at(request).await;

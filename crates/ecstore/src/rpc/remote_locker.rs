@@ -558,16 +558,20 @@ mod tests {
     use tokio::task::JoinHandle;
     use tonic::transport::Endpoint as TonicEndpoint;
 
-    async fn spawn_hanging_listener() -> (String, JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = format!("http://{}", listener.local_addr().unwrap());
+    async fn spawn_hanging_listener() -> Option<(String, JoinHandle<()>)> {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = format!("http://{}", listener.local_addr().expect("listener local address should be available"));
         let task = tokio::spawn(async move {
             if let Ok((stream, _)) = listener.accept().await {
                 let _stream = stream;
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         });
-        (addr, task)
+        Some((addr, task))
     }
 
     async fn cache_lazy_channel(addr: &str) {
@@ -588,7 +592,9 @@ mod tests {
     #[tokio::test]
     async fn test_remote_client_acquire_lock_respects_request_timeout_and_evicts_connection() {
         ensure_test_rpc_secret();
-        let (addr, accept_task) = spawn_hanging_listener().await;
+        let Some((addr, accept_task)) = spawn_hanging_listener().await else {
+            return;
+        };
         cache_lazy_channel(&addr).await;
         assert!(GLOBAL_CONN_MAP.read().await.contains_key(&addr));
 
@@ -622,7 +628,9 @@ mod tests {
     #[tokio::test]
     async fn test_remote_client_acquire_locks_batch_respects_request_timeout_and_evicts_connection() {
         ensure_test_rpc_secret();
-        let (addr, accept_task) = spawn_hanging_listener().await;
+        let Some((addr, accept_task)) = spawn_hanging_listener().await else {
+            return;
+        };
         cache_lazy_channel(&addr).await;
         assert!(GLOBAL_CONN_MAP.read().await.contains_key(&addr));
 

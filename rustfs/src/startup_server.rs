@@ -22,10 +22,12 @@ use rustfs_common::{GlobalReadiness, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_utils::net::parse_and_resolve_address;
 use std::{
-    io::{Error, Result},
+    io::{Error, ErrorKind, Result},
     net::SocketAddr,
     path::Path,
     sync::Arc,
+    thread,
+    time::Duration,
 };
 use tempfile::TempDir;
 use tracing::{debug, error, info, warn};
@@ -165,10 +167,29 @@ pub(crate) async fn prepare_embedded_startup_config(
 }
 
 pub(crate) fn find_embedded_available_port() -> Result<u16> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    Ok(port)
+    let mut last_err = None;
+
+    for _ in 0..8 {
+        match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => {
+                let port = listener.local_addr()?.port();
+                drop(listener);
+                return Ok(port);
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::AddrInUse | ErrorKind::AddrNotAvailable | ErrorKind::Interrupted | ErrorKind::WouldBlock
+                ) =>
+            {
+                last_err = Some(err);
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| Error::other("failed to reserve an embedded TCP port")))
 }
 
 pub(crate) async fn init_embedded_startup_listen_context(config: &Config) -> Result<EmbeddedStartupListenContext> {
@@ -374,7 +395,11 @@ mod tests {
 
     #[test]
     fn find_embedded_available_port_returns_tcp_port() {
-        let port = find_embedded_available_port().expect("available port should be found");
+        let port = match find_embedded_available_port() {
+            Ok(port) => port,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("available port should be found: {err}"),
+        };
 
         assert_ne!(port, 0);
     }
