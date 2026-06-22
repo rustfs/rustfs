@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::{ecstore_error, ecstore_global, ecstore_set_disk, ecstore_storage};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
@@ -25,10 +26,6 @@ use object_store::{
 };
 use pin_project_lite::pin_project;
 use rustfs_common::DEFAULT_DELIMITER;
-use rustfs_ecstore::api::error as ecstore_error;
-use rustfs_ecstore::api::global as ecstore_global;
-use rustfs_ecstore::api::set_disk as ecstore_set_disk;
-use rustfs_ecstore::api::storage as ecstore_storage;
 use rustfs_storage_api::{HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
 use s3s::S3Result;
 use s3s::dto::SelectObjectContentInput;
