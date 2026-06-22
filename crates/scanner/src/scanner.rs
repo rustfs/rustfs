@@ -46,7 +46,7 @@ use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::storage_compat::{
+use super::storage_compat::{
     ECStore, EcstoreError, RUSTFS_META_BUCKET, ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _,
     get_lifecycle_config, get_replication_config, is_erasure_sd, read_config, replace_bucket_usage_memory_from_info, save_config,
 };
@@ -1104,8 +1104,8 @@ pub async fn store_data_usage_in_backend(
 
 #[cfg(test)]
 mod tests {
+    use super::super::storage_compat::EcstoreResult;
     use super::*;
-    use crate::storage_compat::EcstoreResult;
     use crate::{
         ScannerGetObjectReader as GetObjectReader, ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions,
         ScannerPutObjReader as PutObjReader,

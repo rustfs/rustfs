@@ -13,9 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::super::storage_compat::{VolumeInfo, WalkDirOptions};
+use super::super::storage_compat::{gen_tonic_signature_interceptor, node_service_time_out_client};
 use crate::common::workspace_root;
-use crate::storage_compat::{VolumeInfo, WalkDirOptions};
-use crate::storage_compat::{gen_tonic_signature_interceptor, node_service_time_out_client};
 use futures::future::join_all;
 use rmp_serde::{Deserializer, Serializer};
 use rustfs_filemeta::{MetaCacheEntry, MetacacheReader, MetacacheWriter};

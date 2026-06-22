@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use self::storage_compat::IamStore;
 use crate::error::{Error, Result};
-use crate::storage_compat::IamStore;
 use manager::IamCache;
 use oidc::OidcSys;
 use std::sync::{Arc, OnceLock};

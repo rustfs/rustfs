@@ -4,7 +4,7 @@
 mod storage_compat;
 
 use libfuzzer_sys::fuzz_target;
-use crate::storage_compat::{check_object_name_for_length_and_slash, has_bad_path_component, is_valid_object_prefix};
+use self::storage_compat::{check_object_name_for_length_and_slash, has_bad_path_component, is_valid_object_prefix};
 use rustfs_utils::path::{clean, path_join};
 use std::path::{Path, PathBuf};
 
