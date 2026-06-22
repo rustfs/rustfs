@@ -4277,13 +4277,13 @@ mod tests {
     #[test]
     fn pool_meta_decode_rejects_invalid_legacy_decommission_terminal_state() {
         let start_time = OffsetDateTime::now_utc();
-        let legacy_meta = PoolMeta {
+        let legacy_meta = LegacyPoolMeta {
             version: POOL_META_VERSION,
-            pools: vec![PoolStatus {
+            pools: vec![LegacyPoolStatus {
                 id: 1,
                 cmd_line: "/legacy/pool".to_string(),
                 last_update: start_time,
-                decommission: Some(PoolDecommissionInfo {
+                decommission: Some(LegacyPoolDecommissionInfo {
                     start_time: Some(start_time),
                     complete: true,
                     failed: false,
@@ -4291,7 +4291,7 @@ mod tests {
                     ..Default::default()
                 }),
             }],
-            dont_save: true,
+            dont_save: false,
         };
 
         let mut payload = Vec::new();
