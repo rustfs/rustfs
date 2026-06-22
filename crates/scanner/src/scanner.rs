@@ -14,9 +14,8 @@
 
 use std::sync::Arc;
 
-use crate::data_usage_define::{
-    BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH, ScannerObjectIO,
-};
+use crate::ScannerObjectIO;
+use crate::data_usage_define::{BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH};
 use crate::runtime_config::{
     current_scanner_runtime_config, lookup_scanner_runtime_config, refresh_scanner_runtime_config_from_global,
     scanner_bitrot_cycle, scanner_cycle_interval, scanner_start_delay, set_scanner_default_cycle_secs,
@@ -46,7 +45,7 @@ use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-use super::storage_compat::{
+use crate::{
     ECStore, EcstoreError, RUSTFS_META_BUCKET, ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _,
     get_lifecycle_config, get_replication_config, is_erasure_sd, read_config, replace_bucket_usage_memory_from_info, save_config,
 };
@@ -1104,8 +1103,8 @@ pub async fn store_data_usage_in_backend(
 
 #[cfg(test)]
 mod tests {
-    use super::super::storage_compat::EcstoreResult;
     use super::*;
+    use crate::EcstoreResult;
     use crate::{
         ScannerGetObjectReader as GetObjectReader, ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions,
         ScannerPutObjReader as PutObjReader,

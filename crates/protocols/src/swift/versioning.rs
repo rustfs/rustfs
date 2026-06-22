@@ -54,7 +54,7 @@
 use super::account::validate_account_access;
 use super::container::ContainerMapper;
 use super::object::{ObjectKeyMapper, SwiftObjectOptions as ObjectOptions, head_object};
-use super::storage_compat::resolve_swift_object_store_handle;
+use super::resolve_swift_object_store_handle;
 use super::{SwiftError, SwiftResult};
 use rustfs_credentials::Credentials;
 use rustfs_storage_api::{ListOperations as _, ObjectOperations as _};

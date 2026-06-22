@@ -15,8 +15,8 @@
 // Used by test_distributed_lock_4_nodes_grpc in lock.rs
 #![allow(dead_code)]
 
-use super::super::storage_compat::node_service_time_out_client_no_auth;
 use async_trait::async_trait;
+use rustfs_ecstore::api::rpc::{self as ecstore_rpc, TonicInterceptor};
 use rustfs_lock::{
     LockClient, LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats, LockStatus, LockType, Result,
     types::{LockMetadata, LockPriority},
@@ -41,13 +41,10 @@ impl GrpcLockClient {
         &self,
     ) -> Result<
         rustfs_protos::proto_gen::node_service::node_service_client::NodeServiceClient<
-            tonic::service::interceptor::InterceptedService<
-                tonic::transport::Channel,
-                super::super::storage_compat::TonicInterceptor,
-            >,
+            tonic::service::interceptor::InterceptedService<tonic::transport::Channel, TonicInterceptor>,
         >,
     > {
-        node_service_time_out_client_no_auth(&self.addr)
+        ecstore_rpc::node_service_time_out_client_no_auth(&self.addr)
             .await
             .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))
     }

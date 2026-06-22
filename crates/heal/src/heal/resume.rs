@@ -21,7 +21,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use super::storage_compat::{BUCKET_META_PREFIX, DiskError, DiskStore, HealDiskExt as _, RUSTFS_META_BUCKET};
+use super::{BUCKET_META_PREFIX, DiskError, DiskStore, HealDiskExt as _, RUSTFS_META_BUCKET};
 
 const LOG_COMPONENT_HEAL: &str = "heal";
 const LOG_SUBSYSTEM_RESUME: &str = "resume";
@@ -744,7 +744,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_resumable_tasks_integration() {
-        use super::super::storage_compat::{DiskOption, Endpoint, new_disk};
+        use super::super::{DiskOption, Endpoint, new_disk};
         use tempfile::TempDir;
 
         // Create a temporary directory for testing
