@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::storage_compat::{
+use super::{
     BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_VERSIONING_CONFIG,
     BUCKET_WEBSITE_CONFIG, BucketVersioningSys, OBJECT_LOCK_CONFIG, StorageError, check_retention_for_modification, decode_tags,
     decode_tags_to_map, delete_bucket_metadata_config, encode_tags, get_bucket_accelerate_config, get_bucket_logging_config,
@@ -20,7 +20,7 @@ use super::storage_compat::{
     is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found, record_replication_proxy, serialize,
     update_bucket_metadata_config,
 };
-use super::storage_compat::{StorageReplicationConfigExt as _, StorageVersioningConfigExt as _};
+use super::{StorageReplicationConfigExt as _, StorageVersioningConfigExt as _};
 use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::app::context::resolve_object_store_handle;
 use crate::app::multipart_usecase::DefaultMultipartUsecase;

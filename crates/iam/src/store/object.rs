@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::storage_compat::{
+use super::{GroupInfo, MappedPolicy, Store, UserType};
+use crate::error::{Error, Result, is_err_config_not_found, is_err_no_such_group};
+use crate::{
     IAM_CONFIG_ROOT_PREFIX, IamStorageError, IamStore, classify_iam_system_path_failure_reason, delete_iam_config,
     read_iam_config_no_lock, read_iam_config_with_metadata, save_iam_config, save_iam_config_with_opts,
 };
-use super::{GroupInfo, MappedPolicy, Store, UserType};
-use crate::error::{Error, Result, is_err_config_not_found, is_err_no_such_group};
 use crate::{
     cache::{Cache, CacheEntity},
     error::{is_err_no_such_policy, is_err_no_such_user},

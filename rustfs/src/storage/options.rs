@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::storage_compat::BucketVersioningSys;
-use super::storage_compat::Result;
-use super::storage_compat::StorageError;
+use super::BucketVersioningSys;
+use super::Result;
+use super::StorageError;
 use http::header::{IF_MATCH, IF_NONE_MATCH};
 use http::{HeaderMap, HeaderValue};
 use rustfs_utils::http::{

@@ -33,7 +33,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use super::storage_compat::{DiskError, GLOBAL_LOCAL_DISK_MAP, HealDiskExt as _};
+use super::{DiskError, GLOBAL_LOCAL_DISK_MAP, HealDiskExt as _};
 
 const KEEP_HEAL_TASK_STATUS_DURATION: Duration = Duration::from_secs(10 * 60);
 const LOG_COMPONENT_HEAL: &str = "heal";
@@ -2347,7 +2347,7 @@ mod tests {
     use rustfs_madmin::heal_commands::HealResultItem;
     use rustfs_storage_api::BucketInfo;
 
-    use super::super::storage_compat::{DiskStore, Endpoint};
+    use super::super::{DiskStore, Endpoint};
 
     struct MockStorage;
 

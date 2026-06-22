@@ -14,19 +14,50 @@
 
 //! Object application use-case contracts.
 
+use super::object_api_utils::to_s3s_etag;
+use super::quota::checker::QuotaChecker;
+use super::storageclass;
+// Performance metrics recording (with zero-copy-metrics integration)
+use super::ECStore;
+use super::{get_lock_acquire_timeout, is_valid_storage_class};
+use super::{is_all_buckets_not_found, DiskError};
+use super::{is_disk_compressible, MIN_DISK_COMPRESSIBLE_SIZE};
+use super::{is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found, Error as EcstoreError, StorageError};
+use super::{
+    lifecycle::{
+        bucket_lifecycle_audit::LcEventSrc,
+        bucket_lifecycle_ops::{enqueue_transition_immediate, post_restore_opts},
+        lifecycle::{self, TransitionOptions},
+    },
+    metadata_sys,
+    object_lock::{
+        objectlock::{get_object_legalhold_meta, get_object_retention_meta},
+        objectlock_sys::{check_object_lock_for_deletion, is_retention_active, BucketObjectLockSys},
+    },
+    quota::QuotaOperation,
+    replication::{
+        check_replicate_delete, get_must_replicate_options, must_replicate, schedule_replication,
+        schedule_replication_delete, DeletedObjectReplicationInfo, ObjectOpts as ReplicationObjectOpts,
+    },
+    tagging::decode_tags,
+    versioning_sys::BucketVersioningSys,
+};
+use super::{predict_lifecycle_expiration, validate_restore_request, AppReplicationConfigExt as _, AppVersioningConfigExt as _};
+use super::{wrap_reader, DynReader, HashReader, WritePlan};
 use crate::app::context::{
-    AppContext, default_notify_interface, get_global_app_context, resolve_object_store_handle_for_context,
+    default_notify_interface, get_global_app_context, resolve_object_store_handle_for_context, AppContext,
 };
 use crate::config::RustFSBufferConfig;
 use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
 use crate::error::ApiError;
-use crate::storage::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
+use crate::server::convert_ecstore_object_info;
+use crate::storage::access::{authorize_request, has_bypass_governance_header, req_info_mut, PostObjectRequestMarker};
 use crate::storage::concurrency::{
-    ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
+    get_concurrency_aware_buffer_size, get_concurrency_manager, ConcurrencyManager, GetObjectGuard,
 };
 use crate::storage::ecfs::*;
 use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
-use crate::storage::helper::{OperationHelper, spawn_background_with_context};
+use crate::storage::helper::{spawn_background_with_context, OperationHelper};
 use crate::storage::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
     filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
@@ -34,8 +65,8 @@ use crate::storage::options::{
 use crate::storage::request_context::spawn_traced;
 use crate::storage::s3_api::multipart::parse_list_parts_params;
 use crate::storage::sse::{
-    SSEType, build_ssec_read_headers, encryption_material_to_metadata, extract_ssekms_context_from_headers,
-    map_get_object_reader_error,
+    build_ssec_read_headers, encryption_material_to_metadata, extract_ssekms_context_from_headers, map_get_object_reader_error,
+    SSEType,
 };
 use crate::storage::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
 use crate::storage::*;
@@ -46,65 +77,27 @@ use http::{HeaderMap, HeaderValue, StatusCode};
 use md5::Context as Md5Context;
 use metrics::{counter, histogram};
 use pin_project_lite::pin_project;
-use rustfs_object_capacity::capacity_manager::get_capacity_manager;
-// Performance metrics recording (with zero-copy-metrics integration)
-use super::storage_compat::ECStore;
-use super::storage_compat::object_api_utils::to_s3s_etag;
-use super::storage_compat::quota::checker::QuotaChecker;
-use super::storage_compat::storageclass;
-use super::storage_compat::{
-    AppReplicationConfigExt as _, AppVersioningConfigExt as _, predict_lifecycle_expiration, validate_restore_request,
-};
-use super::storage_compat::{DiskError, is_all_buckets_not_found};
-use super::storage_compat::{DynReader, HashReader, WritePlan, wrap_reader};
-use super::storage_compat::{
-    Error as EcstoreError, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
-};
-use super::storage_compat::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
-use super::storage_compat::{get_lock_acquire_timeout, is_valid_storage_class};
-use super::storage_compat::{
-    lifecycle::{
-        bucket_lifecycle_audit::LcEventSrc,
-        bucket_lifecycle_ops::{enqueue_transition_immediate, post_restore_opts},
-        lifecycle::{self, TransitionOptions},
-    },
-    metadata_sys,
-    object_lock::{
-        objectlock::{get_object_legalhold_meta, get_object_retention_meta},
-        objectlock_sys::{BucketObjectLockSys, check_object_lock_for_deletion, is_retention_active},
-    },
-    quota::QuotaOperation,
-    replication::{
-        DeletedObjectReplicationInfo, ObjectOpts as ReplicationObjectOpts, check_replicate_delete, get_must_replicate_options,
-        must_replicate, schedule_replication, schedule_replication_delete,
-    },
-    tagging::decode_tags,
-    versioning_sys::BucketVersioningSys,
-};
-use crate::server::convert_ecstore_object_info;
 use rustfs_concurrency::GetObjectQueueSnapshot;
 use rustfs_filemeta::{
-    REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateTargetDecision, ReplicationState, ReplicationStatusType,
-    ReplicationType, RestoreStatusOps, VersionPurgeStatusType, parse_restore_obj_status, replication_statuses_map,
-    version_purge_statuses_map,
+    parse_restore_obj_status, replication_statuses_map, version_purge_statuses_map, ReplicateDecision, ReplicateTargetDecision,
+    ReplicationState, ReplicationStatusType, ReplicationType, RestoreStatusOps, VersionPurgeStatusType,
+    REPLICATE_INCOMING_DELETE,
 };
 use rustfs_io_core::{BytesPool, PooledBuffer};
 use rustfs_io_metrics;
 use rustfs_lock::NamespaceLockGuard;
 use rustfs_notify::EventArgsBuilder;
+use rustfs_object_capacity::capacity_manager::get_capacity_manager;
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_for_post_object};
+use rustfs_s3_ops::{delete_event_name_for_marker, put_event_name_for_post_object, S3Operation};
 use rustfs_s3select_api::object_store::bytes_stream;
 #[cfg(test)]
 use rustfs_storage_api::HTTPPreconditions;
 use rustfs_storage_api::{HTTPRangeSpec, NamespaceLocking, ObjectIO as _, ObjectOperations as _};
 use rustfs_targets::{
-    EventName, extract_params_header, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
+    extract_params_header, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent, EventName,
 };
-use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, CONTENT_TYPE,
-    SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
     headers::{
         AMZ_DECODED_CONTENT_LENGTH, AMZ_MINIO_SNOWBALL_IGNORE_DIRS, AMZ_MINIO_SNOWBALL_IGNORE_ERRORS, AMZ_MINIO_SNOWBALL_PREFIX,
         AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_MODE_LOWER,
@@ -113,14 +106,17 @@ use rustfs_utils::http::{
         AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID,
         AMZ_SNOWBALL_EXTRACT, AMZ_SNOWBALL_IGNORE_DIRS, AMZ_SNOWBALL_IGNORE_ERRORS, AMZ_SNOWBALL_PREFIX, AMZ_STORAGE_CLASS,
         AMZ_TAG_COUNT,
-    },
-    insert_str, remove_str,
+    }, insert_str, remove_str, AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE,
+    AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, CONTENT_TYPE, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION,
+    SUFFIX_COMPRESSION_SIZE,
+    SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
 };
 use rustfs_utils::path::{encode_dir_object, is_dir_object, path_join_buf};
+use rustfs_utils::CompressionAlgorithm;
 use rustfs_zip::{ArchiveLimits, CompressionFormat};
 use s3s::dto::*;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
-use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use s3s::{s3_error, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use std::collections::HashMap;
 use std::ops::Add;
 use std::path::{Component, Path};
@@ -131,7 +127,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::RwLock;
 use tokio_tar::Archive;
@@ -279,10 +275,10 @@ async fn enqueue_transitioned_delete_cleanup(
     let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Cleanup);
 
     let je = if opts.delete_prefix {
-        super::storage_compat::lifecycle::tier_sweeper::transitioned_force_delete_journal_entry(&existing.transitioned_object)
+        super::lifecycle::tier_sweeper::transitioned_force_delete_journal_entry(&existing.transitioned_object)
     } else {
         let version_id = opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok());
-        super::storage_compat::lifecycle::tier_sweeper::transitioned_delete_journal_entry(
+        super::lifecycle::tier_sweeper::transitioned_delete_journal_entry(
             version_id,
             opts.versioned,
             opts.version_suspended,
@@ -293,11 +289,9 @@ async fn enqueue_transitioned_delete_cleanup(
         return Ok(());
     };
 
-    super::storage_compat::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry(store, &je).await?;
+    super::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry(store, &je).await?;
 
-    let mut expiry_state = super::storage_compat::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState
-        .write()
-        .await;
+    let mut expiry_state = super::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState.write().await;
     if let Err(err) = expiry_state.enqueue_tier_journal_entry(&je).await {
         warn!(
             bucket,
@@ -343,14 +337,14 @@ impl MemoryTrackedBytesStream {
 impl futures::Stream for MemoryTrackedBytesStream {
     type Item = std::io::Result<Bytes>;
 
-    fn poll_next(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
         if *this.emitted {
-            return std::task::Poll::Ready(None);
+            return Poll::Ready(None);
         }
 
         *this.emitted = true;
-        std::task::Poll::Ready(Some(Ok(this.bytes.clone())))
+        Poll::Ready(Some(Ok(this.bytes.clone())))
     }
 }
 
@@ -367,15 +361,15 @@ impl<R> ExtractArchiveEtagReader<R> {
 
 impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
     fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
+    ) -> Poll<std::io::Result<()>> {
         let this = self.project();
         let before = buf.filled().len();
         match this.inner.poll_read(cx, buf) {
-            std::task::Poll::Pending => std::task::Poll::Pending,
-            std::task::Poll::Ready(Ok(())) => {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => {
                 let filled = &buf.filled()[before..];
                 if !filled.is_empty() {
                     this.md5.consume(filled);
@@ -385,9 +379,9 @@ impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
                         *etag = Some(format!("{:x}", this.md5.clone().finalize()));
                     }
                 }
-                std::task::Poll::Ready(Ok(()))
+                Poll::Ready(Ok(()))
             }
-            std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(err)),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
         }
     }
 }
@@ -607,8 +601,8 @@ fn should_buffer_get_object_in_memory_with_threshold(
     let effective_threshold = configured_threshold.min(MAX_GET_OBJECT_MEMORY_BUFFER_BYTES);
     if configured_threshold > MAX_GET_OBJECT_MEMORY_BUFFER_BYTES
         && GET_OBJECT_BUFFER_THRESHOLD_WARNED
-            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
     {
         warn!(
             configured_threshold_bytes = configured_threshold,
@@ -708,7 +702,9 @@ struct PutObjectChecksums {
     crc64nvme: Option<String>,
 }
 
-fn normalize_delete_objects_version_id(version_id: Option<String>) -> Result<(Option<String>, Option<Uuid>), String> {
+fn normalize_delete_objects_version_id(
+    version_id: Option<String>,
+) -> std::result::Result<(Option<String>, Option<Uuid>), String> {
     let version_id = version_id.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     match version_id {
         Some(id) => {
@@ -887,7 +883,7 @@ fn copy_namespace_lock_error(bucket: &str, object: &str, mode: &'static str, err
 
 async fn acquire_self_copy_namespace_lock<S>(store: &S, bucket: &str, object: &str) -> S3Result<NamespaceLockGuard>
 where
-    S: NamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper> + ?Sized,
+    S: NamespaceLocking<Error=EcstoreError, NamespaceLock=rustfs_lock::NamespaceLockWrapper> + ?Sized,
 {
     let object = encode_dir_object(object);
     let lock = store.new_ns_lock(bucket, &object).await.map_err(ApiError::from)?;
@@ -1136,12 +1132,20 @@ fn response_storage_class(info: &ObjectInfo, metadata: &HashMap<String, String>)
         .map(StorageClass::from)
 }
 
-fn response_storage_class_for_attributes(info: &ObjectInfo, metadata: &HashMap<String, String>) -> Option<StorageClass> {
+fn response_storage_class_for_object_attributes(
+    info: &ObjectInfo,
+    metadata: &HashMap<String, String>,
+    requested: bool,
+) -> Option<StorageClass> {
+    if !requested {
+        return None;
+    }
+
     info.storage_class
         .clone()
         .or_else(|| metadata.get(AMZ_STORAGE_CLASS).cloned())
-        .filter(|storage_class| !storage_class.is_empty())
         .or_else(|| Some(storageclass::STANDARD.to_string()))
+        .filter(|storage_class| !storage_class.is_empty())
         .map(StorageClass::from)
 }
 
@@ -1158,7 +1162,7 @@ async fn apply_put_request_object_lock_opts(
         object_lock_mode,
         object_lock_retain_until_date,
     )
-    .await?
+        .await?
     {
         opts.eval_metadata = Some(eval_metadata);
     }
@@ -1331,9 +1335,9 @@ fn is_sse_kms_requested(input: &PutObjectInput, headers: &HeaderMap) -> bool {
         .is_some_and(|sse| sse.as_str().eq_ignore_ascii_case(ServerSideEncryption::AWS_KMS))
         || input.ssekms_key_id.is_some()
         || headers
-            .get(AMZ_SERVER_SIDE_ENCRYPTION)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case(ServerSideEncryption::AWS_KMS))
+        .get(AMZ_SERVER_SIDE_ENCRYPTION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case(ServerSideEncryption::AWS_KMS))
         || headers.contains_key(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID)
 }
 
@@ -1610,7 +1614,7 @@ impl DefaultObjectUsecase {
     #[allow(clippy::too_many_arguments)]
     async fn prepare_get_object_read(
         req: &S3Request<GetObjectInput>,
-        store: &super::storage_compat::ECStore,
+        store: &ECStore,
         manager: &ConcurrencyManager,
         bucket: &str,
         key: &str,
@@ -2161,7 +2165,7 @@ impl DefaultObjectUsecase {
             object_lock_retain_until_date,
             &mut opts,
         )
-        .await?;
+            .await?;
 
         let current_opts: ObjectOptions = internal_object_info_lookup_opts(
             get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
@@ -2201,11 +2205,7 @@ impl DefaultObjectUsecase {
                 StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
             );
             let algorithm = CompressionAlgorithm::default();
-            insert_str(
-                &mut metadata,
-                SUFFIX_COMPRESSION,
-                super::storage_compat::compression_metadata_value(algorithm),
-            );
+            insert_str(&mut metadata, SUFFIX_COMPRESSION, super::compression_metadata_value(algorithm));
             insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
             let mut hrd =
@@ -2216,11 +2216,7 @@ impl DefaultObjectUsecase {
             }
 
             opts.want_checksum = hrd.checksum();
-            insert_str(
-                &mut opts.user_defined,
-                SUFFIX_COMPRESSION,
-                super::storage_compat::compression_metadata_value(algorithm),
-            );
+            insert_str(&mut opts.user_defined, SUFFIX_COMPRESSION, super::compression_metadata_value(algorithm));
             insert_str(&mut opts.user_defined, SUFFIX_ACTUAL_SIZE, size.to_string());
 
             size = HashReader::SIZE_PRESERVE_LAYER;
@@ -2236,7 +2232,7 @@ impl DefaultObjectUsecase {
                         StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
                         actual_size as usize,
                     )
-                    .await?;
+                        .await?;
                     HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
                 } else {
                     let pool = get_concurrency_manager().bytes_pool();
@@ -2245,7 +2241,7 @@ impl DefaultObjectUsecase {
                         actual_size as usize,
                         pool.as_ref(),
                     )
-                    .await?;
+                        .await?;
                     let eager_reader = PooledBufferReader::new(eager_body, actual_size as usize);
                     HashReader::from_stream(eager_reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
                 }
@@ -2411,8 +2407,7 @@ impl DefaultObjectUsecase {
         maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
 
         // Fast in-memory update for immediate quota and admin usage consistency
-        super::storage_compat::record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64)
-            .await;
+        super::record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
 
         let raw_version = obj_info.version_id.map(|v| v.to_string());
 
@@ -2641,7 +2636,7 @@ impl DefaultObjectUsecase {
             rs.is_some(),
             encryption_applied,
         )
-        .await?;
+            .await?;
 
         let checksums = Self::build_get_object_checksums(&info, &req.headers, part_number, rs.as_ref())?;
 
@@ -2752,7 +2747,7 @@ impl DefaultObjectUsecase {
             &opts,
             part_number,
         )
-        .await?;
+            .await?;
         let GetObjectPreparedRead { io_planning, read_setup } = prepared_read;
         let permit_wait_duration = io_planning.permit_wait_duration;
         let queue_status = io_planning.queue_status;
@@ -2827,7 +2822,7 @@ impl DefaultObjectUsecase {
             version_id_for_event,
             output,
         )
-        .await;
+            .await;
         if result.is_ok() {
             request_guard.finish_ok();
         } else {
@@ -2906,6 +2901,8 @@ impl DefaultObjectUsecase {
         );
 
         let requested = |name: &'static str| -> bool { object_attributes_requested(&object_attributes, name) };
+        let storage_class =
+            response_storage_class_for_object_attributes(&info, &metadata_map, requested(ObjectAttributes::STORAGE_CLASS));
 
         let e_tag = if requested(ObjectAttributes::ETAG) {
             info.etag.as_ref().map(|etag| to_s3s_etag(etag))
@@ -2954,13 +2951,6 @@ impl DefaultObjectUsecase {
         } else {
             None
         };
-
-        let storage_class = if requested("StorageClass") {
-            response_storage_class_for_attributes(&info, &metadata_map)
-        } else {
-            None
-        };
-
         let object_parts = if requested(ObjectAttributes::OBJECT_PARTS) && info.is_multipart() {
             let params = parse_list_parts_params(part_number_marker, max_parts)?;
             let mut parts = Vec::new();
@@ -3276,7 +3266,7 @@ impl DefaultObjectUsecase {
             insert_str(
                 &mut compress_metadata,
                 SUFFIX_COMPRESSION,
-                super::storage_compat::compression_metadata_value(CompressionAlgorithm::default()),
+                super::compression_metadata_value(CompressionAlgorithm::default()),
             );
             insert_str(&mut compress_metadata, SUFFIX_ACTUAL_SIZE, actual_size.to_string());
         } else {
@@ -3307,7 +3297,7 @@ impl DefaultObjectUsecase {
             object_lock_mode,
             object_lock_retain_until_date,
         )
-        .await?
+            .await?
         {
             user_defined.extend(object_lock_metadata);
         }
@@ -3369,7 +3359,7 @@ impl DefaultObjectUsecase {
 
         // Update quota tracking after successful copy
         if has_bucket_metadata {
-            super::storage_compat::record_bucket_object_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64).await;
+            super::record_bucket_object_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64).await;
         }
 
         let raw_dest_version = oi.version_id.map(|v| v.to_string());
@@ -3440,7 +3430,7 @@ impl DefaultObjectUsecase {
                 })
                 .collect::<Vec<ObjectToDelete>>(),
         )
-        .await;
+            .await;
 
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -3452,7 +3442,7 @@ impl DefaultObjectUsecase {
         #[derive(Default, Clone)]
         struct DeleteResult {
             delete_object: Option<StorageDeletedObject>,
-            error: Option<Error>,
+            error: Option<s3s::dto::Error>,
         }
 
         let mut delete_results = vec![DeleteResult::default(); delete.objects.len()];
@@ -3466,7 +3456,7 @@ impl DefaultObjectUsecase {
             let (version_id, version_uuid) = match normalize_delete_objects_version_id(raw_version_id.clone()) {
                 Ok(parsed) => parsed,
                 Err(err) => {
-                    delete_results[idx].error = Some(Error {
+                    delete_results[idx].error = Some(s3s::dto::Error {
                         code: Some("NoSuchVersion".to_string()),
                         key: Some(obj_id.key.clone()),
                         message: Some(err),
@@ -3485,7 +3475,7 @@ impl DefaultObjectUsecase {
 
             let auth_res = authorize_request(&mut req, Action::S3Action(S3Action::DeleteObjectAction)).await;
             if let Err(e) = auth_res {
-                delete_results[idx].error = Some(Error {
+                delete_results[idx].error = Some(s3s::dto::Error {
                     code: Some("AccessDenied".to_string()),
                     key: Some(obj_id.key.clone()),
                     message: Some(e.to_string()),
@@ -3497,7 +3487,7 @@ impl DefaultObjectUsecase {
             if bypass_governance {
                 let auth_res = authorize_request(&mut req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await;
                 if let Err(e) = auth_res {
-                    delete_results[idx].error = Some(Error {
+                    delete_results[idx].error = Some(s3s::dto::Error {
                         code: Some("AccessDenied".to_string()),
                         key: Some(obj_id.key.clone()),
                         message: Some(e.to_string()),
@@ -3508,7 +3498,7 @@ impl DefaultObjectUsecase {
             }
 
             if let Err(err) = validate_table_catalog_object_mutation(&bucket, &obj_id.key).await {
-                delete_results[idx].error = Some(Error {
+                delete_results[idx].error = Some(s3s::dto::Error {
                     code: Some("InvalidRequest".to_string()),
                     key: Some(obj_id.key.clone()),
                     message: Some(err.to_string()),
@@ -3531,8 +3521,8 @@ impl DefaultObjectUsecase {
                 &req.headers,
                 metadata,
             )
-            .await
-            .map_err(ApiError::from)?;
+                .await
+                .map_err(ApiError::from)?;
 
             let (goi, gerr) = match store.get_object_info(&bucket, &object.object_name, &opts).await {
                 Ok(res) => (res, None),
@@ -3543,7 +3533,7 @@ impl DefaultObjectUsecase {
                 && !delete_creates_delete_marker(&opts)
                 && let Some(block_reason) = check_object_lock_for_deletion(&bucket, &goi, bypass_governance).await
             {
-                delete_results[idx].error = Some(Error {
+                delete_results[idx].error = Some(s3s::dto::Error {
                     code: Some("AccessDenied".to_string()),
                     key: Some(obj_id.key.clone()),
                     message: Some(block_reason.error_message()),
@@ -3570,7 +3560,7 @@ impl DefaultObjectUsecase {
                     &opts,
                     gerr.clone(),
                 )
-                .await;
+                    .await;
                 if dsc.replicate_any() {
                     if object.version_id.is_some() {
                         object.version_purge_status = Some(VersionPurgeStatusType::Pending);
@@ -3617,8 +3607,8 @@ impl DefaultObjectUsecase {
 
             if err.is_none()
                 || err
-                    .clone()
-                    .is_some_and(|v| is_err_object_not_found(&v) || is_err_version_not_found(&v))
+                .clone()
+                .is_some_and(|v| is_err_object_not_found(&v) || is_err_version_not_found(&v))
             {
                 if replicate_deletes {
                     dobjs[i].replication_state = Some(object_to_delete[i].replication_state());
@@ -3636,7 +3626,7 @@ impl DefaultObjectUsecase {
                     },
                     existing_object_infos[i].as_ref(),
                 )
-                .await
+                    .await
                 {
                     warn!(
                         bucket = %bucket,
@@ -3646,17 +3636,17 @@ impl DefaultObjectUsecase {
                     );
                 }
                 let size = object_sizes[i].max(0) as u64;
-                super::storage_compat::record_bucket_object_delete_memory(
+                super::record_bucket_object_delete_memory(
                     &bucket,
                     size,
                     existing_object_infos[i].is_some() && object_to_delete[i].version_id.is_none(),
                 )
-                .await;
+                    .await;
                 continue;
             }
 
             if let Some(err) = err.clone() {
-                delete_results[didx].error = Some(Error {
+                delete_results[didx].error = Some(s3s::dto::Error {
                     code: Some(err.to_string()),
                     key: Some(object_to_delete[i].object_name.clone()),
                     message: Some(err.to_string()),
@@ -3682,7 +3672,10 @@ impl DefaultObjectUsecase {
             })
             .collect();
 
-        let errors = delete_results.iter().filter_map(|v| v.error.clone()).collect::<Vec<Error>>();
+        let errors = delete_results
+            .iter()
+            .filter_map(|v| v.error.clone())
+            .collect::<Vec<s3s::dto::Error>>();
         let output = DeleteObjectsOutput {
             deleted: Some(deleted),
             errors: Some(errors),
@@ -3693,7 +3686,7 @@ impl DefaultObjectUsecase {
             if let Some(dobj) = &dobjs.delete_object
                 && replicate_deletes
                 && (dobj.delete_marker_replication_status() == ReplicationStatusType::Pending
-                    || dobj.version_purge_status() == VersionPurgeStatusType::Pending)
+                || dobj.version_purge_status() == VersionPurgeStatusType::Pending)
             {
                 let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Replication);
                 let mut dobj = dobj.clone();
@@ -3734,12 +3727,12 @@ impl DefaultObjectUsecase {
                             ..Default::default()
                         }),
                     )
-                    .version_id(dobj.version_id.map(|v| v.to_string()).unwrap_or_default())
-                    .req_params(extract_params_header(&req_headers))
-                    .resp_elements(extract_resp_elements(&S3Response::new(DeleteObjectsOutput::default())))
-                    .host(get_request_host(&req_headers))
-                    .user_agent(get_request_user_agent(&req_headers))
-                    .build();
+                        .version_id(dobj.version_id.map(|v| v.to_string()).unwrap_or_default())
+                        .req_params(extract_params_header(&req_headers))
+                        .resp_elements(extract_resp_elements(&S3Response::new(DeleteObjectsOutput::default())))
+                        .host(get_request_host(&req_headers))
+                        .user_agent(get_request_user_agent(&req_headers))
+                        .build();
 
                     notify.notify(event_args).await;
                 }
@@ -3816,12 +3809,12 @@ impl DefaultObjectUsecase {
         let replicate_force_delete = force_delete
             && !replica
             && has_replication_rules(
-                &bucket,
-                &[ObjectToDelete {
-                    object_name: key.clone(),
-                    ..Default::default()
-                }],
-            )
+            &bucket,
+            &[ObjectToDelete {
+                object_name: key.clone(),
+                ..Default::default()
+            }],
+        )
             .await;
 
         // Check Object Lock retention before deletion
@@ -3884,12 +3877,7 @@ impl DefaultObjectUsecase {
         }
 
         // Fast in-memory update for immediate quota and admin usage consistency
-        super::storage_compat::record_bucket_object_delete_memory(
-            &bucket,
-            obj_info.size.max(0) as u64,
-            opts.version_id.is_none(),
-        )
-        .await;
+        super::record_bucket_object_delete_memory(&bucket, obj_info.size.max(0) as u64, opts.version_id.is_none()).await;
 
         if obj_info.name.is_empty() {
             if replicate_force_delete {
@@ -3903,7 +3891,7 @@ impl DefaultObjectUsecase {
                     event_type: REPLICATE_INCOMING_DELETE.to_string(),
                     ..Default::default()
                 })
-                .await;
+                    .await;
             }
             // Prefix/force-delete returns empty ObjectInfo; still emit bucket notification so webhooks match S3 DELETE.
             helper = helper
@@ -4074,9 +4062,9 @@ impl DefaultObjectUsecase {
         if let Some(match_etag) = if_none_match
             && let Some(strong_etag) = match_etag.into_etag()
             && info
-                .etag
-                .as_ref()
-                .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
+            .etag
+            .as_ref()
+            .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
         {
             return Err(S3Error::new(S3ErrorCode::NotModified));
         }
@@ -4092,17 +4080,17 @@ impl DefaultObjectUsecase {
         if let Some(match_etag) = if_match {
             if let Some(strong_etag) = match_etag.into_etag()
                 && info
-                    .etag
-                    .as_ref()
-                    .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
+                .etag
+                .as_ref()
+                .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
             {
                 return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
             }
         } else if let Some(unmodified_since) = if_unmodified_since
             && info.mod_time.is_some_and(|mod_time| {
-                let give_time: OffsetDateTime = unmodified_since.into();
-                mod_time > give_time.add(time::Duration::seconds(1))
-            })
+            let give_time: OffsetDateTime = unmodified_since.into();
+            mod_time > give_time.add(time::Duration::seconds(1))
+        })
         {
             return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
         }
@@ -4410,7 +4398,7 @@ impl DefaultObjectUsecase {
                         is_restore_in_progress: Some(false),
                         restore_expiry_date: Some(Timestamp::from(restore_expiry)),
                     }
-                    .to_string(),
+                        .to_string(),
                 );
             } else {
                 metadata.insert(
@@ -4419,7 +4407,7 @@ impl DefaultObjectUsecase {
                         is_restore_in_progress: Some(true),
                         restore_expiry_date: Some(Timestamp::from(OffsetDateTime::now_utc())),
                     }
-                    .to_string(),
+                        .to_string(),
                 );
             }
             obj_info.user_defined = Arc::new(metadata);
@@ -4858,11 +4846,7 @@ impl DefaultObjectUsecase {
                     .map_err(ApiError::from)?
             } else if should_compress {
                 let algorithm = CompressionAlgorithm::default();
-                insert_str(
-                    &mut metadata,
-                    SUFFIX_COMPRESSION,
-                    super::storage_compat::compression_metadata_value(algorithm),
-                );
+                insert_str(&mut metadata, SUFFIX_COMPRESSION, super::compression_metadata_value(algorithm));
                 insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
                 let hrd = HashReader::from_stream(f, size, actual_size, None, None, false).map_err(ApiError::from)?;
@@ -4878,7 +4862,7 @@ impl DefaultObjectUsecase {
                 object_lock_retain_until_date.clone(),
                 &mut opts,
             )
-            .await?;
+                .await?;
             if let Some(material) = sse_encryption(EncryptionRequest {
                 bucket: &bucket,
                 key: &fpath,
@@ -4890,7 +4874,7 @@ impl DefaultObjectUsecase {
                 sse_customer_key_md5: sse_customer_key_md5.clone(),
                 content_size: actual_size,
             })
-            .await?
+                .await?
             {
                 effective_sse = Some(material.server_side_encryption.clone());
                 effective_kms_key_id = material.kms_key_id.clone();
@@ -5014,8 +4998,8 @@ mod tests {
         ExistingObjectReplicationStatus, ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus,
     };
     use std::pin::Pin;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, ReadBuf};
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
@@ -5061,8 +5045,8 @@ mod tests {
             Some(ObjectLockMode::from_static(ObjectLockMode::GOVERNANCE)),
             None,
         )
-        .await
-        .unwrap_err();
+            .await
+            .unwrap_err();
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some(ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED));
@@ -5385,8 +5369,8 @@ mod tests {
             false,
             false,
         )
-        .await
-        .expect("build_get_object_body should succeed for streaming path");
+            .await
+            .expect("build_get_object_body should succeed for streaming path");
 
         assert!(body.is_some());
         assert_eq!(
@@ -5416,8 +5400,8 @@ mod tests {
             false,
             true,
         )
-        .await
-        .expect("build_get_object_body should succeed for encrypted streaming path");
+            .await
+            .expect("build_get_object_body should succeed for encrypted streaming path");
 
         assert!(body.is_some());
         assert_eq!(
@@ -5837,7 +5821,7 @@ mod tests {
     }
 
     #[test]
-    fn response_storage_class_for_attributes_defaults_to_standard() {
+    fn response_storage_class_for_object_attributes_defaults_to_standard_when_requested() {
         let metadata = HashMap::new();
         let info = ObjectInfo {
             storage_class: None,
@@ -5846,7 +5830,7 @@ mod tests {
         };
 
         assert_eq!(
-            response_storage_class_for_attributes(&info, &metadata)
+            response_storage_class_for_object_attributes(&info, &metadata, true)
                 .as_ref()
                 .map(StorageClass::as_str),
             Some(storageclass::STANDARD)
@@ -5854,20 +5838,17 @@ mod tests {
     }
 
     #[test]
-    fn response_storage_class_for_attributes_keeps_explicit_storage_class() {
-        let mut metadata = HashMap::new();
-        metadata.insert(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string());
+    fn response_storage_class_for_object_attributes_skips_value_when_not_requested() {
+        let metadata = HashMap::new();
         let info = ObjectInfo {
             storage_class: Some(storageclass::STANDARD_IA.to_string()),
             user_defined: Arc::new(metadata.clone()),
             ..Default::default()
         };
 
-        assert_eq!(
-            response_storage_class_for_attributes(&info, &metadata)
-                .as_ref()
-                .map(StorageClass::as_str),
-            Some(storageclass::STANDARD_IA)
+        assert!(
+            response_storage_class_for_object_attributes(&info, &metadata, false).is_none(),
+            "StorageClass must only be returned when explicitly requested"
         );
     }
 

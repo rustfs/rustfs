@@ -42,14 +42,14 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
-use super::storage_compat::{
+use crate::ScannerObjectInfo as ObjectInfo;
+use crate::{
     BucketTargetSys, BucketVersioningSys, Disk, DiskError, ECStore, EcstoreError as Error, EcstoreResult as Result,
     ReplicationConfig, STORAGE_FORMAT_FILE, ScannerDiskExt as _, ScannerLifecycleConfigExt as _,
     ScannerReplicationConfigExt as _, ScannerVersioningConfigExt as _, SetDisks, StorageError, enqueue_global_free_version,
     get_lifecycle_config, get_object_lock_config, get_replication_config, list_global_tiers, resolve_scanner_object_store_handle,
     storageclass,
 };
-use crate::ScannerObjectInfo as ObjectInfo;
 
 pub(crate) const SCANNER_SKIP_FILE_ERROR: &str = "skip file";
 const LOG_COMPONENT_SCANNER: &str = "scanner";
@@ -1522,9 +1522,9 @@ impl ScannerIODisk for Disk {
 
 #[cfg(test)]
 mod tests {
-    use super::super::storage_compat::{DiskOption, Endpoint, new_disk, path2_bucket_object_with_base_path};
     use super::*;
     use crate::scanner_folder::ScannerItem;
+    use crate::{DiskOption, Endpoint, new_disk, path2_bucket_object_with_base_path};
     use serial_test::serial;
     use temp_env::with_var;
     use uuid::Uuid;
