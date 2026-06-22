@@ -76,8 +76,8 @@ pub(crate) mod ecstore_admin {
 
 pub(crate) mod ecstore_bucket {
     pub(crate) use rustfs_ecstore::api::bucket::{
-        bucket_target_sys, lifecycle, metadata, metadata_sys, migration, object_lock, policy_sys, replication, tagging, target,
-        utils,
+        bandwidth, bucket_target_sys, lifecycle, metadata, metadata_sys, migration, object_lock, policy_sys, replication,
+        tagging, target, utils,
     };
     pub(crate) use rustfs_ecstore::api::bucket::{quota, versioning, versioning_sys};
 }
@@ -85,11 +85,12 @@ pub(crate) mod ecstore_bucket {
 pub(crate) mod ecstore_capacity {
     pub(crate) use rustfs_ecstore::api::capacity::{
         PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free,
+        is_reserved_or_invalid_bucket,
     };
 }
 
 pub(crate) mod ecstore_client {
-    pub(crate) use rustfs_ecstore::api::client::{object_api_utils, transition_api};
+    pub(crate) use rustfs_ecstore::api::client::{admin_handler_utils, object_api_utils, transition_api};
 }
 
 pub(crate) mod ecstore_compression {
@@ -101,7 +102,9 @@ pub(crate) mod ecstore_cluster {
 }
 
 pub(crate) mod ecstore_config {
-    pub(crate) use rustfs_ecstore::api::config::{com, init, init_global_config_sys, storageclass, try_migrate_server_config};
+    pub(crate) use rustfs_ecstore::api::config::{
+        com, init, init_global_config_sys, set_global_storage_class, storageclass, try_migrate_server_config,
+    };
 }
 
 pub(crate) mod ecstore_data_usage {
@@ -133,9 +136,10 @@ pub(crate) mod ecstore_event {
 
 pub(crate) mod ecstore_global {
     pub(crate) use rustfs_ecstore::api::global::{
-        GLOBAL_TierConfigMgr, get_global_endpoints_opt, get_global_lock_client, get_global_lock_clients, get_global_region,
-        get_global_tier_config_mgr, is_dist_erasure, new_object_layer_fn, resolve_object_store_handle, set_global_endpoints,
-        set_global_region, set_global_rustfs_port, set_object_store_resolver, shutdown_background_services, update_erasure_type,
+        GLOBAL_BOOT_TIME, GLOBAL_TierConfigMgr, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt,
+        get_global_lock_client, get_global_lock_clients, get_global_region, get_global_tier_config_mgr, global_rustfs_port,
+        is_dist_erasure, new_object_layer_fn, resolve_object_store_handle, set_global_endpoints, set_global_region,
+        set_global_rustfs_port, set_object_store_resolver, shutdown_background_services, update_erasure_type,
     };
 }
 
@@ -155,6 +159,15 @@ pub(crate) mod ecstore_notification {
     };
 }
 
+#[allow(unused_imports)]
+pub(crate) mod ecstore_rebalance {
+    pub(crate) use rustfs_ecstore::api::rebalance::{
+        DiskStat, RebalSaveOpt, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo,
+        RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord, decode_rebalance_stop_propagation_record,
+        encode_rebalance_stop_propagation_record,
+    };
+}
+
 pub(crate) mod ecstore_rio {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rio::{DecryptReader, EncryptReader, HardLimitReader, Reader, boxed_reader};
@@ -165,7 +178,7 @@ pub(crate) mod ecstore_rio {
 
 pub(crate) mod ecstore_rpc {
     pub(crate) use rustfs_ecstore::api::rpc::{
-        LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG,
+        LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG,
         SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, verify_rpc_signature,
     };
 }
@@ -183,7 +196,7 @@ pub(crate) mod ecstore_storage {
 
 pub(crate) mod ecstore_tier {
     pub(crate) use rustfs_ecstore::api::tier::tier::TierConfigMgr;
-    pub(crate) use rustfs_ecstore::api::tier::{tier, tier_config, warm_backend};
+    pub(crate) use rustfs_ecstore::api::tier::{tier, tier_admin, tier_config, tier_handlers, warm_backend};
 }
 
 pub(crate) const BUCKET_ACCELERATE_CONFIG: &str = ecstore_bucket::metadata::BUCKET_ACCELERATE_CONFIG;
