@@ -33,8 +33,7 @@ use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::endpoints::EndpointServerPools;
 use crate::error::{Error, Result};
 use crate::error::{
-    StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_object_not_found, is_err_operation_canceled,
-    is_err_version_not_found,
+    StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
 };
 use crate::global::resolve_object_store_handle;
 use crate::notification_sys::get_global_notification_sys;
@@ -610,12 +609,52 @@ fn load_decommission_entry_versions(entry: &MetaCacheEntry, bucket: &str, stage:
         .map_err(|err| with_decommission_entry_context(stage, bucket, &entry.name, err))
 }
 
+fn empty_decommission_entry_versions(bucket: &str, object: &str) -> FileInfoVersions {
+    FileInfoVersions {
+        volume: bucket.to_string(),
+        name: object.to_string(),
+        versions: Vec::new(),
+        ..Default::default()
+    }
+}
+
+fn resolve_decommission_entry_exact_versions(
+    result: Result<Option<FileInfoVersions>>,
+    entry: &MetaCacheEntry,
+    bucket: &str,
+    stage: &str,
+) -> Result<FileInfoVersions> {
+    match result {
+        Ok(Some(fivs)) => Ok(fivs),
+        Ok(None) => Ok(empty_decommission_entry_versions(bucket, &entry.name)),
+        Err(err) => Err(with_decommission_entry_context(stage, bucket, &entry.name, err)),
+    }
+}
+
+async fn load_decommission_entry_exact_versions(
+    set: &SetDisks,
+    entry: &MetaCacheEntry,
+    bucket: &str,
+    stage: &str,
+) -> Result<FileInfoVersions> {
+    resolve_decommission_entry_exact_versions(set.load_file_info_versions_exact(bucket, &entry.name).await, entry, bucket, stage)
+}
+
 fn resolve_decommission_check_after_list_result(list_result: Result<()>, entry_error: Option<Error>) -> Result<()> {
     if let Some(err) = entry_error { Err(err) } else { list_result }
 }
 
 fn resolve_decommission_pool_meta_reload_result(result: Result<()>, stage: &str) -> Result<()> {
     result.map_err(|err| Error::other(format!("decommission pool meta reload failed during {stage}: {err}")))
+}
+
+fn apply_decommission_status_space_info(mut pool_info: PoolStatus, space_info: PoolSpaceInfo) -> PoolStatus {
+    if let Some(d) = pool_info.decommission.as_mut() {
+        d.total_size = space_info.total;
+        d.current_size = space_info.free;
+    }
+
+    pool_info
 }
 
 fn resolve_start_decommission_pool_meta_reload_result(result: Result<()>) -> Result<()> {
@@ -720,8 +759,8 @@ fn classify_decommission_terminal_state(failed_items_present: bool) -> Decommiss
     }
 }
 
-fn should_preserve_decommission_canceled_state(meta_canceled: bool, cancel_signal: bool) -> bool {
-    meta_canceled || cancel_signal
+fn should_preserve_decommission_canceled_state(meta_canceled: bool, _cancel_signal: bool) -> bool {
+    meta_canceled
 }
 
 fn should_continue_decommission_queue(meta: &PoolMeta, idx: usize) -> bool {
@@ -2057,19 +2096,8 @@ impl ECStore {
 
         let pool_meta = self.pool_meta.read().await;
 
-        let mut pool_info = get_by_index(pool_meta.pools.as_slice(), idx, "fetch decommission status")?.clone();
-        if let Some(d) = pool_info.decommission.as_mut() {
-            d.total_size = space_info.total;
-            d.current_size = space_info.free;
-        } else {
-            pool_info.decommission = Some(PoolDecommissionInfo {
-                total_size: space_info.total,
-                current_size: space_info.free,
-                ..Default::default()
-            });
-        }
-
-        Ok(pool_info)
+        let pool_info = get_by_index(pool_meta.pools.as_slice(), idx, "fetch decommission status")?.clone();
+        Ok(apply_decommission_status_space_info(pool_info, space_info))
     }
 
     async fn get_decommission_pool_space_info(&self, idx: usize) -> Result<PoolSpaceInfo> {
@@ -2374,7 +2402,7 @@ impl ECStore {
         }
         decommission_cancel_signal_result(rx.is_cancelled())?;
 
-        let mut fivs = load_decommission_entry_versions(&entry, &bucket, "file_info_versions")?;
+        let mut fivs = load_decommission_entry_exact_versions(&set, &entry, &bucket, "file_info_versions").await?;
 
         fivs.versions
             .sort_by_key(|v| (v.mod_time.is_none(), std::cmp::Reverse(v.mod_time)));
@@ -3079,7 +3107,7 @@ impl ECStore {
                 "Decommission background routine failed"
             );
 
-            if is_err_operation_canceled(&err) || should_preserve_decommission_canceled_state(canceled, rx.is_cancelled()) {
+            if should_preserve_decommission_canceled_state(canceled, rx.is_cancelled()) {
                 warn!(
                     event = EVENT_DECOMMISSION_STATE,
                     component = LOG_COMPONENT_ECSTORE,
@@ -4540,9 +4568,10 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
 mod pools_tests {
     use super::{
         DECOMMISSION_PROGRESS_SAVE_INTERVAL, DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD, DecomBucketInfo,
-        DecommissionTerminalState, PoolDecommissionInfo, PoolMeta, PoolSpaceInfo, PoolStatus, bind_decommission_cancelers,
-        bind_missing_decommission_cancelers, cancel_decommission_canceler, classify_decommission_terminal_state,
-        count_decommission_item, decommission_cancel_signal_result, decommission_item_size, decommission_meta_bucket_options,
+        DecommissionTerminalState, PoolDecommissionInfo, PoolMeta, PoolSpaceInfo, PoolStatus,
+        apply_decommission_status_space_info, bind_decommission_cancelers, bind_missing_decommission_cancelers,
+        cancel_decommission_canceler, classify_decommission_terminal_state, count_decommission_item,
+        decommission_cancel_signal_result, decommission_item_size, decommission_meta_bucket_options,
         decommission_start_guard_state, dedup_indices, default_decommission_bucket_concurrency,
         ensure_decommission_cancel_allowed, ensure_decommission_clear_allowed, ensure_decommission_listing_disks_available,
         ensure_decommission_not_rebalancing, ensure_decommission_start_allowed, ensure_decommission_start_local_leader,
@@ -4553,25 +4582,25 @@ mod pools_tests {
         missing_decommission_worker_prefix, observe_decommission_terminal_reload_result, pool_meta_has_active_decommission,
         require_decommission_store, resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
         resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
-        resolve_decommission_entry_reload_result, resolve_decommission_listing_worker_result,
-        resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,
-        resolve_decommission_preflight_heal_result, resolve_decommission_progress_save_result,
-        resolve_decommission_spawn_failure_result, resolve_decommission_terminal_mark_after_error_result,
-        resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result,
-        resolve_start_decommission_pool_meta_reload_result, rollback_start_decommission_pool_meta,
-        run_decommission_buckets_bounded, should_cleanup_decommission_source_entry, should_continue_decommission_queue,
-        should_count_decommission_version_complete, should_preserve_decommission_canceled_state,
-        should_reject_decommission_cancel_as_terminal, should_retry_decommission_cancel_reload,
-        should_skip_canceled_decommission_routine, split_decommission_buckets, take_and_cancel_decommission_canceler,
-        take_decommission_canceler, track_decommission_current_object, validate_start_decommission_request,
-        wait_decommission_worker_drain, with_decommission_entry_context,
+        resolve_decommission_entry_exact_versions, resolve_decommission_entry_reload_result,
+        resolve_decommission_listing_worker_result, resolve_decommission_optional_bucket_config_result,
+        resolve_decommission_pool_meta_reload_result, resolve_decommission_preflight_heal_result,
+        resolve_decommission_progress_save_result, resolve_decommission_spawn_failure_result,
+        resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
+        resolve_decommission_update_after_result, resolve_start_decommission_pool_meta_reload_result,
+        rollback_start_decommission_pool_meta, run_decommission_buckets_bounded, should_cleanup_decommission_source_entry,
+        should_continue_decommission_queue, should_count_decommission_version_complete,
+        should_preserve_decommission_canceled_state, should_reject_decommission_cancel_as_terminal,
+        should_retry_decommission_cancel_reload, should_skip_canceled_decommission_routine, split_decommission_buckets,
+        take_and_cancel_decommission_canceler, take_decommission_canceler, track_decommission_current_object,
+        validate_start_decommission_request, wait_decommission_worker_drain, with_decommission_entry_context,
     };
     use crate::data_movement;
     use crate::disk::endpoint::Endpoint;
     use crate::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::error::Error;
     use crate::rebalance::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats};
-    use rustfs_filemeta::MetaCacheEntry;
+    use rustfs_filemeta::{FileInfo, FileInfoVersions, MetaCacheEntry, ObjectPartInfo};
     use rustfs_rio::Index;
     use std::sync::{
         Arc,
@@ -4606,6 +4635,43 @@ mod pools_tests {
             last_update: OffsetDateTime::now_utc(),
             decommission,
         }
+    }
+
+    #[test]
+    fn test_apply_decommission_status_space_info_keeps_idle_pool_decommission_none() {
+        let status = apply_decommission_status_space_info(
+            decommission_test_pool_status(0, None),
+            PoolSpaceInfo {
+                free: 25,
+                total: 100,
+                used: 75,
+            },
+        );
+
+        assert!(status.decommission.is_none());
+    }
+
+    #[test]
+    fn test_apply_decommission_status_space_info_refreshes_active_decommission_sizes() {
+        let status = apply_decommission_status_space_info(
+            decommission_test_pool_status(
+                0,
+                Some(PoolDecommissionInfo {
+                    total_size: 1,
+                    current_size: 1,
+                    ..Default::default()
+                }),
+            ),
+            PoolSpaceInfo {
+                free: 25,
+                total: 100,
+                used: 75,
+            },
+        );
+
+        let decommission = status.decommission.expect("active decommission info should remain present");
+        assert_eq!(decommission.total_size, 100);
+        assert_eq!(decommission.current_size, 25);
     }
 
     #[test]
@@ -5337,6 +5403,55 @@ mod pools_tests {
     }
 
     #[test]
+    fn test_resolve_decommission_entry_exact_versions_preserves_full_parts() {
+        let entry = MetaCacheEntry {
+            name: "obj.txt".to_string(),
+            metadata: Vec::new(),
+            cached: None,
+            reusable: false,
+        };
+        let fivs = FileInfoVersions {
+            volume: "bucket-a".to_string(),
+            name: "obj.txt".to_string(),
+            versions: vec![FileInfo {
+                name: "obj.txt".to_string(),
+                parts: vec![ObjectPartInfo {
+                    number: 1,
+                    etag: "part-etag".to_string(),
+                    size: 128,
+                    actual_size: 128,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let resolved = resolve_decommission_entry_exact_versions(Ok(Some(fivs)), &entry, "bucket-a", "file_info_versions")
+            .expect("exact versions should be preserved");
+
+        assert_eq!(resolved.versions[0].parts.len(), 1);
+        assert_eq!(resolved.versions[0].parts[0].etag, "part-etag");
+    }
+
+    #[test]
+    fn test_resolve_decommission_entry_exact_versions_uses_empty_when_source_missing() {
+        let entry = MetaCacheEntry {
+            name: "obj.txt".to_string(),
+            metadata: Vec::new(),
+            cached: None,
+            reusable: false,
+        };
+
+        let resolved = resolve_decommission_entry_exact_versions(Ok(None), &entry, "bucket-a", "file_info_versions")
+            .expect("missing source metadata should be treated as empty");
+
+        assert_eq!(resolved.volume, "bucket-a");
+        assert_eq!(resolved.name, "obj.txt");
+        assert!(resolved.versions.is_empty());
+    }
+
+    #[test]
     fn test_resolve_decommission_check_after_list_result_prefers_entry_error() {
         let err = resolve_decommission_check_after_list_result(Err(Error::OperationCanceled), Some(Error::SlowDown))
             .expect_err("entry error should win over cancellation");
@@ -5877,7 +5992,7 @@ mod pools_tests {
 
     #[test]
     fn test_should_preserve_decommission_canceled_state_when_signal_canceled() {
-        assert!(should_preserve_decommission_canceled_state(false, true));
+        assert!(!should_preserve_decommission_canceled_state(false, true));
     }
 
     #[test]
