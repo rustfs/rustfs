@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-core-compat-consumer-batch`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102`.
-- Based on: latest `main` after the API-101 merge.
+- Branch: `overtrue/arch-local-compat-explicit-exports`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103`.
+- Based on: latest `main` after the API-102 merge.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move storage core ECStore compatibility consumers behind
-  the `core_storage_compat` boundary.
-- CI/script changes: extend owner compatibility consumer guard coverage across
-  `rustfs/src/storage`.
-- Docs changes: record the API-102 storage core compatibility consumer cleanup.
+- Rust code changes: narrow selected local compatibility boundaries from glob
+  re-exports to explicit re-exports.
+- CI/script changes: guard narrowed local compatibility boundaries against
+  restoring glob re-exports.
+- Docs changes: record the API-103 local compatibility export cleanup.
 
 ## Phase 0 Tasks
 
@@ -462,6 +462,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: RustFS test-target compile coverage, storage compatibility
     consumer residual scan, migration and layer guards, formatting, diff
     hygiene, Rust risk scan, pre-commit quality gate, and three-expert review.
+- [x] `API-103` Narrow selected local compatibility re-exports.
+  - Completed slice: replace glob re-exports in admin router/service, app
+    context, storage core, and storage RPC local compatibility boundaries with
+    explicit re-export lists.
+  - Acceptance: narrowed local compatibility boundaries expose only the symbols
+    consumed by their owners; migration rules reject restoring glob re-exports
+    in those files.
+  - Must preserve: admin route behavior, dynamic config reload behavior, app
+    context startup handles, storage core option/SSE/access behavior, and
+    storage RPC request handling.
+  - Verification: RustFS test-target compile coverage, narrowed local
+    compatibility glob-export scan, migration and layer guards, formatting,
+    diff hygiene, Rust risk scan, pre-commit quality gate, and three-expert
+    review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3495,13 +3509,25 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-097 localizes disk/RPC/warm-backend method access behind owner-local compatibility traits and aliases without widening non-compat imports. |
-| Migration preservation | pass | RPC, heal, scanner, and transition-test call sites keep existing behavior while losing direct ECStore trait imports. |
-| Testing/verification | pass | Focused compile, residual scan, migration guard, layer guard, formatting, diff hygiene, risk scan, and full pre-commit passed. |
+| Quality/architecture | pass | API-103 narrows selected local compatibility re-export surfaces without changing owner call sites or ECStore contracts. |
+| Migration preservation | pass | The new guard rejects restoring glob re-exports in narrowed local compatibility boundaries. |
+| Testing/verification | pass | Focused compile, narrowed glob-export scan, migration guard, layer guard, formatting, diff hygiene, risk scan, and full pre-commit passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-103 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Narrowed local compatibility glob-export scan: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-102 current slice:
   - `cargo check -p rustfs --tests`: passed.
