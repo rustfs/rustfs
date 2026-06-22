@@ -685,6 +685,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: RustFS compile coverage, nested secondary bridge residual
     scan, migration and layer guards, formatting, diff hygiene, path-only risk
     review, and three-expert review.
+- [x] `API-120` Remove admin handlers secondary compatibility bridge.
+  - Completed slice: replace admin handler consumers of
+    `handlers::storage_compat` with direct admin owner `storage_compat` paths,
+    then delete the handler bridge module.
+  - Acceptance: admin handler modules no longer route through a second local
+    compatibility bridge; migration rules reject the bridge file, module
+    declaration, or direct handler-level `super::storage_compat` consumers.
+  - Must preserve: admin handler config, replication, rebalance, quota, tier,
+    table catalog, metrics, trace, and heal behavior plus existing admin owner
+    `storage_compat` aliases.
+  - Verification: RustFS admin handler compile coverage, handler secondary
+    bridge residual scan, migration and layer guards, formatting, diff hygiene,
+    path-only risk review, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3718,13 +3731,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-119 removes nested service/context/rpc secondary compatibility bridges while keeping consumers on owner `storage_compat` boundaries. |
-| Migration preservation | pass | The extended guard rejects reintroduced nested bridge files or module declarations while preserving existing owner aliases. |
-| Testing/verification | pass | RustFS compile, nested secondary bridge residual scan, migration guard, layer guard, formatting, diff hygiene, and path-only risk review passed. |
+| Quality/architecture | pass | API-120 removes the admin handlers secondary compatibility bridge while keeping handler consumers on the admin owner `storage_compat` boundary. |
+| Migration preservation | pass | The extended guard rejects the deleted handler bridge file, module declaration, or direct handler-level bridge consumers while preserving existing admin aliases. |
+| Testing/verification | pass | RustFS compile, handler secondary bridge residual scan, migration guard, layer guard, formatting, diff hygiene, and path-only risk review passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-120 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Admin handlers secondary compatibility bridge residual scan: passed.
+  - Rust risk review on path-only replacements and guard script: passed.
 
 - Issue #660 API-119 current slice:
   - `cargo check -p rustfs --tests`: passed.
