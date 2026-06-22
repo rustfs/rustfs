@@ -16,7 +16,7 @@
 #![allow(dead_code)]
 
 use async_trait::async_trait;
-use rustfs_ecstore::api::rpc::{self as ecstore_rpc, TonicInterceptor};
+use rustfs_ecstore::api::rpc as ecstore_rpc;
 use rustfs_lock::{
     LockClient, LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats, LockStatus, LockType, Result,
     types::{LockMetadata, LockPriority},
@@ -24,6 +24,8 @@ use rustfs_lock::{
 use rustfs_protos::proto_gen::node_service::{BatchGenerallyLockRequest, GenerallyLockRequest, PingRequest};
 use tonic::Request;
 use tracing::{info, warn};
+
+type TonicInterceptor = ecstore_rpc::TonicInterceptor;
 
 /// gRPC lock client without authentication for testing
 /// Similar to RemoteClient but uses no_auth client

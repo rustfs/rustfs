@@ -97,6 +97,8 @@ OUTER_CONSUMER_COMPAT_RAW_FACADE_PATH_HITS_FILE="${TMP_DIR}/outer_consumer_compa
 RUSTFS_ROOT_E2E_COMPAT_RAW_FACADE_PATH_HITS_FILE="${TMP_DIR}/rustfs_root_e2e_compat_raw_facade_path_hits.txt"
 ALL_STORAGE_COMPAT_RAW_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_raw_facade_path_hits.txt"
 ALL_STORAGE_COMPAT_GROUPED_FACADE_IMPORT_HITS_FILE="${TMP_DIR}/all_storage_compat_grouped_facade_import_hits.txt"
+ALL_ECSTORE_API_GROUPED_FACADE_IMPORT_HITS_FILE="${TMP_DIR}/all_ecstore_api_grouped_facade_import_hits.txt"
+ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE="${TMP_DIR}/all_ecstore_api_raw_subpath_hits.txt"
 ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_self_facade_path_hits.txt"
 RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE="${TMP_DIR}/rustfs_local_compat_owner_self_path_hits.txt"
 RUSTFS_ROOT_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_compat_relative_consumer_hits.txt"
@@ -1040,6 +1042,28 @@ fi
 
 if [[ -s "$ALL_STORAGE_COMPAT_GROUPED_FACADE_IMPORT_HITS_FILE" ]]; then
   report_failure "storage compatibility boundaries must import ECStore facade modules through explicit per-module ecstore_* aliases: $(paste -sd '; ' "$ALL_STORAGE_COMPAT_GROUPED_FACADE_IMPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '^use rustfs_ecstore::api::\{' rustfs/src crates fuzz \
+    --glob '*.rs' \
+    --glob '!crates/ecstore/**' || true
+) >"$ALL_ECSTORE_API_GROUPED_FACADE_IMPORT_HITS_FILE"
+
+if [[ -s "$ALL_ECSTORE_API_GROUPED_FACADE_IMPORT_HITS_FILE" ]]; then
+  report_failure "non-ECStore sources must import ECStore facade modules through explicit per-module ecstore_* aliases: $(paste -sd '; ' "$ALL_ECSTORE_API_GROUPED_FACADE_IMPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_ecstore::api::[a-z_]+::' rustfs/src crates fuzz \
+    --glob '*.rs' \
+    --glob '!crates/ecstore/**' || true
+) >"$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE"
+
+if [[ -s "$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE" ]]; then
+  report_failure "non-ECStore sources must keep raw ECStore facade subpaths behind local ecstore_* module aliases: $(paste -sd '; ' "$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE")"
 fi
 
 (
