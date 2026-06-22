@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::storage_compat::{
+    notify_iam_delete_policy, notify_iam_delete_service_account, notify_iam_delete_user, notify_iam_load_group,
+    notify_iam_load_policy, notify_iam_load_policy_mapping, notify_iam_load_service_account, notify_iam_load_user,
+};
 use crate::error::Error as IamError;
 use crate::error::is_err_no_such_account;
 use crate::error::is_err_no_such_temp_account;
@@ -19,10 +23,6 @@ use crate::error::{Error, Result};
 use crate::manager::extract_jwt_claims;
 use crate::manager::get_default_policyes;
 use crate::manager::{IamCache, IamSyncMetricsSnapshot};
-use crate::storage_compat::{
-    notify_iam_delete_policy, notify_iam_delete_service_account, notify_iam_delete_user, notify_iam_load_group,
-    notify_iam_load_policy, notify_iam_load_policy_mapping, notify_iam_load_service_account, notify_iam_load_user,
-};
 use crate::store::GroupInfo;
 use crate::store::MappedPolicy;
 use crate::store::Store;

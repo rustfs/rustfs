@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::storage_compat::is_iam_first_cluster_node_local;
 use crate::error::{Error, Result, is_err_config_not_found};
-use crate::storage_compat::is_iam_first_cluster_node_local;
 use crate::sys::{get_claims_from_token_with_secret, get_claims_from_token_with_secret_allow_missing_exp};
 use crate::{
     cache::{Cache, CacheEntity, LockedCache},
