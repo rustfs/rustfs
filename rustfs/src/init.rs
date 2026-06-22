@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use crate::server::ShutdownHandle;
+use crate::storage::{ecstore_bucket::metadata_sys as ecstore_metadata_sys, ecstore_global};
 use crate::storage::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
 use crate::{admin, config, version};
 use rustfs_config::{
     DEFAULT_BUFFER_MAX_SIZE, DEFAULT_BUFFER_MIN_SIZE, DEFAULT_BUFFER_PROFILE, DEFAULT_BUFFER_UNKNOWN_SIZE, DEFAULT_UPDATE_CHECK,
     ENV_RUSTFS_BUFFER_DEFAULT_SIZE, ENV_RUSTFS_BUFFER_MAX_SIZE, ENV_RUSTFS_BUFFER_MIN_SIZE, ENV_UPDATE_CHECK, RUSTFS_REGION,
 };
-use rustfs_ecstore::api::{bucket::metadata_sys as ecstore_metadata_sys, global as ecstore_global};
 use rustfs_notify::notifier_global;
 use rustfs_targets::arn::{ARN, TargetIDError};
 use rustfs_utils::get_env_usize;

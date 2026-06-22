@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use crate::startup_fs_guard::enforce_unsupported_fs_policy;
-use rustfs_common::{GlobalReadiness, SystemStage};
-use rustfs_ecstore::api::storage::ECStore;
-use rustfs_ecstore::api::{
-    bucket::replication as ecstore_replication, config as ecstore_config, global as ecstore_global, layout::EndpointServerPools,
-    storage as ecstore_storage,
+use crate::storage::ECStore;
+use crate::storage::{
+    ecstore_bucket::replication as ecstore_replication, ecstore_config, ecstore_global, ecstore_layout::EndpointServerPools,
+    ecstore_storage,
 };
+use rustfs_common::{GlobalReadiness, SystemStage};
 use std::{
     io::{Error, Result},
     net::SocketAddr,

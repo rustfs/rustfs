@@ -991,11 +991,32 @@ impl LocalDisk {
     // Check if a path is valid
     fn check_valid_path<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let path = normalize_path_components(path);
-        if path.starts_with(&self.root) {
-            Ok(())
-        } else {
-            Err(DiskError::InvalidPath)
+        if !path.starts_with(&self.root) {
+            return Err(DiskError::InvalidPath);
         }
+
+        self.reject_symlink_components(&path)
+    }
+
+    fn reject_symlink_components(&self, path: &Path) -> Result<()> {
+        let relative = path.strip_prefix(&self.root).map_err(|_| DiskError::InvalidPath)?;
+        let mut current = self.root.clone();
+
+        for component in relative.components() {
+            current.push(component.as_os_str());
+
+            match lstat_std(&current) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() {
+                        return Err(DiskError::InvalidPath);
+                    }
+                }
+                Err(err) if err.kind() == ErrorKind::NotFound => break,
+                Err(err) => return Err(to_file_error(err).into()),
+            }
+        }
+
+        Ok(())
     }
 
     // Batch path generation with single lock acquisition
@@ -4454,6 +4475,42 @@ mod test {
 
         // Clean up the test directory
         let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_get_bucket_path_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().unwrap();
+        let outside_dir = tempdir().unwrap();
+        let link_path = root_dir.path().join("escape-bucket");
+        symlink(outside_dir.path(), &link_path).unwrap();
+
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        assert!(matches!(disk.get_bucket_path("escape-bucket"), Err(DiskError::InvalidPath)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_get_object_path_rejects_symlink_component_escape() {
+        use std::os::unix::fs::symlink;
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().unwrap();
+        let outside_dir = tempdir().unwrap();
+        let bucket_dir = root_dir.path().join("bucket");
+        fs::create_dir_all(&bucket_dir).await.unwrap();
+        let link_path = bucket_dir.join("escape");
+        symlink(outside_dir.path(), &link_path).unwrap();
+
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        assert!(matches!(disk.get_object_path("bucket", "escape/object.txt"), Err(DiskError::InvalidPath)));
     }
 
     #[tokio::test]

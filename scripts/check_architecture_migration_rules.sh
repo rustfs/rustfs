@@ -715,7 +715,7 @@ fi
     --glob '!**/storage_compat.rs' \
     --glob '!**/*storage_compat.rs' \
     --glob '!target/**' \
-    | rg -v '^(rustfs/src/(admin/mod|app/mod|storage/mod|capacity/service|config/config_test|error|init|runtime_capabilities|startup_(background|bucket_metadata|fs_guard|iam|lifecycle|notification|server|services|shutdown|storage)|table_catalog|workload_admission)\.rs|rustfs/src/server/(event|http|module_switch|readiness)\.rs|rustfs/src/storage/s3_api/(bucket|multipart)\.rs|crates/e2e_test/src/(replication_extension_test|reliant/(grpc_lock_client|node_interact_test))\.rs|crates/heal/src/heal/mod\.rs|crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)\.rs|crates/iam/src/lib\.rs|crates/notify/src/config_manager\.rs|crates/obs/src/metrics/(scheduler|stats_collector)\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/object_store\.rs|crates/scanner/src/lib\.rs|crates/scanner/tests/lifecycle_integration_test\.rs|fuzz/fuzz_targets/(bucket_validation|path_containment)\.rs):' || true
+    | rg -v '^(rustfs/src/(admin/mod|app/mod|storage/mod)\.rs|crates/e2e_test/src/(replication_extension_test|reliant/(grpc_lock_client|node_interact_test))\.rs|crates/heal/src/heal/mod\.rs|crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)\.rs|crates/iam/src/lib\.rs|crates/notify/src/config_manager\.rs|crates/obs/src/metrics/(scheduler|stats_collector)\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/object_store\.rs|crates/scanner/src/lib\.rs|crates/scanner/tests/lifecycle_integration_test\.rs|fuzz/fuzz_targets/(bucket_validation|path_containment)\.rs):' || true
 ) |
   cat >"$DIRECT_ECSTORE_IMPORT_HITS_FILE"
 

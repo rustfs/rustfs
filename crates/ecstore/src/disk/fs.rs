@@ -150,11 +150,11 @@ pub fn access_std(path: impl AsRef<Path>) -> io::Result<()> {
 }
 
 pub async fn lstat(path: impl AsRef<Path>) -> io::Result<Metadata> {
-    fs::metadata(path).await
+    fs::symlink_metadata(path).await
 }
 
 pub fn lstat_std(path: impl AsRef<Path>) -> io::Result<Metadata> {
-    std::fs::metadata(path)
+    std::fs::symlink_metadata(path)
 }
 
 pub async fn make_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
@@ -355,6 +355,22 @@ mod tests {
         assert_eq!(metadata.len(), 12); // "test content" is 12 bytes
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_lstat_preserves_symlink_metadata() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().unwrap();
+        let target_path = temp_dir.path().join("target.txt");
+        let link_path = temp_dir.path().join("link.txt");
+
+        tokio::fs::write(&target_path, b"test content").await.unwrap();
+        symlink(&target_path, &link_path).unwrap();
+
+        let metadata = lstat(&link_path).await.unwrap();
+        assert!(metadata.file_type().is_symlink());
+    }
+
     #[test]
     fn test_lstat_std() {
         let temp_dir = TempDir::new().unwrap();
@@ -367,6 +383,22 @@ mod tests {
         let metadata = lstat_std(&file_path).unwrap();
         assert!(metadata.is_file());
         assert_eq!(metadata.len(), 12); // "test content" is 12 bytes
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_lstat_std_preserves_symlink_metadata() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().unwrap();
+        let target_path = temp_dir.path().join("target-std.txt");
+        let link_path = temp_dir.path().join("link-std.txt");
+
+        std::fs::write(&target_path, b"test content").unwrap();
+        symlink(&target_path, &link_path).unwrap();
+
+        let metadata = lstat_std(&link_path).unwrap();
+        assert!(metadata.file_type().is_symlink());
     }
 
     #[tokio::test]
