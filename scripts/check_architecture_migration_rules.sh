@@ -101,6 +101,7 @@ ALL_ECSTORE_API_GROUPED_FACADE_IMPORT_HITS_FILE="${TMP_DIR}/all_ecstore_api_grou
 ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE="${TMP_DIR}/all_ecstore_api_raw_subpath_hits.txt"
 EXTERNAL_PRODUCTION_ECSTORE_IMPORT_HITS_FILE="${TMP_DIR}/external_production_ecstore_import_hits.txt"
 COMPLETED_EXTERNAL_OWNER_MODULE_ALIAS_HITS_FILE="${TMP_DIR}/completed_external_owner_module_alias_hits.txt"
+COMPLETED_OWNER_BARE_FACADE_IMPORT_HITS_FILE="${TMP_DIR}/completed_owner_bare_facade_import_hits.txt"
 ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_self_facade_path_hits.txt"
 RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE="${TMP_DIR}/rustfs_local_compat_owner_self_path_hits.txt"
 RUSTFS_ROOT_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_compat_relative_consumer_hits.txt"
@@ -1095,6 +1096,34 @@ fi
 
 if [[ -s "$COMPLETED_EXTERNAL_OWNER_MODULE_ALIAS_HITS_FILE" ]]; then
   report_failure "completed external owner and test/fuzz boundaries must expose explicit ECStore symbols instead of ecstore_* module aliases: $(paste -sd '; ' "$COMPLETED_EXTERNAL_OWNER_MODULE_ALIAS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '^(?:pub\(crate\)\s+)?use\s+rustfs_ecstore::api::[a-z_]+\s*;|^(?:pub\(crate\)\s+)?use\s+rustfs_ecstore::api::[a-z_]+::\*\s*;' \
+    crates/heal/src/heal/mod.rs \
+    crates/heal/tests/endpoint_index_test.rs \
+    crates/heal/tests/heal_bug_fixes_test.rs \
+    crates/heal/tests/heal_integration_test.rs \
+    crates/iam/src/lib.rs \
+    crates/notify/src/lib.rs \
+    crates/obs/src/metrics/mod.rs \
+    crates/protocols/src/swift/mod.rs \
+    crates/s3select-api/src/lib.rs \
+    crates/scanner/src/lib.rs \
+    crates/scanner/tests/lifecycle_integration_test.rs \
+    crates/e2e_test/src/reliant/grpc_lock_client.rs \
+    crates/e2e_test/src/reliant/node_interact_test.rs \
+    crates/e2e_test/src/replication_extension_test.rs \
+    rustfs/src/admin/mod.rs \
+    rustfs/src/app/mod.rs \
+    rustfs/src/storage/mod.rs \
+    fuzz/fuzz_targets/bucket_validation.rs \
+    fuzz/fuzz_targets/path_containment.rs || true
+) >"$COMPLETED_OWNER_BARE_FACADE_IMPORT_HITS_FILE"
+
+if [[ -s "$COMPLETED_OWNER_BARE_FACADE_IMPORT_HITS_FILE" ]]; then
+  report_failure "completed owner and test/fuzz boundaries must not import bare or glob ECStore facade modules: $(paste -sd '; ' "$COMPLETED_OWNER_BARE_FACADE_IMPORT_HITS_FILE")"
 fi
 
 (
