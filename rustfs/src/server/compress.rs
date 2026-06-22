@@ -418,7 +418,11 @@ impl PathCategory {
             PathCategory::AdminApi
         } else if path.starts_with("/rustfs/console") {
             PathCategory::Console
-        } else if path == "/health" || path.starts_with("/health/") {
+        } else if path == "/health"
+            || path.starts_with("/health/")
+            || path == "/minio/health/live"
+            || path == "/minio/health/ready"
+        {
             PathCategory::Probe
         } else {
             PathCategory::S3DataPlane
@@ -766,6 +770,8 @@ mod tests {
         assert_eq!(PathCategory::classify("/health"), PathCategory::Probe);
         assert_eq!(PathCategory::classify("/health/live"), PathCategory::Probe);
         assert_eq!(PathCategory::classify("/health/ready"), PathCategory::Probe);
+        assert_eq!(PathCategory::classify("/minio/health/live"), PathCategory::Probe);
+        assert_eq!(PathCategory::classify("/minio/health/ready"), PathCategory::Probe);
     }
 
     #[test]
