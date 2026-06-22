@@ -13,11 +13,12 @@
 // limitations under the License.
 
 use super::super::{
-    CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, FileInfoVersions, LocalPeerS3Client, MetricType,
-    PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG,
-    SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StoragePeerS3ClientExt as _, UpdateMetadataOpts, all_local_disk_path,
-    collect_local_metrics, find_local_disk_by_ref, get_global_lock_client, get_local_server_property, load_bucket_metadata,
-    reload_transition_tier_config, resolve_object_store_handle, set_bucket_metadata,
+    CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, ECStore, Error, FileInfoVersions,
+    LocalPeerS3Client, MetricType, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions,
+    SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StoragePeerS3ClientExt as _,
+    UpdateMetadataOpts, all_local_disk_path, collect_local_metrics, find_local_disk_by_ref, get_global_lock_client,
+    get_local_server_property, load_bucket_metadata, reload_transition_tier_config, resolve_object_store_handle,
+    set_bucket_metadata,
 };
 use crate::admin::service::{
     config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
@@ -45,6 +46,7 @@ use std::{collections::HashMap, io::Cursor, pin::Pin, sync::Arc};
 use tokio::spawn;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, warn};
 
@@ -137,6 +139,23 @@ fn stop_rebalance_response(result: super::super::Result<()>) -> StopRebalanceRes
             error_info: Some(err.to_string()),
         },
     }
+}
+
+fn ensure_rpc_decommission_local_leader(store: &ECStore, idx: usize) -> super::super::Result<()> {
+    let endpoints = store.endpoints();
+    let endpoint = endpoints
+        .as_ref()
+        .get(idx)
+        .and_then(|pool| pool.endpoints.as_ref().first())
+        .ok_or_else(|| Error::other(format!("invalid decommission pool index {idx} for {} pools", endpoints.as_ref().len())))?;
+
+    if !endpoint.is_local {
+        return Err(Error::other(format!(
+            "decommission for pool {idx} must run on the pool first endpoint {endpoint}"
+        )));
+    }
+
+    Ok(())
 }
 
 #[path = "bucket.rs"]
@@ -1054,6 +1073,101 @@ impl Node for NodeService {
             success: true,
             error_info: None,
         }))
+    }
+
+    async fn start_decommission(
+        &self,
+        request: Request<StartDecommissionRequest>,
+    ) -> Result<Response<StartDecommissionResponse>, Status> {
+        let Some(store) = resolve_object_store_handle() else {
+            return Ok(Response::new(StartDecommissionResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
+        };
+
+        let mut indices = Vec::with_capacity(request.get_ref().pool_indices.len());
+        for idx in request.into_inner().pool_indices {
+            indices.push(
+                usize::try_from(idx)
+                    .map_err(|_| Status::invalid_argument(format!("decommission pool index {idx} exceeds local range")))?,
+            );
+        }
+
+        match store.decommission(CancellationToken::new(), indices).await {
+            Ok(()) => Ok(Response::new(StartDecommissionResponse {
+                success: true,
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(StartDecommissionResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            })),
+        }
+    }
+
+    async fn cancel_decommission(
+        &self,
+        request: Request<CancelDecommissionRequest>,
+    ) -> Result<Response<CancelDecommissionResponse>, Status> {
+        let Some(store) = resolve_object_store_handle() else {
+            return Ok(Response::new(CancelDecommissionResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
+        };
+
+        let idx = usize::try_from(request.into_inner().pool_index)
+            .map_err(|_| Status::invalid_argument("decommission pool index exceeds local range"))?;
+        if let Err(err) = ensure_rpc_decommission_local_leader(&store, idx) {
+            return Ok(Response::new(CancelDecommissionResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            }));
+        }
+
+        match store.decommission_cancel(idx).await {
+            Ok(()) => Ok(Response::new(CancelDecommissionResponse {
+                success: true,
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(CancelDecommissionResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            })),
+        }
+    }
+
+    async fn clear_decommission(
+        &self,
+        request: Request<ClearDecommissionRequest>,
+    ) -> Result<Response<ClearDecommissionResponse>, Status> {
+        let Some(store) = resolve_object_store_handle() else {
+            return Ok(Response::new(ClearDecommissionResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
+        };
+
+        let idx = usize::try_from(request.into_inner().pool_index)
+            .map_err(|_| Status::invalid_argument("decommission pool index exceeds local range"))?;
+        if let Err(err) = ensure_rpc_decommission_local_leader(&store, idx) {
+            return Ok(Response::new(ClearDecommissionResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            }));
+        }
+
+        match store.clear_decommission(idx).await {
+            Ok(()) => Ok(Response::new(ClearDecommissionResponse {
+                success: true,
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(ClearDecommissionResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            })),
+        }
     }
 
     async fn load_transition_tier_config(

@@ -29,12 +29,13 @@ use rustfs_madmin::{
 };
 use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::{
-    DeleteBucketMetadataRequest, DeletePolicyRequest, DeleteServiceAccountRequest, DeleteUserRequest, GetCpusRequest,
-    GetLiveEventsRequest, GetMemInfoRequest, GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest,
-    GetProcInfoRequest, GetSeLinuxInfoRequest, GetSysConfigRequest, GetSysErrorsRequest, LoadBucketMetadataRequest,
-    LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
-    LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest,
-    ReloadSiteReplicationConfigRequest, ServerInfoRequest, SignalServiceRequest, StartProfilingRequest, StopRebalanceRequest,
+    CancelDecommissionRequest, ClearDecommissionRequest, DeleteBucketMetadataRequest, DeletePolicyRequest,
+    DeleteServiceAccountRequest, DeleteUserRequest, GetCpusRequest, GetLiveEventsRequest, GetMemInfoRequest, GetMetricsRequest,
+    GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest, GetSysConfigRequest,
+    GetSysErrorsRequest, LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest,
+    LoadRebalanceMetaRequest, LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest,
+    LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ServerInfoRequest,
+    SignalServiceRequest, StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest,
     node_service_client::NodeServiceClient,
 };
 use rustfs_utils::XHost;
@@ -958,6 +959,79 @@ impl PeerRestClient {
                     start_rebalance = start_rebalance,
                     "peer rebalance metadata response"
                 );
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
+                }
+
+                Ok(())
+            }
+            .await,
+        )
+        .await
+    }
+
+    pub async fn start_decommission(&self, pool_indices: Vec<usize>) -> Result<()> {
+        self.finalize_result(
+            async {
+                let pool_indices = pool_indices
+                    .into_iter()
+                    .map(|idx| {
+                        u32::try_from(idx).map_err(|_| Error::other(format!("decommission pool index {idx} exceeds RPC range")))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let mut client = self.get_client().await?;
+                let request = Request::new(StartDecommissionRequest { pool_indices });
+
+                let response = client.start_decommission(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
+                }
+
+                Ok(())
+            }
+            .await,
+        )
+        .await
+    }
+
+    pub async fn decommission_cancel(&self, pool_index: usize) -> Result<()> {
+        self.finalize_result(
+            async {
+                let pool_index = u32::try_from(pool_index)
+                    .map_err(|_| Error::other(format!("decommission pool index {pool_index} exceeds RPC range")))?;
+                let mut client = self.get_client().await?;
+                let request = Request::new(CancelDecommissionRequest { pool_index });
+
+                let response = client.cancel_decommission(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
+                }
+
+                Ok(())
+            }
+            .await,
+        )
+        .await
+    }
+
+    pub async fn clear_decommission(&self, pool_index: usize) -> Result<()> {
+        self.finalize_result(
+            async {
+                let pool_index = u32::try_from(pool_index)
+                    .map_err(|_| Error::other(format!("decommission pool index {pool_index} exceeds RPC range")))?;
+                let mut client = self.get_client().await?;
+                let request = Request::new(ClearDecommissionRequest { pool_index });
+
+                let response = client.clear_decommission(request).await?.into_inner();
                 if !response.success {
                     if let Some(msg) = response.error_info {
                         return Err(Error::other(msg));
