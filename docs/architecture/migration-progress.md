@@ -5,16 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-compat-facade-import-aliases`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106`.
-- Based on: `main` after the API-105 slice.
+- Branch: `overtrue/arch-compat-local-facade-self-refs`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107`.
+- Based on: API-106 slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: split grouped ECStore facade imports in storage
-  compatibility boundaries into explicit per-module `ecstore_*` aliases.
-- CI/script changes: guard all storage compatibility boundaries against grouped
-  ECStore facade imports and scattered raw facade paths.
-- Docs changes: record the API-106 compatibility facade import alias cleanup.
+- Rust code changes: collapse crate-qualified ECStore facade self references in
+  RustFS app/admin compatibility boundaries into local `ecstore_*` and
+  `super::ecstore_*` paths.
+- CI/script changes: guard storage compatibility boundaries against
+  crate-qualified `storage_compat::ecstore_*` self paths.
+- Docs changes: record the API-107 local facade self-reference cleanup.
 
 ## Phase 0 Tasks
 
@@ -516,6 +517,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     storage/admin/app/runtime/edge/test/fuzz behavior, and API surface.
   - Verification: RustFS test-target compile coverage, grouped-import and
     raw-facade residual scans, migration and layer guards, formatting, diff
+    hygiene, Rust risk scan, pre-commit quality gate, and three-expert review.
+- [x] `API-107` Collapse compatibility facade self references.
+  - Completed slice: replace crate-qualified app/admin
+    `storage_compat::ecstore_*` self references with local `ecstore_*` aliases
+    at the root boundary and `super::ecstore_*` paths inside nested
+    compatibility modules.
+  - Acceptance: RustFS app/admin compatibility boundaries no longer route
+    wrapper bodies and aliases through their own crate-qualified
+    `storage_compat::ecstore_*` paths; migration rules reject regressions.
+  - Must preserve: app bucket/lifecycle/object-lock/replication helper
+    behavior, admin bucket metadata/target/replication/tier/config helper
+    behavior, public local compatibility names, and ECStore facade ownership.
+  - Verification: RustFS test-target compile coverage, local facade
+    self-reference residual scan, migration and layer guards, formatting, diff
     hygiene, Rust risk scan, pre-commit quality gate, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
@@ -3550,13 +3565,25 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-106 keeps the compatibility boundary shape explicit by replacing grouped ECStore facade imports with one local module alias per dependency. |
-| Migration preservation | pass | The new guard rejects grouped facade imports and keeps wrapper bodies constrained to local `ecstore_*` aliases without changing compatibility call behavior. |
-| Testing/verification | pass | Focused compile, grouped-import and raw-facade residual scans, migration guard, layer guard, formatting, diff hygiene, risk scan, and full pre-commit passed. |
+| Quality/architecture | pass | API-107 keeps app/admin compatibility wrappers local by replacing crate-qualified self references with direct `ecstore_*` aliases and scoped `super::` paths. |
+| Migration preservation | pass | The new guard rejects crate-qualified `storage_compat::ecstore_*` self paths while preserving existing wrapper names and ECStore facade ownership. |
+| Testing/verification | pass | Focused compile, self-reference residual scan, migration guard, layer guard, formatting, diff hygiene, risk scan, and full pre-commit passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-107 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Full storage compatibility self-reference residual scan: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-106 current slice:
   - `cargo check -p rustfs --tests`: passed.
