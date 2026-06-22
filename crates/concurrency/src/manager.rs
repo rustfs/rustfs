@@ -131,9 +131,26 @@ impl ConcurrencyManager {
         Self::build(ConcurrencyConfig::default())
     }
 
+    /// Try to create a manager from environment-derived configuration.
+    pub fn try_from_env() -> Result<Self, ConfigError> {
+        Self::try_new(ConcurrencyConfig::from_env())
+    }
+
     /// Create from environment variables
     pub fn from_env() -> Self {
-        Self::new(ConcurrencyConfig::from_env())
+        match Self::try_from_env() {
+            Ok(manager) => manager,
+            Err(err) => {
+                tracing::warn!(
+                    event = "concurrency_manager.invalid_env_fallback",
+                    component = "concurrency",
+                    subsystem = "manager",
+                    error = %err,
+                    "Invalid environment-derived concurrency configuration detected; falling back to defaults"
+                );
+                Self::build(ConcurrencyConfig::default())
+            }
+        }
     }
 
     /// Get the configuration
