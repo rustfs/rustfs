@@ -213,6 +213,35 @@ fn validate_start_decommission_guards(decommission_running: bool, rebalance_runn
     Ok(())
 }
 
+fn validate_pool_mutation_leader(
+    endpoints: &super::storage_compat::EndpointServerPools,
+    idx: usize,
+    operation: &str,
+    audit: PoolAuditContext<'_>,
+) -> s3s::S3Result<()> {
+    let endpoint = endpoints
+        .as_ref()
+        .get(idx)
+        .and_then(|pool| pool.endpoints.as_ref().first())
+        .ok_or_else(|| pool_admin_pool_index_error_with_audit(operation, idx, endpoints.as_ref().len(), audit))?;
+
+    if !endpoint.is_local {
+        log_pool_request_rejected_with_index_audit(
+            operation_to_event(operation),
+            "not_pool_leader",
+            idx,
+            endpoints.as_ref().len(),
+            audit,
+        );
+        return Err(S3Error::with_message(
+            S3ErrorCode::OperationAborted,
+            format!("Failed to {operation}: pool {idx} must be handled by its first endpoint {endpoint}"),
+        ));
+    }
+
+    Ok(())
+}
+
 fn contextualize_admin_pool_api_error(
     err: crate::error::ApiError,
     operation: &str,
@@ -572,6 +601,10 @@ impl Operation for StartDecommission {
             return Err(decommission_admin_not_initialized_error_with_audit("start decommission", audit));
         };
 
+        store
+            .load_rebalance_meta()
+            .await
+            .map_err(|e| s3_error!(InternalError, "failed to refresh rebalance metadata before decommission start: {}", e))?;
         let decommission_running = store.is_decommission_running().await;
         let rebalance_running = store.is_rebalance_started().await;
         if decommission_running {
@@ -734,6 +767,8 @@ impl Operation for CancelDecommission {
             return Err(pool_admin_pool_not_found_error_with_audit("cancel decommission", &query.pool, audit));
         };
 
+        validate_pool_mutation_leader(&endpoints, idx, "cancel decommission", audit)?;
+
         let Some(store) = resolve_object_store_handle() else {
             return Err(decommission_admin_not_initialized_error_with_audit("cancel decommission", audit));
         };
@@ -839,6 +874,8 @@ impl Operation for ClearDecommission {
             return Err(pool_admin_pool_not_found_error_with_audit("clear decommission", &query.pool, audit));
         };
 
+        validate_pool_mutation_leader(&endpoints, idx, "clear decommission", audit)?;
+
         let Some(store) = resolve_object_store_handle() else {
             return Err(decommission_admin_not_initialized_error_with_audit("clear decommission", audit));
         };
@@ -868,14 +905,28 @@ impl Operation for ClearDecommission {
 
 #[cfg(test)]
 mod pools_handler_tests {
+    use super::super::storage_compat::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
     use super::{
         PoolAuditContext, contextualize_admin_pool_api_error, decommission_admin_not_initialized_error_with_audit,
         has_duplicate_indices, parse_mutation_pool_query, parse_pool_idx_by_id, parse_status_pool_query,
         pool_admin_missing_credentials_error, pool_admin_missing_credentials_error_with_request,
         pool_admin_pool_index_error_with_audit, pool_admin_pool_not_found_error_with_audit,
         pool_admin_pool_parse_error_with_audit, pool_admin_query_parse_error, pool_admin_query_parse_error_with_audit,
-        validate_start_decommission_guards,
+        validate_pool_mutation_leader, validate_start_decommission_guards,
     };
+
+    fn test_pool_endpoints(is_local: bool) -> EndpointServerPools {
+        let mut endpoint = Endpoint::try_from("http://127.0.0.1:9000/disk").expect("test endpoint should parse");
+        endpoint.is_local = is_local;
+        EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            cmd_line: "http://127.0.0.1:9000/disk".to_string(),
+            endpoints: Endpoints::from(vec![endpoint]),
+            platform: String::new(),
+        }])
+    }
 
     #[test]
     fn test_parse_pool_idx_by_id_rejects_non_numeric() {
@@ -967,6 +1018,30 @@ mod pools_handler_tests {
     #[test]
     fn test_validate_start_decommission_guards_allows_when_idle() {
         assert!(validate_start_decommission_guards(false, false).is_ok());
+    }
+
+    #[test]
+    fn test_validate_pool_mutation_leader_allows_local_first_endpoint() {
+        let endpoints = test_pool_endpoints(true);
+        let audit = PoolAuditContext::new("request", "actor", "remote");
+
+        assert!(validate_pool_mutation_leader(&endpoints, 0, "cancel decommission", audit).is_ok());
+    }
+
+    #[test]
+    fn test_validate_pool_mutation_leader_rejects_remote_first_endpoint() {
+        let endpoints = test_pool_endpoints(false);
+        let audit = PoolAuditContext::new("request", "actor", "remote");
+
+        let err = validate_pool_mutation_leader(&endpoints, 0, "cancel decommission", audit)
+            .expect_err("remote first endpoint should reject mutation");
+
+        assert_eq!(err.code(), &s3s::S3ErrorCode::OperationAborted);
+        assert!(
+            err.message()
+                .expect("rejection should include message")
+                .contains("must be handled by its first endpoint")
+        );
     }
 
     #[test]

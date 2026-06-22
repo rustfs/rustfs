@@ -970,6 +970,10 @@ struct PersistedPoolDecommissionInfo {
     pub bytes_done: usize,
     #[serde(rename = "bytesDecommissionedFailed")]
     pub bytes_failed: usize,
+    #[serde(rename = "terminalReloadAttemptAt", with = "time::serde::rfc3339::option", default)]
+    pub terminal_reload_attempt_at: Option<OffsetDateTime>,
+    #[serde(rename = "terminalReloadFailures", default)]
+    pub terminal_reload_failures: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1098,6 +1102,8 @@ impl TryFrom<PersistedPoolDecommissionInfo> for PoolDecommissionInfo {
             items_decommission_failed: value.items_decommission_failed,
             bytes_done: value.bytes_done,
             bytes_failed: value.bytes_failed,
+            terminal_reload_attempt_at: value.terminal_reload_attempt_at,
+            terminal_reload_failures: value.terminal_reload_failures,
             progress_save_item_baseline: value.items_decommissioned.saturating_add(value.items_decommission_failed),
         })
     }
@@ -1126,6 +1132,8 @@ impl TryFrom<LegacyPoolDecommissionInfo> for PoolDecommissionInfo {
             items_decommission_failed: value.items_decommission_failed,
             bytes_done: value.bytes_done,
             bytes_failed: value.bytes_failed,
+            terminal_reload_attempt_at: None,
+            terminal_reload_failures: Vec::new(),
             progress_save_item_baseline: value.items_decommissioned.saturating_add(value.items_decommission_failed),
         })
     }
@@ -1171,6 +1179,8 @@ impl From<&PoolDecommissionInfo> for PersistedPoolDecommissionInfo {
             items_decommission_failed: value.items_decommission_failed,
             bytes_done: value.bytes_done,
             bytes_failed: value.bytes_failed,
+            terminal_reload_attempt_at: value.terminal_reload_attempt_at,
+            terminal_reload_failures: value.terminal_reload_failures.clone(),
         }
     }
 }
@@ -1304,6 +1314,8 @@ impl PoolMeta {
                     pd.failed = false;
                     pd.complete = false;
                     pd.start_time = None;
+                    pd.terminal_reload_attempt_at = None;
+                    pd.terminal_reload_failures.clear();
 
                     stats.decommission = Some(pd);
                     true
@@ -1328,6 +1340,8 @@ impl PoolMeta {
                     pd.failed = true;
                     pd.complete = false;
                     pd.start_time = None;
+                    pd.terminal_reload_attempt_at = None;
+                    pd.terminal_reload_failures.clear();
 
                     stats.decommission = Some(pd);
                     true
@@ -1373,6 +1387,8 @@ impl PoolMeta {
                     pd.canceled = false;
                     pd.failed = false;
                     pd.complete = true;
+                    pd.terminal_reload_attempt_at = None;
+                    pd.terminal_reload_failures.clear();
 
                     stats.decommission = Some(pd);
                     true
@@ -1415,6 +1431,28 @@ impl PoolMeta {
 
     pub fn queue_decommission(&mut self, idx: usize, pi: PoolSpaceInfo) -> Result<()> {
         self.set_decommission_state(idx, pi, true)
+    }
+
+    pub fn record_decommission_terminal_reload_failure(&mut self, idx: usize, stage: &str, message: String) -> Result<bool> {
+        let pool_count = self.pools.len();
+        ensure_valid_decommission_pool_index(pool_count, idx)?;
+
+        let Some(pool) = self.pools.get_mut(idx) else {
+            return Err(invalid_decommission_pool_index_error(pool_count, idx));
+        };
+        let Some(info) = pool.decommission.as_mut() else {
+            return Err(decommission_metadata_not_initialized_error("record decommission terminal reload failure"));
+        };
+
+        let failure = format!("{stage}: {message}");
+        if info.terminal_reload_failures.last().is_some_and(|last| last == &failure) {
+            return Ok(false);
+        }
+
+        pool.last_update = OffsetDateTime::now_utc();
+        info.terminal_reload_attempt_at = Some(pool.last_update);
+        info.terminal_reload_failures.push(failure);
+        Ok(true)
     }
 
     pub fn promote_queued_decommission(&mut self, idx: usize) -> bool {
@@ -1656,6 +1694,10 @@ pub struct PoolDecommissionInfo {
     pub bytes_done: usize,
     #[serde(rename = "bytesDecommissionedFailed")]
     pub bytes_failed: usize,
+    #[serde(rename = "terminalReloadAttemptAt", with = "time::serde::rfc3339::option", default)]
+    pub terminal_reload_attempt_at: Option<OffsetDateTime>,
+    #[serde(rename = "terminalReloadFailures", default)]
+    pub terminal_reload_failures: Vec<String>,
     #[serde(skip)]
     pub progress_save_item_baseline: usize,
 }
@@ -1960,6 +2002,11 @@ impl ECStore {
         Ok(previous_pool_meta)
     }
 
+    async fn ensure_decommission_rebalance_idle_after_refresh(&self) -> Result<()> {
+        self.load_rebalance_meta().await?;
+        ensure_decommission_not_rebalancing(self.is_rebalance_conflicting_with_decommission().await)
+    }
+
     pub async fn status(&self, idx: usize) -> Result<PoolStatus> {
         let space_info = self.get_decommission_pool_space_info(idx).await?;
 
@@ -2108,6 +2155,19 @@ impl ECStore {
         Ok(())
     }
 
+    async fn record_decommission_terminal_reload_failure(&self, idx: usize, stage: &str, err: Error) -> Result<()> {
+        let changed = {
+            let mut pool_meta = self.pool_meta.write().await;
+            pool_meta.record_decommission_terminal_reload_failure(idx, stage, err.to_string())?
+        };
+
+        if changed {
+            self.save_current_pool_meta().await?;
+        }
+
+        Ok(())
+    }
+
     pub async fn is_decommission_running(&self) -> bool {
         {
             let cancelers = self.decommission_cancelers.read().await;
@@ -2197,7 +2257,7 @@ impl ECStore {
         );
         validate_start_decommission_request(&indices, self.single_pool())?;
 
-        ensure_decommission_not_rebalancing(self.is_rebalance_conflicting_with_decommission().await)?;
+        self.ensure_decommission_rebalance_idle_after_refresh().await?;
 
         let store = require_decommission_store(resolve_object_store_handle(), "start decommission")?;
         let local_indices = local_decommission_queue_prefix(&self.endpoints(), &indices)?;
@@ -3111,6 +3171,21 @@ impl ECStore {
                     resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str()),
                     stage.as_str(),
                 ) {
+                    if let Err(record_err) = self
+                        .record_decommission_terminal_reload_failure(idx, stage.as_str(), err.clone())
+                        .await
+                    {
+                        warn!(
+                            event = EVENT_DECOMMISSION_STATE,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_POOLS,
+                            pool_index = idx,
+                            state = "terminal_reload_record_failed",
+                            error = %record_err,
+                            original_error = %err,
+                            "Decommission terminal reload failure record failed"
+                        );
+                    }
                     warn!(
                         event = EVENT_DECOMMISSION_STATE,
                         component = LOG_COMPONENT_ECSTORE,
@@ -3161,6 +3236,21 @@ impl ECStore {
                     resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str()),
                     stage.as_str(),
                 ) {
+                    if let Err(record_err) = self
+                        .record_decommission_terminal_reload_failure(idx, stage.as_str(), err.clone())
+                        .await
+                    {
+                        warn!(
+                            event = EVENT_DECOMMISSION_STATE,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_POOLS,
+                            pool_index = idx,
+                            state = "terminal_reload_record_failed",
+                            error = %record_err,
+                            original_error = %err,
+                            "Decommission terminal reload failure record failed"
+                        );
+                    }
                     warn!(
                         event = EVENT_DECOMMISSION_STATE,
                         component = LOG_COMPONENT_ECSTORE,
@@ -3287,7 +3377,7 @@ impl ECStore {
         let indices = dedup_indices(&indices);
         validate_start_decommission_request(&indices, self.single_pool())?;
 
-        ensure_decommission_not_rebalancing(self.is_rebalance_conflicting_with_decommission().await)?;
+        self.ensure_decommission_rebalance_idle_after_refresh().await?;
         ensure_decommission_start_local_leader(&self.endpoints(), &indices)?;
 
         for idx in indices.iter().copied() {
@@ -3333,7 +3423,7 @@ impl ECStore {
         }
 
         let _start_guard = self.start_gate.lock().await;
-        ensure_decommission_not_rebalancing(self.is_rebalance_conflicting_with_decommission().await)?;
+        self.ensure_decommission_rebalance_idle_after_refresh().await?;
 
         let previous_pool_meta = self
             .save_current_pool_meta_for_decommission_start(&indices, space_infos, decom_buckets)
@@ -3809,6 +3899,8 @@ mod tests {
                     items_decommission_failed: 1,
                     bytes_done: 1024,
                     bytes_failed: 128,
+                    terminal_reload_attempt_at: Some(start_time),
+                    terminal_reload_failures: vec!["complete_decommission: peer node-a failed".to_string()],
                     ..Default::default()
                 }),
             }],
@@ -3842,8 +3934,49 @@ mod tests {
         assert_eq!(restored_decommission.items_decommission_failed, 1);
         assert_eq!(restored_decommission.bytes_done, 1024);
         assert_eq!(restored_decommission.bytes_failed, 128);
+        assert_eq!(restored_decommission.terminal_reload_attempt_at, Some(start_time));
+        assert_eq!(
+            restored_decommission.terminal_reload_failures,
+            vec!["complete_decommission: peer node-a failed".to_string()]
+        );
         assert!(restored_decommission.queued);
         assert_eq!(restored_decommission.items_since_last_progress_save(), 0);
+    }
+
+    #[test]
+    fn pool_meta_records_decommission_terminal_reload_failure_once() {
+        let start_time = OffsetDateTime::now_utc();
+        let mut pool_meta = PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![PoolStatus {
+                id: 1,
+                cmd_line: "/data/pool1/disk{1...4}".to_string(),
+                last_update: start_time,
+                decommission: Some(PoolDecommissionInfo {
+                    complete: true,
+                    ..Default::default()
+                }),
+            }],
+            dont_save: false,
+        };
+
+        assert!(
+            pool_meta
+                .record_decommission_terminal_reload_failure(0, "complete_decommission", "peer node-a failed".to_string())
+                .expect("terminal reload failure should be recorded")
+        );
+        assert!(
+            !pool_meta
+                .record_decommission_terminal_reload_failure(0, "complete_decommission", "peer node-a failed".to_string())
+                .expect("duplicate terminal reload failure should be ignored")
+        );
+
+        let decommission = pool_meta.pools[0].decommission.as_ref().expect("decommission should exist");
+        assert!(decommission.terminal_reload_attempt_at.is_some());
+        assert_eq!(
+            decommission.terminal_reload_failures,
+            vec!["complete_decommission: peer node-a failed".to_string()]
+        );
     }
 
     #[test]

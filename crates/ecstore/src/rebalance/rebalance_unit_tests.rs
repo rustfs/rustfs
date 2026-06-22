@@ -13,19 +13,21 @@
 // limitations under the License.
 
 use super::REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX;
+use super::control::validate_rebalance_disk_stats_coverage;
 use super::meta::{
-    RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event, apply_stopped_at,
-    classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
+    RebalanceMetaMergeOutcome, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event,
+    apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
     complete_rebalance_pools_at_goal, complete_rebalance_pools_with_empty_queue, defer_bucket_in_rebalance_queue,
     ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, first_rebalance_bucket,
     has_deferred_rebalance_error, is_rebalance_actively_running, is_rebalance_conflicting_with_decommission,
-    is_rebalance_in_progress, is_rebalance_stopped_terminal_event, mark_rebalance_bucket_done, merge_rebalance_bucket_lists,
-    merge_rebalance_meta, next_rebal_bucket_from_stat, percent_free_ratio, rebalance_goal_reached,
-    rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error,
-    record_rebalance_cleanup_warning_in_meta, remove_rebalanced_buckets_from_queue, resolve_next_rebalance_bucket,
-    resolve_rebalance_participants, should_accept_rebalance_stats_update, should_ignore_rebalance_data_usage_cache,
-    should_pool_participate, should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_meta_snapshot,
-    stop_rebalance_state, take_bucket_from_rebalance_queue, validate_init_rebalance_state, validate_start_rebalance_state,
+    is_rebalance_in_progress, is_rebalance_meta_replaceable_for_new_id, is_rebalance_stopped_terminal_event,
+    mark_rebalance_bucket_done, merge_rebalance_bucket_lists, merge_rebalance_meta, next_rebal_bucket_from_stat,
+    percent_free_ratio, rebalance_goal_reached, rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error,
+    rebalance_meta_load_unknown_version_error, record_rebalance_cleanup_warning_in_meta, remove_rebalanced_buckets_from_queue,
+    resolve_next_rebalance_bucket, resolve_rebalance_participants, should_accept_rebalance_stats_update,
+    should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
+    should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue,
+    validate_init_rebalance_state, validate_start_rebalance_state,
 };
 use super::migration::{
     MigrationBackend, MigrationVersionResult, migrate_entry_version, migrate_entry_version_with_retry_wait,
@@ -44,8 +46,8 @@ use super::worker::{
     wait_rebalance_listing_retry, with_rebalance_entry_context,
 };
 use super::{
-    GetObjectReader, ObjectInfo, ObjectOptions, RebalSaveOpt, RebalStatus, RebalanceBucketOutcome, RebalanceCleanupWarnings,
-    RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta, RebalanceStats,
+    DiskStat, GetObjectReader, ObjectInfo, ObjectOptions, RebalSaveOpt, RebalStatus, RebalanceBucketOutcome,
+    RebalanceCleanupWarnings, RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta, RebalanceStats,
 };
 use crate::data_movement;
 use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -1207,7 +1209,7 @@ fn test_merge_rebalance_meta_preserves_updates_from_multiple_pools() {
         ..Default::default()
     };
 
-    merge_rebalance_meta(&mut remote, &local);
+    assert_eq!(merge_rebalance_meta(&mut remote, &local), RebalanceMetaMergeOutcome::Merged);
 
     assert_eq!(remote.pool_stats[0].num_versions, 4);
     assert_eq!(remote.pool_stats[0].object, "remote-object");
@@ -1274,7 +1276,7 @@ fn test_merge_rebalance_meta_replaces_terminal_metadata_for_new_rebalance() {
         ..Default::default()
     };
 
-    merge_rebalance_meta(&mut remote, &local);
+    assert_eq!(merge_rebalance_meta(&mut remote, &local), RebalanceMetaMergeOutcome::Replaced);
 
     assert_eq!(remote.id, "new-rebalance");
     assert_eq!(remote.percent_free_goal, 0.5);
@@ -1322,13 +1324,59 @@ fn test_merge_rebalance_meta_preserves_active_metadata_for_different_rebalance_i
         ..Default::default()
     };
 
-    merge_rebalance_meta(&mut remote, &local);
+    assert_eq!(
+        merge_rebalance_meta(&mut remote, &local),
+        RebalanceMetaMergeOutcome::RejectedActiveConflict
+    );
 
     assert_eq!(remote.id, "active-rebalance");
     assert_eq!(remote.percent_free_goal, 0.25);
     assert_eq!(remote.pool_stats.len(), 1);
     assert_eq!(remote.pool_stats[0].buckets, vec!["bucket-a"]);
     assert_eq!(remote.pool_stats[0].info.start_time, Some(old_started_at));
+}
+
+#[test]
+fn test_merge_rebalance_meta_replaces_stopped_started_metadata_for_new_rebalance() {
+    let stopped_at = OffsetDateTime::from_unix_timestamp(1_500).expect("valid stop timestamp");
+    let new_started_at = OffsetDateTime::from_unix_timestamp(2_000).expect("valid new start timestamp");
+    let mut remote = RebalanceMeta {
+        id: "stopped-rebalance".to_string(),
+        stopped_at: Some(stopped_at),
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                stopping: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let local = RebalanceMeta {
+        id: "new-rebalance".to_string(),
+        percent_free_goal: 0.5,
+        pool_stats: vec![RebalanceStats {
+            buckets: vec!["bucket-a".to_string()],
+            participating: true,
+            info: RebalanceInfo {
+                start_time: Some(new_started_at),
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    assert!(is_rebalance_meta_replaceable_for_new_id(&remote));
+    assert_eq!(merge_rebalance_meta(&mut remote, &local), RebalanceMetaMergeOutcome::Replaced);
+
+    assert_eq!(remote.id, "new-rebalance");
+    assert_eq!(remote.stopped_at, None);
+    assert_eq!(remote.pool_stats[0].info.status, RebalStatus::Started);
+    assert!(!remote.pool_stats[0].info.stopping);
 }
 
 #[test]
@@ -2313,6 +2361,7 @@ fn test_validate_init_rebalance_state_rejects_active_rebalance() {
 
 #[test]
 fn test_validate_init_rebalance_state_allows_terminal_or_missing_rebalance() {
+    let stopped_at = OffsetDateTime::now_utc();
     let completed = RebalanceMeta {
         pool_stats: vec![RebalanceStats {
             participating: true,
@@ -2324,9 +2373,23 @@ fn test_validate_init_rebalance_state_allows_terminal_or_missing_rebalance() {
         }],
         ..Default::default()
     };
+    let stopped_started = RebalanceMeta {
+        stopped_at: Some(stopped_at),
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                stopping: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
 
     validate_init_rebalance_state(false, None).expect("missing rebalance meta should allow init");
     validate_init_rebalance_state(false, Some(&completed)).expect("terminal rebalance meta should allow init");
+    validate_init_rebalance_state(false, Some(&stopped_started)).expect("stopped rebalance meta should allow new init");
 }
 
 #[tokio::test]
@@ -2407,6 +2470,38 @@ fn test_rebalance_goal_not_reached_for_issue_3137_initial_imbalance() {
 
     assert!(should_pool_participate(pool0_free, pool0_capacity, goal));
     assert!(!rebalance_goal_reached(pool0_free, pool0_capacity, 0, goal));
+}
+
+#[test]
+fn test_validate_rebalance_disk_stats_coverage_rejects_missing_pool_capacity() {
+    let disk_stats = vec![
+        DiskStat {
+            total_space: 1_000,
+            available_space: 100,
+        },
+        DiskStat::default(),
+    ];
+
+    let err = validate_rebalance_disk_stats_coverage(&disk_stats)
+        .expect_err("missing pool capacity should reject rebalance initialization");
+
+    assert!(err.to_string().contains("pool 1 has no reported capacity"));
+}
+
+#[test]
+fn test_validate_rebalance_disk_stats_coverage_accepts_all_pools() {
+    let disk_stats = vec![
+        DiskStat {
+            total_space: 1_000,
+            available_space: 100,
+        },
+        DiskStat {
+            total_space: 2_000,
+            available_space: 1_500,
+        },
+    ];
+
+    assert!(validate_rebalance_disk_stats_coverage(&disk_stats).is_ok());
 }
 
 #[test]
@@ -3054,7 +3149,7 @@ fn test_record_rebalance_cleanup_warning_in_meta_preserves_last_error() {
 }
 
 #[test]
-fn test_complete_rebalance_pools_with_empty_queue_preserves_cleanup_warnings() {
+fn test_complete_rebalance_pools_with_empty_queue_skips_cleanup_warnings() {
     let warning_at = OffsetDateTime::from_unix_timestamp(9_000).unwrap();
     let completed_at = OffsetDateTime::from_unix_timestamp(10_000).unwrap();
     let mut meta = RebalanceMeta {
@@ -3077,9 +3172,10 @@ fn test_complete_rebalance_pools_with_empty_queue_preserves_cleanup_warnings() {
         ..Default::default()
     };
 
-    assert!(complete_rebalance_pools_with_empty_queue(&mut meta, completed_at));
+    assert!(!complete_rebalance_pools_with_empty_queue(&mut meta, completed_at));
 
-    assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Completed);
+    assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Started);
+    assert_eq!(meta.pool_stats[0].info.end_time, None);
     assert!(meta.pool_stats[0].info.last_error.is_none());
     assert_eq!(meta.pool_stats[0].cleanup_warnings.count, 1);
     assert_eq!(meta.pool_stats[0].cleanup_warnings.last_message.as_deref(), Some("cleanup failed"));
