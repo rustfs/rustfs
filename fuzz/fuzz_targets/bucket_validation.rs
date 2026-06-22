@@ -4,7 +4,7 @@
 mod storage_compat;
 
 use libfuzzer_sys::fuzz_target;
-use crate::storage_compat::{
+use self::storage_compat::{
     check_bucket_and_object_names, check_list_objs_args, check_valid_bucket_name_strict, is_meta_bucketname,
 };
 

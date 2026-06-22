@@ -1181,6 +1181,7 @@ fi
     crates/obs/src \
     crates/s3select-api/src \
     crates/e2e_test/src \
+    fuzz/fuzz_targets \
     -g '*.rs' || true
 ) >"$STANDALONE_CRATE_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE"
 
