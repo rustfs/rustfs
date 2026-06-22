@@ -13,9 +13,11 @@
 // limitations under the License.
 
 use crate::{KeystoneError, KeystoneVersion, Result};
+use rustfs_utils::egress::validate_outbound_url;
 use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_str, get_env_u64};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use url::Url;
 
 /// Keystone integration configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +166,9 @@ impl KeystoneConfig {
             return Err(KeystoneError::ConfigError("auth_url is required".to_string()));
         }
 
+        let parsed = Url::parse(&self.auth_url).map_err(|err| KeystoneError::ConfigError(format!("invalid auth_url: {err}")))?;
+        validate_outbound_url(&parsed).map_err(|err| KeystoneError::ConfigError(format!("auth_url is not allowed: {err}")))?;
+
         // Validate version
         self.get_version()?;
 
@@ -265,5 +270,17 @@ mod tests {
                 assert_eq!(config.timeout_seconds, 99);
             },
         );
+    }
+
+    #[test]
+    fn test_validate_rejects_loopback_auth_url() {
+        let config = KeystoneConfig {
+            enable: true,
+            auth_url: "https://127.0.0.1:5000".to_string(),
+            ..Default::default()
+        };
+
+        let err = config.validate().expect_err("loopback auth_url should be rejected");
+        assert!(err.to_string().contains("not allowed"));
     }
 }
