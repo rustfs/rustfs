@@ -1228,16 +1228,16 @@ mod tests {
         let sys = NotificationSys {
             peer_clients: Vec::new(),
             all_peer_clients: vec![Some(PeerRestClient::new(
-                "node-a:9000".to_string().try_into().expect("peer host should parse"),
-                "http://node-a:9000".to_string(),
+                "127.0.0.1:9000".to_string().try_into().expect("peer host should parse"),
+                "http://127.0.0.1:9000".to_string(),
             ))],
             peer_admin_caches: Vec::new(),
         };
 
         let client = sys
-            .peer_client_for_grid_host("http://node-a:9000")
+            .peer_client_for_grid_host("http://127.0.0.1:9000")
             .expect("matching grid host should return peer client");
-        assert_eq!(client.grid_host, "http://node-a:9000");
+        assert_eq!(client.grid_host, "http://127.0.0.1:9000");
         assert!(sys.peer_client_for_grid_host("http://node-b:9000").is_none());
     }
 
