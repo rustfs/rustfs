@@ -736,7 +736,7 @@ fi
     --glob '!**/ecstore_test_compat/**' \
     --glob '!**/ecstore_fuzz_compat.rs' \
     --glob '!target/**' \
-    | rg -v '^(rustfs/src/(admin/mod|app/mod)\.rs|crates/e2e_test/src/(replication_extension_test|reliant/(grpc_lock_client|node_interact_test))\.rs|crates/heal/src/heal/mod\.rs|crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)\.rs|crates/iam/src/lib\.rs|crates/notify/src/lib\.rs|crates/obs/src/metrics/mod\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/lib\.rs|crates/scanner/src/lib\.rs|crates/scanner/tests/lifecycle_integration_test\.rs|fuzz/fuzz_targets/(bucket_validation|path_containment)\.rs):' || true
+    | rg -v '^(rustfs/src/(admin/mod|app/mod|storage/mod)\.rs|crates/e2e_test/src/(replication_extension_test|reliant/(grpc_lock_client|node_interact_test))\.rs|crates/heal/src/heal/mod\.rs|crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)\.rs|crates/iam/src/lib\.rs|crates/notify/src/lib\.rs|crates/obs/src/metrics/mod\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/lib\.rs|crates/scanner/src/lib\.rs|crates/scanner/tests/lifecycle_integration_test\.rs|fuzz/fuzz_targets/(bucket_validation|path_containment)\.rs):' || true
 ) |
   cat >"$DIRECT_ECSTORE_IMPORT_HITS_FILE"
 
@@ -1085,7 +1085,7 @@ fi
     --glob '!**/ecstore_compat.rs' \
     --glob '!**/ecstore_test_compat.rs' \
     --glob '!**/ecstore_test_compat/**' |
-    rg -v '^(fuzz/fuzz_targets/bucket_validation\.rs|fuzz/fuzz_targets/path_containment\.rs|crates/e2e_test/src/reliant/grpc_lock_client\.rs|crates/e2e_test/src/reliant/node_interact_test\.rs|crates/e2e_test/src/replication_extension_test\.rs|crates/heal/src/heal/mod\.rs|crates/heal/tests/endpoint_index_test\.rs|crates/heal/tests/heal_bug_fixes_test\.rs|crates/heal/tests/heal_integration_test\.rs|crates/iam/src/lib\.rs|crates/notify/src/lib\.rs|crates/obs/src/metrics/mod\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/lib\.rs|crates/scanner/src/lib\.rs|crates/scanner/tests/lifecycle_integration_test\.rs|rustfs/src/admin/mod\.rs|rustfs/src/app/mod\.rs):' || true
+    rg -v '^(fuzz/fuzz_targets/bucket_validation\.rs|fuzz/fuzz_targets/path_containment\.rs|crates/e2e_test/src/reliant/grpc_lock_client\.rs|crates/e2e_test/src/reliant/node_interact_test\.rs|crates/e2e_test/src/replication_extension_test\.rs|crates/heal/src/heal/mod\.rs|crates/heal/tests/endpoint_index_test\.rs|crates/heal/tests/heal_bug_fixes_test\.rs|crates/heal/tests/heal_integration_test\.rs|crates/iam/src/lib\.rs|crates/notify/src/lib\.rs|crates/obs/src/metrics/mod\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/lib\.rs|crates/scanner/src/lib\.rs|crates/scanner/tests/lifecycle_integration_test\.rs|rustfs/src/admin/mod\.rs|rustfs/src/app/mod\.rs|rustfs/src/storage/mod\.rs):' || true
 ) >"$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE"
 
 if [[ -s "$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE" ]]; then
@@ -1611,6 +1611,7 @@ fi
   {
     for file in \
       crates/e2e_test/src/storage_compat.rs \
+      rustfs/src/storage/ecstore_compat.rs \
       crates/heal/src/heal/ecstore_compat.rs \
       crates/iam/src/ecstore_compat.rs \
       crates/iam/src/store/storage_compat.rs \
@@ -1633,6 +1634,7 @@ fi
       crates/s3select-api/src \
       -g '*.rs' || true
     rg -n --with-filename 'ecstore_compat' \
+      rustfs/src/storage \
       crates/heal/src/heal \
       crates/iam/src \
       crates/notify/src \
@@ -1648,7 +1650,7 @@ fi
 ) >"$STANDALONE_THIN_COMPAT_BRIDGE_HITS_FILE"
 
 if [[ -s "$STANDALONE_THIN_COMPAT_BRIDGE_HITS_FILE" ]]; then
-  report_failure "standalone e2e/IAM/heal/scanner/notify/obs/swift/s3select consumers must import owner APIs directly instead of local thin compatibility bridges: $(paste -sd '; ' "$STANDALONE_THIN_COMPAT_BRIDGE_HITS_FILE")"
+  report_failure "storage owner and standalone e2e/IAM/heal/scanner/notify/obs/swift/s3select consumers must import owner APIs directly instead of local thin compatibility bridges: $(paste -sd '; ' "$STANDALONE_THIN_COMPAT_BRIDGE_HITS_FILE")"
 fi
 
 (

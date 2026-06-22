@@ -5,21 +5,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-test-fuzz-ecstore-thin-bridges`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151`.
-- Based on: `main` after the API-151 stack merge.
+- Branch: `overtrue/arch-storage-owner-ecstore-root-imports`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153`.
+- Based on: `overtrue/arch-owner-ecstore-final-bridges` after API-153.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: remove thin e2e/heal/scanner test and fuzz ECStore
-  compatibility bridge files and keep their ECStore source imports in the
-  owner test/fuzz files.
+- Rust code changes: remove the final storage owner ECStore compatibility
+  bridge file and keep its ECStore source imports in the storage owner root.
 - CI/script changes: lock completed owner and test/fuzz boundaries against
   bare/glob imports, scattered raw ECStore facade subpaths, and startup
   runtime/root-server/table/S3/app shared/app bucket/app ECStore/admin facade
   regressions, plus external runtime, test, fuzz, and storage-owner module
-  ECStore compatibility bypasses, plus runtime crate and test/fuzz thin bridge
-  regressions.
-- Docs changes: record the API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152 owner facade cleanup.
+  ECStore compatibility bypasses, plus runtime crate, owner crate, test/fuzz,
+  and storage owner thin bridge regressions.
+- Docs changes: record the API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154 owner facade cleanup.
 
 ## Phase 0 Tasks
 
@@ -4219,6 +4218,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     syntax check, formatting, diff hygiene, Rust risk scan, branch freshness
     check, pre-commit, and three-expert review.
 
+- [x] `API-154` Collapse storage owner ECStore compatibility bridge.
+  - Do: remove `rustfs/src/storage/ecstore_compat.rs`, moving its `ecstore_*`
+    source modules into `rustfs/src/storage/mod.rs`.
+  - Acceptance: no storage owner `ecstore_compat` bridge file remains, while
+    existing downstream `crate::storage::ecstore_*` paths keep the same shape.
+  - Must preserve: storage owner type aliases, constants, wrapper functions,
+    disk RPC extension traits, bucket metadata helpers, runtime globals, and
+    startup storage wiring.
+  - Verification: RustFS compile coverage, migration guard, shell syntax check,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit, and three-expert review.
+
 ## Next PRs
 
 1. `pure-move`: continue pruning remaining facade compatibility and owner boundaries.
@@ -4233,10 +4244,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 | Quality/architecture | pass | API-153 removes thin owner ECStore bridge files and keeps direct imports at owner roots. |
 | Migration preservation | pass | IAM, heal, and scanner owner-root aliases and wrapper functions keep the same call paths. |
 | Testing/verification | pass | Focused owner crate compile, formatting, migration guard, shell syntax, diff hygiene, Rust risk scan, and pre-commit passed for API-153. |
+| Quality/architecture | pass | API-154 removes the final storage owner ECStore bridge file and keeps direct imports at the storage owner root. |
+| Migration preservation | pass | Existing `crate::storage::ecstore_*` modules, constants, wrappers, and downstream call paths keep the same shape. |
+| Testing/verification | pass | RustFS focused compile, formatting, migration guard, shell syntax, diff hygiene, bridge scan, Rust risk scan, and pre-commit passed for API-154. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-154 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - Storage ECStore thin bridge scan: passed; no `ecstore_compat.rs` files
+    remain outside `crates/ecstore`.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or
+    cast risks added; changes only move storage owner import boundaries.
 
 - Issue #660 API-153 current slice:
   - `cargo check --tests -p rustfs-heal -p rustfs-scanner -p rustfs-iam`:
