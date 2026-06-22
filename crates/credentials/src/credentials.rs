@@ -284,7 +284,7 @@ pub fn try_get_rpc_token() -> std::io::Result<String> {
 
 #[deprecated(note = "use try_get_rpc_token to handle missing RPC secrets explicitly")]
 pub fn get_rpc_token() -> String {
-    try_get_rpc_token().expect(RPC_SECRET_REQUIRED_MESSAGE)
+    try_get_rpc_token().unwrap_or_default()
 }
 
 /// A wrapper struct for masking sensitive strings in Debug implementations.
@@ -594,6 +594,14 @@ mod tests {
         fn assert_string_return(_: fn() -> String) {}
 
         assert_string_return(get_rpc_token);
+    }
+
+    #[test]
+    fn test_get_rpc_token_matches_fallible_api_contract() {
+        match try_get_rpc_token() {
+            Ok(secret) => assert_eq!(get_rpc_token(), secret),
+            Err(_) => assert_eq!(get_rpc_token(), ""),
+        }
     }
 
     #[test]

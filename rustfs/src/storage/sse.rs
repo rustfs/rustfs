@@ -250,9 +250,9 @@ async fn prepare_sse_configuration(
                 })
             })
         });
-        if effective_sse.is_none() {
+        let Some(effective_sse) = effective_sse else {
             return Ok(None);
-        }
+        };
 
         debug!(
             component = LOG_COMPONENT_STORAGE,
@@ -264,7 +264,7 @@ async fn prepare_sse_configuration(
             "Resolved effective SSE configuration"
         );
 
-        let effective_kms_key_id = resolve_effective_kms_key_id(effective_sse.as_ref(), ssekms_key_id, || {
+        let effective_kms_key_id = resolve_effective_kms_key_id(Some(&effective_sse), ssekms_key_id, || {
             bucket_sse_config.rules.first().and_then(|rule| {
                 rule.apply_server_side_encryption_by_default
                     .as_ref()
@@ -273,7 +273,7 @@ async fn prepare_sse_configuration(
         });
 
         Ok(Some(SseConfiguration {
-            effective_sse: effective_sse.unwrap(),
+            effective_sse,
             effective_kms_key_id,
         }))
     } else if let Err(e) = bucket_sse_config_result {
