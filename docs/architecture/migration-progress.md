@@ -5,16 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-external-owner-ecstore-boundaries`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130`.
-- Based on: API-130 slice.
+- Branch: `overtrue/arch-external-owner-facade-symbols`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131`.
+- Based on: API-131 slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: move nested external production ECStore facade imports for
-  notify, observability, and S3 Select behind crate or module owner roots.
-- CI/script changes: reject nested external production `rustfs_ecstore::api`
-  imports outside the approved crate or module owner roots.
-- Docs changes: record the API-131 external owner boundary cleanup.
+- Rust code changes: replace completed external owner root ECStore module
+  aliases for notify, Swift, and S3 Select with explicit local symbols and
+  wrapper functions.
+- CI/script changes: reject restored `ecstore_*` module aliases in completed
+  external owner roots while allowing explicit owner-root facade symbols.
+- Docs changes: record the API-132 external owner facade symbol cleanup.
 
 ## Phase 0 Tasks
 
@@ -3878,6 +3879,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     scan, branch freshness check, pre-commit quality gate, and three-expert
     review.
 
+- [x] `API-132` Replace completed external owner module aliases with symbols.
+  - Do: replace notify, Swift, and S3 Select owner-root `ecstore_*` module
+    aliases with explicit local ECStore symbols, type aliases, constants, and
+    wrapper functions.
+  - Acceptance: completed external owner roots no longer expose broad
+    `ecstore_*` module aliases, while nested modules keep using owner-local
+    symbols and the remaining larger observability, IAM, scanner, and heal
+    owner roots stay unchanged for later slices.
+  - Must preserve: notify config persistence, Swift bucket metadata access, S3
+    Select object-store error mapping, object reads, scan buffering, and all
+    public crate APIs.
+  - Verification: focused notify/Swift/S3 Select compile, completed-owner
+    alias residual scan, migration/layer guards, formatting, diff hygiene, Rust
+    risk scan, branch freshness check, pre-commit quality gate, and
+    three-expert review.
+
 ## Next PRs
 
 1. `pure-move`: continue pruning remaining facade compatibility and owner boundaries.
@@ -3886,13 +3903,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-131 keeps direct ECStore facade imports at external owner roots and leaves nested production modules on local aliases. |
-| Migration preservation | pass | Notify, observability, and S3 Select call paths keep the same ECStore symbols through owner-root aliases only. |
-| Testing/verification | pass | Focused notify/obs/S3 Select compile, nested direct-import residual scan, migration/layer guards, formatting, diff hygiene, and diff-only Rust risk scan passed. |
+| Quality/architecture | pass | API-132 replaces completed notify, Swift, and S3 Select owner-root ECStore module aliases with explicit local symbols and wrappers. |
+| Migration preservation | pass | Notify config persistence, Swift bucket metadata access, and S3 Select object-store behavior keep the same ECStore call paths through owner roots. |
+| Testing/verification | pass | Focused notify/Swift/S3 Select compile, completed-owner alias residual scan, migration/layer guards, formatting, diff hygiene, full pre-commit, and diff-only Rust risk scan passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-132 current slice:
+  - `cargo check --tests -p rustfs-notify -p rustfs-s3select-api -p rustfs-protocols --features rustfs-protocols/swift`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `make pre-commit`: passed, including clippy, script tests, nextest
+    `6518 passed, 111 skipped`, and doc-tests.
+  - Completed external owner module-alias residual scan: passed.
+  - Rust risk scan: diff-only scan found explicit `as` symbol imports only; no
+    new unwrap/expect, panic/todo/unsafe, or risky behavior added.
 
 - Issue #660 API-131 current slice:
   - `cargo check --tests -p rustfs-notify -p rustfs-obs -p rustfs-s3select-api`: passed.
