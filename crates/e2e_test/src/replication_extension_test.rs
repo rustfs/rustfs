@@ -17,6 +17,7 @@ use crate::common::{
 };
 use crate::storage_compat::BucketTargetSys;
 use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
 use aws_sdk_s3::{Client, Config};
@@ -701,7 +702,7 @@ async fn wait_for_object_on_target(
                 return Ok(body);
             }
             Err(err) => {
-                if err.to_string().contains("NoSuchKey") || err.to_string().contains("NotFound") {
+                if matches!(err.code(), Some("NoSuchKey" | "NotFound" | "NoSuchVersion")) {
                     sleep(Duration::from_millis(250)).await;
                     continue;
                 }

@@ -1343,7 +1343,30 @@ impl TargetClient {
             .await
         {
             Ok(_) => Ok(()),
-            Err(e) => Err(e.into()),
+            Err(e) => match e {
+                SdkError::ServiceError(service_err) => {
+                    let err = service_err.into_err();
+                    let meta = err.meta();
+                    let error = match (meta.code(), meta.message()) {
+                        (Some(code), Some(message)) => format!("put_object failed: {code}: {message}"),
+                        (Some(code), None) => format!("put_object failed: {code}"),
+                        (None, Some(message)) => format!("put_object failed: {message}"),
+                        (None, None) => format!("put_object failed: {err:?}"),
+                    };
+                    Err(S3ClientError::with_metadata(
+                        error,
+                        None,
+                        meta.code().map(ToOwned::to_owned),
+                        meta.message().map(ToOwned::to_owned),
+                    ))
+                }
+                SdkError::DispatchFailure(dispatch_err) => Err(S3ClientError::new(format!(
+                    "put_object dispatch failure for bucket:{bucket} object:{object}: {dispatch_err:?}"
+                ))),
+                other => Err(S3ClientError::new(format!(
+                    "put_object request failed for bucket:{bucket} object:{object}: {other:?}"
+                ))),
+            },
         }
     }
 
