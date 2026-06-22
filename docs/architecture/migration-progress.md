@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-root-compat-local-facade-aliases`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105`.
-- Based on: `overtrue/arch-remaining-local-compat-exports` after the API-104 slice.
+- Branch: `overtrue/arch-compat-facade-import-aliases`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106`.
+- Based on: `main` after the API-105 slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
-- Rust code changes: route the S3 API storage compatibility ETag helper through
-  a local ECStore client module alias.
-- CI/script changes: guard all storage compatibility boundaries against
-  scattered raw ECStore facade paths outside local `ecstore_*` module aliases.
-- Docs changes: record the API-105 root compatibility facade alias cleanup.
+- Rust code changes: split grouped ECStore facade imports in storage
+  compatibility boundaries into explicit per-module `ecstore_*` aliases.
+- CI/script changes: guard all storage compatibility boundaries against grouped
+  ECStore facade imports and scattered raw facade paths.
+- Docs changes: record the API-106 compatibility facade import alias cleanup.
 
 ## Phase 0 Tasks
 
@@ -503,6 +503,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     compatibility raw-facade residual scan, migration and layer guards,
     formatting, diff hygiene, Rust risk scan, pre-commit quality gate, and
     three-expert review.
+- [x] `API-106` Split compatibility facade imports.
+  - Completed slice: replace grouped `rustfs_ecstore::api::{...}` imports
+    across storage compatibility boundaries with explicit per-module
+    `ecstore_*` aliases and extend migration guards to reject grouped facade
+    imports.
+  - Acceptance: storage compatibility boundaries keep every ECStore facade
+    module dependency visible as its own local alias, and wrapper bodies or
+    signatures still cannot reintroduce scattered raw
+    `rustfs_ecstore::api::...` paths.
+  - Must preserve: all compatibility wrapper bodies, public alias names,
+    storage/admin/app/runtime/edge/test/fuzz behavior, and API surface.
+  - Verification: RustFS test-target compile coverage, grouped-import and
+    raw-facade residual scans, migration and layer guards, formatting, diff
+    hygiene, Rust risk scan, pre-commit quality gate, and three-expert review.
 - [x] `G-012` Inventory placement and repair invariants.
   - Acceptance:
     [`placement-repair-invariants.md`](placement-repair-invariants.md) records
@@ -3536,13 +3550,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-105 keeps S3 API ETag conversion behind a local ECStore client alias and extends guard coverage without changing call behavior. |
-| Migration preservation | pass | The guard now rejects scattered raw ECStore facade paths across storage compatibility boundaries while preserving local `ecstore_*` imports. |
-| Testing/verification | pass | Focused compile, raw-facade residual scan, migration guard, layer guard, formatting, diff hygiene, risk scan, and full pre-commit passed. |
+| Quality/architecture | pass | API-106 keeps the compatibility boundary shape explicit by replacing grouped ECStore facade imports with one local module alias per dependency. |
+| Migration preservation | pass | The new guard rejects grouped facade imports and keeps wrapper bodies constrained to local `ecstore_*` aliases without changing compatibility call behavior. |
+| Testing/verification | pass | Focused compile, grouped-import and raw-facade residual scans, migration guard, layer guard, formatting, diff hygiene, risk scan, and full pre-commit passed. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-106 current slice:
+  - `cargo check -p rustfs --tests`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Full storage compatibility grouped-import residual scan: passed.
+  - Full storage compatibility raw-facade residual scan: passed.
+  - Rust risk scan on changed Rust files and guard script: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-105 current slice:
   - `cargo check -p rustfs --tests`: passed.

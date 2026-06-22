@@ -13,11 +13,17 @@
 // limitations under the License.
 
 use http::HeaderMap;
-use rustfs_ecstore::api::{
-    bucket as ecstore_bucket, cache as ecstore_cache, capacity as ecstore_capacity, config as ecstore_config,
-    data_usage as ecstore_data_usage, disk as ecstore_disk, error as ecstore_error, global as ecstore_global,
-    set_disk as ecstore_set_disk, storage as ecstore_storage, tier as ecstore_tier,
-};
+use rustfs_ecstore::api::bucket as ecstore_bucket;
+use rustfs_ecstore::api::cache as ecstore_cache;
+use rustfs_ecstore::api::capacity as ecstore_capacity;
+use rustfs_ecstore::api::config as ecstore_config;
+use rustfs_ecstore::api::data_usage as ecstore_data_usage;
+use rustfs_ecstore::api::disk as ecstore_disk;
+use rustfs_ecstore::api::error as ecstore_error;
+use rustfs_ecstore::api::global as ecstore_global;
+use rustfs_ecstore::api::set_disk as ecstore_set_disk;
+use rustfs_ecstore::api::storage as ecstore_storage;
+use rustfs_ecstore::api::tier as ecstore_tier;
 use rustfs_storage_api::{HTTPRangeSpec, ObjectIO, ObjectToDelete};
 use std::path::PathBuf;
 use std::sync::Arc;
