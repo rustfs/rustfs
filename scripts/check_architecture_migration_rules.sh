@@ -111,6 +111,7 @@ RUSTFS_APP_SHARED_OWNER_MODULE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_app_shared_
 RUSTFS_APP_BUCKET_OWNER_SOURCE_HITS_FILE="${TMP_DIR}/rustfs_app_bucket_owner_source_hits.txt"
 RUSTFS_APP_ECSTORE_SOURCE_HITS_FILE="${TMP_DIR}/rustfs_app_ecstore_source_hits.txt"
 RUSTFS_ADMIN_ECSTORE_SOURCE_HITS_FILE="${TMP_DIR}/rustfs_admin_ecstore_source_hits.txt"
+EXTERNAL_RUNTIME_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/external_runtime_ecstore_compat_bypass_hits.txt"
 ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_self_facade_path_hits.txt"
 RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE="${TMP_DIR}/rustfs_local_compat_owner_self_path_hits.txt"
 RUSTFS_ROOT_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_compat_relative_consumer_hits.txt"
@@ -728,6 +729,7 @@ fi
     --glob '!crates/ecstore/**' \
     --glob '!**/storage_compat.rs' \
     --glob '!**/*storage_compat.rs' \
+    --glob '!**/ecstore_compat.rs' \
     --glob '!target/**' \
     | rg -v '^(rustfs/src/(admin/mod|app/mod|storage/mod)\.rs|crates/e2e_test/src/(replication_extension_test|reliant/(grpc_lock_client|node_interact_test))\.rs|crates/heal/src/heal/mod\.rs|crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)\.rs|crates/iam/src/lib\.rs|crates/notify/src/lib\.rs|crates/obs/src/metrics/mod\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/lib\.rs|crates/scanner/src/lib\.rs|crates/scanner/tests/lifecycle_integration_test\.rs|fuzz/fuzz_targets/(bucket_validation|path_containment)\.rs):' || true
 ) |
@@ -1038,6 +1040,7 @@ fi
   rg -n --with-filename 'rustfs_ecstore::api::' rustfs/src crates fuzz \
     --glob '*storage_compat.rs' \
     --glob '*_compat.rs' \
+    --glob '!**/ecstore_compat.rs' \
     | rg -v '^[^:]+:[0-9]+:use rustfs_ecstore::api::[a-z_]+ as ecstore_[a-z_]+;' || true
 ) >"$ALL_STORAGE_COMPAT_RAW_FACADE_PATH_HITS_FILE"
 
@@ -1071,7 +1074,8 @@ fi
   cd "$ROOT_DIR"
   rg -n --with-filename 'rustfs_ecstore::api::[a-z_]+::' rustfs/src crates fuzz \
     --glob '*.rs' \
-    --glob '!crates/ecstore/**' |
+    --glob '!crates/ecstore/**' \
+    --glob '!**/ecstore_compat.rs' |
     rg -v '^(fuzz/fuzz_targets/bucket_validation\.rs|fuzz/fuzz_targets/path_containment\.rs|crates/e2e_test/src/reliant/grpc_lock_client\.rs|crates/e2e_test/src/reliant/node_interact_test\.rs|crates/e2e_test/src/replication_extension_test\.rs|crates/heal/src/heal/mod\.rs|crates/heal/tests/endpoint_index_test\.rs|crates/heal/tests/heal_bug_fixes_test\.rs|crates/heal/tests/heal_integration_test\.rs|crates/iam/src/lib\.rs|crates/notify/src/lib\.rs|crates/obs/src/metrics/mod\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/lib\.rs|crates/scanner/src/lib\.rs|crates/scanner/tests/lifecycle_integration_test\.rs|rustfs/src/admin/mod\.rs|rustfs/src/app/mod\.rs|rustfs/src/storage/mod\.rs):' || true
 ) >"$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE"
 
@@ -1258,6 +1262,24 @@ fi
 
 if [[ -s "$RUSTFS_ADMIN_ECSTORE_SOURCE_HITS_FILE" ]]; then
   report_failure "RustFS admin facade must source ECStore API symbols through storage owner re-exports: $(paste -sd '; ' "$RUSTFS_ADMIN_ECSTORE_SOURCE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_ecstore::api::' \
+    crates/heal/src/heal \
+    crates/iam/src \
+    crates/notify/src \
+    crates/obs/src/metrics \
+    crates/protocols/src/swift \
+    crates/s3select-api/src \
+    crates/scanner/src \
+    --glob '*.rs' \
+    --glob '!**/ecstore_compat.rs' || true
+) >"$EXTERNAL_RUNTIME_ECSTORE_COMPAT_BYPASS_HITS_FILE"
+
+if [[ -s "$EXTERNAL_RUNTIME_ECSTORE_COMPAT_BYPASS_HITS_FILE" ]]; then
+  report_failure "external runtime crates must source ECStore API symbols through their ecstore_compat boundary: $(paste -sd '; ' "$EXTERNAL_RUNTIME_ECSTORE_COMPAT_BYPASS_HITS_FILE")"
 fi
 
 (
