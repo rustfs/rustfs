@@ -70,18 +70,22 @@ pub(crate) use sse::{
 
 use std::sync::Arc;
 
-use rustfs_ecstore::api::admin as ecstore_admin;
-use rustfs_ecstore::api::bucket as ecstore_bucket;
-#[cfg(test)]
-use rustfs_ecstore::api::config as ecstore_config;
-use rustfs_ecstore::api::disk as ecstore_disk;
-use rustfs_ecstore::api::error as ecstore_error;
-use rustfs_ecstore::api::global as ecstore_global;
-use rustfs_ecstore::api::metrics as ecstore_metrics;
-use rustfs_ecstore::api::rio as ecstore_rio;
-use rustfs_ecstore::api::rpc as ecstore_rpc;
-use rustfs_ecstore::api::set_disk as ecstore_set_disk;
-use rustfs_ecstore::api::storage as ecstore_storage;
+pub(crate) use rustfs_ecstore::api::admin as ecstore_admin;
+pub(crate) use rustfs_ecstore::api::bucket as ecstore_bucket;
+pub(crate) use rustfs_ecstore::api::client as ecstore_client;
+pub(crate) use rustfs_ecstore::api::cluster as ecstore_cluster;
+pub(crate) use rustfs_ecstore::api::config as ecstore_config;
+pub(crate) use rustfs_ecstore::api::disk as ecstore_disk;
+pub(crate) use rustfs_ecstore::api::error as ecstore_error;
+pub(crate) use rustfs_ecstore::api::event as ecstore_event;
+pub(crate) use rustfs_ecstore::api::global as ecstore_global;
+pub(crate) use rustfs_ecstore::api::layout as ecstore_layout;
+pub(crate) use rustfs_ecstore::api::metrics as ecstore_metrics;
+pub(crate) use rustfs_ecstore::api::notification as ecstore_notification;
+pub(crate) use rustfs_ecstore::api::rio as ecstore_rio;
+pub(crate) use rustfs_ecstore::api::rpc as ecstore_rpc;
+pub(crate) use rustfs_ecstore::api::set_disk as ecstore_set_disk;
+pub(crate) use rustfs_ecstore::api::storage as ecstore_storage;
 
 pub(crate) const BUCKET_ACCELERATE_CONFIG: &str = ecstore_bucket::metadata::BUCKET_ACCELERATE_CONFIG;
 pub(crate) const BUCKET_LOGGING_CONFIG: &str = ecstore_bucket::metadata::BUCKET_LOGGING_CONFIG;

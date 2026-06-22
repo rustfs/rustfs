@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::api::{
-    bucket::{metadata_sys as ecstore_metadata_sys, migration as ecstore_migration, replication as ecstore_replication},
-    storage::ECStore,
+use crate::storage::{
+    ECStore,
+    ecstore_bucket::{metadata_sys as ecstore_metadata_sys, migration as ecstore_migration, replication as ecstore_replication},
 };
 use rustfs_storage_api::{BucketOperations, BucketOptions};
 use std::{

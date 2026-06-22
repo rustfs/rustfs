@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::storage::ecstore_global::shutdown_background_services;
 use crate::{
     server::{ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, shutdown_event_notifier, stop_audit_system},
     startup_optional_runtime_sidecars::{
         OptionalRuntimeServices, prepare_optional_runtime_shutdowns, shutdown_optional_runtime_services,
     },
 };
-use rustfs_ecstore::api::global::shutdown_background_services;
 use rustfs_heal::shutdown_ahm_services;
 use rustfs_utils::get_env_bool_with_aliases;
 use std::path::Path;
