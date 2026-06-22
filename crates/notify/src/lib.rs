@@ -39,6 +39,11 @@ mod runtime_view;
 mod services;
 mod status_view;
 
+use rustfs_ecstore::api::config::com::{
+    read_config_without_migrate as read_notify_config_without_migrate_from_backend,
+    save_server_config as save_notify_server_config_to_backend,
+};
+use rustfs_ecstore::api::global::resolve_object_store_handle as resolve_notify_object_store_handle_from_backend;
 pub(crate) use rustfs_ecstore::api::storage::ECStore as NotifyStore;
 
 pub use bucket_config_manager::NotifyBucketConfigManager;
@@ -60,13 +65,13 @@ pub use services::NotifyServices;
 pub use status_view::NotifyStatusView;
 
 pub(crate) fn resolve_notify_object_store_handle() -> Option<Arc<NotifyStore>> {
-    rustfs_ecstore::api::global::resolve_object_store_handle()
+    resolve_notify_object_store_handle_from_backend()
 }
 
 pub(crate) async fn read_notify_server_config_without_migrate(
     store: Arc<NotifyStore>,
 ) -> Result<rustfs_config::server_config::Config, String> {
-    rustfs_ecstore::api::config::com::read_config_without_migrate(store)
+    read_notify_config_without_migrate_from_backend(store)
         .await
         .map_err(|err| err.to_string())
 }
@@ -75,7 +80,7 @@ pub(crate) async fn save_notify_server_config(
     store: Arc<NotifyStore>,
     config: &rustfs_config::server_config::Config,
 ) -> Result<(), String> {
-    rustfs_ecstore::api::config::com::save_server_config(store, config)
+    save_notify_server_config_to_backend(store, config)
         .await
         .map_err(|err| err.to_string())
 }

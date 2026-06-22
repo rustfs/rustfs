@@ -6,15 +6,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
 - Branch: `overtrue/arch-rustfs-runtime-owner-symbols`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136`.
-- Based on: API-136 stacked slice.
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137`.
+- Based on: API-137 stacked slice.
 - PR type for this branch: `pure-move`
 - Runtime behavior changes: none.
 - Rust code changes: replace RustFS app/admin/storage owner-root ECStore facade
   aliases with owner-local curated symbol modules.
 - CI/script changes: lock completed owner and test/fuzz boundaries against
-  bare or glob ECStore facade module imports.
-- Docs changes: record the API-136/API-137 RustFS owner facade cleanup.
+  bare/glob imports and scattered raw ECStore facade subpaths.
+- Docs changes: record the API-136/API-137/API-138 owner facade cleanup.
 
 ## Phase 0 Tasks
 
@@ -3965,6 +3965,21 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: architecture migration guard, shell syntax check, formatting,
     diff hygiene, branch freshness check, and three-expert review.
 
+- [x] `API-138` Centralize completed owner raw facade subpaths.
+  - Do: move completed notify and S3 Select owner wrapper raw ECStore facade
+    calls into explicit import declarations, then guard completed owner and
+    test/fuzz boundaries against raw facade subpaths outside import
+    declarations.
+  - Acceptance: completed owner and test/fuzz files keep raw ECStore facade
+    subpaths centralized at import declarations; wrapper bodies use local
+    aliases, constants, or functions.
+  - Must preserve: notify config read/save wrappers, S3 Select object-store
+    handle/error helpers, default read-buffer constant, and all existing public
+    crate APIs.
+  - Verification: focused notify/S3 Select compile, architecture migration
+    guard, shell syntax check, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, and three-expert review.
+
 ## Next PRs
 
 1. `pure-move`: continue pruning remaining facade compatibility and owner boundaries.
@@ -3973,13 +3988,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-137 tightens completed owner and test/fuzz facade import-shape rules without changing runtime code. |
-| Migration preservation | pass | API-136 RustFS owner symbol boundaries and API-135 test/fuzz explicit symbol imports remain unchanged. |
-| Testing/verification | pass | Shell syntax, migration guard, formatting, diff hygiene, and stacked-base freshness checks passed for API-137. |
+| Quality/architecture | pass | API-138 centralizes completed owner raw facade subpaths at import declarations and guards the completed boundary shape. |
+| Migration preservation | pass | Notify and S3 Select wrappers keep the same backend calls; API-135/API-136 completed boundaries remain unchanged. |
+| Testing/verification | pass | Focused notify/S3 Select compile, shell syntax, migration guard, formatting, diff hygiene, and Rust risk scan passed for API-138. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-138 current slice:
+  - `cargo check -p rustfs-notify -p rustfs-s3select-api`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Rust risk scan: no new production unwrap/expect, casts, panic/todo/unsafe,
+    or error-type risks added; existing S3 Select unwrap and Notify
+    `Result<String>` wrapper signatures remain unchanged.
 
 - Issue #660 API-137 current slice:
   - `cargo fmt --all --check`: passed.

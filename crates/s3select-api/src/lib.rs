@@ -13,11 +13,18 @@
 // limitations under the License.
 
 use datafusion::{common::DataFusionError, sql::sqlparser::parser::ParserError};
+use rustfs_ecstore::api::error::{
+    is_err_bucket_not_found as select_is_err_bucket_not_found_from_backend,
+    is_err_object_not_found as select_is_err_object_not_found_from_backend,
+    is_err_version_not_found as select_is_err_version_not_found_from_backend,
+};
+use rustfs_ecstore::api::global::resolve_object_store_handle as resolve_select_object_store_handle_from_backend;
 use snafu::{Backtrace, Location, Snafu};
 use std::fmt::Display;
 use std::sync::Arc;
 
 pub(crate) use rustfs_ecstore::api::error::StorageError as SelectStorageError;
+pub(crate) use rustfs_ecstore::api::set_disk::DEFAULT_READ_BUFFER_SIZE as SELECT_DEFAULT_READ_BUFFER_SIZE;
 pub(crate) use rustfs_ecstore::api::storage::ECStore as SelectStore;
 
 pub mod object_store;
@@ -33,22 +40,20 @@ pub(crate) type SelectGetObjectReader = <SelectStore as rustfs_storage_api::Obje
 pub(crate) type SelectObjectInfo = <SelectStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
 pub(crate) type SelectObjectOptions = <SelectStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
 
-pub(crate) const SELECT_DEFAULT_READ_BUFFER_SIZE: usize = rustfs_ecstore::api::set_disk::DEFAULT_READ_BUFFER_SIZE;
-
 pub(crate) fn resolve_select_object_store_handle() -> Option<Arc<SelectStore>> {
-    rustfs_ecstore::api::global::resolve_object_store_handle()
+    resolve_select_object_store_handle_from_backend()
 }
 
 pub(crate) fn select_is_err_bucket_not_found(err: &SelectStorageError) -> bool {
-    rustfs_ecstore::api::error::is_err_bucket_not_found(err)
+    select_is_err_bucket_not_found_from_backend(err)
 }
 
 pub(crate) fn select_is_err_object_not_found(err: &SelectStorageError) -> bool {
-    rustfs_ecstore::api::error::is_err_object_not_found(err)
+    select_is_err_object_not_found_from_backend(err)
 }
 
 pub(crate) fn select_is_err_version_not_found(err: &SelectStorageError) -> bool {
-    rustfs_ecstore::api::error::is_err_version_not_found(err)
+    select_is_err_version_not_found_from_backend(err)
 }
 
 #[derive(Debug, Snafu)]
