@@ -852,8 +852,10 @@ fi
   cd "$ROOT_DIR"
   rg -n --no-heading 'pub\(crate\)\s+use\s+crate::(?:admin|app|storage)::storage_compat::\*;' \
     rustfs/src/admin/router_storage_compat.rs \
+    rustfs/src/admin/handlers/storage_compat.rs \
     rustfs/src/admin/service/storage_compat.rs \
     rustfs/src/app/context/storage_compat.rs \
+    rustfs/src/app/usecase_storage_compat.rs \
     rustfs/src/storage/core_storage_compat.rs \
     rustfs/src/storage/rpc/storage_compat.rs || true
 ) >"$RUSTFS_LOCAL_COMPAT_GLOB_EXPORT_HITS_FILE"
