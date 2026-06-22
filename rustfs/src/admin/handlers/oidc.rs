@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::storage_compat::{read_admin_config_without_migrate, save_admin_server_config};
 use super::sts::create_oidc_sts_credentials;
 use crate::admin::auth::validate_admin_request;
-use crate::admin::handlers::storage_compat::{read_admin_config_without_migrate, save_admin_server_config};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::app::context::resolve_object_store_handle;
 use crate::auth::{check_key_valid, get_session_token};
