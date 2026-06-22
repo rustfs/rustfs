@@ -100,6 +100,7 @@ ALL_STORAGE_COMPAT_GROUPED_FACADE_IMPORT_HITS_FILE="${TMP_DIR}/all_storage_compa
 ALL_ECSTORE_API_GROUPED_FACADE_IMPORT_HITS_FILE="${TMP_DIR}/all_ecstore_api_grouped_facade_import_hits.txt"
 ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE="${TMP_DIR}/all_ecstore_api_raw_subpath_hits.txt"
 EXTERNAL_PRODUCTION_ECSTORE_IMPORT_HITS_FILE="${TMP_DIR}/external_production_ecstore_import_hits.txt"
+COMPLETED_EXTERNAL_OWNER_MODULE_ALIAS_HITS_FILE="${TMP_DIR}/completed_external_owner_module_alias_hits.txt"
 ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_self_facade_path_hits.txt"
 RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE="${TMP_DIR}/rustfs_local_compat_owner_self_path_hits.txt"
 RUSTFS_ROOT_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_compat_relative_consumer_hits.txt"
@@ -1060,11 +1061,25 @@ fi
   cd "$ROOT_DIR"
   rg -n --with-filename 'rustfs_ecstore::api::[a-z_]+::' rustfs/src crates fuzz \
     --glob '*.rs' \
-    --glob '!crates/ecstore/**' || true
+    --glob '!crates/ecstore/**' |
+    rg -v '^(crates/notify/src/lib\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/lib\.rs|crates/scanner/src/lib\.rs):' || true
 ) >"$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE"
 
 if [[ -s "$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE" ]]; then
   report_failure "non-ECStore sources must keep raw ECStore facade subpaths behind local ecstore_* module aliases: $(paste -sd '; ' "$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '^(?:pub\(crate\) )?use rustfs_ecstore::api::[a-z_]+ as ecstore_[a-z_]+;' \
+    crates/notify/src/lib.rs \
+    crates/protocols/src/swift/mod.rs \
+    crates/s3select-api/src/lib.rs \
+    crates/scanner/src/lib.rs || true
+) >"$COMPLETED_EXTERNAL_OWNER_MODULE_ALIAS_HITS_FILE"
+
+if [[ -s "$COMPLETED_EXTERNAL_OWNER_MODULE_ALIAS_HITS_FILE" ]]; then
+  report_failure "completed external owner roots must expose explicit ECStore symbols instead of ecstore_* module aliases: $(paste -sd '; ' "$COMPLETED_EXTERNAL_OWNER_MODULE_ALIAS_HITS_FILE")"
 fi
 
 (

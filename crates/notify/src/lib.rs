@@ -18,6 +18,8 @@
 //! It supports sending events to various targets
 //! (like Webhook and MQTT) and includes features like event persistence and retry on failure.
 
+use std::sync::Arc;
+
 mod bucket_config_manager;
 mod config_manager;
 mod error;
@@ -37,9 +39,7 @@ mod runtime_view;
 mod services;
 mod status_view;
 
-pub(crate) use rustfs_ecstore::api::config as ecstore_config;
-pub(crate) use rustfs_ecstore::api::global as ecstore_global;
-pub(crate) use rustfs_ecstore::api::storage as ecstore_storage;
+pub(crate) use rustfs_ecstore::api::storage::ECStore as NotifyStore;
 
 pub use bucket_config_manager::NotifyBucketConfigManager;
 pub use config_manager::{NotifyConfigManager, runtime_target_id_for_subsystem};
@@ -58,3 +58,24 @@ pub use runtime_facade::NotifyRuntimeFacade;
 pub use runtime_view::NotifyRuntimeView;
 pub use services::NotifyServices;
 pub use status_view::NotifyStatusView;
+
+pub(crate) fn resolve_notify_object_store_handle() -> Option<Arc<NotifyStore>> {
+    rustfs_ecstore::api::global::resolve_object_store_handle()
+}
+
+pub(crate) async fn read_notify_server_config_without_migrate(
+    store: Arc<NotifyStore>,
+) -> Result<rustfs_config::server_config::Config, String> {
+    rustfs_ecstore::api::config::com::read_config_without_migrate(store)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+pub(crate) async fn save_notify_server_config(
+    store: Arc<NotifyStore>,
+    config: &rustfs_config::server_config::Config,
+) -> Result<(), String> {
+    rustfs_ecstore::api::config::com::save_server_config(store, config)
+        .await
+        .map_err(|err| err.to_string())
+}

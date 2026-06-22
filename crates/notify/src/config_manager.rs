@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::{
-    Event, NotificationError, ecstore_config, ecstore_global, ecstore_storage, registry::TargetRegistry,
-    rule_engine::NotifyRuleEngine, runtime_facade::NotifyRuntimeFacade,
+    Event, NotificationError, registry::TargetRegistry, resolve_notify_object_store_handle, rule_engine::NotifyRuleEngine,
+    runtime_facade::NotifyRuntimeFacade,
 };
 use rustfs_config::notify::{
     NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_SUB_SYS, NOTIFY_NATS_SUB_SYS,
@@ -31,8 +31,6 @@ const LOG_SUBSYSTEM_CONFIG: &str = "config";
 const EVENT_NOTIFY_RUNTIME_LIFECYCLE: &str = "notify_runtime_lifecycle";
 const EVENT_NOTIFY_CONFIG_UPDATE: &str = "notify_config_update";
 
-type NotifyStore = ecstore_storage::ECStore;
-
 #[derive(Debug)]
 enum NotifyConfigStoreError {
     StorageNotAvailable,
@@ -48,31 +46,19 @@ where
         return Err(NotifyConfigStoreError::StorageNotAvailable);
     };
 
-    let mut new_config = read_notify_server_config_without_migrate(store.clone()).await?;
+    let mut new_config = crate::read_notify_server_config_without_migrate(store.clone())
+        .await
+        .map_err(NotifyConfigStoreError::Read)?;
 
     if !modifier(&mut new_config) {
         return Ok(None);
     }
 
-    save_notify_server_config(store, &new_config).await?;
+    crate::save_notify_server_config(store, &new_config)
+        .await
+        .map_err(NotifyConfigStoreError::Save)?;
 
     Ok(Some(new_config))
-}
-
-fn resolve_notify_object_store_handle() -> Option<Arc<NotifyStore>> {
-    ecstore_global::resolve_object_store_handle()
-}
-
-async fn read_notify_server_config_without_migrate(store: Arc<NotifyStore>) -> Result<Config, NotifyConfigStoreError> {
-    ecstore_config::com::read_config_without_migrate(store)
-        .await
-        .map_err(|err| NotifyConfigStoreError::Read(err.to_string()))
-}
-
-async fn save_notify_server_config(store: Arc<NotifyStore>, config: &Config) -> Result<(), NotifyConfigStoreError> {
-    ecstore_config::com::save_server_config(store, config)
-        .await
-        .map_err(|err| NotifyConfigStoreError::Save(err.to_string()))
 }
 
 pub(crate) fn notify_configuration_hint() -> String {
