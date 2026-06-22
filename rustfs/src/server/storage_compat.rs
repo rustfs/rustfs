@@ -14,10 +14,14 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use rustfs_ecstore::api::{
-    config as ecstore_config, disk as ecstore_disk, error as ecstore_error, event as ecstore_event, global as ecstore_global,
-    layout as ecstore_layout, rpc as ecstore_rpc, storage as ecstore_storage,
-};
+use rustfs_ecstore::api::config as ecstore_config;
+use rustfs_ecstore::api::disk as ecstore_disk;
+use rustfs_ecstore::api::error as ecstore_error;
+use rustfs_ecstore::api::event as ecstore_event;
+use rustfs_ecstore::api::global as ecstore_global;
+use rustfs_ecstore::api::layout as ecstore_layout;
+use rustfs_ecstore::api::rpc as ecstore_rpc;
+use rustfs_ecstore::api::storage as ecstore_storage;
 
 pub(crate) const TONIC_RPC_PREFIX: &str = ecstore_rpc::TONIC_RPC_PREFIX;
 

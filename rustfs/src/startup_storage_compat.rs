@@ -14,10 +14,13 @@
 
 use std::sync::Arc;
 
-use rustfs_ecstore::api::{
-    bucket as ecstore_bucket, config as ecstore_config, error as ecstore_error, global as ecstore_global,
-    layout as ecstore_layout, notification as ecstore_notification, storage as ecstore_storage,
-};
+use rustfs_ecstore::api::bucket as ecstore_bucket;
+use rustfs_ecstore::api::config as ecstore_config;
+use rustfs_ecstore::api::error as ecstore_error;
+use rustfs_ecstore::api::global as ecstore_global;
+use rustfs_ecstore::api::layout as ecstore_layout;
+use rustfs_ecstore::api::notification as ecstore_notification;
+use rustfs_ecstore::api::storage as ecstore_storage;
 
 pub(crate) type ECStore = ecstore_storage::ECStore;
 #[cfg(test)]

@@ -17,10 +17,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rustfs_ecstore::api::{
-    bucket as ecstore_bucket, capacity as ecstore_capacity, client as ecstore_client, disk as ecstore_disk,
-    error as ecstore_error, global as ecstore_global, layout as ecstore_layout, storage as ecstore_storage, tier as ecstore_tier,
-};
+use rustfs_ecstore::api::bucket as ecstore_bucket;
+use rustfs_ecstore::api::capacity as ecstore_capacity;
+use rustfs_ecstore::api::client as ecstore_client;
+use rustfs_ecstore::api::disk as ecstore_disk;
+use rustfs_ecstore::api::error as ecstore_error;
+use rustfs_ecstore::api::global as ecstore_global;
+use rustfs_ecstore::api::layout as ecstore_layout;
+use rustfs_ecstore::api::storage as ecstore_storage;
+use rustfs_ecstore::api::tier as ecstore_tier;
 use time::OffsetDateTime;
 
 pub(crate) const BUCKET_LIFECYCLE_CONFIG: &str = ecstore_bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
