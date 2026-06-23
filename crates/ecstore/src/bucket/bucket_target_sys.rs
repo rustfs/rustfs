@@ -21,7 +21,7 @@ use crate::bucket::target::ARN;
 use crate::bucket::target::BucketTargetType;
 use crate::bucket::target::{self, BucketTarget, BucketTargets, Credentials};
 use crate::bucket::versioning_sys::BucketVersioningSys;
-use crate::global::get_global_bucket_monitor;
+use crate::runtime_sources;
 use aws_credential_types::Credentials as SdkCredentials;
 use aws_sdk_s3::config::Region as SdkRegion;
 use aws_sdk_s3::error::ProvideErrorMetadata;
@@ -698,7 +698,7 @@ impl BucketTargetSys {
     }
 
     fn update_bandwidth_limit(&self, bucket: &str, arn: &str, limit: i64) {
-        if let Some(bucket_monitor) = get_global_bucket_monitor() {
+        if let Some(bucket_monitor) = runtime_sources::bucket_monitor() {
             if limit == 0 {
                 bucket_monitor.delete_bucket_throttle(bucket, arn);
                 return;
