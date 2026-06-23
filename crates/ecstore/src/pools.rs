@@ -680,9 +680,18 @@ fn resolve_decommission_pool_meta_reload_result(result: Result<()>, stage: &str)
 }
 
 fn apply_decommission_status_space_info(mut pool_info: PoolStatus, space_info: PoolSpaceInfo) -> PoolStatus {
-    if let Some(d) = pool_info.decommission.as_mut() {
-        d.total_size = space_info.total;
-        d.current_size = space_info.free;
+    match pool_info.decommission.as_mut() {
+        Some(d) => {
+            d.total_size = space_info.total;
+            d.current_size = space_info.free;
+        }
+        None => {
+            pool_info.decommission = Some(PoolDecommissionInfo {
+                total_size: space_info.total,
+                current_size: space_info.free,
+                ..Default::default()
+            });
+        }
     }
 
     pool_info
@@ -4739,7 +4748,7 @@ mod pools_tests {
     }
 
     #[test]
-    fn test_apply_decommission_status_space_info_keeps_idle_pool_decommission_none() {
+    fn test_apply_decommission_status_space_info_adds_idle_pool_usage() {
         let status = apply_decommission_status_space_info(
             decommission_test_pool_status(0, None),
             PoolSpaceInfo {
@@ -4749,7 +4758,13 @@ mod pools_tests {
             },
         );
 
-        assert!(status.decommission.is_none());
+        let decommission = status.decommission.expect("idle pool status should include usage info");
+        assert_eq!(decommission.total_size, 100);
+        assert_eq!(decommission.current_size, 25);
+        assert!(decommission.start_time.is_none());
+        assert!(!decommission.complete);
+        assert!(!decommission.failed);
+        assert!(!decommission.canceled);
     }
 
     #[test]
