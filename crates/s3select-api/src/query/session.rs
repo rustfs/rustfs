@@ -21,10 +21,10 @@ use datafusion::{
         record_batch::RecordBatch,
     },
     execution::{SessionStateBuilder, context::SessionState, runtime_env::RuntimeEnvBuilder},
+    object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path},
     parquet::arrow::ArrowWriter,
     prelude::SessionContext,
 };
-use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
 use std::sync::Arc;
 use tracing::error;
 
@@ -110,7 +110,7 @@ impl SessionCtxFactory {
                 QueryError::StoreError { e: e.to_string() }
             })?;
 
-            df_session_state.with_object_store(&store_url, Arc::new(store)).build()
+            df_session_state.with_object_store(&store_url, store).build()
         } else {
             let store: EcObjectStore =
                 EcObjectStore::new(context.input.clone()).map_err(|_| QueryError::NotImplemented { err: String::new() })?;
