@@ -246,6 +246,7 @@ pub(crate) type ReadMultipleReq = ecstore_disk::ReadMultipleReq;
 pub(crate) type ReadMultipleResp = ecstore_disk::ReadMultipleResp;
 pub(crate) type ReadOptions = ecstore_disk::ReadOptions;
 pub(crate) type RenameDataResp = ecstore_disk::RenameDataResp;
+pub(crate) type ReplicationStats = ecstore_bucket::replication::ReplicationStats;
 pub(crate) type SetupType = ecstore_layout::SetupType;
 pub(crate) type StorageError = ecstore_error::StorageError;
 pub(crate) type TierConfigMgr = ecstore_tier::TierConfigMgr;
@@ -298,6 +299,10 @@ pub(crate) fn disk_endpoint(disk: &DiskStore) -> String {
 
 pub(crate) fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
     ecstore_bucket::replication::get_global_replication_pool()
+}
+
+pub(crate) fn get_global_replication_stats() -> Option<Arc<ReplicationStats>> {
+    ecstore_bucket::replication::GLOBAL_REPLICATION_STATS.get().cloned()
 }
 
 pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>) {

@@ -20,7 +20,7 @@ use super::super::metadata::{
     BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG,
 };
 use super::super::metadata_sys;
-use super::super::replication::{GLOBAL_REPLICATION_STATS, ResyncOpts};
+use super::super::replication::ResyncOpts;
 use super::super::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
 use super::super::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
 use super::super::{delete_admin_config, read_admin_config, save_admin_config};
@@ -34,7 +34,7 @@ use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin
 use crate::app::context::{
     resolve_deployment_id, resolve_endpoints_handle, resolve_iam_handle, resolve_object_store_handle,
     resolve_outbound_tls_generation, resolve_outbound_tls_state, resolve_region, resolve_replication_pool_handle,
-    resolve_runtime_port, resolve_server_config,
+    resolve_replication_stats_handle, resolve_runtime_port, resolve_server_config,
 };
 use crate::auth::{check_key_valid, get_session_token};
 use crate::config::get_config_snapshot;
@@ -1740,7 +1740,7 @@ fn filter_sr_info(mut info: SRInfo, opts: &SRStatusOptions) -> SRInfo {
 }
 
 async fn build_metrics_summary(local_peer: &PeerInfo) -> SRMetricsSummary {
-    let Some(stats) = GLOBAL_REPLICATION_STATS.get() else {
+    let Some(stats) = resolve_replication_stats_handle() else {
         return SRMetricsSummary::default();
     };
 

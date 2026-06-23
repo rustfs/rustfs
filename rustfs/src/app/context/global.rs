@@ -18,14 +18,14 @@ use super::handles::{
     default_bucket_monitor_interface, default_buffer_config_interface, default_deployment_id_interface,
     default_endpoints_interface, default_kms_runtime_interface, default_local_node_name_interface, default_lock_client_interface,
     default_notification_system_interface, default_notify_interface, default_outbound_tls_runtime_interface,
-    default_region_interface, default_replication_pool_interface, default_runtime_port_interface,
-    default_server_config_interface, default_tier_config_interface,
+    default_region_interface, default_replication_pool_interface, default_replication_stats_interface,
+    default_runtime_port_interface, default_server_config_interface, default_tier_config_interface,
 };
 use super::interfaces::{
     ActionCredentialInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface, DeploymentIdInterface,
     EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface,
     NotificationSystemInterface, NotifyInterface, OutboundTlsRuntimeInterface, RegionInterface, ReplicationPoolInterface,
-    RuntimePortInterface, ServerConfigInterface, TierConfigInterface,
+    ReplicationStatsInterface, RuntimePortInterface, ServerConfigInterface, TierConfigInterface,
 };
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
@@ -45,6 +45,7 @@ pub struct AppContext {
     bucket_metadata: Arc<dyn BucketMetadataInterface>,
     bucket_monitor: Arc<dyn BucketMonitorInterface>,
     replication_pool: Arc<dyn ReplicationPoolInterface>,
+    replication_stats: Arc<dyn ReplicationStatsInterface>,
     endpoints: Arc<dyn EndpointsInterface>,
     deployment_id: Arc<dyn DeploymentIdInterface>,
     runtime_port: Arc<dyn RuntimePortInterface>,
@@ -70,6 +71,7 @@ impl AppContext {
             bucket_metadata: default_bucket_metadata_interface(),
             bucket_monitor: default_bucket_monitor_interface(),
             replication_pool: default_replication_pool_interface(),
+            replication_stats: default_replication_stats_interface(),
             endpoints: default_endpoints_interface(),
             deployment_id: default_deployment_id_interface(),
             runtime_port: default_runtime_port_interface(),
@@ -132,6 +134,10 @@ impl AppContext {
         self.replication_pool.clone()
     }
 
+    pub fn replication_stats(&self) -> Arc<dyn ReplicationStatsInterface> {
+        self.replication_stats.clone()
+    }
+
     pub fn endpoints(&self) -> Arc<dyn EndpointsInterface> {
         self.endpoints.clone()
     }
@@ -184,6 +190,7 @@ pub(super) struct AppContextTestInterfaces {
     pub(super) bucket_metadata: Arc<dyn BucketMetadataInterface>,
     pub(super) bucket_monitor: Arc<dyn BucketMonitorInterface>,
     pub(super) replication_pool: Arc<dyn ReplicationPoolInterface>,
+    pub(super) replication_stats: Arc<dyn ReplicationStatsInterface>,
     pub(super) endpoints: Arc<dyn EndpointsInterface>,
     pub(super) deployment_id: Arc<dyn DeploymentIdInterface>,
     pub(super) runtime_port: Arc<dyn RuntimePortInterface>,
@@ -210,6 +217,7 @@ impl AppContext {
             bucket_metadata: interfaces.bucket_metadata,
             bucket_monitor: interfaces.bucket_monitor,
             replication_pool: interfaces.replication_pool,
+            replication_stats: interfaces.replication_stats,
             endpoints: interfaces.endpoints,
             deployment_id: interfaces.deployment_id,
             runtime_port: interfaces.runtime_port,

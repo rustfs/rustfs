@@ -30,7 +30,7 @@ use super::EndpointServerPools;
 use super::TierConfigMgr;
 use super::metadata_sys::BucketMetadataSys;
 use super::new_object_layer_fn;
-use super::{BucketBandwidthMonitor, DynReplicationPool, NotificationSys};
+use super::{BucketBandwidthMonitor, DynReplicationPool, NotificationSys, ReplicationStats};
 use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
 use rustfs_credentials::Credentials;
@@ -109,6 +109,11 @@ pub fn resolve_bucket_monitor_handle() -> Option<Arc<BucketBandwidthMonitor>> {
 /// Resolve replication pool handle using AppContext-first precedence.
 pub fn resolve_replication_pool_handle() -> Option<Arc<DynReplicationPool>> {
     resolve_replication_pool_handle_with(get_global_app_context(), || default_replication_pool_interface().handle())
+}
+
+/// Resolve replication statistics handle using AppContext-first precedence.
+pub fn resolve_replication_stats_handle() -> Option<Arc<ReplicationStats>> {
+    resolve_replication_stats_handle_with(get_global_app_context(), || default_replication_stats_interface().handle())
 }
 
 /// Resolve deployment identity using AppContext-first precedence.
@@ -227,6 +232,15 @@ fn resolve_replication_pool_handle_with(
         .or_else(fallback)
 }
 
+fn resolve_replication_stats_handle_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> Option<Arc<ReplicationStats>>,
+) -> Option<Arc<ReplicationStats>> {
+    context
+        .and_then(|context| context.replication_stats().handle())
+        .or_else(fallback)
+}
+
 #[cfg(test)]
 fn resolve_object_store_handle_with(
     context: Option<Arc<AppContext>>,
@@ -318,7 +332,8 @@ mod tests {
     use crate::app::context::interfaces::{
         ActionCredentialInterface, BucketMetadataInterface, BufferConfigInterface, DeploymentIdInterface, EndpointsInterface,
         IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface,
-        OutboundTlsRuntimeInterface, RegionInterface, RuntimePortInterface, ServerConfigInterface, TierConfigInterface,
+        OutboundTlsRuntimeInterface, RegionInterface, ReplicationStatsInterface, RuntimePortInterface, ServerConfigInterface,
+        TierConfigInterface,
     };
     use crate::config::{RustFSBufferConfig, WorkloadProfile};
     use async_trait::async_trait;
@@ -384,6 +399,16 @@ mod tests {
     impl BucketMetadataInterface for TestBucketMetadataInterface {
         fn handle(&self) -> Option<Arc<RwLock<BucketMetadataSys>>> {
             self.metadata.clone()
+        }
+    }
+
+    struct TestReplicationStatsInterface {
+        stats: Option<Arc<ReplicationStats>>,
+    }
+
+    impl ReplicationStatsInterface for TestReplicationStatsInterface {
+        fn handle(&self) -> Option<Arc<ReplicationStats>> {
+            self.stats.clone()
         }
     }
 
@@ -544,6 +569,8 @@ mod tests {
         let context_kms = Arc::new(KmsServiceManager::new());
         let fallback_kms = Arc::new(KmsServiceManager::new());
         let bucket_metadata = Arc::new(RwLock::new(BucketMetadataSys::new(object_store.clone())));
+        let context_replication_stats = Arc::new(ReplicationStats::new());
+        let fallback_replication_stats = Arc::new(ReplicationStats::new());
         let tier_config = TierConfigMgr::new();
         let server_config = Config::new();
         let buffer_config = RustFSBufferConfig::new(WorkloadProfile::AiTraining);
@@ -591,6 +618,9 @@ mod tests {
                 }),
                 bucket_monitor: default_bucket_monitor_interface(),
                 replication_pool: default_replication_pool_interface(),
+                replication_stats: Arc::new(TestReplicationStatsInterface {
+                    stats: Some(context_replication_stats.clone()),
+                }),
                 endpoints: Arc::new(TestEndpointsInterface {
                     endpoints: Some(endpoints.clone()),
                 }),
@@ -643,6 +673,10 @@ mod tests {
         assert!(Arc::ptr_eq(
             &resolve_object_store_handle_with(Some(context.clone()), || None).expect("context object store"),
             &object_store
+        ));
+        assert!(Arc::ptr_eq(
+            &resolve_replication_stats_handle_with(Some(context.clone()), || None).expect("context replication stats"),
+            &context_replication_stats
         ));
         assert_eq!(
             resolve_endpoints_handle_with(Some(context.clone()), || None)
@@ -705,6 +739,11 @@ mod tests {
         assert!(Arc::ptr_eq(
             &resolve_object_store_handle_with(None, || Some(object_store.clone())).expect("fallback object store"),
             &object_store
+        ));
+        assert!(Arc::ptr_eq(
+            &resolve_replication_stats_handle_with(None, || Some(fallback_replication_stats.clone()))
+                .expect("fallback replication stats"),
+            &fallback_replication_stats
         ));
         assert_eq!(
             resolve_endpoints_handle_with(None, || Some(endpoints.clone()))
