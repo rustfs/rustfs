@@ -47,6 +47,7 @@ pub mod keyring;
 pub mod manager;
 pub mod oidc;
 pub mod oidc_state;
+mod root_credentials;
 pub mod store;
 pub mod sys;
 pub mod utils;
@@ -59,6 +60,10 @@ pub(crate) type IamStorageResult<T> = EcstoreResultType<T>;
 pub(crate) type IamStore = EcstoreStore;
 pub(crate) type IamConfigObjectInfo = <IamStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
 pub(crate) type IamConfigObjectOptions = <IamStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
+
+pub fn is_root_access_key(access_key: &str) -> bool {
+    root_credentials::is_root_access_key(access_key)
+}
 
 pub(crate) async fn read_iam_config_no_lock(api: Arc<IamStore>, file: &str) -> IamStorageResult<Vec<u8>> {
     ecstore_read_config_no_lock(api, file).await
