@@ -15,6 +15,7 @@
 use crate::admin::{
     auth::validate_admin_request,
     router::{AdminOperation, Operation, S3Router},
+    system,
 };
 use crate::app::admin_usecase::DefaultAdminUsecase;
 use crate::auth::{check_key_valid, get_session_token};
@@ -25,6 +26,7 @@ use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
 use matchit::Params;
+use rustfs_concurrency::AdmissionState as WorkloadAdmissionState;
 use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadClass};
 use rustfs_ecstore::api::cluster::{
     ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage, ClusterLocalNodeStorageSnapshot,
@@ -32,7 +34,7 @@ use rustfs_ecstore::api::cluster::{
     ClusterPoolStateSnapshot,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_storage_api::{CapabilityStatus, ObservabilitySnapshot, TopologySnapshot};
+use rustfs_storage_api::{CapabilityState, CapabilityStatus, ObservabilitySnapshot, TopologySnapshot};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
@@ -101,6 +103,9 @@ impl Operation for GetClusterSnapshotHandler {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ClusterSnapshotView {
+    pub summary: ClusterSnapshotSummary,
+    pub runtime_capabilities_path: String,
+    pub extensions_catalog_path: String,
     pub topology: TopologySnapshot,
     pub membership: ClusterMembershipView,
     pub pool_state: ClusterPoolStateView,
@@ -116,6 +121,9 @@ impl From<ClusterReadOnlySnapshot> for ClusterSnapshotView {
     fn from(snapshot: ClusterReadOnlySnapshot) -> Self {
         let actionable_pressure = cluster_has_actionable_pressure(&snapshot);
         Self {
+            summary: ClusterSnapshotSummary::from(&snapshot),
+            runtime_capabilities_path: format!("{}{}", ADMIN_PREFIX, system::RUNTIME_CAPABILITIES_ROUTE_SUFFIX),
+            extensions_catalog_path: format!("{}{}", ADMIN_PREFIX, "/v4/extensions/catalog"),
             topology: snapshot.topology,
             membership: ClusterMembershipView::from(snapshot.membership),
             pool_state: ClusterPoolStateView::from(snapshot.pool_state),
@@ -124,6 +132,42 @@ impl From<ClusterReadOnlySnapshot> for ClusterSnapshotView {
             observability: snapshot.observability,
             workload_admission: workload_admission_views(snapshot.workload_admission),
             runtime_status: ClusterRuntimeStatusView::from(snapshot.runtime_status),
+            actionable_pressure,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ClusterSnapshotSummary {
+    pub runtime: CapabilityStatus,
+    pub topology: CapabilityStatus,
+    pub membership: CapabilityStatus,
+    pub peer_health: CapabilityStatus,
+    pub observability: CapabilityStatus,
+    pub workload_admission: CapabilityStatus,
+    pub actionable_pressure: CapabilityStatus,
+}
+
+impl From<&ClusterReadOnlySnapshot> for ClusterSnapshotSummary {
+    fn from(snapshot: &ClusterReadOnlySnapshot) -> Self {
+        let topology = summarize_topology(snapshot);
+        let membership = summarize_membership(snapshot);
+        let peer_health = summarize_peer_health(snapshot);
+        let observability = summarize_observability(snapshot);
+        let workload_admission = summarize_workload_admission(snapshot);
+        let actionable_pressure = if cluster_has_actionable_pressure(snapshot) {
+            CapabilityStatus::supported().with_reason("cluster snapshot reports degraded runtime or non-open admission")
+        } else {
+            CapabilityStatus::disabled().with_reason("cluster snapshot reports no actionable pressure")
+        };
+
+        Self {
+            runtime: summarize_runtime(snapshot),
+            topology,
+            membership,
+            peer_health,
+            observability,
+            workload_admission,
             actionable_pressure,
         }
     }
@@ -367,9 +411,147 @@ fn runtime_readiness_state_label(state: ClusterRuntimeReadinessState) -> &'stati
     }
 }
 
+fn summarize_runtime(snapshot: &ClusterReadOnlySnapshot) -> CapabilityStatus {
+    match snapshot.runtime_status.state {
+        ClusterRuntimeReadinessState::Ready => CapabilityStatus::supported().with_reason("runtime readiness reports ready"),
+        ClusterRuntimeReadinessState::Degraded => {
+            let reasons = snapshot
+                .runtime_status
+                .degraded_reasons
+                .iter()
+                .map(|reason| reason.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            CapabilityStatus::unknown().with_reason(format!("runtime readiness degraded: {reasons}"))
+        }
+        ClusterRuntimeReadinessState::Unknown => CapabilityStatus::unknown().with_reason("runtime readiness status unknown"),
+    }
+}
+
+fn summarize_topology(snapshot: &ClusterReadOnlySnapshot) -> CapabilityStatus {
+    summarize_named_capability_statuses(
+        [
+            ("profiling", &snapshot.topology.capabilities.profiling),
+            ("numa", &snapshot.topology.capabilities.numa),
+            ("failure_domain_labels", &snapshot.topology.capabilities.failure_domain_labels),
+            ("media_labels", &snapshot.topology.capabilities.media_labels),
+        ],
+        "topology capability",
+    )
+    .with_reason("topology summary resolved from cluster snapshot")
+}
+
+fn summarize_membership(snapshot: &ClusterReadOnlySnapshot) -> CapabilityStatus {
+    if snapshot.membership.nodes.is_empty() {
+        CapabilityStatus::unknown().with_reason("cluster membership has no nodes")
+    } else {
+        CapabilityStatus::supported().with_reason(format!(
+            "cluster membership reports {} nodes and {} drives",
+            snapshot.membership.nodes.len(),
+            snapshot.membership.drives.len()
+        ))
+    }
+}
+
+fn summarize_peer_health(snapshot: &ClusterReadOnlySnapshot) -> CapabilityStatus {
+    if snapshot.peer_health.peers.is_empty() {
+        return CapabilityStatus::unknown().with_reason("cluster peer health has no peers");
+    }
+
+    let unknown = snapshot
+        .peer_health
+        .peers
+        .iter()
+        .filter(|peer| peer.status.state == CapabilityState::Unknown)
+        .count();
+    if unknown > 0 {
+        CapabilityStatus::unknown().with_reason(format!("cluster peer health has {unknown} unresolved peers"))
+    } else {
+        CapabilityStatus::supported().with_reason("cluster peer health resolved for all peers")
+    }
+}
+
+fn summarize_workload_admission(snapshot: &ClusterReadOnlySnapshot) -> CapabilityStatus {
+    let entries = snapshot.workload_admission.entries();
+    if entries.is_empty() {
+        return CapabilityStatus::unknown().with_reason("workload admission snapshot is empty");
+    }
+
+    let non_open = entries
+        .iter()
+        .filter(|entry| entry.state != WorkloadAdmissionState::Open)
+        .map(|entry| entry.class.as_str())
+        .collect::<Vec<_>>();
+    if non_open.is_empty() {
+        CapabilityStatus::supported().with_reason("all workload admission classes are open")
+    } else {
+        CapabilityStatus::unknown().with_reason(format!("workload admission has non-open classes: {}", non_open.join(", ")))
+    }
+}
+
+fn summarize_observability(snapshot: &ClusterReadOnlySnapshot) -> CapabilityStatus {
+    let userspace_profiling = summarize_named_capability_statuses(
+        [
+            ("cpu", &snapshot.observability.userspace_profiling.cpu),
+            ("memory", &snapshot.observability.userspace_profiling.memory),
+            ("continuous_cpu", &snapshot.observability.userspace_profiling.continuous_cpu),
+            ("periodic_cpu", &snapshot.observability.userspace_profiling.periodic_cpu),
+        ],
+        "userspace profiling",
+    );
+    let memory_sampling = summarize_named_capability_statuses(
+        [
+            ("process", &snapshot.observability.memory_sampling.process),
+            ("system", &snapshot.observability.memory_sampling.system),
+            ("cgroup", &snapshot.observability.memory_sampling.cgroup),
+        ],
+        "memory sampling",
+    );
+    let platform = summarize_named_capability_statuses(
+        [
+            ("allocator", &snapshot.observability.platform.allocator),
+            ("ebpf", &snapshot.observability.platform.ebpf),
+            ("numa", &snapshot.observability.platform.numa),
+        ],
+        "platform support",
+    );
+
+    if [userspace_profiling.state, memory_sampling.state, platform.state]
+        .into_iter()
+        .any(|state| state == CapabilityState::Unknown)
+    {
+        CapabilityStatus::unknown().with_reason("observability summary resolved from cluster snapshot")
+    } else {
+        CapabilityStatus::supported().with_reason("observability summary resolved from cluster snapshot")
+    }
+}
+
+fn summarize_named_capability_statuses<const N: usize>(
+    statuses: [(&'static str, &CapabilityStatus); N],
+    subject: &'static str,
+) -> CapabilityStatus {
+    let unknown = statuses
+        .iter()
+        .filter_map(|(name, status)| (status.state == CapabilityState::Unknown).then_some(*name))
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        return CapabilityStatus::unknown().with_reason(format!("{subject} unresolved fields: {}", unknown.join(", ")));
+    }
+
+    let supported_or_disabled = statuses
+        .iter()
+        .any(|(_, status)| matches!(status.state, CapabilityState::Supported | CapabilityState::Disabled));
+    if supported_or_disabled {
+        return CapabilityStatus::supported();
+    }
+
+    let unsupported = statuses.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+    CapabilityStatus::unsupported().with_reason(format!("{subject} unsupported fields: {}", unsupported.join(", ")))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ClusterSnapshotResponse, ClusterSnapshotView};
+    use super::{ClusterSnapshotResponse, ClusterSnapshotSummary, ClusterSnapshotView};
     use crate::cluster_snapshot::{ClusterReadOnlySnapshot, ClusterRuntimeReadinessState, ClusterRuntimeStatusSnapshot};
     use crate::server::{DependencyReadiness, ReadinessDegradedReason};
     use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadClass};
@@ -378,6 +560,7 @@ mod tests {
         ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth, ClusterPeerHealthSnapshot, ClusterPoolState,
         ClusterPoolStateSnapshot,
     };
+    use rustfs_storage_api::CapabilityState;
     use rustfs_storage_api::{CapabilityStatus, ObservabilitySnapshot, TopologySnapshot};
 
     #[test]
@@ -469,12 +652,47 @@ mod tests {
         };
 
         let value = serde_json::to_value(ClusterSnapshotView::from(snapshot)).expect("serialize view");
+        assert_eq!(value["runtime_capabilities_path"], "/rustfs/admin/v4/runtime/capabilities");
+        assert_eq!(value["extensions_catalog_path"], "/rustfs/admin/v4/extensions/catalog");
         assert_eq!(value["membership"]["drives"][0]["endpoint_type"], "url");
         assert_eq!(value["workload_admission"][0]["class"], "repair");
         assert_eq!(value["workload_admission"][0]["state"], "unknown");
         assert_eq!(value["runtime_status"]["state"], "degraded");
+        assert_eq!(value["summary"]["runtime"]["state"], "unknown");
         assert_eq!(value["runtime_status"]["degraded_reasons"][0], "storage_and_lock_unavailable");
         assert_eq!(value["actionable_pressure"], true);
+    }
+
+    #[test]
+    fn cluster_snapshot_summary_reports_cross_surface_status() {
+        let snapshot = ClusterReadOnlySnapshot {
+            topology: TopologySnapshot::default(),
+            membership: ClusterMembershipSnapshot::default(),
+            pool_state: ClusterPoolStateSnapshot::default(),
+            local_storage: ClusterLocalNodeStorageSnapshot::default(),
+            peer_health: ClusterPeerHealthSnapshot::default(),
+            observability: ObservabilitySnapshot::default(),
+            workload_admission: WorkloadAdmissionRegistrySnapshot::new(vec![WorkloadAdmissionSnapshot::new(
+                WorkloadClass::ForegroundRead,
+                AdmissionState::Open,
+            )]),
+            runtime_status: ClusterRuntimeStatusSnapshot {
+                readiness: DependencyReadiness {
+                    storage_ready: true,
+                    iam_ready: true,
+                    lock_quorum_ready: true,
+                },
+                state: ClusterRuntimeReadinessState::Ready,
+                degraded_reasons: Vec::new(),
+            },
+        };
+
+        let summary = ClusterSnapshotSummary::from(&snapshot);
+        assert_eq!(summary.runtime.state, CapabilityState::Supported);
+        assert_eq!(summary.membership.state, CapabilityState::Unknown);
+        assert_eq!(summary.peer_health.state, CapabilityState::Unknown);
+        assert_eq!(summary.workload_admission.state, CapabilityState::Supported);
+        assert_eq!(summary.actionable_pressure.state, CapabilityState::Disabled);
     }
 
     fn extract_block_between_markers(src: &str, start: &str, end: &str) -> String {
